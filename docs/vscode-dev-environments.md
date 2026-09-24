@@ -147,14 +147,14 @@ This extension offers the same one-action experience with local containers. It u
 
 The sidebar has two lists:
 
-- **DEV ENVIRONMENTS** lists the environments that exist on this computer. Each environment is a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Open** of a repository creates its environment. The environment stays until the user selects **Delete**. The list comes from the Environment Registry and from Docker (see [7.5](#75-environment-model-and-workspace-volume)), so it is complete also without internet access.
+- **ENVIRONMENTS** lists the environments that exist on this computer. Each environment is a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Open** of a repository creates its environment. The environment stays until the user selects **Delete**. The list comes from the Environment Registry and from Docker (see [7.5](#75-environment-model-and-workspace-volume)), so it is complete also without internet access.
 - **REPOSITORIES** lists the repositories on GitHub that the user can access and that contain a Dev Container configuration (FR-01). The list comes from GitHub (see [7.4](#74-repository-discovery)). A row is only a reference to GitHub. A repository has no environment on this computer until its first **Open**.
 
 A repository that has an environment appears in both lists.
 
 ```text
 DEV ENVIRONMENTS
-▾ DEV ENVIRONMENTS
+▾ ENVIRONMENTS
     ● acme-university/api        main (python)       Connected
     ◐ acme-university/api        fix-login (node)    Running
     ○ acme-university/web        feature-x           Stopped · 2 hours ago · 3 unpushed
