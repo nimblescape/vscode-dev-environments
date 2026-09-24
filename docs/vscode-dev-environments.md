@@ -82,7 +82,7 @@ This extension offers the same one-action experience with local containers. It u
 |---|---|
 | FR-01 | The extension lists all repositories that the signed-in user can access and that contain a Dev Container configuration. |
 | FR-02 | One action opens a listed repository in a local dev container. If the repository has no environment, the action creates one on the default branch. If the repository has an environment, the action opens this environment (see [6.2](#62-sidebar-view)). |
-| FR-03 | The user can select a branch. If a repository has several configurations, the user can select one. |
+| FR-03 | The user can select a branch. If a repository has several configurations, the user can select one. Both selections apply to the one environment of the repository (see [D-3](#13-decisions)). |
 | FR-04 | No flow requires the user to use commands, views, or prompts of the Dev Containers extension. |
 | FR-05 | While connected to an environment, the user can switch to another environment. |
 | FR-06 | When a window closes, or when VS Code quits, the extension stops the container of that window. No process of the environment keeps running in the background, and the container uses no memory. |
@@ -156,17 +156,18 @@ A repository that has an environment appears in both lists.
 DEV ENVIRONMENTS
 ▾ ENVIRONMENTS
     ● acme-university/api        main (python)       Connected
-    ◐ acme-university/api        fix-login (node)    Running
+    ◐ acme-university/docs       main                Running
     ○ acme-university/web        feature-x           Stopped · 2 hours ago · 3 unpushed
     ○ your-account/dotfiles      main                Stopped · 3 days ago
-▾ REPOSITORIES                                            [Search] [Refresh]
+▾ REPOSITORIES                                              [Search] [Refresh]
   ▾ your-account
-      dotfiles       1 environment                        [Open]  [⋯]
-      website                                             [Open]  [⋯]
+      dotfiles       local environment                      [Open]  [⋯]
+      website                                               [Open]  [⋯]
   ▾ acme-university
-      api            2 configurations · 2 environments    [Open]  [⋯]
-      docs                                                [Open]  [⋯]
-      web            1 environment                        [Open]  [⋯]
+      api            2 configurations · local environment   [Open]  [⋯]
+      docs           local environment                      [Open]  [⋯]
+      infra                                                 [Open]  [⋯]
+      web            local environment                      [Open]  [⋯]
 ```
 
 **Environment row.** Each row shows the repository, the branch, the configuration if the repository has several, the state, and the changes:
@@ -187,12 +188,12 @@ States of an environment (see also [7.15](#715-environment-states)):
 | ◌ | No container | The container was removed outside of the extension. The next **Open** creates it again from the environment image. |
 | ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
 
-**Repository row.** If environments exist for the repository, the row shows their number, for example `1 environment`. A row without this information has no environment yet. **Open** then clones the repository and prepares a new environment, which can take several minutes.
+**Repository row.** If the repository has an environment, the row shows `local environment`. A row without this text has no environment yet. **Open** then clones the repository and prepares a new environment, which can take several minutes.
 
 **Actions:**
 
-- **Open** (button in a repository row): if the repository has no environment, **Open** creates one on the default branch. If the repository has environments, **Open** opens the most recently used one, on the branch that is checked out in it.
-- **⋯** (menu of a repository): Open branch…, Open in new window, Show on GitHub.
+- **Open** (button in a repository row): if the repository has no environment, **Open** creates one on the default branch. If the repository has an environment, **Open** opens it, on the branch that is checked out in it.
+- **⋯** (menu of a repository): Open branch…, Open in new window, Show on GitHub. **Open branch…** opens the environment of the repository and switches it to the selected branch (see [7.5](#75-environment-model-and-workspace-volume)).
 - Menu of an environment: Open, Open in new window, Stop, Rebuild, Delete.
 
 ### 6.3 Status bar
@@ -446,7 +447,9 @@ The Environment Registry is a JSON file in the global storage of the extension. 
 - The container name is stable (see [7.6](#76-open-pipeline)). So a window that VS Code restores finds the container also after an update.
 - The registry stores the last known branch and the numbers of uncommitted files and unpushed commits (`gitSummary`). So the sidebar can show a stopped environment without starting Docker and without a helper container (see [6.2](#62-sidebar-view)). These values are updated before each stop of the container: by the Session Monitor (see [7.9](#79-stop-on-close-and-crash-handling)), and by the action **Stop**. If the container stops in another way, for example when Docker stops, the values of the previous record stay. While the container runs, the extension reads the current branch from the container (`git branch --show-current` through `docker exec`).
 - If the registry is lost, the extension can rebuild the list of environments from the labels of the volumes. The build records are then missing, so the next connection with internet access rebuilds the container.
-- Default: one environment per repository. If the user selects **Open branch…** for a repository that has an environment already, the extension asks: switch the branch in the existing environment, or create a second environment. A second environment has its own volume.
+- One environment per repository (decision [D-3](#13-decisions)). The first open uses the default branch.
+- **Open branch…** switches the branch in the existing environment: the extension runs `git switch <branch>` in the workspace volume. If Git refuses the switch, for example because uncommitted changes conflict with the target branch, the extension shows the message of Git, and the branch does not change. If the configuration of the target branch differs, the rule for a changed `devcontainer.json` applies (see [7.12](#712-automatic-recovery)).
+- If the user selects another configuration (FR-03), the extension changes the configuration of the existing environment and rebuilds its container. The workspace volume is kept.
 
 ### 7.6 Open pipeline
 
@@ -871,7 +874,6 @@ These technical checks must pass before the implementation starts. Each check is
 | ID | Decision | Options | Proposal |
 |---|---|---|---|
 | D-1 | Product name and setting prefix | Free choice | Choose a name without conflicts. The names "Microsoft Dev Box" and "devbox" (Jetify) exist already. |
-| D-3 | Number of environments per repository | One per repository, or one per branch | One per repository by default. A second environment on request. |
 | D-5 | Reopen rule | (a) Reopen the last used environment at each start of VS Code without a restored window. (b) Reopen only if an environment window was open when VS Code quit. | (a), because it matches the requirement "open the last used environment again". The age rule of the reopen record prevents a reconnect after **Close Remote Connection** (see [7.10](#710-reopen-last-environment)). |
 | D-6 | Distribution | Private VSIX file, or Visual Studio Marketplace | Private VSIX file for phase 1 |
 | D-7 | Scope of the image check | (a) Images only. (b) Images and Dev Container Features. | (b), because Features are part of the environment. Depends on [V-9](#11-verification-before-implementation). |
@@ -881,6 +883,7 @@ These technical checks must pass before the implementation starts. Each check is
 | ID | Decision | Result | Reason |
 |---|---|---|---|
 | D-2 | Workspace storage | Named Docker volume per environment | Requirement FR-12: a rebuild mounts the same volume again. Faster file access on macOS and Windows. The disadvantage is described in RK-5. |
+| D-3 | Number of environments per repository | One environment per repository. It uses the default branch first and switches to other branches on demand. | Several environments per repository are not required for now. |
 | D-4 | Action when no window uses an environment | `docker stop` | A stopped container uses no memory. `docker pause` would keep the processes and their memory. |
 
 ## 14. Alternatives considered
