@@ -81,7 +81,7 @@ This extension offers the same one-action experience with local containers. It u
 | ID | Requirement |
 |---|---|
 | FR-01 | The extension lists all repositories that the signed-in user can access and that contain a Dev Container configuration. |
-| FR-02 | One action opens a listed repository in a local dev container on its default branch. |
+| FR-02 | One action opens a listed repository in a local dev container. If the repository has no environment, the action creates one on the default branch. If the repository has an environment, the action opens this environment (see [6.2](#62-sidebar-view)). |
 | FR-03 | The user can select a branch. If a repository has several configurations, the user can select one. |
 | FR-04 | No flow requires the user to use commands, views, or prompts of the Dev Containers extension. |
 | FR-05 | While connected to an environment, the user can switch to another environment. |
@@ -145,25 +145,55 @@ This extension offers the same one-action experience with local containers. It u
 
 ### 6.2 Sidebar view
 
+The sidebar has two lists:
+
+- **DEV ENVIRONMENTS** lists the environments that exist on this computer. Each environment is a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Open** of a repository creates its environment. The environment stays until the user selects **Delete**. The list comes from the Environment Registry and from Docker (see [7.5](#75-environment-model-and-workspace-volume)), so it is complete also without internet access.
+- **REPOSITORIES** lists the repositories on GitHub that the user can access and that contain a Dev Container configuration (FR-01). The list comes from GitHub (see [7.4](#74-repository-discovery)). A row is only a reference to GitHub. A repository has no environment on this computer until its first **Open**.
+
+A repository that has an environment appears in both lists.
+
 ```text
 DEV ENVIRONMENTS
-▾ MY ENVIRONMENTS
-    ● acme-university/api        main        Connected
-    ○ acme-university/web        feature-x   Stopped · 2 hours ago · 3 unpushed
-    ○ your-account/dotfiles      main        Stopped · 3 days ago
-▾ REPOSITORIES                                     [Search] [Refresh]
+▾ DEV ENVIRONMENTS
+    ● acme-university/api        main (python)       Connected
+    ◐ acme-university/api        fix-login (node)    Running
+    ○ acme-university/web        feature-x           Stopped · 2 hours ago · 3 unpushed
+    ○ your-account/dotfiles      main                Stopped · 3 days ago
+▾ REPOSITORIES                                            [Search] [Refresh]
   ▾ your-account
-      dotfiles                                     [Open]  [⋯]
+      dotfiles       1 environment                        [Open]  [⋯]
+      website                                             [Open]  [⋯]
   ▾ acme-university
-      api            2 configurations              [Open]  [⋯]
-      web                                          [Open]  [⋯]
+      api            2 configurations · 2 environments    [Open]  [⋯]
+      docs                                                [Open]  [⋯]
+      web            1 environment                        [Open]  [⋯]
 ```
 
-- Symbols: ● connected, ○ stopped.
-- **Open** (button in the row): opens the repository on its default branch. If an environment for this repository exists already, **Open** uses it.
+**Environment row.** Each row shows the repository, the branch, the configuration if the repository has several, the state, and the changes:
+
+- Branch: the branch that is checked out in the workspace volume. For a stopped environment, the row shows the last known branch from the registry (see [7.5](#75-environment-model-and-workspace-volume)).
+- Configuration: if the repository has more than one configuration, the row shows the configuration in brackets after the branch. The name is the sub-folder of the configuration, for example `python` for `.devcontainer/python/devcontainer.json`, or `default` for `.devcontainer/devcontainer.json` and `.devcontainer.json`.
+- Changes: an environment with uncommitted or unpushed changes shows this information, for example `3 unpushed`. The values are updated each time the extension stops the container (see [7.5](#75-environment-model-and-workspace-volume)).
+
+States of an environment (see also [7.15](#715-environment-states)):
+
+| Symbol | State text | Meaning |
+|---|---|---|
+| ● | Connected | This window is connected to the environment. |
+| ● | Connected · other window | Another VS Code window is connected to the environment. **Open** shows that window (see [7.11](#711-switching)). |
+| ◐ | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop. |
+| ○ | Stopped | The container is stopped. The next **Open** starts it. |
+| ↻ | Updating | An update, a rebuild, or a delete is in progress. |
+| ◌ | No container | The container was removed outside of the extension. The next **Open** creates it again from the environment image. |
+| ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
+
+**Repository row.** If environments exist for the repository, the row shows their number, for example `1 environment`. A row without this information has no environment yet. **Open** then clones the repository and prepares a new environment, which can take several minutes.
+
+**Actions:**
+
+- **Open** (button in a repository row): if the repository has no environment, **Open** creates one on the default branch. If the repository has environments, **Open** opens the most recently used one, on the branch that is checked out in it.
 - **⋯** (menu of a repository): Open branch…, Open in new window, Show on GitHub.
 - Menu of an environment: Open, Open in new window, Stop, Rebuild, Delete.
-- An environment with uncommitted or unpushed changes shows this information, for example `3 unpushed`. The extension updates it when it stops the environment (see [7.9](#79-stop-on-close-and-crash-handling)).
 
 ### 6.3 Status bar
 
@@ -180,7 +210,7 @@ One item on the left side of the status bar:
 
 Command **Dev Environments: Switch Environment…**. It is also available with a keyboard shortcut (proposal: `Ctrl+Alt+E`, on macOS `Cmd+Alt+E`). It shows a Quick Pick list:
 
-1. Recent environments with their state (Connected, Running, Stopped).
+1. Recent environments with their state (see [6.2](#62-sidebar-view)).
 2. The entry **Open repository…**. It shows all discovered repositories with a text search.
 
 The default action opens the selected environment in the current window. Each entry also has a button **Open in new window**.
@@ -292,7 +322,7 @@ flowchart LR
 |---|---|
 | UI layer | Tree views, status bar item, switcher (Quick Pick), welcome views, progress notifications |
 | Discovery Service | Finds repositories with Dev Container configurations through the GitHub GraphQL API. Stores the result. |
-| Environment Registry | Stores the list of environments and their build records in a JSON file in the global storage of the extension |
+| Environment Registry | Stores the list of environments, their build records, and their last known Git state in a JSON file in the global storage of the extension |
 | Open Pipeline | Runs the steps of [7.6](#76-open-pipeline). Handles errors and repeats. |
 | Image Check | Finds the images of a configuration, compares their digests with the registry, and pulls new images |
 | Workspace helper | Short-lived container with Git, Node.js, the Docker CLI, and the Dev Container CLI. It mounts the workspace volume and has access to Docker. It clones the repository, reads the configuration, runs `devcontainer build` and `devcontainer up`, and runs the Git safety check. |
@@ -382,6 +412,12 @@ The Environment Registry is a JSON file in the global storage of the extension. 
   "containerName": "devenv-acme-university-api-3f2a9c1e",
   "createdAt": "2026-09-24T15:40:00Z",
   "lastUsedAt": "2026-09-24T17:10:00Z",
+  "gitSummary": {
+    "branch": "main",
+    "uncommittedFiles": 0,
+    "unpushedCommits": 0,
+    "recordedAt": "2026-09-24T17:10:00Z"
+  },
   "buildRecord": {
     "builtAt": "2026-09-24T15:44:00Z",
     "environmentImage": "devenv-3f2a9c1e:2",
@@ -408,7 +444,7 @@ The Environment Registry is a JSON file in the global storage of the extension. 
 
 - The registry does not store container IDs. The container has the label `devenv.environment-id`. The extension sets this label with the CLI option `--id-label`, and the CLI uses the same label to find the existing container.
 - The container name is stable (see [7.6](#76-open-pipeline)). So a window that VS Code restores finds the container also after an update.
-- The registry does not store the current branch. The extension reads it from the volume when needed.
+- The registry stores the last known branch and the numbers of uncommitted files and unpushed commits (`gitSummary`). So the sidebar can show a stopped environment without starting Docker and without a helper container (see [6.2](#62-sidebar-view)). These values are updated before each stop of the container: by the Session Monitor (see [7.9](#79-stop-on-close-and-crash-handling)), and by the action **Stop**. If the container stops in another way, for example when Docker stops, the values of the previous record stay. While the container runs, the extension reads the current branch from the container (`git branch --show-current` through `docker exec`).
 - If the registry is lost, the extension can rebuild the list of environments from the labels of the volumes. The build records are then missing, so the next connection with internet access rebuilds the container.
 - Default: one environment per repository. If the user selects **Open branch…** for a repository that has an environment already, the extension asks: switch the branch in the existing environment, or create a second environment. A second environment has its own volume.
 
@@ -633,7 +669,7 @@ Further rules:
 
 - The Session Monitor stops only containers of environments in the registry. It does not change other containers.
 - The Container Adapter checks the container state before each action.
-- Before it stops a container, the Session Monitor records whether the repository has uncommitted or unpushed changes (`git status` in the container, if Git is available there). The sidebar shows this information (see [6.2](#62-sidebar-view)).
+- Before it stops a container, the Session Monitor records the current branch and the numbers of uncommitted files and unpushed commits in the registry (`gitSummary`, see [7.5](#75-environment-model-and-workspace-volume)). It runs Git in the container, if Git is available there. The sidebar shows these values (see [6.2](#62-sidebar-view)).
 - It deletes the status files of ended processes after the waiting time.
 - It ends itself when no VS Code window is alive and no waiting time is running.
 - When the extension activates, it starts the Session Monitor if none runs. So a container that kept running without a window after an earlier failure stops at the next start of VS Code.
@@ -780,7 +816,7 @@ The Docker start (FR-14) has no setting, because it is a fixed requirement.
 - **Docker start.** The extension starts Docker only with the documented commands of Docker Desktop. It never asks for an administrator password.
 - **Code execution.** Opening a repository in a container runs code from the repository: the Dockerfile, Dev Container Features, and lifecycle commands. A container is not a strong security boundary. Therefore, the first open of a repository that does not belong to the user or to one of the user's organizations requires a confirmation.
 - **Registry credentials.** The Image Check reads registry credentials through the Docker credential helper, only for the registry of the image. It does not store them.
-- **Stored data.** The repository list and the registry contain metadata only: repository names, URLs, dates, volume names, image names, and image digests.
+- **Stored data.** The repository list and the registry contain metadata only: repository names, URLs, dates, volume names, image names, image digests, branch names, and numbers of changes.
 - **Telemetry.** Version 1 collects no telemetry.
 
 ## 10. Risks
@@ -859,6 +895,7 @@ These technical checks must pass before the implementation starts. Each check is
 | Let the Dev Containers extension build and start the container | The build progress and log of the Dev Containers extension become visible, and the extension cannot make sure that the image check runs before each connection. |
 | Run `docker pull` before each connection instead of the `HEAD` digest check | Simpler. But on Docker Hub, each check counts as a pull, and each check takes longer. |
 | Dev Container CLI plus Remote - SSH (SSH server inside the container) | More components: SSH server, keys, port mapping. Remote - SSH has the same visibility limits as the Dev Containers extension. |
+| Own connection without the Dev Containers extension: an own remote connection type and an own VS Code Server in the container, as the GitHub Codespaces extension does it | The API for an own remote connection type (`registerRemoteAuthorityResolver`) is a proposed API. VS Code allows it only for the extensions that the product configuration of Microsoft VS Code lists, or after each user enables it in the file `argv.json`. Extensions that use a proposed API should not be published on the Marketplace. The Microsoft VS Code Server is not licensed for use by other clients. So the extension would also need its own server build from the open-source code for each VS Code release, because the server accepts only a client with the same commit. |
 | DevPod | The maintenance status of the original project is uncertain, and it adds a separate tool. |
 
 ## 15. References
@@ -874,6 +911,8 @@ These technical checks must pass before the implementation starts. Each check is
 - [VS Code API reference: `authentication`](https://code.visualstudio.com/api/references/vscode-api#authentication)
 - [VS Code: Supporting Remote Development (extension kinds)](https://code.visualstudio.com/api/advanced-topics/remote-extensions)
 - [VS Code: Extension Host](https://code.visualstudio.com/api/advanced-topics/extension-host)
+- [VS Code: Using proposed API](https://code.visualstudio.com/api/advanced-topics/using-proposed-api), and the [proposed API for remote connection types (`vscode.proposed.resolvers.d.ts`)](https://github.com/microsoft/vscode/blob/main/src/vscode-dts/vscode.proposed.resolvers.d.ts)
+- [VS Code: Remote Development FAQ (license of the VS Code Server)](https://code.visualstudio.com/docs/remote/faq)
 - [Docker Desktop CLI (`docker desktop start`)](https://docs.docker.com/desktop/features/desktop-cli/)
 - [Docker Desktop: Resource Saver mode](https://docs.docker.com/desktop/use-desktop/resource-saver/), and the [answer of Docker staff about its default of 5 minutes](https://github.com/docker/for-win/issues/15044)
 - [Docker: `docker container pause` (for decision D-4)](https://docs.docker.com/reference/cli/docker/container/pause/)
