@@ -1,4 +1,4 @@
-// Shared data types. Stored files (registry.json, repositories.json, session files) use these shapes.
+// Shared data types. Stored files (registry.json, repositories-<account ID>.json, session files) use these shapes.
 // All times are ISO 8601 strings in UTC, unless a field says otherwise.
 
 /** Last known Git state of the workspace volume (concept 7.5). */
@@ -38,6 +38,14 @@ export interface BusyMark {
   windowId: string;
 }
 
+/** A GitHub account of the VS Code GitHub sign-in (concept section 9 "Accounts"). */
+export interface GitHubAccount {
+  /** Numeric GitHub user ID as a string (`session.account.id`; the `databaseId` of the GraphQL API). */
+  id: string;
+  /** Login (`session.account.label`). Empty for an owner that was restored from a volume label, until the next open. */
+  login: string;
+}
+
 /** One entry of the Environment Registry (concept 7.5). */
 export interface Environment {
   /** `crypto.randomUUID()`. */
@@ -63,6 +71,33 @@ export interface Environment {
   additionalVolumes?: string[];
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
+  /**
+   * The GitHub account that created the environment. Only this account can use it. Entries of an older version have
+   * none until an account claims them: without a question only when the entry can belong to no other account, otherwise
+   * after a confirmation of the user (concept 7.5).
+   */
+  owner?: GitHubAccount;
+  /**
+   * An update whose new environment image the host access policy refused (concept 7.7): the same update is not built
+   * again until a digest or the configuration changes.
+   */
+  refusedUpdate?: RefusedUpdate;
+}
+
+/**
+ * An update whose new environment image the host access policy refused (concept 7.7, section 9 "Host access"): the
+ * configuration and the digests of the image check that led to it. The same update is not built again; a changed digest
+ * or configuration, or a manual rebuild, tries again.
+ */
+export interface RefusedUpdate {
+  configPath: string;
+  configHash: string;
+  /** Image reference → digest, as recordDigests gives it for the build record. */
+  images: Record<string, string>;
+  /** Feature reference → digest. */
+  features: Record<string, string>;
+  /** What the new image needed, for the message (Messages.updateRefused). */
+  items: string;
 }
 
 export interface RegistryFile {
@@ -81,6 +116,11 @@ export interface RepositoryInfo {
   isArchived: boolean;
   isFork: boolean;
   isPrivate: boolean;
+  /**
+   * The permission of the account on GitHub (`viewerPermission`: ADMIN, MAINTAIN, WRITE, TRIAGE, or READ). Missing when
+   * GitHub does not return it, and in lists of older versions.
+   */
+  viewerPermission?: string;
   pushedAt: string | null;
   defaultBranch: string | null;
   /** Configuration paths in the order of precedence. The first one is the default. */
@@ -97,7 +137,7 @@ export interface OrganizationHint {
   url: string;
 }
 
-/** Content of repositories.json. */
+/** Content of repositories-<account ID>.json. */
 export interface DiscoveryData {
   version: 1;
   fetchedAt: string;
@@ -208,6 +248,8 @@ export interface DevcontainerConfig {
     context?: string;
     args?: Record<string, string>;
     target?: string;
+    /** Options of `docker build`. */
+    options?: string[];
   };
   /** Deprecated form of `build.dockerfile`. */
   dockerFile?: string;
@@ -220,6 +262,9 @@ export interface DevcontainerConfig {
   workspaceFolder?: string;
   shutdownAction?: 'none' | 'stopContainer' | 'stopCompose';
   initializeCommand?: unknown;
+  privileged?: boolean;
+  capAdd?: string[];
+  securityOpt?: string[];
   remoteUser?: string;
   containerUser?: string;
   [key: string]: unknown;

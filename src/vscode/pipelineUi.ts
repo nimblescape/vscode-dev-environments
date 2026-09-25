@@ -44,6 +44,22 @@ export class VsCodePipelineUi implements PipelineUi {
     return choice === rebuildNow ? 'rebuildNow' : 'later';
   }
 
+  /**
+   * Concept 7.5: asks whether the entry of an older version of `repository` is assigned to the account `login`
+   * (EnvironmentClaims in the mode `interactive`). True for Assign; Not now and a dismissed dialog are false.
+   */
+  async confirmAssignment(repository: string, login: string): Promise<boolean> {
+    const assign: vscode.MessageItem = { title: Actions.assign };
+    const notNow: vscode.MessageItem = { title: Actions.notNow, isCloseAffordance: true };
+    const choice = await vscode.window.showWarningMessage(
+      Messages.assignOlderEnvironment(repository, login),
+      { modal: true },
+      assign,
+      notNow,
+    );
+    return choice === assign;
+  }
+
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
     const choice = await vscode.window.showWarningMessage(
       Messages.filesMissing,

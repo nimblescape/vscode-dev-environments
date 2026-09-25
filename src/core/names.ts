@@ -3,11 +3,39 @@ import * as crypto from 'crypto';
 
 export const LABEL_ENVIRONMENT_ID = 'devenv.environment-id';
 export const LABEL_REPOSITORY = 'devenv.repository';
+/** Volume label: the GitHub user ID of the account that created the environment (concept 7.5). */
+export const LABEL_OWNER_ID = 'devenv.owner-id';
+/** Container label: the version of the container setup (CONTAINER_VERSION). */
+export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
+/**
+ * Version of the container setup. 2: container-only Git (concept section 9). A container with an older version (or
+ * without the label) is created again from its environment image.
+ */
+export const CONTAINER_VERSION = 2;
+/**
+ * Container label: `unknown` when the container was created without the configuration of the repository (it could not
+ * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
+ */
+export const LABEL_CONTAINER_CONFIG = 'devenv.container-config';
+export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
 /** Mount point of the workspace volume, in the helper and in the dev container. */
 export const WORKSPACES_ROOT = '/workspaces';
+/**
+ * Folder of the container's own Git, Docker, and GPG configuration in the workspace volume (concept section 9). A
+ * repository name only has `[A-Za-z0-9._-]`, so no repository folder `/workspaces/<name>` can have this name.
+ */
+export const CONFIG_FOLDER = `${WORKSPACES_ROOT}/.devenv+`;
+/** The global Git configuration of the container (GIT_CONFIG_GLOBAL). */
+export const GIT_CONFIG_FILE = `${CONFIG_FOLDER}/gitconfig`;
+/** The token of the owner account, mode 0600, owned by the owner of the repository folder. */
+export const GITHUB_TOKEN_FILE = `${CONFIG_FOLDER}/github-token`;
+/** DOCKER_CONFIG of the container. */
+export const DOCKER_CONFIG_FOLDER = `${CONFIG_FOLDER}/docker`;
+/** GNUPGHOME of the container. */
+export const GNUPG_FOLDER = `${CONFIG_FOLDER}/gnupg`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();
@@ -45,6 +73,13 @@ export function resourceName(repository: string, environmentId: string): string 
   middle = middle.replace(/[-_.]+$/, '');
   return `${prefix}${middle}${suffix}`;
 }
+
+/**
+ * Name of the workspace volume of an environment, as resourceName builds it: `devenv-<owner>-<repository>-<short id>`, with
+ * the first 8 hexadecimal characters of the environment ID at the end. Other volumes whose name starts with `devenv-` (for
+ * example `devenv-tools-node_modules` of a repository `devenv-tools`) are volumes of the repository.
+ */
+export const ENVIRONMENT_VOLUME_PATTERN = /^devenv-[a-z0-9_.-]*-[0-9a-f]{8}$/i;
 
 /** Repository part of the environment image name: `devenv-<short id>`. */
 export function environmentImageRepository(environmentId: string): string {

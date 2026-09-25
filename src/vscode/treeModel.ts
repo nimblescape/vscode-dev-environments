@@ -21,6 +21,10 @@ export const TreeTexts = {
   configuration: (name: string) => `Configuration: ${name}`,
   lastUsed: (time: string) => `Last used: ${time}`,
   noEnvironment: 'No environment yet. Start creates it on the default branch.',
+  /** A repository with an environment of another GitHub account (concept 7.5, D-3). */
+  otherAccountEnvironment: 'Environment of another account',
+  otherAccountEnvironmentTooltip:
+    'This computer has an environment of this repository for another GitHub account. It keeps one environment per repository, so the signed-in account cannot make its own. Sign in with that account to use it.',
   notListedOnGitHub: 'GitHub does not list this repository.',
   archived: 'Archived repository',
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
@@ -38,8 +42,17 @@ export interface TreeInput {
   /** Stored or fresh result of the discovery. `undefined` while no list is loaded. */
   discovery: DiscoveryData | undefined;
   settings: Pick<ExtensionSettings, 'owners' | 'includeArchived' | 'includeForks'>;
-  /** All entries of the Environment Registry. */
+  /**
+   * The entries of the Environment Registry that the signed-in account may use (concept 7.5, `availableEnvironments`).
+   * Environments of another account are never passed, so no row, name, or count reveals them.
+   */
   environments: readonly Environment[];
+  /**
+   * Lower-case `owner/name` of the repositories that have an environment of another GitHub account. D-3 allows one
+   * environment per repository on this computer, so their rows offer no Start (concept 7.5). Only repositories that the
+   * list of the signed-in account names get such a row; the others stay hidden.
+   */
+  lockedRepositories?: ReadonlySet<string>;
   /** Container and volume state per environment ID. `undefined`: Docker is not running or not asked yet. */
   runtime: ReadonlyMap<string, EnvironmentRuntime> | undefined;
   /** Environment of this window. */
@@ -293,7 +306,7 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
       const id = `repo:${key}`;
       if (usedIds.has(id)) continue;
       usedIds.add(id);
-      const row = repositoryRow(id, info);
+      const row = repositoryRow(id, info, input.lockedRepositories?.has(key) === true);
       groupFor(row.owner).others.push(row);
     }
 
@@ -459,11 +472,14 @@ function environmentRow(
   };
 }
 
-function repositoryRow(id: string, info: RepositoryInfo): RepositoryRow {
-  const actions = rowActions(undefined, info);
+/** The row of a repository without environment. `locked`: another account has its environment (no Start, D-3). */
+function repositoryRow(id: string, info: RepositoryInfo, locked = false): RepositoryRow {
+  const actions: RowActions = locked
+    ? { ...rowActions(undefined, info), canStart: false, multiConfig: false }
+    : rowActions(undefined, info);
   const tooltip = [
     info.nameWithOwner,
-    TreeTexts.noEnvironment,
+    locked ? TreeTexts.otherAccountEnvironmentTooltip : TreeTexts.noEnvironment,
     info.defaultBranch ? TreeTexts.defaultBranch(info.defaultBranch) : undefined,
     info.isArchived ? TreeTexts.archived : undefined,
   ]
@@ -479,7 +495,7 @@ function repositoryRow(id: string, info: RepositoryInfo): RepositoryRow {
     notOnGitHub: false,
     actions,
     label: info.name,
-    description: '',
+    description: locked ? TreeTexts.otherAccountEnvironment : '',
     tooltip,
     contextValue: contextValue(actions),
   };

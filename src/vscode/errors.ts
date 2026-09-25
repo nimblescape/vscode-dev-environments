@@ -91,11 +91,23 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   gitSwitchFailed: ['showDetails'],
   filesMissing: ['showDetails'],
   signInRequired: ['signIn'],
+  hostAccess: ['showDetails'],
+  otherAccount: [],
+  // An entry of an older version that the claim did not assign yet (concept 7.5): a later try can assign it.
+  environmentUnassigned: 'retry',
   cancelled: [],
 };
 
 /** Situations that the user can resolve, rather than failures. */
-const WARNINGS = new Set<UserErrorCode>(['composeNotSupported', 'noConfiguration', 'gitSwitchFailed', 'signInRequired']);
+const WARNINGS = new Set<UserErrorCode>([
+  'composeNotSupported',
+  'noConfiguration',
+  'gitSwitchFailed',
+  'signInRequired',
+  'hostAccess',
+  'otherAccount',
+  'environmentUnassigned',
+]);
 
 function runAction(action: ErrorAction, options: ShowErrorOptions): void {
   try {

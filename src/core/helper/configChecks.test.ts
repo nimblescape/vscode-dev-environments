@@ -38,56 +38,17 @@ describe('checkConfiguration', () => {
     expect(checkConfiguration(text).computerDependent).toEqual([]);
   });
 
-  it('reports bind mounts of folders of the computer in mounts (string and object form)', () => {
+  it('leaves mounts to the host access policy, which refuses bind mounts (concept section 9)', () => {
     const text = `{
       "image": "x",
       "mounts": [
         "source=\${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached",
         { "source": "/Users/x/data", "target": "/data", "type": "bind" },
-        "source=cache,target=/cache,type=volume",
-        "source=\${localWorkspaceFolder}/.cache,target=/cache2,type=bind",
-        "source=/var/run/docker.sock,target=/var/run/docker-host.sock,type=bind"
-      ]
-    }`;
-    expect(checkConfiguration(text).computerDependent).toEqual([
-      '${localWorkspaceFolder}',
-      'bind mount ${localEnv:HOME}/.ssh',
-      'bind mount /Users/x/data',
-    ]);
-  });
-
-  it('reports -v, --volume and --mount binds in runArgs, but not named volumes', () => {
-    const text = JSON.stringify({
-      image: 'x',
-      runArgs: [
-        '-v',
-        '/Users/x/src:/src',
-        '--volume=./data:/data:ro',
-        '-vC:\\Users\\x:/win',
-        '--mount',
-        'type=bind,source=/opt/tools,target=/tools',
-        '--mount=type=volume,source=db,target=/db',
-        '-v',
-        'named:/named',
-        '-v',
-        '/anonymous',
-        '-v',
-        '/var/run/docker.sock:/var/run/docker.sock',
-        '--volumes-from',
-        'other',
-        '-v',
-        '${localEnv:HOME}/.aws:/root/.aws:ro',
-        '-v',
-        '${localWorkspaceFolderBasename}-cache:/cache',
+        "source=\${localWorkspaceFolder}/.cache,target=/cache2,type=bind"
       ],
-    });
-    expect(checkConfiguration(text).computerDependent).toEqual([
-      'bind mount /Users/x/src',
-      'bind mount ./data',
-      'bind mount C:\\Users\\x',
-      'bind mount /opt/tools',
-      'bind mount ${localEnv:HOME}/.aws',
-    ]);
+      "runArgs": ["-v", "/Users/x/src:/src", "--env-file", "\${localWorkspaceFolder}/.env"]
+    }`;
+    expect(checkConfiguration(text).computerDependent).toEqual([]);
   });
 
   it('checks the text as well as possible when the JSON is invalid', () => {

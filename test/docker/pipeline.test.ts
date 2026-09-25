@@ -1,8 +1,12 @@
 // The open pipeline and the environment operations against the real Docker engine (concept 7.6, 7.7, 7.12, 7.14), on a
 // seeded environment: a workspace volume with a Git repository, created through the workspace helper, and its registry
-// entry. Its configuration builds a tiny Alpine image with Git and uses the non-root user `guest`, so the ownership fix
-// runs. Real core modules and the real workspace helper; only the user interface, the GitHub session, and (for the
-// offline scenarios) the network are fakes.
+// entry. Its configuration builds a tiny Alpine image with Git and a non-root user `dev` with a home folder, so the
+// ownership fix runs and the container-only Git (concept section 9) can be checked; it publishes one port (appPort).
+// Configurations that the host access policy refuses are checked on further seeded environments. Real core modules and
+// the real workspace helper; only the user interface, the GitHub session, and (for the offline scenarios) the network
+// are fakes.
+import * as http from 'http';
+import type { AddressInfo } from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -13,6 +17,14 @@ import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import type { HttpTransport } from '../../src/core/http';
 import { extractBaseImages } from '../../src/core/imageCheck/dockerfile';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
+import {
+  CONTAINER_CREDENTIAL_HELPER,
+  DEV_CONTAINERS_GITCONFIG_CHECK,
+  GIT_CREDENTIALS_CONFIG_FILE,
+  HOME_GIT_CONFIG_CONTENT,
+  containerEnvironment,
+  containerGitSupport,
+} from '../../src/core/helper/containerGit';
 import { Messages } from '../../src/core/messages';
 import {
   LABEL_ENVIRONMENT_ID,
@@ -29,10 +41,12 @@ import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
-import { TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
+import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
 import {
+  DUMMY_TOKEN,
   FakeUi,
   HELPER_DOCKERFILE,
+  TEST_ACCOUNT,
   RecordingProgress,
   Timings,
   dockerTestContext,
@@ -50,7 +64,9 @@ import {
 const REPOSITORY = 'devenv-test/tiny';
 const FOLDER = '/workspaces/tiny';
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
-const REMOTE_USER = 'guest';
+const REMOTE_USER = 'dev';
+/** The port of the container that the configuration publishes (appPort); the host port is free at the start. */
+const CONTAINER_PORT = 8080;
 const UNTRACKED = 'untracked.txt';
 const FAKE_DIGEST = `sha256:${'0'.repeat(64)}`;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -215,6 +231,36 @@ describe('open pipeline on a seeded environment', () => {
 
   /** ID of the base image that was on the computer before the tests; a stopped container keeps it (beforeAll). */
   let baselineBaseId: string | undefined;
+  /** Host port of appPort. */
+  let hostPort = 0;
+
+  /** A free TCP port on 127.0.0.1. */
+  async function freePort(): Promise<number> {
+    const server = http.createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    return port;
+  }
+
+  /** The environment variables of the container (`docker inspect`). */
+  function containerEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const entry of cli.container(containerName)?.Config.Env ?? []) {
+      const index = entry.indexOf('=');
+      env[entry.slice(0, index)] = entry.slice(index + 1);
+    }
+    return env;
+  }
+
+  /** `git credential fill` as the remote user in the container, for `host`. */
+  function credentialFill(host: string): { code: number | null; out: string } {
+    const result = cli.run(
+      ['exec', '-i', '-u', REMOTE_USER, '-e', 'GIT_TERMINAL_PROMPT=0', containerName, 'git', 'credential', 'fill'],
+      `protocol=https\nhost=${host}\npath=acme/api.git\n\n`,
+    );
+    return { code: result.code, out: result.out };
+  }
 
   beforeAll(async () => {
     // A base image that was on the computer before the tests stays: Docker refuses to remove an image that a container
@@ -231,6 +277,7 @@ describe('open pipeline on a seeded environment', () => {
 
     await timings.measure('workspace helper image ready', () => helper.ensureImage());
     paths.ensureDirectoriesSync();
+    hostPort = await freePort();
     const devcontainerJson = JSON.stringify(
       {
         name: 'Tiny',
@@ -238,11 +285,17 @@ describe('open pipeline on a seeded environment', () => {
         remoteUser: REMOTE_USER,
         // The containers of the run carry the label of the run, so the cleanup finds them.
         runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
+        // Without an address: the extension publishes it on 127.0.0.1 only (concept section 9 "Host access").
+        appPort: [`${hostPort}:${CONTAINER_PORT}`],
       },
       null,
       2,
     );
-    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    const dockerfile = [
+      `FROM ${TEST_BASE_IMAGE}`,
+      'RUN apk add --no-cache git && adduser -D dev',
+      `LABEL ${TEST_RUN_LABEL}=${run.runId}`,
+    ].join('\n');
     await docker.createVolume(volumeName, {
       [LABEL_ENVIRONMENT_ID]: environmentId,
       [LABEL_REPOSITORY]: REPOSITORY,
@@ -254,7 +307,16 @@ describe('open pipeline on a seeded environment', () => {
     });
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
-    await registry.add({ id: environmentId, repository: REPOSITORY, configPath: CONFIG_PATH, volumeName, containerName, createdAt: now, lastUsedAt: now });
+    await registry.add({
+      id: environmentId,
+      repository: REPOSITORY,
+      configPath: CONFIG_PATH,
+      volumeName,
+      containerName,
+      createdAt: now,
+      lastUsedAt: now,
+      owner: TEST_ACCOUNT,
+    });
     log.info(`Seeded environment ${environmentId}: volume ${volumeName}.`);
   });
 
@@ -333,6 +395,118 @@ describe('open pipeline on a seeded environment', () => {
     expect(ui.since(events)).toEqual([]);
   });
 
+  it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
+    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe('2');
+    const env = containerEnv();
+    expect(env).toMatchObject({
+      GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',
+      DOCKER_CONFIG: '/workspaces/.devenv+/docker',
+      GNUPGHOME: '/workspaces/.devenv+/gnupg',
+      GIT_SSH_COMMAND: 'ssh -o IdentityAgent=none',
+      // Remove every credential helper, include the helpers of the user, and for github.com only the one of the container.
+      GIT_CONFIG_COUNT: '4',
+      GIT_CONFIG_KEY_0: 'credential.helper',
+      GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'include.path',
+      GIT_CONFIG_VALUE_1: GIT_CREDENTIALS_CONFIG_FILE,
+      GIT_CONFIG_KEY_2: 'credential.https://github.com.helper',
+      GIT_CONFIG_VALUE_2: '',
+      GIT_CONFIG_KEY_3: 'credential.https://github.com.helper',
+      GIT_CONFIG_VALUE_3: CONTAINER_CREDENTIAL_HELPER,
+    });
+    // The same settings for every Git version (GIT_CONFIG_PARAMETERS), exactly as the override configuration gives them.
+    expect(env).toMatchObject(containerEnvironment());
+    // No token in any variable of the container.
+    expect(Object.values(env).some((value) => value.includes(DUMMY_TOKEN))).toBe(false);
+    // remoteEnv for the VS Code server is in the label that the Dev Containers extension reads.
+    expect(cli.container(containerName)?.Config.Labels?.['devcontainer.metadata']).toContain('"SSH_AUTH_SOCK":""');
+
+    // The token file: mode 600, owned by the remote user, readable by it, and the only file with the token.
+    expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/github-token')).toBe(`600 ${REMOTE_USER}`);
+    expect(execIn(REMOTE_USER, 'cat /workspaces/.devenv+/github-token')).toBe(DUMMY_TOKEN);
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('/workspaces/.devenv+/github-token');
+    expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/docker /workspaces/.devenv+/gnupg')).toBe(`700 ${REMOTE_USER}\n700 ${REMOTE_USER}`);
+    expect(execIn(REMOTE_USER, 'ls /workspaces/.devenv+/gnupg/private-keys-v1.d')).toBe('README-devenv');
+
+    // Git reads only the configuration of the container. The ~/.gitconfig of the extension has a section, so the Dev
+    // Containers extension does not copy the configuration of the computer into it (its own check exits with 1).
+    expect(execIn(REMOTE_USER, 'git config --global --list').split('\n')).toEqual([
+      `user.name=${TEST_ACCOUNT.login}`,
+      `user.email=${TEST_ACCOUNT.id}+${TEST_ACCOUNT.login}@users.noreply.github.com`,
+      'credential.https://github.com.helper=',
+      `credential.https://github.com.helper=${CONTAINER_CREDENTIAL_HELPER}`,
+    ]);
+    expect(execIn(REMOTE_USER, 'cat ~/.gitconfig')).toBe(HOME_GIT_CONFIG_CONTENT.trim());
+    const copyCheck = cli.run(['exec', '-u', REMOTE_USER, containerName, 'sh', '-c', `${DEV_CONTAINERS_GITCONFIG_CHECK}; exit 0`]);
+    expect(copyCheck.code, copyCheck.err).toBe(1);
+    expect(copyCheck.out).toContain('exists');
+    expect(execIn(REMOTE_USER, 'git config --show-origin --get user.email')).toContain('file:/workspaces/.devenv+/gitconfig');
+
+    // The credential helper answers for https://github.com with the token, and for no other host.
+    const github = credentialFill('github.com');
+    expect(github.code).toBe(0);
+    expect(github.out).toContain('username=x-access-token');
+    expect(github.out).toContain(`password=${DUMMY_TOKEN}`);
+    const other = credentialFill('example.com');
+    expect(other.code).not.toBe(0);
+    expect(other.out).not.toContain(DUMMY_TOKEN);
+  });
+
+  it('container-only Git: a credential helper of the user in credentials.gitconfig answers for its host, never for github.com', () => {
+    // No single quote in the value: the shell command below quotes it with single quotes.
+    const userHelper = (password: string): string => `!f() { test "$1" = get && printf "username=u\\npassword=${password}\\n"; }; f`;
+    const set = (key: string, value: string): string =>
+      execIn(REMOTE_USER, `git config --file '${GIT_CREDENTIALS_CONFIG_FILE}' --add '${key}' '${value}' && echo ok`);
+    try {
+      expect(set('credential.https://gitlab.example.com.helper', userHelper('from-the-user'))).toBe('ok');
+      expect(set('credential.https://github.com.helper', userHelper('not-for-github'))).toBe('ok');
+      const gitlab = credentialFill('gitlab.example.com');
+      expect(gitlab.code).toBe(0);
+      expect(gitlab.out).toContain('password=from-the-user');
+      const github = credentialFill('github.com');
+      expect(github.code).toBe(0);
+      expect(github.out).toContain(`password=${DUMMY_TOKEN}`);
+      expect(github.out).not.toContain('not-for-github');
+    } finally {
+      execIn(REMOTE_USER, `git config --file '${GIT_CREDENTIALS_CONFIG_FILE}' --remove-section 'credential.https://gitlab.example.com' || true`);
+      execIn(REMOTE_USER, `git config --file '${GIT_CREDENTIALS_CONFIG_FILE}' --remove-section 'credential.https://github.com' || true`);
+    }
+  });
+
+  it('container-only Git: without the token file (removed when a window of another account leaves), Git gets no password', () => {
+    const token = '/workspaces/.devenv+/github-token';
+    execIn('root', `cp -p ${token} /tmp/devenv-token-backup && rm -f ${token}`);
+    try {
+      const github = credentialFill('github.com');
+      expect(github.code).not.toBe(0);
+      expect(github.out).not.toContain('password=');
+    } finally {
+      execIn('root', `mv /tmp/devenv-token-backup ${token}`);
+    }
+    expect(execIn('root', `stat -c "%a %U" ${token}`)).toBe(`600 ${REMOTE_USER}`);
+  });
+
+  it('host access: appPort is published on 127.0.0.1 only', () => {
+    expect(cli.lines(['port', containerName])).toEqual([`${CONTAINER_PORT}/tcp -> 127.0.0.1:${hostPort}`]);
+  });
+
+  it('network: the container reaches a service on the computer (host.docker.internal)', async (context) => {
+    const resolved = cli.run(['exec', containerName, 'sh', '-c', 'getent hosts host.docker.internal || nslookup host.docker.internal']);
+    // Docker Engine on Linux has the name only with --add-host host.docker.internal:host-gateway.
+    if (resolved.code !== 0) context.skip();
+    const server = http.createServer((_request, response) => response.end('hello from the computer'));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      // Not with the synchronous DockerCli: the server of this process must answer while Docker runs the request.
+      const result = await runner.run(run.dockerPath, ['exec', containerName, 'wget', '-q', '-T', '10', '-O', '-', `http://host.docker.internal:${port}/`], { env });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toBe('hello from the computer');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('stop: records the Git summary, then stops the container', async () => {
     expect(execIn(REMOTE_USER, `cd ${FOLDER} && printf kept > ${UNTRACKED} && echo ok`)).toBe('ok');
     const started = Date.now();
@@ -367,6 +541,43 @@ describe('open pipeline on a seeded environment', () => {
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();
     expect(untrackedFileKept()).toBe(true);
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);
+    expect(ui.since(events)).toEqual([]);
+  });
+
+  it('a container of an older version (without the label devenv.container-version) is created again, without a build', async () => {
+    // A container as the first version of the extension created it: the ID label, the workspace volume, no version label.
+    cli.ok(['rm', '-f', containerName]);
+    const oldId = cli.ok([
+      'create',
+      '--name',
+      containerName,
+      '--label',
+      `${LABEL_ENVIRONMENT_ID}=${environmentId}`,
+      '--label',
+      `${TEST_RUN_LABEL}=${run.runId}`,
+      '--mount',
+      `type=volume,source=${volumeName},target=/workspaces`,
+      '--entrypoint',
+      'sh',
+      `${imageRepository}:1`,
+      '-c',
+      'sleep 3600',
+    ]);
+    const progress = new RecordingProgress();
+    const events = ui.events.length;
+    await timings.measure('create an old container again', () => online.openEnvironment(environmentId, { progress }), () => progress.summary());
+
+    expect(progress.steps).toEqual(['checkingImage', 'starting']);
+    const container = cli.container(containerName);
+    expect(container?.Id).not.toBe(oldId);
+    expect(container?.State.Running).toBe(true);
+    expect(container?.Config.Image).toBe(`${imageRepository}:1`);
+    expect(container?.Config.Labels?.['devenv.container-version']).toBe('2');
+    expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
+    expect(containersOfEnvironment()).toHaveLength(1);
+    expect(cli.image(`${imageRepository}:2`)).toBeUndefined();
+    expect(untrackedFileKept()).toBe(true);
+    expect(workspaceMount()?.Name).toBe(volumeName);
     expect(ui.since(events)).toEqual([]);
   });
 
@@ -483,6 +694,80 @@ describe('open pipeline on a seeded environment', () => {
     expect(filesOfOtherUsers()).toBe('');
     expect(ui.since(events)).toEqual([{ kind: 'info', text: Messages.registryUnreachable }]);
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);
+  });
+
+  it.each<[string, Record<string, unknown>, string]>([
+    ['a bind mount', { mounts: ['source=/tmp,target=/host-tmp,type=bind'] }, 'bind mount /tmp'],
+    ['privileged mode', { privileged: true }, 'privileged mode'],
+    [
+      'the Docker socket of a Feature (docker-outside-of-docker)',
+      { features: { 'ghcr.io/devcontainers/features/docker-outside-of-docker:1': {} } },
+      'bind mount /var/run/docker.sock',
+    ],
+  ])('host access: a configuration with %s is refused before any build; the volume stays', async (_name, extra, item) => {
+    const id = newEnvironmentId();
+    const name = resourceName('devenv-test/refused', id);
+    const config = JSON.stringify({ name: 'Refused', build: { dockerfile: 'Dockerfile' }, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`], ...extra });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: 'devenv-test/refused', [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/refused', config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository: 'devenv-test/refused', configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    try {
+      const progress = new RecordingProgress();
+      const error = await timings.measure(`refuse ${item}`, () => online.openEnvironment(id, { progress }).then(() => undefined, (caught: unknown) => caught));
+      expect(error).toMatchObject({ code: 'hostAccess' });
+      expect((error as Error).message).toContain(item);
+      expect(progress.steps).not.toContain('preparing');
+      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])).toEqual([]);
+      expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${id}`])).toEqual([]);
+      // NFR-07: the environment keeps its volume.
+      expect(cli.volume(name)).toBeDefined();
+      expect(await registry.get(id)).toBeDefined();
+    } finally {
+      await registry.remove(id);
+      cli.run(['volume', 'rm', name]);
+    }
+  });
+
+  it('container-only Git with Git 2.30 (it ignores GIT_CONFIG_GLOBAL and GIT_CONFIG_COUNT): the token and the identity of the owner', async () => {
+    const id = newEnvironmentId();
+    const repository = 'devenv-test/old-git';
+    const name = resourceName(repository, id);
+    const config = JSON.stringify({ name: 'Old Git', build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`] });
+    const dockerfile = [`FROM ${OLD_GIT_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    // A base image that the user had stays; one that this test pulled goes at the end.
+    const pulledHere = !readBaseline(run).images.some((image) => image.tags.map(familiarName).includes(familiarName(OLD_GIT_BASE_IMAGE)));
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/old-git', config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    const asUser = (args: string[], input?: string) => cli.run(['exec', ...(input === undefined ? [] : ['-i']), '-u', REMOTE_USER, '-e', 'GIT_TERMINAL_PROMPT=0', name, ...args], input);
+    try {
+      const events = ui.events.length;
+      await timings.measure('first open with Git 2.30', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      const version = asUser(['git', '--version']).out;
+      expect(containerGitSupport(version), version).toBe('noGlobalVariable');
+      // Git 2.9 to 2.31 gets no warning (only a log line).
+      expect(ui.since(events)).toEqual([]);
+      // The identity of the volume, through the include of the ~/.gitconfig of the extension.
+      expect(asUser(['git', 'config', '--get', 'user.email']).out).toBe(`${TEST_ACCOUNT.id}+${TEST_ACCOUNT.login}@users.noreply.github.com`);
+      // The credential helper of the container through GIT_CONFIG_PARAMETERS: the token for github.com, nothing for others.
+      const github = asUser(['git', 'credential', 'fill'], 'protocol=https\nhost=github.com\npath=acme/api.git\n\n');
+      expect(github.code).toBe(0);
+      expect(github.out).toContain(`password=${DUMMY_TOKEN}`);
+      const other = asUser(['git', 'credential', 'fill'], 'protocol=https\nhost=example.com\npath=acme/api.git\n\n');
+      expect(other.code).not.toBe(0);
+      expect(other.out).not.toContain(DUMMY_TOKEN);
+    } finally {
+      await registry.remove(id);
+      cli.run(['rm', '-f', name]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      cli.run(['volume', 'rm', name]);
+      if (pulledHere) cli.run(['image', 'rm', OLD_GIT_BASE_IMAGE]);
+    }
   });
 
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {

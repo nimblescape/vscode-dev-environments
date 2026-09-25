@@ -106,6 +106,23 @@ describe('showError (concept 6.5)', () => {
     expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.signIn');
   });
 
+  it('shows a refused configuration and an environment of another account as warnings (concept section 9)', () => {
+    const { logger } = recordingLogger();
+    const hostAccess = Messages.hostAccess('bind mount /Users/x, privileged mode');
+    showError(new UserFacingError('hostAccess', hostAccess), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message: hostAccess, actions: ['Show details'] });
+    resetFakeVscode();
+    showError(new UserFacingError('otherAccount', Messages.otherAccount('acme/api')), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message: Messages.otherAccount('acme/api'), actions: [] });
+  });
+
+  it('shows an environment of an older version that is not assigned yet as a warning with Try again (concept 7.5)', () => {
+    const { logger } = recordingLogger();
+    const message = Messages.olderEnvironmentNotAssigned('acme/api');
+    showError(new UserFacingError('environmentUnassigned', message), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message, actions: ['Show details', 'Try again'] });
+  });
+
   it('shows nothing for a cancellation, and logs it', () => {
     for (const error of [new UserFacingError('cancelled', 'The operation was cancelled.'), abortError()]) {
       resetFakeVscode();
@@ -149,6 +166,9 @@ describe('showError (concept 6.5)', () => {
       'filesMissing',
       'gitSwitchFailed',
       'signInRequired',
+      'hostAccess',
+      'otherAccount',
+      'environmentUnassigned',
     ] as const;
     for (const code of codes) {
       for (const retry of [undefined, vi.fn()]) {

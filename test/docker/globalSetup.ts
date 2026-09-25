@@ -13,6 +13,7 @@ import { extractBaseImages } from '../../src/core/imageCheck/dockerfile';
 import { HELPER_CACHE_VOLUME } from '../../src/core/names';
 import {
   DockerCli,
+  OLD_GIT_BASE_IMAGE,
   TEST_BASE_IMAGE,
   baselinePath,
   createDockerConfig,
@@ -62,7 +63,7 @@ export default async function setup(project: TestProject): Promise<() => void> {
   console.log(`Docker tests: run ${runId}, engine ${info.out}, logs in ${runDir}`);
 
   const helperDockerfile = fs.readFileSync(HELPER_DOCKERFILE, 'utf8');
-  const allowedTags = [helperImageTag(helperDockerfile), ...extractBaseImages(helperDockerfile), TEST_BASE_IMAGE];
+  const allowedTags = [helperImageTag(helperDockerfile), ...extractBaseImages(helperDockerfile), TEST_BASE_IMAGE, OLD_GIT_BASE_IMAGE];
 
   return () => {
     // The test files remove their objects themselves; this is the safety net after a crash.

@@ -668,6 +668,32 @@ describe('buildTreeModel', () => {
     expect(entry.tooltip).toBe(['acme/api', TreeTexts.noEnvironment, 'Default branch: trunk'].join('\n'));
   });
 
+  it('offers no Start for a repository with an environment of another account (concept 7.5, D-3)', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([
+          repo('majikmate/module-ts', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/b/devcontainer.json'] }),
+          repo('acme/api'),
+        ]),
+        lockedRepositories: new Set(['majikmate/module-ts']),
+      }),
+    );
+    const locked = row(groups, 'majikmate/module-ts');
+    expect(locked.environment).toBeUndefined();
+    expect(locked.actions).toEqual({
+      canStart: false,
+      canStop: false,
+      canDelete: false,
+      canRebuild: false,
+      multiConfig: false,
+      onGitHub: true,
+    });
+    expect(locked.contextValue).toBe('repository;onGitHub');
+    expect(locked.description).toBe(TreeTexts.otherAccountEnvironment);
+    expect(locked.tooltip).toBe(['majikmate/module-ts', TreeTexts.otherAccountEnvironmentTooltip, 'Default branch: main'].join('\n'));
+    expect(row(groups, 'acme/api').contextValue).toBe('repository;canStart;onGitHub');
+  });
+
   it('keeps tree item IDs unique if the registry holds two environments of one repository', () => {
     const groups = buildTreeModel(
       input({

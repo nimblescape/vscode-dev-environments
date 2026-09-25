@@ -4,11 +4,13 @@
 // so no value needs quoting.
 //
 // GitHub token (implementation notes 7, concept section 9): the token never appears on a command line, in an environment
-// variable of the container, in the volume, or in .git/config. It arrives on standard input and is written to a file
-// in a tmpfs mount (SECRETS_FOLDER). A Git credential helper that exists only for one command
+// variable of a container, or in .git/config. It arrives on standard input and is written to a file in a tmpfs mount
+// (SECRETS_FOLDER). For the clone and the branch switch, a Git credential helper that exists only for one command
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
+// The only copy in the volume is the token file of the dev container (GIT_FILES_SCRIPT, mode 0600).
 import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
-import { WORKSPACES_ROOT } from '../names';
+import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../names';
+import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
 export { GIT_SUMMARY_SCRIPT };
 
@@ -160,6 +162,90 @@ if [ "$status" -ne 0 ]; then
   fail 1 "$out"
 fi
 if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
+`;
+
+/**
+ * `$1` = folder name of the repository in /workspaces, `$2` = user.name, `$3` = user.email, `$4` = the credential helper
+ * of the dev container (CONTAINER_CREDENTIAL_HELPER). Token on stdin. Prepares the configuration folder of the dev
+ * container (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and folders get with the
+ * owner (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
+ * - github-token: the token, mode 0600, written again at each run (a new sign-in gives a new token);
+ * - gitconfig: created when missing, with user.name and user.email; of an existing file, only the section
+ *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours);
+ * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
+ *   created when missing, with an example in comments; an existing file stays as it is;
+ * - docker/ (DOCKER_CONFIG) and gnupg/ (GNUPGHOME) with gnupg/private-keys-v1.d/, mode 0700. The file in
+ *   private-keys-v1.d makes the Dev Containers extension skip the forwarding of the GPG agent, which it does only for a
+ *   container without private keys (Assumption (V-8)); GnuPG ignores it, because it is no `<keygrip>.key`.
+ * A link or a file in place of one of the folders is removed first, and the token file is replaced with a rename, so
+ * that the token never goes to another place.
+ */
+export const GIT_FILES_SCRIPT = `${TOKEN_PRELUDE}
+folder="$1"
+name="$2"
+email="$3"
+credential_helper="$4"
+case "$folder" in
+  '' | . | .. | -* | */*) fail 2 "Invalid folder name: $folder" ;;
+esac
+repo='${WORKSPACES_ROOT}'/"$folder"
+dir='${CONFIG_FOLDER}'
+if [ ! -d "$repo" ]; then
+  fail 4 "The folder $repo does not exist."
+fi
+owner=$(stat -c '%u:%g' "$repo")
+read_token
+for path in "$dir" "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d"; do
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+    rm -f "$path"
+  fi
+  if [ ! -d "$path" ]; then
+    mkdir "$path"
+  fi
+done
+chmod 0755 "$dir"
+chmod 0700 "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d"
+placeholder="$dir/gnupg/private-keys-v1.d/README-devenv"
+if [ -L "$placeholder" ] || [ ! -f "$placeholder" ]; then
+  rm -rf "$placeholder"
+  printf '%s\n' 'Dev Environments: this file keeps the GPG agent of the computer out of the container.' > "$placeholder"
+fi
+work=$(mktemp -d "$dir/.work.XXXXXX")
+cp "$token_file" "$work/github-token"
+rm -f "$token_file"
+chmod 0600 "$work/github-token"
+chown "$owner" "$work/github-token"
+mv -fT "$work/github-token" "$dir/github-token"
+cfg="$dir/gitconfig"
+if [ -L "$cfg" ]; then
+  rm -f "$cfg"
+fi
+if [ ! -e "$cfg" ]; then
+  : > "$work/gitconfig"
+  if [ -n "$name" ]; then git config --file "$work/gitconfig" user.name "$name"; fi
+  if [ -n "$email" ]; then git config --file "$work/gitconfig" user.email "$email"; fi
+  chmod 0644 "$work/gitconfig"
+  mv -fT "$work/gitconfig" "$cfg"
+fi
+key='credential.https://github.com.helper'
+current=$(git config --file "$cfg" --get-all "$key") || current=''
+wanted=$(printf '\n%s' "$credential_helper")
+if [ "$current" != "$wanted" ]; then
+  git config --file "$cfg" --unset-all "$key" || true
+  git config --file "$cfg" --add "$key" ''
+  git config --file "$cfg" --add "$key" "$credential_helper"
+fi
+credentials="$dir/credentials.gitconfig"
+if [ -L "$credentials" ] || { [ -e "$credentials" ] && [ ! -f "$credentials" ]; }; then
+  rm -rf "$credentials"
+fi
+if [ ! -e "$credentials" ]; then
+  printf '%s' '${GIT_CREDENTIALS_CONFIG_CONTENT.replace(/'/g, `'"'"'`)}' > "$work/credentials.gitconfig"
+  chmod 0644 "$work/credentials.gitconfig"
+  mv -fT "$work/credentials.gitconfig" "$credentials"
+fi
+chown -h "$owner" "$dir" "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d" "$placeholder" "$cfg" "$credentials"
+echo "The Git configuration of the environment is in $dir."
 `;
 
 /**
@@ -330,6 +416,11 @@ process.stdout.write(JSON.stringify(main()) + '\n');
 /** `sh -c` command that clones the repository into the volume. Token on stdin, secrets mount required. */
 export function cloneCommand(repository: string, folderName: string, branch?: string): string[] {
   return ['sh', '-c', CLONE_SCRIPT, 'sh', repository, folderName, branch ?? ''];
+}
+
+/** `sh -c` command that writes the token and the Git configuration of the dev container. Token on stdin, secrets mount required. */
+export function gitFilesCommand(folderName: string, identity: { name: string; email: string }, credentialHelper: string): string[] {
+  return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper];
 }
 
 /** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */

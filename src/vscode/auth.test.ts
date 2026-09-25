@@ -38,6 +38,33 @@ describe('VsCodeGitHubAuth (concept section 9)', () => {
     auth.dispose();
   });
 
+  it('gives the account of the same session: the GitHub user ID and the login (concept 7.5)', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    getSession.mockResolvedValue({ ...session('gho_1'), account: { id: '1001', label: 'scalarion' } });
+    await expect(auth.getAccount({ interactive: false })).resolves.toEqual({ id: '1001', login: 'scalarion' });
+    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true });
+    getSession.mockResolvedValue(undefined);
+    await expect(auth.getAccount({ interactive: false })).resolves.toBeUndefined();
+    auth.dispose();
+  });
+
+  it('gives the token and the account of one session with one read (concept 7.5: a claim needs both together)', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    // A second read would give another session (an account change between two reads).
+    getSession.mockResolvedValueOnce({ ...session('gho_1'), account: { id: '1001', label: 'scalarion' } });
+    getSession.mockResolvedValueOnce({ ...session('gho_2'), account: { id: '2002', label: 'staussh' } });
+    await expect(auth.getSession({ interactive: false })).resolves.toEqual({
+      token: 'gho_1',
+      account: { id: '1001', login: 'scalarion' },
+    });
+    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true });
+    getSession.mockReset();
+    getSession.mockResolvedValue(undefined);
+    await expect(auth.getSession({ interactive: false })).resolves.toBeUndefined();
+    auth.dispose();
+  });
+
   it('returns undefined when the user cancels the sign-in', async () => {
     const auth = new VsCodeGitHubAuth(silentLogger);
     getSession.mockRejectedValue(new Error('User did not consent to login.'));

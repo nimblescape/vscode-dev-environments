@@ -6,10 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { StateTexts } from '../core/messages';
+import { EnvironmentClaims } from '../core/ownership';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import type { DiscoveryData, Environment, ExtensionSettings, RepositoryInfo, WindowStatus } from '../core/types';
+import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
@@ -29,6 +30,10 @@ const SETTINGS: ExtensionSettings = {
   refreshIntervalMinutes: 60,
 };
 
+const OCTO: GitHubAccount = { id: '1001', login: 'octo' };
+const OTHER: GitHubAccount = { id: '2002', login: 'someone' };
+
+/** An environment of the signed-in account OCTO, unless `overrides` names another owner. */
 function environment(id: string, repository: string, overrides: Partial<Environment> = {}): Environment {
   const name = `devenv-${repository.replace('/', '-')}`;
   return {
@@ -39,6 +44,7 @@ function environment(id: string, repository: string, overrides: Partial<Environm
     containerName: name,
     createdAt: iso(NOW - 86_400_000),
     lastUsedAt: iso(NOW - 3_600_000),
+    owner: OCTO,
     ...overrides,
   };
 }
@@ -79,7 +85,12 @@ interface Harness {
   service: { inspectStates: ReturnType<typeof vi.fn>; currentBranch: ReturnType<typeof vi.fn> };
   docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn> };
   discovery: { loadStored: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; getRepository: ReturnType<typeof vi.fn> };
-  auth: { getToken: ReturnType<typeof vi.fn>; isSignedIn: ReturnType<typeof vi.fn>; updateContextKey: ReturnType<typeof vi.fn> };
+  auth: {
+    getToken: ReturnType<typeof vi.fn>;
+    getAccount: ReturnType<typeof vi.fn>;
+    isSignedIn: ReturnType<typeof vi.fn>;
+    updateContextKey: ReturnType<typeof vi.fn>;
+  };
 }
 
 function createHarness(): Harness {
@@ -108,12 +119,16 @@ function createHarness(): Harness {
   };
   const auth = {
     getToken: vi.fn(async () => 'gho_token'),
+    getAccount: vi.fn(async (): Promise<GitHubAccount | undefined> => OCTO),
     isSignedIn: vi.fn(async () => true),
     updateContextKey: vi.fn(async () => true),
     renewToken: vi.fn(async () => undefined),
   };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+  const getRepository = discovery.getRepository as unknown as (repository: string, token: string) => Promise<RepositoryInfo | undefined>;
+  const claims = new EnvironmentClaims({ registry, getRepository: (repository, token) => getRepository(repository, token), logger });
   const sidebar = new Sidebar({
+    claims,
     logger,
     registry,
     sessionFiles,
@@ -145,6 +160,12 @@ afterEach(() => {
 
 function rows(): RepositoryRow[] {
   return repositoryRows(h.models[h.models.length - 1] ?? []);
+}
+
+/** The sidebar knows the signed-in account (activation) and has loaded its list. */
+async function signedIn(): Promise<void> {
+  await h.sidebar.initialize();
+  await h.sidebar.refreshDiscovery();
 }
 
 function rowOf(repository: string): RepositoryRow {
@@ -229,6 +250,7 @@ describe('Sidebar', () => {
   it('shows every environment as stopped when Docker does not run, so a lost connection is not shown as Connected', async () => {
     await h.registry.add(environment(API, 'acme/api'));
     h.coordinator.environmentId = API;
+    await signedIn();
     await h.sidebar.render();
     expect(rowOf('acme/api').state).toBe('connected');
 
@@ -241,6 +263,7 @@ describe('Sidebar', () => {
 
   it('falls back to the states of the registry when Docker runs but its answer could not be read', async () => {
     await h.registry.add(environment(API, 'acme/api'));
+    await signedIn();
     h.service.inspectStates.mockResolvedValueOnce(new Map([[API, { container: 'running', volume: true }]]));
     await h.sidebar.refreshStates();
     expect(rowOf('acme/api').state).toBe('running');
@@ -251,6 +274,7 @@ describe('Sidebar', () => {
 
   it('reads the branch of running containers when it refreshes the states', async () => {
     await h.registry.add(environment(API, 'acme/api', { gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) } }));
+    await signedIn();
     h.service.inspectStates.mockResolvedValue(new Map([[API, { container: 'running', volume: true }]]));
     h.service.currentBranch.mockResolvedValue('feature-x');
     const refreshed = vi.fn();
@@ -269,29 +293,123 @@ describe('Sidebar', () => {
       environment(OLD, 'acme/old', { busy: { operation: 'rebuild', since: iso(NOW - 1000), pid: 999_999, windowId: 'w2' } }),
     );
     await h.sessionFiles.writeWindowStatus({ windowId: 'w1', pid: process.pid, environmentId: null, state: 'active', updatedAt: iso(NOW) });
+    await signedIn();
     await h.sidebar.render();
     expect(rowOf('acme/api').state).toBe('updating');
     expect(rowOf('acme/api').contextValue).not.toContain('canStop');
     expect(rowOf('acme/old').state).toBe('stopped');
   });
 
-  it('adds the sign-in row only when the user is not signed in', async () => {
+  it('shows nothing but the sign-in when the user is not signed in: no environment is available (concept 7.5)', async () => {
     await h.registry.add(environment(API, 'acme/api'));
     h.auth.updateContextKey.mockResolvedValue(false);
+    h.auth.getAccount.mockResolvedValue(undefined);
     await h.sidebar.initialize();
     expect(h.signedInFlags[h.signedInFlags.length - 1]).toBe(false);
-    h.auth.isSignedIn.mockResolvedValue(true);
+    expect(rows()).toEqual([]);
+    h.auth.getAccount.mockResolvedValue(OCTO);
     await h.sidebar.onSessionChanged();
     await h.sidebar.render();
     expect(h.signedInFlags[h.signedInFlags.length - 1]).toBe(true);
+    expect(rows().map((row) => row.repository)).toContain('acme/api');
   });
 
   it('trusts an owner only with a list of the current account', async () => {
-    fakeVscode.authentication.getSession.mockResolvedValue({ account: { label: 'octo' } });
     h.discovery.loadStored.mockResolvedValue({ ...data([]), viewerLogin: 'someone-else' });
     await h.sidebar.initialize();
     h.discovery.refresh.mockResolvedValue(data([]));
     expect(await h.sidebar.trustedOwner('acme')).toBe(true);
     expect(await h.sidebar.trustedOwner('stranger')).toBe(false);
+  });
+
+  it('shows only the environments of the signed-in account, and names no other (concept 7.5)', async () => {
+    await h.registry.add(environment(API, 'acme/api'));
+    await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
+    await h.registry.add(environment(GONE, 'majikmate/legacy', { owner: undefined }));
+    h.discovery.refresh.mockResolvedValue(data([info('acme/api')]));
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    const shown = JSON.stringify(h.models);
+    expect(shown).not.toContain('module-ts');
+    expect(shown).not.toContain('majikmate');
+    // Search and the switcher list the same.
+    expect((await h.sidebar.repositoriesForPicker()).map((repository) => repository.nameWithOwner)).toEqual(['acme/api']);
+    expect((await h.sidebar.availableEnvironments()).map((entry) => entry.id)).toEqual([API]);
+    // No lookup on GitHub for a hidden environment, and no branch read in its container.
+    expect(h.discovery.getRepository.mock.calls.map((call) => call[0])).toEqual(['majikmate/legacy']);
+    h.service.inspectStates.mockResolvedValue(new Map([[OLD, { container: 'running', volume: true }], [API, { container: 'running', volume: true }]]));
+    await h.sidebar.refreshStates();
+    expect(h.service.currentBranch.mock.calls.map((call) => call[0])).toEqual([API]);
+  });
+
+  it('offers no Start for a listed repository that has an environment of another account (D-3)', async () => {
+    await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
+    // An entry of an older version is not counted: this account may still claim it.
+    await h.registry.add(environment(GONE, 'acme/legacy', { owner: undefined }));
+    h.discovery.refresh.mockResolvedValue(data([info('majikmate/module-ts'), info('acme/legacy'), info('acme/api')]));
+    await signedIn();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/legacy', 'majikmate/module-ts']);
+    expect(rowOf('majikmate/module-ts').environment).toBeUndefined();
+    expect(rowOf('majikmate/module-ts').actions.canStart).toBe(false);
+    expect(rowOf('acme/legacy').actions.canStart).toBe(true);
+    expect(rowOf('acme/api').actions.canStart).toBe(true);
+  });
+
+  it('claims an environment of an older version after a refresh only when it can belong to this account alone', async () => {
+    // Without a question (EnvironmentClaims mode `auto`): a private repository of the account itself that it can push to.
+    await h.registry.add(environment(OLD, 'octo/module-ts', { owner: undefined }));
+    await h.registry.add(environment(GONE, 'majikmate/no-access', { owner: undefined }));
+    await h.registry.add(environment(FAILS, 'majikmate/shared', { owner: undefined }));
+    h.discovery.getRepository.mockImplementation(async (repository: string) => {
+      if (repository === 'octo/module-ts') return { ...info(repository), isPrivate: true, viewerPermission: 'WRITE' };
+      // Other members of the organization can access it too: it stays hidden until a command confirms it.
+      if (repository === 'majikmate/shared') return { ...info(repository), isPrivate: true, viewerPermission: 'WRITE' };
+      return undefined;
+    });
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect((await h.registry.get(OLD))?.owner).toEqual(OCTO);
+    expect((await h.registry.get(GONE))?.owner).toBeUndefined();
+    expect((await h.registry.get(FAILS))?.owner).toBeUndefined();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'octo/module-ts']);
+  });
+
+  it('keeps an environment of an older version hidden when GitHub cannot be asked', async () => {
+    await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: undefined }));
+    h.discovery.getRepository.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect((await h.registry.get(OLD))?.owner).toBeUndefined();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+  });
+
+  it('shows the list and the environments of the new account after an account change, never those of the previous one', async () => {
+    await h.registry.add(environment(API, 'acme/api'));
+    await h.registry.add(environment(OLD, 'staussh/tools', { owner: OTHER }));
+    h.discovery.loadStored.mockImplementation(async (accountId: string) =>
+      accountId === OCTO.id ? data([info('scalarion/private')]) : data([info('staussh/public')]),
+    );
+    h.discovery.refresh.mockImplementation(() => new Promise(() => undefined));
+    await h.sidebar.initialize();
+    expect(rows().map((row) => row.repository).sort()).toEqual(['acme/api', 'scalarion/private']);
+
+    h.auth.getAccount.mockResolvedValue(OTHER);
+    void h.sidebar.onSessionChanged();
+    await vi.waitFor(() => expect(h.sidebar.currentAccount).toEqual(OTHER));
+    await h.sidebar.render();
+    expect(h.discovery.loadStored).toHaveBeenLastCalledWith(OTHER.id);
+    expect(rows().map((row) => row.repository).sort()).toEqual(['staussh/public', 'staussh/tools']);
+    expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('scalarion');
+  });
+
+  it('refreshes with the ID of the account, so the list is stored for that account', async () => {
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    expect(h.discovery.refresh).toHaveBeenCalledWith('gho_token', OCTO.id);
   });
 });

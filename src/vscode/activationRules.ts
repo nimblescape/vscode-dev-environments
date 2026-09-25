@@ -48,7 +48,7 @@ export interface ReopenInput {
   /** Number of pending operations that were found (whether this window ran them or not). */
   pendingOperations: number;
   record: ReopenRecord | undefined;
-  /** IDs of the environments in the registry. */
+  /** IDs of the environments in the registry that the signed-in account may use (concept 7.5). */
   environmentIds: ReadonlySet<string>;
   now: number;
 }

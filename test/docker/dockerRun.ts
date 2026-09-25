@@ -19,6 +19,12 @@ export const TEST_RUN_LABEL = 'devenv.test-run';
  */
 export const TEST_BASE_IMAGE = process.env.DEVENV_TEST_BASE_IMAGE ?? 'mirror.gcr.io/library/alpine:3.22';
 
+/**
+ * Base image with a Git older than 2.32 (Alpine 3.13: Git 2.30), for container-only Git with a Git that ignores
+ * GIT_CONFIG_GLOBAL and GIT_CONFIG_COUNT (concept section 9). An override must be an Alpine image with such a Git.
+ */
+export const OLD_GIT_BASE_IMAGE = process.env.DEVENV_TEST_OLD_GIT_IMAGE ?? 'mirror.gcr.io/library/alpine:3.13';
+
 /** What the global setup passes to the test files (vitest `provide`/`inject`). */
 export interface DockerTestRun {
   /** Value of the label devenv.test-run on the objects of this run. */
@@ -130,7 +136,7 @@ export interface ContainerDetails {
   /** With a leading `/`. */
   Name: string;
   State: { Status: string; Running: boolean };
-  Config: { Image: string; Labels: Record<string, string> | null };
+  Config: { Image: string; Labels: Record<string, string> | null; Env?: string[] | null };
   Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
 }
 

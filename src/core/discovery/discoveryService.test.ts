@@ -21,6 +21,7 @@ import {
   ORGANIZATIONS_QUERY,
   parseDiscoveryData,
   REPOSITORY_QUERY,
+  VIEWER_QUERY,
 } from './discoveryService';
 
 const TOKEN = 'gho_secretTokenValue123';
@@ -95,10 +96,19 @@ function repoNode(nameWithOwner: string, options: RepoOptions = {}): Record<stri
 
 function discoverPage(
   nodes: Array<Record<string, unknown> | null>,
-  options: { endCursor?: string | null; hasNextPage?: boolean; login?: string; organizations?: string[]; orgHasNext?: boolean; errors?: GraphQLError[] } = {},
+  options: {
+    endCursor?: string | null;
+    hasNextPage?: boolean;
+    login?: string;
+    databaseId?: number;
+    organizations?: string[];
+    orgHasNext?: boolean;
+    errors?: GraphQLError[];
+  } = {},
 ): Reply {
   const viewer: Record<string, unknown> = {
     login: options.login ?? 'octo',
+    ...(options.databaseId !== undefined ? { databaseId: options.databaseId } : {}),
     repositories: {
       pageInfo: { hasNextPage: options.hasNextPage ?? false, endCursor: options.endCursor ?? null },
       nodes,
@@ -118,12 +128,13 @@ const SAML_MESSAGE =
 const oauthMessage = (org: string) =>
   `Although you appear to have the correct authorization credentials, the \`${org}\` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited. For more information on these restrictions, including how to enable this app, visit https://docs.github.com/articles/restricting-access-to-your-organization-s-data/`;
 
+const ACCOUNT_ID = '1001';
 let dir: string;
 let file: string;
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
-  file = path.join(dir, 'repositories.json');
+  file = path.join(dir, `repositories-${ACCOUNT_ID}.json`);
 });
 
 afterEach(() => {
@@ -131,7 +142,7 @@ afterEach(() => {
 });
 
 function service(transport: FakeGitHub, logger?: Logger): DiscoveryService {
-  return new DiscoveryService(new GitHubApi(transport), file, logger, clock);
+  return new DiscoveryService(new GitHubApi(transport), (accountId) => (accountId === ACCOUNT_ID ? file : path.join(dir, `repositories-${accountId}.json`)), logger, clock);
 }
 
 describe('DiscoveryService.refresh', () => {
@@ -149,7 +160,7 @@ describe('DiscoveryService.refresh', () => {
       });
     });
     const logger = recordingLogger();
-    const result = await service(transport, logger).refresh(TOKEN);
+    const result = await service(transport, logger).refresh(TOKEN, ACCOUNT_ID);
 
     expect(transport.requests).toHaveLength(2);
     expect(transport.requests[0].query).toBe(DISCOVERY_QUERY);
@@ -180,7 +191,7 @@ describe('DiscoveryService.refresh', () => {
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as DiscoveryData;
     expect(stored).toEqual(result);
     expect(fs.readFileSync(file, 'utf8')).not.toContain(TOKEN);
-    expect(await service(transport).loadStored()).toEqual(result);
+    expect(await service(transport).loadStored(ACCOUNT_ID)).toEqual(result);
     expect(logger.lines.join('\n')).not.toContain(TOKEN);
   });
 
@@ -192,7 +203,7 @@ describe('DiscoveryService.refresh', () => {
       }
       return discoverPage([repoNode('octo/a')], { organizations: ['acme', 'beta'], orgHasNext: true });
     });
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.organizations).toEqual(['acme', 'beta', 'gamma']);
     expect(transport.ofQuery(ORGANIZATIONS_QUERY)).toHaveLength(1);
   });
@@ -203,7 +214,7 @@ describe('DiscoveryService.refresh', () => {
         ? new Error('socket hang up')
         : discoverPage([repoNode('octo/a')], { organizations: ['acme'], orgHasNext: true }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.organizations).toEqual(['acme']);
   });
 
@@ -229,7 +240,7 @@ describe('DiscoveryService.refresh', () => {
         errors: [samlError(1), samlError(2)],
       });
     });
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.repositories.map((repository) => repository.nameWithOwner)).toEqual(['acme/api']);
     expect(result.hints).toEqual([{ organization: 'secure-org', kind: 'saml', url: 'https://github.com/orgs/secure-org/sso' }]);
   });
@@ -243,7 +254,7 @@ describe('DiscoveryService.refresh', () => {
     const transport = new FakeGitHub(() =>
       discoverPage([null, repoNode('octo/a'), null], { organizations: ['acme-university'], errors: [error(0), error(2)] }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'acme-university', kind: 'oauthRestricted', url: OAUTH_APP_CONNECTIONS_URL }]);
     expect(transport.requests).toHaveLength(1);
   });
@@ -254,7 +265,7 @@ describe('DiscoveryService.refresh', () => {
         errors: [{ type: 'FORBIDDEN', message: SAML_MESSAGE, path: ['viewer', 'repositories', 'nodes', 0, 'folder'] }],
       }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'secure-org', kind: 'saml', url: 'https://github.com/orgs/secure-org/sso' }]);
     expect(transport.requests).toHaveLength(1);
   });
@@ -270,7 +281,7 @@ describe('DiscoveryService.refresh', () => {
             ],
           }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'Acme', kind: 'saml', url: 'https://github.com/orgs/Acme/sso' }]);
   });
 
@@ -288,7 +299,7 @@ describe('DiscoveryService.refresh', () => {
         ],
       }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'ip-org', kind: 'other', url: 'https://github.com/ip-org' }]);
     // No SAML or OAuth error without an organization: no probe.
     expect(transport.requests).toHaveLength(1);
@@ -300,7 +311,7 @@ describe('DiscoveryService.refresh', () => {
         errors: [{ type: 'FORBIDDEN', message: SAML_MESSAGE, path: ['viewer', 'repositories', 'nodes', 0, 'folder'] }],
       }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([]);
   });
 
@@ -314,7 +325,7 @@ describe('DiscoveryService.refresh', () => {
           }),
     );
     const logger = recordingLogger();
-    const result = await service(transport, logger).refresh(TOKEN);
+    const result = await service(transport, logger).refresh(TOKEN, ACCOUNT_ID);
     expect(result.repositories).toHaveLength(1);
     expect(result.hints).toEqual([]);
     expect(logger.lines.some((line) => line.includes('could not be checked'))).toBe(true);
@@ -329,7 +340,7 @@ describe('DiscoveryService.refresh', () => {
       }
       return discoverPage([null], { organizations, errors: [{ type: 'FORBIDDEN', message: SAML_MESSAGE, path: ['viewer', 'repositories', 'nodes', 0] }] });
     });
-    await service(transport).refresh(TOKEN);
+    await service(transport).refresh(TOKEN, ACCOUNT_ID);
     const probes = transport.requests.filter((request) => request.query.startsWith('query OrganizationAccess('));
     expect(probes.map((request) => Object.keys(request.variables).length)).toEqual([50, 50, 20]);
     expect(probes[2].variables.o19).toBe('org119');
@@ -338,7 +349,7 @@ describe('DiscoveryService.refresh', () => {
   it('throws on HTTP 401 and leaves the stored file unchanged', async () => {
     fs.writeFileSync(file, 'previous');
     const transport = new FakeGitHub(() => ({ status: 401, body: { message: 'Bad credentials' } }));
-    const error = await service(transport).refresh(TOKEN).catch((caught: unknown) => caught);
+    const error = await service(transport).refresh(TOKEN, ACCOUNT_ID).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(GitHubApiError);
     expect((error as GitHubApiError).status).toBe(401);
     expect(fs.readFileSync(file, 'utf8')).toBe('previous');
@@ -351,19 +362,19 @@ describe('DiscoveryService.refresh', () => {
     const transport = new FakeGitHub((request) =>
       request.variables.cursor === null ? discoverPage([repoNode('octo/a')], { hasNextPage: true, endCursor: 'c1' }) : failure,
     );
-    await expect(service(transport).refresh(TOKEN)).rejects.toBe(failure);
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toBe(failure);
     expect(fs.readFileSync(file, 'utf8')).toBe('previous');
   });
 
   it('throws when GitHub returns no repository list, and does not retry a rate limit', async () => {
     const transport = new FakeGitHub(() => ({ body: { data: null, errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded' }] } }));
-    await expect(service(transport).refresh(TOKEN)).rejects.toThrow(/API rate limit exceeded/);
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/API rate limit exceeded/);
     expect(transport.requests).toHaveLength(1);
   });
 
   it('throws when the viewer has no login', async () => {
     const transport = new FakeGitHub(() => ({ body: { data: { viewer: { repositories: { nodes: [] } } } } }));
-    await expect(service(transport).refresh(TOKEN)).rejects.toThrow(/did not return the repository list/);
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/did not return the repository list/);
   });
 
   it('retries a page with a smaller page size when GitHub does not answer in time, and keeps the smaller size', async () => {
@@ -373,7 +384,7 @@ describe('DiscoveryService.refresh', () => {
       return discoverPage([repoNode('octo/b')]);
     });
     const logger = recordingLogger();
-    const result = await service(transport, logger).refresh(TOKEN);
+    const result = await service(transport, logger).refresh(TOKEN, ACCOUNT_ID);
     expect(transport.requests.map((request) => [request.variables.cursor, request.variables.pageSize])).toEqual([
       [null, 50],
       [null, 25],
@@ -388,7 +399,7 @@ describe('DiscoveryService.refresh', () => {
     const transport = new FakeGitHub(() => ({
       body: { data: null, errors: [{ message: 'Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug.' }] },
     }));
-    await expect(service(transport).refresh(TOKEN)).rejects.toThrow(/Something went wrong/);
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/Something went wrong/);
     expect(transport.requests.map((request) => request.variables.pageSize)).toEqual([50, 25, 12, 10]);
   });
 
@@ -396,7 +407,7 @@ describe('DiscoveryService.refresh', () => {
     const transport = new FakeGitHub((request) =>
       discoverPage([repoNode(request.variables.cursor === null ? 'octo/a' : 'octo/b')], { hasNextPage: true, endCursor: 'same' }),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(transport.requests).toHaveLength(2);
     expect(result.repositories).toHaveLength(2);
   });
@@ -410,7 +421,7 @@ describe('DiscoveryService.refresh', () => {
       }
       return discoverPage([], { hasNextPage: true, endCursor: cursor === null ? 'A' : cycle[cursor], organizations: ['acme'], orgHasNext: true });
     });
-    await service(transport).refresh(TOKEN);
+    await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(transport.ofQuery(DISCOVERY_QUERY).map((request) => request.variables.cursor)).toEqual([null, 'A', 'B']);
     expect(transport.ofQuery(ORGANIZATIONS_QUERY).map((request) => request.variables.cursor)).toEqual(['org-cursor-1', 'O2']);
   });
@@ -420,7 +431,7 @@ describe('DiscoveryService.refresh', () => {
     const transport = new FakeGitHub(() =>
       discoverPage([{ nameWithOwner: 'no-slash' }, { nameWithOwner: 'a/b/c' }, { nameWithOwner: 42 }, bad] as Array<Record<string, unknown>>),
     );
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.repositories.map((repository) => [repository.nameWithOwner, repository.url])).toEqual([
       ['octo/b', 'https://github.com/octo/b'],
     ]);
@@ -428,7 +439,7 @@ describe('DiscoveryService.refresh', () => {
 
   it('maps an empty repository (no default branch) without a configuration away', async () => {
     const transport = new FakeGitHub(() => discoverPage([repoNode('octo/empty', { config: 'none', defaultBranch: null })]));
-    const result = await service(transport).refresh(TOKEN);
+    const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.repositories).toEqual([]);
   });
 
@@ -437,7 +448,7 @@ describe('DiscoveryService.refresh', () => {
     fs.writeFileSync(blocked, 'a file, not a folder');
     const transport = new FakeGitHub(() => discoverPage([repoNode('octo/a')]));
     const logger = recordingLogger();
-    const result = await new DiscoveryService(new GitHubApi(transport), path.join(blocked, 'repositories.json'), logger, clock).refresh(TOKEN);
+    const result = await new DiscoveryService(new GitHubApi(transport), () => path.join(blocked, 'repositories.json'), logger, clock).refresh(TOKEN, ACCOUNT_ID);
     expect(result.repositories).toHaveLength(1);
     expect(logger.lines.some((line) => line.includes('could not be stored'))).toBe(true);
   });
@@ -446,19 +457,51 @@ describe('DiscoveryService.refresh', () => {
     const controller = new AbortController();
     controller.abort();
     const transport = new FakeGitHub(() => discoverPage([]));
-    await expect(service(transport).refresh(TOKEN, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
     expect(transport.requests).toHaveLength(0);
+  });
+});
+
+describe('DiscoveryService per GitHub account (concept 6.2)', () => {
+  it('stores and reads the list of each account in its own file, and never the list of another account', async () => {
+    const transport = new FakeGitHub(() => discoverPage([repoNode('scalarion/private')], { login: 'scalarion', databaseId: 1001 }));
+    const discovery = service(transport);
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(fs.existsSync(file)).toBe(true);
+    expect((await discovery.loadStored(ACCOUNT_ID))?.repositories.map((info) => info.nameWithOwner)).toEqual(['scalarion/private']);
+    expect(await discovery.loadStored('2002')).toBeUndefined();
+  });
+
+  it('stores nothing when the token belongs to another account than the one the list is for', async () => {
+    const transport = new FakeGitHub(() => discoverPage([repoNode('staussh/x')], { login: 'staussh', databaseId: 2002 }));
+    await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/session changed/);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+});
+
+describe('DiscoveryService.viewer', () => {
+  it('reads the ID, the login, and the profile name of the account', async () => {
+    const transport = new FakeGitHub(() => ({ body: { data: { viewer: { databaseId: 1001, login: 'scalarion', name: 'Hannes' } } } }));
+    await expect(service(transport).viewer(TOKEN)).resolves.toEqual({ databaseId: 1001, login: 'scalarion', name: 'Hannes' });
+    expect(transport.requests[0].query).toBe(VIEWER_QUERY);
+    const noName = new FakeGitHub(() => ({ body: { data: { viewer: { databaseId: 1001, login: 'scalarion', name: null } } } }));
+    await expect(service(noName).viewer(TOKEN)).resolves.toEqual({ databaseId: 1001, login: 'scalarion', name: null });
+  });
+
+  it('throws when GitHub does not return the account', async () => {
+    const transport = new FakeGitHub(() => ({ body: { errors: [{ message: 'Bad credentials' }] } }));
+    await expect(service(transport).viewer(TOKEN)).rejects.toThrow(/did not return the account/);
   });
 });
 
 describe('DiscoveryService.loadStored', () => {
   it('returns undefined without a file, for invalid JSON, and for another version', async () => {
     const transport = new FakeGitHub(() => discoverPage([]));
-    expect(await service(transport).loadStored()).toBeUndefined();
+    expect(await service(transport).loadStored(ACCOUNT_ID)).toBeUndefined();
     fs.writeFileSync(file, '{ invalid');
-    expect(await service(transport).loadStored()).toBeUndefined();
+    expect(await service(transport).loadStored(ACCOUNT_ID)).toBeUndefined();
     fs.writeFileSync(file, JSON.stringify({ version: 2, fetchedAt: 'x', viewerLogin: 'a', organizations: [], repositories: [], hints: [] }));
-    expect(await service(transport).loadStored()).toBeUndefined();
+    expect(await service(transport).loadStored(ACCOUNT_ID)).toBeUndefined();
   });
 
   it('drops invalid entries', () => {
@@ -479,7 +522,14 @@ describe('DiscoveryService.loadStored', () => {
       fetchedAt: '2026-09-24T12:00:00Z',
       viewerLogin: 'octo',
       organizations: ['acme', 3],
-      repositories: [valid, { ...valid, url: 'file:///etc/passwd' }, { ...valid, configPaths: [] }, null],
+      repositories: [
+        valid,
+        { ...valid, nameWithOwner: 'octo/b', viewerPermission: 'WRITE' },
+        { ...valid, url: 'file:///etc/passwd' },
+        { ...valid, configPaths: [] },
+        { ...valid, viewerPermission: 7 },
+        null,
+      ],
       hints: [
         { organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' },
         { organization: 'x', kind: 'unknown', url: 'https://github.com/x' },
@@ -491,7 +541,8 @@ describe('DiscoveryService.loadStored', () => {
       fetchedAt: '2026-09-24T12:00:00Z',
       viewerLogin: 'octo',
       organizations: ['acme'],
-      repositories: [valid],
+      // A list of an older version has no permission; it is still valid.
+      repositories: [valid, { ...valid, nameWithOwner: 'octo/b', viewerPermission: 'WRITE' }],
       hints: [{ organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' }],
     });
   });
@@ -558,8 +609,57 @@ describe('DiscoveryService single repository queries', () => {
     );
     const info = await service(transport).getRepository('acme/api', TOKEN);
     expect(info).toMatchObject({ nameWithOwner: 'acme/api', owner: 'acme', isArchived: true, configPaths: [] });
+    expect(info?.viewerPermission).toBeUndefined();
     expect(transport.requests[0].query).toBe(REPOSITORY_QUERY);
     expect(await service(transport).getRepository('acme/gone', TOKEN)).toBeUndefined();
+  });
+
+  it('getRepository reads the permission of the account (concept 7.5: read access alone assigns no environment)', async () => {
+    expect(REPOSITORY_QUERY).toMatch(/\bviewerPermission\b/);
+    const transport = new FakeGitHub((request) => ({
+      body: {
+        data: {
+          repository: {
+            ...repoNode(`acme/${request.variables.name as string}`, { isPrivate: false }),
+            viewerPermission: request.variables.name === 'api' ? 'READ' : null,
+          },
+        },
+      },
+    }));
+    expect(await service(transport).getRepository('acme/api', TOKEN)).toMatchObject({ isPrivate: false, viewerPermission: 'READ' });
+    expect(await service(transport).getRepository('acme/web', TOKEN)).not.toHaveProperty('viewerPermission');
+  });
+
+  it('getRepository in the quiet mode logs nothing and names the repository in no error (concept 7.5)', async () => {
+    const replies: Record<string, Reply> = {
+      gone: {
+        body: { data: { repository: null }, errors: [{ type: 'NOT_FOUND', message: "Could not resolve to a Repository with the name 'acme/gone'." }] },
+      },
+      limited: { body: { data: null, errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded for acme/limited' }] } },
+      timeout: {
+        body: {
+          data: { repository: null },
+          errors: [{ message: "Something went wrong while executing your query for 'acme/timeout'. This may be the result of a timeout." }],
+        },
+      },
+    };
+    const transport = new FakeGitHub((request) => replies[request.variables.name as string]);
+    const logger = recordingLogger();
+    const quiet = { quiet: true };
+    expect(await service(transport, logger).getRepository('acme/gone', TOKEN, undefined, quiet)).toBeUndefined();
+    await expect(service(transport, logger).getRepository('acme/limited', TOKEN, undefined, quiet)).rejects.toThrow(
+      'GitHub did not answer the query for a repository (RATE_LIMITED).',
+    );
+    await expect(service(transport, logger).getRepository('acme/timeout', TOKEN, undefined, quiet)).rejects.toThrow(
+      'GitHub did not answer the query for a repository (timeout).',
+    );
+    await expect(service(transport, logger).getRepository('acme', TOKEN, undefined, quiet)).rejects.toThrow('Invalid repository name.');
+    expect(logger.lines).toEqual([]);
+
+    // Without the quiet mode, the log and the errors name the repository, as before.
+    expect(await service(transport, logger).getRepository('acme/gone', TOKEN)).toBeUndefined();
+    expect(logger.lines.join('\n')).toContain('Repository acme/gone: ');
+    await expect(service(transport, logger).getRepository('acme/limited', TOKEN)).rejects.toThrow(/acme\/limited/);
   });
 
   it('getRepository returns undefined without access (SAML), but throws when the query failed', async () => {

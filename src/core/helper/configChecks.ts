@@ -1,13 +1,14 @@
 // Checks of a devcontainer.json that the extension makes before it uses the configuration: Docker Compose
-// (implementation notes 1), properties that need the computer (concept RK-10, implementation notes 7), and the
-// additional named volumes of the configuration (concept 7.14).
+// (implementation notes 1), `${localWorkspaceFolder}` (concept RK-10, implementation notes 7), and the additional named
+// volumes of the configuration (concept 7.14). Mounts of the computer are refused by the host access policy
+// (hostAccess.ts), not reported here.
 import { parseJsonc, stripJsonc } from '../jsonc';
 import type { DevcontainerConfig } from '../types';
 
 export interface ConfigurationProblems {
   /** `dockerComposeFile` is present → Messages.composeNotSupported. */
   compose: boolean;
-  /** Short human-readable items, for example `${localWorkspaceFolder}` or `bind mount /Users/x/data`. */
+  /** Short human-readable items: `${localWorkspaceFolder}`. */
   computerDependent: string[];
 }
 
@@ -18,10 +19,11 @@ interface MountSpec {
 
 const LOCAL_WORKSPACE_FOLDER = /\$\{localWorkspaceFolder\}/;
 
-// Properties where `${localWorkspaceFolder}` does no harm: the override configuration of `up` replaces workspaceMount
-// and workspaceFolder, `name` is only a label, and initializeCommand runs in the workspace helper, where the variable is
-// the folder of the repository in the volume.
-const HARMLESS_PROPERTIES = ['workspaceFolder', 'workspaceMount', 'name', 'initializeCommand'];
+// Properties where `${localWorkspaceFolder}` is not reported: the override configuration of `up` replaces workspaceMount
+// and workspaceFolder, `name` is only a label, the host access policy refuses initializeCommand and bind mounts
+// (`mounts`, and `-v`/`--mount` of runArgs), and the other runArgs are read in the workspace helper, where the variable
+// is the folder of the repository in the volume (for example `--env-file`).
+const HARMLESS_PROPERTIES = ['workspaceFolder', 'workspaceMount', 'name', 'initializeCommand', 'mounts', 'runArgs'];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -125,15 +127,9 @@ function allMounts(config: Record<string, unknown>): MountSpec[] {
   return mounts;
 }
 
-/** The Docker socket is not a file of the computer: Docker Desktop and Docker Engine provide it in the engine. */
-function isDockerSocket(source: string): boolean {
-  return /(^|[\\/])docker\.sock(\.raw)?$/.test(source);
-}
-
 /**
- * configText: raw devcontainer.json text (JSONC). Finds `${localWorkspaceFolder}` (outside of the properties where it
- * does no harm) and bind mounts of folders of the computer (`mounts` with type=bind, and -v/--volume/--mount in runArgs
- * whose source is a path). Text in comments is ignored.
+ * configText: raw devcontainer.json text (JSONC). Finds `${localWorkspaceFolder}` outside of the properties where it
+ * does no harm or where the host access policy decides. Text in comments is ignored.
  *
  * `${localWorkspaceFolderBasename}` is not reported: in the helper the CLI resolves it to the repository name, which is
  * the name of a local clone too.
@@ -160,13 +156,6 @@ export function checkConfiguration(configText: string): ConfigurationProblems {
   const items: string[] = [];
   const relevant = Object.fromEntries(Object.entries(config).filter(([key]) => !HARMLESS_PROPERTIES.includes(key)));
   if (LOCAL_WORKSPACE_FOLDER.test(JSON.stringify(relevant))) items.push('${localWorkspaceFolder}');
-  for (const mount of allMounts(config)) {
-    if (mount.type !== 'bind' || !mount.source) continue;
-    // The variable is reported above already.
-    if (LOCAL_WORKSPACE_FOLDER.test(mount.source) || isDockerSocket(mount.source)) continue;
-    const item = `bind mount ${mount.source}`;
-    if (!items.includes(item)) items.push(item);
-  }
   return { compose, computerDependent: items };
 }
 

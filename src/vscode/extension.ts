@@ -1,6 +1,7 @@
 // Extension entry (esbuild entry of dist/extension.js): the composition root. activate() builds the components, registers
 // the commands and listeners, and runs the tasks of the window role (concept 7.9, 7.10, 7.14). Only the open pipeline
 // of a restored window (role A) is awaited; everything else runs in the background.
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -15,6 +16,7 @@ import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
+import { EnvironmentClaims } from '../core/ownership';
 import { systemClock, type Logger } from '../core/ports';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
@@ -107,8 +109,24 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
   });
-  const discovery = new DiscoveryService(new GitHubApi(nodeHttpsTransport, logger), paths.repositories, logger);
+  // One stored list per GitHub account (concept 6.2); the shared list of version 1 is removed.
+  const discovery = new DiscoveryService(
+    new GitHubApi(nodeHttpsTransport, logger),
+    (accountId) => paths.repositoriesFile(accountId),
+    logger,
+  );
+  fs.promises
+    .rm(paths.legacyRepositories, { force: true })
+    .catch((error: unknown) => logger.warn(`The old repository list could not be removed: ${errorMessage(error)}`));
   const ui = new VsCodePipelineUi(auth, logger, () => logger.show());
+  // Concept 7.5: entries of an older version. The quiet question logs no repository name (a hidden entry may belong to
+  // another account); a command of the user asks before an entry that is not unambiguous is assigned.
+  const claims = new EnvironmentClaims({
+    registry,
+    getRepository: (repository, token, signal) => discovery.getRepository(repository, token, signal, { quiet: true }),
+    confirm: (environment, account) => ui.confirmAssignment(environment.repository, account.login),
+    logger,
+  });
   const connection = new ConnectionAdapter(logger);
   const sessionCoordinator = new SessionCoordinator({
     paths,
@@ -127,6 +145,10 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     sessionFiles,
     imageChecker,
     auth,
+    // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
+    viewer: (token, signal) => discovery.viewer(token, signal),
+    // Concept 7.5: an entry of an older version that an open meets (for example restored from its volume) is claimed first.
+    claims,
     ui,
     logger,
     clock: systemClock,
@@ -155,6 +177,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     docker,
     discovery,
     auth,
+    claims,
     tree,
     settings: getSettings,
   });
@@ -168,6 +191,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     service,
     discovery,
     auth,
+    claims,
     ui,
     connection,
     coordinator: sessionCoordinator,
@@ -210,7 +234,11 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
       if (!state.focused || !focusThrottle.tryAcquire()) return;
       background(view.visible ? sidebar.refreshStates() : sidebar.render(), 'update the sidebar');
     }),
-    auth.onDidChangeSession(() => background(sidebar.onSessionChanged(), 'update the sign-in state')),
+    auth.onDidChangeSession(() => {
+      // Concept 7.5: a window of an environment of another account closes; the view shows the list of the new account.
+      background(controller.onSessionChanged(), 'check the environment of this window after the account change');
+      background(sidebar.onSessionChanged(), 'update the sign-in state');
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!affectsSettings(event)) return;
       settings = readSettings();

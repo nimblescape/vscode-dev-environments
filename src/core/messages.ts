@@ -32,6 +32,48 @@ export const Messages = {
     `The configuration ${configPath} does not exist on this branch. The configuration ${configurationName} is used.`,
   computerDependent: (items: string) =>
     `This configuration uses files on your computer (${items}). This does not work, because the repository is stored in a Docker volume.`,
+  hostAccess: (items: string) =>
+    `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. Change the configuration of the repository.`,
+  /** Settings that the host access policy does not know, so it cannot tell what they do (concept section 9). */
+  unsupportedOptions: (items: string) =>
+    `This configuration uses options that Dev Environments does not support: ${items}. Change the configuration of the repository.`,
+  /** Both: settings that need access to the computer, and settings that the policy does not know. */
+  hostAccessAndUnsupported: (items: string, unsupported: string) =>
+    `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. It also uses options that Dev Environments does not support: ${unsupported}. Change the configuration of the repository.`,
+  /** Concept 7.7: the new environment image of an update was refused by the host access policy; the old one starts. */
+  updateRefused: (items: string) =>
+    `The newer image of the environment needs access to your computer, which Dev Environments does not allow: ${items}. The environment is started without the update.`,
+  /** Concept 7.5, section 9: a container of an older version of the extension is created again. */
+  containerRecreated:
+    'Dev Environments was updated, so the container of the environment is set up again. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /** A container that was created while the configuration could not be read is created again with it. */
+  containerConfigApplied:
+    'The configuration of the environment can be read again, so the container is set up again with it. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /** Concept section 9: Git before 2.9 does not remove the forwarding credential helper with an empty helper. */
+  oldGit: (version: string) =>
+    `Git ${version} in the environment is older than version 2.9. It may use the Git credentials of your computer instead of the GitHub account of the environment. Use an image with a newer Git.`,
+  // The CLI resolves ${localEnv:NAME} in the workspace helper: a variable that the helper sets (HOME, PATH, HOSTNAME, and
+  // the variables of its image, HELPER_ENV_NAMES) gets the value of the helper, any other one is empty or has its default
+  // value. `helperNames`: those of `names` that the helper sets, when the caller knows them.
+  localEnvNotPassed: (names: string, helperNames?: string) =>
+    `The configuration uses variables of your computer: ${names}. Dev Environments does not pass their values to the environment. ` +
+    (helperNames
+      ? `The workspace helper sets ${helperNames} to its own values (for example, HOME is /root), not to the values of your computer. The others are empty or have their default value.`
+      : 'They are empty or have their default value, except variables that the workspace helper sets itself (for example, HOME is /root).'),
+  otherAccount: (repository: string) =>
+    `The environment of ${repository} belongs to another GitHub account. Sign in with that account to use it.`,
+  /** Concept 7.5: the question before an entry of an older version is assigned to the signed-in account. */
+  assignOlderEnvironment: (repository: string, login: string) =>
+    `The environment of ${repository} was created before environments were separated by GitHub account. Assign it to ${login}? Afterwards, only ${login} can use it.`,
+  /**
+   * Concept 7.5: an entry of an older version has no owner, and the claim did not assign it to the signed-in account (no
+   * answer of GitHub, no access, or no confirmation). Not "another account": nobody owns it yet.
+   */
+  olderEnvironmentNotAssigned: (repository: string) =>
+    `The environment of ${repository} was created with an older version of Dev Environments and is not assigned to a GitHub account yet. It could not be assigned to the signed-in account: GitHub did not confirm the access to ${repository}, or the assignment was not confirmed. Try again later.`,
+  otherAccountConnection: (repository: string) =>
+    `The environment of ${repository} does not belong to the GitHub account that is signed in. This window closes its connection.`,
+  gitSetupFailed: 'Git in the environment could not be prepared. Pushing to GitHub may not work.',
   untrustedRepository: (repository: string) =>
     `${repository} does not belong to you or to one of your organizations. Opening it runs code from the repository (Dockerfile, Features, and commands) on your computer. Open it?`,
   signInRequired: 'Sign in with GitHub to use Dev Environments.',
@@ -66,6 +108,8 @@ export const Actions = {
   open: 'Open',
   cancel: 'Cancel',
   continue: 'Continue',
+  assign: 'Assign',
+  notNow: 'Not now',
 } as const;
 
 export const StateTexts = {

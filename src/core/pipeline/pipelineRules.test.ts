@@ -4,11 +4,13 @@ import { CommandError } from '../errors';
 import {
   baseImageKey,
   configHash,
+  containerIsCurrent,
   digestReference,
   errorDetail,
   imageRemoteUser,
   imagesToPull,
   isNetworkFailure,
+  isRefusedUpdate,
   isRepositoryName,
   isRootUser,
   lifecycleHookFailure,
@@ -17,6 +19,7 @@ import {
   nextBuildNumber,
   nonEmptyString,
   recordDigests,
+  refusedUpdateOf,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
@@ -41,6 +44,57 @@ describe('configHash', () => {
     expect(configHash('{ }', 'FROM ubuntu\n')).toBe(`sha256:${expected}`);
     expect(configHash('{ }')).toBe(`sha256:${crypto.createHash('sha256').update('{ }').digest('hex')}`);
     expect(configHash('{ "a": 1 }')).not.toBe(configHash('{ "a": 2 }'));
+  });
+});
+
+describe('containerIsCurrent (concept section 9: containers of an older setup are created again)', () => {
+  it.each<[string, Record<string, string>, boolean]>([
+    ['the current version', { 'devenv.container-version': '2' }, true],
+    ['a newer version', { 'devenv.container-version': '3' }, true],
+    ['an older version', { 'devenv.container-version': '1' }, false],
+    ['no label (created by version 1 of the extension)', { 'devenv.environment-id': 'x' }, false],
+    ['an invalid label', { 'devenv.container-version': 'two' }, false],
+    ['an empty label', { 'devenv.container-version': '' }, false],
+  ])('%s', (_name, labels, expected) => {
+    expect(containerIsCurrent(labels)).toBe(expected);
+  });
+
+  it('counts a container created without the configuration as current only while the configuration cannot be read', () => {
+    const provisional = { 'devenv.container-version': '2', 'devenv.container-config': 'unknown' };
+    expect(containerIsCurrent(provisional)).toBe(false);
+    expect(containerIsCurrent(provisional, true)).toBe(false);
+    expect(containerIsCurrent(provisional, false)).toBe(true);
+    expect(containerIsCurrent({ 'devenv.container-version': '2' }, false)).toBe(true);
+    expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
+  });
+});
+
+describe('refused updates (concept 7.7: a new image that the host access policy refuses)', () => {
+  const refused = {
+    configPath: '.devcontainer/devcontainer.json',
+    configHash: 'sha256:1',
+    images: { 'node:20': 'sha256:AA' },
+    features: { 'ghcr.io/x/f:1': 'sha256:bb' },
+    items: 'bind mount /var/run/docker.sock',
+  };
+  const { items: _items, ...key } = refused;
+
+  it('reads a valid field of the registry entry, and nothing else', () => {
+    expect(refusedUpdateOf({ refusedUpdate: refused })).toEqual(refused);
+    expect(refusedUpdateOf({})).toBeUndefined();
+    expect(refusedUpdateOf({ refusedUpdate: { ...refused, images: { a: 1 } } })).toBeUndefined();
+    expect(refusedUpdateOf({ refusedUpdate: { ...refused, items: undefined } })).toBeUndefined();
+    expect(refusedUpdateOf({ refusedUpdate: 'x' })).toBeUndefined();
+  });
+
+  it('recognizes the same update: same configuration and digests, ignoring the case of the digests', () => {
+    expect(isRefusedUpdate(refused, { ...key, images: { 'node:20': 'sha256:aa' } })).toBe(true);
+    expect(isRefusedUpdate(undefined, key)).toBe(false);
+    expect(isRefusedUpdate(refused, { ...key, configHash: 'sha256:2' })).toBe(false);
+    expect(isRefusedUpdate(refused, { ...key, configPath: '.devcontainer/other/devcontainer.json' })).toBe(false);
+    expect(isRefusedUpdate(refused, { ...key, features: { 'ghcr.io/x/f:1': 'sha256:cc' } })).toBe(false);
+    expect(isRefusedUpdate(refused, { ...key, images: { ...key.images, 'redis:7': 'sha256:dd' } })).toBe(false);
+    expect(isRefusedUpdate(refused, { ...key, images: {} })).toBe(false);
   });
 });
 

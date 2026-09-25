@@ -1,24 +1,30 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { CommandError, UserFacingError } from '../errors';
+import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
+import { runArgsProblems } from '../helper/hostAccess';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
 import type { EnsureImageOptions } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import {
   LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   environmentImageName,
   environmentImageRepository,
   resourceName,
 } from '../names';
 import { abortError } from '../ports';
-import type { Environment, WindowStatus } from '../types';
+import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import { PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
 import {
+  ACCOUNT,
   BASE_IMAGE,
+  OTHER_ACCOUNT,
   DEFAULT_CONFIG_TEXT,
   DIGEST_NEW,
   DIGEST_OLD,
@@ -33,6 +39,7 @@ import {
   WINDOW_ID,
   checked,
   createHarness,
+  imageConfigWithUser,
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
@@ -87,6 +94,26 @@ async function rejection(promise: Promise<unknown>): Promise<UserFacingError> {
   throw new Error('The promise did not reject.');
 }
 
+type ClaimSpy = ReturnType<typeof fakeClaims>;
+
+/**
+ * EnvironmentClaims.claim for the service: gives each entry of `environmentIds` without owner to the account when `grant`
+ * resolves to true (GitHub confirmed the access). Never throws, like EnvironmentClaims.
+ */
+function fakeClaims(grant: () => Promise<boolean>) {
+  return vi.fn(async (account: GitHubAccount, _token: string, claimOptions: { environmentIds?: readonly string[]; mode?: string } = {}) => {
+    const claimed: string[] = [];
+    for (const id of claimOptions.environmentIds ?? []) {
+      if (!(await grant())) continue;
+      const updated = await h.registry.updateEnvironment(id, (e) => {
+        e.owner ??= { ...account };
+      });
+      if (updated?.owner?.id === account.id) claimed.push(id);
+    }
+    return claimed;
+  });
+}
+
 /** A git summary script run through docker exec: 4 lines. */
 function gitExecOutput(branch: string, counts = [0, 0, 0]): string {
   return `${branch}\n${counts.join('\n')}\n`;
@@ -105,7 +132,9 @@ describe('open: first open', () => {
     expect(result.containerName).toBe(name);
     expect(result.remoteWorkspaceFolder).toBe('/workspaces/api');
     expect(env!.volumeName).toBe(name);
-    expect(h.docker.volumes.get(name)).toEqual({ [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: REPO });
+    expect(h.docker.volumes.get(name)).toEqual({ [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // Concept 7.5: the environment belongs to the account that creates it.
+    expect(env!.owner).toEqual(ACCOUNT);
     expect(h.helper.clones).toEqual([{ volumeName: name, repository: REPO, branch: 'main', token: TOKEN }]);
     expect(h.docker.log).toContain(`pull ${BASE_IMAGE}`);
     const image = environmentImageName(id, 1);
@@ -117,7 +146,13 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--name', name]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=2', '--name', name]);
+    expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
+    // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
+    expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
+    expect(h.helper.gitPreparations).toEqual([
+      { volumeName: name, repository: REPO, token: TOKEN, identity: { name: 'octo', email: '1001+octo@users.noreply.github.com' } },
+    ]);
 
     expect(env!.buildRecord).toMatchObject({
       environmentImage: image,
@@ -136,6 +171,14 @@ describe('open: first open', () => {
 
     const ownership = h.docker.execs.find((e) => e.user === 'root');
     expect(ownership?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    // The configuration folder of the container gets the remote user too (written before `up`).
+    expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual([
+      '/workspaces/api',
+      '/workspaces/.devenv+',
+    ]);
+    // Before the first attach: the ~/.gitconfig of the remote user, which keeps the Dev Containers extension from copying
+    // the Git configuration of the computer.
+    expect(h.docker.execs.find((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toMatchObject({ user: 'root', command: homeGitConfigCommand('vscode') });
     expect(await pendingIds()).toEqual([id]);
     expect(h.progress.steps).toEqual(['downloadingRepository', 'checkingImage', 'downloadingImage', 'preparing', 'starting']);
     expect(h.progress.details).toEqual([]);
@@ -260,8 +303,10 @@ describe('open: first open', () => {
   it('skips the ownership fix for root', async () => {
     h.helper.remoteUser = 'root';
     await h.service.open(TARGET, options());
-    expect(h.docker.execs.some((e) => e.command.join(' ').includes('chown'))).toBe(false);
+    expect(h.docker.execs.some((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT)).toBe(false);
     expect(h.docker.runs).toEqual([]);
+    // Root gets the ~/.gitconfig too.
+    expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT && e.command[4] === 'root')).toBe(true);
     expect((await h.registry.findByRepository(REPO))?.remoteUser).toBe('root');
   });
 
@@ -347,28 +392,36 @@ describe('open: first open', () => {
 
   it('warns about configurations that depend on the computer and continues', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = {
-      configText: '{ "image": "ubuntu", "mounts": ["source=${localWorkspaceFolder}/data,target=/data,type=bind"] }',
+      configText: '{ "image": "ubuntu", "containerEnv": { "SRC": "${localWorkspaceFolder}/data" } }',
     };
     await h.service.open(TARGET, options());
     expect(h.ui.warnings).toEqual([Messages.computerDependent('${localWorkspaceFolder}')]);
     expect(h.helper.ups).toHaveLength(1);
   });
 
-  it('passes local values of ${localEnv:…} to the helper', async () => {
+  it('passes no value of ${localEnv:…} to the helper, and names the variables in one warning', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = {
-      configText: '{ "image": "ubuntu", "containerEnv": { "A": "${localEnv:FOO}", "B": "${localEnv:MISSING:x}" } }',
+      configText: '{ "image": "ubuntu", "containerEnv": { "A": "${localEnv:FOO}", "B": "${localEnv:MISSING:x}", "C": "${localEnv:FOO}" } }',
     };
     await h.service.open(TARGET, options());
-    expect(h.helper.readConfigurationEnv[0]).toEqual({ FOO: 'local-foo' });
-    expect(h.helper.builds[0].localEnv).toEqual({ FOO: 'local-foo' });
-    expect(h.helper.ups[0].localEnv).toEqual({ FOO: 'local-foo' });
+    expect(h.ui.warnings).toEqual([Messages.localEnvNotPassed('FOO, MISSING')]);
+    // The value of the computer (FOO=local-foo in the harness) reaches no helper run.
+    expect(JSON.stringify([h.helper.builds, h.helper.ups, h.helper.gitPreparations])).not.toContain('local-foo');
+  });
+
+  it('names the variables of ${localEnv:…} that get the values of the workspace helper (for example HOME)', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = {
+      configText: '{ "image": "ubuntu", "containerEnv": { "A": "${localEnv:HOME}/x", "B": "${localEnv:FOO}", "C": "${env:PATH}" } }',
+    };
+    await h.service.open(TARGET, options());
+    expect(h.ui.warnings).toEqual([Messages.localEnvNotPassed('HOME, FOO, PATH', 'HOME, PATH')]);
   });
 
   it('stores shutdownAction none and the additional named volumes', async () => {
     h.helper.config = {
       image: BASE_IMAGE,
       shutdownAction: 'none',
-      mounts: ['source=api-data,target=/data,type=volume', { source: '/host', target: '/x', type: 'bind' }],
+      mounts: ['source=api-data,target=/data,type=volume', { target: '/x', type: 'tmpfs' }],
     };
     await h.service.open(TARGET, options());
     const env = await h.registry.findByRepository(REPO);
@@ -708,7 +761,7 @@ describe('open: existing environment', () => {
       h.ui.filesMissingAnswer = 'cloneAgain';
       h.docker.execHandler = (_c, command) => (command[0] === 'sh' && command[2]?.includes('rev-list') ? { stdout: gitExecOutput('main') } : {});
       await h.service.open(TARGET, options());
-      expect(h.docker.volumes.get(NAME)).toEqual({ [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO });
+      expect(h.docker.volumes.get(NAME)).toEqual({ [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
       expect(h.helper.clones).toEqual([{ volumeName: NAME, repository: REPO, branch: 'main', token: TOKEN }]);
       expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
       expect(h.docker.runs.map((run) => run.image)).toEqual([IMAGE_1]);
@@ -1331,7 +1384,7 @@ describe('open: registry lost', () => {
   const OLD_NAME = resourceName(REPO, OTHER_ID);
 
   beforeEach(() => {
-    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
   });
 
   it('uses the labeled volume of the repository instead of creating a second environment (Docker was stopped)', async () => {
@@ -1354,6 +1407,73 @@ describe('open: registry lost', () => {
     expect(result.environment.id).toBe(OTHER_ID);
     expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
     expect(h.helper.clones).toEqual([]);
+  });
+
+  it('restores the owner from the volume label; its login follows at the open', async () => {
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.owner).toEqual(ACCOUNT);
+  });
+
+  /** A harness whose service claims entries without owner (fakeClaims), with a restored volume without owner. */
+  function withClaims(grant: () => Promise<boolean>): ClaimSpy {
+    const claim = fakeClaims(grant);
+    h = recreate({ claims: { claim } });
+    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    return claim;
+  }
+
+  it('refuses a restored volume of another account without a claim, and creates no second environment', async () => {
+    const claim = withClaims(async () => true);
+    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('otherAccount');
+    expect(error.message).toBe(Messages.otherAccount(REPO));
+    expect(claim).not.toHaveBeenCalled();
+    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
+    expect([...h.docker.volumes.keys()]).toEqual([OLD_NAME]);
+    expect(h.helper.calls).toEqual([]);
+  });
+
+  it('claims a restored volume of an older version (without owner) for the account, and uses it', async () => {
+    const claim = withClaims(async () => true);
+    const result = await h.service.open(TARGET, options());
+    // Start is a command of the user: the claim may ask (EnvironmentClaims, mode interactive).
+    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [OTHER_ID], mode: 'interactive' }));
+    expect(result.environment.id).toBe(OTHER_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
+    expect(h.helper.clones).toEqual([]);
+  });
+
+  it('refuses a restored volume of an older version as not assigned when the claim fails, not as of another account', async () => {
+    let online = false;
+    const claim = withClaims(async () => online);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect(error.code).not.toBe('otherAccount');
+    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
+    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
+    expect([...h.docker.volumes.keys()]).toEqual([OLD_NAME]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
+    expect(h.helper.calls).toEqual([]);
+
+    // Try again (the entry is in the registry now), with GitHub reachable: the open claims it and uses it.
+    online = true;
+    const result = await h.service.open(TARGET, options());
+    expect(claim).toHaveBeenCalledTimes(2);
+    expect(result.environment.id).toBe(OTHER_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect(h.helper.clones).toEqual([]);
+  });
+
+  it('refuses a restored volume of an older version as not assigned without claims', async () => {
+    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
+    expect(h.helper.calls).toEqual([]);
   });
 
   it('creates the environment when only volumes of other repositories exist, and restores those', async () => {
@@ -1820,5 +1940,633 @@ describe('abort while waiting for another operation', () => {
     expect(error.code).toBe('cancelled');
     release();
     await first;
+  });
+});
+
+describe('accounts (concept 7.5, section 9 "Accounts")', () => {
+  it('refuses to open an environment of another account, before it starts Docker or anything else', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT });
+    for (const open of [() => h.service.open(TARGET, options()), () => h.service.openEnvironment(ENV_ID, options())]) {
+      const error = await rejection(open());
+      expect(error.code).toBe('otherAccount');
+      expect(error.message).toBe(Messages.otherAccount(REPO));
+    }
+    expect(h.dockerStarts).toBe(0);
+    expect(h.helper.calls).toEqual([]);
+    expect(await pendingIds()).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+
+  it('hides an entry of an older version without owner until a claim: the open is refused as not assigned', async () => {
+    await seedEnvironment(h, { owner: null });
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).not.toBe('otherAccount');
+    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect((await rejection(h.service.stop(ENV_ID))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect((await rejection(h.service.switchBranch(ENV_ID, 'dev', options()))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect(h.helper.calls).toEqual([]);
+  });
+
+  it('claims an entry of an older version at an open that no claim reached before (a retry, a reopen)', async () => {
+    const claim = fakeClaims(async () => true);
+    h = recreate({ claims: { claim } });
+    await seedEnvironment(h, { owner: null });
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [ENV_ID], mode: 'interactive' }));
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect((await entry())?.owner).toEqual(ACCOUNT);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('claims without a question for an operation that is not interactive, and never for an entry of another account', async () => {
+    const claim = fakeClaims(async () => false);
+    h = recreate({ claims: { claim } });
+    await seedEnvironment(h, { owner: null, container: 'running' });
+    expect((await rejection(h.service.stop(ENV_ID))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
+    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [ENV_ID], mode: 'auto' }));
+    expect(h.docker.log).toEqual([]);
+
+    claim.mockClear();
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      e.owner = OTHER_ACCOUNT;
+    });
+    expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('otherAccount');
+    expect((await rejection(h.service.switchBranch(ENV_ID, 'dev', options()))).code).toBe('otherAccount');
+    expect(claim).not.toHaveBeenCalled();
+  });
+
+  it('asks for a sign-in: without an account, no environment is available', async () => {
+    await seedEnvironment(h);
+    h.token = undefined;
+    expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('signInRequired');
+    expect((await rejection(h.service.stop(ENV_ID))).code).toBe('signInRequired');
+  });
+
+  it('refuses stop, delete, the safety check, a branch switch, and the configuration questions for another account', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: 'running' });
+    const operations: Array<[string, () => Promise<unknown>]> = [
+      ['stop', () => h.service.stop(ENV_ID)],
+      ['delete', () => h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }))],
+      ['safetyCheck', () => h.service.safetyCheck(ENV_ID, options())],
+      ['switchBranch', () => h.service.switchBranch(ENV_ID, 'dev', options())],
+      ['listConfigurations', () => h.service.listConfigurations(ENV_ID, options())],
+      ['configurationChanged', () => h.service.configurationChanged(ENV_ID, options())],
+    ];
+    for (const [name, operation] of operations) {
+      const error = await rejection(operation());
+      expect(`${name}: ${error.code}`).toBe(`${name}: otherAccount`);
+    }
+    expect(h.docker.log).toEqual([]);
+    expect(h.helper.calls).toEqual([]);
+    expect(await entry()).toBeDefined();
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+  });
+
+  it('updates the login of the owner at an open (an owner restored from a label, or a renamed account)', async () => {
+    await seedEnvironment(h, { owner: { id: ACCOUNT.id, login: '' } });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect((await entry())?.owner).toEqual(ACCOUNT);
+  });
+
+  it('refuses when the session changes between the questions for the token and for the account', async () => {
+    const service = recreate({
+      auth: { getToken: vi.fn().mockResolvedValueOnce(TOKEN).mockResolvedValue('gho_other'), getAccount: async () => ACCOUNT },
+    });
+    h = service;
+    await seedEnvironment(h);
+    expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('signInRequired');
+    expect(h.helper.gitPreparations).toEqual([]);
+  });
+});
+
+describe('container-only Git (concept section 9 "Git inside the container")', () => {
+  it('writes the token of the owner at every open, also when the container runs already', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.openEnvironment(ENV_ID, options());
+    h.token = 'gho_new_session';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.gitPreparations.map((call) => call.token)).toEqual([TOKEN, 'gho_new_session']);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('writes it before `up`, once per open, and passes the variables of container-only Git', async () => {
+    await seedEnvironment(h);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call === 'prepareGit' || call.startsWith('up'))).toEqual(['prepareGit', `up ${IMAGE_1}`]);
+    expect(h.helper.ups[0].override).toMatchObject({
+      containerEnv: expect.objectContaining({ GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig', DOCKER_CONFIG: '/workspaces/.devenv+/docker' }),
+      remoteEnv: expect.objectContaining({ GNUPGHOME: '/workspaces/.devenv+/gnupg', SSH_AUTH_SOCK: '' }),
+    });
+    // The token is never part of the override configuration (variables of the container).
+    expect(JSON.stringify(h.helper.ups[0].override)).not.toContain(TOKEN);
+  });
+
+  it('warns and opens the environment when the token cannot be written', async () => {
+    await seedEnvironment(h);
+    h.helper.prepareGitError = new CommandError('prepare Git', 4, '', 'The folder /workspaces/api does not exist.');
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([Messages.gitSetupFailed]);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('takes the identity from the GitHub profile of the account, once per window, with the session as fallback', async () => {
+    const viewer = vi.fn(async () => ({ databaseId: 1001, login: 'octo', name: 'Octo Cat' }));
+    h = recreate({ viewer });
+    await seedEnvironment(h);
+    await h.service.openEnvironment(ENV_ID, options());
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.gitPreparations.map((call) => call.identity)).toEqual([
+      { name: 'Octo Cat', email: '1001+octo@users.noreply.github.com' },
+      { name: 'Octo Cat', email: '1001+octo@users.noreply.github.com' },
+    ]);
+    expect(viewer).toHaveBeenCalledTimes(1);
+
+    h = recreate({ viewer: async () => Promise.reject(new Error('getaddrinfo ENOTFOUND api.github.com')) });
+    await seedEnvironment(h);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.gitPreparations[0].identity).toEqual({ name: 'octo', email: '1001+octo@users.noreply.github.com' });
+  });
+
+  it('asks GitHub for the profile before the image check, not after it, so both time limits run at once', async () => {
+    const events: string[] = [];
+    const viewer = vi.fn(async () => {
+      events.push('viewer');
+      return { databaseId: 1001, login: 'octo', name: 'Octo Cat' };
+    });
+    h = recreate({
+      viewer,
+      imageChecker: {
+        check: async () => {
+          events.push('image check');
+          return checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+        },
+      },
+    });
+    await seedEnvironment(h);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(events).toEqual(['viewer', 'image check']);
+    expect(h.helper.gitPreparations[0].identity.name).toBe('Octo Cat');
+  });
+
+  it('asks a new environment for the profile while the repository is cloned', async () => {
+    const viewer = vi.fn(async () => ({ databaseId: 1001, login: 'octo', name: 'Octo Cat' }));
+    h = recreate({ viewer });
+    h.helper.onClone = () => {
+      expect(viewer).toHaveBeenCalledTimes(1);
+    };
+    await h.service.open(TARGET, options());
+    expect(h.helper.gitPreparations.map((call) => call.identity.name)).toEqual(['Octo Cat']);
+    expect(viewer).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not ask again for 10 minutes after a failed question; the fallback is used meanwhile', async () => {
+    let now = T0;
+    const viewer = vi.fn(async () => Promise.reject(new Error('getaddrinfo ENOTFOUND api.github.com')));
+    h = recreate({ viewer, clock: { now: () => now } });
+    await seedEnvironment(h, { container: 'running' });
+    const fallback = { name: 'octo', email: '1001+octo@users.noreply.github.com' };
+    await h.service.openEnvironment(ENV_ID, options());
+    now += 9 * 60_000;
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(viewer).toHaveBeenCalledTimes(1);
+    expect(h.helper.gitPreparations.map((call) => call.identity)).toEqual([fallback, fallback]);
+
+    now += 2 * 60_000;
+    viewer.mockResolvedValue({ databaseId: 1001, login: 'octo', name: 'Octo Cat' } as never);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(viewer).toHaveBeenCalledTimes(2);
+    expect(h.helper.gitPreparations[2].identity.name).toBe('Octo Cat');
+  });
+
+  it('ends a question that GitHub does not answer after its time limit, with the fallback', async () => {
+    const viewer = vi.fn(() => new Promise<never>(() => undefined));
+    h = recreate({ viewer, viewerTimeoutMs: 20 });
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.gitPreparations[0].identity).toEqual({ name: 'octo', email: '1001+octo@users.noreply.github.com' });
+  });
+
+  it('ends as cancelled when Cancel is pressed while the question for the profile runs, without waiting for GitHub', async () => {
+    const controller = new AbortController();
+    const viewer = vi.fn(() => new Promise<never>(() => undefined));
+    h = recreate({
+      viewer,
+      viewerTimeoutMs: 60_000,
+      imageChecker: {
+        check: async () => {
+          controller.abort();
+          return checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+        },
+      },
+    });
+    await seedEnvironment(h, { container: 'running' });
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options({ signal: controller.signal })));
+    expect(error.code).toBe('cancelled');
+    expect(viewer).toHaveBeenCalledTimes(1);
+    expect(h.helper.gitPreparations).toEqual([]);
+  });
+
+  it.each<[string, 'stopped' | 'running', Record<string, string>]>([
+    ['a stopped container without the label (version 1)', 'stopped', {}],
+    ['a running container without the label', 'running', {}],
+    ['a container of an older version', 'stopped', { 'devenv.container-version': '1' }],
+  ])('creates %s again from the environment image, without a build; the volume stays', async (_name, state, labels) => {
+    await seedEnvironment(h, { container: state, containerLabels: labels });
+    const before = h.docker.containersOf(ENV_ID)[0].id;
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+    const containers = h.docker.containersOf(ENV_ID);
+    expect(containers).toHaveLength(1);
+    expect(containers[0].id).not.toBe(before);
+    expect(containers[0].labels['devenv.container-version']).toBe('2');
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(result.containerName).toBe(NAME);
+    // A new container: the ~/.gitconfig of the remote user before the first attach.
+    expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(true);
+    // The files outside the volume are lost: the progress says so.
+    expect(h.progress.details).toEqual([Messages.containerRecreated]);
+  });
+
+  it('starts a current container as it is', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(false);
+    expect(h.progress.details).not.toContain(Messages.containerRecreated);
+  });
+
+  it('says so when a build replaces an old container, and names only the newer image for an update', async () => {
+    await seedEnvironment(h, { container: 'stopped', containerLabels: {}, image: false });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.progress.details).toEqual([Messages.containerRecreated]);
+
+    h.cleanup();
+    h = createHarness();
+    await seedEnvironment(h, { container: 'stopped', containerLabels: {}, record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.progress.details).toEqual([Messages.newerImage]);
+  });
+
+  describe.each<[string, (harness: Harness) => void]>([
+    ['the configuration cannot be read', (harness) => {
+      harness.helper.readConfigurationError = new DevcontainerCommandError('devcontainer read-configuration', 1, '', 'syntax error');
+    }],
+    ['the branch has no configuration', (harness) => {
+      harness.helper.files = {};
+    }],
+    ['the configuration uses Docker Compose', (harness) => {
+      harness.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: '{ "dockerComposeFile": "compose.yml", "service": "app" }' } };
+    }],
+  ])('an old container while %s', (_name, breakConfiguration) => {
+    const CONFIG = { image: BASE_IMAGE, runArgs: ['--network=host', '--cap-add=SYS_PTRACE'], appPort: [3000] };
+
+    it('is created again without the configuration, and again with it once it can be read', async () => {
+      await seedEnvironment(h, { container: 'stopped', containerLabels: {} });
+      h.helper.config = { ...CONFIG, features: { [FEATURE]: {} }, remoteUser: 'vscode' };
+      const files = h.helper.files;
+      breakConfiguration(h);
+      const original = h.docker.containersOf(ENV_ID)[0].id;
+
+      // The old container is replaced (it forwards the Git credentials of the computer), but the new one is provisional.
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+      const provisional = h.docker.containersOf(ENV_ID)[0];
+      expect(provisional.id).not.toBe(original);
+      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '2', 'devenv.container-config': 'unknown' });
+      expect(h.progress.details).toContain(Messages.containerRecreated);
+
+      // While the configuration stays broken, the provisional container is only started.
+      provisional.state = 'stopped';
+      h.helper.calls.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([provisional.id]);
+
+      // The configuration can be read again: the container gets its runArgs and appPort.
+      h.helper.readConfigurationError = undefined;
+      h.helper.files = files;
+      h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+      h.helper.calls.length = 0;
+      h.progress.details.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+      const last = h.helper.ups[h.helper.ups.length - 1];
+      expect(last.override.runArgs).toEqual(expect.arrayContaining(['--network=host', '--cap-add=SYS_PTRACE']));
+      expect(last.override.runArgs).not.toContain('devenv.container-config=unknown');
+      expect(last.override.appPort).toEqual(['127.0.0.1:3000:3000']);
+      const final = h.docker.containersOf(ENV_ID);
+      expect(final).toHaveLength(1);
+      expect(final[0].id).not.toBe(provisional.id);
+      expect(final[0].labels['devenv.container-config']).toBeUndefined();
+      expect(h.progress.details).toEqual([Messages.containerConfigApplied]);
+      expect(h.helper.builds).toEqual([]);
+
+      // From now on, it is current.
+      final[0].state = 'stopped';
+      h.helper.calls.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    });
+  });
+
+  it('never starts an old container with docker start when the workspace helper is not available', async () => {
+    await seedEnvironment(h, { container: 'stopped', containerLabels: {} });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+
+  it('builds when an old container has no environment image, and refuses to start it offline', async () => {
+    await seedEnvironment(h, { container: 'stopped', containerLabels: {}, image: false });
+    h.checker.outcome = { status: 'unreachable', registries: ['mcr.microsoft.com'] };
+    h.helper.buildError = () => new DevcontainerCommandError('devcontainer build', 1, '', 'failed to resolve source metadata');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+  });
+});
+
+describe('the Git version of a new container (concept section 9 "Git inside the container")', () => {
+  function gitVersion(stdout: string, exitCode = 0): void {
+    h.docker.execHandler = (_container, command) => (command[0] === 'git' && command[1] === '--version' ? { exitCode, stdout } : {});
+  }
+
+  function versionChecks(): Array<{ user?: string; index: number }> {
+    return h.docker.execs
+      .map((exec, index) => ({ exec, index }))
+      .filter(({ exec }) => exec.command[0] === 'git' && exec.command[1] === '--version')
+      .map(({ exec, index }) => ({ user: exec.user, index }));
+  }
+
+  it('warns about Git before 2.9, whose credential requests may reach the computer', async () => {
+    await seedEnvironment(h, { container: null });
+    gitVersion('git version 2.8.6\n');
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([Messages.oldGit('2.8.6')]);
+    // As the remote user, after its ~/.gitconfig was written.
+    const home = h.docker.execs.findIndex((exec) => exec.command[2] === HOME_GIT_CONFIG_SCRIPT);
+    expect(versionChecks()).toEqual([{ user: 'vscode', index: expect.any(Number) }]);
+    expect(versionChecks()[0].index).toBeGreaterThan(home);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('only logs Git 2.9 to 2.31, which reads the configuration of the volume through ~/.gitconfig', async () => {
+    await seedEnvironment(h, { container: null });
+    gitVersion('git version 2.30.2\n');
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.logger.infos.some((line) => line.includes('git version 2.30.2') && line.includes('GIT_CONFIG_GLOBAL'))).toBe(true);
+  });
+
+  it.each<[string, string, number]>([
+    ['a current Git', 'git version 2.39.5\n', 0],
+    ['a container without Git', 'sh: git: not found\n', 127],
+    ['an output that is not known', 'something else\n', 0],
+  ])('says nothing for %s', async (_name, stdout, exitCode) => {
+    await seedEnvironment(h, { container: null });
+    gitVersion(stdout, exitCode);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('does not check a container that exists already', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    gitVersion('git version 2.8.6\n');
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(versionChecks()).toEqual([]);
+    expect(h.ui.warnings).toEqual([]);
+  });
+});
+
+describe('host access policy in the pipeline (concept section 9 "Host access")', () => {
+  it('refuses a first open before any build, and leaves nothing behind', async () => {
+    h.helper.config = { image: BASE_IMAGE, privileged: true, mounts: ['source=/Users/x,target=/x,type=bind'] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess('bind mount /Users/x, privileged mode'));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([]);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  it('names the settings that the policy does not know apart from those that need the computer, with the same code', async () => {
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '--privileged'] };
+    const mixed = await rejection(h.service.open(TARGET, options()));
+    expect(mixed.code).toBe('hostAccess');
+    expect(mixed.message).toBe(Messages.hostAccessAndUnsupported('privileged mode', '--rm'));
+    expect(mixed.detail).toContain('access to the computer: privileged mode');
+    expect(mixed.detail).toContain('not supported: --rm');
+
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm'], build: { options: ['--progress=plain'] } };
+    const unsupported = await rejection(h.service.open(TARGET, options()));
+    expect(unsupported.code).toBe('hostAccess');
+    expect(unsupported.message).toBe(Messages.unsupportedOptions('--rm, build option --progress'));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it.each<[string, string[]]>([
+    ['a --name as the value of --label', ['--label', '--name', '--privileged']],
+    ['a --name as the value of -e', ['-e', '--name', '--privileged']],
+    ['a --name with its value', ['--name', 'mine', '--privileged']],
+    ['a --name before a bind mount', ['--name=mine', '-v/Users/hs:/host']],
+    ['labels around --name and --init', ['--label', '--name', '--init', '--label', '--privileged']],
+    ['a --name of its own', ['--name', 'mine', '--init']],
+  ])('never gives Docker what the policy refuses, for runArgs with %s', async (_name, runArgs) => {
+    await seedEnvironment(h, { container: null });
+    h.helper.config = { image: BASE_IMAGE, runArgs };
+    const error = await h.service.openEnvironment(ENV_ID, options()).then(
+      () => undefined,
+      (caught: unknown) => caught as UserFacingError,
+    );
+    if (error) {
+      expect(error.code).toBe('hostAccess');
+      expect(h.helper.ups).toEqual([]);
+      return;
+    }
+    // What Docker gets passes the policy as a whole: the extension's --label and --name included.
+    const given = h.helper.ups[0].override.runArgs as string[];
+    expect(runArgsProblems(given, NAME)).toEqual([]);
+    expect(given.slice(-2)).toEqual(['--name', NAME]);
+    expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
+  });
+
+  it('refuses a Feature that mounts the Docker socket (merged configuration), before any build', async () => {
+    h.helper.merged = { mounts: [{ source: '/var/run/docker.sock', target: '/var/run/docker-host.sock', type: 'bind' }] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('bind mount /var/run/docker.sock');
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('keeps an existing environment whose configuration is refused, and starts nothing (NFR-07)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--privileged'] };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(await entry()).toBeDefined();
+  });
+
+  it('refuses a rebuild and a configuration selection of a refused configuration', async () => {
+    await seedEnvironment(h);
+    h.helper.config = { image: BASE_IMAGE, initializeCommand: 'docker login' };
+    expect((await rejection(h.service.openEnvironment(ENV_ID, options({ forceRebuild: true })))).code).toBe('hostAccess');
+    expect((await rejection(h.service.openEnvironment(ENV_ID, options({ configPath: DEFAULT_CONFIG_PATH })))).code).toBe('hostAccess');
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('checks the metadata of the environment image before a container is created from it', async () => {
+    // The configuration cannot be read (merged configuration unknown), the image asks for privileged mode.
+    await seedEnvironment(h, { container: null });
+    h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'docker-in-docker', privileged: true }]));
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'offline');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess('privileged mode'));
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  describe('a new image of an update whose metadata needs the computer (concept 7.7)', () => {
+    const SOCKET_MOUNT = { id: 'docker-outside-of-docker', mounts: [{ source: '/var/run/docker.sock', target: '/x', type: 'bind' }] };
+    const REFUSED = Messages.updateRefused('bind mount /var/run/docker.sock');
+    const NEWER_FEATURE = `sha256:${'e'.repeat(64)}`;
+
+    async function refusedUpdate(): Promise<unknown> {
+      return (await entry())?.refusedUpdate;
+    }
+
+    beforeEach(() => {
+      h.helper.buildMetadata = [SOCKET_MOUNT];
+    });
+
+    it('is not used: the old container starts, with a warning, and the refusal is remembered', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      const result = await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds.map((b) => b.imageName)).toEqual([IMAGE_2]);
+      expect(h.helper.ups.map((u) => [u.image, u.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => [c.id, c.state])).toEqual([[before, 'running']]);
+      expect(h.ui.warnings).toEqual([REFUSED]);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+      expect(h.docker.images.has(IMAGE_1)).toBe(true);
+      expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
+      expect((await entry())?.buildRecord?.images).toEqual({ [BASE_IMAGE]: DIGEST_OLD });
+      expect(await refusedUpdate()).toEqual({
+        configPath: DEFAULT_CONFIG_PATH,
+        configHash: configHash(DEFAULT_CONFIG_TEXT),
+        images: { [BASE_IMAGE]: DIGEST_NEW },
+        features: { [FEATURE]: FEATURE_DIGEST },
+        items: 'bind mount /var/run/docker.sock',
+      });
+      expect(result.environment.busy).toBeUndefined();
+    });
+
+    it('is not built again for the same digests, until a digest changes', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      await h.service.openEnvironment(ENV_ID, options());
+      h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+
+      // The same update: no pull, no build; the old container starts, and the user learns why again.
+      h.ui.warnings.length = 0;
+      h.docker.log.length = 0;
+      h.progress.steps.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(1);
+      expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([]);
+      expect(h.helper.ups.map((u) => [u.image, u.removeExistingContainer])).toEqual([
+        [IMAGE_1, false],
+        [IMAGE_1, false],
+      ]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
+      expect(h.ui.warnings).toEqual([REFUSED]);
+      expect(h.progress.steps).not.toContain('preparing');
+
+      // A newer Feature: the update is tried again (and refused again).
+      h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: NEWER_FEATURE });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(2);
+      expect(((await refusedUpdate()) as { features: unknown }).features).toEqual({ [FEATURE]: NEWER_FEATURE });
+
+      // The Feature does not need the computer anymore: the update is used, and the refusal is forgotten.
+      h.helper.buildMetadata = [];
+      h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(3);
+      const record = (await entry())?.buildRecord;
+      expect(record?.environmentImage).toBe(environmentImageName(ENV_ID, 4));
+      expect(await refusedUpdate()).toBeUndefined();
+    });
+
+    it('is tried again when the configuration changes', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(await refusedUpdate()).toBeDefined();
+      h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: `${DEFAULT_CONFIG_TEXT}\n` } };
+      h.ui.configurationChangedAnswer = 'rebuildNow';
+      h.helper.buildMetadata = [];
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(2);
+      expect(await refusedUpdate()).toBeUndefined();
+    });
+
+    it('creates a missing container from the old image, whose metadata is checked again', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: null });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups.map((u) => [u.image, u.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.image)).toEqual([IMAGE_1]);
+      expect(h.docker.runs).toEqual([]);
+      expect(h.ui.warnings).toEqual([REFUSED]);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+
+      // The old image needs the computer too: nothing starts.
+      h.docker.containers.clear();
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'dind', privileged: true }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    });
+
+    it('ends the open without an old container or image to fall back to', async () => {
+      await seedEnvironment(h, { container: null, image: false });
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.hostAccess('bind mount /var/run/docker.sock'));
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+      expect(await refusedUpdate()).toBeUndefined();
+    });
+
+    it('falls back the same way after a requested rebuild', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
+      expect(h.helper.builds.map((b) => b.imageName)).toEqual([IMAGE_2]);
+      expect(h.helper.ups.map((u) => [u.image, u.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
+      expect(h.ui.warnings).toEqual([REFUSED]);
+      expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
+    });
+  });
+
+  it('binds published ports to 127.0.0.1 in the override configuration', async () => {
+    h.helper.config = { image: BASE_IMAGE, appPort: [3000, '8080:80'], runArgs: ['-p', '9000:90', '--network', 'host'] };
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups[0].override.appPort).toEqual(['127.0.0.1:3000:3000', '127.0.0.1:8080:80']);
+    expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['-p', '127.0.0.1:9000:90', '--network', 'host']));
   });
 });

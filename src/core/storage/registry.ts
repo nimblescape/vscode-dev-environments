@@ -5,9 +5,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isoTime, silentLogger, sleep, systemClock, type Clock, type Logger } from '../ports';
-import type { BuildRecord, BusyMark, BusyOperation, Environment, GitSummary, RegistryFile } from '../types';
+import type { BuildRecord, BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RefusedUpdate, RegistryFile } from '../types';
 import { writeJsonAtomic } from './atomicJson';
-import { errorCode, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
+import { errorCode, isStorageId, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
 
 /** The registry format that this version reads and writes. */
 export const REGISTRY_VERSION = 1;
@@ -367,6 +367,8 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['shutdownActionNone', (value) => typeof value === 'boolean'],
   ['additionalVolumes', (value) => Array.isArray(value) && value.every(isNonEmptyString)],
   ['lastBuildNumber', isCount],
+  ['owner', isOwner],
+  ['refusedUpdate', isRefusedUpdate],
 ];
 
 /**
@@ -414,6 +416,22 @@ function isBuildRecord(value: unknown): value is BuildRecord {
     isStringRecord(value.images) &&
     isStringRecord(value.features)
   );
+}
+
+function isRefusedUpdate(value: unknown): value is RefusedUpdate {
+  return (
+    isRecord(value) &&
+    isString(value.configPath) &&
+    isString(value.configHash) &&
+    isStringRecord(value.images) &&
+    isStringRecord(value.features) &&
+    isString(value.items)
+  );
+}
+
+/** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */
+function isOwner(value: unknown): value is GitHubAccount {
+  return isRecord(value) && isStorageId(value.id) && isString(value.login);
 }
 
 function isBusyMark(value: unknown): value is BusyMark {

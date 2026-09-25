@@ -3,10 +3,66 @@ import * as crypto from 'crypto';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import type { DevcontainerResult } from '../types';
+import { CONTAINER_CONFIG_UNKNOWN, CONTAINER_VERSION, LABEL_CONTAINER_CONFIG, LABEL_CONTAINER_VERSION } from '../names';
+import type { DevcontainerResult, RefusedUpdate } from '../types';
+
+export type { RefusedUpdate };
 
 /** Configuration path of an environment whose configuration is not known yet (the pipeline falls back to the first one found). */
 export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
+
+/**
+ * True for a container of the current setup: its label devenv.container-version is CONTAINER_VERSION or newer. The
+ * pipeline creates an older container (without the variables of container-only Git, concept section 9) again from its
+ * environment image; the volume stays.
+ * `configKnown`: the configuration of the repository can be read now. Then a container that was created without it
+ * (label devenv.container-config=unknown) is not current either: it lacks the runArgs and appPort of the configuration.
+ * While the configuration cannot be read, such a container is current, so it is only started and not created again at
+ * every open.
+ */
+export function containerIsCurrent(labels: Readonly<Record<string, string>>, configKnown = true): boolean {
+  const text = labels[LABEL_CONTAINER_VERSION];
+  const version = text !== undefined && /^\d{1,6}$/.test(text) ? Number(text) : 0;
+  if (version < CONTAINER_VERSION) return false;
+  return !configKnown || labels[LABEL_CONTAINER_CONFIG] !== CONTAINER_CONFIG_UNKNOWN;
+}
+
+/** The field `refusedUpdate` of a registry entry, when it is valid. */
+export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
+  const value: unknown = (entry as { refusedUpdate?: unknown }).refusedUpdate;
+  if (
+    !isRecord(value) ||
+    typeof value.configPath !== 'string' ||
+    typeof value.configHash !== 'string' ||
+    !isStringRecord(value.images) ||
+    !isStringRecord(value.features) ||
+    typeof value.items !== 'string'
+  ) {
+    return undefined;
+  }
+  return { configPath: value.configPath, configHash: value.configHash, images: value.images, features: value.features, items: value.items };
+}
+
+/** True if `update` is the refused update `refused`: same configuration, same digests (ignoring the case). */
+export function isRefusedUpdate(refused: RefusedUpdate | undefined, update: Omit<RefusedUpdate, 'items'>): boolean {
+  return (
+    refused !== undefined &&
+    refused.configPath === update.configPath &&
+    refused.configHash === update.configHash &&
+    sameDigests(refused.images, update.images) &&
+    sameDigests(refused.features, update.features)
+  );
+}
+
+function sameDigests(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => ownValue(b, key)?.toLowerCase() === a[key].toLowerCase());
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every((item) => typeof item === 'string');
+}
 
 /** Result of the image check of one open pipeline. */
 export type ImageCheckState =

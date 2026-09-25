@@ -6,12 +6,14 @@ import type { ImageInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, helperImageTag, type BaseDigestLookup } from './helperImage';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
+  GIT_FILES_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   READ_FILES_SCRIPT,
@@ -21,6 +23,7 @@ import {
 import {
   DOCKER_SOCKET,
   HELPER_IMAGE_RECHECK_MS,
+  MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
   helperDockerSocket,
   helperRunArgs,
@@ -643,6 +646,43 @@ describe('WorkspaceHelper.switchBranch', () => {
   });
 });
 
+describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the container")', () => {
+  const identity = { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' };
+
+  it('passes the token only on stdin, without the Docker socket and without network', async () => {
+    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity });
+    const run = docker.runs[0];
+    expect(run.options.input).toBe(TOKEN);
+    expect(run.args.some((arg) => arg.includes(TOKEN))).toBe(false);
+    expect(run.args).toContain('--tmpfs');
+    expect(run.args).not.toContain('-e');
+    expect(run.args).not.toContain(`type=bind,source=${DOCKER_SOCKET},target=${DOCKER_SOCKET}`);
+    expect(run.args.join(' ')).not.toContain('devenv-helper-cache');
+    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
+    expect(commandOf(run.args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
+    expect(logger.lines.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('throws a CommandError without the token when the script fails', async () => {
+    docker.handler = () => ({ exitCode: 4, stdout: `echo ${TOKEN}\n`, stderr: `The folder /workspaces/api does not exist. ${TOKEN}\n` });
+    const output: string[] = [];
+    const error = await createHelper()
+      .prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, onOutput: (text) => output.push(text) })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(CommandError);
+    expect((error as CommandError).message).not.toContain(TOKEN);
+    expect((error as CommandError).stdout + (error as CommandError).stderr).not.toContain(TOKEN);
+    expect(output.join('')).not.toContain(TOKEN);
+  });
+
+  it('refuses an empty token before any Docker call', async () => {
+    await expect(createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: '', identity })).rejects.toMatchObject({
+      code: 'signInRequired',
+    });
+    expect(docker.calls).toHaveLength(0);
+  });
+});
+
 describe('WorkspaceHelper file and Git queries', () => {
   it('readConfigFiles returns the files, or undefined for a missing configuration', async () => {
     const helper = createHelper();
@@ -732,10 +772,9 @@ describe('Docker access of the helper runs', () => {
       repository: 'acme/api',
       configPath: '.devcontainer.json',
       environmentId: 'e',
-      localEnv: {},
     });
-    await helper.build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', imageName: 'i:1', localEnv: {} });
-    await helper.up({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', removeExistingContainer: false, localEnv: {} });
+    await helper.build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', imageName: 'i:1' });
+    await helper.up({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', removeExistingContainer: false });
 
     expect(docker.runs).toHaveLength(3);
     for (const run of docker.runs) {
@@ -746,24 +785,23 @@ describe('Docker access of the helper runs', () => {
 });
 
 describe('WorkspaceHelper Dev Container CLI calls', () => {
-  it('readConfiguration returns the configuration object and passes the local variables', async () => {
+  it('readConfiguration returns the configuration and the merged configuration, and passes no variable of the computer', async () => {
     docker.handler = () => ({
-      stdout: '{"configuration":{"image":"node:22","runArgs":["--init"]},"workspace":{}}\n',
+      stdout: '{"configuration":{"image":"node:22","runArgs":["--init"]},"mergedConfiguration":{"privileged":true},"workspace":{}}\n',
       stderr: '[2026] @devcontainers/cli 0.89.0.\n',
     });
     const output: string[] = [];
-    const config = await createHelper().readConfiguration({
+    const result = await createHelper().readConfiguration({
       volumeName: 'vol',
       repository: 'acme/api',
       configPath: '.devcontainer/devcontainer.json',
       environmentId: '3f2a9c1e-5b7d',
-      localEnv: { HOME: '/Users/me' },
       onOutput: (text) => output.push(text),
     });
-    expect(config).toEqual({ image: 'node:22', runArgs: ['--init'] });
+    expect(result).toEqual({ config: { image: 'node:22', runArgs: ['--init'] }, merged: { privileged: true } });
     expect(output.join('')).toContain('@devcontainers/cli');
     const args = docker.runs[0].args;
-    expect(args).toContain('HOME=/Users/me');
+    expect(args).not.toContain('-e');
     expect(commandOf(args)).toEqual([
       'devcontainer',
       'read-configuration',
@@ -773,7 +811,93 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       '/workspaces/api/.devcontainer/devcontainer.json',
       '--id-label',
       'devenv.environment-id=3f2a9c1e-5b7d',
+      '--include-merged-configuration',
     ]);
+  });
+
+  it('readConfiguration reads the configuration again without the merged configuration when that fails (offline, private image)', async () => {
+    docker.handler = (args) =>
+      args.includes('--include-merged-configuration')
+        ? { exitCode: 1, stderr: 'Error fetching image details: getaddrinfo ENOTFOUND ghcr.io\n' }
+        : { stdout: '{"configuration":{"image":"ghcr.io/acme/private:1"}}\n' };
+    const result = await createHelper().readConfiguration({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      configPath: '.devcontainer/devcontainer.json',
+      environmentId: 'e',
+    });
+    expect(result).toEqual({ config: { image: 'ghcr.io/acme/private:1' } });
+    expect(docker.runs).toHaveLength(2);
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('merged configuration'))).toBe(true);
+    // A broken configuration fails also without it.
+    docker.handler = () => ({ exitCode: 1, stderr: 'Dev container config (…) must contain a JSON object literal.\n' });
+    await expect(
+      createHelper().readConfiguration({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', environmentId: 'e' }),
+    ).rejects.toBeInstanceOf(CommandError);
+  });
+
+  describe('readConfiguration on a network that drops packets (the CLI waits for the registries)', () => {
+    /** The run with the merged configuration hangs until its signal aborts; the run without it answers. */
+    function hangingMergedRead(): Promise<void> {
+      return new Promise((started) => {
+        docker.handler = (args, options) => {
+          if (args[0] !== 'run') return {};
+          if (!args.includes('--include-merged-configuration')) return { stdout: '{"configuration":{"image":"node:22"}}\n' };
+          started();
+          return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(abortError())));
+        };
+      });
+    }
+
+    const read = (signal?: AbortSignal) =>
+      createHelper().readConfiguration({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', environmentId: 'e', signal });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('stops the read with the merged configuration after the time limit, removes its container, and reads without it', async () => {
+      const started = hangingMergedRead();
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const result = read();
+      await started;
+      await vi.advanceTimersByTimeAsync(MERGED_CONFIGURATION_TIMEOUT_MS - 1);
+      expect(docker.runs).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(result).resolves.toEqual({ config: { image: 'node:22' } });
+      expect(docker.runs).toHaveLength(2);
+      expect(docker.runs[1].args).not.toContain('--include-merged-configuration');
+      const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
+      expect(name).toMatch(/^devenv-helper-/);
+      expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+      expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('merged configuration') && line.includes('10 seconds'))).toBe(true);
+    });
+
+    it('ends at once on a cancel during the read with the merged configuration', async () => {
+      const started = hangingMergedRead();
+      const controller = new AbortController();
+      const result = read(controller.signal);
+      await started;
+      controller.abort();
+      await expect(result).rejects.toThrow(/cancelled/);
+      expect(docker.runs).toHaveLength(1);
+      const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
+      expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+    });
+
+    it('reads without the merged configuration and without a time limit when the caller does not need it', async () => {
+      docker.handler = () => ({ stdout: '{"configuration":{"image":"node:22"},"mergedConfiguration":{"privileged":true}}\n' });
+      const result = await createHelper().readConfiguration({
+        volumeName: 'vol',
+        repository: 'acme/api',
+        configPath: '.devcontainer.json',
+        environmentId: 'e',
+        merged: false,
+      });
+      expect(result).toEqual({ config: { image: 'node:22' } });
+      expect(docker.runs).toHaveLength(1);
+      expect(docker.runs[0].args).not.toContain('--include-merged-configuration');
+    });
   });
 
   it('build returns the result and sends every other output line to onOutput', async () => {
@@ -787,7 +911,6 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       repository: 'acme/api',
       configPath: '.devcontainer/python/devcontainer.json',
       imageName: 'devenv-3f2a9c1e:2',
-      localEnv: {},
       onOutput: (text) => output.push(text),
     });
     expect(result).toEqual({ outcome: 'success', imageName: ['devenv-3f2a9c1e:2'] });
@@ -825,7 +948,6 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       repository: 'acme/api',
       configPath: '.devcontainer/devcontainer.json',
       imageName: 'i:1',
-      localEnv: {},
       onOutput: (text) => output.push(text),
     });
     expect(output).toEqual(['log 1\n', 'log 2\n']);
@@ -837,7 +959,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       stdout: '{"outcome":"error","message":"Command failed: docker pull x","description":"An error occurred building the container."}\n',
     });
     const error = await createHelper()
-      .build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer/devcontainer.json', imageName: 'i:1', localEnv: {} })
+      .build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer/devcontainer.json', imageName: 'i:1' })
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(DevcontainerCommandError);
     expect((error as DevcontainerCommandError).result?.message).toBe('Command failed: docker pull x');
@@ -847,7 +969,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
   it('build throws DevcontainerCommandError when there is no result', async () => {
     docker.handler = () => ({ exitCode: null, stderr: 'killed' });
     await expect(
-      createHelper().build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer/devcontainer.json', imageName: 'i:1', localEnv: {} }),
+      createHelper().build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer/devcontainer.json', imageName: 'i:1' }),
     ).rejects.toBeInstanceOf(DevcontainerCommandError);
   });
 
@@ -862,12 +984,11 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       override,
       environmentId: '3f2a9c1e-5b7d',
       removeExistingContainer: true,
-      localEnv: { HOME: '/Users/me' },
     });
     expect(result).toMatchObject({ outcome: 'success', containerId: 'c1', remoteWorkspaceFolder: '/workspaces/api' });
     const run = docker.runs[0];
     expect(JSON.parse(run.options.input ?? '')).toEqual(override);
-    expect(run.args).toContain('HOME=/Users/me');
+    expect(run.args).not.toContain('-e');
     expect(commandOf(run.args)).toEqual([
       'sh',
       '-c',
@@ -899,8 +1020,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
         override: {},
         environmentId: 'e',
         removeExistingContainer: false,
-        localEnv: {},
-      }),
+        }),
     ).rejects.toMatchObject({ name: 'DevcontainerCommandError', exitCode: 1 });
   });
 });
@@ -925,7 +1045,6 @@ describe('WorkspaceHelper.up with a failed lifecycle command', () => {
       override: {},
       environmentId: 'e',
       removeExistingContainer: false,
-      localEnv: {},
     });
   }
 

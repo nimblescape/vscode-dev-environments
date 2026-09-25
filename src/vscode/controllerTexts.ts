@@ -21,6 +21,24 @@ export const ControllerTexts = {
   otherWindowNoAnswer: (repository: string) =>
     `The other window of ${repository} did not close its connection. Nothing was changed.`,
   alreadyDeleting: (repository: string) => `The environment of ${repository} is being deleted in another window.`,
+  // Accounts (concept 7.5).
+  /** An environment of another account; D-3: one environment per repository on this computer. */
+  otherAccount: (repository: string) =>
+    `The environment of ${repository} belongs to another GitHub account. Sign in with that account to use it. This computer keeps one environment per repository, so the signed-in account cannot make its own.`,
+  /**
+   * A restored window of an environment of an older version that has no owner yet (Messages.olderEnvironmentNotAssigned
+   * for a command). Not "another account": nobody owns it.
+   */
+  ownerNotConfirmedConnection: (repository: string) =>
+    `The environment of ${repository} was made by an older version of Dev Environments and does not belong to a GitHub account yet. This window closes its connection. Start ${repository} to give the environment to the signed-in account.`,
+  signedOutConnection: (repository: string) =>
+    `Nobody is signed in to GitHub. This window closes its connection to the environment of ${repository}. Sign in with GitHub to use it again.`,
+  /** The window kept its connection after it left an environment that it must not use (for example Cancel on unsaved files). */
+  stillConnected: (repository: string) =>
+    `This window is still connected to the environment of ${repository}, which it must not use. Save your files: the window closes its connection again.`,
+  /** Concept section 9: a container of an older version uses the Git of the computer. */
+  outdatedContainerClosed: (repository: string) =>
+    `The container of ${repository} was made by an older version of Dev Environments and cannot be used. This window closes its connection. Start ${repository} again to make a new container.`,
   noEnvironments: 'There is no environment yet. Start a repository to create one.',
   noRepositories: 'No repository is available. Sign in with GitHub, or refresh the list.',
   branchesUnavailable: 'The branches could not be loaded. Type the name of a branch.',

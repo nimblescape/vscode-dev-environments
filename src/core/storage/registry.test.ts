@@ -98,6 +98,8 @@ describe('EnvironmentRegistry reading', () => {
     const valid = environment(ID_A, 'o/r', {
       gitSummary: { branch: null, uncommittedFiles: 1, unpushedCommits: 2, stashes: 0, recordedAt: 'x' },
       busy: { operation: 'rebuild', since: 'x', pid: 12, windowId: 'w' },
+      owner: { id: '1001', login: 'octo' },
+      refusedUpdate: { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:1', images: { 'node:20': 'sha256:a' }, features: {}, items: 'privileged mode' },
     });
     writeRaw({
       version: 1,
@@ -114,7 +116,12 @@ describe('EnvironmentRegistry reading', () => {
           shutdownActionNone: 'yes',
           additionalVolumes: ['a', 3],
           lastBuildNumber: 1.5,
+          owner: { id: '../1001', login: 'octo' },
+          refusedUpdate: { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:1', images: { 'node:20': 1 }, features: {}, items: 'x' },
         },
+        // An owner restored from a volume label has no login yet; it stays.
+        { ...environment('e7', 'o/d'), owner: { id: '1002', login: '' } },
+        { ...environment('e8', 'o/e'), owner: { login: 'octo' } },
         { ...environment('e4', 'no-slash') },
         { ...environment('e5', 'o/r'), volumeName: '' },
         { ...environment('e6', 'o/r'), containerName: 7 },
@@ -124,7 +131,7 @@ describe('EnvironmentRegistry reading', () => {
       ],
     });
     const list = await new EnvironmentRegistry(paths).list();
-    expect(list.map((entry) => entry.id)).toEqual([ID_A, ID_B, 'e3']);
+    expect(list.map((entry) => entry.id)).toEqual([ID_A, ID_B, 'e3', 'e7', 'e8']);
     expect(list[0]).toEqual(valid);
     expect(list[1]).toEqual({
       id: ID_B,
@@ -136,6 +143,9 @@ describe('EnvironmentRegistry reading', () => {
       lastUsedAt: '1970-01-01T00:00:00.000Z',
     });
     expect(list[2]).toEqual(environment('e3', 'o/c'));
+    expect(list[3].owner).toEqual({ id: '1002', login: '' });
+    // An invalid owner is removed: the entry counts as one of an older version, which only a claim makes available.
+    expect(list[4]).toEqual(environment('e8', 'o/e'));
   });
 
   it('accepts busy marks with an operation of a newer version', async () => {

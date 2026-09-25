@@ -5,14 +5,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
+import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
+import { CONTAINER_VERSION, GITHUB_TOKEN_FILE, LABEL_CONTAINER_VERSION } from '../core/names';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import type { Environment, ExtensionSettings, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
+import { EnvironmentClaims, availableEnvironments } from '../core/ownership';
+import { silentLogger } from '../core/ports';
+import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
 import { Controller, type ControllerDeps } from './controller';
@@ -29,6 +33,9 @@ const OTHER_WINDOW_ID = 'window-2';
 const OTHER_PID = 4242;
 const ENV_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const CONTAINER = 'devenv-acme-api-3f2a9c1e';
+/** The signed-in account; the environments of the tests belong to it unless a test names another owner. */
+const ACCOUNT: GitHubAccount = { id: '1001', login: 'octo' };
+const OTHER_ACCOUNT: GitHubAccount = { id: '2002', login: 'someone' };
 
 const SETTINGS: ExtensionSettings = {
   reopenLastOnStartup: true,
@@ -53,6 +60,7 @@ function environment(overrides: Partial<Environment> = {}): Environment {
     lastUsedAt: iso(NOW - 3_600_000),
     remoteWorkspaceFolder: '/workspaces/api',
     gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW - 3_600_000) },
+    owner: ACCOUNT,
     ...overrides,
   };
 }
@@ -71,6 +79,18 @@ function repositoryInfo(nameWithOwner: string, overrides: Partial<RepositoryInfo
     defaultBranch: 'main',
     configPaths: ['.devcontainer/devcontainer.json'],
     ...overrides,
+  };
+}
+
+/** The container of the environment as `docker.findContainer` gives it; `version` is its label devenv.container-version. */
+function containerInfo(version: string | undefined): ContainerInfo {
+  return {
+    id: 'c0ffee',
+    name: CONTAINER,
+    state: 'running',
+    rawState: 'running',
+    image: 'devenv-acme-api:1',
+    labels: version === undefined ? {} : { [LABEL_CONTAINER_VERSION]: version },
   };
 }
 
@@ -157,7 +177,13 @@ interface Harness {
   disconnectRequests: DisconnectRequests;
   controller: Controller;
   commands: Map<string, (argument?: unknown) => Promise<void>>;
-  docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn>; containerState: ReturnType<typeof vi.fn> };
+  docker: {
+    isInstalled: ReturnType<typeof vi.fn>;
+    isRunning: ReturnType<typeof vi.fn>;
+    containerState: ReturnType<typeof vi.fn>;
+    findContainer: ReturnType<typeof vi.fn>;
+    exec: ReturnType<typeof vi.fn>;
+  };
   service: {
     open: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
     openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
@@ -182,7 +208,14 @@ interface Harness {
     otherActiveWindows: ReturnType<typeof vi.fn<() => Promise<WindowStatus[]>>>;
     setEnvironment: ReturnType<typeof vi.fn>;
   };
-  auth: { getToken: ReturnType<typeof vi.fn>; isSignedIn: ReturnType<typeof vi.fn>; updateContextKey: ReturnType<typeof vi.fn> };
+  auth: {
+    getToken: ReturnType<typeof vi.fn>;
+    getAccount: ReturnType<typeof vi.fn>;
+    getSession: ReturnType<typeof vi.fn>;
+    isSignedIn: ReturnType<typeof vi.fn>;
+    updateContextKey: ReturnType<typeof vi.fn>;
+  };
+  claims: { claim: ReturnType<typeof vi.fn> };
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -201,7 +234,7 @@ interface Harness {
   settings: ExtensionSettings;
 }
 
-function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: number } = {}): Harness {
+function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number; disconnectAnswerMs?: number } = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const clock = { now: () => NOW };
   const paths = new StoragePaths(root);
@@ -215,6 +248,9 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
     isInstalled: vi.fn(() => true),
     isRunning: vi.fn(async () => true),
     containerState: vi.fn(async (_name: string) => 'running'),
+    // A container of the current setup (concept section 9), unless a test gives another label.
+    findContainer: vi.fn(async (_id: string) => containerInfo(String(CONTAINER_VERSION))),
+    exec: vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false })),
   };
   const service: Harness['service'] = {
     open: vi.fn(async () => openResult(environment())),
@@ -242,9 +278,16 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
   };
   const auth = {
     getToken: vi.fn(async () => 'gho_token'),
+    getAccount: vi.fn(async (): Promise<GitHubAccount | undefined> => ACCOUNT),
+    // One session: the token and the account that getToken and getAccount give, unless a test changes it.
+    getSession: vi.fn(async (): Promise<{ token: string; account: GitHubAccount } | undefined> => {
+      const [token, account] = [await auth.getToken(), await auth.getAccount()];
+      return token && account ? { token, account } : undefined;
+    }),
     isSignedIn: vi.fn(async () => true),
     updateContextKey: vi.fn(async () => true),
   };
+  const claims = { claim: vi.fn(async (): Promise<string[]> => []) };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -255,6 +298,7 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
     repositoryInfo: (repository: string) => infos.get(repository.toLowerCase()),
     liveBranch: () => undefined,
     repositoriesForPicker: vi.fn(async () => [...infos.values()]),
+    availableEnvironments: vi.fn(async () => availableEnvironments(await registry.list(), await auth.getAccount())),
     model: () => [],
     trustedOwner: vi.fn(async () => true),
     refreshDiscovery: vi.fn(async () => undefined),
@@ -278,6 +322,7 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
     service,
     discovery,
     auth,
+    claims,
     ui,
     connection,
     coordinator,
@@ -289,6 +334,7 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
     isAlive: (pid: number) => alive.has(pid),
     timing: {
       handOffCheckMs: options.handOffCheckMs ?? 60_000,
+      leaveCheckMs: options.leaveCheckMs ?? 60_000,
       reopenCheckDelayMs: 0,
       disconnectAnswerMs: options.disconnectAnswerMs ?? 60_000,
       busyPollMs: 5,
@@ -330,6 +376,7 @@ function createHarness(options: { handOffCheckMs?: number; disconnectAnswerMs?: 
     connection,
     coordinator,
     auth,
+    claims,
     ui,
     discovery,
     sidebar,
@@ -416,6 +463,16 @@ function cancellableProgress(): { cancel(): void } {
 function warningMessages(): string[] {
   return fakeVscode.window.showWarningMessage.mock.calls.map((call: unknown[]) => String(call[0]));
 }
+
+/** A new harness with other timings. */
+function recreateHarness(options: Parameters<typeof createHarness>[0]): void {
+  h.controller.dispose();
+  fs.rmSync(h.root, { recursive: true, force: true });
+  resetFakeVscode();
+  h = createHarness(options);
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('Controller commands', () => {
   it('registers exactly the commands of package.json', () => {
@@ -1170,6 +1227,55 @@ describe('Window roles', () => {
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
   });
 
+  it('role A: keeps a container of the current version attached when the host access policy refuses the configuration', async () => {
+    // The container passed the policy when it was made; the user can change the configuration in it.
+    const env = environment();
+    await h.registry.add(env);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  for (const [code, message] of [
+    ['hostAccess', Messages.hostAccess('privileged mode')],
+    ['cancelled', PipelineTexts.cancelled],
+    ['helperFailed', Messages.helperFailed],
+  ] as const) {
+    it(`role A: closes the connection to a container of an older version that the failed pipeline did not make again (${code})`, async () => {
+      // Concept section 9: that container uses the Git of the computer; the window must not attach to it.
+      const env = environment();
+      await h.registry.add(env);
+      h.docker.findContainer.mockResolvedValue(containerInfo(code === 'cancelled' ? undefined : '1'));
+      h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError(code, message));
+      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+      await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+      expect(h.docker.findContainer).toHaveBeenCalledWith(ENV_ID);
+      expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
+      expect(h.statusBar.showNotConnected).toHaveBeenCalled();
+      expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+      expect(warningMessages()).toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+      expect(h.service.currentBranch).not.toHaveBeenCalled();
+      // Start from the status bar does not say "already connected" to the old container.
+      await run('start', { environmentId: ENV_ID });
+      expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+    });
+  }
+
+  it('Start: leaves a running container of an older version instead of saying that the window is connected', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.docker.findContainer.mockResolvedValue(containerInfo('1'));
+    await run('start', row('acme/api', env));
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+    // The pipeline does not replace the container under this window; a Start from the empty window makes a new one.
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    expect(h.coordinator.setEnvironment).toHaveBeenLastCalledWith(null);
+    expect(warningMessages()).toEqual([ControllerTexts.outdatedContainerClosed('acme/api')]);
+  });
+
   it('Reconnect: leaves the environment and closes the connection when "Delete environment" removed it', async () => {
     const env = environment();
     await h.registry.add(env);
@@ -1425,5 +1531,413 @@ describe('Connection of this window', () => {
     h.controller.onViewVisible();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.openDownloadPage);
+  });
+});
+
+describe('Accounts (concept 7.5)', () => {
+  it('refuses Start, Stop, Delete, Rebuild, Switch branch, and Select configuration of an environment of another account', async () => {
+    const env = environment({ owner: OTHER_ACCOUNT });
+    await h.registry.add(env);
+    for (const command of ['start', 'stop', 'delete', 'rebuild', 'switchBranch', 'selectConfiguration'] as const) {
+      await run(command, row('acme/api', env));
+    }
+    // A stale row without the environment, and a repository row: the registry names the hidden environment.
+    await run('start', row('acme/api'));
+    // The status bar item Reconnect.
+    await run('start', { environmentId: ENV_ID });
+    expect(warningMessages()).toEqual(Array(8).fill(ControllerTexts.otherAccount('acme/api')));
+    for (const call of Object.values(h.service)) expect(call).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.quickPicks).toEqual([]);
+  });
+
+  it('asks for a sign-in for an environment when nobody is signed in', async () => {
+    await h.registry.add(environment());
+    h.auth.getAccount.mockResolvedValue(undefined);
+    await run('start', row('acme/api', environment()));
+    expect(warningMessages()).toEqual([Messages.signInRequired]);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('claims an environment of an older version when the account can access its repository, then starts it', async () => {
+    await h.registry.add(environment({ owner: undefined }));
+    h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        entry.owner = account;
+      });
+      return options.environmentIds;
+    });
+    await run('start', row('acme/api', environment({ owner: undefined })));
+    expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID] });
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+  });
+
+  it.each<[string, boolean]>([
+    ['Assign', true],
+    ['Not now', false],
+  ])(
+    'asks before Start assigns an environment of an older version of a public repository, and claims it only after %s',
+    async (_answer, assign) => {
+      // A public repository of an organization: GitHub returns it to every account, so only the user can decide.
+      await h.registry.add(environment({ owner: undefined }));
+      const confirm = vi.fn(async () => assign);
+      const claims = new EnvironmentClaims({
+        registry: h.registry,
+        getRepository: async (repository) => ({
+          nameWithOwner: repository,
+          owner: 'acme',
+          name: 'api',
+          url: `https://github.com/${repository}`,
+          isArchived: false,
+          isFork: false,
+          isPrivate: false,
+          viewerPermission: 'WRITE',
+          pushedAt: null,
+          defaultBranch: 'main',
+          configPaths: [],
+        }),
+        confirm,
+        logger: silentLogger,
+      });
+      h.claims.claim.mockImplementation((account: GitHubAccount, token: string, options: object) => claims.claim(account, token, options));
+      await run('start', row('acme/api', environment({ owner: undefined })));
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ id: ENV_ID }), ACCOUNT);
+      expect((await h.registry.get(ENV_ID))?.owner).toEqual(assign ? ACCOUNT : undefined);
+      if (assign) {
+        expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+      } else {
+        expect(h.service.openEnvironment).not.toHaveBeenCalled();
+        expect(warningMessages()).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
+      }
+    },
+  );
+
+  it('keeps an environment of an older version hidden when the claim fails, without calling it one of another account', async () => {
+    // For example without internet access: GitHub cannot confirm the access, and nobody owns the entry.
+    await h.registry.add(environment({ owner: undefined }));
+    await run('start', row('acme/api'));
+    expect(warningMessages()).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
+    expect(warningMessages()).not.toContain(ControllerTexts.otherAccount('acme/api'));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('lists only the environments of the account in the pickers', async () => {
+    await h.registry.add(environment({ owner: OTHER_ACCOUNT }));
+    await run('stop');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.noEnvironments);
+    expect(fakeVscode.window.showQuickPick).not.toHaveBeenCalled();
+    await run('switchEnvironment');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenLastCalledWith(ControllerTexts.noRepositories);
+  });
+
+  it('role A: a restored window of another account runs no pipeline and closes its connection', async () => {
+    const env = environment({ owner: OTHER_ACCOUNT });
+    await h.registry.add(env);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
+    expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
+    expect(h.statusBar.showNotConnected).toHaveBeenCalled();
+  });
+
+  it('role A: without a sign-in, the window closes its connection', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    h.auth.getAccount.mockResolvedValue(undefined);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([ControllerTexts.signedOutConnection('acme/api')]);
+  });
+
+  it('role A: claims the environment of an older version first, then runs the pipeline', async () => {
+    const env = environment({ owner: undefined });
+    await h.registry.add(env);
+    h.claims.claim.mockImplementation(async (account: GitHubAccount) => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        entry.owner = account;
+      });
+      return [ENV_ID];
+    });
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  it('closes the connection at once when the signed-in account changes to one that may not use the environment', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await h.controller.onSessionChanged();
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.coordinator.setEnvironment).toHaveBeenLastCalledWith(null);
+    expect(warningMessages()).toContain(Messages.otherAccountConnection('acme/api'));
+    // The window has no environment anymore: the Session Monitor stops the container after the waiting time.
+    await run('stop');
+    expect(h.service.stop).not.toHaveBeenCalled();
+  });
+
+  it('role B: runs no pending operation of another account, and does not reopen its environment', async () => {
+    await h.registry.add(environment({ owner: OTHER_ACCOUNT }));
+    await h.sessionFiles.writeOperation({
+      environmentId: ENV_ID,
+      operation: 'delete',
+      requestedAt: iso(NOW - 5000),
+      requestedBy: 'old-window',
+      reason: 'manual',
+    });
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.delete).not.toHaveBeenCalled();
+    // The operation stays until it expires (10 minutes), like an operation that no window takes.
+    expect(fs.readdirSync(h.paths.operationsDir)).toEqual([`${ENV_ID}.json`]);
+
+    await h.sessionFiles.removeOperation(ENV_ID);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('closes the connection with a sign-in message when nobody is signed in anymore', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.auth.getAccount.mockResolvedValue(undefined);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.coordinator.setEnvironment).toHaveBeenLastCalledWith(null);
+    expect(warningMessages()).toEqual([ControllerTexts.signedOutConnection('acme/api')]);
+    expect(warningMessages()).not.toContain(Messages.otherAccountConnection('acme/api'));
+  });
+
+  it('takes the token of the owner out of the running container when the account changes, not on a hand-off', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('stop', row('acme/api', env));
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+    expect(h.docker.exec).not.toHaveBeenCalled();
+
+    recreateHarness({});
+    await h.registry.add(env);
+    await connectHere(env);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
+    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+  });
+
+  it('role A: takes the token out of a running container of another account, and asks nothing of a stopped one', async () => {
+    const env = environment({ owner: OTHER_ACCOUNT });
+    await h.registry.add(env);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
+    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+
+    recreateHarness({});
+    await h.registry.add(env);
+    h.docker.containerState.mockResolvedValue('stopped');
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    await pause(20);
+    expect(h.docker.exec).not.toHaveBeenCalled();
+  });
+
+  it('closes the connection again when the window kept it after an account change (Cancel on unsaved files)', async () => {
+    recreateHarness({ leaveCheckMs: 20 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    // This extension host still runs after the close: the window is still attached to the container.
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length >= 2, 'the second close');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.stillConnected('acme/api'), { modal: true });
+    // The token is taken out again with each close.
+    await settle(() => h.docker.exec.mock.calls.length >= 2, 'the second removal of the token');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('role A: closes the connection again when a restored window of another account kept it', async () => {
+    recreateHarness({ leaveCheckMs: 20 });
+    const env = environment({ owner: OTHER_ACCOUNT });
+    await h.registry.add(env);
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length >= 2, 'the second close');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.stillConnected('acme/api'), { modal: true });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('does not close the connection again when the window has left the container, or after dispose', async () => {
+    recreateHarness({ leaveCheckMs: 20 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    // currentContainerName gives no container: the window is not attached anymore.
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    await pause(80);
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+    expect(warningMessages()).not.toContain(ControllerTexts.stillConnected('acme/api'));
+
+    recreateHarness({ leaveCheckMs: 20 });
+    await h.registry.add(env);
+    await connectHere(env);
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    h.controller.dispose();
+    await pause(80);
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('reloads the window instead of closing it again when the owner account signs in again before the check', async () => {
+    recreateHarness({ leaveCheckMs: 100 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    // The user kept the connection, then signed in with the owner account again.
+    h.auth.getAccount.mockResolvedValue(ACCOUNT);
+    await h.controller.onSessionChanged();
+    // The reload runs the open pipeline of role A, which writes the token again.
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    await pause(150);
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+    expect(warningMessages()).not.toContain(ControllerTexts.stillConnected('acme/api'));
+  });
+
+  it('reloads the window at the check when the owner account is signed in again', async () => {
+    recreateHarness({ leaveCheckMs: 100 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    h.auth.getAccount.mockResolvedValue(ACCOUNT);
+    await settle(() => h.connection.open.mock.calls.length === 1, 'the reload');
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not connect when the account changed while the pipeline ran (concept 7.5)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const pipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockImplementationOnce(async (id: string) => {
+      await h.sessionFiles.writePending(id, WINDOW_ID);
+      return pipeline.promise;
+    });
+    const start = run('start', row('acme/api', env));
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    pipeline.resolve(openResult(env));
+    await start;
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    // Without the pending connection file, the Session Monitor stops the container after the waiting time.
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+  });
+
+  it('does not connect a first open when the account changed while the pipeline ran', async () => {
+    const info = repositoryInfo('acme/api');
+    h.sidebar.infos.set('acme/api', info);
+    const pipeline = deferred<OpenResult>();
+    h.service.open.mockImplementationOnce(async () => {
+      await h.registry.add(environment());
+      return pipeline.promise;
+    });
+    const start = run('start', row('acme/api', undefined, info));
+    await settle(() => h.service.open.mock.calls.length === 1, 'the pipeline');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    pipeline.resolve(openResult(environment()));
+    await start;
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+  });
+
+  it('does not connect when nobody is signed in anymore at the end of the pipeline', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const pipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockReturnValueOnce(pipeline.promise);
+    const start = run('start', row('acme/api', env));
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    h.auth.getAccount.mockResolvedValue(undefined);
+    pipeline.resolve(openResult(env));
+    await start;
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.signInRequired, Actions.signIn);
+  });
+
+  it('role B: does not connect after a pending rebuild when the account changed while it ran', async () => {
+    await h.registry.add(environment());
+    await h.sessionFiles.writeOperation({
+      environmentId: ENV_ID,
+      operation: 'rebuild',
+      requestedAt: iso(NOW - 5000),
+      requestedBy: 'old-window',
+      reason: 'manual',
+    });
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    const pipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockReturnValueOnce(pipeline.promise);
+    const tasks = h.controller.runEmptyWindowTasks();
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    pipeline.resolve(openResult(environment()));
+    await tasks;
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+  });
+
+  it('claims nothing when the session changed between the read of the account and the claim', async () => {
+    await h.registry.add(environment({ owner: undefined }));
+    h.auth.getSession.mockResolvedValue({ token: 'gho_other', account: OTHER_ACCOUNT });
+    await run('start', row('acme/api', environment({ owner: undefined })));
+    expect(h.claims.claim).not.toHaveBeenCalled();
+    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
+  });
+
+  it('role A: claims nothing when the session changed, and closes the connection', async () => {
+    const env = environment({ owner: undefined });
+    await h.registry.add(env);
+    h.auth.getSession.mockResolvedValue({ token: 'gho_other', account: OTHER_ACCOUNT });
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.claims.claim).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
+  });
+
+  it('role A: an environment of an older version that GitHub did not confirm closes with a message that says so', async () => {
+    // For example a restored window before the network is up: nobody owns the entry yet.
+    const env = environment({ owner: undefined });
+    await h.registry.add(env);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    // Before the connection of a restored window, no question: only an unambiguous claim.
+    expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'auto', environmentIds: [ENV_ID] });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([ControllerTexts.ownerNotConfirmedConnection('acme/api')]);
   });
 });

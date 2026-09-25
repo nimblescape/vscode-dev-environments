@@ -1,14 +1,22 @@
-// `${localEnv:NAME}` variables of devcontainer.json (implementation notes 7). The Dev Container CLI runs in the
-// workspace helper, so without help it would resolve these variables with the environment of the helper container.
-// The extension finds them in the configuration text and passes the values of this computer to the helper.
+// `${localEnv:NAME}` variables of devcontainer.json (implementation notes 7). The Dev Container CLI runs in the workspace
+// helper, and the extension does not pass the values of this computer to it (concept section 9 "Host access"): the CLI
+// resolves the variables in the helper. A variable that the helper sets itself (HELPER_ENV_NAMES, for example HOME=/root)
+// gets the value of the helper; any other one is empty or gets the default of the expression. The extension finds the
+// variables in the configuration text, to name them in one warning.
 import { stripJsonc } from '../jsonc';
 
 // The CLI treats `${env:NAME}` as an alias of `${localEnv:NAME}`. A default value follows a second colon.
 const VARIABLE = /\$\{(?:localEnv|env):([^:}]+)(?::[^}]*)?\}/g;
 
 /**
+ * Variables that are set in the workspace helper, where the CLI resolves `${localEnv:…}`: HOME (/root), PATH, and
+ * HOSTNAME of Docker, and NODE_VERSION and YARN_VERSION of its base image (node). The pipeline passes no other variable.
+ */
+export const HELPER_ENV_NAMES: readonly string[] = ['HOME', 'PATH', 'HOSTNAME', 'NODE_VERSION', 'YARN_VERSION'];
+
+/**
  * Names of the variables `${localEnv:NAME}` and `${localEnv:NAME:default}` in a configuration text (JSONC), in order,
- * without duplicates. Variables in comments are ignored, so that no value leaves the computer without need.
+ * without duplicates. Variables in comments are ignored.
  */
 export function findLocalEnvNames(text: string): string[] {
   const names: string[] = [];
@@ -20,23 +28,7 @@ export function findLocalEnvNames(text: string): string[] {
   return names;
 }
 
-/**
- * Local values of the variables. Only variables with a value are included: for a missing variable, the CLI uses the
- * default of the expression. On Windows, variable names are not case-sensitive.
- */
-export function localEnvValues(
-  names: string[],
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform = process.platform,
-): Record<string, string> {
-  const values: Record<string, string> = {};
-  for (const name of names) {
-    let value = env[name];
-    if (value === undefined && platform === 'win32') {
-      const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
-      value = key === undefined ? undefined : env[key];
-    }
-    if (value !== undefined) values[name] = value;
-  }
-  return values;
+/** Those of `names` that the workspace helper sets itself (HELPER_ENV_NAMES), in their order. */
+export function helperEnvNames(names: readonly string[]): string[] {
+  return names.filter((name) => HELPER_ENV_NAMES.includes(name));
 }

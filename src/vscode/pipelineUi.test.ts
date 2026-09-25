@@ -33,6 +33,21 @@ describe('VsCodePipelineUi', () => {
     await expect(ui.confirmUntrustedRepository('other/repo')).resolves.toBe(false);
   });
 
+  it('asks before an environment of an older version is assigned to the account (modal): Assign, or Not now', async () => {
+    const { ui } = setup();
+    window.showWarningMessage.mockImplementationOnce(async (_message, _options, assign) => assign);
+    await expect(ui.confirmAssignment('acme/api', 'octo')).resolves.toBe(true);
+    const [message, options, ...items] = window.showWarningMessage.mock.calls[0];
+    expect(message).toBe(Messages.assignOlderEnvironment('acme/api', 'octo'));
+    expect(options).toEqual({ modal: true });
+    expect(items).toEqual([{ title: 'Assign' }, { title: 'Not now', isCloseAffordance: true }]);
+
+    window.showWarningMessage.mockImplementationOnce(async (_message, _options, _assign, notNow) => notNow);
+    await expect(ui.confirmAssignment('acme/api', 'octo')).resolves.toBe(false);
+    window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await expect(ui.confirmAssignment('acme/api', 'octo')).resolves.toBe(false);
+  });
+
   it('asks about a changed configuration: Rebuild now, or Later (also when dismissed)', async () => {
     const { ui } = setup();
     window.showInformationMessage.mockImplementationOnce(async (_message, _options, rebuildNow) => rebuildNow);

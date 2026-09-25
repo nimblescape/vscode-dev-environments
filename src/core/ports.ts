@@ -1,5 +1,6 @@
 // Interfaces through which code in src/core receives what it needs. Code in src/core never imports `vscode`.
 import type { ProgressStep } from './messages';
+import type { GitHubAccount } from './types';
 
 export interface Logger {
   info(message: string): void;
@@ -106,6 +107,11 @@ export interface Credentials {
 export interface GitHubAuth {
   /** Token of the session with the scopes `repo` and `read:org`. `interactive: false` never shows a dialog. */
   getToken(options: { interactive: boolean }): Promise<string | undefined>;
+  /**
+   * The account of the same session as getToken: the GitHub user ID and the login. `undefined` when no session exists
+   * (not signed in). `interactive: false` never shows a dialog.
+   */
+  getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined>;
   /** Credentials for ghcr.io from the session with the additional scope `read:packages`. */
   getPackagesCredentials(options: { interactive: boolean }): Promise<Credentials | undefined>;
 }

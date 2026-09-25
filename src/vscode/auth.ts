@@ -1,8 +1,10 @@
 // GitHub access through the built-in GitHub sign-in of VS Code (concept section 9, NFR-03). VS Code stores the session;
-// the extension never stores or logs the token.
+// the extension never stores the token on the computer and never logs it. It writes the token of an environment's owner
+// account into that environment only (the open pipeline, concept section 9 "Git inside the container").
 import * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
 import type { Credentials, GitHubAuth, Logger } from '../core/ports';
+import type { GitHubAccount } from '../core/types';
 
 export const GITHUB_PROVIDER_ID = 'github';
 /** `repo` lists and clones private repositories; `read:org` reads the organization memberships. */
@@ -41,6 +43,24 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   async getToken(options: { interactive: boolean }): Promise<string | undefined> {
     const session = await this.session(GITHUB_SCOPES, options.interactive);
     return session?.accessToken;
+  }
+
+  /**
+   * The account of the session of getToken (concept 7.5): `session.account.id` (the numeric GitHub user ID) and
+   * `session.account.label` (the login). `undefined` without a session.
+   */
+  async getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined> {
+    const session = await this.session(GITHUB_SCOPES, options.interactive);
+    return session ? { id: session.account.id, login: session.account.label } : undefined;
+  }
+
+  /**
+   * The token and the account of one session. Use it where both must belong together (a claim, concept 7.5): the session
+   * can change between a call of getAccount and a call of getToken. `undefined` without a session.
+   */
+  async getSession(options: { interactive: boolean }): Promise<{ token: string; account: GitHubAccount } | undefined> {
+    const session = await this.session(GITHUB_SCOPES, options.interactive);
+    return session ? { token: session.accessToken, account: { id: session.account.id, login: session.account.label } } : undefined;
   }
 
   /** Credentials for ghcr.io: the session with the additional scope `read:packages`. */

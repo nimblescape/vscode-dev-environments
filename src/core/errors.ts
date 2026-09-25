@@ -14,6 +14,9 @@ export type UserErrorCode =
   | 'filesMissing'
   | 'gitSwitchFailed'
   | 'signInRequired'
+  | 'hostAccess'
+  | 'otherAccount'
+  | 'environmentUnassigned'
   | 'cancelled';
 
 export class UserFacingError extends Error {

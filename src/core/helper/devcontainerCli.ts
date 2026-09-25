@@ -1,7 +1,9 @@
 // Arguments and results of the Dev Container CLI in the workspace helper (implementation notes 8). Pure functions.
 import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
-import { WORKSPACES_ROOT } from '../names';
+import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION, WORKSPACES_ROOT } from '../names';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { loopbackAppPorts, overrideRunArgs, withoutNameArgs } from './hostAccess';
 
 /**
  * Mount point of the cache volume devenv-helper-cache in the helper, passed as `--user-data-folder`.
@@ -10,16 +12,16 @@ import { WORKSPACES_ROOT } from '../names';
  */
 export const HELPER_CACHE_FOLDER = '/devenv-cache';
 
-export function readConfigurationArgs(p: { workspaceFolder: string; configPath: string; idLabel: string }): string[] {
-  return [
-    'read-configuration',
-    '--workspace-folder',
-    p.workspaceFolder,
-    '--config',
-    p.configPath,
-    '--id-label',
-    p.idLabel,
-  ];
+/**
+ * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:
+ * the configuration merged with the metadata of the base image and of the Features (or of the existing container), which
+ * the host access policy checks (concept section 9). Without a container, the CLI reads the base image and the Features
+ * for it (from the registries, if they are not local).
+ */
+export function readConfigurationArgs(p: { workspaceFolder: string; configPath: string; idLabel: string; merged?: boolean }): string[] {
+  const args = ['read-configuration', '--workspace-folder', p.workspaceFolder, '--config', p.configPath, '--id-label', p.idLabel];
+  if (p.merged !== false) args.push('--include-merged-configuration');
+  return args;
 }
 
 export function buildArgs(p: { workspaceFolder: string; configPath: string; imageName: string }): string[] {
@@ -144,26 +146,21 @@ export class DevcontainerCommandError extends CommandError {
   }
 }
 
-/** Removes `--name <value>` and `--name=<value>` from docker run arguments. */
+/**
+ * Removes `--name <value>` and `--name=<value>` from docker run arguments, read as the host access policy and Docker read
+ * them (withoutNameArgs): a `--name` that is the value of another flag stays.
+ */
 export function stripNameArgs(runArgs: readonly string[]): string[] {
-  const result: string[] = [];
-  for (let i = 0; i < runArgs.length; i++) {
-    const arg = runArgs[i];
-    if (arg === '--name') {
-      i++;
-      continue;
-    }
-    if (arg.startsWith('--name=')) continue;
-    result.push(arg);
-  }
-  return result;
+  return withoutNameArgs(runArgs);
 }
 
 /**
  * Override configuration for `up` (implementation notes 8, concept 7.6): only image, workspaceMount, workspaceFolder,
- * runArgs (repository values without any --name, plus `--name <container name>`), appPort (if set), and
- * shutdownAction 'none'. `initializeCommand` (if set) is added too: it is not part of the image metadata, and without
- * it the command of the repository would never run (concept section 5: it runs in the workspace helper).
+ * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
+ * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>` and
+ * `--name <container name>`), appPort (if set, on 127.0.0.1), containerEnv
+ * and remoteEnv (container-only Git, concept section 9), and shutdownAction 'none'. `initializeCommand` is never passed:
+ * the host access policy refuses a configuration with one.
  */
 export function buildOverrideConfig(p: {
   environmentImage: string;
@@ -172,16 +169,24 @@ export function buildOverrideConfig(p: {
   containerName: string;
   runArgs?: string[];
   appPort?: DevcontainerConfig['appPort'];
-  initializeCommand?: DevcontainerConfig['initializeCommand'];
 }): Record<string, unknown> {
   const override: Record<string, unknown> = {
     image: p.environmentImage,
     workspaceMount: `source=${p.volumeName},target=${WORKSPACES_ROOT},type=volume`,
     workspaceFolder: `${WORKSPACES_ROOT}/${p.repositoryName}`,
-    runArgs: [...stripNameArgs(p.runArgs ?? []), '--name', p.containerName],
+    runArgs: [
+      ...overrideRunArgs(p.runArgs),
+      '--label',
+      `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`,
+      '--name',
+      p.containerName,
+    ],
   };
-  if (p.appPort !== undefined) override.appPort = p.appPort;
-  if (p.initializeCommand !== undefined && p.initializeCommand !== null) override.initializeCommand = p.initializeCommand;
+  const appPort = loopbackAppPorts(p.appPort);
+  if (appPort !== undefined) override.appPort = appPort;
+  // Merged over the containerEnv and remoteEnv of the image metadata; these values win.
+  override.containerEnv = containerEnvironment();
+  override.remoteEnv = remoteEnvironment();
   // Assumption (V-4): this value replaces shutdownAction of the image metadata, so the Dev Containers extension never
   // stops the container.
   override.shutdownAction = 'none';

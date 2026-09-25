@@ -28,8 +28,12 @@ export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper
 /** Token for the helper runs. The tests clone only public repositories, so Git never sends it. */
 export const DUMMY_TOKEN = 'dummy-token-of-the-docker-tests';
 
+/** The account of the fake GitHub session; the environments of the tests belong to it. */
+export const TEST_ACCOUNT = { id: '4242', login: 'devenv-test' };
+
 export const fakeAuth: GitHubAuth = {
   getToken: async () => DUMMY_TOKEN,
+  getAccount: async () => TEST_ACCOUNT,
   getPackagesCredentials: async () => undefined,
 };
 

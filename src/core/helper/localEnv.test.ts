@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findLocalEnvNames, localEnvValues } from './localEnv';
+import { HELPER_ENV_NAMES, findLocalEnvNames, helperEnvNames } from './localEnv';
 
 describe('findLocalEnvNames', () => {
   it('finds names with and without default, in order, without duplicates', () => {
@@ -33,17 +33,10 @@ describe('findLocalEnvNames', () => {
   });
 });
 
-describe('localEnvValues', () => {
-  it('returns only defined values, also empty strings', () => {
-    expect(localEnvValues(['HOME', 'MISSING', 'EMPTY'], { HOME: '/Users/me', EMPTY: '' }, 'darwin')).toEqual({
-      HOME: '/Users/me',
-      EMPTY: '',
-    });
-  });
-
-  it('looks names up case-insensitively on Windows only', () => {
-    const env = { Path: 'C:\\Windows', USERPROFILE: 'C:\\Users\\me' };
-    expect(localEnvValues(['PATH', 'userprofile'], env, 'win32')).toEqual({ PATH: 'C:\\Windows', userprofile: 'C:\\Users\\me' });
-    expect(localEnvValues(['PATH', 'userprofile'], env, 'linux')).toEqual({});
+describe('helperEnvNames', () => {
+  it('returns the names that the workspace helper sets itself, in their order', () => {
+    expect(helperEnvNames(['GITHUB_USER', 'PATH', 'HOME', 'USERPROFILE'])).toEqual(['PATH', 'HOME']);
+    expect(helperEnvNames(['GITHUB_USER'])).toEqual([]);
+    expect(HELPER_ENV_NAMES).toContain('HOME');
   });
 });

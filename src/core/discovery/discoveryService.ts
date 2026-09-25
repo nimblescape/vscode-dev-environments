@@ -1,7 +1,8 @@
 // Discovery Service (concept 7.4): finds the repositories with a Dev Container configuration through the GitHub
-// GraphQL API and stores the result in repositories.json. Security (concept section 9): the token is only passed on
-// to the GitHubApi; the stored file contains metadata only.
+// GraphQL API and stores the result in repositories-<account ID>.json, one file per GitHub account (concept 6.2). Security
+// (concept section 9): the token is only passed on to the GitHubApi; the stored file contains metadata only.
 import { readJson, writeJsonAtomic } from '../storage/atomicJson';
+import type { GitHubViewer } from '../helper/containerGit';
 import { splitRepository } from '../names';
 import { isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
 import type { DiscoveryData, ExtensionSettings, OrganizationHint, OrganizationHintKind, RepositoryInfo } from '../types';
@@ -55,6 +56,7 @@ const REPOSITORY_FIELDS_FRAGMENT = `fragment RepositoryFields on Repository {
   isArchived
   isFork
   isPrivate
+  viewerPermission
   pushedAt
   owner {
     login
@@ -81,6 +83,7 @@ const REPOSITORY_FIELDS_FRAGMENT = `fragment RepositoryFields on Repository {
 export const DISCOVERY_QUERY = `query Discover($cursor: String, $pageSize: Int!, $withOrganizations: Boolean!) {
   viewer {
     login
+    databaseId
     organizations(first: ${ORGANIZATIONS_PAGE_SIZE}) @include(if: $withOrganizations) {
       pageInfo {
         hasNextPage
@@ -122,6 +125,15 @@ export const ORGANIZATIONS_QUERY = `query Organizations($cursor: String) {
         login
       }
     }
+  }
+}`;
+
+/** The signed-in account: its user ID, login, and profile name (the Git identity of the container, concept section 9). */
+export const VIEWER_QUERY = `query Viewer {
+  viewer {
+    databaseId
+    login
+    name
   }
 }`;
 
@@ -195,6 +207,7 @@ interface RepositoryNode extends ConfigurationNode {
   isArchived?: boolean;
   isFork?: boolean;
   isPrivate?: boolean;
+  viewerPermission?: string | null;
   pushedAt?: string | null;
   owner?: LoginNode | null;
   defaultBranchRef?: { name?: string } | null;
@@ -202,6 +215,7 @@ interface RepositoryNode extends ConfigurationNode {
 
 interface ViewerNode {
   login?: string;
+  databaseId?: number | null;
   organizations?: Connection<LoginNode> | null;
   repositories?: Connection<RepositoryNode> | null;
 }
@@ -215,6 +229,10 @@ type PageViewer = ViewerNode & { login: string; repositories: Connection<Reposit
 
 function isPageViewer(viewer: ViewerNode | null | undefined): viewer is PageViewer {
   return isRecord(viewer) && typeof viewer.login === 'string' && viewer.login !== '' && isRecord(viewer.repositories);
+}
+
+interface ViewerData {
+  viewer?: { databaseId?: number | null; login?: string; name?: string | null } | null;
 }
 
 interface OrganizationsData {
@@ -245,24 +263,29 @@ interface CollectedError {
 export class DiscoveryService {
   constructor(
     private readonly api: GitHubApi,
-    private readonly filePath: string,
+    /** The file of the stored list of an account (StoragePaths.repositoriesFile). */
+    private readonly fileOf: (accountId: string) => string,
     private readonly logger: Logger = silentLogger,
     private readonly clock: Clock = systemClock,
   ) {}
 
-  /** The stored result of the last discovery. `undefined` if there is none or if the file is not valid. */
-  async loadStored(): Promise<DiscoveryData | undefined> {
-    return parseDiscoveryData(await readJson<unknown>(this.filePath));
+  /**
+   * The stored result of the last discovery of the account `accountId`. `undefined` if there is none or if the file is
+   * not valid. The list of another account is never read.
+   */
+  async loadStored(accountId: string): Promise<DiscoveryData | undefined> {
+    return parseDiscoveryData(await readJson<unknown>(this.fileOf(accountId)));
   }
 
   /**
-   * Full discovery: all pages with up to 50 repositories each, in the order of the API (last push first). Keeps only
-   * repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth app access
-   * restrictions become one hint per organization. Partial data with errors is used. Stores the result atomically and
-   * returns it. Throws on a network failure, an HTTP error, or when GitHub does not return the list; the stored file
-   * then stays unchanged.
+   * Full discovery for the account `accountId` with its token: all pages with up to 50 repositories each, in the order of
+   * the API (last push first). Keeps only repositories with at least one configuration. Errors for organizations with
+   * SAML single sign-on or OAuth app access restrictions become one hint per organization. Partial data with errors is
+   * used. Stores the result atomically in the file of the account and returns it. Throws on a network failure, an HTTP
+   * error, when GitHub does not return the list, or when the token belongs to another account (a sign-in changed the
+   * session meanwhile); the stored file then stays unchanged.
    */
-  async refresh(token: string, signal?: AbortSignal): Promise<DiscoveryData> {
+  async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
     const repositories: RepositoryInfo[] = [];
     const seen = new Set<string>();
     const errors: CollectedError[] = [];
@@ -285,6 +308,10 @@ export class DiscoveryService {
       if (pages === 1) {
         viewerLogin = page.viewer.login;
         organizationsConnection = page.viewer.organizations;
+        const viewerId = page.viewer.databaseId;
+        if (typeof viewerId === 'number' && String(viewerId) !== accountId) {
+          throw new Error('The GitHub session changed while the repository list was loaded.');
+        }
       }
       for (const error of page.errors) errors.push({ error, data: page.data });
 
@@ -332,12 +359,22 @@ export class DiscoveryService {
         (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization.` : '.'),
     );
     try {
-      await writeJsonAtomic(this.filePath, result);
+      await writeJsonAtomic(this.fileOf(accountId), result);
     } catch (error) {
       // The list is still valid for this session; the next refresh stores it again.
       this.logger.error('Repository list: the list could not be stored.', error);
     }
     return result;
+  }
+
+  /** The account of the token: user ID, login, and profile name. Throws when GitHub does not return it. */
+  async viewer(token: string, signal?: AbortSignal): Promise<GitHubViewer> {
+    const result = await this.api.graphql<ViewerData>(VIEWER_QUERY, {}, token, signal);
+    const viewer = result.data?.viewer;
+    if (!isRecord(viewer) || typeof viewer.databaseId !== 'number' || typeof viewer.login !== 'string' || viewer.login === '') {
+      throw new Error(`GitHub did not return the account: ${describeGraphQLErrors(result.errors)}`);
+    }
+    return { databaseId: viewer.databaseId, login: viewer.login, name: typeof viewer.name === 'string' ? viewer.name : null };
   }
 
   /** Branch names (refs/heads, up to 100, alphabetical), the default branch first. */
@@ -385,11 +422,26 @@ export class DiscoveryService {
    * One repository, for repositories that are not in the stored list (for example environments that only the registry
    * knows). `undefined` if GitHub does not return it (not found, or no access). The result can have no configuration.
    * Throws when the query failed (for example a rate limit or a timeout), because the answer is then unknown.
+   * `quiet` (for repositories that may belong to another account, concept 7.5): nothing is logged, and an error message
+   * names neither the repository nor quotes GitHub, whose messages can contain the name.
    */
-  async getRepository(repository: string, token: string, signal?: AbortSignal): Promise<RepositoryInfo | undefined> {
-    const { owner, name } = splitRepository(repository);
+  async getRepository(
+    repository: string,
+    token: string,
+    signal?: AbortSignal,
+    options: { quiet?: boolean } = {},
+  ): Promise<RepositoryInfo | undefined> {
+    const quiet = options.quiet === true;
+    let owner: string;
+    let name: string;
+    try {
+      ({ owner, name } = splitRepository(repository));
+    } catch (error) {
+      if (quiet) throw new Error('Invalid repository name.');
+      throw error;
+    }
     const result = await this.api.graphql<RepositoryData>(REPOSITORY_QUERY, { owner, name }, token, signal);
-    if (result.errors) this.logger.info(`Repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
+    if (result.errors && !quiet) this.logger.info(`Repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
     const node = result.data?.repository;
     if (isRecord(node)) return toRepositoryInfo(node);
     const notFoundOrNoAccess =
@@ -397,6 +449,7 @@ export class DiscoveryService {
       node === null &&
       (result.errors ?? []).every((error) => error.type === 'NOT_FOUND' || classifyGraphQLError(error) !== undefined);
     if (notFoundOrNoAccess) return undefined;
+    if (quiet) throw new Error(`GitHub did not answer the query for a repository (${graphQLErrorKinds(result.errors)}).`);
     throw new Error(`GitHub did not answer the query for the repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
   }
 
@@ -707,6 +760,12 @@ function isRetryableError(error: unknown): boolean {
   return error instanceof GitHubApiError && (error.status === 502 || error.status === 503 || error.status === 504);
 }
 
+/** The kinds of GraphQL errors, without their messages (which can name a repository), for example `RATE_LIMITED, timeout`. */
+function graphQLErrorKinds(errors: GraphQLError[] | undefined): string {
+  const kinds = new Set((errors ?? []).map((error) => error.type ?? (TIMEOUT_PATTERN.test(error.message) ? 'timeout' : 'error')));
+  return kinds.size > 0 ? [...kinds].join(', ') : 'no details';
+}
+
 /** GitHub answers a query that takes too long with an error "Something went wrong … This may be the result of a timeout". */
 function isTimeoutResponse(errors: GraphQLError[] | undefined): boolean {
   if (!errors || errors.length === 0) return false;
@@ -733,6 +792,9 @@ function toRepositoryInfo(node: RepositoryNode): RepositoryInfo | undefined {
     isArchived: node.isArchived === true,
     isFork: node.isFork === true,
     isPrivate: node.isPrivate === true,
+    ...(typeof node.viewerPermission === 'string' && node.viewerPermission !== ''
+      ? { viewerPermission: node.viewerPermission }
+      : {}),
     pushedAt: typeof node.pushedAt === 'string' ? node.pushedAt : null,
     defaultBranch: typeof defaultBranch === 'string' && defaultBranch !== '' ? defaultBranch : null,
     configPaths: detectConfigurations(node),
@@ -759,6 +821,8 @@ function isRepositoryInfo(value: unknown): value is RepositoryInfo {
     typeof value.isArchived === 'boolean' &&
     typeof value.isFork === 'boolean' &&
     typeof value.isPrivate === 'boolean' &&
+    // Lists of older versions have no permission.
+    (value.viewerPermission === undefined || typeof value.viewerPermission === 'string') &&
     (value.pushedAt === null || typeof value.pushedAt === 'string') &&
     (value.defaultBranch === null || typeof value.defaultBranch === 'string') &&
     isStringArray(value.configPaths) &&
@@ -777,7 +841,7 @@ function isOrganizationHint(value: unknown): value is OrganizationHint {
   );
 }
 
-/** Checks the content of repositories.json. Invalid entries are dropped; an invalid file gives `undefined`. */
+/** Checks the content of repositories-<account ID>.json. Invalid entries are dropped; an invalid file gives `undefined`. */
 export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
   if (!isRecord(value) || value.version !== 1) return undefined;
   if (typeof value.fetchedAt !== 'string' || typeof value.viewerLogin !== 'string') return undefined;

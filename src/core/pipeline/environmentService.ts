@@ -8,12 +8,15 @@ import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
 import { additionalNamedVolumes, checkConfiguration } from '../helper/configChecks';
+import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
-import { findLocalEnvNames, localEnvValues } from '../helper/localEnv';
+import { hostAccessReport, type HostAccessReport } from '../helper/hostAccess';
+import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   collectReferences,
   compareWithBuildRecord,
+  type CheckedOutcome,
   type CheckOutcome,
   type ConfigReferences,
   type ImageChecker,
@@ -21,8 +24,12 @@ import {
 import { registryDisplayName } from '../imageCheck/reference';
 import { Messages, Steps, type ProgressStep } from '../messages';
 import {
+  CONFIG_FOLDER,
+  CONTAINER_CONFIG_UNKNOWN,
+  LABEL_CONTAINER_CONFIG,
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
+  LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   WORKSPACES_ROOT,
   configurationName,
@@ -33,6 +40,7 @@ import {
   resourceName,
   splitRepository,
 } from '../names';
+import { isAvailableTo, ownerOf, type EnvironmentClaims } from '../ownership';
 import {
   abortError,
   isAbortError,
@@ -57,18 +65,22 @@ import type {
   DevcontainerResult,
   Environment,
   ExtensionSettings,
+  GitHubAccount,
   GitSummary,
+  RefusedUpdate,
   WindowStatus,
 } from '../types';
 import {
   DEFAULT_CONFIG_PATH,
   baseImageKey,
   configHash,
+  containerIsCurrent,
   digestReference,
   errorDetail,
   imageRemoteUser,
   imagesToPull,
   isNetworkFailure,
+  isRefusedUpdate,
   isRepositoryName,
   isRootUser,
   lifecycleHookFailure,
@@ -77,6 +89,7 @@ import {
   nextBuildNumber,
   nonEmptyString,
   recordDigests,
+  refusedUpdateOf,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
@@ -137,6 +150,7 @@ export type EnvironmentHelper = Pick<
   | 'up'
   | 'gitSummary'
   | 'switchBranch'
+  | 'prepareGit'
 >;
 
 /** The part of EnvironmentRegistry that the service uses. */
@@ -162,7 +176,21 @@ export interface EnvironmentServiceDeps {
   registry: EnvironmentStore;
   sessionFiles: EnvironmentSessionFiles;
   imageChecker: Pick<ImageChecker, 'check'>;
-  auth: Pick<GitHubAuth, 'getToken'>;
+  auth: Pick<GitHubAuth, 'getToken' | 'getAccount'>;
+  /**
+   * The GitHub account of a token (DiscoveryService.viewer), for the Git identity of a new environment (concept section 9).
+   * Without it, or when GitHub does not answer in time, the identity comes from the account of the session.
+   */
+  viewer?: (token: string, signal?: AbortSignal) => Promise<GitHubViewer>;
+  /** Time limit of `viewer`. Default 5 s. */
+  viewerTimeoutMs?: number;
+  /**
+   * Claims of entries without owner (concept 7.5). An open of an entry of an older version, for example one restored from
+   * its volume during a first open, claims it for the signed-in account first. Without it, such an entry is refused.
+   * An open is a command of the user (a restored window runs the pipeline only for an entry that the controller checked
+   * before), so its claim is `interactive`.
+   */
+  claims?: Pick<EnvironmentClaims, 'claim'>;
   ui: PipelineUi;
   logger: Logger;
   clock: Clock;
@@ -260,7 +288,6 @@ interface LoadedConfiguration {
   configHash: string;
   config: DevcontainerConfig;
   dockerfileText?: string;
-  localEnv: Record<string, string>;
   references: ConfigReferences;
 }
 
@@ -283,6 +310,21 @@ interface PipelineContext {
   busy: boolean;
   /** The workspace helper image could not be prepared (for example offline after an extension update). */
   helperUnavailable: boolean;
+  /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
+  session: GitHubSession;
+  /** The token and the Git configuration were written into the volume in this run. */
+  gitPrepared: boolean;
+  /**
+   * The Git identity of the account (identityOf), asked for as soon as the session is known, so the question to GitHub
+   * runs while Docker starts and the image check runs. Never rejects.
+   */
+  identity: Promise<GitIdentity>;
+}
+
+/** A token together with the account of its session. */
+interface GitHubSession {
+  token: string;
+  account: GitHubAccount;
 }
 
 /** What steps 8 and 9 did with the container. */
@@ -305,6 +347,8 @@ interface UpdatePlan {
 /** Reports each progress step once, and logs it. */
 class StepReporter {
   private current: ProgressStep | undefined;
+  /** The detail shown with the current step (a new step removes it). */
+  private shownDetail: string | undefined;
 
   constructor(
     private readonly progress: ProgressReporter,
@@ -314,16 +358,21 @@ class StepReporter {
   step(step: ProgressStep): void {
     if (step === this.current) return;
     this.current = step;
+    this.shownDetail = undefined;
     this.logger.info(`Step: ${Steps[step]}`);
     this.progress.step(step);
   }
 
+  /** Shows `message` with the current step, once while it is shown. */
   detail(message: string): void {
+    if (message === this.shownDetail) return;
+    this.shownDetail = message;
     this.progress.detail(message);
   }
 
   /** Removes the detail of the current step (an empty detail is not shown). */
   clearDetail(): void {
+    this.shownDetail = undefined;
     this.progress.detail('');
   }
 }
@@ -364,8 +413,78 @@ function repositoryKey(repository: string): string {
 }
 
 function volumeLabels(environment: Environment): Record<string, string> {
-  return { [LABEL_ENVIRONMENT_ID]: environment.id, [LABEL_REPOSITORY]: environment.repository };
+  const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environment.id, [LABEL_REPOSITORY]: environment.repository };
+  // The owner comes back with the entry when the registry is lost (concept 7.5).
+  if (environment.owner) labels[LABEL_OWNER_ID] = environment.owner.id;
+  return labels;
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isHostAccess(error: unknown): boolean {
+  return isUserFacingError(error) && error.code === 'hostAccess';
+}
+
+function otherAccount(repository: string): UserFacingError {
+  return new UserFacingError('otherAccount', Messages.otherAccount(repository));
+}
+
+/**
+ * An entry of an older version without owner that could not be claimed (GitHub did not confirm the access of the
+ * account, for example without a connection). It belongs to no account yet, so the text of otherAccount would be wrong.
+ */
+function environmentUnassigned(repository: string): UserFacingError {
+  return new UserFacingError(
+    'environmentUnassigned',
+    Messages.olderEnvironmentNotAssigned(repository),
+    'The environment has no owner, and the claim for the signed-in account did not succeed.',
+  );
+}
+
+/** True if the host access policy refuses something of `report`. */
+function isRefused(report: HostAccessReport): boolean {
+  return report.hostAccess.length > 0 || report.unsupported.length > 0;
+}
+
+/** Both lists of a report, for the log. */
+function describeRefusal(report: HostAccessReport): string {
+  return [
+    report.hostAccess.length > 0 ? `access to the computer: ${report.hostAccess.join('; ')}` : undefined,
+    report.unsupported.length > 0 ? `not supported: ${report.unsupported.join('; ')}` : undefined,
+  ]
+    .filter((part) => part !== undefined)
+    .join(' / ');
+}
+
+/**
+ * The message of a refusal (concept section 9 "Host access"): the settings that need access to the computer
+ * (Messages.hostAccess), the settings that the policy does not know (Messages.unsupportedOptions), or both.
+ */
+function refusalMessage(report: HostAccessReport): string {
+  const access = report.hostAccess.join(', ');
+  const unsupported = report.unsupported.join(', ');
+  if (access === '') return Messages.unsupportedOptions(unsupported);
+  if (unsupported === '') return Messages.hostAccess(access);
+  return Messages.hostAccessAndUnsupported(access, unsupported);
+}
+
+/** UserFacingError('hostAccess') with what the configuration or the image needs, and what the policy does not know. */
+class HostAccessError extends UserFacingError {
+  /** All refused settings, for the message of a refused update (Messages.updateRefused). */
+  readonly items: readonly string[];
+
+  constructor(readonly report: HostAccessReport) {
+    super('hostAccess', refusalMessage(report), `Refused by the host access policy: ${describeRefusal(report)}`);
+    this.items = [...report.hostAccess, ...report.unsupported];
+  }
+}
+
+/** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
+const VIEWER_TIMEOUT_MS = 5_000;
+/** After a failed question for the profile, the fallback identity is used this long before GitHub is asked again. */
+const IDENTITY_RETRY_MS = 10 * 60_000;
 
 /** `process.kill(pid, 0)`: EPERM (a process of another user) counts as alive. */
 function processExists(pid: number): boolean {
@@ -389,16 +508,16 @@ function defaultDockerStarter(deps: EnvironmentServiceDeps): DockerStarter {
 }
 
 /** Waits for `promise`; rejects with an AbortError when `signal` aborts first. */
-function waitUnlessAborted(promise: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
-  if (!signal) return promise.then(() => undefined);
+function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortError());
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<T>((resolve, reject) => {
     const onAbort = (): void => reject(abortError());
     signal.addEventListener('abort', onAbort, { once: true });
     promise.then(
-      () => {
+      (value) => {
         signal.removeEventListener('abort', onAbort);
-        resolve();
+        resolve(value);
       },
       (error: unknown) => {
         signal.removeEventListener('abort', onAbort);
@@ -415,6 +534,11 @@ function waitUnlessAborted(promise: Promise<unknown>, signal: AbortSignal | unde
  */
 export class EnvironmentService {
   private readonly queues = new Map<string, Promise<void>>();
+  /**
+   * Git identity per account ID (identityOf): the question to GitHub, shared by the opens of this window. After a failed
+   * question, `retryAfter` is the time from which GitHub is asked again.
+   */
+  private readonly identities = new Map<string, { identity: Promise<GitIdentity>; retryAfter?: number }>();
   private readonly startDockerFn: DockerStarter;
   private readonly isAlive: (pid: number) => boolean;
   private readonly busyWaitMs: number;
@@ -480,7 +604,9 @@ export class EnvironmentService {
       this.logger.info(`The first open of ${target.repository} was not confirmed.`);
       throw cancelledError();
     }
-    const token = await this.requireToken();
+    const session = await this.requireSession();
+    // Asked now, so the question to GitHub runs while Docker starts and the repository is cloned.
+    const identity = this.identityOf(session);
     await this.startDocker(steps, signal);
     // Concept 7.5 "registry lost", D-3: a labeled volume of this repository that the registry lacks holds the work of the
     // user. It becomes the environment again; a second environment would hide it. Docker runs now, so the volumes are
@@ -508,6 +634,8 @@ export class EnvironmentService {
       createdAt: now,
       lastUsedAt: now,
       busy: this.busyMark('create'),
+      // The environment belongs to the account that creates it (concept 7.5, section 9 "Accounts").
+      owner: ownerOf(session.account),
     };
     try {
       await this.deps.registry.add(environment);
@@ -532,12 +660,15 @@ export class EnvironmentService {
       ownershipPrepared: false,
       busy: true,
       helperUnavailable: false,
+      session,
+      gitPrepared: false,
+      identity,
     };
     try {
       steps.step('downloadingRepository');
       await this.deps.docker.createVolume(name, volumeLabels(environment));
       await this.prepareHelper(ctx);
-      await this.clone(ctx, token, options.branch ?? target.defaultBranch ?? undefined);
+      await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
       return await this.runPipeline(ctx);
     } catch (error) {
       await this.removeFailedFirstOpen(ctx.env);
@@ -551,15 +682,20 @@ export class EnvironmentService {
   private async openExisting(environment: Environment, options: OpenOptions, defaultBranch: string | undefined): Promise<OpenResult> {
     const { signal } = options;
     const steps = new StepReporter(options.progress, this.logger);
+    // Concept 7.5: only the owner account opens an environment; each open writes its token into the environment.
+    const session = await this.requireSession();
+    const owned = await this.requireOwner(environment, session, signal);
+    // Asked now, so the question to GitHub runs while Docker starts and the image check runs (NFR-08).
+    const identity = this.identityOf(session);
     // The Session Monitor must not stop a running container while the pipeline runs (concept 7.9). The file is written
     // again while the pipeline runs, because it counts only for 2 minutes and not every step holds a busy mark.
-    await this.deps.sessionFiles.writePending(environment.id, this.deps.owner.windowId);
-    const stopRefresh = this.keepPendingFresh(environment.id);
+    await this.deps.sessionFiles.writePending(owned.id, this.deps.owner.windowId);
+    const stopRefresh = this.keepPendingFresh(owned.id);
     let ctx: PipelineContext | undefined;
     let succeeded = false;
     try {
       await this.startDocker(steps, signal);
-      const env = await this.waitForOtherOperation(environment, signal);
+      const env = await this.waitForOtherOperation(owned, signal);
       let forced = options.forceRebuild === true;
       let configPath = env.configPath;
       if (options.configPath !== undefined) {
@@ -581,6 +717,9 @@ export class EnvironmentService {
         ownershipPrepared: false,
         busy: false,
         helperUnavailable: false,
+        session,
+        gitPrepared: false,
+        identity,
       };
       if (!(await this.deps.docker.volumeExists(env.volumeName))) {
         await this.recoverMissingFiles(ctx, defaultBranch, options.progress);
@@ -594,9 +733,66 @@ export class EnvironmentService {
       await stopRefresh();
       if (ctx) await this.releaseBusy(ctx);
       if (!succeeded) {
-        await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(environment.id));
+        await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(owned.id));
       }
     }
+  }
+
+  /**
+   * Refuses an environment of another account (concept 7.5): UserFacingError('otherAccount'). An entry of an older version
+   * without owner is claimed for the account of `session` first (for example one that a first open restored from its
+   * volume, which the caller could not claim before); when the claim does not succeed, it is refused as not assigned.
+   * Returns the registry entry; the login of the owner is updated when the account has another one now (a rename on
+   * GitHub, or an owner restored from a volume label).
+   */
+  private async requireOwner(environment: Environment, session: GitHubSession, signal: AbortSignal | undefined): Promise<Environment> {
+    const { account } = session;
+    const current = await this.availableEntry(environment, account, { token: session.token, interactive: true, signal });
+    if (current.owner?.login === account.login) return current;
+    const updated = await this.deps.registry.updateEnvironment(current.id, (entry) => {
+      if (entry.owner?.id === account.id) entry.owner = ownerOf(account);
+    });
+    return updated ?? current;
+  }
+
+  /** The signed-in account, without a dialog; refuses an environment of another account (concept 7.5). */
+  private async requireOwnAccount(environment: Environment, interactive: boolean): Promise<void> {
+    const account = await this.deps.auth.getAccount({ interactive });
+    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    if (isAvailableTo(environment, account)) return;
+    // The token for a claim must be one of the session of `account` (see requireSession): after a change, no claim.
+    let token = environment.owner === undefined ? await this.deps.auth.getToken({ interactive: false }) : undefined;
+    if (token !== undefined && (await this.deps.auth.getAccount({ interactive: false }))?.id !== account.id) token = undefined;
+    await this.availableEntry(environment, account, { token, interactive });
+  }
+
+  /**
+   * The registry entry, when it belongs to `account` (concept 7.5). An entry without owner is claimed first when a claim
+   * is possible (`claims` and the token of the session of `account`); `interactive`: a command of the user, whose claim
+   * may ask. Throws otherAccount for an entry of another account, and environmentUnassigned for an entry that still has
+   * no owner.
+   */
+  private async availableEntry(
+    environment: Environment,
+    account: GitHubAccount,
+    claim: { token: string | undefined; interactive: boolean; signal?: AbortSignal },
+  ): Promise<Environment> {
+    let current = environment;
+    if (current.owner === undefined && this.deps.claims && claim.token) {
+      await this.deps.claims.claim(account, claim.token, {
+        mode: claim.interactive ? 'interactive' : 'auto',
+        environmentIds: [current.id],
+        signal: claim.signal,
+      });
+      current = (await this.deps.registry.get(current.id)) ?? current;
+    }
+    if (isAvailableTo(current, account)) return current;
+    if (current.owner === undefined) {
+      this.logger.info(`The environment ${current.id} of an older version could not be given to the signed-in account. It is not used.`);
+      throw environmentUnassigned(current.repository);
+    }
+    this.logger.info(`The environment ${current.id} does not belong to the signed-in account. It is not used.`);
+    throw otherAccount(current.repository);
   }
 
   /** Concept 7.12: the workspace volume is missing. Never creates an empty volume without asking (concept 7.5). */
@@ -611,13 +807,12 @@ export class EnvironmentService {
     }
     if (choice !== 'cloneAgain') throw cancelledError();
 
-    const token = await this.requireToken();
     await this.markBusy(ctx, 'create');
     ctx.steps.step('downloadingRepository');
     await this.deps.docker.createVolume(env.volumeName, volumeLabels(env));
     try {
       await this.prepareHelper(ctx);
-      await this.clone(ctx, token, defaultBranch);
+      await this.clone(ctx, ctx.session.token, defaultBranch);
     } catch (error) {
       // The new volume is empty: remove it, so the files count as missing again.
       await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
@@ -637,13 +832,12 @@ export class EnvironmentService {
    */
   private async resumeInterruptedClone(ctx: PipelineContext, defaultBranch: string | undefined): Promise<void> {
     this.logger.info(`The preparation of ${ctx.env.repository} was interrupted. The clone is completed first.`);
-    const token = await this.requireToken();
     const interrupted = ctx.env.busy;
     await this.markBusy(ctx, 'create');
     ctx.steps.step('downloadingRepository');
     try {
       await this.prepareHelper(ctx);
-      await this.clone(ctx, token, defaultBranch);
+      await this.clone(ctx, ctx.session.token, defaultBranch);
     } catch (error) {
       // The mark of the ended window comes back, so the next open completes the clone again. A mark of this window
       // would count as live: the environment would show as busy without Start and Delete, and other windows could
@@ -674,13 +868,16 @@ export class EnvironmentService {
         '.',
     );
 
-    // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside.
+    // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside. A
+    // configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
     let loaded: LoadedConfiguration | undefined;
     try {
       loaded = await this.loadConfiguration(ctx, imagePresent);
     } catch (error) {
       const usable = container !== undefined || imagePresent;
-      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw configurationError(error);
+      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) {
+        throw configurationError(error);
+      }
       this.logger.error(`The configuration of ${ctx.env.repository} could not be used. The existing environment is started.`, error);
       this.deps.ui.warn(isUserFacingError(error) ? error.message : Messages.buildFailed);
     }
@@ -688,7 +885,9 @@ export class EnvironmentService {
     let outcome: ContainerOutcome | undefined;
     if (loaded) {
       await this.saveConfiguration(ctx, loaded, record);
-      const plan = await this.planUpdate(ctx, loaded, record, imagePresent, container !== undefined);
+      // A container of an older setup is created again (concept section 9); it does not count as a working container.
+      const currentContainer = container !== undefined && containerIsCurrent(container.labels);
+      const plan = await this.planUpdate(ctx, loaded, record, imagePresent, currentContainer);
       if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
     }
     outcome ??= await this.startContainer(ctx, container, record, imagePresent, loaded);
@@ -718,30 +917,44 @@ export class EnvironmentService {
 
     const problems = checkConfiguration(files.configText);
     if (problems.compose) throw new UserFacingError('composeNotSupported', Messages.composeNotSupported);
+
+    await this.requireVolume(env);
+    const { config, merged } = await helper.readConfiguration({
+      volumeName: env.volumeName,
+      repository: env.repository,
+      configPath,
+      environmentId: env.id,
+      onOutput: this.output,
+      signal: ctx.signal,
+    });
+    // Concept section 9 "Host access": checked before any build or container start.
+    const report = hostAccessReport({ config, merged, ownVolume: env.volumeName });
+    if (isRefused(report)) {
+      this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
+      throw new HostAccessError(report);
+    }
+    if (merged === undefined) {
+      this.logger.info('The merged configuration is not known: the image metadata is checked before the container starts.');
+    }
     if (problems.computerDependent.length > 0) {
       const items = problems.computerDependent.join(', ');
       this.logger.warn(`The configuration ${configPath} depends on the computer: ${items}`);
       this.deps.ui.warn(Messages.computerDependent(items));
     }
-
-    const localEnv = localEnvValues(findLocalEnvNames(files.configText), this.deps.env, this.deps.platform);
-    await this.requireVolume(env);
-    const config = await helper.readConfiguration({
-      volumeName: env.volumeName,
-      repository: env.repository,
-      configPath,
-      environmentId: env.id,
-      localEnv,
-      onOutput: this.output,
-      signal: ctx.signal,
-    });
+    // The values of the computer are not passed to the workspace helper: the CLI resolves the variables there, so a
+    // variable that the helper sets (for example HOME) gets its value, any other one is empty or has its default.
+    const localEnvNames = findLocalEnvNames(files.configText);
+    if (localEnvNames.length > 0) {
+      const fromHelper = helperEnvNames(localEnvNames);
+      this.logger.info(`Variables of the computer that the configuration uses and that are not passed: ${localEnvNames.join(', ')}`);
+      this.deps.ui.warn(Messages.localEnvNotPassed(localEnvNames.join(', '), fromHelper.length > 0 ? fromHelper.join(', ') : undefined));
+    }
     return {
       configPath,
       fallback,
       configHash: configHash(files.configText, files.dockerfileText),
       config,
       dockerfileText: files.dockerfileText,
-      localEnv,
       references: collectReferences(config, files.dockerfileText),
     };
   }
@@ -782,6 +995,11 @@ export class EnvironmentService {
       entry.configPath = configPath;
       entry.shutdownActionNone = loaded.config.shutdownAction === 'none';
       entry.additionalVolumes = additionalVolumes;
+      // A refused update of another configuration is not tried again anyway.
+      const refused = refusedUpdateOf(entry);
+      if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
+        delete entry.refusedUpdate;
+      }
     });
   }
 
@@ -810,6 +1028,21 @@ export class EnvironmentService {
     if (shouldCheckImages({ ...input, updateImagesOnConnect: this.deps.settings().updateImagesOnConnect })) {
       check = await this.checkImages(ctx, loaded, record, imagePresent || containerExists);
     }
+    // Concept 7.7: an update whose new image the host access policy refused is not built again for the same digests and
+    // configuration; the existing environment starts. A changed digest or configuration, or a rebuild, tries again.
+    const refused = refusedUpdateOf(ctx.env);
+    const refusedAgain =
+      !forced &&
+      record !== undefined &&
+      imagePresent &&
+      check.kind === 'checked' &&
+      !check.upToDate &&
+      isRefusedUpdate(refused, this.updateKey(loaded, record, check.outcome));
+    if (refusedAgain && refused && check.kind === 'checked') {
+      this.logger.info(`The update of ${ctx.env.repository} was refused by the host access policy (${refused.items}). The existing environment is used.`);
+      this.deps.ui.warn(Messages.updateRefused(refused.items));
+      check = { ...check, upToDate: true, changedImages: [], changedFeatures: [] };
+    }
     const build = needsBuild({ ...input, check, containerExists });
     const updateAvailable = check.kind === 'checked' && !check.upToDate && !skipUpdate;
     const reason = forced
@@ -822,7 +1055,9 @@ export class EnvironmentService {
           ? 'the environment image is missing'
           : updateAvailable
             ? 'a newer image is available'
-            : 'up to date';
+            : refusedAgain
+              ? 'the newer image needs access to the computer'
+              : 'up to date';
     this.logger.info(`Decision for ${ctx.env.repository}: ${build ? 'build a new environment image' : 'no build'} (${reason}).`);
     return { check, build, forced, updateAvailable };
   }
@@ -861,6 +1096,16 @@ export class EnvironmentService {
     return { kind: 'checked', outcome, ...comparison };
   }
 
+  /** What identifies an update (RefusedUpdate): the configuration and the digests that the new build record would get. */
+  private updateKey(loaded: LoadedConfiguration, record: BuildRecord | undefined, outcome: CheckedOutcome): Omit<RefusedUpdate, 'items'> {
+    return {
+      configPath: loaded.configPath,
+      configHash: loaded.configHash,
+      images: recordDigests(loaded.references.images, outcome.images, record?.images),
+      features: recordDigests(loaded.references.features, outcome.features, record?.features),
+    };
+  }
+
   /**
    * Step 8, the update order of concept 7.7: pull, build, replace the container, write the build record, remove the
    * old images. A working container is never removed before the new environment image is ready (NFR-07).
@@ -876,7 +1121,11 @@ export class EnvironmentService {
   ): Promise<ContainerOutcome | undefined> {
     const env = ctx.env;
     const oldImageUsable = record !== undefined && imagePresent;
-    const canFallBack = container !== undefined || oldImageUsable;
+    // A container of an older setup is no fallback by itself: it must be created again, from an image that exists.
+    const containerUsable =
+      container !== undefined &&
+      (containerIsCurrent(container.labels) || (await this.deps.docker.imageExists(container.image).catch(() => false)));
+    const canFallBack = containerUsable || oldImageUsable;
     // An update that only follows newer digests keeps the old environment when a download fails. Otherwise a build is
     // needed anyway, and an image that exists locally is good enough when its download fails.
     const toleratePullFailure = !(oldImageUsable && !plan.forced);
@@ -914,7 +1163,6 @@ export class EnvironmentService {
         repository: env.repository,
         configPath: loaded.configPath,
         imageName,
-        localEnv: loaded.localEnv,
         onOutput: this.output,
         signal: ctx.signal,
       });
@@ -924,10 +1172,21 @@ export class EnvironmentService {
 
     // Concept 7.7 step 3: replace the container, with the same workspace volume.
     ctx.steps.step('starting');
+    // A newer image names the replacement already (Messages.newerImage); otherwise the user learns it here.
+    if (container !== undefined && !containerIsCurrent(container.labels) && !plan.updateAvailable) this.announceRecreation(ctx, container);
     let result: DevcontainerResult;
     try {
-      result = await this.runUp(ctx, imageName, loaded.config, loaded.localEnv, container !== undefined);
+      result = await this.runUp(ctx, imageName, loaded.config, container !== undefined, true);
     } catch (error) {
+      if (isHostAccess(error)) {
+        // The new image needs access to the computer (for example a Feature of a newer version): it is not used. The check
+        // runs before `up`, so the old container is unchanged. Like a failed update (concept 7.7), the environment starts
+        // with the old container or image; without them, the open ends here.
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        if (!canFallBack) throw error;
+        await this.rememberRefusedUpdate(ctx, loaded, record, plan.check, error);
+        return undefined;
+      }
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
       this.logger.error(`The container of ${env.repository} could not be created from ${imageName}.`, error);
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
@@ -942,7 +1201,7 @@ export class EnvironmentService {
       this.deps.ui.warn(Messages.buildFailed);
       // The old container is started when it still exists; a missing or half-created one is replaced.
       const survivor = await this.deps.docker.findContainer(env.id).catch(() => undefined);
-      const keep = survivor !== undefined && survivor.image === previousImage;
+      const keep = survivor !== undefined && survivor.image === previousImage && containerIsCurrent(survivor.labels);
       this.logger.info(
         keep
           ? `The previous container ${survivor.name} is started again.`
@@ -950,9 +1209,9 @@ export class EnvironmentService {
       );
       await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
       try {
-        result = await this.runUp(ctx, previousImage, loaded.config, loaded.localEnv, !keep);
+        result = await this.runUp(ctx, previousImage, loaded.config, !keep, !keep);
       } catch (restoreError) {
-        if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError)) throw restoreError;
+        if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError) || isHostAccess(restoreError)) throw restoreError;
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(restoreError));
       }
       return keep ? { result, created: false, container: survivor } : { result, created: true };
@@ -972,10 +1231,33 @@ export class EnvironmentService {
     await this.updateEntry(ctx, (entry) => {
       entry.buildRecord = newRecord;
       entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);
+      delete entry.refusedUpdate;
     });
     this.logger.info(`New environment image of ${env.repository}: ${imageName}.`);
     await this.removeEnvironmentImages(ctx.env, imageName, record);
     return { result, created: true };
+  }
+
+  /**
+   * The new environment image of an update needs access to the computer (concept 7.7, section 9 "Host access"): the user
+   * learns what it needs, the existing environment starts, and the same update is not built again (planUpdate) until a
+   * digest or the configuration changes. Only an update after an image check can be recognized again.
+   */
+  private async rememberRefusedUpdate(
+    ctx: PipelineContext,
+    loaded: LoadedConfiguration,
+    record: BuildRecord | undefined,
+    check: ImageCheckState,
+    error: unknown,
+  ): Promise<void> {
+    const items = error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error);
+    this.logger.info(`The existing environment of ${ctx.env.repository} is started without the update. A changed digest or configuration tries it again.`);
+    this.deps.ui.warn(Messages.updateRefused(items));
+    if (check.kind !== 'checked') return;
+    const refusedUpdate: RefusedUpdate = { ...this.updateKey(loaded, record, check.outcome), items };
+    await this.updateEntry(ctx, (entry) => {
+      entry.refusedUpdate = refusedUpdate;
+    });
   }
 
   /**
@@ -1038,28 +1320,60 @@ export class EnvironmentService {
     imagePresent: boolean,
     loaded: LoadedConfiguration | undefined,
   ): Promise<ContainerOutcome> {
-    if (container?.state === 'running') {
+    // Concept section 9: a container of an older setup, without the variables of container-only Git, is created again
+    // from its environment image, like a missing one. The volume stays. So is a container that was created without the
+    // configuration (it could not be read then), once the configuration can be read: it lacks its runArgs and appPort.
+    const configKnown = loaded !== undefined;
+    const outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown);
+    if (container?.state === 'running' && !outdated) {
       this.logger.info(`The container ${container.name} runs already.`);
+      await this.prepareGit(ctx);
       return { created: false, container };
     }
     ctx.steps.step('starting');
     if (ctx.helperUnavailable) {
-      if (container) return this.startWithDocker(ctx, container);
+      if (container && !outdated) return this.startWithDocker(ctx, container);
       throw new UserFacingError('helperFailed', Messages.helperFailed);
     }
     // Assumption (V-10): `up` finds an existing container by --id-label and starts it without using the image of the
     // override configuration; a missing container is created from the environment image, without network access.
-    const image = record && imagePresent ? record.environmentImage : container?.image;
+    let image = record && imagePresent ? record.environmentImage : container?.image;
+    if (outdated && image === container?.image && image !== undefined && !(await this.deps.docker.imageExists(image).catch(() => false))) {
+      image = undefined;
+    }
     if (!image) throw new UserFacingError('buildFailed', Messages.buildFailed, 'There is no environment image.');
+    if (outdated && container) {
+      this.logger.info(
+        containerIsCurrent(container.labels, false)
+          ? `The container ${container.name} was created without the configuration, which can be read now. It is created again from ${image}; the files in the volume are kept.`
+          : `The container ${container.name} was created by an older version of Dev Environments. It is created again from ${image}; the files in the volume are kept.`,
+      );
+      this.announceRecreation(ctx, container);
+    }
+    if (!configKnown && (container === undefined || outdated)) {
+      this.logger.warn(
+        `The container of ${ctx.env.repository} is created without the configuration, which cannot be read. Its runArgs and published ports apply once it can be read; the container is then created again.`,
+      );
+    }
     try {
-      const result = await this.runUp(ctx, image, loaded?.config, loaded?.localEnv ?? {}, false);
-      return { result, created: container === undefined, container };
+      const result = await this.runUp(ctx, image, loaded?.config, outdated, container === undefined || outdated);
+      return { result, created: container === undefined || outdated, container: outdated ? undefined : container };
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
-      if (container && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container);
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      if (container && !outdated && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container);
       this.logger.error(`The container of ${ctx.env.repository} could not be started.`, error);
       throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
     }
+  }
+
+  /**
+   * An existing container is created again without an update of its image (concept section 9): the files outside the
+   * workspace volume, for example the home folder, are lost. The progress says so, as it names a newer image (concept 6.5).
+   */
+  private announceRecreation(ctx: PipelineContext, container: ContainerInfo): void {
+    // Current apart from the configuration: it was created while the configuration could not be read.
+    const withoutConfiguration = containerIsCurrent(container.labels, false);
+    ctx.steps.detail(withoutConfiguration ? Messages.containerConfigApplied : Messages.containerRecreated);
   }
 
   /** Without the workspace helper, a stopped container still starts with `docker start` (offline after an extension update). */
@@ -1075,28 +1389,44 @@ export class EnvironmentService {
     return { created: false, container };
   }
 
-  /** `devcontainer up` with the override configuration (concept 7.6). */
+  /**
+   * `devcontainer up` with the override configuration (concept 7.6). `createsContainer`: `up` creates a container from
+   * `image` (no container, or `removeExistingContainer`); only then the image metadata is checked, because `up` starts
+   * an existing container without the image, and that container passed the check when it was created.
+   */
   private async runUp(
     ctx: PipelineContext,
     image: string,
     config: DevcontainerConfig | undefined,
-    localEnv: Record<string, string>,
     removeExistingContainer: boolean,
+    createsContainer: boolean,
   ): Promise<DevcontainerResult> {
     const env = ctx.env;
-    // The container is in use from its start on (concept 7.9).
-    await this.deps.sessionFiles.writePending(env.id, this.deps.owner.windowId);
-    await this.requireVolume(env);
-    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image);
     const override = buildOverrideConfig({
       environmentImage: image,
       volumeName: env.volumeName,
       repositoryName: splitRepository(env.repository).name,
       containerName: env.containerName,
-      runArgs: stringList(config?.runArgs),
+      // Without the configuration, the container gets no runArgs and appPort of the repository. Its label makes the next
+      // open with a readable configuration create it again (containerIsCurrent).
+      runArgs: config ? stringList(config.runArgs) : ['--label', `${LABEL_CONTAINER_CONFIG}=${CONTAINER_CONFIG_UNKNOWN}`],
       appPort: config?.appPort,
-      initializeCommand: config?.initializeCommand,
     });
+    // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
+    // pass the policy too (the check of the configuration covers them as the repository wrote them).
+    const finalRunArgs = hostAccessReport({ config: { runArgs: override.runArgs }, ownVolume: env.volumeName });
+    if (isRefused(finalRunArgs)) {
+      this.logger.warn(`The runArgs of the container of ${env.repository} are refused by the host access policy: ${describeRefusal(finalRunArgs)}`);
+      throw new HostAccessError(finalRunArgs);
+    }
+    // The container is in use from its start on (concept 7.9).
+    await this.deps.sessionFiles.writePending(env.id, this.deps.owner.windowId);
+    await this.requireVolume(env);
+    if (createsContainer) await this.checkImageHostAccess(ctx, image);
+    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image);
+    // After the ownership fix (the files get the owner of the repository folder), and before `up`, so that the lifecycle
+    // commands have the token and the Git configuration.
+    await this.prepareGit(ctx);
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
       result = await this.deps.helper.up({
@@ -1105,7 +1435,6 @@ export class EnvironmentService {
         override,
         environmentId: env.id,
         removeExistingContainer,
-        localEnv,
         onOutput: this.output,
         signal: ctx.signal,
       });
@@ -1163,11 +1492,158 @@ export class EnvironmentService {
 
   /** The user that `devcontainer up` gives a container of `image` (label devcontainer.metadata, see imageRemoteUser). */
   private async imageUser(image: string, signal: AbortSignal | undefined): Promise<string> {
+    return imageRemoteUser(await this.imageConfig(image, signal));
+  }
+
+  /** `Config` of `docker image inspect`. */
+  private async imageConfig(image: string, signal: AbortSignal | undefined): Promise<unknown> {
     const inspect = await this.deps.docker.runChecked(['image', 'inspect', '--format', '{{json .Config}}', image], {
       timeoutMs: IMAGE_INSPECT_TIMEOUT_MS,
       signal,
     });
-    return imageRemoteUser(JSON.parse(inspect.trim()) as unknown);
+    return JSON.parse(inspect.trim()) as unknown;
+  }
+
+  /**
+   * Concept section 9 "Host access", before every `up`: the label devcontainer.metadata of the environment image holds
+   * what `up` applies from the base image, the Features, and the configuration of the build (mounts, privileged mode,
+   * capabilities). It also covers a configuration that could not be read, and Features that a build added after the
+   * merged configuration was read. Throws UserFacingError('hostAccess').
+   */
+  private async checkImageHostAccess(ctx: PipelineContext, image: string): Promise<void> {
+    const config = await this.imageConfig(image, ctx.signal);
+    const labels = isRecord(config) && isRecord(config.Labels) ? config.Labels : {};
+    const text = labels['devcontainer.metadata'];
+    let metadata: unknown[] = [];
+    if (typeof text === 'string') {
+      try {
+        const parsed: unknown = JSON.parse(text);
+        metadata = Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        this.logger.warn(`The label devcontainer.metadata of ${image} is not valid JSON.`);
+      }
+    }
+    const report = hostAccessReport({ metadata, ownVolume: ctx.env.volumeName });
+    if (!isRefused(report)) return;
+    this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
+    throw new HostAccessError(report);
+  }
+
+  /**
+   * Concept section 9 "Git inside the container": the token of the owner account and the Git configuration of the
+   * container, written into the volume once per run (at every open: a new sign-in gives a new token), before `up`. A
+   * failure is a warning: the environment opens, but Git may not reach GitHub.
+   */
+  private async prepareGit(ctx: PipelineContext): Promise<void> {
+    if (ctx.gitPrepared || ctx.helperUnavailable) return;
+    ctx.gitPrepared = true;
+    const env = ctx.env;
+    try {
+      await this.requireVolume(env);
+      // Asked for when the session became known; a Cancel does not wait for GitHub.
+      const identity = await waitUnlessAborted(ctx.identity, ctx.signal);
+      await this.deps.helper.prepareGit({
+        volumeName: env.volumeName,
+        repository: env.repository,
+        token: ctx.session.token,
+        identity,
+        onOutput: this.output,
+        signal: ctx.signal,
+      });
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
+      this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
+      this.deps.ui.warn(Messages.gitSetupFailed);
+    }
+  }
+
+  /**
+   * user.name and user.email of a new Git configuration: the profile of the account on GitHub, or, when GitHub does not
+   * answer within 5 seconds, the login and the ID of the session. The opens of this window share one question per
+   * account: its answer counts for the window; after a failed question, the fallback counts for 10 minutes, so an open
+   * without a connection does not wait again. The question does not end with the open that started it (another open may
+   * wait for it too); its time limit ends it. Never rejects.
+   */
+  private identityOf(session: GitHubSession): Promise<GitIdentity> {
+    const { account } = session;
+    const cached = this.identities.get(account.id);
+    if (cached && (cached.retryAfter === undefined || this.deps.clock.now() < cached.retryAfter)) return cached.identity;
+    const fallback = gitIdentity({ databaseId: account.id, login: account.login, name: null });
+    const viewer = this.deps.viewer;
+    if (!viewer) return Promise.resolve(fallback);
+    const timeoutMs = this.deps.viewerTimeoutMs ?? VIEWER_TIMEOUT_MS;
+    const entry: { identity: Promise<GitIdentity>; retryAfter?: number } = { identity: Promise.resolve(fallback) };
+    entry.identity = (async () => {
+      try {
+        const timeout = AbortSignal.timeout(timeoutMs);
+        const profile = await waitUnlessAborted(viewer(session.token, timeout), timeout);
+        if (String(profile.databaseId) === account.id) return gitIdentity(profile);
+        this.logger.info(`GitHub returned the profile of another account than ${account.login}.`);
+      } catch (error) {
+        this.logger.info(`The profile of ${account.login} could not be read from GitHub: ${errorMessage(error)}`);
+      }
+      entry.retryAfter = this.deps.clock.now() + IDENTITY_RETRY_MS;
+      return fallback;
+    })();
+    this.identities.set(account.id, entry);
+    return entry.identity;
+  }
+
+  /**
+   * Concept section 9, in a new container before the first attach: the ~/.gitconfig of the remote user
+   * (HOME_GIT_CONFIG_CONTENT: a section that keeps the Dev Containers extension from copying the Git configuration of the
+   * computer, and an include of the configuration of the volume for Git older than 2.32), and an empty
+   * ~/.config/git/config. Then the Git version of the container (checkGitVersion). A failure is logged.
+   * Assumption (V-8): the extension does not copy the configuration of the computer into a file with such a section.
+   */
+  private async prepareHomeGitConfig(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    try {
+      const result = await this.deps.docker.exec(container, homeGitConfigCommand(user), {
+        user: 'root',
+        signal: ctx.signal,
+        timeoutMs: GIT_EXEC_TIMEOUT_MS,
+      });
+      if (result.exitCode !== 0) {
+        this.logger.warn(`The Git configuration of ${user} in the container could not be prepared: ${(result.stderr || result.stdout).trim()}`);
+      }
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The Git configuration of ${user} in the container could not be prepared: ${errorMessage(error)}`);
+    }
+    await this.checkGitVersion(ctx, container, user);
+  }
+
+  /**
+   * Concept section 9: what Git of a new container supports of container-only Git (containerGitSupport). Git before 2.9
+   * may use the forwarding credential helper of the Dev Containers extension, so the user gets a warning; Git 2.9 to 2.31
+   * ignores GIT_CONFIG_GLOBAL and gets the configuration of the volume only through ~/.gitconfig, which is logged. A
+   * container without Git needs nothing. Never fails the open.
+   */
+  private async checkGitVersion(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    let output: string;
+    try {
+      const result = await this.deps.docker.exec(container, ['git', '--version'], {
+        user,
+        signal: ctx.signal,
+        timeoutMs: BRANCH_EXEC_TIMEOUT_MS,
+      });
+      if (result.exitCode !== 0) return;
+      output = result.stdout;
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.info(`The Git version in the container could not be read: ${errorMessage(error)}`);
+      return;
+    }
+    const support = containerGitSupport(output);
+    const version = output.trim();
+    if (support === 'unsafe') {
+      this.logger.warn(`${version} in the container of ${ctx.env.repository} is older than 2.9: its credential requests may reach the computer.`);
+      this.deps.ui.warn(Messages.oldGit(version.replace(/^git version\s+/, '')));
+    } else if (support === 'noGlobalVariable') {
+      this.logger.info(
+        `${version} in the container of ${ctx.env.repository} ignores GIT_CONFIG_GLOBAL: Git reads the configuration of the volume through ~/.gitconfig.`,
+      );
+    }
   }
 
   /** Steps 10 and 11: ownership, Git state, registry entry, pending connection file. */
@@ -1185,7 +1661,11 @@ export class EnvironmentService {
 
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
       await this.fixOwnership(ctx, containerRef, folder, remoteUser);
+      // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
+      // is still root when the ownership fix before `up` did not run or failed.
+      await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
     }
+    if (outcome.created) await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.
     this.throwIfCancelled(ctx.signal);
@@ -1296,6 +1776,7 @@ export class EnvironmentService {
       this.logger.info(`Stop: the environment ${environmentId} does not exist.`);
       return;
     }
+    await this.requireOwnAccount(environment, false);
     await this.exclusive(repositoryKey(environment.repository), undefined, async () => {
       if (!(await this.deps.docker.isRunning())) {
         this.logger.info('Docker is not running, so no container runs.');
@@ -1332,6 +1813,7 @@ export class EnvironmentService {
     if (!env) return undefined;
     const steps = new StepReporter(options.progress, this.logger);
     try {
+      await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       if (!(await this.deps.docker.volumeExists(env.volumeName))) return undefined;
       let summary: GitSummary;
@@ -1367,6 +1849,7 @@ export class EnvironmentService {
           await this.removeEnvironmentFiles(environmentId);
           return;
         }
+        await this.requireOwnAccount(current, true);
         await this.deleteLocked(current, options);
       } catch (error) {
         throw this.toUserError(error, options.signal);
@@ -1413,12 +1896,14 @@ export class EnvironmentService {
       const steps = new StepReporter(options.progress, this.logger);
       let busy = false;
       try {
+        const session = await this.requireSession();
         await this.startDocker(steps, options.signal);
-        const current = await this.deps.registry.get(environmentId);
-        if (!current) throw environmentMissing(environment.repository);
+        const found = await this.deps.registry.get(environmentId);
+        if (!found) throw environmentMissing(environment.repository);
+        const current = await this.availableEntry(found, session.account, { token: session.token, interactive: true, signal: options.signal });
         let env = await this.waitForOtherOperation(current, options.signal);
         await this.requireVolume(env);
-        const token = await this.requireToken();
+        const token = session.token;
         env = await this.setBusyMark(env, 'switchBranch');
         busy = true;
         steps.step('downloadingRepository');
@@ -1455,6 +1940,7 @@ export class EnvironmentService {
     if (!record) return true;
     const steps = new StepReporter(options.progress, this.logger);
     try {
+      await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       if (!(await this.deps.docker.volumeExists(env.volumeName))) return false;
       // The configuration that the pipeline would use: on a branch without the selected one, the fallback.
@@ -1473,6 +1959,7 @@ export class EnvironmentService {
     if (!env) return [];
     const steps = new StepReporter(options.progress, this.logger);
     try {
+      await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       await this.requireVolume(env);
       return await this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
@@ -1536,6 +2023,8 @@ export class EnvironmentService {
         this.logger.warn(`The volume ${volume.name} has invalid labels and is skipped.`);
         continue;
       }
+      // The owner label of the volume gives the entry its owner again; its login follows at the next open.
+      const ownerId = volume.labels[LABEL_OWNER_ID];
       candidates.push({
         id,
         repository,
@@ -1544,6 +2033,7 @@ export class EnvironmentService {
         containerName: volume.name,
         createdAt: now,
         lastUsedAt: now,
+        ...(isStorageId(ownerId) ? { owner: { id: ownerId, login: '' } } : {}),
       });
     }
     if (candidates.length === 0) return 0;
@@ -1577,10 +2067,19 @@ export class EnvironmentService {
     await this.startDockerFn({ onStarting: () => steps.step('startingDocker'), signal });
   }
 
-  private async requireToken(): Promise<string> {
+  /**
+   * The token and the account of the GitHub session; asks for a sign-in when needed. Both must come from one session: a
+   * sign-in with another account between the two questions would give an environment of this account the token of the
+   * other one.
+   */
+  private async requireSession(): Promise<GitHubSession> {
     const token = await this.deps.auth.getToken({ interactive: true });
     if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    return token;
+    const account = await this.deps.auth.getAccount({ interactive: false });
+    if (!account || (await this.deps.auth.getToken({ interactive: false })) !== token) {
+      throw new UserFacingError('signInRequired', Messages.signInRequired, 'The GitHub session changed during the open.');
+    }
+    return { token, account };
   }
 
   /**

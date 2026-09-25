@@ -7,9 +7,11 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, DOCKER_DOWNLOAD_URL, Messages, formatChanges } from '../core/messages';
-import { repositoryFolder, splitRepository } from '../core/names';
+import { GITHUB_TOKEN_FILE, repositoryFolder, splitRepository } from '../core/names';
+import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
+import { containerIsCurrent } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -17,6 +19,7 @@ import type {
   BusyOperation,
   Environment,
   ExtensionSettings,
+  GitHubAccount,
   PendingConnection,
   PendingOperation,
   PendingOperationKind,
@@ -61,6 +64,13 @@ import { TreeTexts, recentEnvironments, stateIcon } from './treeModel';
  */
 const HANDOFF_CHECK_MS = 30_000;
 /**
+ * A window that left an environment it must not use (concept 7.5, section 9) checks this long after "Close Remote
+ * Connection" that its connection closed; a running extension host means that the user kept the connection.
+ */
+const LEAVE_CHECK_MS = 10_000;
+/** `docker exec` that removes the token of the owner account from a container. */
+const TOKEN_REMOVAL_TIMEOUT_MS = 10_000;
+/**
  * The reopen rule (concept 7.10) looks at the other windows. Windows that VS Code restores at the same start write their
  * status files during their own activation; this pause lets them do so first.
  */
@@ -87,6 +97,8 @@ export interface ControllerDeps {
   service: EnvironmentService;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
+  /** Claims of environments of an older version (concept 7.5). */
+  claims: EnvironmentClaims;
   ui: VsCodePipelineUi;
   connection: ConnectionAdapter;
   coordinator: SessionCoordinator;
@@ -98,8 +110,14 @@ export interface ControllerDeps {
   clock?: Clock;
   /** For tests. Default: `isProcessAlive`. */
   isAlive?: (pid: number) => boolean;
-  /** For tests: HANDOFF_CHECK_MS, REOPEN_CHECK_DELAY_MS, DISCONNECT_REQUEST_MAX_AGE_MS, and BUSY_POLL_MS. */
-  timing?: { handOffCheckMs?: number; reopenCheckDelayMs?: number; disconnectAnswerMs?: number; busyPollMs?: number };
+  /** For tests: HANDOFF_CHECK_MS, LEAVE_CHECK_MS, REOPEN_CHECK_DELAY_MS, DISCONNECT_REQUEST_MAX_AGE_MS, and BUSY_POLL_MS. */
+  timing?: {
+    handOffCheckMs?: number;
+    leaveCheckMs?: number;
+    reopenCheckDelayMs?: number;
+    disconnectAnswerMs?: number;
+    busyPollMs?: number;
+  };
 }
 
 /** What a command works on. */
@@ -130,6 +148,17 @@ interface WindowEnvironment {
   branch?: string;
 }
 
+/**
+ * An environment that this window left because it must not use it, while the window may still be attached to its
+ * container: the environment of another account (or of nobody, after a sign-out), or a container of an older version.
+ */
+interface LeftEnvironment {
+  environmentId: string;
+  containerName: string;
+  repository: string;
+  reason: 'account' | 'outdated';
+}
+
 type HandOffRequest = Pick<PendingOperation, 'operation' | 'reason' | 'configPath' | 'removeAdditionalVolumes'>;
 
 /** What a command without argument asks for: `open` is a repository that the command opens (Start). */
@@ -145,6 +174,9 @@ export class Controller implements vscode.Disposable {
   private readonly isAlive: (pid: number) => boolean;
   private readonly timers = new Set<NodeJS.Timeout>();
   private current: WindowEnvironment | undefined;
+  /** See `LeftEnvironment`; checked until the window has closed its connection (`checkLeftConnection`). */
+  private left: LeftEnvironment | undefined;
+  private checkingLeft = false;
   private ready: Promise<void> = Promise.resolve();
   private checkingConnection = false;
   private dockerChecked = false;
@@ -289,10 +321,13 @@ export class Controller implements vscode.Disposable {
    * activate() awaits this.
    */
   async openAttachedWindow(
-    environment: Environment,
+    attached: Environment,
     containerName: string,
     pending: PendingConnection | undefined,
   ): Promise<void> {
+    // Concept 7.5: the environment of another account runs no pipeline and starts no container; the window closes.
+    const environment = await this.ownWindowEnvironment(attached, containerName);
+    if (!environment) return;
     this.current = { environment, containerName, lost: false };
     this.updateStatusBar();
     const repository = this.displayName({ repository: environment.repository });
@@ -319,6 +354,19 @@ export class Controller implements vscode.Disposable {
       if (!succeeded) {
         // "Delete environment" for missing files (concept 7.12) removed the environment of this window.
         if (await this.leaveDeletedEnvironment(environment.id)) return;
+        // Concept section 9: the pipeline did not make the container of an older version again (for example the host
+        // access policy refused the configuration, or the user cancelled). That container uses the Git of the computer,
+        // so the window must not attach to it. A current container stays: it passed the policy when it was made.
+        if (this.current?.environment.id === environment.id && (await this.containerOutdated(environment.id))) {
+          this.logger.info(`The container of ${repository} is of an older version and was not made again. The window closes its remote connection.`);
+          await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+            environmentId: environment.id,
+            containerName,
+            repository,
+            reason: 'outdated',
+          });
+          return;
+        }
         // The window shows its own connection error; the status bar offers Reconnect.
         if (this.current) {
           this.current.lost = true;
@@ -344,8 +392,17 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The pending ${operation.operation} of ${operation.environmentId} is too old and is dropped.`);
       await this.removeOperationQuietly(operation.environmentId);
     }
+    const account = await this.readAccount();
     for (const operation of runnable) {
       if (this.disposed) return;
+      // Concept 7.5: an operation of an environment of another account is not run by this window; it expires.
+      const target = await registry.get(operation.environmentId);
+      if (target && !isAvailableTo(target, account)) {
+        this.logger.info(
+          `The pending ${operation.operation} of ${operation.environmentId} is for another GitHub account. It is not run.`,
+        );
+        continue;
+      }
       let claimed: PendingOperation | undefined;
       try {
         claimed = await sessionFiles.claimOperation(operation.environmentId, coordinator.windowId);
@@ -371,7 +428,8 @@ export class Controller implements vscode.Disposable {
       otherActiveWindows: others.length,
       pendingOperations: operations.length,
       record,
-      environmentIds: new Set(environments.map((environment) => environment.id)),
+      // Concept 7.5: only an environment of the signed-in account is opened again.
+      environmentIds: new Set(availableEnvironments(environments, account).map((environment) => environment.id)),
       now: this.clock.now(),
     });
     if (!decision.reopen) {
@@ -606,7 +664,8 @@ export class Controller implements vscode.Disposable {
   /** Switch Environment… (concept 6.4): the selected environment or repository opens in this window. */
   async switchEnvironment(): Promise<void> {
     const { registry, sidebar } = this.deps;
-    const [environments, repositories] = await Promise.all([registry.list(), sidebar.repositoriesForPicker()]);
+    // Only the environments and the repositories of the signed-in account (concept 7.5).
+    const [environments, repositories] = await Promise.all([sidebar.availableEnvironments(), sidebar.repositoriesForPicker()]);
     if (environments.length === 0 && repositories.length === 0) {
       this.inform(ControllerTexts.noRepositories);
       return;
@@ -620,10 +679,12 @@ export class Controller implements vscode.Disposable {
         this.inform(PipelineTexts.environmentMissing);
         return;
       }
-      await this.startTarget(this.environmentTarget(environment));
+      const target = await this.ownTarget(this.environmentTarget(environment));
+      if (target) await this.startTarget(target);
       return;
     }
-    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner));
+    const target = await this.ownTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner));
+    if (target) await this.startTarget(target);
   }
 
   /** Refresh: the repository list (sign-in first when needed), a lost registry, and the states. */
@@ -644,7 +705,9 @@ export class Controller implements vscode.Disposable {
       return;
     }
     const info = await pickRepository(repositories, ControllerTexts.selectRepositoryToStart);
-    if (info) await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner));
+    if (!info) return;
+    const target = await this.ownTarget(await this.repositoryTargetFor(info.nameWithOwner));
+    if (target) await this.startTarget(target);
   }
 
   /** Sign in with GitHub (concept 6.1 step 1). */
@@ -676,7 +739,20 @@ export class Controller implements vscode.Disposable {
     if (environment) {
       if (this.isConnectedHere(environment)) {
         // "Already connected → nothing" only while the container runs; otherwise this is Reconnect (concept 6.3, 7.12).
-        if (await this.containerRuns(this.current?.containerName ?? environment.containerName)) {
+        const containerName = this.current?.containerName ?? environment.containerName;
+        if (await this.containerRuns(containerName)) {
+          // Concept section 9: a container of an older version uses the Git of the computer. The pipeline must not
+          // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
+          if (await this.containerOutdated(environment.id)) {
+            this.logger.info(`The container of ${repository} is of an older version. The window closes its remote connection.`);
+            await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+              environmentId: environment.id,
+              containerName,
+              repository,
+              reason: 'outdated',
+            });
+            return;
+          }
           this.logger.info(`This window is connected to ${repository}.`);
           if (this.current?.lost) {
             this.current.lost = false;
@@ -765,6 +841,21 @@ export class Controller implements vscode.Disposable {
         .removePending(result.environment.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
       throw new UserFacingError('cancelled', PipelineTexts.cancelled);
+    }
+    // Concept 7.5: the session is read at the start of the pipeline; the account may have changed while it ran (a build
+    // can take minutes). The window connects only to an environment of the account that is signed in now.
+    const account = await this.readAccount();
+    const entry = (await this.deps.registry.get(result.environment.id).catch(() => undefined)) ?? result.environment;
+    if (!isAvailableTo(entry, account)) {
+      const repository = this.displayName({ repository: result.environment.repository });
+      this.logger.info(`${repository} is not connected: the GitHub account changed while it opened.`);
+      // Without the pending connection file, the Session Monitor stops the container after the waiting time.
+      await this.deps.sessionFiles
+        .removePending(result.environment.id)
+        .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
+      throw account
+        ? new UserFacingError('otherAccount', ControllerTexts.otherAccount(repository))
+        : new UserFacingError('signInRequired', Messages.signInRequired);
     }
     progress.step('connecting');
     await this.deps.coordinator.writePending(result.environment.id);
@@ -1114,6 +1205,10 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The request of another window for ${repository} is dropped: this window has left the environment.`);
       return;
     }
+    if (!isAvailableTo(environment, await this.readAccount())) {
+      this.logger.info(`The request of another window for ${repository} is dropped: the environment is of another GitHub account.`);
+      return;
+    }
     this.logger.info(`Another window asks this window to close its connection for the ${request.operation} of ${repository}.`);
     await this.handOff(
       this.environmentTarget(environment),
@@ -1207,8 +1302,22 @@ export class Controller implements vscode.Disposable {
     if (this.current) return;
     const containerName = this.deps.connection.currentContainerName();
     if (!containerName) return;
-    const environment = await this.deps.registry.findByContainerName(containerName);
-    if (!environment) return;
+    const restored = await this.deps.registry.findByContainerName(containerName);
+    if (!restored) return;
+    const environment = await this.ownWindowEnvironment(restored, containerName);
+    if (!environment || this.current) return;
+    // No pipeline runs here, so a container of an older version is not made again: the window leaves it (section 9).
+    if (await this.containerOutdated(environment.id)) {
+      const repository = this.displayName({ repository: environment.repository });
+      this.logger.info(`The container of ${repository} is of an older version. The window closes its remote connection.`);
+      await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+        environmentId: environment.id,
+        containerName,
+        repository,
+        reason: 'outdated',
+      });
+      return;
+    }
     this.current = { environment, containerName, lost: false };
     await this.deps.coordinator.setEnvironment(environment.id);
     this.updateStatusBar();
@@ -1229,17 +1338,191 @@ export class Controller implements vscode.Disposable {
       return false;
     }
     this.logger.info('The environment of this window was deleted. The window closes its remote connection.');
+    await this.leaveEnvironment();
+    return true;
+  }
+
+  /**
+   * The window leaves its environment: no environment in its status file (the Session Monitor stops the container after
+   * the waiting time), the status bar, then "Close Remote Connection", with `message` for the user.
+   * With `left` (an environment that the window must not use), the window does not rely on the close: VS Code lets the
+   * user keep the connection (Cancel in the dialog about unsaved files). The token of the owner account leaves the
+   * container at once when the account is the reason, and `checkLeftConnection` closes the connection again.
+   */
+  private async leaveEnvironment(message?: string, left?: LeftEnvironment): Promise<void> {
     this.current = undefined;
+    this.left = left;
     await this.deps.coordinator
       .setEnvironment(null)
       .catch((error: unknown) => this.logger.warn(`The window status could not be written: ${errorMessage(error)}`));
     this.updateStatusBar();
-    // Not awaited: a restored window's activate() must end first (V-2), and the command reloads the window.
+    if (message) this.warn(message);
+    if (left?.reason === 'account') this.background(this.removeGitToken(left.containerName), 'remove the GitHub token');
+    this.closeConnection(left);
+  }
+
+  /**
+   * "Close Remote Connection", then (with `left`) the check whether the window has closed it. Not awaited: a restored
+   * window's activate() must end first (V-2), and the command reloads the window. `closeFirst: false` only schedules the
+   * check.
+   */
+  private closeConnection(left: LeftEnvironment | undefined, options: { closeFirst?: boolean } = {}): void {
+    const close = options.closeFirst ?? true;
     this.background(
-      this.delay(0).then(() => this.deps.connection.closeRemoteConnection()),
+      this.delay(0)
+        .then(() => (close ? this.deps.connection.closeRemoteConnection() : undefined))
+        .finally(() => {
+          // The window reloads when the connection closes, and this extension host ends: the check never runs then.
+          if (!left || this.left !== left || this.disposed) return;
+          const timer = setTimeout(() => {
+            this.timers.delete(timer);
+            this.background(this.checkLeftConnection(true), 'check the connection of this window');
+          }, this.deps.timing?.leaveCheckMs ?? LEAVE_CHECK_MS);
+          this.timers.add(timer);
+        }),
       'close the remote connection',
     );
+  }
+
+  /**
+   * The window left an environment that it must not use (`leaveEnvironment` with `left`), and this extension host still
+   * runs, so the window may have kept its connection. When the signed-in account may use the environment again (the
+   * user signed in with the owner account), the window reloads: the open pipeline of role A runs and writes the token
+   * again. Otherwise, with `retry`, the window says so and closes its connection again.
+   */
+  private async checkLeftConnection(retry: boolean): Promise<void> {
+    const left = this.left;
+    if (!left || this.current || this.disposed || this.checkingLeft) return;
+    if (this.deps.connection.currentContainerName() !== left.containerName) {
+      this.left = undefined;
+      return;
+    }
+    this.checkingLeft = true;
+    try {
+      if (await this.reopenLeftEnvironment(left)) return;
+      if (!retry) return;
+      if (this.activeConnectRequests.size > 0) {
+        // A Start in this window connects it elsewhere: the close must not end its pipeline. Checked again later.
+        this.closeConnection(left, { closeFirst: false });
+        return;
+      }
+      this.logger.warn(`This window is still connected to ${left.repository}, which it must not use. It closes its remote connection again.`);
+      if (left.reason === 'account') this.background(this.removeGitToken(left.containerName), 'remove the GitHub token');
+      await vscode.window
+        .showWarningMessage(ControllerTexts.stillConnected(left.repository), { modal: true })
+        .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
+      // The owner account may have signed in while the message was open.
+      if (await this.reopenLeftEnvironment(left)) return;
+      if (this.left !== left || this.current || this.disposed) return;
+      this.closeConnection(left);
+    } finally {
+      this.checkingLeft = false;
+    }
+  }
+
+  /**
+   * The window left the environment because of the account, and the signed-in account may use it now: the window
+   * reloads, and the open pipeline of role A runs (it writes the token again). Returns true when the window reloads.
+   */
+  private async reopenLeftEnvironment(left: LeftEnvironment): Promise<boolean> {
+    if (left.reason !== 'account') return false;
+    const account = await this.readAccount();
+    const found = await this.deps.registry.get(left.environmentId).catch(() => undefined);
+    const environment = found && account ? await this.claimIfUnowned(found, account, 'auto') : found;
+    if (this.left !== left || this.current || this.disposed) return false;
+    if (!environment || !isAvailableTo(environment, account)) return false;
+    this.left = undefined;
+    this.logger.info(`The signed-in GitHub account may use ${left.repository} again. The window reloads to open it.`);
+    await this.deps.connection.open(left.containerName, environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository));
     return true;
+  }
+
+  /**
+   * Concept 7.5: the token of the owner account leaves the running container of an environment that the signed-in
+   * account may not use, so that Git there cannot push as the owner while a window keeps its connection. The credential
+   * helper of the container then gives nothing; the next open of the owner writes the token again (section 9).
+   * Best effort: a stopped container needs no removal (its token cannot be used without a start by the owner).
+   */
+  private async removeGitToken(containerName: string): Promise<void> {
+    if (!(await this.containerRuns(containerName))) return;
+    const result = await this.deps.docker.exec(containerName, ['rm', '-f', GITHUB_TOKEN_FILE], {
+      user: 'root',
+      timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS,
+    });
+    if (result.exitCode === 0) this.logger.info(`The GitHub token was removed from the container ${containerName}.`);
+    else this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${result.stderr.trim()}`);
+  }
+
+  /**
+   * Concept 7.5, role A and a restored registry: the environment that this window is attached to, when it belongs to the
+   * signed-in account (an entry of an older version is claimed first; a sign-in is asked for when needed). Otherwise
+   * the window runs no pipeline, starts no container, and closes its remote connection with a message; `undefined`.
+   * Assumption (V-8): the activation blocks the connection of a restored window (V-2), so the window of another account
+   * never connects to a stopped container; a container that still runs is closed right after the connection.
+   */
+  private async ownWindowEnvironment(environment: Environment, containerName: string): Promise<Environment | undefined> {
+    const account = await this.readAccount(true);
+    // Before the connection of a restored window: no question (concept 7.5), only an unambiguous claim.
+    const current = account ? await this.claimIfUnowned(environment, account, 'auto') : environment;
+    if (account && isAvailableTo(current, account)) return current;
+    const repository = this.displayName({ repository: environment.repository });
+    let message: string;
+    if (!account) {
+      this.logger.info('Nobody is signed in to GitHub. The window closes its remote connection.');
+      message = ControllerTexts.signedOutConnection(repository);
+    } else if (current.owner === undefined) {
+      this.logger.info(
+        `The environment ${environment.id} of an older version does not belong to an account yet. The window closes its remote connection.`,
+      );
+      message = ControllerTexts.ownerNotConfirmedConnection(repository);
+    } else {
+      this.logger.info('This window is attached to an environment of another GitHub account. It closes its remote connection.');
+      message = Messages.otherAccountConnection(repository);
+    }
+    await this.leaveEnvironment(message, { environmentId: environment.id, containerName, repository, reason: 'account' });
+    return undefined;
+  }
+
+  /**
+   * Sign-in, sign-out, or account change (concept 7.5): a window connected to an environment that the new account may
+   * not use closes its remote connection at once. The Session Monitor stops the container after the waiting time.
+   * A window that has left such an environment but kept its connection reloads when the owner account signs in again.
+   */
+  async onSessionChanged(): Promise<void> {
+    const current = this.current;
+    if (this.disposed) return;
+    if (!current) {
+      await this.checkLeftConnection(false);
+      return;
+    }
+    const account = await this.readAccount();
+    const environment = (await this.deps.registry.get(current.environment.id).catch(() => undefined)) ?? current.environment;
+    if (isAvailableTo(environment, account) || this.current !== current) return;
+    const repository = this.displayName({ repository: environment.repository });
+    this.logger.info(
+      account
+        ? `The GitHub account changed. ${repository} belongs to another account: the window closes its remote connection.`
+        : 'Nobody is signed in to GitHub anymore. The window closes its remote connection.',
+    );
+    await this.leaveEnvironment(
+      account ? Messages.otherAccountConnection(repository) : ControllerTexts.signedOutConnection(repository),
+      { environmentId: environment.id, containerName: current.containerName, repository, reason: 'account' },
+    );
+  }
+
+  /**
+   * True when the container of the environment exists and was made by an older version of the extension (concept
+   * section 9: it uses the Git of the computer). False when Docker cannot be asked. Never throws.
+   */
+  private async containerOutdated(environmentId: string): Promise<boolean> {
+    if (!this.deps.docker.isInstalled()) return false;
+    try {
+      const container = await this.deps.docker.findContainer(environmentId);
+      return container !== undefined && !containerIsCurrent(container.labels);
+    } catch (error) {
+      this.logger.info(`The container of the environment ${environmentId} could not be read: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   /** Concept 6.3 "Connection lost": the container of this window does not run (for example after a Docker restart). */
@@ -1328,6 +1611,70 @@ export class Controller implements vscode.Disposable {
    * Palette) a Quick Pick. The environment is read from the registry again: the row may be older than the registry.
    */
   private async resolveTarget(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
+    const target = await this.resolveTargetOfAnyAccount(argument, pick, placeholder);
+    // Show on GitHub needs no environment; every other command refuses an environment of another account (concept 7.5).
+    if (!target || pick === 'gitHub') return target;
+    return this.ownTarget(target);
+  }
+
+  /**
+   * Concept 7.5: the target, when its environment (if any) belongs to the signed-in account; an entry of an older
+   * version is claimed first. Asks for a sign-in when the target has an environment and nobody is signed in. Otherwise
+   * shows Messages.otherAccount and returns `undefined`.
+   */
+  private async ownTarget(target: Target): Promise<Target | undefined> {
+    const environment = target.environment;
+    if (!environment) return target;
+    const account = await this.readAccount(true);
+    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    // A command of the user: an entry of an older version is assigned after a question when the claim is not unambiguous.
+    const current = await this.claimIfUnowned(environment, account, 'interactive');
+    if (isAvailableTo(current, account)) return { ...target, environment: current };
+    if (current.owner === undefined) {
+      // Not "another account": nobody owns the entry yet (no answer of GitHub, no access, or no confirmation).
+      this.logger.info(`The environment ${environment.id} of an older version does not belong to an account yet. It is not used.`);
+      this.warn(Messages.olderEnvironmentNotAssigned(this.displayName(target)));
+      return undefined;
+    }
+    this.logger.info(`The environment ${environment.id} belongs to another GitHub account. It is not used.`);
+    this.warn(ControllerTexts.otherAccount(this.displayName(target)));
+    return undefined;
+  }
+
+  /**
+   * An environment without owner (of an older version) is claimed for `account` (EnvironmentClaims, concept 7.5): in the
+   * mode `auto` only when it can belong to no other account, in the mode `interactive` also after a question to the user.
+   * The token and the account come from one session: a session that changed since `account` was read claims nothing.
+   */
+  private async claimIfUnowned(environment: Environment, account: GitHubAccount, mode: ClaimMode): Promise<Environment> {
+    if (environment.owner) return environment;
+    let session: { token: string; account: GitHubAccount } | undefined;
+    try {
+      session = await this.deps.auth.getSession({ interactive: false });
+    } catch (error) {
+      this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+      return environment;
+    }
+    if (!session) return environment;
+    if (session.account.id !== account.id) {
+      this.logger.info(`The GitHub session changed. The environment ${environment.id} is not claimed.`);
+      return environment;
+    }
+    await this.deps.claims.claim(session.account, session.token, { mode, environmentIds: [environment.id] });
+    return (await this.deps.registry.get(environment.id)) ?? environment;
+  }
+
+  /** The signed-in account; `undefined` without a sign-in, or when the session cannot be read. */
+  private async readAccount(interactive = false): Promise<GitHubAccount | undefined> {
+    try {
+      return await this.deps.auth.getAccount({ interactive });
+    } catch (error) {
+      this.logger.warn(`The GitHub account could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
+  private async resolveTargetOfAnyAccount(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const { registry, sidebar } = this.deps;
     switch (argument.kind) {
       case 'row': {
@@ -1395,8 +1742,8 @@ export class Controller implements vscode.Disposable {
   }
 
   private async pickEnvironment(placeholder: string): Promise<Environment | undefined> {
-    const { registry, sidebar } = this.deps;
-    const environments = await registry.list();
+    const { sidebar } = this.deps;
+    const environments = await sidebar.availableEnvironments();
     if (environments.length === 0) {
       this.inform(ControllerTexts.noEnvironments);
       return undefined;
@@ -1520,6 +1867,12 @@ export class Controller implements vscode.Disposable {
   private inform(message: string): void {
     vscode.window
       .showInformationMessage(message)
+      .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
+  }
+
+  private warn(message: string): void {
+    vscode.window
+      .showWarningMessage(message)
       .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
   }
 

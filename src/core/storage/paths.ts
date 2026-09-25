@@ -40,8 +40,8 @@ export class StoragePaths {
   readonly registry: string;
   /** Lock folder for read-modify-write of the registry. */
   readonly registryLock: string;
-  /** Stored result of the discovery. */
-  readonly repositories: string;
+  /** Stored result of the discovery of version 1, shared by all accounts. It is removed (repositoriesFile replaces it). */
+  readonly legacyRepositories: string;
   /** Window status files, `<window-id>.json`. */
   readonly sessionsDir: string;
   /** Pending connection files, `<environment-id>.json`. */
@@ -62,7 +62,7 @@ export class StoragePaths {
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
     this.registryLock = path.join(root, 'registry.lock');
-    this.repositories = path.join(root, 'repositories.json');
+    this.legacyRepositories = path.join(root, 'repositories.json');
     this.sessionsDir = path.join(root, 'sessions');
     this.pendingDir = path.join(root, 'pending');
     this.operationsDir = path.join(root, 'operations');
@@ -71,6 +71,14 @@ export class StoragePaths {
     this.monitorLock = path.join(root, 'monitor.lock');
     this.monitorLog = path.join(root, 'monitor.log');
     this.helperState = path.join(root, 'helper.json');
+  }
+
+  /**
+   * Stored result of the discovery of one GitHub account: `repositories-<account ID>.json` (a list holds the repository
+   * names of one account, and is never shown to another). Throws for an ID that is not a valid file name part.
+   */
+  repositoriesFile(accountId: string): string {
+    return path.join(this.root, `repositories-${checkedId('account ID', accountId)}.json`);
   }
 
   /** `sessions/<window-id>.json`. Throws for an ID that is not a valid file name part (see `isStorageId`). */

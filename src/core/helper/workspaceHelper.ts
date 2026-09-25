@@ -33,11 +33,13 @@ import {
   type BaseDigestLookup,
   type HelperBuildKind,
 } from './helperImage';
+import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
 import {
   OVERRIDE_CONFIG_PATH,
   SECRETS_FOLDER,
   buildCommand,
   cloneCommand,
+  gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
   switchBranchCommand,
@@ -99,6 +101,13 @@ export const HELPER_IMAGE_RECHECK_MS = 60 * 60 * 1000;
 export const DOCKER_SOCKET = '/var/run/docker.sock';
 
 /**
+ * Time limit of the helper run that reads the merged configuration (readConfiguration). Without a container, the CLI
+ * reads the base image and the Features for it from the registries, and a network that drops packets would hold the
+ * open for as long as the time limits of TCP and HTTP. After this time the configuration is read without it.
+ */
+export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
+
+/**
  * Source of the socket mount (implementation notes 6). The source is a path on the machine of the Docker engine.
  * Assumption (V-7): Docker Desktop (macOS, Windows, and Linux) runs the engine in a VM, where the socket is
  * /var/run/docker.sock, whatever DOCKER_HOST points to on the computer. So a `unix://` DOCKER_HOST is used only on
@@ -112,8 +121,10 @@ export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Plat
   return socketPath;
 }
 
-// Variables that would break the tools in the helper (or point them to the computer) if a configuration referenced
-// them with ${localEnv:…}. The CLI resolves such a variable with the value of the helper instead.
+// Variables that would break the tools in the helper (or point them to the computer) if a caller passed them with the
+// `env` option of `run`. The pipeline passes no variable of the computer: `${localEnv:…}` resolves in the helper, to the
+// value of the helper for a variable that it sets itself (HELPER_ENV_NAMES, for example HOME=/root), otherwise to an empty
+// value or the default of the expression (concept section 9 "Host access").
 const RESERVED_ENV_NAMES = new Set(['PATH', 'HOSTNAME', 'PWD', 'OLDPWD', 'SHLVL', 'IFS', 'ENV', 'TMPDIR', 'TMP', 'TEMP', 'NODE_OPTIONS']);
 const RESERVED_ENV_PREFIXES = ['DOCKER_', 'BUILDX_', 'BUILDKIT_', 'LD_'];
 
@@ -277,6 +288,11 @@ class ResultLineFilter {
 
 interface StreamOptions {
   env?: Record<string, string>;
+  /**
+   * Time limit of the helper container (not of a build of the helper image before it). When it ends, the container is
+   * removed, and the run rejects with an Error that is not an AbortError.
+   */
+  timeoutMs?: number;
   input?: string;
   secrets?: boolean;
   /** See HelperRunSpec.docker (default `true`). */
@@ -421,24 +437,55 @@ export class WorkspaceHelper {
     return value;
   }
 
-  /** devcontainer read-configuration; returns the `configuration` object of its JSON output. Throws CommandError. */
+  /**
+   * devcontainer read-configuration --include-merged-configuration: the `configuration` object of its JSON output, and
+   * `mergedConfiguration` (with the metadata of the base image and the Features, or of the existing container), which
+   * the host access policy checks (concept section 9). Without a container, the CLI reads the base image and the Features
+   * for the merged configuration, from the registries when they are not local, and without the credentials of the
+   * extension; when that fails (for example offline, or a private base image), the configuration is read again without
+   * it and `merged` is `undefined`: the image metadata is checked before `up` in any case. The same happens when the
+   * read with the merged configuration takes longer than MERGED_CONFIGURATION_TIMEOUT_MS. With `merged: false`, the
+   * configuration is read without it at once (no network is needed). Variables of the computer (`${localEnv:…}`) are not
+   * passed. Throws CommandError.
+   */
   async readConfiguration(p: {
     volumeName: string;
     repository: string;
     configPath: string;
     environmentId: string;
-    localEnv: Record<string, string>;
+    /** Whether to read the merged configuration (default `true`). */
+    merged?: boolean;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
-  }): Promise<DevcontainerConfig> {
+  }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
+    if (p.merged !== false) {
+      try {
+        const value = await this.readConfigurationOutput(p, true, MERGED_CONFIGURATION_TIMEOUT_MS);
+        return { config: value.configuration as DevcontainerConfig, merged: isRecord(value.mergedConfiguration) ? value.mergedConfiguration : undefined };
+      } catch (error) {
+        // Only a cancel ends the read; the time limit is no AbortError.
+        if (isAbortError(error) || p.signal?.aborted) throw error;
+        this.deps.logger.warn(`The merged configuration of ${p.repository} could not be read: ${errorMessage(error)}`);
+      }
+    }
+    const value = await this.readConfigurationOutput(p, false);
+    return { config: value.configuration as DevcontainerConfig };
+  }
+
+  private async readConfigurationOutput(
+    p: { volumeName: string; repository: string; configPath: string; environmentId: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    merged: boolean,
+    timeoutMs?: number,
+  ): Promise<Record<string, unknown> & { configuration: Record<string, unknown> }> {
     const folder = this.repositoryFolder(p.repository);
     const args = readConfigurationArgs({
       workspaceFolder: folder,
       configPath: `${folder}/${checkConfigPath(p.configPath)}`,
       idLabel: `${LABEL_ENVIRONMENT_ID}=${p.environmentId}`,
+      merged,
     });
     const result = await this.runStreams(p.volumeName, ['devcontainer', ...args], {
-      env: p.localEnv,
+      timeoutMs,
       signal: p.signal,
       onStderr: p.onOutput ?? this.logOutput,
     });
@@ -452,7 +499,9 @@ export class WorkspaceHelper {
       } catch {
         continue;
       }
-      if (isRecord(value) && isRecord(value.configuration)) return value.configuration as DevcontainerConfig;
+      if (isRecord(value) && isRecord(value.configuration)) {
+        return value as Record<string, unknown> & { configuration: Record<string, unknown> };
+      }
     }
     throw new CommandError(command, result.exitCode, result.stdout, `No configuration in the output.\n${result.stderr}`);
   }
@@ -466,7 +515,6 @@ export class WorkspaceHelper {
     repository: string;
     configPath: string;
     imageName: string;
-    localEnv: Record<string, string>;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
@@ -475,7 +523,6 @@ export class WorkspaceHelper {
     const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
     this.deps.logger.info(`Building the environment image ${p.imageName} from ${p.configPath}.`);
     return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
-      env: p.localEnv,
       onOutput: p.onOutput,
       signal: p.signal,
     });
@@ -494,7 +541,6 @@ export class WorkspaceHelper {
     override: Record<string, unknown>;
     environmentId: string;
     removeExistingContainer: boolean;
-    localEnv: Record<string, string>;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -510,7 +556,6 @@ export class WorkspaceHelper {
     );
     try {
       return await this.runDevcontainer('devcontainer up', p.volumeName, upCommand(OVERRIDE_CONFIG_PATH, args), {
-        env: p.localEnv,
         input: JSON.stringify(p.override, null, 2),
         onOutput: p.onOutput,
         signal: p.signal,
@@ -521,6 +566,38 @@ export class WorkspaceHelper {
       if (!(await this.containerRuns(containerId, p.signal))) throw error;
       this.deps.logger.warn(`${description} The container ${containerId.slice(0, 12)} of ${p.repository} runs and is kept.`);
       return { outcome: 'success', containerId, lifecycleCommandFailure: description };
+    }
+  }
+
+  /**
+   * Writes the token of the owner account and the Git, Docker, and GPG configuration of the dev container into the volume
+   * (GIT_FILES_SCRIPT, concept section 9 "Git inside the container"), without the Docker socket, the cache volume, and
+   * network. The token goes to the helper on stdin only; it is never on a command line, in a variable, or in the output.
+   * Throws CommandError (with the token removed from the output).
+   */
+  async prepareGit(p: {
+    volumeName: string;
+    repository: string;
+    token: string;
+    identity: GitIdentity;
+    onOutput?: (text: string) => void;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    checkToken(p.token);
+    const { name } = checkRepository(p.repository);
+    const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
+    this.deps.logger.info(`Writing the Git configuration and the GitHub token of ${p.repository} into the volume ${p.volumeName}.`);
+    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+      input: p.token,
+      secrets: true,
+      docker: false,
+      network: false,
+      signal: p.signal,
+      onStdout: output,
+      onStderr: output,
+    });
+    if (result.exitCode !== 0) {
+      throw new CommandError('prepare Git', result.exitCode, redact(result.stdout, p.token), redact(result.stderr, p.token));
     }
   }
 
@@ -680,14 +757,13 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { env: Record<string, string>; input?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: { input?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
     const stdoutFilter = new ResultLineFilter(output);
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, helperCommand, {
-        env: options.env,
         input: options.input,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
@@ -759,7 +835,10 @@ export class WorkspaceHelper {
       `Workspace helper ${containerName}: ${describeCommand(command)}` +
         (envNames.length > 0 ? ` (variables: ${envNames.join(', ')})` : ''),
     );
-    const signal = options.signal;
+    // The time limit ends the run like a cancel, but only of this container.
+    const limit = options.timeoutMs !== undefined ? new AbortController() : undefined;
+    const timer = limit ? setTimeout(() => limit.abort(), options.timeoutMs) : undefined;
+    const signal = limit ? (options.signal ? AbortSignal.any([options.signal, limit.signal]) : limit.signal) : options.signal;
     // Killing the Docker CLI does not stop the container on every platform: remove it.
     const onAbort = (): void => {
       this.deps.docker.run(['rm', '-f', containerName], { timeoutMs: 30_000 }).catch(() => undefined);
@@ -772,7 +851,14 @@ export class WorkspaceHelper {
         onStdout: options.onStdout,
         onStderr: options.onStderr,
       });
+    } catch (error) {
+      if (limit?.signal.aborted && !options.signal?.aborted && isAbortError(error)) {
+        const seconds = Math.round((options.timeoutMs ?? 0) / 1000);
+        throw new Error(`The workspace helper ${containerName} did not end within ${seconds} seconds.`);
+      }
+      throw error;
     } finally {
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
     }
   }

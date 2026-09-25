@@ -8,6 +8,7 @@ import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
   CREDENTIAL_HELPER,
+  GIT_FILES_SCRIPT,
   GIT_SUMMARY_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
@@ -18,11 +19,13 @@ import {
   UP_SCRIPT,
   buildCommand,
   cloneCommand,
+  gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
   switchBranchCommand,
   upCommand,
 } from './scripts';
+import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
 function hasProgram(name: string, args: string[]): boolean {
   return !spawnSync(name, args, { stdio: 'ignore' }).error;
@@ -62,6 +65,7 @@ function runSh(command: string[], input = ''): { status: number | null; stdout: 
 const SHELL_SCRIPTS: Array<[string, string]> = [
   ['CLONE_SCRIPT', CLONE_SCRIPT],
   ['SWITCH_BRANCH_SCRIPT', SWITCH_BRANCH_SCRIPT],
+  ['GIT_FILES_SCRIPT', GIT_FILES_SCRIPT],
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
   ['BUILD_SCRIPT', BUILD_SCRIPT],
@@ -91,6 +95,16 @@ describe('shell scripts', () => {
       '/workspaces/api',
       'feature/x',
       'acme/api',
+    ]);
+    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual([
+      'sh',
+      '-c',
+      GIT_FILES_SCRIPT,
+      'sh',
+      'api',
+      'Me',
+      'me@x',
+      'helper',
     ]);
     expect(upCommand(OVERRIDE_CONFIG_PATH, ['up', '--x'])).toEqual(['sh', '-c', UP_SCRIPT, 'sh', OVERRIDE_CONFIG_PATH, 'up', '--x']);
     expect(buildCommand('/workspaces/api/.devcontainer/devcontainer.json', ['build'])).toEqual([
@@ -342,6 +356,151 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     expect(result.log).not.toContain('git switch');
     expect(result.log).toMatch(/find .*-exec chown -h 1000:1000/);
     expect(result.tokenLeft).toBe(false);
+  });
+});
+
+describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
+  // The script needs Linux (a tmpfs in /proc/mounts, GNU stat and mv). Fake tools on PATH stand in for them; Git is real.
+  const TOKEN = 'gho_secret_value';
+
+  function setup(): { ws: string; secrets: string; bin: string; log: string } {
+    const dir = tempDir();
+    const ws = path.join(dir, 'workspaces');
+    const secrets = path.join(dir, 'secrets');
+    const bin = path.join(dir, 'bin');
+    const log = path.join(dir, 'log');
+    fs.mkdirSync(path.join(ws, 'api'), { recursive: true });
+    fs.mkdirSync(secrets);
+    const tool = (name: string, body: string) => {
+      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(bin, name), 0o755);
+    };
+    tool('awk', 'exit 0');
+    tool('stat', 'echo 1000:1001');
+    tool('chown', `echo "chown $*" >> '${log}'`);
+    tool('mv', 'if [ "$1" = -fT ]; then shift; exec /bin/mv -f "$1" "$2"; fi\nexec /bin/mv "$@"');
+    return { ws, secrets, bin, log };
+  }
+
+  function run(env: { ws: string; secrets: string; bin: string }, token = TOKEN, folder = 'api') {
+    const script = GIT_FILES_SCRIPT.split(SECRETS_FOLDER).join(env.secrets).split('/workspaces').join(env.ws);
+    const command = gitFilesCommand(folder, { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
+    const result = spawnSync('sh', ['-c', script, ...command.slice(3)], {
+      encoding: 'utf8',
+      input: token,
+      env: { ...process.env, PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`, GIT_CONFIG_NOSYSTEM: '1' },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  function gitConfig(file: string, ...args: string[]): string {
+    return spawnSync('git', ['config', '--file', file, ...args], { encoding: 'utf8' }).stdout;
+  }
+
+  it('writes the token (0600), the Git configuration, and the Docker and GPG folders, owned by the repository owner', () => {
+    const env = setup();
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout + result.stderr).not.toContain(TOKEN);
+    const dir = path.join(env.ws, '.devenv+');
+    const tokenFile = path.join(dir, 'github-token');
+    expect(fs.readFileSync(tokenFile, 'utf8')).toBe(TOKEN);
+    expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
+    const cfg = path.join(dir, 'gitconfig');
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, 'user.email')).toBe('1001+scalarion@users.noreply.github.com\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    for (const folder of ['docker', 'gnupg', 'gnupg/private-keys-v1.d']) {
+      expect(fs.statSync(path.join(dir, folder)).mode & 0o777).toBe(0o700);
+    }
+    expect(fs.readdirSync(path.join(dir, 'gnupg', 'private-keys-v1.d'))).toEqual(['README-devenv']);
+    const chowned = fs.readFileSync(env.log, 'utf8');
+    expect(chowned).toContain(`chown 1000:1001 ${path.join(dir, '.work.')}`);
+    expect(chowned).toContain(`chown -h 1000:1001 ${dir} ${dir}/docker ${dir}/gnupg ${dir}/gnupg/private-keys-v1.d`);
+    expect(chowned).toContain(cfg);
+    // The token is gone from the tmpfs, and no temporary folder is left.
+    expect(fs.readdirSync(env.secrets)).toEqual([]);
+    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token', 'gnupg']);
+    // The file for the credential helpers of the user: only comments, readable by every user of the container.
+    const credentials = path.join(dir, 'credentials.gitconfig');
+    expect(fs.readFileSync(credentials, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
+    expect(fs.statSync(credentials).mode & 0o777).toBe(0o644);
+    expect(spawnSync('git', ['config', '--file', credentials, '--list'], { encoding: 'utf8' })).toMatchObject({ status: 0, stdout: '' });
+    expect(chowned).toContain(`${cfg} ${credentials}`);
+    // The token is only in the token file.
+    expect(spawnSync('grep', ['-rl', TOKEN, env.ws], { encoding: 'utf8' }).stdout.trim()).toBe(tokenFile);
+  });
+
+  it('writes a new token at each run, and keeps the changes of the user in the Git configuration', () => {
+    const env = setup();
+    expect(run(env).status).toBe(0);
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    spawnSync('git', ['config', '--file', cfg, 'user.name', 'Changed Name']);
+    spawnSync('git', ['config', '--file', cfg, 'alias.st', 'status']);
+    const before = fs.readFileSync(cfg, 'utf8');
+    expect(run(env, 'gho_new_token').status).toBe(0);
+    expect(fs.readFileSync(path.join(env.ws, '.devenv+', 'github-token'), 'utf8')).toBe('gho_new_token');
+    // Unchanged: the credential section is as it must be.
+    expect(fs.readFileSync(cfg, 'utf8')).toBe(before);
+
+    // The credential helpers of the user stay.
+    const credentials = path.join(env.ws, '.devenv+', 'credentials.gitconfig');
+    fs.writeFileSync(credentials, '[credential "https://gitlab.example.com"]\n\thelper = store\n');
+    expect(run(env).status).toBe(0);
+    expect(fs.readFileSync(credentials, 'utf8')).toBe('[credential "https://gitlab.example.com"]\n\thelper = store\n');
+
+    // A changed credential section is repaired; the rest of the file stays.
+    spawnSync('git', ['config', '--file', cfg, '--replace-all', 'credential.https://github.com.helper', 'store']);
+    expect(run(env).status).toBe(0);
+    expect(gitConfig(cfg, 'user.name')).toBe('Changed Name\n');
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  it('replaces a link in place of the configuration folder, so the token never goes into the repository', () => {
+    const env = setup();
+    fs.symlinkSync(path.join(env.ws, 'api'), path.join(env.ws, '.devenv+'));
+    expect(run(env).status).toBe(0);
+    expect(fs.lstatSync(path.join(env.ws, '.devenv+')).isDirectory()).toBe(true);
+    expect(fs.readdirSync(path.join(env.ws, 'api'))).toEqual([]);
+  });
+
+  it('replaces a link or a folder in place of credentials.gitconfig', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const target = path.join(env.ws, 'api', 'target');
+    fs.writeFileSync(target, 'x');
+    fs.symlinkSync(target, path.join(dir, 'credentials.gitconfig'));
+    expect(run(env).status).toBe(0);
+    expect(fs.lstatSync(path.join(dir, 'credentials.gitconfig')).isFile()).toBe(true);
+    expect(fs.readFileSync(target, 'utf8')).toBe('x');
+
+    fs.rmSync(path.join(dir, 'credentials.gitconfig'));
+    fs.mkdirSync(path.join(dir, 'credentials.gitconfig'));
+    expect(run(env).status).toBe(0);
+    expect(fs.readFileSync(path.join(dir, 'credentials.gitconfig'), 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
+  });
+
+  it('writes nothing without the repository folder, and nothing without a tmpfs for the token', () => {
+    const env = setup();
+    const missing = run(env, TOKEN, 'other');
+    expect(missing.status).toBe(4);
+    expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
+
+    write(path.join(env.bin, 'awk'), '#!/bin/sh\nexit 1\n');
+    const noTmpfs = run(env);
+    expect(noTmpfs.status).toBe(3);
+    expect(noTmpfs.stderr).toContain('is not a tmpfs mount');
+    expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
+    expect(noTmpfs.stdout + noTmpfs.stderr).not.toContain(TOKEN);
+  });
+
+  it('rejects an invalid folder name', () => {
+    const result = run(setup(), TOKEN, '../etc');
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('Invalid folder name');
   });
 });
 

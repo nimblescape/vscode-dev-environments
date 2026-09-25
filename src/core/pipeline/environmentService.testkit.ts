@@ -8,7 +8,15 @@ import { CommandError } from '../errors';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import type { CheckOutcome, ConfigReferences } from '../imageCheck/imageCheck';
 import type { ProgressStep } from '../messages';
-import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
+import {
+  CONTAINER_VERSION,
+  LABEL_CONTAINER_VERSION,
+  LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
+  LABEL_REPOSITORY,
+  environmentImageName,
+  resourceName,
+} from '../names';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunResult } from '../ports';
 import { StoragePaths } from '../storage/paths';
 import { EnvironmentRegistry } from '../storage/registry';
@@ -20,6 +28,7 @@ import type {
   DevcontainerResult,
   Environment,
   ExtensionSettings,
+  GitHubAccount,
   GitSummary,
 } from '../types';
 import {
@@ -41,6 +50,9 @@ export const DIGEST_OLD = `sha256:${'a'.repeat(64)}`;
 export const DIGEST_NEW = `sha256:${'b'.repeat(64)}`;
 export const FEATURE_DIGEST = `sha256:${'c'.repeat(64)}`;
 export const TOKEN = 'gho_testtoken';
+/** The signed-in account of the harness; seeded environments belong to it. */
+export const ACCOUNT: GitHubAccount = { id: '1001', login: 'octo' };
+export const OTHER_ACCOUNT: GitHubAccount = { id: '2002', login: 'someone' };
 export const WINDOW_ID = 'window-1';
 export const PID = 4242;
 export const T0 = Date.parse('2026-09-24T15:40:00.000Z');
@@ -208,14 +220,15 @@ export class FakeDocker implements EnvironmentDocker {
     this.images.add(reference);
   }
 
-  addContainer(p: { environmentId: string; name: string; state: ContainerState; image: string }): ContainerInfo {
+  /** `labels` default: the label devenv.container-version of the current setup. */
+  addContainer(p: { environmentId: string; name: string; state: ContainerState; image: string; labels?: Record<string, string> }): ContainerInfo {
     const id = `container-${++this.counter}`;
     const container: ContainerInfo = {
       id,
       name: p.name,
       state: p.state,
       rawState: p.state === 'running' ? 'running' : 'exited',
-      labels: { [LABEL_ENVIRONMENT_ID]: p.environmentId },
+      labels: { ...(p.labels ?? { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION) }), [LABEL_ENVIRONMENT_ID]: p.environmentId },
       image: p.image,
     };
     this.containers.set(id, container);
@@ -231,11 +244,17 @@ export class FakeDocker implements EnvironmentDocker {
   }
 }
 
-/** `Config` of an environment image whose metadata label names `remoteUser` (the base image entry comes first). */
-export function imageConfigWithUser(remoteUser: string): { User: string; Labels: Record<string, string> } {
+/**
+ * `Config` of an environment image whose metadata label names `remoteUser` (the base image entry comes first), with more
+ * entries (for example of Features) before the configuration.
+ */
+export function imageConfigWithUser(
+  remoteUser: string,
+  entries: Array<Record<string, unknown>> = [],
+): { User: string; Labels: Record<string, string> } {
   return {
     User: '',
-    Labels: { 'devcontainer.metadata': JSON.stringify([{ id: 'base', remoteUser: 'root' }, { remoteUser }]) },
+    Labels: { 'devcontainer.metadata': JSON.stringify([{ id: 'base', remoteUser: 'root' }, ...entries, { remoteUser }]) },
   };
 }
 
@@ -259,6 +278,8 @@ export class FakeHelper implements EnvironmentHelper {
   configurations: string[] | undefined;
   /** Resolved configuration that readConfiguration returns. */
   config: DevcontainerConfig = { image: BASE_IMAGE, features: { [FEATURE]: {} }, remoteUser: 'vscode' };
+  /** `mergedConfiguration` that readConfiguration returns (`undefined`: the CLI could not read it). */
+  merged: Record<string, unknown> | undefined = {};
   remoteUser = 'vscode';
   ensureImageError: Maybe<Error>;
   cloneError: Maybe<Error>;
@@ -279,13 +300,17 @@ export class FakeHelper implements EnvironmentHelper {
   lifecycleFailureReport: 'error' | 'result' = 'error';
   gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
   switchError: Maybe<Error>;
+  prepareGitError: Maybe<Error>;
+  /** More entries of the label devcontainer.metadata of a built image (for example of a Feature). */
+  buildMetadata: Array<Record<string, unknown>> = [];
   /** Hook while a build runs (to look at the registry or to abort). */
   onBuild: (imageName: string) => void | Promise<void> = () => undefined;
   onClone: () => void | Promise<void> = () => undefined;
   readonly clones: Array<{ volumeName: string; repository: string; branch?: string; token: string }> = [];
-  readonly builds: Array<{ imageName: string; configPath: string; localEnv: Record<string, string> }> = [];
-  readonly ups: Array<{ image: string; removeExistingContainer: boolean; override: Record<string, unknown>; localEnv: Record<string, string> }> = [];
-  readonly readConfigurationEnv: Array<Record<string, string>> = [];
+  readonly builds: Array<{ imageName: string; configPath: string }> = [];
+  readonly ups: Array<{ image: string; removeExistingContainer: boolean; override: Record<string, unknown> }> = [];
+  /** Each write of the token and the Git configuration into the volume. */
+  readonly gitPreparations: Array<{ volumeName: string; repository: string; token: string; identity: { name: string; email: string } }> = [];
   /** Volumes that a helper run created silently (the real helper does this for a missing volume). Must stay empty. */
   readonly silentlyCreatedVolumes: string[] = [];
 
@@ -325,31 +350,32 @@ export class FakeHelper implements EnvironmentHelper {
     return this.configurations ?? Object.keys(this.files);
   }
 
-  async readConfiguration(p: { volumeName: string; configPath: string; localEnv: Record<string, string> }): Promise<DevcontainerConfig> {
+  async readConfiguration(p: { volumeName: string; configPath: string }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
     this.mount(p.volumeName);
     this.calls.push(`readConfiguration ${p.configPath}`);
-    this.readConfigurationEnv.push(p.localEnv);
     if (this.readConfigurationError) throw this.readConfigurationError;
-    return JSON.parse(JSON.stringify(this.config)) as DevcontainerConfig;
+    const config = JSON.parse(JSON.stringify(this.config)) as DevcontainerConfig;
+    return this.merged === undefined ? { config } : { config, merged: { ...config, ...this.merged } };
   }
 
-  async build(p: {
-    volumeName: string;
-    configPath: string;
-    imageName: string;
-    localEnv: Record<string, string>;
-    signal?: AbortSignal;
-  }): Promise<DevcontainerResult> {
+  async prepareGit(p: { volumeName: string; repository: string; token: string; identity: { name: string; email: string } }): Promise<void> {
+    this.mount(p.volumeName);
+    this.calls.push('prepareGit');
+    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity } });
+    if (this.prepareGitError) throw this.prepareGitError;
+  }
+
+  async build(p: { volumeName: string; configPath: string; imageName: string; signal?: AbortSignal }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
     this.calls.push(`build ${p.imageName}`);
-    this.builds.push({ imageName: p.imageName, configPath: p.configPath, localEnv: p.localEnv });
+    this.builds.push({ imageName: p.imageName, configPath: p.configPath });
     await this.onBuild(p.imageName);
     if (p.signal?.aborted) throw abortError();
     const error = this.buildError(p.imageName);
     if (error) throw error;
     this.docker.images.add(p.imageName);
     // Like `devcontainer build`: the configuration (with the remote user) is the last entry of the metadata label.
-    this.docker.imageConfigs.set(p.imageName, imageConfigWithUser(this.remoteUser));
+    this.docker.imageConfigs.set(p.imageName, imageConfigWithUser(this.remoteUser, this.buildMetadata));
     return { outcome: 'success', imageName: p.imageName };
   }
 
@@ -358,12 +384,11 @@ export class FakeHelper implements EnvironmentHelper {
     override: Record<string, unknown>;
     environmentId: string;
     removeExistingContainer: boolean;
-    localEnv: Record<string, string>;
   }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
     const image = String(p.override.image);
     this.calls.push(`up ${image}${p.removeExistingContainer ? ' --remove-existing-container' : ''}`);
-    this.ups.push({ image, removeExistingContainer: p.removeExistingContainer, override: p.override, localEnv: p.localEnv });
+    this.ups.push({ image, removeExistingContainer: p.removeExistingContainer, override: p.override });
     const existing = this.docker.containersOf(p.environmentId)[0];
     const error = this.upError(image, p.removeExistingContainer);
     if (error && this.upFailsBeforeRemoval) throw error;
@@ -381,7 +406,14 @@ export class FakeHelper implements EnvironmentHelper {
       }
       const runArgs = p.override.runArgs as string[];
       const name = runArgs[runArgs.lastIndexOf('--name') + 1];
-      containerId = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image }).id;
+      // Like `docker run`: the labels of runArgs.
+      const labels: Record<string, string> = {};
+      runArgs.forEach((arg, index) => {
+        if (arg !== '--label') return;
+        const [key, ...value] = runArgs[index + 1].split('=');
+        labels[key] = value.join('=');
+      });
+      containerId = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels }).id;
     }
     const failure = this.lifecycleFailure(image);
     if (failure !== undefined) {
@@ -515,8 +547,10 @@ export interface Harness {
   progress: RecordingProgress;
   settings: ExtensionSettings;
   env: NodeJS.ProcessEnv;
-  /** Tokens that getToken returns, in order; `undefined` = not signed in. */
+  /** The token that getToken returns; `undefined` = not signed in. */
   token: string | undefined;
+  /** The account of the session (getAccount); none while `token` is `undefined`. */
+  account: GitHubAccount;
   /** Docker is stopped: the starter reports a start and starts it. */
   dockerStopped: boolean;
   dockerStartError: Maybe<Error>;
@@ -550,6 +584,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     settings: { ...DEFAULT_SETTINGS },
     env: { FOO: 'local-foo' } as NodeJS.ProcessEnv,
     token: TOKEN as string | undefined,
+    account: { ...ACCOUNT },
     dockerStopped: false,
     dockerStartError: undefined as Maybe<Error>,
     dockerStarts: 0,
@@ -576,7 +611,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     registry: h.registry,
     sessionFiles: h.sessionFiles,
     imageChecker: h.checker,
-    auth: { getToken: async () => h.token },
+    auth: { getToken: async () => h.token, getAccount: async () => (h.token === undefined ? undefined : h.account) },
     ui: h.ui,
     logger: h.logger,
     clock,
@@ -607,6 +642,10 @@ export interface SeedOptions {
   image?: boolean;
   /** The workspace volume exists. Default true. */
   volume?: boolean;
+  /** Labels of the container. Default: the label devenv.container-version of the current setup. */
+  containerLabels?: Record<string, string>;
+  /** Default: ACCOUNT. `null`: an entry of an older version without owner. */
+  owner?: GitHubAccount | null;
   extra?: Partial<Environment>;
 }
 
@@ -641,17 +680,22 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
     gitSummary: { branch: 'main', uncommittedFiles: 3, unpushedCommits: 4, stashes: 1, recordedAt: '2026-09-20T10:00:00.000Z' },
     lastBuildNumber: record?.buildNumber,
     ...(record ? { buildRecord: record } : {}),
+    ...(options.owner === null ? {} : { owner: options.owner ?? ACCOUNT }),
     ...options.extra,
   };
   await h.registry.add(environment);
-  if (options.volume !== false) h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository });
+  if (options.volume !== false) {
+    const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository };
+    if (environment.owner) labels[LABEL_OWNER_ID] = environment.owner.id;
+    h.docker.volumes.set(name, labels);
+  }
   if (record && options.image !== false) {
     h.docker.images.add(record.environmentImage);
     h.docker.imageConfigs.set(record.environmentImage, imageConfigWithUser('vscode'));
   }
   const state = options.container === undefined ? 'stopped' : options.container;
   if (state !== null) {
-    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(id, 1) });
+    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(id, 1), labels: options.containerLabels });
   }
   return environment;
 }
