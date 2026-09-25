@@ -9,7 +9,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Clock } from '../ports';
-import type { MonitorSettings, PendingOperation, WindowStatus } from '../types';
+import type { Environment, MonitorSettings, PendingOperation, WindowStatus } from '../types';
 import { StoragePaths } from './paths';
 import {
   DEFAULT_CLAIM_MAX_AGE_MS,
@@ -19,6 +19,7 @@ import {
   isPendingOperation,
   isReopenRecord,
   isWindowStatus,
+  pendingVolumesToRemove,
 } from './sessionFiles';
 
 const ENV_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -343,9 +344,25 @@ describe('validators', () => {
     expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: 'yes' })).toBe(false);
     expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db', 3] })).toBe(false);
     expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db'] })).toBe(true);
+    // A pending delete of an earlier version.
+    expect(isPendingOperation({ ...operation(ENV_A), removeAdditionalVolumes: true })).toBe(true);
+    expect(isPendingOperation({ ...operation(ENV_A), removeAdditionalVolumes: 'yes' })).toBe(false);
     expect(isReopenRecord({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isReopenRecord(null)).toBe(false);
     expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isMonitorSettings({ waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(false);
+  });
+});
+
+describe('pendingVolumesToRemove', () => {
+  const env = { additionalVolumes: ['db', 'cache'] } as Environment;
+  it.each<[string, Partial<PendingOperation>, string[]]>([
+    ['the confirmed list', { additionalVolumesToRemove: ['db'] }, ['db']],
+    ['an empty confirmed list', { additionalVolumesToRemove: [] }, []],
+    ['the request of an earlier version that removes them', { removeAdditionalVolumes: true }, ['db', 'cache']],
+    ['the request of an earlier version that keeps them', { removeAdditionalVolumes: false }, []],
+    ['no choice', {}, []],
+  ])('%s', (_name, fields, expected) => {
+    expect(pendingVolumesToRemove({ ...operation(ENV_A), ...fields }, env)).toEqual(expected);
   });
 });

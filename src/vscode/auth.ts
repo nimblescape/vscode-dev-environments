@@ -75,7 +75,10 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
    * `session.account.label` (the login). `undefined` without a session.
    */
   async getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined> {
-    const session = await this.session(GITHUB_SCOPES, options.interactive);
+    // The account needs no working token: a session whose token GitHub rejected still names it, so commands on the
+    // environments of the account (Stop, Delete) ask for no new sign-in. Only without any session a dialog shows.
+    const existing = options.interactive ? await this.session(GITHUB_SCOPES, false) : undefined;
+    const session = existing ?? (await this.session(GITHUB_SCOPES, options.interactive));
     return session ? { id: session.account.id, login: session.account.label } : undefined;
   }
 

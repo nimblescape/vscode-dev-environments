@@ -35,6 +35,8 @@ export interface ContainerInfo {
   labels: Record<string, string>;
   /** Image reference that the container was created from (`Config.Image`), for example `devenv-3f2a9c1e:2`. */
   image: string;
+  /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
+  volumes?: string[];
 }
 
 export interface VolumeInfo {
@@ -186,8 +188,16 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
     rawState: state.Status,
     labels: toLabels(isRecord(config) ? config.Labels : undefined),
     image,
+    volumes: mountedVolumes(value.Mounts),
     created: typeof value.Created === 'string' ? value.Created : '',
   };
+}
+
+function mountedVolumes(mounts: unknown): string[] {
+  if (!Array.isArray(mounts)) return [];
+  return mounts
+    .filter((mount): mount is Record<string, unknown> => isRecord(mount) && mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '')
+    .map((mount) => mount.Name as string);
 }
 
 function toVolumeInfo(value: unknown): VolumeInfo | undefined {
@@ -196,8 +206,8 @@ function toVolumeInfo(value: unknown): VolumeInfo | undefined {
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image } = container;
-  return { id, name, state, rawState, labels, image };
+  const { id, name, state, rawState, labels, image, volumes } = container;
+  return { id, name, state, rawState, labels, image, ...(volumes && volumes.length > 0 ? { volumes } : {}) };
 }
 
 /** Newest first; a running container before a stopped one. */

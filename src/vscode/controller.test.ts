@@ -1345,6 +1345,20 @@ describe('Window roles', () => {
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
+  it('role B: a pending delete of an earlier version (removeAdditionalVolumes) removes the volumes that its question listed', async () => {
+    await h.registry.add(environment({ additionalVolumes: ['api-db'] }));
+    await h.sessionFiles.writeOperation({
+      environmentId: ENV_ID,
+      operation: 'delete',
+      requestedAt: iso(NOW - 5000),
+      requestedBy: 'old-window',
+      reason: 'manual',
+      removeAdditionalVolumes: true,
+    });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+  });
+
   it('role B: runs a pending delete and a pending stop', async () => {
     await h.registry.add(environment());
     await h.registry.add(environment({ id: 'b1c2d3e4-0000-4000-8000-000000000002', repository: 'acme/web', containerName: 'web', volumeName: 'web' }));
@@ -1672,7 +1686,8 @@ describe('Accounts (concept 7.5)', () => {
       h.quickPicks[0].pick('release/2.0');
       await command;
       expect(h.service.switchBranch).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0' }));
+      // The command asked already: the open does not ask about the entry again.
+      expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0', olderEnvironmentAsked: true }));
       expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
     });
   });

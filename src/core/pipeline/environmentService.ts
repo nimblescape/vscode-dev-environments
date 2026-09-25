@@ -255,6 +255,11 @@ export interface OpenOptions extends OperationOptions {
   forceRebuild?: boolean;
   /** "Select configuration…": change the configuration first. Implies a rebuild when an environment exists. */
   configPath?: string;
+  /**
+   * The command asked the user already whether an entry of an older version of the repository is assigned (Switch
+   * branch…, Select configuration…): the open does not ask about a declined entry again (concept 7.5).
+   */
+  olderEnvironmentAsked?: boolean;
 }
 
 export interface OpenResult {
@@ -588,7 +593,7 @@ export class EnvironmentService {
       try {
         // The account decides which environment is used, and the token of the same session goes into it.
         const session = await this.requireSession();
-        const existing = await this.environmentFor(target.repository, session, options.signal);
+        const existing = await this.environmentFor(target.repository, session, options.signal, options.olderEnvironmentAsked !== true);
         if (existing) {
           if (options.branch !== undefined) {
             this.logger.info(`The branch ${options.branch} applies only to a first open; use Switch branch for an environment.`);
@@ -628,6 +633,7 @@ export class EnvironmentService {
     repository: string,
     session: GitHubSession,
     signal: AbortSignal | undefined,
+    askAgain: boolean,
   ): Promise<Environment | undefined> {
     const own = await this.deps.registry.findForAccount(repository, session.account.id);
     if (own) return own;
@@ -638,7 +644,7 @@ export class EnvironmentService {
       await this.deps.claims.claim(session.account, session.token, {
         mode: 'interactive',
         environmentIds: [older.id],
-        askAgain: true,
+        askAgain,
         signal,
         onUnanswered: () => {
           unanswered = true;
@@ -680,7 +686,8 @@ export class EnvironmentService {
     // work of the user. It becomes the environment again; a second environment would hide it. Docker runs now, so the
     // volumes are read also when the registry was lost while Docker was stopped, or when registry.json is invalid.
     if ((await this.reconcileFromVolumes()) > 0) {
-      const restored = await this.environmentFor(target.repository, session, signal);
+      // The question about an entry of an older version was asked a moment ago: a declined one is not asked about again.
+      const restored = await this.environmentFor(target.repository, session, signal, false);
       if (restored) {
         this.logger.info(`An environment of ${target.repository} was restored from its volume ${restored.volumeName}. It is used.`);
         if (options.branch !== undefined) {
@@ -2188,6 +2195,16 @@ export class EnvironmentService {
       });
     }
     if (candidates.length === 0) return 0;
+    // The additional volumes are not on the workspace volume: the container of the environment, which a lost registry does
+    // not remove, still mounts them. Without them, another account's environment could take them over as its own.
+    const containers = await docker.listEnvironmentContainers();
+    for (const candidate of candidates) {
+      const volumes = containers
+        .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
+        .flatMap((container) => container.volumes ?? [])
+        .filter((name) => name !== candidate.volumeName);
+      if (volumes.length > 0) candidate.additionalVolumes = [...new Set(volumes)];
+    }
     const skipped: string[] = [];
     const added = await this.deps.registry.update((file) => {
       let count = 0;

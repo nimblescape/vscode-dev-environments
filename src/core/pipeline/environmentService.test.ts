@@ -2006,6 +2006,19 @@ describe('reconcileFromVolumes', () => {
     expect(await h.service.reconcileFromVolumes()).toBe(0);
   });
 
+  it('restores the additional volumes from the container of the environment, so that another account cannot take them over', async () => {
+    const name = resourceName('acme/api', OTHER_ID);
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api', [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    h.docker.containers.set(container.id, { ...container, volumes: [name, 'api-node_modules'] });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
+    // The first open of the signed-in account is refused the volume of the other account's restored environment.
+    h.helper.config = { image: BASE_IMAGE, mounts: ['source=api-node_modules,target=/n,type=volume'] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('volume api-node_modules of another environment'));
+  });
+
   it('restores one environment per repository and owner: two accounts, and one entry of an older version (concept D-3)', async () => {
     const ids = ['a0000001-0000-4000-8000-000000000001', 'a0000002-0000-4000-8000-000000000002', 'a0000003-0000-4000-8000-000000000003'];
     const skippedIds = ['b0000004-0000-4000-8000-000000000004', 'b0000005-0000-4000-8000-000000000005'];

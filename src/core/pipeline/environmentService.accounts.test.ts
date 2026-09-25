@@ -44,8 +44,8 @@ function recreate(overrides: Partial<EnvironmentServiceDeps>): void {
   h = createHarness(overrides);
 }
 
-function options(): { progress: typeof h.progress } {
-  return { progress: h.progress };
+function options(extra: { olderEnvironmentAsked?: boolean } = {}): { progress: typeof h.progress; olderEnvironmentAsked?: boolean } {
+  return { progress: h.progress, ...extra };
 }
 
 /** A switch of the GitHub account in VS Code: another account, with a token of its own. */
@@ -295,6 +295,28 @@ describe('entries of an older version at Start (concept 7.5, D-3)', () => {
     expect(confirm).toHaveBeenCalledTimes(3);
     expect(result.environment.id).toBe(ENV_ID);
     expect(result.environment.owner).toEqual(ACCOUNT);
+  });
+
+  it('does not ask again about a declined entry when the command asked already (Switch branch…, Select configuration…)', async () => {
+    const { confirm } = withClaims(() => false);
+    await seedEnvironment(h, { owner: null, extra: { additionalVolumes: ['api-node_modules'] } });
+    await rejection(h.service.open(TARGET, options()));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    const error = await rejection(h.service.open(TARGET, options({ olderEnvironmentAsked: true })));
+    expect(error.message).toBe(Messages.olderEnvironmentUsesVolumes(REPO));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    await rejection(h.service.open(TARGET, options()));
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks once in one open, also when the restore of a lost registry adds an entry of another repository', async () => {
+    const { confirm } = withClaims(() => false);
+    await seedEnvironment(h, { owner: null });
+    const web = 'e0000001-0000-4000-8000-000000000001';
+    h.docker.volumes.set(resourceName('acme/web', web), { [LABEL_ENVIRONMENT_ID]: web, [LABEL_REPOSITORY]: 'acme/web' });
+    const own = (await h.service.open(TARGET, options())).environment;
+    expect(own.id).not.toBe(ENV_ID);
+    expect(confirm).toHaveBeenCalledTimes(1);
   });
 
   it('creates an environment of the account when GitHub does not return the repository of the entry to it', async () => {

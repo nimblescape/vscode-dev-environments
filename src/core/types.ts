@@ -190,6 +190,11 @@ export interface PendingOperation {
    * that the environment recorded after the question is kept.
    */
   additionalVolumesToRemove?: string[];
+  /**
+   * For `delete`, written by an earlier version: also remove the additional volumes. That version's question listed the
+   * recorded additional volumes, so they are removed (pendingVolumesToRemove).
+   */
+  removeAdditionalVolumes?: boolean;
 }
 
 /** Content of reopen.json (concept 7.10). */

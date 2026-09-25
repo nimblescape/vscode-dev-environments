@@ -18,7 +18,7 @@ import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core
 import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
 import { containerIsCurrent } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
-import type { SessionFiles } from '../core/storage/sessionFiles';
+import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
 import type {
   BusyMark,
   BusyOperation,
@@ -142,6 +142,8 @@ interface Target {
    * account that is signed in then (D-3).
    */
   named?: boolean;
+  /** The command asked whether the entry of an older version of the repository is assigned (the open does not ask again). */
+  olderEnvironmentAsked?: boolean;
 }
 
 interface StartOptions {
@@ -813,6 +815,7 @@ export class Controller implements vscode.Disposable {
                   signal,
                   branch: options.branch,
                   configPath: options.configPath,
+                  olderEnvironmentAsked: target.olderEnvironmentAsked,
                 });
               }
               await this.connect(result, progress, request, signal);
@@ -1231,7 +1234,7 @@ export class Controller implements vscode.Disposable {
         operation: request.operation,
         reason: request.reason,
         configPath: request.configPath,
-        additionalVolumesToRemove: request.additionalVolumesToRemove,
+        additionalVolumesToRemove: request.operation === 'delete' ? pendingVolumesToRemove(request, environment) : undefined,
       },
       HAND_OFF_BUSY[request.operation],
     );
@@ -1261,7 +1264,7 @@ export class Controller implements vscode.Disposable {
           await this.operation(
             this.displayName(target),
             'Delete',
-            () => this.deleteWithProgress(this.displayName(target), environment, operation.additionalVolumesToRemove ?? []),
+            () => this.deleteWithProgress(this.displayName(target), environment, pendingVolumesToRemove(operation, environment)),
             { retry: () => this.delete({ kind: 'environment', environmentId: environment.id }) },
           );
           return;
@@ -1675,7 +1678,7 @@ export class Controller implements vscode.Disposable {
     const older = account ? await this.deps.registry.findUnowned(target.repository) : undefined;
     if (!account || !older) return target;
     const claimed = await this.claimIfUnowned(older, account, 'interactive');
-    return isAvailableTo(claimed, account) ? { ...target, environment: claimed } : target;
+    return isAvailableTo(claimed, account) ? { ...target, environment: claimed } : { ...target, olderEnvironmentAsked: true };
   }
 
   /**

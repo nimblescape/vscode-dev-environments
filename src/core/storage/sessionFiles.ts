@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { isoTime, systemClock, type Clock } from '../ports';
 import type {
+  Environment,
   MonitorSettings,
   PendingConnection,
   PendingOperation,
@@ -259,8 +260,18 @@ export function isPendingOperation(value: unknown): value is PendingOperation {
     isKeyOf(OPERATION_REASONS, value.reason) &&
     (value.configPath === undefined || isNonEmptyString(value.configPath)) &&
     (value.additionalVolumesToRemove === undefined ||
-      (Array.isArray(value.additionalVolumesToRemove) && value.additionalVolumesToRemove.every(isNonEmptyString)))
+      (Array.isArray(value.additionalVolumesToRemove) && value.additionalVolumesToRemove.every(isNonEmptyString))) &&
+    (value.removeAdditionalVolumes === undefined || typeof value.removeAdditionalVolumes === 'boolean')
   );
+}
+
+/**
+ * The additional volumes that a pending delete removes: the confirmed list, or for the request of an earlier version
+ * (`removeAdditionalVolumes`), the volumes that `environment` records, which its question listed.
+ */
+export function pendingVolumesToRemove(operation: PendingOperation, environment: Environment): string[] {
+  if (operation.additionalVolumesToRemove) return operation.additionalVolumesToRemove;
+  return operation.removeAdditionalVolumes === true ? [...(environment.additionalVolumes ?? [])] : [];
 }
 
 export function isReopenRecord(value: unknown): value is ReopenRecord {

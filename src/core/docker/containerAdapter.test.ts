@@ -283,6 +283,23 @@ describe('containers', () => {
     expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1' }]);
   });
 
+  it('reads the named volumes that a container mounts', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['c1']));
+      const container = {
+        ...(containerJson({ id: 'c1', name: 'x', status: 'running' }) as Record<string, unknown>),
+        Mounts: [
+          { Type: 'volume', Name: 'devenv-acme-api-3f2a9c1e', Destination: '/workspaces' },
+          { Type: 'volume', Name: 'api-node_modules', Destination: '/workspaces/api/node_modules' },
+          { Type: 'bind', Source: '/tmp', Destination: '/tmp' },
+          { Type: 'tmpfs', Destination: '/run' },
+        ],
+      };
+      return ok(inspectOutput([container]));
+    });
+    expect((await docker.listEnvironmentContainers())[0].volumes).toEqual(['devenv-acme-api-3f2a9c1e', 'api-node_modules']);
+  });
+
   it('throws when inspect fails for another reason', async () => {
     const { docker } = adapter((call) => {
       if (call.args[0] === 'ps') return ok(idLines(['c1']));

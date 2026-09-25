@@ -153,6 +153,20 @@ describe('VsCodeGitHubAuth (concept section 9)', () => {
       auth.dispose();
     });
 
+    it('gives the account of a rejected session without a dialog: commands on its environments need no new sign-in', async () => {
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      getSession.mockResolvedValue(rejectedSession);
+      auth.reportRejectedToken('gho_old');
+      await vi.waitFor(() => expect(fakeVscode.commands.executeCommand).toHaveBeenCalled());
+      getSession.mockClear();
+      await expect(auth.getAccount({ interactive: true })).resolves.toEqual({ id: '1', login: 'octocat' });
+      expect(getSession.mock.calls.map((call) => call[2])).toEqual([{ silent: true }]);
+      // A request that needs a working token asks for a new session.
+      await auth.getToken({ interactive: true });
+      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { forceNewSession: true });
+      auth.dispose();
+    });
+
     it('ignores a token that belongs to no current session', async () => {
       const auth = new VsCodeGitHubAuth(silentLogger);
       const states = vi.fn();
