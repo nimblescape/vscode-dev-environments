@@ -125,6 +125,12 @@ describe('host access policy: runArgs', () => {
     ['a port on all addresses', ['-p', '0.0.0.0:8080:80'], ['published port 0.0.0.0:8080:80']],
     ['a port on a LAN address', ['--publish=192.168.1.5:8080:80'], ['published port 192.168.1.5:8080:80']],
     ['a port on all IPv6 addresses', ['-p', '[::]:8080:80'], ['published port [::]:8080:80']],
+    // Docker's long syntax has no address: Docker publishes it on all addresses, also with 127.0.0.1:: in front of it.
+    ['a port in the long syntax', ['-p', 'published=8080,target=80'], ['published port published=8080,target=80']],
+    ['a port in the long syntax after an unknown key', ['-p', 'x=y,published=8080,target=80'], ['published port x=y,published=8080,target=80']],
+    ['a port in the long syntax with --publish=', ['--publish=published=9090,target=90'], ['published port published=9090,target=90']],
+    ['a port in the long syntax attached to -p', ['-ppublished=8080,target=80'], ['published port published=8080,target=80']],
+    ['a port in the long syntax behind 127.0.0.1', ['-p', '127.0.0.1::published=8080,target=80'], ['published port 127.0.0.1::published=8080,target=80']],
     ['all ports', ['-P'], ['publishing all ports (-P)']],
     ['all ports, long form', ['--publish-all'], ['publishing all ports (--publish-all)']],
     ['the platform (as in build.options)', ['--platform', 'linux/amd64', '--init', '--platform=linux/arm64'], []],
@@ -496,6 +502,7 @@ describe('host access policy: properties of the configuration, the merged config
     ['appPort without address', { appPort: '8080:80' }, []],
     ['appPort on 127.0.0.1', { appPort: ['127.0.0.1:8080:80'] }, []],
     ['appPort on all addresses', { appPort: ['0.0.0.0:8080:80', 3000] }, ['published port 0.0.0.0:8080:80']],
+    ['appPort in the long syntax of docker run', { appPort: ['published=8080,target=80'] }, ['published port published=8080,target=80']],
     [
       'variables of container-only Git in containerEnv and remoteEnv',
       { containerEnv: { GIT_CONFIG_GLOBAL: '/x', FOO: 'bar' }, remoteEnv: { GIT_SSH_COMMAND: 'ssh', GIT_CONFIG_PARAMETERS: "'a=b'", PATH: '${containerEnv:PATH}:/x' } },
@@ -710,6 +717,8 @@ describe('ports on localhost', () => {
     [':8080:80', '127.0.0.1:8080:80'],
     ['127.0.0.1:8080:80', '127.0.0.1:8080:80'],
     ['[::1]:8080:80', '[::1]:8080:80'],
+    // The long syntax is refused by the policy; a prefix would only hide it from the final check.
+    ['published=8080,target=80', 'published=8080,target=80'],
   ])('publishes %s as %s', (spec, expected) => {
     expect(withLoopbackAddress(spec)).toBe(expected);
   });

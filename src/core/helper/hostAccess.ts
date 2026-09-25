@@ -662,8 +662,13 @@ export function splitPortAddress(spec: string): { address: string | undefined; p
   return { address: parts.slice(0, -2).join(':'), ports: parts.slice(-2).join(':') };
 }
 
-/** A port that names an address other than a loopback address. Without an address, the extension adds 127.0.0.1. */
+/**
+ * A port that names an address other than a loopback address. Without an address, the extension adds 127.0.0.1.
+ * Docker's long syntax (`published=8080,target=80`: any value with `=`) has no key for the address, so Docker publishes
+ * it on all addresses, and an address in front of it becomes part of an unknown key: it is refused.
+ */
 function portProblems(spec: string): string[] {
+  if (spec.includes('=')) return [`published port ${spec.trim()}`];
   const { address } = splitPortAddress(spec.trim());
   if (address === undefined || address === '' || isLoopbackAddress(address)) return [];
   return [`published port ${spec.trim()}`];
@@ -684,6 +689,8 @@ function appPortProblems(appPort: unknown): string[] {
 /** `-p` and `appPort` values without an address get 127.0.0.1: `8080:80` → `127.0.0.1:8080:80`, `80` → `127.0.0.1::80`. */
 export function withLoopbackAddress(spec: string): string {
   const trimmed = spec.trim();
+  // The long syntax has no address (portProblems refuses it); a prefix would only hide it.
+  if (trimmed.includes('=')) return trimmed;
   const { address, ports } = splitPortAddress(trimmed);
   if (address !== undefined && address !== '') return trimmed;
   return ports.includes(':') ? `127.0.0.1:${ports}` : `127.0.0.1::${ports}`;
