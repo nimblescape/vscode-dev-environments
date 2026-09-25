@@ -17,7 +17,7 @@ import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
-import { repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
+import { TreeTexts, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -348,7 +348,7 @@ describe('Sidebar', () => {
     expect(h.service.currentBranch.mock.calls.map((call) => call[0])).toEqual([API]);
   });
 
-  it('offers no Start for a listed repository that has an environment of another account (D-3)', async () => {
+  it('offers Start for a listed repository that has an environment of another account, and names it nowhere (D-3)', async () => {
     await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
     // An entry of an older version is not counted: this account may still claim it.
     await h.registry.add(environment(GONE, 'acme/legacy', { owner: undefined }));
@@ -357,7 +357,10 @@ describe('Sidebar', () => {
     await h.sidebar.render();
     expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/legacy', 'majikmate/module-ts']);
     expect(rowOf('majikmate/module-ts').environment).toBeUndefined();
-    expect(rowOf('majikmate/module-ts').actions.canStart).toBe(false);
+    expect(rowOf('majikmate/module-ts').actions.canStart).toBe(true);
+    expect(rowOf('majikmate/module-ts').description).toBe('');
+    expect(rowOf('majikmate/module-ts').tooltip).toContain(TreeTexts.noEnvironment);
+    expect(JSON.stringify(h.models)).not.toContain(OLD);
     expect(rowOf('acme/legacy').actions.canStart).toBe(true);
     expect(rowOf('acme/api').actions.canStart).toBe(true);
   });

@@ -1546,14 +1546,27 @@ describe('Accounts (concept 7.5)', () => {
     for (const command of ['start', 'stop', 'delete', 'rebuild', 'switchBranch', 'selectConfiguration'] as const) {
       await run(command, row('acme/api', env));
     }
-    // A stale row without the environment, and a repository row: the registry names the hidden environment.
-    await run('start', row('acme/api'));
     // The status bar item Reconnect.
     await run('start', { environmentId: ENV_ID });
-    expect(warningMessages()).toEqual(Array(8).fill(ControllerTexts.otherAccount('acme/api')));
+    expect(warningMessages()).toEqual(Array(7).fill(Messages.otherAccount('acme/api')));
     for (const call of Object.values(h.service)) expect(call).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
     expect(h.quickPicks).toEqual([]);
+  });
+
+  it('starts the own environment of the account for a repository that has an environment of another account (D-3)', async () => {
+    await h.registry.add(environment({ owner: OTHER_ACCOUNT }));
+    const own = environment({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devenv-octo-api-c1d2e3f4' });
+    h.service.open.mockImplementation(async () => {
+      await h.registry.add(own);
+      return openResult(own);
+    });
+    // A stale row without the environment, and a repository row: the environment of the other account is not named.
+    await run('start', row('acme/api'));
+    expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([]);
+    expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
   });
 
   it('asks for a sign-in for an environment when nobody is signed in', async () => {
@@ -1619,12 +1632,16 @@ describe('Accounts (concept 7.5)', () => {
   );
 
   it('keeps an environment of an older version hidden when the claim fails, without calling it one of another account', async () => {
-    // For example without internet access: GitHub cannot confirm the access, and nobody owns the entry.
+    // For example without internet access: GitHub cannot confirm the access, and nobody owns the entry. A repository row
+    // goes to the open pipeline, which claims the entry or refuses (environmentUnassigned).
     await h.registry.add(environment({ owner: undefined }));
+    h.service.open.mockRejectedValue(new UserFacingError('environmentUnassigned', Messages.olderEnvironmentNotAssigned('acme/api')));
     await run('start', row('acme/api'));
-    expect(warningMessages()).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
-    expect(warningMessages()).not.toContain(ControllerTexts.otherAccount('acme/api'));
+    const shown = [...warningMessages(), ...fakeVscode.window.showErrorMessage.mock.calls.map((call) => String(call[0]))];
+    expect(shown).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
+    expect(shown).not.toContain(Messages.otherAccount('acme/api'));
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
   });
 
   it('lists only the environments of the account in the pickers', async () => {
@@ -1902,7 +1919,7 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
     // Without the pending connection file, the Session Monitor stops the container after the waiting time.
     expect(await h.sessionFiles.readPendings()).toEqual([]);
-    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
   });
 
   it('does not connect a first open when the account changed while the pipeline ran', async () => {
@@ -1919,7 +1936,7 @@ describe('Accounts (concept 7.5)', () => {
     pipeline.resolve(openResult(environment()));
     await start;
     expect(h.connection.open).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
   });
 
   it('does not connect when nobody is signed in anymore at the end of the pipeline', async () => {
@@ -1954,7 +1971,7 @@ describe('Accounts (concept 7.5)', () => {
     pipeline.resolve(openResult(environment()));
     await tasks;
     expect(h.connection.open).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([ControllerTexts.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
   });
 
   it('claims nothing when the session changed between the read of the account and the claim', async () => {

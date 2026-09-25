@@ -247,7 +247,6 @@ export class Sidebar implements vscode.Disposable {
       discovery: this.data,
       settings: this.deps.settings(),
       environments,
-      lockedRepositories: lockedRepositories(entries, account),
       runtime: this.runtime,
       currentEnvironmentId: coordinator.environmentId,
       otherWindowEnvironmentIds: environmentIdsOf(others),
@@ -405,19 +404,6 @@ export class Sidebar implements vscode.Disposable {
     this.loadFailed = loadFailed;
     setContext(LOAD_FAILED_CONTEXT_KEY, loadFailed, this.deps.logger);
   }
-}
-
-/**
- * Lower-case `owner/name` of the repositories with an environment of another account (concept 7.5, D-3). An entry of an
- * older version without owner is not counted: the signed-in account may still claim it.
- */
-function lockedRepositories(environments: readonly Environment[], account: GitHubAccount | undefined): Set<string> {
-  if (!account) return new Set();
-  return new Set(
-    environments
-      .filter((environment) => environment.owner !== undefined && environment.owner.id !== account.id)
-      .map((environment) => environment.repository.toLowerCase()),
-  );
 }
 
 function setContext(key: string, value: boolean, logger: Logger): void {
