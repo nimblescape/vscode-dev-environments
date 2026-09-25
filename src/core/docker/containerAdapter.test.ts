@@ -210,6 +210,35 @@ describe('isRunning / daemonStatus', () => {
     expect(isAbortError(error)).toBe(true);
     expect(runner.calls[0].options.signal).toBe(controller.signal);
   });
+
+  it('reports each result to onDaemonStatus, also without CLI, but not a cancellation', async () => {
+    const reported: boolean[] = [];
+    const results = [ok('"29.8.0"\n'), fail('Cannot connect to the Docker daemon')];
+    const runner = new FakeRunner(() => {
+      const next = results.shift();
+      if (!next) throw abortError();
+      return next;
+    });
+    const options = { onDaemonStatus: (running: boolean) => reported.push(running) };
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin' }, silentLogger, 'linux', options);
+    expect(await docker.isRunning()).toBe(true);
+    expect(await docker.isRunning()).toBe(false);
+    await expect(docker.isRunning()).rejects.toThrow();
+    expect(reported).toEqual([true, false]);
+    const missing = new ContainerAdapter(runner, undefined, {}, silentLogger, 'linux', options);
+    expect(await missing.isRunning()).toBe(false);
+    expect(reported).toEqual([true, false, false]);
+  });
+
+  it('keeps its answer when onDaemonStatus throws', async () => {
+    const runner = new FakeRunner(() => ok('"29.8.0"\n'));
+    const docker = new ContainerAdapter(runner, DOCKER, {}, silentLogger, 'linux', {
+      onDaemonStatus: () => {
+        throw new Error('listener failed');
+      },
+    });
+    expect(await docker.isRunning()).toBe(true);
+  });
 });
 
 describe('containers', () => {
@@ -749,6 +778,24 @@ describe('ContainerAdapter: a Docker CLI that is installed later', () => {
     expect(await docker.isRunning()).toBe(true);
     expect(lookups).toEqual([1]);
     expect(runner.calls.map((call) => call.file)).toEqual(['/usr/local/bin/docker', '/Applications/Docker.app/Contents/Resources/bin/docker']);
+  });
+
+  it('looks for a missing CLI at once with lookUpCliNow, without the waiting time', () => {
+    const { docker, lookups, advance } = setup([undefined, undefined, '/opt/docker/bin/docker']);
+    expect(docker.lookUpCliNow()).toBe(false);
+    expect(docker.lookUpCliNow()).toBe(false);
+    expect(lookups).toHaveLength(2);
+    advance(1);
+    expect(docker.lookUpCliNow()).toBe(true);
+    expect(docker.dockerPath).toBe('/opt/docker/bin/docker');
+    // A found CLI is not looked up again.
+    expect(docker.lookUpCliNow()).toBe(true);
+    expect(lookups).toHaveLength(3);
+  });
+
+  it('keeps a fixed path with lookUpCliNow', () => {
+    const docker = new ContainerAdapter(new FakeRunner(() => ok()), undefined, {}, silentLogger, 'linux');
+    expect(docker.lookUpCliNow()).toBe(false);
   });
 
   it('keeps the path fixed without findDocker', async () => {

@@ -13,7 +13,7 @@ Dev Environments lists the GitHub repositories that you can access and that cont
 ## Requirements
 
 - Visual Studio Code 1.90 or later.
-- Docker: Docker Desktop on macOS, Windows (with WSL 2), or Linux, or Docker Engine on Linux.
+- Docker: Docker Desktop on macOS, Windows (with WSL 2), or Linux, or Docker Engine on Linux. Without Docker, the extension offers to install it (see below).
 - A GitHub account.
 - The Dev Containers extension. You do not need to install it yourself: VS Code installs it together with this extension.
 
@@ -21,7 +21,7 @@ Git on your computer is not needed.
 
 ## How to use it
 
-1. Select the **Dev Environments** icon in the activity bar.
+1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, select **Install Docker…** (see [Installing Docker](#installing-docker)).
 2. Select **Sign in with GitHub**. The list shows your repositories with a Dev Container configuration, grouped by owner.
 3. Use the actions of a repository:
    - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window.
@@ -33,6 +33,20 @@ Git on your computer is not needed.
 **Select Organizations…**, **Search**, and **Refresh** are at the top of the view. **Select Organizations…** limits the list to the organizations and accounts that you select: only their repositories are scanned, which is faster when you can access many repositories. Select none to see all repositories again. **Dev Environments: Show Log** opens the complete log.
 
 The first load of the list can take some time with many repositories; the view shows the repositories as they arrive. Later updates read only the repositories that changed.
+
+## Installing Docker
+
+When Docker is not installed, the view shows **Install Docker…** above the sign-in. It opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
+
+1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards).
+2. **Install Docker**:
+   - macOS: with Homebrew, `brew install --cask docker-desktop`; without Homebrew, the installer `Docker.dmg` is downloaded from Docker and opens (drag Docker to Applications).
+   - Windows: with winget, `winget install --exact --id Docker.DockerDesktop …`; without winget, `Docker Desktop Installer.exe` is downloaded from Docker and starts.
+   - Linux (Ubuntu, Debian, Fedora, RHEL, CentOS): Docker Engine from the package repository of Docker, and your user joins the group `docker` (sign in again afterwards). Other distributions: the installation guide of Docker opens.
+3. **Start Docker**. At its first start, Docker Desktop shows its own dialogs once. On Linux, `sudo systemctl enable --now docker` starts the Docker service.
+4. **Sign in with GitHub**.
+
+Nothing runs without your confirmation: a dialog first lists the exact commands, or the download address and the file. Commands run visibly in a terminal of VS Code, where you enter your password if one is needed. Downloads come only from Docker over HTTPS, and the installers are signed by Docker; your system checks the signature when the installer opens. Settings of the opened workspace do not change what runs in the terminal. If Docker is installed already, nothing is installed. Docker Desktop is free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription (Docker Subscription Service Agreement). The installation works only in a local window, not in a remote window.
 
 ## Settings
 
@@ -61,7 +75,7 @@ The first load of the list can take some time with many repositories; the view s
 - Only data in the repository volume survives a rebuild, and also when an update of the extension sets the container up again (the progress says so). Data in other folders of the container, for example the home folder, is lost, unless the configuration stores it in an additional named volume (property `mounts`).
 - Each GitHub account has its own environment of a repository, with its own clone: two accounts that work on the same repository need the disk space for two clones. A configuration whose named volumes have a fixed name (or `${localWorkspaceFolderBasename}-…`) works for one account's environment only; use `${devcontainerId}` in the name to give each environment its own volume.
 - Work that runs in the container after its window has closed, for example a long build in a terminal, ends when the container stops.
-- On Linux with Docker Engine, the extension cannot start the Docker service, because this needs administrator rights.
+- On Linux with Docker Engine, the extension cannot start the Docker service by itself, because this needs administrator rights. **Start Docker** in the walkthrough runs `sudo systemctl enable --now docker` in a terminal, where you enter your password.
 - Docker Compose configurations are not supported yet.
 - With **Select Organizations…**, GitHub is asked only about the selected owners. Your environments of repositories of other owners stay in the list, but without the check whether the repository is still on GitHub. An environment created with an older version of Dev Environments that is not assigned to a GitHub account yet stays hidden while its owner is not selected.
 

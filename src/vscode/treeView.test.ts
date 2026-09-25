@@ -115,6 +115,29 @@ describe('RepositoriesTreeProvider', () => {
     provider.dispose();
   });
 
+  it('shows the Docker row with a warning first when no Docker CLI is found and the view lists environments', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false, dockerMissing: true });
+    const [first, second, ...rest] = provider.getChildren();
+    expect(first).toMatchObject({ kind: 'installDocker', id: 'installDocker' });
+    expect(second).toMatchObject({ kind: 'signIn', id: 'signIn' });
+    expect(rest).toEqual(groups);
+    const item = provider.getTreeItem(first) as unknown as TreeItem;
+    expect(item).toMatchObject({ label: 'Install Docker…', id: 'installDocker', contextValue: 'installDocker' });
+    expect(item.tooltip).toBe('Dev Environments runs your environments in Docker, which is not installed on this computer.');
+    expect(item.command).toMatchObject({ command: 'devEnvironments.installDocker' });
+    expect(item.iconPath).toMatchObject({ id: 'warning', color: { id: 'list.warningForeground' } });
+    expect(provider.getParent(first)).toBeUndefined();
+    expect(provider.getChildren(first)).toEqual([]);
+    expect(provider.getModel()).toEqual(groups);
+    provider.setModel(groups, { signedIn: true, dockerMissing: false });
+    expect(provider.getChildren()).toEqual(groups);
+    provider.setModel([], { signedIn: true, dockerMissing: true });
+    expect(provider.getChildren()).toEqual([]);
+    provider.dispose();
+  });
+
   it('shows no sign-in row in an empty view (the welcome view shows the sign-in button)', () => {
     const provider = new RepositoriesTreeProvider(silentLogger);
     provider.setModel([], { signedIn: false });

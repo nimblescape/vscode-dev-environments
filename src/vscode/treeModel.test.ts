@@ -452,6 +452,23 @@ describe('buildTreeModel', () => {
       expect(rootNodes(groups, true)).toEqual(groups);
       expect(rootNodes([], false)).toEqual([]);
     });
+
+    it('adds the Docker row first, above the sign-in row, when no Docker CLI is found and the view is not empty', () => {
+      const groups = buildTreeModel(input({ signedIn: false, environments: [environment('e1', 'acme/api')] }));
+      const docker = { kind: 'installDocker', id: 'installDocker', label: TreeTexts.installDocker, tooltip: TreeTexts.installDockerTooltip };
+      const signIn = { kind: 'signIn', id: 'signIn', label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip };
+      expect(rootNodes(groups, false, true)).toEqual([docker, signIn, ...groups]);
+      expect(rootNodes(groups, true, true)).toEqual([docker, ...groups]);
+      expect(rootNodes(groups, true, false)).toEqual(groups);
+      // The welcome view shows the Install Docker button in an empty view.
+      expect(rootNodes([], false, true)).toEqual([]);
+      expect(rootNodes([], true, true)).toEqual([]);
+    });
+
+    it('uses the title of the command and the text of the welcome view for the Docker row', () => {
+      expect(TreeTexts.installDocker).toBe('Install Docker…');
+      expect(TreeTexts.installDockerTooltip).toBe('Dev Environments runs your environments in Docker, which is not installed on this computer.');
+    });
   });
 
   it('shows only the environments when the user is not signed in, without "not on GitHub"', () => {

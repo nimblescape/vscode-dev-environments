@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import type { ContainerInfo } from '../core/docker/containerAdapter';
+import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { UserFacingError } from '../core/errors';
 import { CONFIG_FOLDER_OWNER_COMMAND } from '../core/helper/containerGit';
 import { Actions, Messages } from '../core/messages';
@@ -222,6 +223,7 @@ interface Harness {
     updateContextKey: ReturnType<typeof vi.fn>;
   };
   claims: { claim: ReturnType<typeof vi.fn> };
+  dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -294,6 +296,12 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     updateContextKey: vi.fn(async () => true),
   };
   const claims = { claim: vi.fn(async (): Promise<string[]> => []) };
+  const dockerSetup = {
+    openWizard: vi.fn(async () => {}),
+    install: vi.fn(async () => {}),
+    start: vi.fn(async () => {}),
+    installWsl: vi.fn(async () => {}),
+  };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -335,6 +343,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     sidebar,
     statusBar,
     settings: () => settings,
+    dockerSetup,
     viewVisible: () => false,
     clock,
     isAlive: (pid: number) => alive.has(pid),
@@ -383,6 +392,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     coordinator,
     auth,
     claims,
+    dockerSetup,
     ui,
     discovery,
     sidebar,
@@ -487,7 +497,7 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    expect(declared).toHaveLength(14);
+    expect(declared).toHaveLength(18);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -506,7 +516,7 @@ describe('Controller commands', () => {
     expect(defaults).toEqual({ ...DEFAULT_SETTINGS });
     const keys = new Set(manifest.contributes.viewsWelcome.flatMap((view) => view.when.match(/devEnvironments\.\w+/g) ?? []));
     // Exactly the keys that the extension sets.
-    expect([...keys].sort()).toEqual([LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort());
+    expect([...keys].sort()).toEqual([DockerContextKeys.missing, LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort());
   });
 
   it('shows "could not be loaded", not "no repository was found", after a failed first load (package.json)', () => {
@@ -534,6 +544,36 @@ describe('Controller commands', () => {
     expect(shown({ [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
     ]);
+    // Without Docker: the Docker entry first, and the sign-in entry below it.
+    expect(shown({ [DockerContextKeys.missing]: true })).toEqual([
+      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
+      'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
+    ]);
+    expect(shown({ ...signedIn, [DockerContextKeys.missing]: true })).toEqual([
+      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
+      'Loading your repositories…',
+    ]);
+  });
+
+  it('shows the Docker entry first with the exact text and the command Install Docker…', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        commands: Array<{ command: string; title: string; category: string }>;
+        viewsWelcome: Array<{ view: string; contents: string; when: string }>;
+      };
+    };
+    expect(manifest.contributes.viewsWelcome[0]).toEqual({
+      view: 'devEnvironments.repositories',
+      contents:
+        'Dev Environments runs your environments in Docker, which is not installed on this computer.\n[Install Docker…](command:devEnvironments.installDocker)',
+      when: 'devEnvironments.dockerMissing',
+    });
+    expect(manifest.contributes.viewsWelcome[1].when).toBe('!devEnvironments.signedIn');
+    expect(manifest.contributes.commands.find((command) => command.command === Commands.installDocker)).toEqual({
+      command: 'devEnvironments.installDocker',
+      title: 'Install Docker…',
+      category: 'Dev Environments',
+    });
   });
 
   it('shows the log', async () => {
@@ -1569,7 +1609,41 @@ describe('Connection of this window', () => {
     h.controller.onViewVisible();
     h.controller.onViewVisible();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.openDownloadPage);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.installDocker);
+  });
+
+  it('opens the Docker setup with the action Install Docker…', async () => {
+    h.docker.isInstalled.mockReturnValue(false);
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.installDocker);
+    h.controller.onViewVisible();
+    await settle(() => fakeVscode.commands.executeCommand.mock.calls.length > 0, 'the command');
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(Commands.installDocker);
+    expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('says nothing when the view shows and Docker is installed', () => {
+    h.controller.onViewVisible();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('opens the walkthrough with Install Docker…', async () => {
+    await run('installDocker');
+    expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the buttons of the walkthrough', async () => {
+    await run('dockerSetupInstall');
+    await run('dockerSetupStart');
+    await run('dockerSetupInstallWsl');
+    expect(h.dockerSetup.install).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.start).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.installWsl).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows an error of a walkthrough button (concept 6.5)', async () => {
+    h.dockerSetup.start.mockRejectedValue(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
+    await run('dockerSetupStart');
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerStartFailed, Actions.showDetails);
   });
 });
 
@@ -2252,8 +2326,9 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.claims.claim.mock.calls.length === 1, 'the command again');
     expect(h.claims.claim).toHaveBeenCalledWith(OTHER_ACCOUNT, 'gho_other', expect.objectContaining({ environmentIds: [ENV_ID] }));
     expect(h.claims.claim).toHaveBeenCalledTimes(1);
-    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
+    // The pipeline starts after the claim finished (its registry write included).
     await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
     expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
   });
 
