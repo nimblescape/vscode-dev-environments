@@ -5,6 +5,7 @@
 // Targets of the commands and the choices of their Quick Picks (concept 6.2, 6.4). No `vscode` import, so the rules are
 // unit-tested.
 import { filterRepositories, isTrustedOwner } from '../core/discovery/discoveryService';
+import { isRepositoryInScope } from '../core/discovery/scope';
 import { configurationName } from '../core/names';
 import type { RepositoryTarget } from '../core/pipeline/environmentService';
 import type { DiscoveryData, Environment, ExtensionSettings, RepositoryInfo } from '../core/types';
@@ -126,14 +127,19 @@ export function pickerRepositories(input: {
 /**
  * Repositories of environments that the discovery does not list (it stores only repositories with a configuration on
  * the default branch): they are looked up one by one after a refresh, so that the sidebar does not show `not on GitHub`
- * for a repository that exists. Each repository once, in the order of the registry.
+ * for a repository that exists. Each repository once, in the order of the registry. With a scan scope (`owners`, concept
+ * 7.4), only repositories of its owners: GitHub is not asked about any other one.
  */
-export function repositoriesToLookUp(environments: readonly Environment[], listed: readonly RepositoryInfo[]): string[] {
+export function repositoriesToLookUp(
+  environments: readonly Environment[],
+  listed: readonly RepositoryInfo[],
+  owners: readonly string[] = [],
+): string[] {
   const known = new Set(listed.map((info) => repositoryKey(info.nameWithOwner)));
   const result: string[] = [];
   for (const environment of environments) {
     const key = repositoryKey(environment.repository);
-    if (known.has(key)) continue;
+    if (known.has(key) || !isRepositoryInScope(owners, environment.repository)) continue;
     known.add(key);
     result.push(environment.repository);
   }

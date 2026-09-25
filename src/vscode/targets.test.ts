@@ -180,6 +180,15 @@ describe('repository lists', () => {
     expect(repositoriesToLookUp(environments, [repo('Acme/Api')])).toEqual(['acme/old', 'lost/repo']);
     expect(repositoriesToLookUp([], [repo('acme/api')])).toEqual([]);
   });
+
+  it.each<[string, string[], string[]]>([
+    ['the empty scope looks up every unlisted repository', [], ['acme/old', 'lost/repo']],
+    ['a scope looks up only repositories of its owners', ['ACME'], ['acme/old']],
+    ['a scope without these owners looks up nothing', ['beta'], []],
+  ])('with a scan scope: %s', (_name, owners, expected) => {
+    const environments = [environment('e1', 'acme/api'), environment('e2', 'acme/old'), environment('e4', 'lost/repo')];
+    expect(repositoriesToLookUp(environments, [repo('acme/api')], owners)).toEqual(expected);
+  });
 });
 
 describe('configurationChoices', () => {

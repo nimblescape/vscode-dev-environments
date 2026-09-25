@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
+import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
 import { availableEnvironments, type EnvironmentClaims } from '../core/ownership';
@@ -150,6 +151,21 @@ export class Sidebar implements vscode.Disposable {
       this.deps.logger.error('The repository list could not be updated.', error);
       return this.data;
     });
+  }
+
+  /**
+   * The setting `owners` (the scan scope, concept 7.4) changed: a list of another scope is not shown anymore, because it
+   * may contain repositories outside the new scope, and a refresh with the new scope starts at once. Never rejects.
+   */
+  async onScopeChanged(): Promise<void> {
+    if (this.data && !this.isOfCurrentScope(this.data)) {
+      this.data = undefined;
+      this.lookups = new Map();
+      this.setLoaded(false);
+      this.setLoadFailed(false);
+    }
+    this.renderInBackground();
+    if (this.signedIn) await this.refreshDiscovery({ again: true });
   }
 
   /**
@@ -317,6 +333,8 @@ export class Sidebar implements vscode.Disposable {
       );
       // The account changed while the list loaded: the list is not shown (the next refresh loads the new one).
       if (this.account?.id !== account.id) return this.data;
+      // The scope changed while the list loaded: the refresh that the change requested loads the list of the new scope.
+      if (!this.isOfCurrentScope(data)) return this.data;
       this.data = data;
       this.setLoadFailed(false);
       // Concept 7.5: environments of an older version become available when this account can access the repository.
@@ -343,7 +361,8 @@ export class Sidebar implements vscode.Disposable {
   private async lookUpUnlisted(data: DiscoveryData, token: string): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
     const environments = await this.availableEnvironments();
-    for (const repository of repositoriesToLookUp(environments, data.repositories)) {
+    // Concept 7.4: GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
+    for (const repository of repositoriesToLookUp(environments, data.repositories, this.deps.settings().owners)) {
       if (this.disposed) break;
       try {
         const info = await this.deps.discovery.getRepository(repository, token);
@@ -405,6 +424,11 @@ export class Sidebar implements vscode.Disposable {
     });
     // Another change of the account meanwhile wins.
     if (this.account?.id !== account.id) return;
+    // A list of another scan scope may contain repositories outside the current one: the view waits for the refresh.
+    if (stored && !this.isOfCurrentScope(stored)) {
+      this.deps.logger.info('The stored repository list was loaded for other organizations. It is loaded again.');
+      return;
+    }
     this.data = stored;
     this.setLoaded(stored !== undefined);
   }
@@ -417,6 +441,11 @@ export class Sidebar implements vscode.Disposable {
       this.deps.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
       return undefined;
     }
+  }
+
+  /** True if the list was built with the scan scope of the current settings (a list without scope: all repositories). */
+  private isOfCurrentScope(data: DiscoveryData): boolean {
+    return sameScope(data.scope, this.deps.settings().owners);
   }
 
   /** The account of the GitHub session, without a dialog. */

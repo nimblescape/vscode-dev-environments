@@ -13,6 +13,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
+import { isRepositoryInScope, sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { registryBaseDigest } from '../core/helper/helperImage';
 import { WorkspaceHelper } from '../core/helper/workspaceHelper';
@@ -139,6 +140,8 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     registry,
     getRepository: (repository, token, signal) => discovery.getRepository(repository, token, signal, { quiet: true }),
     confirm: (environment, account) => ui.confirmAssignment(environment.repository, account.login),
+    // Concept 7.4: no lookup of a repository outside the scan scope; such an entry stays hidden.
+    inScope: (repository) => isRepositoryInScope(getSettings().owners, repository),
     logger,
   });
   const connection = new ConnectionAdapter(logger);
@@ -257,7 +260,12 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     auth.onDidChangeSignInState(() => background(sidebar.onSessionChanged({ again: false }), 'update the sign-in state')),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!affectsSettings(event)) return;
+      const previous = settings;
       settings = readSettings();
+      // Concept 7.4: another scan scope loads the list again at once.
+      if (!sameScope(previous.owners, settings.owners)) {
+        background(sidebar.onScopeChanged(), 'load the repository list of the selected organizations');
+      }
       background(sessionCoordinator.writeMonitorSettings(), 'write the settings for the Session Monitor');
       background(sidebar.render(), 'update the sidebar');
       sidebar.restartTimer();
