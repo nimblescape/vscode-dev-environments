@@ -3,10 +3,23 @@
   "version": "2.0.0",
   "tasks": [
     {
-      // esbuild in watch mode: rebuilds dist/extension.js and dist/sessionMonitor.js (with source maps) on every change.
+      // One development build (with source maps) before each launch. It ends when both bundles are written, so the
+      // debugger starts without depending on the background detection of the watch task. Exit code 1 on build errors.
+      "label": "build",
+      "type": "shell",
+      "command": "node",
+      "args": ["esbuild.mjs"],
+      "group": "build",
+      "presentation": { "reveal": "silent", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      // Optional: esbuild in watch mode, rebuilds dist/ on every change while you debug (then reload the Extension
+      // Development Host window with Developer: Reload Window to load the new build).
       "label": "watch",
-      "type": "npm",
-      "script": "watch",
+      "type": "shell",
+      "command": "node",
+      "args": ["esbuild.mjs", "--watch"],
       "isBackground": true,
       "group": { "kind": "build", "isDefault": true },
       "presentation": { "reveal": "never", "panel": "dedicated" },
@@ -26,8 +39,8 @@
       }
     },
     {
-      // Opens an Extension Development Host window with the extension from dist/, its extension host waiting for a
-      // debugger on 127.0.0.1:9339. Used by "Run Extension (attach over IPv4)" in launch.json.
+      // Opens an Extension Development Host window with the extension from dist/; its extension host waits for a
+      // debugger on 127.0.0.1:9339 (see "Run Extension" in launch.json).
       "label": "open extension development host",
       "type": "shell",
       "command": "code",
@@ -36,7 +49,22 @@
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--inspect-brk-extensions=9339"
       ],
-      "dependsOn": "watch",
+      "dependsOn": "build",
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    },
+    {
+      // The same in a VS Code profile of your choice (the Dev Containers extension must be installed in it).
+      "label": "open extension development host (profile)",
+      "type": "shell",
+      "command": "code",
+      "args": [
+        "--new-window",
+        "--profile=${input:profile}",
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--inspect-brk-extensions=9339"
+      ],
+      "dependsOn": "build",
       "presentation": { "reveal": "never" },
       "problemMatcher": []
     },
@@ -48,6 +76,14 @@
       "isBackground": true,
       "presentation": { "reveal": "never", "panel": "dedicated" },
       "problemMatcher": "$tsc-watch"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "profile",
+      "type": "promptString",
+      "description": "Name of the VS Code profile for the Extension Development Host",
+      "default": "Deno"
     }
   ]
 }
