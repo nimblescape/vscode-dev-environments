@@ -562,6 +562,8 @@ export class DiscoveryService {
       scope: normalizeScope(logins),
       withoutConfiguration: scan.collector.withoutConfiguration(),
     };
+    const uncertain = scan.collector.uncertain();
+    if (uncertain.length > 0) result.uncertain = uncertain;
     this.logger.info(
       `Repository list: ${repositories.length} of ${scan.collector.scanned} repositories have a Dev Container configuration` +
         (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization or were not found.` : '.'),
@@ -1318,6 +1320,11 @@ class RepositoryCollector {
     return this.entries.filter((entry) => entry.info.configPaths.length > 0).map((entry) => entry.info);
   }
 
+  /** The repositories with a configuration whose detection is not certain: a later refresh reads them again. */
+  uncertain(): string[] {
+    return this.entries.filter((entry) => !entry.checked && entry.info.configPaths.length > 0).map((entry) => entry.info.nameWithOwner);
+  }
+
   withoutConfiguration(): CheckedRepository[] {
     return this.entries
       .filter((entry) => entry.checked && entry.info.configPaths.length === 0)
@@ -1451,6 +1458,7 @@ export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
     ...(Array.isArray(value.withoutConfiguration)
       ? { withoutConfiguration: value.withoutConfiguration.filter(isCheckedRepository).map(checkedRepository) }
       : {}),
+    ...(isStringArray(value.uncertain) ? { uncertain: [...value.uncertain] } : {}),
   };
 }
 

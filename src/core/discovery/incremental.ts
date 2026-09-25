@@ -15,8 +15,9 @@ export interface StoredDetection {
 }
 
 /**
- * The detection results of a stored list, by lower-case `owner/name`: the repositories with a configuration, and those
- * without one (`DiscoveryData.withoutConfiguration`). Empty without a stored list.
+ * The detection results of a stored list, by lower-case `owner/name`: the repositories with a configuration (without
+ * those whose detection was not certain, `DiscoveryData.uncertain`), and those without one
+ * (`DiscoveryData.withoutConfiguration`). Empty without a stored list.
  */
 export function storedDetections(data: DiscoveryData | undefined): Map<string, StoredDetection> {
   const detections = new Map<string, StoredDetection>();
@@ -24,7 +25,10 @@ export function storedDetections(data: DiscoveryData | undefined): Map<string, S
   for (const checked of data.withoutConfiguration ?? []) {
     detections.set(checked.nameWithOwner.toLowerCase(), { pushedAt: checked.pushedAt, defaultBranch: checked.defaultBranch, configPaths: [] });
   }
+  // A detection that was not certain is read again (concept 7.4: a lookup that fails is repeated at the next refresh).
+  const uncertain = new Set((data.uncertain ?? []).map((name) => name.toLowerCase()));
   for (const info of data.repositories) {
+    if (uncertain.has(info.nameWithOwner.toLowerCase())) continue;
     detections.set(info.nameWithOwner.toLowerCase(), {
       pushedAt: info.pushedAt,
       defaultBranch: info.defaultBranch,

@@ -187,6 +187,11 @@ export interface DiscoveryData {
    * new and changed repositories. Missing in lists of older versions.
    */
   withoutConfiguration?: CheckedRepository[];
+  /**
+   * Repositories with a configuration whose lookup was not complete (a GraphQL error in its part of the answer), by
+   * `owner/name`: the next refresh reads their configurations again (concept 7.4). Missing when there are none.
+   */
+  uncertain?: string[];
 }
 
 /** Content of sessions/<window-id>.json (concept 7.9). */

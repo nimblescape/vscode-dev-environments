@@ -42,6 +42,8 @@ class FakeGitHub implements HttpTransport {
   readonly requests: GraphQLRequest[] = [];
   repos: FakeRepository[] = [];
   lookupErrors = new Set<string>();
+  /** The lookup of these repositories answers the root file, but its folder part fails with an error. */
+  folderErrors = new Set<string>();
   /** Answers with a timeout error while a batch has more than this many repositories. */
   batchLimit = Infinity;
   open = 0;
@@ -99,6 +101,9 @@ class FakeGitHub implements HttpTransport {
         if (this.lookupErrors.has(name)) {
           data[`r${i}`] = null;
           errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`] });
+        } else if (this.folderErrors.has(name)) {
+          data[`r${i}`] = { rootFile: { __typename: 'Blob' }, folder: null };
+          errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`, 'folder'] });
         } else {
           data[`r${i}`] = repo ? lookups(repo) : null;
         }
@@ -193,6 +198,23 @@ describe('incremental detection, empty scope', () => {
     expect(DISCOVERY_QUERY).not.toMatch(/rootFile|folder|ConfigurationLookups/);
     expect(second.repositories).toEqual(first.repositories);
     expect(second.withoutConfiguration).toEqual(first.withoutConfiguration);
+  });
+
+  it('reads a repository again whose lookup failed in part, although it found a configuration (concept 7.4)', async () => {
+    github.repos = [repo('acme/api'), repo('acme/web')];
+    github.folderErrors.add('acme/api');
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(names(first.repositories)).toEqual(['acme/api', 'acme/web']);
+    expect(first.uncertain).toEqual(['acme/api']);
+    github.requests.length = 0;
+    github.folderErrors.clear();
+    // No push since: only the repository whose detection was not certain is read again.
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups().map((request) => request.variables)).toEqual([{ o0: 'acme', n0: 'api' }]);
+    expect(second.uncertain).toBeUndefined();
+    github.requests.length = 0;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups()).toEqual([]);
   });
 
   it('reads the configurations only of new repositories and of repositories with another pushedAt', async () => {
