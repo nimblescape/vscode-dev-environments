@@ -1601,6 +1601,21 @@ describe('Accounts (concept 7.5)', () => {
     }
   });
 
+  it('Try again of a named environment (the status bar item) keeps that environment, also twice and after an account change', async () => {
+    await h.registry.add(environment());
+    h.service.openEnvironment.mockRejectedValue(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    let answers = 0;
+    fakeVscode.window.showErrorMessage.mockImplementation(async () => {
+      answers++;
+      if (answers === 1) h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      return answers <= 2 ? Actions.tryAgain : undefined;
+    });
+    await run('start', { environmentId: ENV_ID });
+    await settle(() => h.service.openEnvironment.mock.calls.length === 3, 'the second Try again');
+    expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID, ENV_ID]);
+    expect(h.service.open).not.toHaveBeenCalled();
+  });
+
   it('asks for a sign-in for an environment when nobody is signed in', async () => {
     await h.registry.add(environment());
     h.auth.getAccount.mockResolvedValue(undefined);

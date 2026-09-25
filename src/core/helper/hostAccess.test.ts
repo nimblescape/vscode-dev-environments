@@ -686,6 +686,39 @@ describe('volumes of other programs, by their labels (restrictions summary, find
     const metadata = [{ mounts: 'source=image-vol,target=/i' }];
     expect(mountedVolumeNames({ config, merged, metadata, ownVolume: OWN })).toEqual(['cache', 'history', 'feature-vol', 'image-vol', 'data', 'more']);
     expect(mountedVolumeNames({ config: { runArgs: ['--init'] }, ownVolume: OWN })).toEqual([]);
+    // The cases of the parser that recorded the volumes before (configChecks, concept 7.14).
+    expect(
+      mountedVolumeNames({
+        config: {
+          mounts: [
+            'source=api-node_modules,target=/workspaces/api/node_modules,type=volume',
+            'src=pgdata,dst=/var/lib/postgresql/data',
+            { source: 'cache', target: '/cache', type: 'volume' },
+            { source: '/Users/x', target: '/x', type: 'bind' },
+            'source=/tmp,target=/tmp,type=bind',
+            'type=volume,target=/anonymous',
+            { source: 'cache', target: '/cache2', type: 'volume' },
+          ],
+          runArgs: ['-v', 'history:/commandhistory', '--mount', 'type=volume,source=db,target=/db', '-v', './x:/x'],
+        },
+        ownVolume: OWN,
+      }),
+    ).toEqual(['api-node_modules', 'pgdata', 'cache', 'history', 'db']);
+    // Sources with an unresolved variable (read-configuration before the container exists) are skipped.
+    expect(
+      mountedVolumeNames({
+        config: {
+          mounts: [
+            'source=${devcontainerId}-history,target=/commandhistory,type=volume',
+            { source: '${localEnv:VOLUME}', target: '/v', type: 'volume' },
+            'source=1r60kajr11nn-history,target=/commandhistory,type=volume',
+          ],
+          runArgs: ['-v', '${devcontainerId}-cache:/cache'],
+        },
+        ownVolume: OWN,
+      }),
+    ).toEqual(['1r60kajr11nn-history']);
+    expect(mountedVolumeNames({ config: { image: 'x' }, ownVolume: OWN })).toEqual([]);
   });
 });
 

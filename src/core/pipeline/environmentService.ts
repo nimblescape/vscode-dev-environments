@@ -1598,15 +1598,13 @@ export class EnvironmentService {
   /**
    * Concept section 9 "Host access": what the policy checks for `env`, with what it needs to know about the named volumes
    * that the configuration mounts: the volumes of the environments of other accounts (their additional volumes), and of
-   * an entry of an older version without owner of the same repository, which may hold the work of another person until
-   * an account takes it over, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
+   * the entries of an older version without owner, which may hold the work of another person until an account takes them
+   * over, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
    */
   private async hostAccessInput(env: Environment, input: Omit<HostAccessInput, 'ownVolume'>): Promise<HostAccessInput> {
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
     const others = (await this.deps.registry.list()).filter(
-      (other) =>
-        other.id !== env.id &&
-        (other.owner === undefined ? repositoryKey(other.repository) === repositoryKey(env.repository) : other.owner.id !== env.owner?.id),
+      (other) => other.id !== env.id && (other.owner === undefined || other.owner.id !== env.owner?.id),
     );
     // A volume that the environment recorded itself stays its own: older entries of one person shared volumes before
     // the environments were separated by account.

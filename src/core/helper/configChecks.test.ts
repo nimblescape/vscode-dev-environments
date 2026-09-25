@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { additionalNamedVolumes, checkConfiguration } from './configChecks';
+import { checkConfiguration } from './configChecks';
 
 describe('checkConfiguration', () => {
   it('finds nothing in a plain image configuration', () => {
@@ -59,41 +59,5 @@ describe('checkConfiguration', () => {
     expect(checkConfiguration('{ "dockerComposeFile": "a.yml", ')).toEqual({ compose: true, computerDependent: [] });
     expect(checkConfiguration('{ "x": "${localWorkspaceFolder}" ').computerDependent).toEqual(['${localWorkspaceFolder}']);
     expect(checkConfiguration('not json at all')).toEqual({ compose: false, computerDependent: [] });
-  });
-});
-
-describe('additionalNamedVolumes', () => {
-  it('finds named volumes of mounts and runArgs, without duplicates and without binds', () => {
-    expect(
-      additionalNamedVolumes({
-        mounts: [
-          'source=api-node_modules,target=/workspaces/api/node_modules,type=volume',
-          'src=pgdata,dst=/var/lib/postgresql/data',
-          { source: 'cache', target: '/cache', type: 'volume' },
-          { source: '/Users/x', target: '/x', type: 'bind' },
-          'source=/tmp,target=/tmp,type=bind',
-          'type=volume,target=/anonymous',
-          { source: 'cache', target: '/cache2', type: 'volume' },
-        ],
-        runArgs: ['-v', 'history:/commandhistory', '--mount', 'type=volume,source=db,target=/db', '-v', './x:/x'],
-      }),
-    ).toEqual(['api-node_modules', 'pgdata', 'cache', 'history', 'db']);
-  });
-
-  it('skips sources with an unresolved variable (read-configuration before the container exists)', () => {
-    expect(
-      additionalNamedVolumes({
-        mounts: [
-          'source=${devcontainerId}-history,target=/commandhistory,type=volume',
-          { source: '${localEnv:VOLUME}', target: '/v', type: 'volume' },
-          'source=1r60kajr11nn-history,target=/commandhistory,type=volume',
-        ],
-        runArgs: ['-v', '${devcontainerId}-cache:/cache'],
-      }),
-    ).toEqual(['1r60kajr11nn-history']);
-  });
-
-  it('returns an empty list without mounts', () => {
-    expect(additionalNamedVolumes({ image: 'x' })).toEqual([]);
   });
 });

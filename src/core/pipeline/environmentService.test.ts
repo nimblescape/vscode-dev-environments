@@ -2863,9 +2863,17 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.helper.ups).toEqual([]);
     });
 
-    it('are allowed when an entry of an older version without owner of another repository uses them (one person shared them before)', async () => {
+    it('are refused when an entry of an older version without owner of another repository uses them', async () => {
       await otherEnvironment(null);
       await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+    });
+
+    it('are allowed when the environment recorded them itself: entries of one person shared them before the separation', async () => {
+      await otherEnvironment(null);
+      await seedEnvironment(h, { container: null, extra: { additionalVolumes: [SHARED] } });
       h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.ups).toHaveLength(1);
@@ -2877,6 +2885,13 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.ups).toHaveLength(1);
+    });
+
+    it('are recorded from the merged configuration too (a Feature of an existing container)', async () => {
+      await seedEnvironment(h);
+      h.helper.merged = { mounts: ['source=feature-cache,target=/c,type=volume'] };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['feature-cache']);
     });
 
     it('are recorded with the parser of the policy: a quoted --mount field, and a volume of a Feature in the image metadata', async () => {
