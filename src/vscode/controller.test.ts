@@ -1609,6 +1609,59 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
   });
 
+  describe('Switch branch… and Select configuration… of a repository with only an entry of an older version', () => {
+    /** The claim gives the entry to the account (`grant`), or leaves it without owner. */
+    function claims(grant: boolean): void {
+      h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
+        if (!grant) return [];
+        await h.registry.updateEnvironment(ENV_ID, (entry) => {
+          entry.owner = account;
+        });
+        return options.environmentIds;
+      });
+    }
+
+    it('Switch branch… claims the entry first and switches its branch', async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      claims(true);
+      const command = run('switchBranch', row('acme/api'));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+      expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID] });
+      expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
+      expect(h.service.open).not.toHaveBeenCalled();
+    });
+
+    it('Select configuration… claims the entry first and rebuilds it with the selected configuration', async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      claims(true);
+      h.service.listConfigurations.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown[]) => items[1]);
+      await run('selectConfiguration', row('acme/api'));
+      expect(h.service.listConfigurations).toHaveBeenCalledWith(ENV_ID, expect.anything());
+      expect(h.service.openEnvironment).toHaveBeenCalledWith(
+        ENV_ID,
+        expect.objectContaining({ configPath: '.devcontainer/python/devcontainer.json', forceRebuild: true }),
+      );
+      expect(h.service.open).not.toHaveBeenCalled();
+    });
+
+    it('Switch branch… without the claim leaves the entry and goes to the open pipeline', async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      claims(false);
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      const command = run('switchBranch', row('acme/api'));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].type('release/2.0');
+      h.quickPicks[0].pick('release/2.0');
+      await command;
+      expect(h.service.switchBranch).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0' }));
+      expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
+    });
+  });
+
   it('claims an environment of an older version when the account can access its repository, then starts it', async () => {
     await h.registry.add(environment({ owner: undefined }));
     h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
