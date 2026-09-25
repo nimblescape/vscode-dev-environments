@@ -1,0 +1,53 @@
+{
+  // Build tasks for debugging the extension (see launch.json).
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // esbuild in watch mode: rebuilds dist/extension.js and dist/sessionMonitor.js (with source maps) on every change.
+      "label": "watch",
+      "type": "npm",
+      "script": "watch",
+      "isBackground": true,
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "never", "panel": "dedicated" },
+      "problemMatcher": {
+        "owner": "esbuild",
+        "source": "esbuild",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": [
+          { "regexp": "^✘ \\[(ERROR|WARNING)\\] (.*)$", "severity": 1, "message": 2 },
+          { "regexp": "^\\s+(.+):(\\d+):(\\d+):$", "file": 1, "line": 2, "column": 3 }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\[watch\\] build started",
+          "endsPattern": "^\\[watch\\] build finished"
+        }
+      }
+    },
+    {
+      // Opens an Extension Development Host window with the extension from dist/, its extension host waiting for a
+      // debugger on 127.0.0.1:9339. Used by "Run Extension (attach over IPv4)" in launch.json.
+      "label": "open extension development host",
+      "type": "shell",
+      "command": "code",
+      "args": [
+        "--new-window",
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--inspect-brk-extensions=9339"
+      ],
+      "dependsOn": "watch",
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    },
+    {
+      // esbuild does not check types; run this next to "watch" to see type errors in the Problems view.
+      "label": "typecheck: watch",
+      "type": "shell",
+      "command": "npx tsc --noEmit --watch",
+      "isBackground": true,
+      "presentation": { "reveal": "never", "panel": "dedicated" },
+      "problemMatcher": "$tsc-watch"
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Starts an Extension Development Host window with this extension from dist/. It replaces an installed copy of
+      // nimblescape.vscode-dev-environments in that window. The extension needs the Dev Containers extension, which must
+      // be installed in the profile of the new window.
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "watch"
+    },
+    {
+      // Same, in a VS Code profile of your choice (the Dev Containers extension must be installed in it).
+      "name": "Run Extension (profile)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}", "--profile=${input:profile}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "watch"
+    },
+    {
+      // Workaround for VS Code 1.139.0 (js-debug 1.117, microsoft/vscode-js-debug#2420): the "Run Extension"
+      // configurations fail with "Extension host did not start in 10 seconds" when localhost resolves to ::1 first.
+      // This one opens the Extension Development Host through the code command and attaches over IPv4. "restart"
+      // attaches again after the window reloads (for example when it connects to a container).
+      "name": "Run Extension (attach over IPv4)",
+      "type": "node",
+      "request": "attach",
+      "address": "127.0.0.1",
+      "port": 9339,
+      "restart": true,
+      "timeout": 30000,
+      "continueOnAttach": true,
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "open extension development host"
+    },
+    {
+      // Runs the Session Monitor under the debugger. Only one monitor runs per storage folder (monitor.lock): quit the
+      // running one first, or give another folder.
+      "name": "Debug Session Monitor",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/dist/sessionMonitor.js",
+      "args": ["${input:monitorStorage}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "watch",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    },
+    {
+      // Runs the unit tests of the file open in the editor.
+      "name": "Debug Unit Tests (current file)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+      "args": ["run", "${relativeFile}"],
+      "autoAttachChildProcesses": true,
+      "smartStep": true,
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    },
+    {
+      // Runs the Docker integration tests of the file open in the editor (test/docker/*.test.ts) against the running
+      // Docker engine.
+      "name": "Debug Docker Tests (current file)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+      "args": ["run", "--config", "vitest.docker.config.ts", "${relativeFile}"],
+      "autoAttachChildProcesses": true,
+      "smartStep": true,
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "profile",
+      "type": "promptString",
+      "description": "Name of the VS Code profile for the Extension Development Host",
+      "default": "Deno"
+    },
+    {
+      "id": "monitorStorage",
+      "type": "promptString",
+      "description": "Storage folder of the extension (the Session Monitor's argument)",
+      "default": "${userHome}/Library/Application Support/Code/User/globalStorage/nimblescape.vscode-dev-environments"
+    }
+  ]
+}
