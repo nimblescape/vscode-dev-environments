@@ -113,7 +113,7 @@ export interface ControllerDeps {
   statusBar: EnvironmentStatusBar;
   settings: () => ExtensionSettings;
   /** The Docker setup (concept 6.1 step 2): the walkthrough and its commands. */
-  dockerSetup: Pick<DockerSetup, 'openWizard'>;
+  dockerSetup: Pick<DockerSetup, 'openWizard' | 'install' | 'start' | 'installWsl'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
   viewVisible: () => boolean;
   clock?: Clock;
@@ -232,7 +232,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 15 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 18 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -250,6 +250,9 @@ export class Controller implements vscode.Disposable {
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
       installDocker: () => this.deps.dockerSetup.openWizard(),
+      dockerSetupInstall: () => this.deps.dockerSetup.install(),
+      dockerSetupStart: () => this.deps.dockerSetup.start(),
+      dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
     };
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {

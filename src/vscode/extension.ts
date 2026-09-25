@@ -195,7 +195,11 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   // Concept 6.1 step 2: the welcome view and the row "Install Docker…" while no Docker CLI is found.
   const setup = new DockerSetup({
     docker,
+    runner,
     logger,
+    showLog: () => logger.show(),
+    platform,
+    env,
     onDidChangeInstalled: () => {
       sidebar.render().catch((error: unknown) => logger.error('Could not update the sidebar.', error));
     },

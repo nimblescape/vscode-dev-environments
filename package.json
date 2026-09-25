@@ -79,6 +79,98 @@
         "when": "devEnvironments.signedIn && devEnvironments.loadFailed"
       }
     ],
+    "walkthroughs": [
+      {
+        "id": "dockerSetup",
+        "title": "Set up Docker for Dev Environments",
+        "description": "Dev Environments runs your environments in Docker. Install and start Docker, then sign in with GitHub.",
+        "steps": [
+          {
+            "id": "wsl",
+            "title": "Install WSL 2",
+            "description": "Docker Desktop runs your environments in WSL 2, the Windows Subsystem for Linux. Windows asks for administrator permission, and the computer must restart afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)",
+            "media": {
+              "markdown": "resources/walkthrough/wsl.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.wslReady"
+            ],
+            "when": "isWindows"
+          },
+          {
+            "id": "installMac",
+            "title": "Install Docker",
+            "description": "Installs Docker Desktop with Homebrew, or downloads its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+            "media": {
+              "markdown": "resources/walkthrough/install-mac.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.dockerInstalled"
+            ],
+            "when": "isMac"
+          },
+          {
+            "id": "installWindows",
+            "title": "Install Docker",
+            "description": "Installs Docker Desktop with winget, or downloads its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+            "media": {
+              "markdown": "resources/walkthrough/install-windows.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.dockerInstalled"
+            ],
+            "when": "isWindows"
+          },
+          {
+            "id": "installLinux",
+            "title": "Install Docker",
+            "description": "Installs Docker Engine from the package repository of Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+            "media": {
+              "markdown": "resources/walkthrough/install-linux.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.dockerInstalled"
+            ],
+            "when": "isLinux"
+          },
+          {
+            "id": "startDesktop",
+            "title": "Start Docker",
+            "description": "Starts Docker Desktop and waits until it is ready. At its first start, Docker Desktop shows its own dialogs once.\n[Start Docker](command:devEnvironments.dockerSetup.start)",
+            "media": {
+              "markdown": "resources/walkthrough/start-desktop.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.dockerReady"
+            ],
+            "when": "isMac || isWindows"
+          },
+          {
+            "id": "startLinux",
+            "title": "Start Docker",
+            "description": "Starts Docker and checks that it is ready. The Docker service is started in a terminal, where you enter your password.\n[Start Docker](command:devEnvironments.dockerSetup.start)",
+            "media": {
+              "markdown": "resources/walkthrough/start-linux.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.dockerReady"
+            ],
+            "when": "isLinux"
+          },
+          {
+            "id": "signIn",
+            "title": "Sign in with GitHub",
+            "description": "Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)",
+            "media": {
+              "markdown": "resources/walkthrough/sign-in.md"
+            },
+            "completionEvents": [
+              "onContext:devEnvironments.signedIn"
+            ]
+          }
+        ]
+      }
+    ],
     "commands": [
       {
         "command": "devEnvironments.start",
@@ -161,6 +253,21 @@
         "command": "devEnvironments.installDocker",
         "title": "Install Docker…",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.dockerSetup.install",
+        "title": "Install Docker",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.dockerSetup.start",
+        "title": "Start Docker",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.dockerSetup.installWsl",
+        "title": "Install WSL 2",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [
@@ -174,6 +281,18 @@
       "commandPalette": [
         {
           "command": "devEnvironments.selectOwnersFiltered",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.dockerSetup.install",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.dockerSetup.start",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.dockerSetup.installWsl",
           "when": "false"
         }
       ],

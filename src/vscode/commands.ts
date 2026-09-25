@@ -21,6 +21,10 @@ export const Commands = {
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devEnvironments.selectOwnersFiltered',
   installDocker: 'devEnvironments.installDocker',
+  // The buttons of the walkthrough "Set up Docker for Dev Environments" (hidden in the Command Palette).
+  dockerSetupInstall: 'devEnvironments.dockerSetup.install',
+  dockerSetupStart: 'devEnvironments.dockerSetup.start',
+  dockerSetupInstallWsl: 'devEnvironments.dockerSetup.installWsl',
 } as const;
 
 export type CommandName = keyof typeof Commands;

@@ -223,7 +223,7 @@ interface Harness {
     updateContextKey: ReturnType<typeof vi.fn>;
   };
   claims: { claim: ReturnType<typeof vi.fn> };
-  dockerSetup: { openWizard: ReturnType<typeof vi.fn> };
+  dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -296,7 +296,12 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     updateContextKey: vi.fn(async () => true),
   };
   const claims = { claim: vi.fn(async (): Promise<string[]> => []) };
-  const dockerSetup = { openWizard: vi.fn(async () => {}) };
+  const dockerSetup = {
+    openWizard: vi.fn(async () => {}),
+    install: vi.fn(async () => {}),
+    start: vi.fn(async () => {}),
+    installWsl: vi.fn(async () => {}),
+  };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -492,7 +497,7 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    expect(declared).toHaveLength(15);
+    expect(declared).toHaveLength(18);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -1624,6 +1629,21 @@ describe('Connection of this window', () => {
   it('opens the walkthrough with Install Docker…', async () => {
     await run('installDocker');
     expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the buttons of the walkthrough', async () => {
+    await run('dockerSetupInstall');
+    await run('dockerSetupStart');
+    await run('dockerSetupInstallWsl');
+    expect(h.dockerSetup.install).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.start).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.installWsl).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows an error of a walkthrough button (concept 6.5)', async () => {
+    h.dockerSetup.start.mockRejectedValue(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
+    await run('dockerSetupStart');
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerStartFailed, Actions.showDetails);
   });
 });
 

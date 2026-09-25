@@ -49,7 +49,19 @@ export class TreeItem {
   ) {}
 }
 
-export const Uri = { parse: (value: string) => ({ scheme: value.split(':')[0], toString: () => value }) };
+export const Uri = {
+  parse: (value: string) => ({ scheme: value.split(':')[0], toString: () => value }),
+  file: (fsPath: string) => ({ scheme: 'file', fsPath, toString: () => `file://${fsPath}` }),
+};
+
+export interface FakeTerminal {
+  name?: string;
+  shown: number;
+  lines: string[];
+  show(): void;
+  sendText(text: string): void;
+  dispose(): void;
+}
 
 export const ProgressLocation = { SourceControl: 1, Window: 10, Notification: 15 } as const;
 export const StatusBarAlignment = { Left: 1, Right: 2 } as const;
@@ -105,6 +117,7 @@ export const fakeVscode = {
     showQuickPick: vi.fn(),
     createQuickPick: vi.fn(),
     withProgress: vi.fn(),
+    createTerminal: vi.fn(),
   },
   env: { openExternal: vi.fn(), remoteName: undefined as string | undefined },
   commands: { executeCommand: vi.fn(), registerCommand: vi.fn() },
@@ -118,6 +131,7 @@ export const fakeVscode = {
     sessionChanges.fire({ provider: { id: providerId, label: providerId } });
   },
   statusBarItems: [] as FakeStatusBarItem[],
+  terminals: [] as FakeTerminal[],
   outputChannels: [] as FakeOutputChannel[],
 };
 
@@ -125,6 +139,7 @@ export const fakeVscode = {
 export function resetFakeVscode(): void {
   const { window } = fakeVscode;
   fakeVscode.statusBarItems.length = 0;
+  fakeVscode.terminals.length = 0;
   fakeVscode.env.remoteName = undefined;
   fakeVscode.outputChannels.length = 0;
   for (const mock of [
@@ -166,6 +181,22 @@ export function resetFakeVscode(): void {
     };
     fakeVscode.outputChannels.push(channel);
     return channel;
+  });
+  window.createTerminal.mockImplementation((options: { name?: string }) => {
+    const terminal: FakeTerminal = {
+      name: options.name,
+      shown: 0,
+      lines: [],
+      show() {
+        terminal.shown++;
+      },
+      sendText(text) {
+        terminal.lines.push(text);
+      },
+      dispose() {},
+    };
+    fakeVscode.terminals.push(terminal);
+    return terminal;
   });
   window.createStatusBarItem.mockImplementation((id: string, alignment: number, priority: number) => {
     const item: FakeStatusBarItem = {
