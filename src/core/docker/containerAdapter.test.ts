@@ -445,6 +445,31 @@ describe('volumes', () => {
     expect(await docker.listEnvironmentVolumes()).toEqual([]);
     expect(runner.calls).toHaveLength(1);
   });
+
+  it('inspects the volumes of a list that exist, each once, with their labels', async () => {
+    const { docker, runner } = adapter(() =>
+      fail(
+        'Error response from daemon: get gone: no such volume',
+        1,
+        inspectOutput([
+          { Name: 'db', Driver: 'local', Labels: { 'com.docker.compose.project': 'shop' } },
+          { Name: 'cache', Driver: 'local', Labels: null },
+        ]),
+      ),
+    );
+    expect(await docker.inspectVolumes(['db', 'cache', 'gone', 'db'])).toEqual([
+      { name: 'db', labels: { 'com.docker.compose.project': 'shop' } },
+      { name: 'cache', labels: {} },
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['volume', 'inspect', 'db', 'cache', 'gone']]);
+  });
+
+  it('inspects nothing for an empty list, and throws for errors other than a missing volume', async () => {
+    const { docker, runner } = adapter(() => fail('Cannot connect to the Docker daemon at unix:///var/run/docker.sock.'));
+    expect(await docker.inspectVolumes([])).toEqual([]);
+    expect(runner.calls).toHaveLength(0);
+    await expect(docker.inspectVolumes(['x'])).rejects.toBeInstanceOf(CommandError);
+  });
 });
 
 describe('images', () => {

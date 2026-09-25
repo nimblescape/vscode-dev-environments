@@ -4,15 +4,18 @@
 
 // Docker objects of the integration tests (npm run test:docker): the Docker CLI with a configuration of its own, snapshots
 // of the containers, volumes, and images of the engine, and the removal of what a test run created. Every object that a
-// test creates carries the label devenv.test-run=<run ID>, or uses a volume that carries it, so the cleanup never touches
+// test creates carries the label devenv-test.run=<run ID>, or uses a volume that carries it, so the cleanup never touches
 // other objects of the user. This module does not import vitest: the global setup uses it too.
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-/** Label on every container, volume, and image that the tests create. Its value is the run ID. */
-export const TEST_RUN_LABEL = 'devenv.test-run';
+/**
+ * Label on every container, volume, and image that the tests create. Its value is the run ID. Not a key with the prefix
+ * `devenv.`: the host access policy refuses such labels in the runArgs of a configuration.
+ */
+export const TEST_RUN_LABEL = 'devenv-test.run';
 
 /**
  * Base image of the test configurations: the official Alpine image, from the Docker Hub mirror of Google
@@ -31,7 +34,7 @@ export const OLD_GIT_BASE_IMAGE = process.env.DEVENV_TEST_OLD_GIT_IMAGE ?? 'mirr
 
 /** What the global setup passes to the test files (vitest `provide`/`inject`). */
 export interface DockerTestRun {
-  /** Value of the label devenv.test-run on the objects of this run. */
+  /** Value of the label devenv-test.run on the objects of this run. */
   runId: string;
   /** Temporary folder of the run: storage folders, logs, the Docker configuration, the baseline. */
   runDir: string;
@@ -140,7 +143,8 @@ export interface ContainerDetails {
   /** With a leading `/`. */
   Name: string;
   State: { Status: string; Running: boolean };
-  Config: { Image: string; Labels: Record<string, string> | null; Env?: string[] | null };
+  Config: { Image: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean };
+  HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null };
   Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
 }
 
@@ -149,6 +153,7 @@ export interface ImageDetails {
   Id: string;
   RepoTags: string[] | null;
   RepoDigests: string[] | null;
+  Architecture?: string;
   Config: { Labels: Record<string, string> | null };
 }
 
@@ -244,7 +249,7 @@ export function unexpectedChanges(baseline: DockerSnapshot, current: DockerSnaps
 }
 
 /**
- * Removes the objects of a test run: the containers with the label devenv.test-run=<runId> and the containers that use a
+ * Removes the objects of a test run: the containers with the label devenv-test.run=<runId> and the containers that use a
  * volume of the run (helper runs), then the images and the volumes with the label. Images are removed with force: they
  * are images of the run only. Returns a description of each removed object.
  */

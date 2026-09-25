@@ -38,7 +38,10 @@ export const Messages = {
     `This configuration uses files on your computer (${items}). This does not work, because the repository is stored in a Docker volume.`,
   hostAccess: (items: string) =>
     `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. Change the configuration of the repository.`,
-  /** Settings that the host access policy does not know, so it cannot tell what they do (concept section 9). */
+  /**
+   * Settings that the host access policy does not know, so it cannot tell what they do, and values that work against how
+   * the extension runs the container, for example `--restart=always` (concept section 9).
+   */
   unsupportedOptions: (items: string) =>
     `This configuration uses options that Dev Environments does not support: ${items}. Change the configuration of the repository.`,
   /** Both: settings that need access to the computer, and settings that the policy does not know. */
@@ -64,6 +67,11 @@ export const Messages = {
     (helperNames
       ? `The workspace helper sets ${helperNames} to its own values (for example, HOME is /root), not to the values of your computer. The others are empty or have their default value.`
       : 'They are empty or have their default value, except variables that the workspace helper sets itself (for example, HOME is /root).'),
+  /**
+   * Concept 7.5: an environment that a command names belongs to another account, for example a row or the status bar item
+   * from before an account change, or an open during which the account changed. Never for a repository: each account
+   * has its own environment of it (D-3).
+   */
   otherAccount: (repository: string) =>
     `The environment of ${repository} belongs to another GitHub account. Sign in with that account to use it.`,
   /** Concept 7.5: the question before an entry of an older version is assigned to the signed-in account. */

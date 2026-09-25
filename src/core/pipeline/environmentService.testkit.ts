@@ -99,6 +99,8 @@ export class FakeDocker implements EnvironmentDocker {
   execHandler: (container: string, command: readonly string[], user?: string) => Partial<RunResult> = () => ({});
   /** Volumes that `docker volume rm` refuses to remove. */
   readonly volumesInUse = new Set<string>();
+  /** The names of each `docker volume inspect` (inspectVolumes). */
+  readonly volumeInspections: string[][] = [];
   /** `Config` of `docker image inspect` per image. Default: no labels, no user. */
   readonly imageConfigs = new Map<string, { User?: string; Labels?: Record<string, string> }>();
   /** `docker run` calls: the image and the arguments after it. */
@@ -193,6 +195,11 @@ export class FakeDocker implements EnvironmentDocker {
     return [...this.volumes.entries()]
       .filter(([, labels]) => LABEL_ENVIRONMENT_ID in labels)
       .map(([name, labels]) => ({ name, labels: { ...labels } }));
+  }
+
+  async inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]> {
+    this.volumeInspections.push([...names]);
+    return [...new Set(names)].filter((name) => this.volumes.has(name)).map((name) => ({ name, labels: { ...this.volumes.get(name) } }));
   }
 
   async imageExists(reference: string): Promise<boolean> {

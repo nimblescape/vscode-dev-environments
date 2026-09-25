@@ -178,11 +178,9 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
  *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours);
  * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
  *   created when missing, with an example in comments; an existing file stays as it is;
- * - docker/ (DOCKER_CONFIG) and gnupg/ (GNUPGHOME) with gnupg/private-keys-v1.d/, mode 0700. The file in
- *   private-keys-v1.d makes the Dev Containers extension skip the forwarding of the GPG agent, which it does only for a
- *   container without private keys (Assumption (V-8)); GnuPG ignores it, because it is no `<keygrip>.key`.
+ * - docker/ (DOCKER_CONFIG), mode 0700.
  * A link or a file in place of one of the folders is removed first, and the token file is replaced with a rename, so
- * that the token never goes to another place.
+ * that the token never goes to another place. The folder gnupg/ of an earlier version stays as it is; nothing uses it.
  */
 export const GIT_FILES_SCRIPT = `${TOKEN_PRELUDE}
 folder="$1"
@@ -199,7 +197,7 @@ if [ ! -d "$repo" ]; then
 fi
 owner=$(stat -c '%u:%g' "$repo")
 read_token
-for path in "$dir" "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d"; do
+for path in "$dir" "$dir/docker"; do
   if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
     rm -f "$path"
   fi
@@ -208,12 +206,7 @@ for path in "$dir" "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d"; do
   fi
 done
 chmod 0755 "$dir"
-chmod 0700 "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d"
-placeholder="$dir/gnupg/private-keys-v1.d/README-devenv"
-if [ -L "$placeholder" ] || [ ! -f "$placeholder" ]; then
-  rm -rf "$placeholder"
-  printf '%s\n' 'Dev Environments: this file keeps the GPG agent of the computer out of the container.' > "$placeholder"
-fi
+chmod 0700 "$dir/docker"
 work=$(mktemp -d "$dir/.work.XXXXXX")
 cp "$token_file" "$work/github-token"
 rm -f "$token_file"
@@ -248,7 +241,7 @@ if [ ! -e "$credentials" ]; then
   chmod 0644 "$work/credentials.gitconfig"
   mv -fT "$work/credentials.gitconfig" "$credentials"
 fi
-chown -h "$owner" "$dir" "$dir/docker" "$dir/gnupg" "$dir/gnupg/private-keys-v1.d" "$placeholder" "$cfg" "$credentials"
+chown -h "$owner" "$dir" "$dir/docker" "$cfg" "$credentials"
 echo "The Git configuration of the environment is in $dir."
 `;
 

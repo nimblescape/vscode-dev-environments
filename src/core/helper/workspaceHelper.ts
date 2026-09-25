@@ -574,7 +574,7 @@ export class WorkspaceHelper {
   }
 
   /**
-   * Writes the token of the owner account and the Git, Docker, and GPG configuration of the dev container into the volume
+   * Writes the token of the owner account and the Git and Docker configuration of the dev container into the volume
    * (GIT_FILES_SCRIPT, concept section 9 "Git inside the container"), without the Docker socket, the cache volume, and
    * network. The token goes to the helper on stdin only; it is never on a command line, in a variable, or in the output.
    * Throws CommandError (with the token removed from the output).

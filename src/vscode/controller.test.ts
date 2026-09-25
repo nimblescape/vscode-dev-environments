@@ -11,6 +11,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { UserFacingError } from '../core/errors';
+import { CONFIG_FOLDER_OWNER_COMMAND } from '../core/helper/containerGit';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, GITHUB_TOKEN_FILE, LABEL_CONTAINER_VERSION } from '../core/names';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
@@ -1736,6 +1737,50 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.onSessionChanged();
     await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
     expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+  });
+
+  describe('the token of a container where root may not remove it (a configuration with --cap-drop)', () => {
+    const DENIED = "rm: cannot remove '/workspaces/.devenv+/github-token': Permission denied";
+    type ExecResult = { exitCode: number; stdout?: string; stderr?: string };
+
+    /** docker exec: `rm` as root is denied; `stat` of the folder of the token gives `owner`; any other user may remove it. */
+    function rootMayNotRemove(owner: ExecResult): void {
+      h.docker.exec.mockImplementation(async (_container: string, command: string[], options: { user?: string }) => {
+        let result: ExecResult = { exitCode: 0 };
+        if (command[0] === 'rm' && options.user === 'root') result = { exitCode: 1, stderr: DENIED };
+        else if (command[0] === 'stat') result = owner;
+        return { stdout: '', stderr: '', timedOut: false, ...result };
+      });
+    }
+
+    async function takeTokenOut(): Promise<void> {
+      const env = environment({ owner: OTHER_ACCOUNT });
+      await h.registry.add(env);
+      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+      const logged = () => [...h.logger.info.mock.calls, ...h.logger.warn.mock.calls].some((call) => String(call[0]).includes('The GitHub token'));
+      await settle(logged, 'the removal of the token');
+    }
+
+    const calls = () => h.docker.exec.mock.calls.map((call) => ({ command: call[1] as string[], user: (call[2] as { user?: string }).user }));
+
+    it('removes it as the owner of its folder', async () => {
+      rootMayNotRemove({ exitCode: 0, stdout: '1000:1000\n' });
+      await takeTokenOut();
+      expect(calls()).toEqual([
+        { command: ['rm', '-f', GITHUB_TOKEN_FILE], user: 'root' },
+        { command: [...CONFIG_FOLDER_OWNER_COMMAND], user: 'root' },
+        { command: ['rm', '-f', GITHUB_TOKEN_FILE], user: '1000:1000' },
+      ]);
+      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
+      expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
+    });
+
+    it('warns when the owner of its folder is not known', async () => {
+      rootMayNotRemove({ exitCode: 1, stderr: "stat: can't stat" });
+      await takeTokenOut();
+      expect(calls().map((call) => call.user)).toEqual(['root', 'root']);
+      expect(h.logger.warn).toHaveBeenCalledWith(`The GitHub token could not be removed from the container ${CONTAINER}: ${DENIED}`);
+    });
   });
 
   it('role A: takes the token out of a running container of another account, and asks nothing of a stopped one', async () => {

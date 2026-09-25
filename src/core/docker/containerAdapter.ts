@@ -472,8 +472,13 @@ export class ContainerAdapter {
     const names = parseJsonLines(await this.runChecked(listArgs, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS })).filter(
       (name): name is string => typeof name === 'string' && name !== '',
     );
+    return this.inspectVolumes(names);
+  }
+
+  /** The volumes of `names` that exist, with all their labels (`docker volume inspect`); missing ones are left out. */
+  async inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]> {
     const volumes: VolumeInfo[] = [];
-    for (const batch of chunks(names, INSPECT_BATCH_SIZE)) {
+    for (const batch of chunks([...new Set(names)], INSPECT_BATCH_SIZE)) {
       for (const item of await this.inspectBatch(['volume', 'inspect', ...batch], 'volume')) {
         const volume = toVolumeInfo(item);
         if (volume) volumes.push(volume);

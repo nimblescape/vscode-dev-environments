@@ -401,7 +401,7 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     return spawnSync('git', ['config', '--file', file, ...args], { encoding: 'utf8' }).stdout;
   }
 
-  it('writes the token (0600), the Git configuration, and the Docker and GPG folders, owned by the repository owner', () => {
+  it('writes the token (0600), the Git configuration, and the Docker folder, owned by the repository owner', () => {
     const env = setup();
     const result = run(env);
     expect(result.stderr).toBe('');
@@ -415,17 +415,15 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
     expect(gitConfig(cfg, 'user.email')).toBe('1001+scalarion@users.noreply.github.com\n');
     expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
-    for (const folder of ['docker', 'gnupg', 'gnupg/private-keys-v1.d']) {
-      expect(fs.statSync(path.join(dir, folder)).mode & 0o777).toBe(0o700);
-    }
-    expect(fs.readdirSync(path.join(dir, 'gnupg', 'private-keys-v1.d'))).toEqual(['README-devenv']);
+    expect(fs.statSync(path.join(dir, 'docker')).mode & 0o777).toBe(0o700);
     const chowned = fs.readFileSync(env.log, 'utf8');
     expect(chowned).toContain(`chown 1000:1001 ${path.join(dir, '.work.')}`);
-    expect(chowned).toContain(`chown -h 1000:1001 ${dir} ${dir}/docker ${dir}/gnupg ${dir}/gnupg/private-keys-v1.d`);
+    expect(chowned).toContain(`chown -h 1000:1001 ${dir} ${dir}/docker ${dir}/gitconfig`);
     expect(chowned).toContain(cfg);
     // The token is gone from the tmpfs, and no temporary folder is left.
     expect(fs.readdirSync(env.secrets)).toEqual([]);
-    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token', 'gnupg']);
+    // No GnuPG folder: the extension does not change where GnuPG works (user decision 2026-09-25).
+    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token']);
     // The file for the credential helpers of the user: only comments, readable by every user of the container.
     const credentials = path.join(dir, 'credentials.gitconfig');
     expect(fs.readFileSync(credentials, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));

@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
-import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
+import { HOME_GIT_CONFIG_SCRIPT, devContainersSettings, homeGitConfigCommand } from '../helper/containerGit';
 import { runArgsProblems } from '../helper/hostAccess';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
@@ -129,7 +129,7 @@ describe('open: first open', () => {
       command[0] === 'sh' && command[2]?.includes('rev-list') ? { stdout: gitExecOutput('main') } : {};
     const result = await h.service.open(TARGET, options());
 
-    const env = await h.registry.findByRepository(REPO);
+    const env = await h.registry.findForAccount(REPO, ACCOUNT.id);
     expect(env).toBeDefined();
     const id = env!.id;
     const name = resourceName(REPO, id);
@@ -150,7 +150,7 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=2', '--name', name]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=3', '--name', name]);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
     // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
@@ -204,7 +204,7 @@ describe('open: first open', () => {
 
     h.ui.trust = true;
     await h.service.open({ ...TARGET, trusted: false }, options());
-    expect(await h.registry.findByRepository(REPO)).toBeDefined();
+    expect(await h.registry.findForAccount(REPO, ACCOUNT.id)).toBeDefined();
   });
 
   it('does not ask for a trusted owner', async () => {
@@ -284,11 +284,11 @@ describe('open: first open', () => {
   it('marks the environment busy (create) while it is prepared', async () => {
     let busy: Environment['busy'];
     h.helper.onBuild = async () => {
-      busy = (await h.registry.findByRepository(REPO))?.busy;
+      busy = (await h.registry.findForAccount(REPO, ACCOUNT.id))?.busy;
     };
     await h.service.open(TARGET, options());
     expect(busy).toMatchObject({ operation: 'create', pid: PID, windowId: WINDOW_ID });
-    expect((await h.registry.findByRepository(REPO))?.busy).toBeUndefined();
+    expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.busy).toBeUndefined();
   });
 
   it('writes the pending connection file before up, so the new container is in use from its start', async () => {
@@ -299,7 +299,7 @@ describe('open: first open', () => {
       return original(p);
     };
     await h.service.open(TARGET, options());
-    const id = (await h.registry.findByRepository(REPO))!.id;
+    const id = (await h.registry.findForAccount(REPO, ACCOUNT.id))!.id;
     expect(pendingAtUp).toEqual([[id]]);
     expect(await pendingIds()).toEqual([id]);
   });
@@ -311,7 +311,7 @@ describe('open: first open', () => {
     expect(h.docker.runs).toEqual([]);
     // Root gets the ~/.gitconfig too.
     expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT && e.command[4] === 'root')).toBe(true);
-    expect((await h.registry.findByRepository(REPO))?.remoteUser).toBe('root');
+    expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.remoteUser).toBe('root');
   });
 
   it('gives the cloned files to the remote user before up runs the lifecycle commands', async () => {
@@ -322,7 +322,7 @@ describe('open: first open', () => {
       return original(p);
     };
     await h.service.open(TARGET, options());
-    const env = (await h.registry.findByRepository(REPO))!;
+    const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
     expect(h.docker.runs).toHaveLength(1);
     expect(runsAtUp).toBe(1);
     const run = h.docker.runs[0];
@@ -344,7 +344,7 @@ describe('open: first open', () => {
     expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created'))).toBe(true);
   });
 
-  it('uses the environment that another window created in the meantime (one per repository)', async () => {
+  it('uses the environment that another window of the account created in the meantime (one per repository and account)', async () => {
     const registry = h.registry;
     const original = registry.add.bind(registry);
     let raced = false;
@@ -365,7 +365,7 @@ describe('open: first open', () => {
     h.helper.files = { '.devcontainer/python/devcontainer.json': { configText: DEFAULT_CONFIG_TEXT } };
     await h.service.open(TARGET, options({ branch: 'feature-x' }));
     expect(h.ui.infos).toEqual([Messages.configurationNotFound(DEFAULT_CONFIG_PATH, 'python')]);
-    const env = await h.registry.findByRepository(REPO);
+    const env = await h.registry.findForAccount(REPO, ACCOUNT.id);
     expect(env?.configPath).toBe('.devcontainer/python/devcontainer.json');
     expect(env?.buildRecord?.configPath).toBe('.devcontainer/python/devcontainer.json');
   });
@@ -374,7 +374,7 @@ describe('open: first open', () => {
     h.helper.files = { '.devcontainer.json': { configText: DEFAULT_CONFIG_TEXT } };
     await h.service.open({ ...TARGET, configPaths: [] }, options());
     expect(h.ui.infos).toEqual([]);
-    expect((await h.registry.findByRepository(REPO))?.configPath).toBe('.devcontainer.json');
+    expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.configPath).toBe('.devcontainer.json');
   });
 
   it('reports a repository without configuration and cleans up', async () => {
@@ -428,7 +428,7 @@ describe('open: first open', () => {
       mounts: ['source=api-data,target=/data,type=volume', { target: '/x', type: 'tmpfs' }],
     };
     await h.service.open(TARGET, options());
-    const env = await h.registry.findByRepository(REPO);
+    const env = await h.registry.findForAccount(REPO, ACCOUNT.id);
     expect(env?.shutdownActionNone).toBe(true);
     expect(env?.additionalVolumes).toEqual(['api-data']);
   });
@@ -1426,16 +1426,19 @@ describe('open: registry lost', () => {
     return claim;
   }
 
-  it('refuses a restored volume of another account without a claim, and creates no second environment', async () => {
+  it('creates an environment of the account next to a restored volume of another account, without a claim (concept D-3)', async () => {
     const claim = withClaims(async () => true);
     h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('otherAccount');
-    expect(error.message).toBe(Messages.otherAccount(REPO));
+    const result = await h.service.open(TARGET, options());
     expect(claim).not.toHaveBeenCalled();
-    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
-    expect([...h.docker.volumes.keys()]).toEqual([OLD_NAME]);
-    expect(h.helper.calls).toEqual([]);
+    expect(result.environment.id).not.toBe(OTHER_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect(h.helper.clones).toEqual([expect.objectContaining({ volumeName: result.environment.volumeName, token: TOKEN })]);
+    // The environment of the other account is restored, stays as it is, and is not named.
+    expect(await h.registry.get(OTHER_ID)).toMatchObject({ volumeName: OLD_NAME, owner: { id: OTHER_ACCOUNT.id } });
+    expect(h.docker.volumes.get(OLD_NAME)).toEqual({ [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    expect(h.docker.containersOf(OTHER_ID)).toEqual([]);
+    expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);
   });
 
   it('claims a restored volume of an older version (without owner) for the account, and uses it', async () => {
@@ -1450,34 +1453,52 @@ describe('open: registry lost', () => {
     expect(h.helper.clones).toEqual([]);
   });
 
-  it('refuses a restored volume of an older version as not assigned when the claim fails, not as of another account', async () => {
+  it('leaves a restored volume of an older version hidden when the claim fails, and creates an environment of the account', async () => {
+    const claim = withClaims(async () => false);
+    const result = await h.service.open(TARGET, options());
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [OTHER_ID], mode: 'interactive' }));
+    expect(result.environment.id).not.toBe(OTHER_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect(h.helper.clones).toEqual([expect.objectContaining({ volumeName: result.environment.volumeName })]);
+    // The entry of the older version keeps its volume and stays without owner, so the account that created it can claim it.
+    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
+    expect(h.docker.volumes.has(OLD_NAME)).toBe(true);
+    expect(h.ui.warnings).toEqual([]);
+
+    // The next open uses the environment of the account; the entry of the older version is not asked about again.
+    const again = await h.service.open(TARGET, options());
+    expect(again.environment.id).toBe(result.environment.id);
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(h.helper.clones).toHaveLength(1);
+  });
+
+  it('leaves a restored volume of an older version hidden without claims, and creates an environment of the account', async () => {
+    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).not.toBe(OTHER_ID);
+    expect((await h.registry.list()).map((e) => e.id).sort()).toEqual([OTHER_ID, result.environment.id].sort());
+    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
+  });
+
+  it('refuses the restored entry of an older version as not assigned when it is opened by its ID and the claim fails', async () => {
     let online = false;
     const claim = withClaims(async () => online);
-    const error = await rejection(h.service.open(TARGET, options()));
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    const error = await rejection(h.service.openEnvironment(OTHER_ID, options()));
     expect(claim).toHaveBeenCalledTimes(1);
     expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
     expect(error.code).not.toBe('otherAccount');
     expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
-    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
-    expect([...h.docker.volumes.keys()]).toEqual([OLD_NAME]);
-    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
     expect(h.helper.calls).toEqual([]);
 
-    // Try again (the entry is in the registry now), with GitHub reachable: the open claims it and uses it.
+    // Try again, with GitHub reachable: the open claims it and uses it.
     online = true;
-    const result = await h.service.open(TARGET, options());
+    const result = await h.service.openEnvironment(OTHER_ID, options());
     expect(claim).toHaveBeenCalledTimes(2);
     expect(result.environment.id).toBe(OTHER_ID);
     expect(result.environment.owner).toEqual(ACCOUNT);
     expect(h.helper.clones).toEqual([]);
-  });
-
-  it('refuses a restored volume of an older version as not assigned without claims', async () => {
-    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
-    expect(h.helper.calls).toEqual([]);
   });
 
   it('creates the environment when only volumes of other repositories exist, and restores those', async () => {
@@ -1511,7 +1532,7 @@ describe('open: failed lifecycle command', () => {
     h.helper.remoteUser = 'node';
     h.helper.lifecycleFailure = () => POST_CREATE_FAILED;
     const result = await h.service.open(TARGET, options());
-    const env = (await h.registry.findByRepository(REPO))!;
+    const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
     const image = environmentImageName(env.id, 1);
     expect(result.environment.id).toBe(env.id);
     expect(env.buildRecord?.environmentImage).toBe(image);
@@ -1909,7 +1930,11 @@ describe('reconcileFromVolumes', () => {
     const name = resourceName('acme/web', OTHER_ID);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web' });
     h.docker.volumes.set('bad', { [LABEL_ENVIRONMENT_ID]: '../x', [LABEL_REPOSITORY]: 'acme/bad' });
-    h.docker.volumes.set('duplicate', { [LABEL_ENVIRONMENT_ID]: '11111111-2222-3333-4444-555555555555', [LABEL_REPOSITORY]: 'ACME/api' });
+    h.docker.volumes.set('duplicate', {
+      [LABEL_ENVIRONMENT_ID]: '11111111-2222-3333-4444-555555555555',
+      [LABEL_REPOSITORY]: 'ACME/api',
+      [LABEL_OWNER_ID]: ACCOUNT.id,
+    });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     const added = await h.registry.get(OTHER_ID);
     expect(added).toMatchObject({
@@ -1921,6 +1946,36 @@ describe('reconcileFromVolumes', () => {
     expect(added?.buildRecord).toBeUndefined();
     expect(await h.registry.list()).toHaveLength(2);
     expect(await h.service.reconcileFromVolumes()).toBe(0);
+  });
+
+  it('restores one environment per repository and owner: two accounts, and one entry of an older version (concept D-3)', async () => {
+    const ids = ['a0000001-0000-4000-8000-000000000001', 'a0000002-0000-4000-8000-000000000002', 'a0000003-0000-4000-8000-000000000003'];
+    const skippedIds = ['b0000004-0000-4000-8000-000000000004', 'b0000005-0000-4000-8000-000000000005'];
+    const volume = (id: string, owner: GitHubAccount | undefined): void => {
+      const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: REPO };
+      if (owner) labels[LABEL_OWNER_ID] = owner.id;
+      h.docker.volumes.set(resourceName(REPO, id), labels);
+    };
+    volume(ids[0], ACCOUNT);
+    volume(ids[1], OTHER_ACCOUNT);
+    volume(ids[2], undefined);
+    // A second volume of the same repository and owner is not added.
+    volume(skippedIds[0], OTHER_ACCOUNT);
+    volume(skippedIds[1], undefined);
+    expect(await h.service.reconcileFromVolumes()).toBe(3);
+    const entries = await h.registry.list();
+    expect(entries.map((e) => [e.id, e.owner?.id])).toEqual([
+      [ids[0], ACCOUNT.id],
+      [ids[1], OTHER_ACCOUNT.id],
+      [ids[2], undefined],
+    ]);
+    expect(h.logger.warnings.filter((warning) => warning.includes('another environment of the same owner'))).toEqual(
+      skippedIds.map((id) => `The volume ${resourceName(REPO, id)} belongs to a repository that has another environment of the same owner. It is not added.`),
+    );
+    // Each account finds its own environment of the repository.
+    expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.id).toBe(ids[0]);
+    expect((await h.registry.findForAccount(REPO, OTHER_ACCOUNT.id))?.id).toBe(ids[1]);
+    expect((await h.registry.findUnowned(REPO))?.id).toBe(ids[2]);
   });
 
   it('does nothing when Docker does not run', async () => {
@@ -1948,17 +2003,28 @@ describe('abort while waiting for another operation', () => {
 });
 
 describe('accounts (concept 7.5, section 9 "Accounts")', () => {
-  it('refuses to open an environment of another account, before it starts Docker or anything else', async () => {
+  it('refuses to open an environment of another account by its ID, before it starts Docker or anything else', async () => {
     await seedEnvironment(h, { owner: OTHER_ACCOUNT });
-    for (const open of [() => h.service.open(TARGET, options()), () => h.service.openEnvironment(ENV_ID, options())]) {
-      const error = await rejection(open());
-      expect(error.code).toBe('otherAccount');
-      expect(error.message).toBe(Messages.otherAccount(REPO));
-    }
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('otherAccount');
+    expect(error.message).toBe(Messages.otherAccount(REPO));
     expect(h.dockerStarts).toBe(0);
     expect(h.helper.calls).toEqual([]);
     expect(await pendingIds()).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+
+  it('opens the repository of an environment of another account in an environment of the account (concept D-3)', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).not.toBe(ENV_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+    expect(h.helper.clones).toEqual([expect.objectContaining({ volumeName: result.environment.volumeName, token: TOKEN })]);
+    // The environment of the other account is not touched: no token, no start, no pending connection.
+    expect(h.helper.gitPreparations.map((call) => call.volumeName)).toEqual([result.environment.volumeName]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    expect(await pendingIds()).toEqual([result.environment.id]);
+    expect((await entry())?.owner).toEqual(OTHER_ACCOUNT);
   });
 
   it('hides an entry of an older version without owner until a claim: the open is refused as not assigned', async () => {
@@ -2059,7 +2125,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.helper.calls.filter((call) => call === 'prepareGit' || call.startsWith('up'))).toEqual(['prepareGit', `up ${IMAGE_1}`]);
     expect(h.helper.ups[0].override).toMatchObject({
       containerEnv: expect.objectContaining({ GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig', DOCKER_CONFIG: '/workspaces/.devenv+/docker' }),
-      remoteEnv: expect.objectContaining({ GNUPGHOME: '/workspaces/.devenv+/gnupg', SSH_AUTH_SOCK: '' }),
+      remoteEnv: expect.objectContaining({ GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig', GIT_SSH_COMMAND: 'ssh -o IdentityAgent=none' }),
     });
     // The token is never part of the override configuration (variables of the container).
     expect(JSON.stringify(h.helper.ups[0].override)).not.toContain(TOKEN);
@@ -2174,6 +2240,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     ['a stopped container without the label (version 1)', 'stopped', {}],
     ['a running container without the label', 'running', {}],
     ['a container of an older version', 'stopped', { 'devenv.container-version': '1' }],
+    ['a container of the version before (without the settings of the Dev Containers extension)', 'running', { 'devenv.container-version': '2' }],
   ])('creates %s again from the environment image, without a build; the volume stays', async (_name, state, labels) => {
     await seedEnvironment(h, { container: state, containerLabels: labels });
     const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -2183,7 +2250,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     const containers = h.docker.containersOf(ENV_ID);
     expect(containers).toHaveLength(1);
     expect(containers[0].id).not.toBe(before);
-    expect(containers[0].labels['devenv.container-version']).toBe('2');
+    expect(containers[0].labels['devenv.container-version']).toBe('3');
     expect(h.docker.volumes.has(NAME)).toBe(true);
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
     expect(result.containerName).toBe(NAME);
@@ -2191,6 +2258,18 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(true);
     // The files outside the volume are lost: the progress says so.
     expect(h.progress.details).toEqual([Messages.containerRecreated]);
+  });
+
+  it('switches off the forwarding of the Dev Containers extension in the override configuration of the container', async () => {
+    await seedEnvironment(h, { container: null });
+    await h.service.openEnvironment(ENV_ID, options());
+    const override = h.helper.ups[0].override;
+    expect(override.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
+    // Only through the settings: the variables of the Dev Containers extension keep their values.
+    for (const env of [override.containerEnv, override.remoteEnv]) {
+      for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
+    }
+    expect((override.runArgs as string[]).slice(-4)).toEqual(['--label', 'devenv.container-version=3', '--name', NAME]);
   });
 
   it('starts a current container as it is', async () => {
@@ -2239,7 +2318,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
       const provisional = h.docker.containersOf(ENV_ID)[0];
       expect(provisional.id).not.toBe(original);
-      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '2', 'devenv.container-config': 'unknown' });
+      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '3', 'devenv.container-config': 'unknown' });
       expect(h.progress.details).toContain(Messages.containerRecreated);
 
       // While the configuration stays broken, the provisional container is only started.
@@ -2294,6 +2373,49 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
     expect(h.docker.volumes.has(NAME)).toBe(true);
+  });
+});
+
+describe('the ~/.gitconfig of a new container when root may not write it (concept section 9, --cap-drop)', () => {
+  const homeRuns = () => h.docker.execs.filter((exec) => exec.command[2] === HOME_GIT_CONFIG_SCRIPT);
+  const DENIED = 'sh: 1: cannot create /home/vscode/.gitconfig: Permission denied';
+
+  it('runs the script once, as root, when root may write it', async () => {
+    await seedEnvironment(h, { container: null });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(homeRuns().map((exec) => exec.user)).toEqual(['root']);
+  });
+
+  it('lets the remote user write it when root may not (a container without the rights of root)', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.execHandler = (_container, command, user) =>
+      command[2] === HOME_GIT_CONFIG_SCRIPT && user === 'root' ? { exitCode: 2, stderr: DENIED } : {};
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(homeRuns().map((exec) => ({ user: exec.user, command: exec.command }))).toEqual([
+      { user: 'root', command: homeGitConfigCommand('vscode') },
+      { user: 'vscode', command: homeGitConfigCommand('vscode') },
+    ]);
+    expect(h.logger.infos.some((line) => line.includes('could not be prepared as root') && line.includes(DENIED))).toBe(true);
+    expect(h.logger.warnings.filter((line) => line.includes('Git configuration'))).toEqual([]);
+  });
+
+  it('warns when neither root nor the remote user may write it, and still opens the environment', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.execHandler = (_container, command) => (command[2] === HOME_GIT_CONFIG_SCRIPT ? { exitCode: 2, stderr: DENIED } : {});
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(homeRuns().map((exec) => exec.user)).toEqual(['root', 'vscode']);
+    expect(h.logger.warnings.filter((line) => line.includes('Git configuration of vscode'))).toEqual([
+      `The Git configuration of vscode in the container could not be prepared: ${DENIED}`,
+    ]);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('does not run it again when the remote user is root', async () => {
+    h.helper.remoteUser = 'root';
+    h.docker.execHandler = (_container, command) => (command[2] === HOME_GIT_CONFIG_SCRIPT ? { exitCode: 2, stderr: 'denied' } : {});
+    await h.service.open(TARGET, options());
+    expect(homeRuns().map((exec) => exec.user)).toEqual(['root']);
+    expect(h.logger.warnings).toContain('The Git configuration of root in the container could not be prepared: denied');
   });
 });
 
@@ -2363,17 +2485,17 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
   });
 
   it('names the settings that the policy does not know apart from those that need the computer, with the same code', async () => {
-    h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '--privileged'] };
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--pull=always', '--privileged'] };
     const mixed = await rejection(h.service.open(TARGET, options()));
     expect(mixed.code).toBe('hostAccess');
-    expect(mixed.message).toBe(Messages.hostAccessAndUnsupported('privileged mode', '--rm'));
+    expect(mixed.message).toBe(Messages.hostAccessAndUnsupported('privileged mode', '--pull'));
     expect(mixed.detail).toContain('access to the computer: privileged mode');
-    expect(mixed.detail).toContain('not supported: --rm');
+    expect(mixed.detail).toContain('not supported: --pull');
 
-    h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm'], build: { options: ['--progress=plain'] } };
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--pull=always'], build: { options: ['--progress=plain'] } };
     const unsupported = await rejection(h.service.open(TARGET, options()));
     expect(unsupported.code).toBe('hostAccess');
-    expect(unsupported.message).toBe(Messages.unsupportedOptions('--rm, build option --progress'));
+    expect(unsupported.message).toBe(Messages.unsupportedOptions('--pull, build option --progress'));
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
   });
@@ -2402,6 +2524,50 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     expect(runArgsProblems(given, NAME)).toEqual([]);
     expect(given.slice(-2)).toEqual(['--name', NAME]);
     expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
+  });
+
+  it.each<[string, unknown[], string[] | undefined]>([
+    // Restrictions summary, finding 1: the exact inputs. `undefined`: refused before any build.
+    ['--name as a label before a bind mount', ['--label', '--name', '--init', '--label', '-v/Users:/host'], ['--label', '--name', '--init', '--label', '-v/Users:/host']],
+    ['a number before a bind mount', ['--label', 3, '--label', '-v/Users:/host'], undefined],
+    ['a number before --privileged', ['--label', 3, '--label', '--privileged'], undefined],
+    ['a number before a port on all addresses', ['--label', 3, '--label', '-p0.0.0.0:80:80'], undefined],
+    ['--rm as a label before a bind mount', ['--label', '--rm', '--init', '--label', '-v/Users:/host'], ['--label', '--rm', '--init', '--label', '-v/Users:/host']],
+    ['--rm, -it, the platform, and --cap-drop', ['--rm', '-it', '--platform', 'linux/amd64', '--cap-drop', 'ALL'], ['--platform', 'linux/amd64', '--cap-drop', 'ALL']],
+    ['a flag without its value at the end', ['--init', '-e'], undefined],
+  ])('gives Docker exactly the runArgs that the policy checked, for %s', async (_name, runArgs, passed) => {
+    await seedEnvironment(h, { container: null });
+    // The configuration as the CLI reads it: JSON, so the list may have entries that are no text.
+    h.helper.config = { image: BASE_IMAGE, runArgs: runArgs as string[] };
+    if (passed === undefined) {
+      expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('hostAccess');
+      expect(h.helper.builds).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+      return;
+    }
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=3', '--name', NAME]);
+  });
+
+  it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
+    await seedEnvironment(h, { container: null });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=3', '--name', NAME]);
+    const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
+    expect(lines).toHaveLength(1);
+    for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {
+      expect(lines[0]).toContain(removed);
+    }
+    // The --rm that is the value of --label is passed on, and not named.
+    expect(lines[0].match(/--rm \(/g)).toHaveLength(1);
+  });
+
+  it('logs no removal when the runArgs have nothing to remove', async () => {
+    await seedEnvironment(h, { container: null });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--init', '--label', '--rm'] };
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.logger.infos.filter((line) => line.startsWith('Removed from the runArgs'))).toEqual([]);
   });
 
   it('refuses a Feature that mounts the Docker socket (merged configuration), before any build', async () => {
@@ -2572,5 +2738,84 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     await h.service.open(TARGET, options());
     expect(h.helper.ups[0].override.appPort).toEqual(['127.0.0.1:3000:3000', '127.0.0.1:8080:80']);
     expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['-p', '127.0.0.1:9000:90', '--network', 'host']));
+  });
+
+  it('refuses labels of Dev Environments and variables of container-only Git before any build (findings 5 and 6)', async () => {
+    h.helper.config = {
+      image: BASE_IMAGE,
+      runArgs: ['--label', 'devenv.environment-id=someone-else', '-e', 'GIT_CONFIG_GLOBAL=/tmp/gitconfig'],
+      remoteEnv: { GIT_CONFIG_PARAMETERS: "'credential.helper=store'" },
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(
+      Messages.hostAccessAndUnsupported('variable GIT_CONFIG_GLOBAL in runArgs, variable GIT_CONFIG_PARAMETERS in remoteEnv', 'label devenv.environment-id'),
+    );
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('refuses the cache volume of the Dev Containers extension before any build (finding 4)', async () => {
+    h.helper.config = { image: BASE_IMAGE, mounts: ['source=vscode,target=/vscode,type=volume'] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('volume vscode of the Dev Containers extension'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses an existing volume of another program by its labels, and reads only the labels of the mounted volumes (finding 4)', async () => {
+    h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' });
+    h.helper.config = { image: BASE_IMAGE, mounts: ['source=shop_db,target=/db,type=volume', 'source=cache,target=/c,type=volume'] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('volume shop_db of the Docker Compose project shop'));
+    expect(h.docker.volumeInspections).toEqual([['shop_db', 'cache']]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('reads no labels for a configuration without named volumes', async () => {
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.docker.volumeInspections).toEqual([]);
+  });
+
+  describe('named volumes of environments of other accounts (finding 4)', () => {
+    const SHARED = 'shared-cache';
+
+    /** An environment of another repository that uses the volume SHARED. `null`: an entry of an older version. */
+    async function otherEnvironment(owner: GitHubAccount | null): Promise<void> {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner, container: null, extra: { additionalVolumes: [SHARED] } });
+    }
+
+    it('are refused before any build', async () => {
+      await otherEnvironment(OTHER_ACCOUNT);
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: [`source=${SHARED},target=/cache,type=volume`] };
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+      expect(h.helper.builds).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it.each<[string, GitHubAccount | null]>([
+      ['an environment of the same account', ACCOUNT],
+      ['an entry of an older version without owner', null],
+    ])('are allowed when %s uses them', async (_name, owner) => {
+      await otherEnvironment(owner);
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['-v', `${SHARED}:/cache`]));
+    });
+
+    it('are refused in the metadata of the environment image before a container is created from it', async () => {
+      await otherEnvironment(OTHER_ACCOUNT);
+      await seedEnvironment(h, { container: null });
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [{ type: 'volume', source: SHARED, target: '/c' }] }]));
+      h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'offline');
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+      expect(h.helper.ups).toEqual([]);
+    });
   });
 });

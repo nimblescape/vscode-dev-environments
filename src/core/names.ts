@@ -12,24 +12,31 @@ export const LABEL_OWNER_ID = 'devenv.owner-id';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
 export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
 /**
- * Version of the container setup. 2: container-only Git (concept section 9). A container with an older version (or
- * without the label) is created again from its environment image.
+ * Version of the container setup. 2: container-only Git (concept section 9). 3: the documented settings of the Dev
+ * Containers extension for the container (no copy of the Git configuration of the computer, no forwarding credential
+ * helpers, no sign-in of the GitHub CLI), which it reads from the label devcontainer.metadata only at the first attach of
+ * a new container, and only the documented variables of Git and Docker (no more GIT_CONFIG_PARAMETERS, GNUPGHOME, and
+ * SSH_AUTH_SOCK). A container with an older version (or without the label) is created again from its environment image.
  */
-export const CONTAINER_VERSION = 2;
+export const CONTAINER_VERSION = 3;
 /**
  * Container label: `unknown` when the container was created without the configuration of the repository (it could not
  * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
  */
 export const LABEL_CONTAINER_CONFIG = 'devenv.container-config';
 export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
+/** `--label` value of the override configuration: the version of the container setup. */
+export const CONTAINER_VERSION_LABEL = `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`;
+/** `--label` value of the override configuration of a container created without the configuration of the repository. */
+export const CONTAINER_CONFIG_UNKNOWN_LABEL = `${LABEL_CONTAINER_CONFIG}=${CONTAINER_CONFIG_UNKNOWN}`;
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
 /** Mount point of the workspace volume, in the helper and in the dev container. */
 export const WORKSPACES_ROOT = '/workspaces';
 /**
- * Folder of the container's own Git, Docker, and GPG configuration in the workspace volume (concept section 9). A
- * repository name only has `[A-Za-z0-9._-]`, so no repository folder `/workspaces/<name>` can have this name.
+ * Folder of the container's own Git and Docker configuration in the workspace volume (concept section 9). A repository
+ * name only has `[A-Za-z0-9._-]`, so no repository folder `/workspaces/<name>` can have this name.
  */
 export const CONFIG_FOLDER = `${WORKSPACES_ROOT}/.devenv+`;
 /** The global Git configuration of the container (GIT_CONFIG_GLOBAL). */
@@ -38,8 +45,6 @@ export const GIT_CONFIG_FILE = `${CONFIG_FOLDER}/gitconfig`;
 export const GITHUB_TOKEN_FILE = `${CONFIG_FOLDER}/github-token`;
 /** DOCKER_CONFIG of the container. */
 export const DOCKER_CONFIG_FOLDER = `${CONFIG_FOLDER}/docker`;
-/** GNUPGHOME of the container. */
-export const GNUPG_FOLDER = `${CONFIG_FOLDER}/gnupg`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();

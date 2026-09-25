@@ -10,6 +10,7 @@ import { isBlockingBusyMark } from '../core/busy';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
+import { CONFIG_FOLDER_OWNER_COMMAND, parseOwnerIds } from '../core/helper/containerGit';
 import { Actions, DOCKER_DOWNLOAD_URL, Messages, formatChanges } from '../core/messages';
 import { GITHUB_TOKEN_FILE, repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
@@ -130,7 +131,10 @@ interface Target {
   repository: string;
   /** GitHub data, if known. */
   info?: RepositoryInfo;
-  /** The environment of the repository, read from the registry when the command started. */
+  /**
+   * The environment, read from the registry when the command started: the one that the command names (a row, the status
+   * bar item, the switcher), or else the environment of the repository of the signed-in account (concept 7.5, D-3).
+   */
   environment?: Environment;
 }
 
@@ -584,8 +588,9 @@ export class Controller implements vscode.Disposable {
 
   /** Select configuration… (concept 6.2, 7.5): changes the configuration of the environment and rebuilds it. */
   async selectConfiguration(argument: CommandArgument): Promise<void> {
-    const target = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForConfiguration);
-    if (!target) return;
+    const resolved = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForConfiguration);
+    if (!resolved) return;
+    const target = await this.withOlderEnvironment(resolved);
     const repository = this.displayName(target);
     const environment = target.environment;
     let configPaths = target.info?.configPaths ?? [];
@@ -631,8 +636,9 @@ export class Controller implements vscode.Disposable {
 
   /** Switch branch… (concept 6.2, 7.5). */
   async switchBranch(argument: CommandArgument): Promise<void> {
-    const target = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForBranch);
-    if (!target) return;
+    const resolved = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForBranch);
+    if (!resolved) return;
+    const target = await this.withOlderEnvironment(resolved);
     const token = await this.deps.auth.getToken({ interactive: true });
     if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
     const environment = target.environment;
@@ -687,8 +693,7 @@ export class Controller implements vscode.Disposable {
       if (target) await this.startTarget(target);
       return;
     }
-    const target = await this.ownTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner));
-    if (target) await this.startTarget(target);
+    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner, true));
   }
 
   /** Refresh: the repository list (sign-in first when needed), a lost registry, and the states. */
@@ -710,8 +715,7 @@ export class Controller implements vscode.Disposable {
     }
     const info = await pickRepository(repositories, ControllerTexts.selectRepositoryToStart);
     if (!info) return;
-    const target = await this.ownTarget(await this.repositoryTargetFor(info.nameWithOwner));
-    if (target) await this.startTarget(target);
+    await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner, true));
   }
 
   /** Sign in with GitHub (concept 6.1 step 1). */
@@ -858,7 +862,7 @@ export class Controller implements vscode.Disposable {
         .removePending(result.environment.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
       throw account
-        ? new UserFacingError('otherAccount', ControllerTexts.otherAccount(repository))
+        ? new UserFacingError('otherAccount', Messages.otherAccount(repository))
         : new UserFacingError('signInRequired', Messages.signInRequired);
     }
     progress.step('connecting');
@@ -1445,14 +1449,20 @@ export class Controller implements vscode.Disposable {
    * Concept 7.5: the token of the owner account leaves the running container of an environment that the signed-in
    * account may not use, so that Git there cannot push as the owner while a window keeps its connection. The credential
    * helper of the container then gives nothing; the next open of the owner writes the token again (section 9).
-   * Best effort: a stopped container needs no removal (its token cannot be used without a start by the owner).
+   * Best effort: a stopped container needs no removal (its token cannot be used without a start by the owner). When root
+   * may not remove it (a configuration that takes rights away, for example `--cap-drop ALL`), the owner of the folder of
+   * the token removes it.
    */
   private async removeGitToken(containerName: string): Promise<void> {
     if (!(await this.containerRuns(containerName))) return;
-    const result = await this.deps.docker.exec(containerName, ['rm', '-f', GITHUB_TOKEN_FILE], {
-      user: 'root',
-      timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS,
-    });
+    const run = (command: readonly string[], user: string) =>
+      this.deps.docker.exec(containerName, [...command], { user, timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS });
+    let result = await run(['rm', '-f', GITHUB_TOKEN_FILE], 'root');
+    if (result.exitCode !== 0) {
+      const owner = await run(CONFIG_FOLDER_OWNER_COMMAND, 'root');
+      const ids = owner.exitCode === 0 ? parseOwnerIds(owner.stdout) : undefined;
+      if (ids !== undefined) result = await run(['rm', '-f', GITHUB_TOKEN_FILE], ids);
+    }
     if (result.exitCode === 0) this.logger.info(`The GitHub token was removed from the container ${containerName}.`);
     else this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${result.stderr.trim()}`);
   }
@@ -1616,7 +1626,8 @@ export class Controller implements vscode.Disposable {
    */
   private async resolveTarget(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const target = await this.resolveTargetOfAnyAccount(argument, pick, placeholder);
-    // Show on GitHub needs no environment; every other command refuses an environment of another account (concept 7.5).
+    // Show on GitHub needs no environment; every other command refuses a named environment of another account (concept
+    // 7.5). A repository has only the environment of the signed-in account (D-3), so it is never refused.
     if (!target || pick === 'gitHub') return target;
     return this.ownTarget(target);
   }
@@ -1624,7 +1635,8 @@ export class Controller implements vscode.Disposable {
   /**
    * Concept 7.5: the target, when its environment (if any) belongs to the signed-in account; an entry of an older
    * version is claimed first. Asks for a sign-in when the target has an environment and nobody is signed in. Otherwise
-   * shows Messages.otherAccount and returns `undefined`.
+   * shows Messages.otherAccount and returns `undefined`: only an environment that the command names can be one of
+   * another account (a row or the status bar item from before an account change), never the environment of a repository.
    */
   private async ownTarget(target: Target): Promise<Target | undefined> {
     const environment = target.environment;
@@ -1641,8 +1653,23 @@ export class Controller implements vscode.Disposable {
       return undefined;
     }
     this.logger.info(`The environment ${environment.id} belongs to another GitHub account. It is not used.`);
-    this.warn(ControllerTexts.otherAccount(this.displayName(target)));
+    this.warn(Messages.otherAccount(this.displayName(target)));
     return undefined;
+  }
+
+  /**
+   * Switch branch… and Select configuration… change the environment of the repository. When the signed-in account has
+   * none, an entry of an older version of the repository is claimed first (concept 7.5), so that the branch or the
+   * configuration applies to it. Otherwise the target stays without environment, and the open pipeline creates the
+   * environment of the account (D-3).
+   */
+  private async withOlderEnvironment(target: Target): Promise<Target> {
+    if (target.environment) return target;
+    const account = await this.readAccount();
+    const older = account ? await this.deps.registry.findUnowned(target.repository) : undefined;
+    if (!account || !older) return target;
+    const claimed = await this.claimIfUnowned(older, account, 'interactive');
+    return isAvailableTo(claimed, account) ? { ...target, environment: claimed } : target;
   }
 
   /**
@@ -1680,12 +1707,17 @@ export class Controller implements vscode.Disposable {
 
   private async resolveTargetOfAnyAccount(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const { registry, sidebar } = this.deps;
+    // Show on GitHub needs neither an environment nor a sign-in.
+    const signIn = pick !== 'gitHub';
     switch (argument.kind) {
       case 'row': {
-        const byId = argument.environmentId !== undefined ? await registry.get(argument.environmentId) : undefined;
-        const environment = byId ?? (await registry.findByRepository(argument.repository));
         const info = sidebar.repositoryInfo(argument.repository) ?? argument.info;
-        return { repository: argument.repository, info, environment };
+        // The environment of the row while it exists; otherwise (a row without environment, or one deleted meanwhile)
+        // the environment of the repository of the signed-in account.
+        const named = argument.environmentId !== undefined ? await registry.get(argument.environmentId) : undefined;
+        if (named) return { repository: argument.repository, info, environment: named };
+        const target = await this.repositoryTargetFor(argument.repository, signIn);
+        return { ...target, info: target.info ?? info };
       }
       case 'environment': {
         const environment = await registry.get(argument.environmentId);
@@ -1710,7 +1742,7 @@ export class Controller implements vscode.Disposable {
         }
         // The title "Open repository…" only where the pick opens the repository.
         const info = await pickRepository(repositories, placeholder, pick === 'open' ? undefined : null);
-        return info ? this.repositoryTargetFor(info.nameWithOwner) : undefined;
+        return info ? this.repositoryTargetFor(info.nameWithOwner, signIn) : undefined;
       }
     }
   }
@@ -1719,14 +1751,29 @@ export class Controller implements vscode.Disposable {
     return { repository: environment.repository, info: this.deps.sidebar.repositoryInfo(environment.repository), environment };
   }
 
-  private async repositoryTargetFor(repository: string): Promise<Target> {
-    const environment = await this.deps.registry.findByRepository(repository);
-    return { repository, info: this.deps.sidebar.repositoryInfo(repository), environment };
+  /**
+   * The target of a repository, with the environment of the repository of the signed-in account, if it has one (concept
+   * 7.5, D-3). The environments of other accounts are not looked at: they neither block nor name anything, and the first
+   * Start of an account creates its own. The account decides the environment, so with `signIn` a sign-in is asked for
+   * when nobody is signed in; without it, the target has no environment then.
+   */
+  private async repositoryTargetFor(repository: string, signIn: boolean): Promise<Target> {
+    const info = this.deps.sidebar.repositoryInfo(repository);
+    const account = await this.readAccount(signIn);
+    if (signIn && !account) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    const environment = account ? await this.deps.registry.findForAccount(repository, account.id) : undefined;
+    return { repository, info, environment };
   }
 
-  /** The target with the current registry entry (for Try again, and after a change of the environment). */
+  /**
+   * The target with the current registry entry (for Try again, and after a change of the environment): its environment
+   * while it exists, otherwise the environment of the repository of the signed-in account, if any.
+   */
   private async refreshedTarget(target: Target): Promise<Target> {
-    const fresh = await this.repositoryTargetFor(target.environment?.repository ?? target.repository);
+    const current = target.environment ? await this.deps.registry.get(target.environment.id) : undefined;
+    const fresh = current
+      ? this.environmentTarget(current)
+      : await this.repositoryTargetFor(target.environment?.repository ?? target.repository, false);
     return { ...fresh, info: fresh.info ?? target.info };
   }
 

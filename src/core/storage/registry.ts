@@ -48,6 +48,19 @@ const MAX_TRANSIENT_LOCK_ERRORS = 50;
 const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
 const EPOCH = new Date(0).toISOString();
 
+/**
+ * True if `environment` is the environment of the repository `owner/name` (ignoring case) of the GitHub account
+ * `accountId`; `undefined` stands for the entries of an older version, which have no owner. A repository has at most one
+ * environment per account, and at most one entry without owner (concept D-3).
+ */
+export function isEnvironmentOf(
+  environment: Pick<Environment, 'repository' | 'owner'>,
+  repository: string,
+  accountId: string | undefined,
+): boolean {
+  return environment.repository.toLowerCase() === repository.toLowerCase() && environment.owner?.id === accountId;
+}
+
 /** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
 export class EnvironmentRegistry {
   private readonly logger: Logger;
@@ -102,10 +115,17 @@ export class EnvironmentRegistry {
     return (await this.list()).find((environment) => environment.id === id);
   }
 
-  /** Finds the environment of `owner/name`, ignoring case. */
-  async findByRepository(repository: string): Promise<Environment | undefined> {
-    const wanted = repository.toLowerCase();
-    return (await this.list()).find((environment) => environment.repository.toLowerCase() === wanted);
+  /** Finds the environment of `owner/name` (ignoring case) of the GitHub account `accountId` (concept D-3). */
+  async findForAccount(repository: string, accountId: string): Promise<Environment | undefined> {
+    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, accountId));
+  }
+
+  /**
+   * Finds the entry of an older version of `owner/name` (ignoring case): it has no owner, and it stays hidden until an
+   * account claims it (concept 7.5).
+   */
+  async findUnowned(repository: string): Promise<Environment | undefined> {
+    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, undefined));
   }
 
   /** Finds the environment of a container name, with or without the leading `/` of `docker inspect`. */
@@ -128,18 +148,20 @@ export class EnvironmentRegistry {
   }
 
   /**
-   * Adds an environment. Throws if an environment with the same ID, or of the same repository (ignoring case), exists:
-   * one environment per repository (concept D-3). The check runs under the lock, so two windows that start the same
+   * Adds an environment. Throws if an environment with the same ID exists, or one of the same repository (ignoring case)
+   * and the same owner account: one environment per repository and GitHub account (concept D-3); the entries of an older
+   * version count as one owner. The check runs under the lock, so two windows of one account that start the same
    * repository at the same time cannot both add an environment.
    */
   async add(environment: Environment): Promise<void> {
-    const repository = environment.repository.toLowerCase();
+    const accountId = environment.owner?.id;
     await this.update((file) => {
       if (file.environments.some((existing) => existing.id === environment.id)) {
         throw new Error(`The environment ${environment.id} exists already.`);
       }
-      if (file.environments.some((existing) => existing.repository.toLowerCase() === repository)) {
-        throw new Error(`An environment of ${environment.repository} exists already.`);
+      if (file.environments.some((existing) => isEnvironmentOf(existing, environment.repository, accountId))) {
+        const owner = accountId === undefined ? 'without owner' : `of the GitHub account ${accountId}`;
+        throw new Error(`An environment of ${environment.repository} ${owner} exists already.`);
       }
       file.environments.push(environment);
     });

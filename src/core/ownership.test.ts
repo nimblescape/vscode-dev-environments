@@ -12,6 +12,7 @@ import type { HttpRequest, HttpResponse, HttpTransport } from './http';
 import {
   EnvironmentClaims,
   availableEnvironments,
+  canClaim,
   isAvailableTo,
   isUnambiguousClaim,
   ownerOf,
@@ -95,6 +96,20 @@ describe('isAvailableTo (concept 7.5, section 9 "Accounts")', () => {
 
   it('stores the ID and the login of the account as the owner', () => {
     expect(ownerOf({ ...SCALARION, extra: 1 } as GitHubAccount)).toEqual(SCALARION);
+  });
+});
+
+describe('canClaim (concept 7.5, D-3): an account never gets a second environment of a repository', () => {
+  const OLDER = environment('older', 'acme/api');
+  it.each<[string, Environment[], Environment, boolean]>([
+    ['an entry without owner, the account has no environment of its repository', [OLDER, environment('web', 'acme/web', SCALARION)], OLDER, true],
+    ['another account has an environment of the repository', [OLDER, environment('theirs', 'acme/api', STAUSSH)], OLDER, true],
+    ['the account has an environment of the repository', [OLDER, environment('own', 'acme/api', SCALARION)], OLDER, false],
+    ['the same, with the repository in another case', [OLDER, environment('own', 'ACME/Api', SCALARION)], OLDER, false],
+    ['the entry belongs to another account', [environment('theirs', 'acme/api', STAUSSH)], environment('theirs', 'acme/api', STAUSSH), false],
+    ['the entry belongs to the account already', [environment('own', 'acme/api', SCALARION)], environment('own', 'acme/api', SCALARION), false],
+  ])('%s', (_name, environments, entry, expected) => {
+    expect(canClaim(environments, entry, SCALARION)).toBe(expected);
   });
 });
 
@@ -292,16 +307,93 @@ describe('EnvironmentClaims', () => {
     expect(owner).toEqual(results[0].length === 1 ? SCALARION : STAUSSH);
   });
 
+  it('claims no entry of a repository of which the account has an environment, and asks neither GitHub nor the user', async () => {
+    await registry.add(environment('own', 'scalarion/app', SCALARION));
+    await registry.add(environment('older', 'Scalarion/App'));
+    await registry.add(environment('shared', 'majikmate/module-ts'));
+    const getRepository = vi.fn(async (repository: string) => info(repository, { viewerPermission: 'WRITE' }));
+    const confirm = vi.fn(async (_entry: Environment, _account: GitHubAccount) => true);
+    const logger = recordingLogger();
+    const claims = new EnvironmentClaims({ registry, getRepository, confirm, logger });
+
+    await expect(claims.claim(SCALARION, 'token', { mode: 'interactive' })).resolves.toEqual(['shared']);
+    expect(getRepository.mock.calls.map((call) => call[0])).toEqual(['majikmate/module-ts']);
+    expect(confirm.mock.calls.map((call) => call[0].id)).toEqual(['shared']);
+    expect((await registry.get('older'))?.owner).toBeUndefined();
+    expect(logger.lines).toContain('The environment older stays hidden: the signed-in account has an environment of its repository.');
+    expect(logger.lines.join('\n')).not.toMatch(/scalarion\/app/i);
+    // An account without an environment of the repository can take it over.
+    await expect(claims.claim(STAUSSH, 'token', { mode: 'interactive', environmentIds: ['older'] })).resolves.toEqual(['older']);
+    expect((await registry.get('older'))?.owner).toEqual(STAUSSH);
+  });
+
+  it('checks again under the registry lock: no claim when the account got an environment of the repository meanwhile', async () => {
+    await registry.add(environment('older', 'scalarion/app'));
+    const getRepository = vi.fn(async (repository: string) => {
+      // Another window of the account creates its environment of the repository while GitHub is asked.
+      await registry.add(environment('new', 'scalarion/app', SCALARION));
+      return info(repository);
+    });
+    const logger = recordingLogger();
+    const claims = new EnvironmentClaims({ registry, getRepository, logger });
+    await expect(claims.claim(SCALARION, 'token')).resolves.toEqual([]);
+    expect(getRepository).toHaveBeenCalledTimes(1);
+    expect((await registry.get('older'))?.owner).toBeUndefined();
+    expect((await registry.get('new'))?.owner).toEqual(SCALARION);
+    expect(logger.lines).toContain('The environment older stays hidden: the signed-in account has an environment of its repository.');
+  });
+
+  it('reports the entries that stay without owner because GitHub could not be asked, and only those', async () => {
+    await registry.add(environment('offline', 'majikmate/web'));
+    await registry.add(environment('no-access', 'majikmate/private'));
+    await registry.add(environment('declined', 'majikmate/module-ts'));
+    await registry.add(environment('own', 'scalarion/app'));
+    const getRepository = vi.fn(async (repository: string) => {
+      if (repository === 'majikmate/web') throw new Error('getaddrinfo ENOTFOUND api.github.com');
+      if (repository === 'majikmate/private') return undefined;
+      return info(repository, { viewerPermission: 'WRITE' });
+    });
+    const unanswered: string[] = [];
+    const claims = new EnvironmentClaims({ registry, getRepository, confirm: async () => false, logger: silentLogger });
+    const claimed = await claims.claim(SCALARION, 'token', { mode: 'interactive', onUnanswered: (id) => unanswered.push(id) });
+    expect(claimed).toEqual(['own']);
+    expect(unanswered).toEqual(['offline']);
+  });
+
+  it('claims at most one of two entries without owner of one repository, and asks only once', async () => {
+    // Not created by this version (add refuses it); written directly, as a registry of an unknown origin could have it.
+    await registry.update((file) => {
+      file.environments.push(environment('first', 'majikmate/module-ts'), environment('second', 'majikmate/module-ts'));
+    });
+    const getRepository = vi.fn(async (repository: string) => info(repository, { viewerPermission: 'WRITE' }));
+    const confirm = vi.fn(async () => true);
+    const claims = new EnvironmentClaims({ registry, getRepository, confirm, logger: silentLogger });
+    await expect(claims.claim(SCALARION, 'token', { mode: 'interactive' })).resolves.toEqual(['first']);
+    expect(getRepository).toHaveBeenCalledTimes(1);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect((await registry.get('second'))?.owner).toBeUndefined();
+  });
+
+  it('adopts no entry of a repository of which the account has an environment', async () => {
+    await registry.add(environment('own', 'scalarion/deleted', SCALARION));
+    await registry.add(environment('gone', 'scalarion/deleted'));
+    const claims = new EnvironmentClaims({ registry, getRepository: async () => undefined, logger: silentLogger });
+    await expect(claims.adopt(SCALARION, ['gone'])).resolves.toEqual([]);
+    expect((await registry.get('gone'))?.owner).toBeUndefined();
+    await expect(claims.adopt(STAUSSH, ['gone'])).resolves.toEqual(['gone']);
+    expect((await registry.get('gone'))?.owner).toEqual(STAUSSH);
+  });
+
   it('never throws, also when the registry cannot be read', async () => {
     const claims = new EnvironmentClaims({
-      registry: { list: async () => Promise.reject(new Error('EACCES')), updateEnvironment: async () => undefined },
+      registry: { list: async () => Promise.reject(new Error('EACCES')), update: async () => undefined as never },
       getRepository: async () => undefined,
       logger: silentLogger,
     });
     await expect(claims.claim(SCALARION, 'token')).resolves.toEqual([]);
     await expect(
       new EnvironmentClaims({
-        registry: { list: async () => [], updateEnvironment: async () => Promise.reject(new Error('lock timeout')) },
+        registry: { list: async () => [], update: async () => Promise.reject(new Error('lock timeout')) },
         getRepository: async () => undefined,
         logger: silentLogger,
       }).adopt(SCALARION, ['a']),
