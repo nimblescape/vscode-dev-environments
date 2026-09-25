@@ -83,6 +83,7 @@ import {
   errorDetail,
   imageRemoteUser,
   imagesToPull,
+  isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
   isRepositoryName,
@@ -181,7 +182,7 @@ export interface EnvironmentServiceDeps {
   registry: EnvironmentStore;
   sessionFiles: EnvironmentSessionFiles;
   imageChecker: Pick<ImageChecker, 'check'>;
-  auth: Pick<GitHubAuth, 'getToken' | 'getAccount'>;
+  auth: Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'>;
   /**
    * The GitHub account of a token (DiscoveryService.viewer), for the Git identity of a new environment (concept section 9).
    * Without it, or when GitHub does not answer in time, the identity comes from the account of the session.
@@ -2005,14 +2006,19 @@ export class EnvironmentService {
         env = await this.setBusyMark(env, 'switchBranch');
         busy = true;
         steps.step('downloadingRepository');
-        await this.deps.helper.switchBranch({
-          volumeName: env.volumeName,
-          repository: env.repository,
-          branch,
-          token,
-          onOutput: this.output,
-          signal: options.signal,
-        });
+        await this.deps.helper
+          .switchBranch({
+            volumeName: env.volumeName,
+            repository: env.repository,
+            branch,
+            token,
+            onOutput: this.output,
+            signal: options.signal,
+          })
+          .catch((error: unknown) => {
+            this.reportIfTokenRejected(error, token);
+            throw error;
+          });
         await this.deps.registry.updateEnvironment(env.id, (entry) => {
           if (entry.gitSummary) entry.gitSummary = { ...entry.gitSummary, branch };
           if (entry.busy && this.isOwnMark(entry.busy)) delete entry.busy;
@@ -2239,12 +2245,24 @@ export class EnvironmentService {
         signal: ctx.signal,
       });
     } catch (error) {
+      this.reportIfTokenRejected(error, token);
       if (this.isCancellation(error, ctx.signal) || isUserFacingError(error)) throw error;
       const detail = errorDetail(error);
       this.logger.error(`${env.repository} could not be cloned.`, error);
       if (isNetworkFailure(detail)) throw new UserFacingError('firstOpenOffline', Messages.firstOpenOffline, detail);
       throw new UserFacingError('cloneFailed', Messages.cloneFailed, detail);
     }
+  }
+
+  /**
+   * A Git run of the helper with `token` failed because github.com rejected the token (HTTP 401): reported to the one
+   * place of the sign-in state (GitHubAuth.reportRejectedToken), so that Sign in with GitHub replaces it.
+   */
+  private reportIfTokenRejected(error: unknown, token: string): void {
+    const text = isUserFacingError(error) ? `${error.message}\n${error.detail ?? ''}` : errorDetail(error);
+    if (!isGitHubTokenRejected(text)) return;
+    this.logger.warn('GitHub rejected the token of the sign-in (HTTP 401).');
+    this.deps.auth.reportRejectedToken?.(token);
   }
 
   /**

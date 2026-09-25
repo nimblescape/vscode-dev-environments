@@ -237,6 +237,24 @@ describe('open: first open', () => {
     expect(await h.registry.list()).toEqual([]);
   });
 
+  it('reports a token that github.com rejects in the clone to the sign-in state (the sign-in fix)', async () => {
+    h.helper.cloneError = new CommandError(
+      'git clone',
+      128,
+      '',
+      "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    );
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('cloneFailed');
+    expect(h.rejectedTokens).toEqual([h.token]);
+  });
+
+  it('does not report the token for a clone failure of another kind', async () => {
+    h.helper.cloneError = new CommandError('git clone', 128, '', "remote: Repository not found.\nfatal: repository 'https://github.com/acme/api.git/' not found");
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.rejectedTokens).toEqual([]);
+  });
+
   it('reports a failed build as firstOpenOffline when the registry was unreachable', async () => {
     h.checker.outcome = { status: 'unreachable', registries: ['mcr.microsoft.com'] };
     h.helper.buildError = () => new DevcontainerCommandError('devcontainer build', 1, '', 'failed to solve');
@@ -1844,6 +1862,20 @@ describe('switchBranch', () => {
     const env = await entry();
     expect(env?.gitSummary?.branch).toBe('main');
     expect(env?.busy).toBeUndefined();
+    expect(h.rejectedTokens).toEqual([]);
+  });
+
+  it('reports a token that github.com rejects in the fetch of Switch branch to the sign-in state (the sign-in fix)', async () => {
+    await seedEnvironment(h);
+    h.helper.switchError = new UserFacingError(
+      'gitSwitchFailed',
+      Messages.gitSwitchFailed('feature-x', "fatal: Authentication failed for 'https://github.com/acme/api.git/'"),
+      "fatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    );
+    const error = await rejection(h.service.switchBranch(ENV_ID, 'feature-x', options()));
+    expect(error.code).toBe('gitSwitchFailed');
+    expect(h.rejectedTokens).toEqual([h.token]);
+    expect((await entry())?.busy).toBeUndefined();
   });
 
   it('reports missing files without creating a volume', async () => {

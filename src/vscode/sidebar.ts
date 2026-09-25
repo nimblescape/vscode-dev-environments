@@ -20,7 +20,7 @@ import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { isProcessAlive } from '../monitor/lock';
-import { SIGNED_IN_CONTEXT_KEY, SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
+import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import { CoalescingTask, mapLimit } from './tasks';
@@ -159,7 +159,7 @@ export class Sidebar implements vscode.Disposable {
     const account = await this.readAccount();
     // Another account: its own stored list at once, never the list of the previous one (concept 6.2).
     if (account?.id !== this.account?.id) await this.useAccount(account);
-    this.setSignedIn(account !== undefined);
+    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
     this.renderInBackground();
     if (this.signedIn) await this.refreshDiscovery({ again: options.again ?? true });
   }
@@ -294,8 +294,10 @@ export class Sidebar implements vscode.Disposable {
     const token = await this.deps.auth.getToken({ interactive: false });
     const account = token === undefined ? undefined : await this.readAccount();
     if (account?.id !== this.account?.id) await this.useAccount(account);
-    this.setSignedIn(account !== undefined);
-    if (token === undefined || account === undefined) {
+    // A session whose token GitHub rejected does not count as signed in (auth.ts): no refresh, which would fail again,
+    // until Sign in with GitHub replaces the token.
+    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
+    if (token === undefined || account === undefined || !this.signedIn) {
       this.renderInBackground();
       return this.data;
     }
@@ -357,10 +359,18 @@ export class Sidebar implements vscode.Disposable {
       .then(undefined, (error: unknown) => this.deps.logger.error('The new GitHub sign-in failed.', error));
   }
 
+  /** The sign-in state of auth.ts, which alone sets the context key `devEnvironments.signedIn`. */
   private setSignedIn(signedIn: boolean): void {
-    if (this.signedIn === signedIn) return;
     this.signedIn = signedIn;
-    setContext(SIGNED_IN_CONTEXT_KEY, signedIn, this.deps.logger);
+  }
+
+  private async authSignedIn(): Promise<boolean> {
+    try {
+      return await this.deps.auth.isSignedIn();
+    } catch (error) {
+      this.deps.logger.warn(`The sign-in state could not be read: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   private setLoaded(loaded = true): void {

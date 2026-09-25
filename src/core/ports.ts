@@ -118,6 +118,11 @@ export interface GitHubAuth {
   getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined>;
   /** Credentials for ghcr.io from the session with the additional scope `read:packages`. */
   getPackagesCredentials(options: { interactive: boolean }): Promise<Credentials | undefined>;
+  /**
+   * GitHub rejected `token` (HTTP 401, or Git "Authentication failed" for github.com). Every caller of GitHub reports it
+   * here, so that the session does not count as signed in and the next sign-in replaces it. Never throws.
+   */
+  reportRejectedToken?(token: string): void;
 }
 
 /** Decisions and messages that the open pipeline needs from the user interface. */

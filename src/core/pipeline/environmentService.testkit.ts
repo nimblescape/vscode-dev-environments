@@ -569,6 +569,8 @@ export interface Harness {
   /** Process IDs that count as alive (besides PID). */
   alivePids: Set<number>;
   sleeps: number[];
+  /** Tokens that the service reported as rejected by GitHub (GitHubAuth.reportRejectedToken). */
+  rejectedTokens: string[];
   clock: Clock;
   service: EnvironmentService;
   cleanup(): void;
@@ -601,6 +603,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     dockerStarts: 0,
     alivePids: new Set<number>(),
     sleeps: [] as number[],
+    rejectedTokens: [] as string[],
     clock,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   } as Omit<Harness, 'service'> as Harness;
@@ -622,7 +625,11 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     registry: h.registry,
     sessionFiles: h.sessionFiles,
     imageChecker: h.checker,
-    auth: { getToken: async () => h.token, getAccount: async () => (h.token === undefined ? undefined : h.account) },
+    auth: {
+      getToken: async () => h.token,
+      getAccount: async () => (h.token === undefined ? undefined : h.account),
+      reportRejectedToken: (token: string) => void h.rejectedTokens.push(token),
+    },
     ui: h.ui,
     logger: h.logger,
     clock,

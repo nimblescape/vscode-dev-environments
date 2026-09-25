@@ -13,6 +13,7 @@ import {
   errorDetail,
   imageRemoteUser,
   imagesToPull,
+  isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
   isRepositoryName,
@@ -322,5 +323,28 @@ describe('lifecycleHookFailure', () => {
     expect(lifecycleHookName('postAttachCommand from devcontainer.json failed.')).toBe('postAttachCommand');
     expect(lifecycleHookName('xpostStartCommand from devcontainer.json failed.')).toBeUndefined();
     expect(lifecycleHookName(undefined)).toBeUndefined();
+  });
+});
+
+describe('isGitHubTokenRejected', () => {
+  it.each([
+    "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://x-access-token@github.com/acme/api.git/'",
+    'remote: Invalid username or password.',
+    "fatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 401",
+  ])('a rejected token: %s', (text) => {
+    expect(isGitHubTokenRejected(text)).toBe(true);
+  });
+
+  it.each([
+    "remote: Repository not found.\nfatal: repository 'https://github.com/acme/api.git/' not found",
+    "fatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 403",
+    "fatal: Authentication failed for 'https://git.example.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://github.com.evil.example/acme/api.git/'",
+    "fatal: unable to access 'https://github.com/acme/api.git/': Could not resolve host: github.com",
+    "error: pathspec 'feature' did not match any file(s) known to git",
+  ])('not a rejected token: %s', (text) => {
+    expect(isGitHubTokenRejected(text)).toBe(false);
   });
 });

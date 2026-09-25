@@ -126,7 +126,7 @@ export function parseWwwAuthenticate(header: string): AuthChallenge[] {
 class TransportFailure extends Error {}
 
 type AuthResult = { kind: 'ok'; authorization: string } | { kind: 'result'; result: DigestResult };
-type TokenResult = { kind: 'token'; token: string } | { kind: 'denied' } | { kind: 'result'; result: DigestResult };
+type TokenResult = { kind: 'token'; token: string } | { kind: 'denied'; status: number } | { kind: 'result'; result: DigestResult };
 
 /** Client for the manifest digest of a tag (HEAD request). Talks HTTPS only. */
 export class RegistryClient {
@@ -134,14 +134,20 @@ export class RegistryClient {
   private readonly credentialCache = new WeakMap<AbortSignal, Map<string, Promise<Credentials | undefined>>>();
 
   private readonly credentialsTimeoutMs: number;
+  private readonly onCredentialsRejected: ((registry: string, credentials: Credentials) => void) | undefined;
 
+  /**
+   * `onCredentialsRejected`: the token service of `registry` answered HTTP 401 for `credentials` (for ghcr.io with the
+   * GitHub session: GitHub rejected its token).
+   */
   constructor(
     private readonly transport: HttpTransport,
     private readonly credentials: CredentialsProvider,
     private readonly logger: Logger = silentLogger,
-    options: { credentialsTimeoutMs?: number } = {},
+    options: { credentialsTimeoutMs?: number; onCredentialsRejected?: (registry: string, credentials: Credentials) => void } = {},
   ) {
     this.credentialsTimeoutMs = options.credentialsTimeoutMs ?? CREDENTIALS_TIMEOUT_MS;
+    this.onCredentialsRejected = options.onCredentialsRejected;
   }
 
   /**
@@ -269,6 +275,7 @@ export class RegistryClient {
       const withCredentials = await this.requestToken(registry, tokenUrl, credentials, signal);
       if (withCredentials.kind === 'token') return { kind: 'ok', authorization: `Bearer ${withCredentials.token}` };
       if (withCredentials.kind === 'result') return withCredentials;
+      if (withCredentials.status === 401) this.reportRejected(registry, credentials);
       // Rejected credentials (for example an expired password): a public image still works anonymously.
       this.logger.warn(`The stored credentials for ${registryDisplayName(registry)} were rejected. Trying without credentials.`);
     }
@@ -276,6 +283,14 @@ export class RegistryClient {
     if (anonymous.kind === 'token') return { kind: 'ok', authorization: `Bearer ${anonymous.token}` };
     if (anonymous.kind === 'result') return anonymous;
     return { kind: 'result', result: { kind: 'authRequired', registry } };
+  }
+
+  private reportRejected(registry: string, credentials: Credentials): void {
+    try {
+      this.onCredentialsRejected?.(registry, credentials);
+    } catch (error) {
+      this.logger.warn(`The rejected credentials of ${registryDisplayName(registry)} could not be reported: ${errorMessage(error)}`);
+    }
   }
 
   private async requestToken(
@@ -287,7 +302,7 @@ export class RegistryClient {
     const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': USER_AGENT };
     if (credentials) headers.Authorization = `Basic ${basic(credentials)}`;
     const response = await this.send({ method: 'GET', url: url.toString(), headers }, signal);
-    if (response.status === 401 || response.status === 403) return { kind: 'denied' };
+    if (response.status === 401 || response.status === 403) return { kind: 'denied', status: response.status };
     if (response.status !== 200) {
       const result = statusResult(registry, response.status);
       return { kind: 'result', result: result.kind === 'notFound' ? { kind: 'error', registry, error: 'The token service was not found (HTTP 404).' } : result };
