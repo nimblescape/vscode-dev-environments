@@ -409,7 +409,7 @@ export class Sidebar implements vscode.Disposable {
     this.setLoaded(stored !== undefined);
   }
 
-  /** The account of the GitHub session, without a dialog. */
+  /** Token and account of the GitHub session, without a dialog; undefined when it cannot be read. */
   private async readSession(): Promise<{ token: string; account: GitHubAccount } | undefined> {
     try {
       return await this.deps.auth.getSession({ interactive: false });
@@ -419,6 +419,7 @@ export class Sidebar implements vscode.Disposable {
     }
   }
 
+  /** The account of the GitHub session, without a dialog. */
   private async readAccount(): Promise<GitHubAccount | undefined> {
     try {
       return await this.deps.auth.getAccount({ interactive: false });

@@ -2170,6 +2170,33 @@ describe('Accounts (concept 7.5)', () => {
       Actions.showDetails,
       Actions.tryAgain,
     );
+    expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
+  });
+
+  it('Try again after the account changed during the claim runs the same command again for the account signed in now', async () => {
+    await h.registry.add(environment({ owner: undefined }));
+    h.auth.getSession.mockResolvedValueOnce({ token: 'gho_other', account: OTHER_ACCOUNT });
+    h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        entry.owner = account;
+      });
+      return options.environmentIds;
+    });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.tryAgain);
+    await run('start', row('acme/api', environment({ owner: undefined })));
+    // The second run reads the account and the session again: now they match, so the claim runs, for the same row.
+    await settle(() => h.claims.claim.mock.calls.length === 1, 'the command again');
+    expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', expect.objectContaining({ environmentIds: [ENV_ID] }));
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
+  });
+
+  it('offers no Try again of the command for errors other than an unassigned environment', async () => {
+    // Refresh has no Try again of its own: a failure reaches the error display of the command.
+    h.sidebar.refreshDiscovery.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await run('refresh');
+    expect(fakeVscode.window.showErrorMessage.mock.calls).toEqual([[Messages.helperFailed, Actions.showDetails]]);
+    expect(h.sidebar.refreshDiscovery).toHaveBeenCalledTimes(1);
   });
 
   it('role A: claims nothing when the session changed, and closes the connection', async () => {
