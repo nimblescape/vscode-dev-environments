@@ -20,7 +20,7 @@ import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { isProcessAlive } from '../monitor/lock';
-import { SIGNED_IN_CONTEXT_KEY, SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
+import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import { CoalescingTask, mapLimit } from './tasks';
@@ -70,6 +70,8 @@ export class Sidebar implements vscode.Disposable {
   private lookups: ReadonlyMap<string, RepositoryInfo | null> = new Map();
   private timer: NodeJS.Timeout | undefined;
   private signInOffered = false;
+  /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
+  private accountChanges = 0;
   private disposed = false;
   private readonly renderTask = new CoalescingTask(() => this.renderNow());
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
@@ -158,8 +160,11 @@ export class Sidebar implements vscode.Disposable {
   async onSessionChanged(options: { again?: boolean } = {}): Promise<void> {
     const account = await this.readAccount();
     // Another account: its own stored list at once, never the list of the previous one (concept 6.2).
-    if (account?.id !== this.account?.id) await this.useAccount(account);
-    this.setSignedIn(account !== undefined);
+    if (account?.id !== this.account?.id) {
+      this.accountChanges++;
+      await this.useAccount(account);
+    }
+    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
     this.renderInBackground();
     if (this.signedIn) await this.refreshDiscovery({ again: options.again ?? true });
   }
@@ -247,7 +252,6 @@ export class Sidebar implements vscode.Disposable {
       discovery: this.data,
       settings: this.deps.settings(),
       environments,
-      lockedRepositories: lockedRepositories(entries, account),
       runtime: this.runtime,
       currentEnvironmentId: coordinator.environmentId,
       otherWindowEnvironmentIds: environmentIdsOf(others),
@@ -292,11 +296,18 @@ export class Sidebar implements vscode.Disposable {
 
   private async refreshDiscoveryNow(): Promise<DiscoveryData | undefined> {
     if (this.disposed) return this.data;
-    const token = await this.deps.auth.getToken({ interactive: false });
-    const account = token === undefined ? undefined : await this.readAccount();
+    // Token and account of one session: the list is stored for the account, and the claims give entries to it.
+    const changes = this.accountChanges;
+    const session = await this.readSession();
+    // The account changed while the session was read: the refresh of that change uses the new session.
+    if (changes !== this.accountChanges) return this.data;
+    const token = session?.token;
+    const account = session?.account;
     if (account?.id !== this.account?.id) await this.useAccount(account);
-    this.setSignedIn(account !== undefined);
-    if (token === undefined || account === undefined) {
+    // A session whose token GitHub rejected does not count as signed in (auth.ts): no refresh, which would fail again,
+    // until Sign in with GitHub replaces the token.
+    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
+    if (token === undefined || account === undefined || !this.signedIn) {
       this.renderInBackground();
       return this.data;
     }
@@ -358,10 +369,18 @@ export class Sidebar implements vscode.Disposable {
       .then(undefined, (error: unknown) => this.deps.logger.error('The new GitHub sign-in failed.', error));
   }
 
+  /** The sign-in state of auth.ts, which alone sets the context key `devEnvironments.signedIn`. */
   private setSignedIn(signedIn: boolean): void {
-    if (this.signedIn === signedIn) return;
     this.signedIn = signedIn;
-    setContext(SIGNED_IN_CONTEXT_KEY, signedIn, this.deps.logger);
+  }
+
+  private async authSignedIn(): Promise<boolean> {
+    try {
+      return await this.deps.auth.isSignedIn();
+    } catch (error) {
+      this.deps.logger.warn(`The sign-in state could not be read: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   private setLoaded(loaded = true): void {
@@ -390,6 +409,16 @@ export class Sidebar implements vscode.Disposable {
     this.setLoaded(stored !== undefined);
   }
 
+  /** Token and account of the GitHub session, without a dialog; undefined when it cannot be read. */
+  private async readSession(): Promise<{ token: string; account: GitHubAccount } | undefined> {
+    try {
+      return await this.deps.auth.getSession({ interactive: false });
+    } catch (error) {
+      this.deps.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
   /** The account of the GitHub session, without a dialog. */
   private async readAccount(): Promise<GitHubAccount | undefined> {
     try {
@@ -405,19 +434,6 @@ export class Sidebar implements vscode.Disposable {
     this.loadFailed = loadFailed;
     setContext(LOAD_FAILED_CONTEXT_KEY, loadFailed, this.deps.logger);
   }
-}
-
-/**
- * Lower-case `owner/name` of the repositories with an environment of another account (concept 7.5, D-3). An entry of an
- * older version without owner is not counted: the signed-in account may still claim it.
- */
-function lockedRepositories(environments: readonly Environment[], account: GitHubAccount | undefined): Set<string> {
-  if (!account) return new Set();
-  return new Set(
-    environments
-      .filter((environment) => environment.owner !== undefined && environment.owner.id !== account.id)
-      .map((environment) => environment.repository.toLowerCase()),
-  );
 }
 
 function setContext(key: string, value: boolean, logger: Logger): void {

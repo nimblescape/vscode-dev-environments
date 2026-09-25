@@ -40,7 +40,7 @@ function otherHelperTag(): string {
 
 /**
  * The real ContainerAdapter, limited to the images of this run: the listing of the helper images shows only images with
- * the label devenv.test-run=<run ID>, and the removal of any other image fails (the helper logs the failure; the test
+ * the label devenv-test.run=<run ID>, and the removal of any other image fails (the helper logs the failure; the test
  * checks that none was tried). It records the builds and the removals.
  */
 class RunScopedDocker implements HelperDocker {

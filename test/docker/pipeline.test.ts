@@ -23,23 +23,24 @@ import { extractBaseImages } from '../../src/core/imageCheck/dockerfile';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import {
   CONTAINER_CREDENTIAL_HELPER,
-  DEV_CONTAINERS_GITCONFIG_CHECK,
   GIT_CREDENTIALS_CONFIG_FILE,
   HOME_GIT_CONFIG_CONTENT,
   containerEnvironment,
   containerGitSupport,
+  devContainersSettings,
 } from '../../src/core/helper/containerGit';
 import { Messages } from '../../src/core/messages';
 import {
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
+  LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   environmentImageRepository,
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
-import { isoTime, systemClock } from '../../src/core/ports';
+import { isoTime, systemClock, type GitHubAuth } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
@@ -162,7 +163,7 @@ describe('open pipeline on a seeded environment', () => {
   const offlineHelper = helperWithDueCheck(offlineTransport, 'offline');
   const hangingHelper = helperWithDueCheck(hangingTransport, 'hanging');
 
-  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper): EnvironmentService {
+  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): EnvironmentService {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
     return new EnvironmentService({
       docker,
@@ -171,7 +172,7 @@ describe('open pipeline on a seeded environment', () => {
       registry,
       sessionFiles,
       imageChecker: timedChecker(new ImageChecker(client, log), label, checks),
-      auth: fakeAuth,
+      auth,
       ui,
       logger: log,
       clock: systemClock,
@@ -400,12 +401,11 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
-    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe('2');
+    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe('3');
     const env = containerEnv();
     expect(env).toMatchObject({
       GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',
       DOCKER_CONFIG: '/workspaces/.devenv+/docker',
-      GNUPGHOME: '/workspaces/.devenv+/gnupg',
       GIT_SSH_COMMAND: 'ssh -o IdentityAgent=none',
       // Remove every credential helper, include the helpers of the user, and for github.com only the one of the container.
       GIT_CONFIG_COUNT: '4',
@@ -418,22 +418,29 @@ describe('open pipeline on a seeded environment', () => {
       GIT_CONFIG_KEY_3: 'credential.https://github.com.helper',
       GIT_CONFIG_VALUE_3: CONTAINER_CREDENTIAL_HELPER,
     });
-    // The same settings for every Git version (GIT_CONFIG_PARAMETERS), exactly as the override configuration gives them.
+    // Exactly the variables of the override configuration, and none of the Dev Containers extension or of GnuPG.
     expect(env).toMatchObject(containerEnvironment());
+    for (const name of ['GIT_CONFIG_PARAMETERS', 'GNUPGHOME', 'SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC']) expect(env).not.toHaveProperty(name);
     // No token in any variable of the container.
     expect(Object.values(env).some((value) => value.includes(DUMMY_TOKEN))).toBe(false);
-    // remoteEnv for the VS Code server is in the label that the Dev Containers extension reads.
-    expect(cli.container(containerName)?.Config.Labels?.['devcontainer.metadata']).toContain('"SSH_AUTH_SOCK":""');
+    // remoteEnv for the VS Code server and the settings of the Dev Containers extension are in the last entry of the label
+    // that the Dev Containers extension reads when it attaches: the variables of Git and Docker only, so the variables of
+    // the Dev Containers extension and the VS Code server (SSH_AUTH_SOCK, REMOTE_CONTAINERS_IPC, BROWSER) keep their values.
+    const metadata: unknown = JSON.parse(cli.container(containerName)?.Config.Labels?.['devcontainer.metadata'] ?? '[]');
+    const last = (Array.isArray(metadata) ? metadata[metadata.length - 1] : undefined) as Record<string, unknown> | undefined;
+    expect(last?.remoteEnv).toEqual(containerEnvironment());
+    expect(last?.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
 
     // The token file: mode 600, owned by the remote user, readable by it, and the only file with the token.
     expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/github-token')).toBe(`600 ${REMOTE_USER}`);
     expect(execIn(REMOTE_USER, 'cat /workspaces/.devenv+/github-token')).toBe(DUMMY_TOKEN);
     expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('/workspaces/.devenv+/github-token');
-    expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/docker /workspaces/.devenv+/gnupg')).toBe(`700 ${REMOTE_USER}\n700 ${REMOTE_USER}`);
-    expect(execIn(REMOTE_USER, 'ls /workspaces/.devenv+/gnupg/private-keys-v1.d')).toBe('README-devenv');
+    expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/docker')).toBe(`700 ${REMOTE_USER}`);
+    // No GnuPG folder of the extension: GnuPG works where the image sets it up.
+    expect(execIn('root', 'ls -A /workspaces/.devenv+').split('\n').sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token']);
 
-    // Git reads only the configuration of the container. The ~/.gitconfig of the extension has a section, so the Dev
-    // Containers extension does not copy the configuration of the computer into it (its own check exits with 1).
+    // Git reads only the configuration of the container; the ~/.gitconfig of the extension includes it for Git without
+    // the variables. No ~/.config/git/config of the extension.
     expect(execIn(REMOTE_USER, 'git config --global --list').split('\n')).toEqual([
       `user.name=${TEST_ACCOUNT.login}`,
       `user.email=${TEST_ACCOUNT.id}+${TEST_ACCOUNT.login}@users.noreply.github.com`,
@@ -441,9 +448,7 @@ describe('open pipeline on a seeded environment', () => {
       `credential.https://github.com.helper=${CONTAINER_CREDENTIAL_HELPER}`,
     ]);
     expect(execIn(REMOTE_USER, 'cat ~/.gitconfig')).toBe(HOME_GIT_CONFIG_CONTENT.trim());
-    const copyCheck = cli.run(['exec', '-u', REMOTE_USER, containerName, 'sh', '-c', `${DEV_CONTAINERS_GITCONFIG_CHECK}; exit 0`]);
-    expect(copyCheck.code, copyCheck.err).toBe(1);
-    expect(copyCheck.out).toContain('exists');
+    expect(execIn(REMOTE_USER, 'test -e ~/.config/git/config && echo exists || echo missing')).toBe('missing');
     expect(execIn(REMOTE_USER, 'git config --show-origin --get user.email')).toContain('file:/workspaces/.devenv+/gitconfig');
 
     // The credential helper answers for https://github.com with the token, and for no other host.
@@ -576,7 +581,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Id).not.toBe(oldId);
     expect(container?.State.Running).toBe(true);
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
-    expect(container?.Config.Labels?.['devenv.container-version']).toBe('2');
+    expect(container?.Config.Labels?.['devenv.container-version']).toBe('3');
     expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     expect(containersOfEnvironment()).toHaveLength(1);
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();
@@ -703,6 +708,17 @@ describe('open pipeline on a seeded environment', () => {
   it.each<[string, Record<string, unknown>, string]>([
     ['a bind mount', { mounts: ['source=/tmp,target=/host-tmp,type=bind'] }, 'bind mount /tmp'],
     ['privileged mode', { privileged: true }, 'privileged mode'],
+    // Restrictions summary, findings 5 and 6: the values of runArgs would replace those of the extension.
+    [
+      'a label of Dev Environments',
+      { runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', `${LABEL_ENVIRONMENT_ID}=someone-else`] },
+      `label ${LABEL_ENVIRONMENT_ID}`,
+    ],
+    [
+      'a variable of container-only Git',
+      { runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, '-e', 'GIT_CONFIG_GLOBAL=/tmp/gitconfig'] },
+      'variable GIT_CONFIG_GLOBAL in runArgs',
+    ],
     [
       'the Docker socket of a Feature (docker-outside-of-docker)',
       { features: { 'ghcr.io/devcontainers/features/docker-outside-of-docker:1': {} } },
@@ -735,6 +751,42 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  it('host access: a volume of a Docker Compose project is refused by its labels before any build; both volumes stay', async () => {
+    // A volume of the run, labelled as Docker Compose labels the volumes of its projects (for example a database).
+    const composeVolume = `devenv-test-compose-${run.runId}_data`;
+    cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', 'com.docker.compose.project=devenv-test', '--label', 'com.docker.compose.volume=data', composeVolume]);
+    const id = newEnvironmentId();
+    const repository = 'devenv-test/compose-volume';
+    const name = resourceName(repository, id);
+    const config = JSON.stringify({
+      name: 'Compose volume',
+      build: { dockerfile: 'Dockerfile' },
+      runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
+      mounts: [`source=${composeVolume},target=/data,type=volume`],
+    });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/compose-volume', config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    try {
+      const progress = new RecordingProgress();
+      const error = await online.openEnvironment(id, { progress }).then(() => undefined, (caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'hostAccess' });
+      expect((error as Error).message).toContain(`volume ${composeVolume} of the Docker Compose project devenv-test`);
+      expect(progress.steps).not.toContain('preparing');
+      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])).toEqual([]);
+      expect(cli.lines(['ps', '-a', '-q', '--filter', `volume=${composeVolume}`])).toEqual([]);
+      expect(cli.volume(name)).toBeDefined();
+      expect(cli.volume(composeVolume)).toBeDefined();
+    } finally {
+      await registry.remove(id);
+      cli.run(['volume', 'rm', name]);
+      cli.run(['volume', 'rm', composeVolume]);
+    }
+  });
+
   it('container-only Git with Git 2.30 (it ignores GIT_CONFIG_GLOBAL and GIT_CONFIG_COUNT): the token and the identity of the owner', async () => {
     const id = newEnvironmentId();
     const repository = 'devenv-test/old-git';
@@ -758,7 +810,8 @@ describe('open pipeline on a seeded environment', () => {
       expect(ui.since(events)).toEqual([]);
       // The identity of the volume, through the include of the ~/.gitconfig of the extension.
       expect(asUser(['git', 'config', '--get', 'user.email']).out).toBe(`${TEST_ACCOUNT.id}+${TEST_ACCOUNT.login}@users.noreply.github.com`);
-      // The credential helper of the container through GIT_CONFIG_PARAMETERS: the token for github.com, nothing for others.
+      // The credential helper of the container through the include of ~/.gitconfig (Git 2.30 reads no GIT_CONFIG_COUNT):
+      // the token for github.com, nothing for others.
       const github = asUser(['git', 'credential', 'fill'], 'protocol=https\nhost=github.com\npath=acme/api.git\n\n');
       expect(github.code).toBe(0);
       expect(github.out).toContain(`password=${DUMMY_TOKEN}`);
@@ -774,12 +827,103 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  it('host access: --platform linux/amd64, --cap-drop ALL, --rm, and -it pass; --rm and -it are not passed, and the user writes ~/.gitconfig', async () => {
+    const id = newEnvironmentId();
+    const repository = 'devenv-test/no-rights';
+    const name = resourceName(repository, id);
+    const config = JSON.stringify({
+      name: 'No rights',
+      // The image is built for the platform of the container (on Apple silicon, amd64 runs emulated).
+      build: { dockerfile: 'Dockerfile', options: ['--platform=linux/amd64'] },
+      remoteUser: REMOTE_USER,
+      runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, '--platform', 'linux/amd64', '--cap-drop', 'ALL', '--rm', '-it'],
+    });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/no-rights', config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    try {
+      await timings.measure('first open with --platform linux/amd64, --cap-drop ALL, --rm, -it', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      const container = cli.container(name);
+      expect(container?.State.Running).toBe(true);
+      expect(container?.HostConfig.AutoRemove).toBe(false);
+      expect(container?.HostConfig.CapDrop).toEqual(['ALL']);
+      expect(container?.Config.Tty).toBe(false);
+      expect(container?.Config.OpenStdin).toBe(false);
+      expect(cli.image(container!.Config.Image)?.Architecture).toBe('amd64');
+      expect(fs.readFileSync(log.file, 'utf8')).toContain(`Removed from the runArgs of ${repository}: --rm (`);
+      // Without its capabilities, root may not write into the home folder of the user: the user wrote ~/.gitconfig.
+      const gitconfig = cli.run(['exec', '-u', REMOTE_USER, name, 'sh', '-c', 'stat -c %U ~/.gitconfig && grep -c "^\\[include\\]" ~/.gitconfig']);
+      expect(gitconfig.out, gitconfig.err).toBe(`${REMOTE_USER}\n1`);
+      // Without --rm, a stop keeps the container.
+      await docker.stopContainer(name);
+      expect(cli.container(name)?.State.Running).toBe(false);
+    } finally {
+      await registry.remove(id);
+      cli.run(['rm', '-f', name]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      cli.run(['volume', 'rm', name]);
+    }
+  });
+
+  it('two accounts, one repository: two volumes and two containers, each with the identity of its owner; both come back after a lost registry (D-3)', async () => {
+    const repository = 'devenv-test/shared';
+    const second = { id: '4343', login: 'devenv-test-second' };
+    const secondService = service(registryTransport, 'second account', helper, { ...fakeAuth, getAccount: async () => second });
+    const config = JSON.stringify({ name: 'Shared', build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`] });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    const owners = [TEST_ACCOUNT, second];
+    const entries = owners.map((account) => {
+      const id = newEnvironmentId();
+      return { account, id, name: resourceName(repository, id) };
+    });
+    try {
+      const now = isoTime(systemClock);
+      for (const { account, id, name } of entries) {
+        await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: account.id, [TEST_RUN_LABEL]: run.runId });
+        const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/shared', config, dockerfile], { docker: false, network: false });
+        expect(seeded.exitCode, seeded.stderr).toBe(0);
+        // The registry keeps one environment per repository and account, so both entries are added.
+        await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: account });
+      }
+      await timings.measure('first open of the first account', () => online.openEnvironment(entries[0].id, { progress: new RecordingProgress() }));
+      await timings.measure('first open of the second account', () => secondService.openEnvironment(entries[1].id, { progress: new RecordingProgress() }));
+      // Each account's own environment cannot be opened by the other one.
+      await expect(online.openEnvironment(entries[1].id, { progress: new RecordingProgress() })).rejects.toMatchObject({ code: 'otherAccount' });
+      expect(new Set(entries.map(({ name }) => name)).size).toBe(2);
+      for (const { account, name } of entries) {
+        expect(cli.volume(name)).toBeDefined();
+        expect(cli.container(name)?.State.Running).toBe(true);
+        const email = cli.run(['exec', '-u', REMOTE_USER, name, 'git', 'config', '--get', 'user.email']);
+        expect(email.out, email.err).toBe(`${account.id}+${account.login}@users.noreply.github.com`);
+      }
+      // A lost registry: both environments come back from the labels of their volumes, each with its owner.
+      for (const { id } of entries) await registry.remove(id);
+      expect(await online.reconcileFromVolumes()).toBeGreaterThanOrEqual(2);
+      for (const { account, id } of entries) expect((await registry.get(id))?.owner?.id).toBe(account.id);
+    } finally {
+      for (const { id, name } of entries) {
+        await registry.remove(id);
+        cli.run(['rm', '-f', name]);
+        cli.run(['volume', 'rm', name]);
+      }
+      // By reference, not by ID: the two builds are identical, so both tags can name one image ID.
+      for (const { id } of entries) {
+        for (const reference of cli.lines(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', environmentImageRepository(id)])) {
+          cli.run(['image', 'rm', reference]);
+        }
+      }
+    }
+  });
+
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {
     const progress = new RecordingProgress();
     const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
 
-    await timings.measure('delete', () => online.delete(environmentId, { progress, removeAdditionalVolumes: false }));
+    await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));
     expect(containersOfEnvironment()).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.lines(['image', 'ls', '-q', imageRepository])).toEqual([]);

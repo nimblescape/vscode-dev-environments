@@ -43,10 +43,16 @@ export class GitHubTimeoutError extends Error {
 export interface GitHubApiOptions {
   /** Time limit of one request. Default: 30 seconds. */
   timeoutMs?: number;
+  /** GitHub answered HTTP 401 for `token` (the sign-in is not valid anymore). Called before the error is thrown. */
+  onUnauthorized?: (token: string) => void;
+  /** GitHub answered HTTP 200 for `token`. */
+  onAuthorized?: (token: string) => void;
 }
 
 export class GitHubApi {
   private readonly timeoutMs: number;
+  private readonly onUnauthorized: ((token: string) => void) | undefined;
+  private readonly onAuthorized: ((token: string) => void) | undefined;
 
   constructor(
     private readonly transport: HttpTransport,
@@ -54,6 +60,8 @@ export class GitHubApi {
     options: GitHubApiOptions = {},
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_GITHUB_TIMEOUT_MS;
+    this.onUnauthorized = options.onUnauthorized;
+    this.onAuthorized = options.onAuthorized;
   }
 
   /**
@@ -70,6 +78,9 @@ export class GitHubApi {
     signal?: AbortSignal,
   ): Promise<{ data?: T; errors?: GraphQLError[] }> {
     const response = await this.post(JSON.stringify({ query, variables }), token, signal);
+    // Every GraphQL request of the extension goes through here, so every 401 reaches the one place of the sign-in state.
+    if (response.status === 401) this.notify(this.onUnauthorized, token);
+    if (response.status === 200) this.notify(this.onAuthorized, token);
     if (response.status !== 200) {
       throw new GitHubApiError(
         `GitHub API request failed with HTTP status ${response.status}${describeBody(response.body)}.`,
@@ -94,6 +105,14 @@ export class GitHubApi {
       throw new GitHubApiError('GitHub API returned a response without data and without errors.', response.status);
     }
     return result;
+  }
+
+  private notify(listener: ((token: string) => void) | undefined, token: string): void {
+    try {
+      listener?.(token);
+    } catch (error) {
+      this.logger.warn(`GitHub API: the sign-in state could not be updated: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async post(body: string, token: string, signal?: AbortSignal): Promise<HttpResponse> {

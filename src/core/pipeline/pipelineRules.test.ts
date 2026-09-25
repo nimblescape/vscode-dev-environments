@@ -13,6 +13,7 @@ import {
   errorDetail,
   imageRemoteUser,
   imagesToPull,
+  isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
   isRepositoryName,
@@ -53,8 +54,9 @@ describe('configHash', () => {
 
 describe('containerIsCurrent (concept section 9: containers of an older setup are created again)', () => {
   it.each<[string, Record<string, string>, boolean]>([
-    ['the current version', { 'devenv.container-version': '2' }, true],
-    ['a newer version', { 'devenv.container-version': '3' }, true],
+    ['the current version', { 'devenv.container-version': '3' }, true],
+    ['a newer version', { 'devenv.container-version': '4' }, true],
+    ['the version before (container-only Git without the settings of the Dev Containers extension)', { 'devenv.container-version': '2' }, false],
     ['an older version', { 'devenv.container-version': '1' }, false],
     ['no label (created by version 1 of the extension)', { 'devenv.environment-id': 'x' }, false],
     ['an invalid label', { 'devenv.container-version': 'two' }, false],
@@ -64,11 +66,11 @@ describe('containerIsCurrent (concept section 9: containers of an older setup ar
   });
 
   it('counts a container created without the configuration as current only while the configuration cannot be read', () => {
-    const provisional = { 'devenv.container-version': '2', 'devenv.container-config': 'unknown' };
+    const provisional = { 'devenv.container-version': '3', 'devenv.container-config': 'unknown' };
     expect(containerIsCurrent(provisional)).toBe(false);
     expect(containerIsCurrent(provisional, true)).toBe(false);
     expect(containerIsCurrent(provisional, false)).toBe(true);
-    expect(containerIsCurrent({ 'devenv.container-version': '2' }, false)).toBe(true);
+    expect(containerIsCurrent({ 'devenv.container-version': '3' }, false)).toBe(true);
     expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
   });
 });
@@ -321,5 +323,28 @@ describe('lifecycleHookFailure', () => {
     expect(lifecycleHookName('postAttachCommand from devcontainer.json failed.')).toBe('postAttachCommand');
     expect(lifecycleHookName('xpostStartCommand from devcontainer.json failed.')).toBeUndefined();
     expect(lifecycleHookName(undefined)).toBeUndefined();
+  });
+});
+
+describe('isGitHubTokenRejected', () => {
+  it.each([
+    "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://github.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://x-access-token@github.com/acme/api.git/'",
+    'remote: Invalid username or password.',
+    "fatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 401",
+  ])('a rejected token: %s', (text) => {
+    expect(isGitHubTokenRejected(text)).toBe(true);
+  });
+
+  it.each([
+    "remote: Repository not found.\nfatal: repository 'https://github.com/acme/api.git/' not found",
+    "fatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 403",
+    "fatal: Authentication failed for 'https://git.example.com/acme/api.git/'",
+    "fatal: Authentication failed for 'https://github.com.evil.example/acme/api.git/'",
+    "fatal: unable to access 'https://github.com/acme/api.git/': Could not resolve host: github.com",
+    "error: pathspec 'feature' did not match any file(s) known to git",
+  ])('not a rejected token: %s', (text) => {
+    expect(isGitHubTokenRejected(text)).toBe(false);
   });
 });

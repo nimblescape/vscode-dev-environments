@@ -213,6 +213,20 @@ export function isNetworkFailure(text: string): boolean {
   return /unable to access/i.test(text) && !/returned error:\s*\d{3}/i.test(text);
 }
 
+/**
+ * True if Git says that github.com rejected the token of the helper run: HTTP 401 over HTTPS, for example
+ * `remote: Invalid username or token. Password authentication is not supported for Git operations.` followed by
+ * `fatal: Authentication failed for 'https://github.com/acme/api.git/'`. A repository without access gives
+ * `Repository not found` (404) instead, which is not a rejected token.
+ */
+export function isGitHubTokenRejected(text: string): boolean {
+  return (
+    /authentication failed for '?https:\/\/([^/@\s']*@)?github\.com[/']/i.test(text) ||
+    /^remote: invalid username or (token|password)/im.test(text) ||
+    /'?https:\/\/([^/@\s']*@)?github\.com\/[^\s']*'?: the requested url returned error: 401\b/i.test(text)
+  );
+}
+
 // Description of the Dev Container CLI when a lifecycle command fails in a container that it created or started:
 // `postStartCommand from devcontainer.json failed.`, or `<name> of postStartCommand from … failed.` for a command object.
 const LIFECYCLE_HOOK_FAILURE =

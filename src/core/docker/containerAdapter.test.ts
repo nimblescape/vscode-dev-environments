@@ -283,6 +283,23 @@ describe('containers', () => {
     expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1' }]);
   });
 
+  it('reads the named volumes that a container mounts', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['c1']));
+      const container = {
+        ...(containerJson({ id: 'c1', name: 'x', status: 'running' }) as Record<string, unknown>),
+        Mounts: [
+          { Type: 'volume', Name: 'devenv-acme-api-3f2a9c1e', Destination: '/workspaces' },
+          { Type: 'volume', Name: 'api-node_modules', Destination: '/workspaces/api/node_modules' },
+          { Type: 'bind', Source: '/tmp', Destination: '/tmp' },
+          { Type: 'tmpfs', Destination: '/run' },
+        ],
+      };
+      return ok(inspectOutput([container]));
+    });
+    expect((await docker.listEnvironmentContainers())[0].volumes).toEqual(['devenv-acme-api-3f2a9c1e', 'api-node_modules']);
+  });
+
   it('throws when inspect fails for another reason', async () => {
     const { docker } = adapter((call) => {
       if (call.args[0] === 'ps') return ok(idLines(['c1']));
@@ -444,6 +461,31 @@ describe('volumes', () => {
     const { docker, runner } = adapter(() => ok(''));
     expect(await docker.listEnvironmentVolumes()).toEqual([]);
     expect(runner.calls).toHaveLength(1);
+  });
+
+  it('inspects the volumes of a list that exist, each once, with their labels', async () => {
+    const { docker, runner } = adapter(() =>
+      fail(
+        'Error response from daemon: get gone: no such volume',
+        1,
+        inspectOutput([
+          { Name: 'db', Driver: 'local', Labels: { 'com.docker.compose.project': 'shop' } },
+          { Name: 'cache', Driver: 'local', Labels: null },
+        ]),
+      ),
+    );
+    expect(await docker.inspectVolumes(['db', 'cache', 'gone', 'db'])).toEqual([
+      { name: 'db', labels: { 'com.docker.compose.project': 'shop' } },
+      { name: 'cache', labels: {} },
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['volume', 'inspect', 'db', 'cache', 'gone']]);
+  });
+
+  it('inspects nothing for an empty list, and throws for errors other than a missing volume', async () => {
+    const { docker, runner } = adapter(() => fail('Cannot connect to the Docker daemon at unix:///var/run/docker.sock.'));
+    expect(await docker.inspectVolumes([])).toEqual([]);
+    expect(runner.calls).toHaveLength(0);
+    await expect(docker.inspectVolumes(['x'])).rejects.toBeInstanceOf(CommandError);
   });
 });
 

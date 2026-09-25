@@ -104,9 +104,22 @@ export interface RefusedUpdate {
   items: string;
 }
 
+/**
+ * An additional volume that a Delete kept (concept 7.14 step 4), with the account whose environment used it: it stays
+ * foreign for the environments of other accounts while it exists (concept section 9 "Host access").
+ */
+export interface KeptVolume {
+  name: string;
+  /** Missing for a volume of an entry of an older version without owner. */
+  owner?: GitHubAccount;
+  keptAt: string;
+}
+
 export interface RegistryFile {
   version: 1;
   environments: Environment[];
+  /** Additional volumes that a Delete kept. Missing in files of earlier versions. */
+  keptVolumes?: KeptVolume[];
 }
 
 /** A repository found by the discovery (concept 7.4). */
@@ -185,7 +198,15 @@ export interface PendingOperation {
   reason: 'manual' | 'update' | 'configChanged' | 'configurationSelected';
   /** New configuration path, for `configurationSelected`. */
   configPath?: string;
-  /** For `delete`: also remove the additional named volumes of the configuration. */
+  /**
+   * For `delete`: the additional named volumes that the user confirmed for removal, as the question listed them. A volume
+   * that the environment recorded after the question is kept.
+   */
+  additionalVolumesToRemove?: string[];
+  /**
+   * For `delete`, written by an earlier version: also remove the additional volumes. That version's question listed the
+   * recorded additional volumes, so they are removed (pendingVolumesToRemove).
+   */
   removeAdditionalVolumes?: boolean;
 }
 

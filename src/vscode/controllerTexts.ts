@@ -25,10 +25,13 @@ export const ControllerTexts = {
   otherWindowNoAnswer: (repository: string) =>
     `The other window of ${repository} did not close its connection. Nothing was changed.`,
   alreadyDeleting: (repository: string) => `The environment of ${repository} is being deleted in another window.`,
-  // Accounts (concept 7.5).
-  /** An environment of another account; D-3: one environment per repository on this computer. */
-  otherAccount: (repository: string) =>
-    `The environment of ${repository} belongs to another GitHub account. Sign in with that account to use it. This computer keeps one environment per repository, so the signed-in account cannot make its own.`,
+  // Accounts (concept 7.5). A named environment of another account: Messages.otherAccount.
+  /**
+   * Concept 7.5: the GitHub session changed during a command on an entry of an older version (for example another account
+   * signed in at the sign-in of the claim). Nothing was assigned; Try again runs the command for the new account.
+   */
+  accountChangedDuringClaim: (repository: string) =>
+    `The GitHub account changed while the environment of ${repository} was being assigned. Nothing was assigned. Try again.`,
   /**
    * A restored window of an environment of an older version that has no owner yet (Messages.olderEnvironmentNotAssigned
    * for a command). Not "another account": nobody owns it.

@@ -16,7 +16,7 @@ import {
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
-import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
 
 describe('argument builders', () => {
   it('read-configuration', () => {
@@ -188,19 +188,36 @@ describe('buildOverrideConfig', () => {
     containerName: 'devenv-acme-api-3f2a9c1e',
   };
 
-  it('contains only the properties that the image metadata does not store, and the variables of container-only Git', () => {
+  it('contains only the properties that the image metadata does not store, and the variables and settings of container-only Git', () => {
     expect(buildOverrideConfig(base)).toEqual({
       image: 'devenv-3f2a9c1e:2',
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
-      runArgs: ['--label', 'devenv.container-version=2', '--name', 'devenv-acme-api-3f2a9c1e'],
+      runArgs: ['--label', 'devenv.container-version=3', '--name', 'devenv-acme-api-3f2a9c1e'],
       containerEnv: containerEnvironment(),
       remoteEnv: remoteEnvironment(),
+      customizations: { vscode: { settings: devContainersSettings() } },
       shutdownAction: 'none',
     });
   });
 
-  it('switches off the forwarding of the computer with variables of the container and of VS Code (concept section 9)', () => {
+  it('switches off the forwarding of the Dev Containers extension for this container, also with runArgs and ports', () => {
+    for (const override of [buildOverrideConfig(base), buildOverrideConfig({ ...base, runArgs: ['--init'], appPort: [3000] })]) {
+      expect(override.customizations).toEqual({
+        vscode: {
+          settings: {
+            'dev.containers.copyGitConfig': false,
+            'remote.containers.copyGitConfig': false,
+            'dev.containers.gitCredentialHelperConfigLocation': 'none',
+            'dev.containers.dockerCredentialHelper': false,
+            'dev.containers.githubCLILoginWithToken': false,
+          },
+        },
+      });
+    }
+  });
+
+  it('keeps Git and Docker on the configuration of the volume with their own variables (concept section 9)', () => {
     const override = buildOverrideConfig(base);
     const containerEnv = override.containerEnv as Record<string, string>;
     const remoteEnv = override.remoteEnv as Record<string, string>;
@@ -208,7 +225,6 @@ describe('buildOverrideConfig', () => {
       expect(env).toMatchObject({
         GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',
         DOCKER_CONFIG: '/workspaces/.devenv+/docker',
-        GNUPGHOME: '/workspaces/.devenv+/gnupg',
         GIT_SSH_COMMAND: 'ssh -o IdentityAgent=none',
         GIT_CONFIG_COUNT: '4',
         GIT_CONFIG_KEY_0: 'credential.helper',
@@ -219,16 +235,17 @@ describe('buildOverrideConfig', () => {
         GIT_CONFIG_VALUE_2: '',
         GIT_CONFIG_KEY_3: 'credential.https://github.com.helper',
       });
-      expect(env.GIT_CONFIG_PARAMETERS).toMatch(/^'credential\.helper=' /);
-      // No token in a variable, and the local browser stays (URLs of the container open on the computer).
+      // No token in a variable. The variables of the Dev Containers extension and of the VS Code server keep their own
+      // values (user decision 2026-09-25): the browser of the computer, the agents, and the channels of the extension.
       expect(Object.keys(env)).not.toContain('GH_TOKEN');
       expect(Object.keys(env)).not.toContain('GITHUB_TOKEN');
-      expect(Object.keys(env)).not.toContain('BROWSER');
+      for (const name of ['BROWSER', 'VSCODE_IPC_HOOK_CLI', 'SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'GNUPGHOME', 'GIT_CONFIG_PARAMETERS']) {
+        expect(Object.keys(env)).not.toContain(name);
+      }
       // The CLI substitutes `${…}` in the override configuration.
       for (const value of Object.values(env)) expect(value).not.toContain('${');
     }
-    expect(containerEnv).not.toHaveProperty('SSH_AUTH_SOCK');
-    expect(remoteEnv.SSH_AUTH_SOCK).toBe('');
+    expect(remoteEnv).toEqual(containerEnv);
   });
 
   it('keeps the repository runArgs without any --name, binds published ports to 127.0.0.1, and adds the label and the name', () => {
@@ -245,7 +262,7 @@ describe('buildOverrideConfig', () => {
       '-p',
       '127.0.0.1:8080:80',
       '--label',
-      'devenv.container-version=2',
+      'devenv.container-version=3',
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);
@@ -274,7 +291,7 @@ describe('buildOverrideConfig', () => {
     expect(buildOverrideConfig({ ...base, runArgs: shifting }).runArgs).toEqual([
       ...shifting,
       '--label',
-      'devenv.container-version=2',
+      'devenv.container-version=3',
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);

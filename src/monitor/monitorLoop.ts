@@ -13,7 +13,7 @@ import { isBusyMarkLive } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { errorMessage } from '../core/errors';
 import { gitSummaryCommand, parseGitSummaryOutput } from '../core/git/gitSummary';
-import { LABEL_ENVIRONMENT_ID, repositoryFolder } from '../core/names';
+import { LABEL_ENVIRONMENT_ID, repositoryFolder, shortId } from '../core/names';
 import { isoTime, sleep, systemClock, type Clock, type Logger, type RunResult } from '../core/ports';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
@@ -42,6 +42,19 @@ export { BUSY_MARK_MAX_AGE_MS } from '../core/busy';
 export const STOP_RETRY_MAX_MS = 5 * 60_000;
 /** The monitor ends after this many ticks in a row that failed (for example an unreadable registry). */
 export const MAX_FAILED_TICKS = 60;
+
+/**
+ * The name of an environment in the log: its repository, and the short ID of the environment when another environment of
+ * `environments` has the same repository (one environment per repository and GitHub account, concept D-3).
+ */
+export function environmentLabel(
+  environment: Pick<Environment, 'id' | 'repository'>,
+  environments: readonly Pick<Environment, 'id' | 'repository'>[],
+): string {
+  const repository = environment.repository.toLowerCase();
+  const shared = environments.some((other) => other.id !== environment.id && other.repository.toLowerCase() === repository);
+  return shared ? `${environment.repository} (${shortId(environment.id)})` : environment.repository;
+}
 
 /** Settings when monitor.json is missing or invalid: the defaults of concept section 8. */
 export function defaultMonitorSettings(): MonitorSettings {
@@ -289,11 +302,12 @@ export class MonitorLoop {
     if (!this.deps.refreshLock()) return 'lockLost';
 
     // Recording the Git summary and stopping take time, and the files were read at the start of the tick.
-    const environment = await this.idleEnvironment(id);
-    if (!environment) return 'skipped';
+    const idle = await this.idleEnvironment(id);
+    if (!idle) return 'skipped';
+    const { environment, label } = idle;
     const target = containers.find((container) => container.name === environment.containerName) ?? containers[0];
 
-    const summary = await this.readGitSummary(environment, target);
+    const summary = await this.readGitSummary(environment, label, target);
     if (this.stopRequested) return 'skipped';
     if (summary) {
       // Read before the registry update: its mutator runs under the registry lock and does no I/O.
@@ -310,15 +324,15 @@ export class MonitorLoop {
           current.gitSummary = summary;
         });
         if (!updated) {
-          logger.info(`${environment.repository} was removed from the registry. Its container is not stopped.`);
+          logger.info(`${label} was removed from the registry. Its container is not stopped.`);
           return 'skipped';
         }
         if (busy) {
-          logger.info(`${environment.repository} is busy again. Its container is not stopped.`);
+          logger.info(`${label} is busy again. Its container is not stopped.`);
           return 'skipped';
         }
       } catch (error) {
-        logger.warn(`The Git state of ${environment.repository} could not be recorded. ${errorMessage(error)}`);
+        logger.warn(`The Git state of ${label} could not be recorded. ${errorMessage(error)}`);
       }
     }
 
@@ -328,7 +342,7 @@ export class MonitorLoop {
     let failed = false;
     for (const container of containers) {
       try {
-        logger.info(`Stopping the container ${container.name} of ${environment.repository}: no window uses it.`);
+        logger.info(`Stopping the container ${container.name} of ${label}: no window uses it.`);
         await this.deps.docker.stopContainer(container.id);
       } catch (error) {
         failed = true;
@@ -345,12 +359,16 @@ export class MonitorLoop {
     return 'stopped';
   }
 
-  /** Reads the files again. The environment if it is still in the registry and not in use, else `undefined`. */
-  private async idleEnvironment(id: string): Promise<Environment | undefined> {
+  /**
+   * Reads the files again. The environment, with its name for the log (environmentLabel), if it is still in the registry
+   * and not in use, else `undefined`.
+   */
+  private async idleEnvironment(id: string): Promise<{ environment: Environment; label: string } | undefined> {
     const now = this.clock.now();
     const snapshot = await this.readSnapshot(now);
     const environment = snapshot.environments.find((candidate) => candidate.id === id);
     if (!environment) return undefined;
+    const label = environmentLabel(environment, snapshot.environments);
     const { inUse } = computeInUse({
       now,
       environments: snapshot.monitorEnvironments,
@@ -359,17 +377,17 @@ export class MonitorLoop {
       state: this.monitorState,
     });
     if (inUse.has(id)) {
-      this.deps.logger.info(`${environment.repository} is in use again. Its container is not stopped.`);
+      this.deps.logger.info(`${label} is in use again. Its container is not stopped.`);
       return undefined;
     }
-    return environment;
+    return { environment, label };
   }
 
   /**
    * Git summary from the running container (concept 7.9 "Further rules"), as `remoteUser`. `undefined` when Git is
    * missing in the container or fails: the registry then keeps the previous values (concept 7.5).
    */
-  private async readGitSummary(environment: Environment, container: ContainerInfo): Promise<GitSummary | undefined> {
+  private async readGitSummary(environment: Environment, label: string, container: ContainerInfo): Promise<GitSummary | undefined> {
     const { logger } = this.deps;
     try {
       const folder = environment.remoteWorkspaceFolder || repositoryFolder(environment.repository);
@@ -382,10 +400,10 @@ export class MonitorLoop {
         logger.info(`Git is not available in ${container.name}. The last recorded Git state is kept.`);
       } else {
         const reason = result.timedOut ? 'did not end in time' : `failed with exit code ${result.exitCode}`;
-        logger.warn(`The Git state of ${environment.repository} ${reason}. ${result.stderr.trim().slice(-500)}`);
+        logger.warn(`The Git state of ${label} ${reason}. ${result.stderr.trim().slice(-500)}`);
       }
     } catch (error) {
-      logger.warn(`The Git state of ${environment.repository} could not be read. ${errorMessage(error)}`);
+      logger.warn(`The Git state of ${label} could not be read. ${errorMessage(error)}`);
     }
     return undefined;
   }
@@ -418,7 +436,9 @@ export class MonitorLoop {
 
   /** Logs when a waiting time starts and when an environment is in use again, so that monitor.log explains each stop. */
   private logWaitingTimes(previous: MonitorState, decision: MonitorDecision, snapshot: Snapshot, settings: MonitorSettings): void {
-    const names = new Map(snapshot.environments.map((environment) => [environment.id, environment.repository]));
+    const names = new Map(
+      snapshot.environments.map((environment) => [environment.id, environmentLabel(environment, snapshot.environments)]),
+    );
     const before = previous.idleSince ?? {};
     const after = decision.state.idleSince;
     const seconds = Math.round(waitingTimeMs(settings) / 1000);

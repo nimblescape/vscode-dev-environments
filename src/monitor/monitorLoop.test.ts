@@ -20,6 +20,7 @@ import {
   GIT_SUMMARY_TIMEOUT_MS,
   MAX_FAILED_TICKS,
   MonitorLoop,
+  environmentLabel,
   type MonitorDocker,
   type MonitorLoopDeps,
   type TickResult,
@@ -283,6 +284,18 @@ async function closedWindowScenario(h: Harness, extra: Partial<Environment> = {}
   h.docker.containers = [containerOf(env)];
   return env;
 }
+
+describe('environmentLabel (concept D-3: one environment per repository and GitHub account)', () => {
+  const API = { id: ID_A, repository: 'acme/api' };
+  it.each<[string, Array<Pick<Environment, 'id' | 'repository'>>, string]>([
+    ['the only environment of its repository', [API, { id: ID_B, repository: 'acme/web' }], 'acme/api'],
+    ['another environment of the repository (of another account)', [API, { id: ID_B, repository: 'acme/api' }], 'acme/api (3f2a9c1e)'],
+    ['the same, with the repository in another case', [API, { id: ID_B, repository: 'ACME/Api' }], 'acme/api (3f2a9c1e)'],
+    ['an environment that the list does not have', [{ id: ID_B, repository: 'acme/web' }], 'acme/api'],
+  ])('%s', (_name, environments, expected) => {
+    expect(environmentLabel(API, environments)).toBe(expected);
+  });
+});
 
 describe('MonitorLoop.tick', () => {
   let h: Harness;
@@ -684,6 +697,28 @@ describe('MonitorLoop.tick', () => {
     const results = await runUntil(h, T0 + 5 * 60_000, keepB);
     expect(results.some((result) => result.end)).toBe(false);
     expect(h.docker.count('list')).toBe(listsAfterConfirmation);
+  });
+
+  it('stops each environment of one repository on its own (two GitHub accounts), and names them apart in the log', async () => {
+    const envA = await closedWindowScenario(h, { owner: { id: '1001', login: 'octo' } });
+    const envB = environment(ID_B, 'acme/api', { owner: { id: '2002', login: 'someone' } });
+    await h.registry.add(envB);
+    h.docker.containers = [containerOf(envA), containerOf(envB)];
+    // A window of the other account uses its environment of the same repository.
+    let lastWrite = -Infinity;
+    const keepB = async (): Promise<void> => {
+      if (h.clock.time - lastWrite >= 15_000) {
+        lastWrite = h.clock.time;
+        await writeWindow(h, 'w2', ID_B, { pid: LIVE_PID_2 });
+      }
+    };
+    const results = await runUntil(h, T0 + WAITING_MS + 1, keepB);
+    expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    expect(h.docker.calls.filter((call) => call.startsWith('stop'))).toEqual([`stop ${containerOf(envA).id}`]);
+    expect(h.docker.containers.map((container) => container.state)).toEqual(['stopped', 'running']);
+    expect(h.logger.lines).toContain('info acme/api (3f2a9c1e) runs, and no window uses it. It stops in 30 seconds.');
+    expect(h.logger.lines).toContain(`info Stopping the container ${envA.containerName} of acme/api (3f2a9c1e): no window uses it.`);
+    expect(h.logger.lines.some((line) => line.includes('7c1d2e3f'))).toBe(false);
   });
 
   it('logs when an environment is in use again during its waiting time', async () => {

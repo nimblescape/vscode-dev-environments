@@ -24,7 +24,7 @@ function request(overrides: Partial<PendingOperation> = {}): PendingOperation {
     requestedAt: new Date(NOW).toISOString(),
     requestedBy: 'window-2',
     reason: 'manual',
-    removeAdditionalVolumes: true,
+    additionalVolumesToRemove: ['api-db'],
     ...overrides,
   };
 }

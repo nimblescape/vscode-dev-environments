@@ -4,11 +4,12 @@
 
 // Environments belong to the GitHub account that created them (concept 7.5, section 9 "Accounts"). An account never
 // sees, starts, or connects to an environment of another account. Entries of an older version have no owner: an account
-// takes one over only when it can belong to nobody else, or when the user confirms it.
+// takes one over only when it can belong to nobody else, or when the user confirms it, and only while the account has
+// no environment of its repository (one environment per repository and account, concept D-3).
 import { GitHubApiError, GitHubTimeoutError } from './discovery/githubApi';
 import { errorMessage } from './errors';
 import type { Logger } from './ports';
-import type { EnvironmentRegistry } from './storage/registry';
+import { isEnvironmentOf, type EnvironmentRegistry } from './storage/registry';
 import type { Environment, GitHubAccount, RepositoryInfo } from './types';
 
 /**
@@ -35,6 +36,19 @@ export function unownedEnvironments<T extends Pick<Environment, 'owner'>>(enviro
 /** The owner entry of an environment that `account` creates or claims. */
 export function ownerOf(account: GitHubAccount): GitHubAccount {
   return { id: account.id, login: account.login };
+}
+
+/**
+ * True if `account` may take over `entry` of `environments` (concept 7.5, D-3): the entry has no owner, and the account
+ * has no environment of its repository, because an account has at most one environment per repository. Otherwise the
+ * entry stays hidden.
+ */
+export function canClaim(
+  environments: readonly Pick<Environment, 'repository' | 'owner'>[],
+  entry: Pick<Environment, 'repository' | 'owner'>,
+  account: GitHubAccount,
+): boolean {
+  return entry.owner === undefined && !environments.some((other) => isEnvironmentOf(other, entry.repository, account.id));
 }
 
 /** Permissions of GitHub (`viewerPermission`) that allow a push. */
@@ -64,7 +78,7 @@ export function isUnambiguousClaim(info: RepositoryInfo, account: GitHubAccount)
 export type ClaimMode = 'auto' | 'interactive';
 
 export interface ClaimDeps {
-  registry: Pick<EnvironmentRegistry, 'list' | 'updateEnvironment'>;
+  registry: Pick<EnvironmentRegistry, 'list' | 'update'>;
   /**
    * DiscoveryService.getRepository with the token of the account, in its quiet mode: the repository, or `undefined` when
    * GitHub does not return it (not found, or no access). Throws when the answer is unknown (for example without
@@ -86,11 +100,19 @@ export interface ClaimOptions {
   /** Only these entries; default: every entry without owner. */
   environmentIds?: readonly string[];
   signal?: AbortSignal;
+  /**
+   * Called for each entry that stays without owner because GitHub could not be asked (for example without a connection,
+   * or at a rate limit): whether the account may take it over is not known yet.
+   */
+  onUnanswered?: (environmentId: string) => void;
+  /** In the `interactive` mode: ask also about an entry that the user declined in this session (a new Start of it). */
+  askAgain?: boolean;
 }
 
 /**
  * Claims of environments without owner (concept 7.5). One claim runs at a time; the registry change checks again under
- * its lock that the entry has no owner, so two windows never give one entry to two accounts.
+ * its lock that the entry has no owner and that the account has no environment of its repository (canClaim), so two
+ * windows never give one entry to two accounts, and an account never gets a second environment of a repository.
  */
 export class EnvironmentClaims {
   private queue: Promise<unknown> = Promise.resolve();
@@ -100,10 +122,11 @@ export class EnvironmentClaims {
   constructor(private readonly deps: ClaimDeps) {}
 
   /**
-   * Gives each environment without owner (only those of `environmentIds`, when given) to `account`, when GitHub returns
-   * its repository for the token of the account and either the claim is unambiguous (isUnambiguousClaim) or, in the
-   * `interactive` mode, the user confirms it. A failed question leaves the entry without owner, so it stays hidden.
-   * Returns the IDs of the claimed environments. Never throws.
+   * Gives each environment without owner (only those of `environmentIds`, when given) to `account`, when the account has
+   * no environment of its repository (canClaim), GitHub returns the repository for the token of the account, and either
+   * the claim is unambiguous (isUnambiguousClaim) or, in the `interactive` mode, the user confirms it. An entry of a
+   * repository of which the account has an environment is neither asked about nor claimed. A failed question leaves the
+   * entry without owner, so it stays hidden. Returns the IDs of the claimed environments. Never throws.
    */
   claim(account: GitHubAccount, token: string, options: ClaimOptions = {}): Promise<string[]> {
     return this.enqueue(() => this.claimNow(account, token, options));
@@ -112,7 +135,8 @@ export class EnvironmentClaims {
   /**
    * Gives the entries `environmentIds` that have no owner to `account` without asking GitHub. Only for a command in which
    * the user chose the entries and confirmed it, for example for an entry whose repository GitHub does not return
-   * anymore (deleted, or access lost), which no claim can take over. An entry that got an owner meanwhile is not changed.
+   * anymore (deleted, or access lost), which no claim can take over. An entry that got an owner meanwhile, and an entry
+   * of a repository of which the account has an environment (canClaim), is not changed.
    * Returns the IDs of the entries that now belong to `account`. Never throws.
    */
   adopt(account: GitHubAccount, environmentIds: readonly string[]): Promise<string[]> {
@@ -134,13 +158,14 @@ export class EnvironmentClaims {
   private async claimNow(account: GitHubAccount, token: string, options: ClaimOptions): Promise<string[]> {
     const { registry, logger } = this.deps;
     const mode = options.mode ?? 'auto';
-    let candidates: Environment[];
+    let environments: Environment[];
     try {
-      candidates = unownedEnvironments(await registry.list());
+      environments = await registry.list();
     } catch (error) {
       logger.warn(`The environments without owner could not be read: ${errorMessage(error)}`);
       return [];
     }
+    let candidates = unownedEnvironments(environments);
     if (options.environmentIds) {
       const wanted = new Set(options.environmentIds);
       candidates = candidates.filter((environment) => wanted.has(environment.id));
@@ -149,11 +174,16 @@ export class EnvironmentClaims {
     for (const environment of candidates) {
       if (options.signal?.aborted) break;
       // The repository name of an entry that stays hidden is not shown, not even in the log.
+      if (!canClaim(environments, environment, account)) {
+        logger.info(`The environment ${environment.id} stays hidden: the signed-in account has an environment of its repository.`);
+        continue;
+      }
       let info: RepositoryInfo | undefined;
       try {
         info = await this.deps.getRepository(environment.repository, token, options.signal);
       } catch (error) {
         logger.info(`The environment ${environment.id} stays hidden: GitHub could not be asked (${failureReason(error)}).`);
+        options.onUnanswered?.(environment.id);
         continue;
       }
       if (!info) {
@@ -161,20 +191,28 @@ export class EnvironmentClaims {
         continue;
       }
       const allowed =
-        isUnambiguousClaim(info, account) || (mode === 'interactive' && (await this.confirmed(environment, account)));
+        isUnambiguousClaim(info, account) ||
+        (mode === 'interactive' && (await this.confirmed(environment, account, options.askAgain === true)));
       if (!allowed) {
         logger.info(`The environment ${environment.id} stays hidden: it is assigned to an account only after a confirmation.`);
         continue;
       }
-      if (await this.setOwner(environment.id, account)) claimed.push(environment.id);
+      if (await this.setOwner(environment.id, account)) {
+        claimed.push(environment.id);
+        // Another entry of the same repository is not asked about anymore.
+        environment.owner = ownerOf(account);
+      }
     }
     return claimed;
   }
 
-  /** Asks ClaimDeps.confirm once per account and entry in this session. False without it, and when it fails. */
-  private async confirmed(environment: Environment, account: GitHubAccount): Promise<boolean> {
+  /**
+   * Asks ClaimDeps.confirm once per account and entry in this session (`askAgain`: also after a decline). False without
+   * it, and when it fails.
+   */
+  private async confirmed(environment: Environment, account: GitHubAccount, askAgain: boolean): Promise<boolean> {
     const key = `${account.id}/${environment.id}`;
-    if (!this.deps.confirm || this.declined.has(key)) return false;
+    if (!this.deps.confirm || (this.declined.has(key) && !askAgain)) return false;
     let answer: boolean;
     try {
       answer = await this.deps.confirm(environment, account);
@@ -186,16 +224,27 @@ export class EnvironmentClaims {
     return answer;
   }
 
-  /** Writes `account` as the owner while the entry has none (checked under the registry lock). True if it is the owner. */
+  /**
+   * Writes `account` as the owner while the entry has none and the account has no environment of its repository (canClaim,
+   * checked under the registry lock). True if the account is the owner.
+   */
   private async setOwner(id: string, account: GitHubAccount): Promise<boolean> {
     try {
       let changed = false;
-      const updated = await this.deps.registry.updateEnvironment(id, (entry) => {
-        if (entry.owner !== undefined) return;
-        entry.owner = ownerOf(account);
-        changed = true;
+      const updated = await this.deps.registry.update((file) => {
+        const entry = file.environments.find((candidate) => candidate.id === id);
+        if (entry && canClaim(file.environments, entry, account)) {
+          entry.owner = ownerOf(account);
+          changed = true;
+        }
+        return entry;
       });
-      if (updated?.owner?.id !== account.id) return false;
+      if (updated?.owner?.id !== account.id) {
+        if (updated && updated.owner === undefined) {
+          this.deps.logger.info(`The environment ${id} stays hidden: the signed-in account has an environment of its repository.`);
+        }
+        return false;
+      }
       if (changed) {
         this.deps.logger.info(`The environment of ${updated.repository} now belongs to the GitHub account ${account.login}.`);
       }

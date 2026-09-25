@@ -29,7 +29,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
-import { VsCodeGitHubAuth } from './auth';
+import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
@@ -101,7 +101,11 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     findExecutable: (name) => findExecutable(name, credentialEnv, platform),
     logger,
   });
-  const registryClient = new RegistryClient(nodeHttpsTransport, withGitHubPackagesFallback(credentials.provider(), auth), logger);
+  // The sign-in fix: a 401 of GitHub (here the token service of ghcr.io for the GitHub session) reaches auth.ts, which
+  // ignores tokens that belong to no current session (for example a token of the Docker credentials).
+  const registryClient = new RegistryClient(nodeHttpsTransport, withGitHubPackagesFallback(credentials.provider(), auth), logger, {
+    onCredentialsRejected: ghcrRejectionReporter(auth),
+  });
   const imageChecker = new ImageChecker(registryClient, logger);
   const helper = new WorkspaceHelper({
     docker,
@@ -115,7 +119,10 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   });
   // One stored list per GitHub account (concept 6.2); the shared list of version 1 is removed.
   const discovery = new DiscoveryService(
-    new GitHubApi(nodeHttpsTransport, logger),
+    new GitHubApi(nodeHttpsTransport, logger, {
+      onUnauthorized: (token) => auth.reportRejectedToken(token),
+      onAuthorized: (token) => auth.reportAcceptedToken(token),
+    }),
     (accountId) => paths.repositoriesFile(accountId),
     logger,
   );
@@ -243,6 +250,8 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
       background(controller.onSessionChanged(), 'check the environment of this window after the account change');
       background(sidebar.onSessionChanged(), 'update the sign-in state');
     }),
+    // GitHub rejected the token of the session, or accepted it again: the same account, so only the view changes.
+    auth.onDidChangeSignInState(() => background(sidebar.onSessionChanged({ again: false }), 'update the sign-in state')),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!affectsSettings(event)) return;
       settings = readSettings();

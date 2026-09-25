@@ -9,7 +9,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isoTime, silentLogger, sleep, systemClock, type Clock, type Logger } from '../ports';
-import type { BuildRecord, BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RefusedUpdate, RegistryFile } from '../types';
+import type {
+  BuildRecord,
+  BusyMark,
+  BusyOperation,
+  Environment,
+  GitHubAccount,
+  GitSummary,
+  KeptVolume,
+  RefusedUpdate,
+  RegistryFile,
+} from '../types';
 import { writeJsonAtomic } from './atomicJson';
 import { errorCode, isStorageId, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
 
@@ -47,6 +57,19 @@ const LOCK_RETRY_MS = 20;
 const MAX_TRANSIENT_LOCK_ERRORS = 50;
 const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
 const EPOCH = new Date(0).toISOString();
+
+/**
+ * True if `environment` is the environment of the repository `owner/name` (ignoring case) of the GitHub account
+ * `accountId`; `undefined` stands for the entries of an older version, which have no owner. A repository has at most one
+ * environment per account, and at most one entry without owner (concept D-3).
+ */
+export function isEnvironmentOf(
+  environment: Pick<Environment, 'repository' | 'owner'>,
+  repository: string,
+  accountId: string | undefined,
+): boolean {
+  return environment.repository.toLowerCase() === repository.toLowerCase() && environment.owner?.id === accountId;
+}
 
 /** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
 export class EnvironmentRegistry {
@@ -102,10 +125,17 @@ export class EnvironmentRegistry {
     return (await this.list()).find((environment) => environment.id === id);
   }
 
-  /** Finds the environment of `owner/name`, ignoring case. */
-  async findByRepository(repository: string): Promise<Environment | undefined> {
-    const wanted = repository.toLowerCase();
-    return (await this.list()).find((environment) => environment.repository.toLowerCase() === wanted);
+  /** Finds the environment of `owner/name` (ignoring case) of the GitHub account `accountId` (concept D-3). */
+  async findForAccount(repository: string, accountId: string): Promise<Environment | undefined> {
+    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, accountId));
+  }
+
+  /**
+   * Finds the entry of an older version of `owner/name` (ignoring case): it has no owner, and it stays hidden until an
+   * account claims it (concept 7.5).
+   */
+  async findUnowned(repository: string): Promise<Environment | undefined> {
+    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, undefined));
   }
 
   /** Finds the environment of a container name, with or without the leading `/` of `docker inspect`. */
@@ -128,18 +158,20 @@ export class EnvironmentRegistry {
   }
 
   /**
-   * Adds an environment. Throws if an environment with the same ID, or of the same repository (ignoring case), exists:
-   * one environment per repository (concept D-3). The check runs under the lock, so two windows that start the same
+   * Adds an environment. Throws if an environment with the same ID exists, or one of the same repository (ignoring case)
+   * and the same owner account: one environment per repository and GitHub account (concept D-3); the entries of an older
+   * version count as one owner. The check runs under the lock, so two windows of one account that start the same
    * repository at the same time cannot both add an environment.
    */
   async add(environment: Environment): Promise<void> {
-    const repository = environment.repository.toLowerCase();
+    const accountId = environment.owner?.id;
     await this.update((file) => {
       if (file.environments.some((existing) => existing.id === environment.id)) {
         throw new Error(`The environment ${environment.id} exists already.`);
       }
-      if (file.environments.some((existing) => existing.repository.toLowerCase() === repository)) {
-        throw new Error(`An environment of ${environment.repository} exists already.`);
+      if (file.environments.some((existing) => isEnvironmentOf(existing, environment.repository, accountId))) {
+        const owner = accountId === undefined ? 'without owner' : `of the GitHub account ${accountId}`;
+        throw new Error(`An environment of ${environment.repository} ${owner} exists already.`);
       }
       file.environments.push(environment);
     });
@@ -161,11 +193,46 @@ export class EnvironmentRegistry {
     });
   }
 
-  /** Removes an environment. A missing ID is not an error. */
-  async remove(id: string): Promise<void> {
+  /**
+   * Removes the entry `id`; a missing ID is not an error. `volumes.kept`: additional volumes of the entry that its Delete kept; they are recorded with
+   * the owner of the entry, besides the records of other owners of the same name (each keeps its data there).
+   * `volumes.removed`: volumes that no longer exist; all their records are dropped. One change of the file, so no
+   * volume is ever without its record.
+   */
+  async remove(id: string, volumes: { kept?: readonly string[]; removed?: readonly string[] } = {}): Promise<void> {
     await this.update((file) => {
+      const entry = file.environments.find((environment) => environment.id === id);
       file.environments = file.environments.filter((environment) => environment.id !== id);
+      const removed = new Set(volumes.removed ?? []);
+      const records = (file.keptVolumes ?? []).filter((record) => !removed.has(record.name));
+      const keptAt = isoTime(this.clock);
+      for (const name of entry ? new Set(volumes.kept ?? []) : []) {
+        if (removed.has(name) || records.some((record) => record.name === name && record.owner?.id === entry?.owner?.id)) continue;
+        records.push({ name, ...(entry?.owner ? { owner: entry.owner } : {}), keptAt });
+      }
+      if (records.length > 0) file.keptVolumes = records;
+      else delete file.keptVolumes;
     });
+  }
+
+  /**
+   * Drops the records of the kept volumes `names`, of every owner: the caller found that these volumes no longer exist,
+   * so a volume of that name that is created later holds none of the data that the records protect.
+   */
+  async forgetKeptVolumes(names: readonly string[]): Promise<void> {
+    if (names.length === 0) return;
+    await this.update((file) => {
+      if (!file.keptVolumes) return;
+      const gone = new Set(names);
+      const records = file.keptVolumes.filter((record) => !gone.has(record.name));
+      if (records.length > 0) file.keptVolumes = records;
+      else delete file.keptVolumes;
+    });
+  }
+
+  /** The additional volumes that Deletes kept (see `remove`). */
+  async keptVolumes(): Promise<KeptVolume[]> {
+    return (await this.read()).keptVolumes ?? [];
   }
 
   /**
@@ -195,7 +262,7 @@ export class EnvironmentRegistry {
     const result = await mutator(file);
     file.version = REGISTRY_VERSION;
     if (JSON.stringify(file) !== before) {
-      if (parsed.state === 'invalid' || parsed.dropped > 0) await this.backup(parsed);
+      if (parsed.state === 'invalid' || parsed.dropped > 0 || parsed.droppedRecords > 0) await this.backup(parsed);
       await retryTransient(() => writeJsonAtomic(this.paths.registry, file));
     }
     return result;
@@ -206,7 +273,11 @@ export class EnvironmentRegistry {
     const copy = `${this.paths.registry}.backup-${this.clock.now()}`;
     await retryTransient(() => fs.promises.copyFile(this.paths.registry, copy));
     const reason =
-      parsed.state === 'invalid' ? 'was not valid' : `contained ${parsed.dropped} invalid environment entries`;
+      parsed.state === 'invalid'
+        ? 'was not valid'
+        : parsed.dropped > 0
+          ? `contained ${parsed.dropped} invalid environment entries`
+          : `contained ${parsed.droppedRecords} invalid records of kept volumes`;
     this.logger.warn(`The environment registry ${reason}. A copy was saved as ${copy}.`);
   }
 }
@@ -322,6 +393,8 @@ interface ParsedRegistry {
   version?: number;
   /** Number of entries left out (invalid, or a repeated ID). */
   dropped: number;
+  /** Number of records of kept volumes left out as invalid (a list that is no list counts as one). */
+  droppedRecords: number;
 }
 
 function emptyRegistry(): RegistryFile {
@@ -329,20 +402,20 @@ function emptyRegistry(): RegistryFile {
 }
 
 function parseRegistry(text: string | undefined): ParsedRegistry {
-  if (text === undefined) return { state: 'missing', file: emptyRegistry(), dropped: 0 };
+  if (text === undefined) return { state: 'missing', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   const value = parseJson(text);
-  if (!isRecord(value)) return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+  if (!isRecord(value)) return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
 
   // A file without a version is taken as version 1: only this extension writes the file.
   const version = value.version;
   if (version !== undefined && version !== REGISTRY_VERSION) {
     if (typeof version === 'number' && Number.isFinite(version) && version > REGISTRY_VERSION) {
-      return { state: 'newer', file: emptyRegistry(), version, dropped: 0 };
+      return { state: 'newer', file: emptyRegistry(), version, dropped: 0, droppedRecords: 0 };
     }
-    return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+    return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   }
   if (value.environments !== undefined && !Array.isArray(value.environments)) {
-    return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+    return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   }
 
   const entries: unknown[] = Array.isArray(value.environments) ? value.environments : [];
@@ -354,10 +427,19 @@ function parseRegistry(text: string | undefined): ParsedRegistry {
     ids.add(environment.id);
     environments.push(environment);
   }
+  // Invalid records of kept volumes are left out. That makes the policy looser (the volume of such a record is no longer
+  // refused to other accounts), so the next write keeps a copy of the file first, as for invalid entries.
+  let droppedRecords = 0;
+  if (value.keptVolumes !== undefined) {
+    const kept = Array.isArray(value.keptVolumes) ? value.keptVolumes.filter(isKeptVolume) : [];
+    droppedRecords = Array.isArray(value.keptVolumes) ? value.keptVolumes.length - kept.length : 1;
+    if (kept.length > 0) value.keptVolumes = kept;
+    else delete value.keptVolumes;
+  }
   // The parsed object is kept, so fields that this version does not know survive a read-modify-write.
   value.version = REGISTRY_VERSION;
   value.environments = environments;
-  return { state: 'ok', file: value as unknown as RegistryFile, dropped: entries.length - environments.length };
+  return { state: 'ok', file: value as unknown as RegistryFile, dropped: entries.length - environments.length, droppedRecords };
 }
 
 type Check = (value: unknown) => boolean;
@@ -431,6 +513,11 @@ function isRefusedUpdate(value: unknown): value is RefusedUpdate {
     isStringRecord(value.features) &&
     isString(value.items)
   );
+}
+
+/** A record of a volume that a Delete kept: its name, the time, and the owner account unless it had none. */
+function isKeptVolume(value: unknown): value is KeptVolume {
+  return isRecord(value) && isNonEmptyString(value.name) && isString(value.keptAt) && (value.owner === undefined || isOwner(value.owner));
 }
 
 /** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */

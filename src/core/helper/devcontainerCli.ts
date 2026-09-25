@@ -5,8 +5,8 @@
 // Arguments and results of the Dev Container CLI in the workspace helper (implementation notes 8). Pure functions.
 import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
-import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION, WORKSPACES_ROOT } from '../names';
-import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { CONTAINER_VERSION_LABEL, WORKSPACES_ROOT } from '../names';
+import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
 import { loopbackAppPorts, overrideRunArgs, withoutNameArgs } from './hostAccess';
 
 /**
@@ -162,9 +162,9 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
  * Override configuration for `up` (implementation notes 8, concept 7.6): only image, workspaceMount, workspaceFolder,
  * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
  * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>` and
- * `--name <container name>`), appPort (if set, on 127.0.0.1), containerEnv
- * and remoteEnv (container-only Git, concept section 9), and shutdownAction 'none'. `initializeCommand` is never passed:
- * the host access policy refuses a configuration with one.
+ * `--name <container name>`), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
+ * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'.
+ * `initializeCommand` is never passed: the host access policy refuses a configuration with one.
  */
 export function buildOverrideConfig(p: {
   environmentImage: string;
@@ -178,19 +178,15 @@ export function buildOverrideConfig(p: {
     image: p.environmentImage,
     workspaceMount: `source=${p.volumeName},target=${WORKSPACES_ROOT},type=volume`,
     workspaceFolder: `${WORKSPACES_ROOT}/${p.repositoryName}`,
-    runArgs: [
-      ...overrideRunArgs(p.runArgs),
-      '--label',
-      `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`,
-      '--name',
-      p.containerName,
-    ],
+    runArgs: [...overrideRunArgs(p.runArgs), '--label', CONTAINER_VERSION_LABEL, '--name', p.containerName],
   };
   const appPort = loopbackAppPorts(p.appPort);
   if (appPort !== undefined) override.appPort = appPort;
-  // Merged over the containerEnv and remoteEnv of the image metadata; these values win.
+  // Merged over the containerEnv, remoteEnv, and settings of the image metadata; these values win. The settings only add
+  // to the customizations of the image metadata (its extensions and other settings stay).
   override.containerEnv = containerEnvironment();
   override.remoteEnv = remoteEnvironment();
+  override.customizations = { vscode: { settings: devContainersSettings() } };
   // Assumption (V-4): this value replaces shutdownAction of the image metadata, so the Dev Containers extension never
   // stops the container.
   override.shutdownAction = 'none';

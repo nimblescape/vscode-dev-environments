@@ -99,6 +99,8 @@ export class FakeDocker implements EnvironmentDocker {
   execHandler: (container: string, command: readonly string[], user?: string) => Partial<RunResult> = () => ({});
   /** Volumes that `docker volume rm` refuses to remove. */
   readonly volumesInUse = new Set<string>();
+  /** The names of each `docker volume inspect` (inspectVolumes). */
+  readonly volumeInspections: string[][] = [];
   /** `Config` of `docker image inspect` per image. Default: no labels, no user. */
   readonly imageConfigs = new Map<string, { User?: string; Labels?: Record<string, string> }>();
   /** `docker run` calls: the image and the arguments after it. */
@@ -193,6 +195,11 @@ export class FakeDocker implements EnvironmentDocker {
     return [...this.volumes.entries()]
       .filter(([, labels]) => LABEL_ENVIRONMENT_ID in labels)
       .map(([name, labels]) => ({ name, labels: { ...labels } }));
+  }
+
+  async inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]> {
+    this.volumeInspections.push([...names]);
+    return [...new Set(names)].filter((name) => this.volumes.has(name)).map((name) => ({ name, labels: { ...this.volumes.get(name) } }));
   }
 
   async imageExists(reference: string): Promise<boolean> {
@@ -304,6 +311,8 @@ export class FakeHelper implements EnvironmentHelper {
   lifecycleFailureReport: 'error' | 'result' = 'error';
   gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
   switchError: Maybe<Error>;
+  /** Named volumes that a container created by `up` mounts besides the workspace volume. */
+  containerVolumes: string[] = [];
   prepareGitError: Maybe<Error>;
   /** More entries of the label devcontainer.metadata of a built image (for example of a Feature). */
   buildMetadata: Array<Record<string, unknown>> = [];
@@ -417,7 +426,9 @@ export class FakeHelper implements EnvironmentHelper {
         const [key, ...value] = runArgs[index + 1].split('=');
         labels[key] = value.join('=');
       });
-      containerId = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels }).id;
+      const created = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels });
+      if (this.containerVolumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes: [p.volumeName, ...this.containerVolumes] });
+      containerId = created.id;
     }
     const failure = this.lifecycleFailure(image);
     if (failure !== undefined) {
@@ -562,6 +573,8 @@ export interface Harness {
   /** Process IDs that count as alive (besides PID). */
   alivePids: Set<number>;
   sleeps: number[];
+  /** Tokens that the service reported as rejected by GitHub (GitHubAuth.reportRejectedToken). */
+  rejectedTokens: string[];
   clock: Clock;
   service: EnvironmentService;
   cleanup(): void;
@@ -594,6 +607,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     dockerStarts: 0,
     alivePids: new Set<number>(),
     sleeps: [] as number[],
+    rejectedTokens: [] as string[],
     clock,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   } as Omit<Harness, 'service'> as Harness;
@@ -615,7 +629,11 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     registry: h.registry,
     sessionFiles: h.sessionFiles,
     imageChecker: h.checker,
-    auth: { getToken: async () => h.token, getAccount: async () => (h.token === undefined ? undefined : h.account) },
+    auth: {
+      getToken: async () => h.token,
+      getAccount: async () => (h.token === undefined ? undefined : h.account),
+      reportRejectedToken: (token: string) => void h.rejectedTokens.push(token),
+    },
     ui: h.ui,
     logger: h.logger,
     clock,

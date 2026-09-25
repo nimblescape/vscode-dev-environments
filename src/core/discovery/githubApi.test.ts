@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
 import { abortError, isAbortError, type Logger } from '../ports';
 import {
@@ -109,6 +109,31 @@ describe('GitHubApi.graphql', () => {
     expect((error as GitHubApiError).status).toBe(401);
     expect((error as Error).message).toContain('Bad credentials');
     expect((error as Error).message).not.toContain(TOKEN);
+  });
+
+  it('reports a 401 with its token before it throws, and a 200 as accepted; other answers report nothing (the sign-in fix)', async () => {
+    for (const [status, body, rejected, accepted] of [
+      [401, { message: 'Bad credentials' }, [TOKEN], []],
+      [200, { data: { viewer: { login: 'octo' } } }, [], [TOKEN]],
+      [403, { message: 'Forbidden' }, [], []],
+      [502, 'Bad Gateway', [], []],
+    ] as const) {
+      const onUnauthorized = vi.fn();
+      const onAuthorized = vi.fn();
+      const api = new GitHubApi(respond(body, status), undefined, { onUnauthorized, onAuthorized });
+      await api.graphql('query', {}, TOKEN).catch(() => undefined);
+      expect(onUnauthorized.mock.calls.map((call) => call[0])).toEqual(rejected);
+      expect(onAuthorized.mock.calls.map((call) => call[0])).toEqual(accepted);
+    }
+  });
+
+  it('still throws GitHubApiError when the listener of a 401 throws', async () => {
+    const api = new GitHubApi(respond({ message: 'Bad credentials' }, 401), undefined, {
+      onUnauthorized: () => {
+        throw new Error('listener failed');
+      },
+    });
+    await expect(api.graphql('query', {}, TOKEN)).rejects.toMatchObject({ name: 'GitHubApiError', status: 401 });
   });
 
   it('throws GitHubApiError for an HTML error page', async () => {

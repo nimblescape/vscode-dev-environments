@@ -17,7 +17,7 @@ import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
-import { repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
+import { TreeTexts, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -91,6 +91,7 @@ interface Harness {
   discovery: { loadStored: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; getRepository: ReturnType<typeof vi.fn> };
   auth: {
     getToken: ReturnType<typeof vi.fn>;
+    getSession: ReturnType<typeof vi.fn>;
     getAccount: ReturnType<typeof vi.fn>;
     isSignedIn: ReturnType<typeof vi.fn>;
     updateContextKey: ReturnType<typeof vi.fn>;
@@ -123,6 +124,12 @@ function createHarness(): Harness {
   };
   const auth = {
     getToken: vi.fn(async () => 'gho_token'),
+    // One session: the token and the account that getToken and getAccount give.
+    getSession: vi.fn(async (): Promise<{ token: string; account: GitHubAccount } | undefined> => {
+      const token = (await auth.getToken()) as string | undefined;
+      const account = await auth.getAccount();
+      return token !== undefined && account !== undefined ? { token, account } : undefined;
+    }),
     getAccount: vi.fn(async (): Promise<GitHubAccount | undefined> => OCTO),
     isSignedIn: vi.fn(async () => true),
     updateContextKey: vi.fn(async () => true),
@@ -348,7 +355,7 @@ describe('Sidebar', () => {
     expect(h.service.currentBranch.mock.calls.map((call) => call[0])).toEqual([API]);
   });
 
-  it('offers no Start for a listed repository that has an environment of another account (D-3)', async () => {
+  it('offers Start for a listed repository that has an environment of another account, and names it nowhere (D-3)', async () => {
     await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
     // An entry of an older version is not counted: this account may still claim it.
     await h.registry.add(environment(GONE, 'acme/legacy', { owner: undefined }));
@@ -357,7 +364,10 @@ describe('Sidebar', () => {
     await h.sidebar.render();
     expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/legacy', 'majikmate/module-ts']);
     expect(rowOf('majikmate/module-ts').environment).toBeUndefined();
-    expect(rowOf('majikmate/module-ts').actions.canStart).toBe(false);
+    expect(rowOf('majikmate/module-ts').actions.canStart).toBe(true);
+    expect(rowOf('majikmate/module-ts').description).toBe('');
+    expect(rowOf('majikmate/module-ts').tooltip).toContain(TreeTexts.noEnvironment);
+    expect(JSON.stringify(h.models)).not.toContain(OLD);
     expect(rowOf('acme/legacy').actions.canStart).toBe(true);
     expect(rowOf('acme/api').actions.canStart).toBe(true);
   });
@@ -409,6 +419,15 @@ describe('Sidebar', () => {
     expect(h.discovery.loadStored).toHaveBeenLastCalledWith(OTHER.id);
     expect(rows().map((row) => row.repository).sort()).toEqual(['staussh/public', 'staussh/tools']);
     expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('scalarion');
+  });
+
+  it('refreshes and claims with the token and the account of one session', async () => {
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    // Separate reads would give OCTO's token with OTHER's account after a switch between them.
+    h.auth.getSession.mockResolvedValue({ token: 'gho_other', account: OTHER });
+    await h.sidebar.refreshDiscovery({ again: true });
+    expect(h.discovery.refresh).toHaveBeenLastCalledWith('gho_other', OTHER.id);
   });
 
   it('refreshes with the ID of the account, so the list is stored for that account', async () => {
