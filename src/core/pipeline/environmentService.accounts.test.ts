@@ -319,6 +319,26 @@ describe('entries of an older version at Start (concept 7.5, D-3)', () => {
     expect(confirm).toHaveBeenCalledTimes(1);
   });
 
+  it('reads the token for the claim of a command interactively: a new sign-in while GitHub rejects the token', async () => {
+    const { getRepository } = withClaims(() => true);
+    const interactive: boolean[] = [];
+    recreate({
+      claims: h.service['deps'].claims,
+      auth: {
+        getToken: async (options: { interactive: boolean }) => {
+          interactive.push(options.interactive);
+          return options.interactive ? 'gho_new' : TOKEN;
+        },
+        getAccount: async () => ACCOUNT,
+      },
+    });
+    await seedEnvironment(h, { owner: null });
+    await h.service.listConfigurations(ENV_ID, options());
+    expect(interactive).toContain(true);
+    expect(getRepository).toHaveBeenCalledWith(REPO, 'gho_new', undefined);
+    expect((await h.registry.get(ENV_ID))?.owner).toEqual(ACCOUNT);
+  });
+
   it('creates an environment of the account when GitHub does not return the repository of the entry to it', async () => {
     const { confirm } = withClaims(() => true, async () => undefined);
     await seedEnvironment(h, { owner: null });

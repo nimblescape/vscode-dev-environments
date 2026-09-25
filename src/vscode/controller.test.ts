@@ -1443,6 +1443,25 @@ describe('Connection of this window', () => {
     await settle(() => h.statusBar.showConnected.mock.calls.length > connectedCalls, 'Connected');
   });
 
+  it('hands off the delete of a window of an earlier version (removeAdditionalVolumes) with the volumes that its question listed', async () => {
+    const env = environment({ additionalVolumes: ['api-db'] });
+    await h.registry.add(env);
+    await connectHere(env);
+    await h.disconnectRequests.write({
+      environmentId: ENV_ID,
+      operation: 'delete',
+      requestedAt: iso(NOW - 2000),
+      requestedBy: OTHER_WINDOW_ID,
+      reason: 'manual',
+      removeAdditionalVolumes: true,
+    });
+    h.controller.onHeartbeat();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    expect(await h.sessionFiles.readOperations()).toEqual([
+      expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', additionalVolumesToRemove: ['api-db'] }),
+    ]);
+  });
+
   it('closes its connection for the request of another window, and leaves the operation to its empty window', async () => {
     const env = environment();
     await h.registry.add(env);
@@ -1657,9 +1676,32 @@ describe('Accounts (concept 7.5)', () => {
       await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
       h.quickPicks[0].pick('feature-x');
       await command;
-      expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID] });
+      // Also after an earlier decline: the command asks (like a new Start), so the open does not ask again.
+      expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID], askAgain: true });
       expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
       expect(h.service.open).not.toHaveBeenCalled();
+    });
+
+    it('Switch branch… asks again about an entry that the user declined at an earlier Start', async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      const answers = [false, true];
+      const confirm = vi.fn(async () => answers.shift() ?? false);
+      const claims = new EnvironmentClaims({
+        registry: h.registry,
+        getRepository: async (repository) => repositoryInfo(repository, { isPrivate: false }),
+        confirm,
+        logger: silentLogger,
+      });
+      h.claims.claim.mockImplementation((account: GitHubAccount, token: string, options: object) => claims.claim(account, token, options));
+      // The earlier Start: declined.
+      await claims.claim(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID] });
+      expect(confirm).toHaveBeenCalledTimes(1);
+      const command = run('switchBranch', row('acme/api'));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+      expect(confirm).toHaveBeenCalledTimes(2);
+      expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
     });
 
     it('Select configuration… claims the entry first and rebuilds it with the selected configuration', async () => {
@@ -1702,6 +1744,8 @@ describe('Accounts (concept 7.5)', () => {
     });
     await run('start', row('acme/api', environment({ owner: undefined })));
     expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'interactive', environmentIds: [ENV_ID] });
+    // The claim asks GitHub: a command reads the session interactively (a new sign-in while GitHub rejects the token).
+    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
@@ -2118,6 +2162,9 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     // Before the connection of a restored window, no question: only an unambiguous claim.
     expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', { mode: 'auto', environmentIds: [ENV_ID] });
+    // A restored window never asks for a sign-in.
+    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: false });
+    expect(h.auth.getSession).not.toHaveBeenCalledWith({ interactive: true });
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([ControllerTexts.ownerNotConfirmedConnection('acme/api')]);
   });

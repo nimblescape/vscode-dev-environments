@@ -2019,6 +2019,32 @@ describe('reconcileFromVolumes', () => {
     expect(error.message).toBe(Messages.hostAccess('volume api-node_modules of another environment'));
   });
 
+  it('restores only the named volumes of the containers of each environment: not anonymous ones, not those of other programs or environments', async () => {
+    const name = resourceName('acme/api', OTHER_ID);
+    const anonymous = 'ab'.repeat(32);
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api' });
+    h.docker.volumes.set(anonymous, { 'com.docker.volume.anonymous': '' });
+    h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop' });
+    for (const volumes of [[name, 'api-node_modules', anonymous], [name, 'api-node_modules', 'shop_db']]) {
+      const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+      h.docker.containers.set(container.id, { ...container, volumes });
+    }
+    const other = h.docker.addContainer({ environmentId: 'f0000001-0000-4000-8000-000000000001', name: 'x', state: 'stopped', image: 'x' });
+    h.docker.containers.set(other.id, { ...other, volumes: ['x-cache'] });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
+  });
+
+  it('lets a declined claim of a restored entry with only anonymous volumes create an environment of the account', async () => {
+    const name = resourceName(REPO, OTHER_ID);
+    const anonymous = 'cd'.repeat(32);
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    h.docker.containers.set(container.id, { ...container, volumes: [name, anonymous] });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
+  });
+
   it('restores one environment per repository and owner: two accounts, and one entry of an older version (concept D-3)', async () => {
     const ids = ['a0000001-0000-4000-8000-000000000001', 'a0000002-0000-4000-8000-000000000002', 'a0000003-0000-4000-8000-000000000003'];
     const skippedIds = ['b0000004-0000-4000-8000-000000000004', 'b0000005-0000-4000-8000-000000000005'];

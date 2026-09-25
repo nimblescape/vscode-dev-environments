@@ -1677,7 +1677,8 @@ export class Controller implements vscode.Disposable {
     const account = await this.readAccount();
     const older = account ? await this.deps.registry.findUnowned(target.repository) : undefined;
     if (!account || !older) return target;
-    const claimed = await this.claimIfUnowned(older, account, 'interactive');
+    // The command asks also about an entry that the user declined before (like a new Start), so the open need not ask.
+    const claimed = await this.claimIfUnowned(older, account, 'interactive', true);
     return isAvailableTo(claimed, account) ? { ...target, environment: claimed } : { ...target, olderEnvironmentAsked: true };
   }
 
@@ -1686,11 +1687,18 @@ export class Controller implements vscode.Disposable {
    * mode `auto` only when it can belong to no other account, in the mode `interactive` also after a question to the user.
    * The token and the account come from one session: a session that changed since `account` was read claims nothing.
    */
-  private async claimIfUnowned(environment: Environment, account: GitHubAccount, mode: ClaimMode): Promise<Environment> {
+  private async claimIfUnowned(
+    environment: Environment,
+    account: GitHubAccount,
+    mode: ClaimMode,
+    askAgain = false,
+  ): Promise<Environment> {
     if (environment.owner) return environment;
     let session: { token: string; account: GitHubAccount } | undefined;
     try {
-      session = await this.deps.auth.getSession({ interactive: false });
+      // The claim asks GitHub, so it needs a working token: a command of the user asks for a new sign-in while GitHub
+      // rejects the token of the session (auth.ts); a restored window (`auto`) never asks.
+      session = await this.deps.auth.getSession({ interactive: mode === 'interactive' });
     } catch (error) {
       this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
       return environment;
@@ -1700,7 +1708,7 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The GitHub session changed. The environment ${environment.id} is not claimed.`);
       return environment;
     }
-    await this.deps.claims.claim(session.account, session.token, { mode, environmentIds: [environment.id] });
+    await this.deps.claims.claim(session.account, session.token, { mode, environmentIds: [environment.id], ...(askAgain ? { askAgain } : {}) });
     return (await this.deps.registry.get(environment.id)) ?? environment;
   }
 

@@ -430,6 +430,9 @@ function configurationError(error: unknown): unknown {
   return new UserFacingError('buildFailed', Messages.buildFailed, errorDetail(error));
 }
 
+/** The name that Docker gives an anonymous volume: 64 hexadecimal characters. */
+const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
+
 function repositoryKey(repository: string): string {
   return repository.toLowerCase();
 }
@@ -840,13 +843,17 @@ export class EnvironmentService {
     return updated ?? current;
   }
 
-  /** The signed-in account, without a dialog; refuses an environment of another account (concept 7.5). */
+  /**
+   * The signed-in account (`interactive`: a sign-in may be asked for); refuses an environment of another account (concept
+   * 7.5). The claim of an entry without owner needs a working token, which a command of the user may ask for.
+   */
   private async requireOwnAccount(environment: Environment, interactive: boolean): Promise<void> {
     const account = await this.deps.auth.getAccount({ interactive });
     if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
     if (isAvailableTo(environment, account)) return;
     // The token for a claim must be one of the session of `account` (see requireSession): after a change, no claim.
-    let token = environment.owner === undefined ? await this.deps.auth.getToken({ interactive: false }) : undefined;
+    // The claim asks GitHub: a command of the user gets a working token (a new sign-in while GitHub rejects the token).
+    let token = environment.owner === undefined ? await this.deps.auth.getToken({ interactive }) : undefined;
     if (token !== undefined && (await this.deps.auth.getAccount({ interactive: false }))?.id !== account.id) token = undefined;
     await this.availableEntry(environment, account, { token, interactive });
   }
@@ -2197,13 +2204,22 @@ export class EnvironmentService {
     if (candidates.length === 0) return 0;
     // The additional volumes are not on the workspace volume: the container of the environment, which a lost registry does
     // not remove, still mounts them. Without them, another account's environment could take them over as its own.
+    // Only the volumes that the pipeline records (named volumes of the configuration): not the anonymous volumes of the
+    // container (a VOLUME of the image), nor a volume that another program created (its labels, volumeLabelOwner).
     const containers = await docker.listEnvironmentContainers();
+    const mounted = new Map<string, string[]>();
     for (const candidate of candidates) {
       const volumes = containers
         .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
         .flatMap((container) => container.volumes ?? [])
-        .filter((name) => name !== candidate.volumeName);
-      if (volumes.length > 0) candidate.additionalVolumes = [...new Set(volumes)];
+        .filter((name) => name !== candidate.volumeName && !ANONYMOUS_VOLUME_NAME.test(name));
+      if (volumes.length > 0) mounted.set(candidate.id, [...new Set(volumes)]);
+    }
+    const names = [...new Set([...mounted.values()].flat())];
+    const labels = new Map(names.length > 0 ? (await docker.inspectVolumes(names)).map((volume) => [volume.name, volume.labels]) : []);
+    for (const candidate of candidates) {
+      const volumes = (mounted.get(candidate.id) ?? []).filter((name) => volumeLabelOwner(labels.get(name) ?? {}) === undefined);
+      if (volumes.length > 0) candidate.additionalVolumes = volumes;
     }
     const skipped: string[] = [];
     const added = await this.deps.registry.update((file) => {
