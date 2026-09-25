@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // The open pipeline and the environment operations against the real Docker engine (concept 7.6, 7.7, 7.12, 7.14), on a
 // seeded environment: a workspace volume with a Git repository, created through the workspace helper, and its registry
 // entry. Its configuration builds a tiny Alpine image with Git and a non-root user `dev` with a home folder, so the

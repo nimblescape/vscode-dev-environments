@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Refresh and cleanup of the workspace helper image (implementation notes 7) against the real Docker engine and the real
 // registry, with a tiny helper Dockerfile of this run (so its own tag). The Docker adapter of the helper is limited to
 // the images of the run, so the cleanup under test never sees or removes a helper image of the user.

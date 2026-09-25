@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Sidebar view `devEnvironments.repositories` (concept 6.2). The rows come from the pure model in treeModel.ts.
 import * as vscode from 'vscode';
 import { Actions } from '../core/messages';

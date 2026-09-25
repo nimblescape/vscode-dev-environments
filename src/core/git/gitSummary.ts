@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>`,
 // either in the workspace helper or with `docker exec` in a dev container. Values arrive as positional parameters.
 import type { GitSummary } from '../types';

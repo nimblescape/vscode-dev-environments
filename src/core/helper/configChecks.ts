@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Checks of a devcontainer.json that the extension makes before it uses the configuration: Docker Compose
 // (implementation notes 1), `${localWorkspaceFolder}` (concept RK-10, implementation notes 7), and the additional named
 // volumes of the configuration (concept 7.14). Mounts of the computer are refused by the host access policy

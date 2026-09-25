@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // The work of the Session Monitor process (concept 7.9, implementation notes 12): every TICK_MS it reads the coordination
 // files, applies the rules of rules.ts, stops the containers that no window uses anymore, and ends itself when it has no
 // work. All I/O goes through the dependencies, so that tests can drive single ticks with fakes.

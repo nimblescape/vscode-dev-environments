@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Entry point of the Session Monitor process, bundled to dist/sessionMonitor.js (concept 7.9, implementation notes 12).
 // A window starts it detached with the Node.js runtime of VS Code:
 //   ELECTRON_RUN_AS_NODE=1 <VS Code executable> dist/sessionMonitor.js <global storage folder>

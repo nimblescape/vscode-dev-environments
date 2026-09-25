@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Data of the sidebar (concept 6.2, 7.4): the repository list of the discovery, the environments of the registry, and
 // their states. Docker is asked only on request (view visible, after an operation), never in the background, so that
 // Docker Desktop's Resource Saver can work; the 15-second heartbeat only reads the coordination files.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Decisions at the activation of a window (concept 7.9, 7.10, 7.14). No `vscode` import, so they are unit-tested.
 import type { ExtensionSettings, PendingConnection, PendingOperation, ReopenRecord } from '../core/types';
 import { PENDING_MAX_AGE_MS } from '../monitor/rules';

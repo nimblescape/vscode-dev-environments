@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Parser for JSON with comments and trailing commas, the format of devcontainer.json.
 
 /** Removes comments and trailing commas outside of strings. */

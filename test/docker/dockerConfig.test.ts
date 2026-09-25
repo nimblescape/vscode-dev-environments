@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // The Docker configuration of the test run (implementation notes 2): the tests never use credentials of the user. A
 // configuration without auths, credsStore, and credHelpers is not enough: the Docker CLI and buildx then use the default
 // credential helper of the platform, if it is on PATH. This test puts fake helpers first on PATH that record each call.

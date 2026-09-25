@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Finding the Docker CLI and the process environment for Docker calls (implementation notes 6 "Finding the CLI").
 // The platform is a parameter, so that the Windows rules can be tested on every computer.
 import * as fs from 'fs';

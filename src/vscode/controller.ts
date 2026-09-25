@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Controller (concept 6, 7.9–7.14): the commands of package.json and the flows of the window roles at activation. It
 // connects the UI components (sidebar, status bar, switcher, progress, messages) with the environment service, the
 // Session Coordinator, and the Connection Adapter.

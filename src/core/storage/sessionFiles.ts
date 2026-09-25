@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Coordination files in the global storage folder (concept 7.9, 7.10, 7.14; implementation notes 4): window status files,
 // pending connection files, pending operations, the reopen record, and the settings for the Session Monitor.
 // Every write is atomic. Reads skip files that are missing, unreadable, or invalid.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Credentials for the host `docker pull` of the pipeline (concept 7.7 "Registry requires a sign-in", concept section 12
 // phase 2 "private images on ghcr.io with the GitHub session"). The image check can use the GitHub session for ghcr.io
 // (withGitHubPackagesFallback); the pull must get the same credentials, or a private image passes the check but never

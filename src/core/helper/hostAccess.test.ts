@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 import { describe, expect, it } from 'vitest';
 import { ENVIRONMENT_VOLUME_PATTERN, HELPER_CACHE_VOLUME, newEnvironmentId, resourceName } from '../names';
 import { buildOverrideConfig } from './devcontainerCli';

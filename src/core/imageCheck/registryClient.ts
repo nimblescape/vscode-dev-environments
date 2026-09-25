@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Digest requests to image registries (concept 7.7, implementation notes 9), as defined by the
 // OCI Distribution Specification, with the token authentication of the Docker registry API.
 import * as crypto from 'crypto';

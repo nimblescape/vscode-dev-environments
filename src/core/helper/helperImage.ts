@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Image of the workspace helper (implementation notes 7): built locally from resources/helper/Dockerfile. With a state
 // file, the base image is checked once a week in the background (a changed base image rebuilds the same tag at the next
 // ensure), and helper images that no window uses anymore are removed once a day.

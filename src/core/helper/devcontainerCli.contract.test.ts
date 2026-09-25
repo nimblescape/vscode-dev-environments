@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Contract of the Dev Container CLI (implementation notes 8), checked against the CLI package of the pinned version
 // (devDependency @devcontainers/cli, the version of the helper image): the options that the helper passes, and the text
 // of a failed lifecycle command. A CLI version that renames an option or changes that text fails here, before a release.

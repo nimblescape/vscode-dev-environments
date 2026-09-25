@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Decision logic of the Session Monitor (concept 7.9, implementation notes 12): rule 1 (in use), rule 2 (stop after the
 // waiting time), and the sleep rule. Pure functions without I/O and without a clock of their own, so that every
 // situation can be tested with plain values.

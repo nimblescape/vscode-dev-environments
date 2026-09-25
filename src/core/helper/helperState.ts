@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // State of the workspace helper images (implementation notes 4 and 7): `helper.json` in the global storage folder.
 // Per helper tag, it records the digest of the base image of the last build and when the tag was built, checked, and
 // last used, so that the base image is checked once a week and helper images that no window uses are removed; for tags

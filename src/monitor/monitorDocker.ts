@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Docker access of the Session Monitor process: the Container Adapter with short time limits, and a Docker CLI that is
 // looked up again when it was not found (for example while Docker Desktop updates itself).
 import { ContainerAdapter, type ContainerInfo } from '../core/docker/containerAdapter';

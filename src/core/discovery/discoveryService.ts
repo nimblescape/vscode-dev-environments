@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Discovery Service (concept 7.4): finds the repositories with a Dev Container configuration through the GitHub
 // GraphQL API and stores the result in repositories-<account ID>.json, one file per GitHub account (concept 6.2). Security
 // (concept section 9): the token is only passed on to the GitHubApi; the stored file contains metadata only.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { encodeAuthority } from './connection/authority';
 import { CLOSE_REMOTE_COMMAND, ConnectionAdapter, OPEN_FOLDER_COMMAND, RELOAD_WINDOW_COMMAND } from './connectionAdapter';

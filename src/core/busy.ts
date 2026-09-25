@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Liveness of busy marks (concept 7.9 rule 1: "The registry marks the environment as busy"). One rule for the windows
 // (sidebar, environment service) and the Session Monitor, so that they never disagree about a mark.
 import type { BusyMark, WindowStatus } from './types';

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Environment Registry (concept 7.5): registry.json in the global storage folder.
 // Several VS Code windows and the Session Monitor process change it. Every read-modify-write runs under the lock folder
 // registry.lock, and every write is atomic (temporary file, then rename), so a read without the lock sees either the old

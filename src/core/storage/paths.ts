@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Layout of the global storage folder (implementation notes 4), and small file system helpers for the storage modules.
 import * as fs from 'fs';
 import * as path from 'path';

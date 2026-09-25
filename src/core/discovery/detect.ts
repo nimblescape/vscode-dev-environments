@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Detection of Dev Container configurations in a GraphQL query result (concept 7.4). The rules follow the file
 // locations of the Dev Container specification, in its order of precedence.
 

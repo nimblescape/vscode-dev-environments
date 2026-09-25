@@ -81,3 +81,5 @@ npm test              # unit tests, without VS Code and without Docker
 npm run test:docker   # integration tests against the running Docker engine
 npm run package       # creates the .vsix file
 ```
+
+© 2026 Hannes Stauss (scalarion@nimblescape.com) · [MIT License](https://github.com/nimblescape/vscode-dev-environments/blob/main/LICENSE).

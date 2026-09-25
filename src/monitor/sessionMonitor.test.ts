@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Runs the real bundle (as dist/sessionMonitor.js is built) in a child process. No Docker is needed: without
 // environments in the registry the monitor never calls Docker.
 import { spawn, type ChildProcess } from 'child_process';

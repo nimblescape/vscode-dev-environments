@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Error presentation (concept 6.5): a message names the situation and offers at most one action besides Show details.
 // The complete error goes to the log (NFR-02).
 import * as vscode from 'vscode';

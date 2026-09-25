@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Log file of the Session Monitor process (monitor.log). The process has no output channel and no console (it runs
 // detached with stdio 'ignore'), so this file is the only trace of its decisions. Writes are synchronous: they are short,
 // keep their order, and are not lost when the process ends.

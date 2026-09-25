@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 import { spawn } from 'child_process';
 import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Version of the Dev Container CLI in the workspace helper (implementation notes 2 and 7). package.json lists
 // `@devcontainers/cli` as an exact devDependency only to pin this version: esbuild.mjs and vitest.config.ts pass it to
 // the code as __DEVCONTAINER_CLI_VERSION__ (src/types/globals.d.ts). The package is neither bundled nor shipped.

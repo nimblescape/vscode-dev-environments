@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Disconnect requests (concept 6.2 Stop, 7.14 Rebuild step 3 and Delete step 2, 7.15): a window that stops, rebuilds, or
 // deletes an environment that another window is connected to asks that window to close its connection first. The
 // connected window then hands off as for its own request (busy mark, pending operation, Close Remote Connection), so that

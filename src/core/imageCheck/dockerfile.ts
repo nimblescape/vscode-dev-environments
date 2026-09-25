@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Base images of a Dockerfile (concept 7.7, implementation notes 9).
 // Follows the Dockerfile parser of BuildKit where it matters for FROM: parser directives, line continuations,
 // comments, heredocs, global ARGs, and variable substitution.

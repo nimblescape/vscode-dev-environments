@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
 # Workspace helper of the Dev Environments extension (implementation notes 7).
 # The extension builds this image locally and tags it devenv-helper:<hash of this file and the CLI version>.
 # It must build with BuildKit and with the classic builder: no syntax directive, no heredocs, no RUN --mount.

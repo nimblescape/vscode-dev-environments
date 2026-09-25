@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Pure decisions and helpers of the open pipeline (concept 7.6, 7.7, 7.12). No I/O.
 import * as crypto from 'crypto';
 import { CommandError, errorMessage } from '../errors';

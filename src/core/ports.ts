@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Interfaces through which code in src/core receives what it needs. Code in src/core never imports `vscode`.
 import type { ProgressStep } from './messages';
 import type { GitHubAccount } from './types';

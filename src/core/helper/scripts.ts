@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Scripts that run in the workspace helper (implementation notes 7). The helper image is Debian, so /bin/sh is dash:
 // the shell scripts are POSIX sh. A shell script runs as `sh -c <script> sh <args…>`, a Node.js script as
 // `node -e <script> <args…>`. Values always arrive as positional parameters and are never part of the script text,

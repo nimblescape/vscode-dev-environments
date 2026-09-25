@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // In-memory fakes for the tests of the environment service: Docker, workspace helper, image check, and user interface.
 // The registry and the session files are the real ones, in a temporary folder. Only test files import this module.
 import * as fs from 'fs';

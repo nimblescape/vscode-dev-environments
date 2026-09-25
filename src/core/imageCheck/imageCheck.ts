@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Image update check (concept 7.7, implementation notes 9): the references of a configuration,
 // their current digests, and the comparison with the build record.
 import { errorMessage } from '../errors';

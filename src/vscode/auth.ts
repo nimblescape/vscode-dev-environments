@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // GitHub access through the built-in GitHub sign-in of VS Code (concept section 9, NFR-03). VS Code stores the session;
 // the extension never stores the token on the computer and never logs it. It writes the token of an environment's owner
 // account into that environment only (the open pipeline, concept section 9 "Git inside the container").

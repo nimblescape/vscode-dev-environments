@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Container-only Git (concept section 9 "Git inside the container"): Git, Docker, and GPG in a dev container use only
 // the configuration in the workspace volume (CONFIG_FOLDER) and the token of the owner account, never the configuration,
 // the credential helpers, or the agents that the Dev Containers extension forwards from the computer. The global Dev

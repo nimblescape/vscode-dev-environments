@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Switcher (concept 6.4): Quick Pick with the recent environments and the entry "Open repository…".
 import * as vscode from 'vscode';
 import type { Environment, RepositoryInfo } from '../core/types';

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Status bar item (concept 6.3): one item on the left side.
 import * as vscode from 'vscode';
 import { Actions } from '../core/messages';

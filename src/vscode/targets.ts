@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Targets of the commands and the choices of their Quick Picks (concept 6.2, 6.4). No `vscode` import, so the rules are
 // unit-tested.
 import { filterRepositories, isTrustedOwner } from '../core/discovery/discoveryService';

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // All user-visible texts. Where the concept gives a text (section 6.5), the text here is exactly that text.
 
 export const Steps = {

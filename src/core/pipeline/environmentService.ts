@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Environment service (concept 7.5, 7.6, 7.7, 7.12, 7.14): the open pipeline and the operations on environments.
 // It works without VS Code and never connects a window; the VS Code layer connects the window with the result of
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the

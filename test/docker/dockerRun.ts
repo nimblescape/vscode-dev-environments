@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Docker objects of the integration tests (npm run test:docker): the Docker CLI with a configuration of its own, snapshots
 // of the containers, volumes, and images of the engine, and the removal of what a test run created. Every object that a
 // test creates carries the label devenv.test-run=<run ID>, or uses a volume that carries it, so the cleanup never touches

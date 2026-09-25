@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Shared parts of the Docker test files: the run of the global setup, a log file per test file, the timings, and fakes
 // for the user interface, the GitHub session, and the network. Everything else is the real core modules.
 import * as fs from 'fs';

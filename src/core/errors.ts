@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Errors with a plain-language message for the user (NFR-02). Technical details go to the log.
 
 export type UserErrorCode =

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Host access policy (concept section 9 "Host access"): a dev container may use the network, and nothing else of the
 // computer. Its published ports reach the computer only on localhost (not with `--network host`, where the ports of the
 // container are ports of the computer on the addresses that it listens on). The open pipeline checks the configuration

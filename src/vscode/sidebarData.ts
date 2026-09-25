@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Parts of the sidebar input (TreeInput) that come from Docker and from the coordination files. No `vscode` import.
 import { isBusyMarkLive, type BusyMarkLivenessInput } from '../core/busy';
 import type { Environment, WindowStatus } from '../core/types';

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Logger on the output channel "Dev Environments" (NFR-02: technical logs only on request, implementation notes 13).
 import * as vscode from 'vscode';
 import { CommandError, isUserFacingError } from '../core/errors';

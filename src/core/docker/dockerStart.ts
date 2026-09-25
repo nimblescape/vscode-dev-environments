@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Docker start (concept 7.6 "Docker start", implementation notes 6, FR-14).
 import { spawn } from 'child_process';
 import * as fs from 'fs';

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // GitHub GraphQL API over an HttpTransport (concept 7.4). The token is used only for the Authorization header:
 // it never appears in a log line or in an error message (concept section 9).
 import type { HttpResponse, HttpTransport } from '../http';

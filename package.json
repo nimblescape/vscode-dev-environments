@@ -4,8 +4,19 @@
   "description": "Open your GitHub repositories in local dev containers with one action.",
   "version": "0.1.0",
   "publisher": "nimblescape",
-  "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "author": {
+    "name": "nimblescape e.U.",
+    "url": "https://nimblescape.com"
+  },
+  "homepage": "https://nimblescape.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nimblescape/vscode-dev-environments.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nimblescape/vscode-dev-environments/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -300,7 +311,7 @@
     "test": "vitest run",
     "test:docker": "vitest run --config vitest.docker.config.ts",
     "vscode:prepublish": "node esbuild.mjs --production",
-    "package": "vsce package --no-dependencies --skip-license --allow-missing-repository"
+    "package": "vsce package --no-dependencies --no-rewrite-relative-links"
   },
   "devDependencies": {
     "@devcontainers/cli": "0.89.0",

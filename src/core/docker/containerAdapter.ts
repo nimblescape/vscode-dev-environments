@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Container Adapter (concept 7.2): Docker CLI calls on the computer.
 // Output is read as JSON (`--format '{{json …}}'` and `docker … inspect`), never as a table. Labels are read with
 // `docker inspect`, because `docker ps`/`docker volume ls` join them into one string `a=b,c=d` that is ambiguous

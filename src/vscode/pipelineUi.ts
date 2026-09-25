@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Decisions and messages of the open pipeline (PipelineUi) in VS Code (concept 6.5, 7.12, section 9).
 import * as vscode from 'vscode';
 import { Actions, Messages } from '../core/messages';

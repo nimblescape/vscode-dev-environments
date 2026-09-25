@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Workspace helper (implementation notes 7, concept 7.6): a short-lived container with Git and the Dev Container CLI.
 // It mounts the workspace volume at /workspaces. The runs of the Dev Container CLI also get the Docker socket, so the
 // CLI builds and starts dev containers with the Docker engine of the computer. Git and the scripts that read files run

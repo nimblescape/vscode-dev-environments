@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Pure model of the sidebar (concept 6.2): one list of repositories, grouped by owner. This module never imports
 // `vscode`, so the rules for rows, states, actions, and sorting are unit-tested; treeView.ts only maps the model to
 // tree items.

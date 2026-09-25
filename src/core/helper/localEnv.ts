@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // `${localEnv:NAME}` variables of devcontainer.json (implementation notes 7). The Dev Container CLI runs in the workspace
 // helper, and the extension does not pass the values of this computer to it (concept section 9 "Host access"): the CLI
 // resolves the variables in the helper. A variable that the helper sets itself (HELPER_ENV_NAMES, for example HOME=/root)

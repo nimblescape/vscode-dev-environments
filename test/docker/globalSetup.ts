@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Global setup of the Docker integration tests (npm run test:docker). It checks that Docker runs, prepares a Docker
 // configuration without the credentials of the user, and records the containers, volumes, and images of the engine.
 // The teardown removes what the run left behind, and fails when the run left a new object (except the workspace helper

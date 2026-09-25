@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Shared data types. Stored files (registry.json, repositories-<account ID>.json, session files) use these shapes.
 // All times are ISO 8601 strings in UTC, unless a field says otherwise.
 

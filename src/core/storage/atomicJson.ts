@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // JSON files in the global storage folder (implementation notes 4).
 // Every write is atomic: a temporary file in the same folder, then a rename.
 import * as crypto from 'crypto';

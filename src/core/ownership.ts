@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Environments belong to the GitHub account that created them (concept 7.5, section 9 "Accounts"). An account never
 // sees, starts, or connects to an environment of another account. Entries of an older version have no owner: an account
 // takes one over only when it can belong to nobody else, or when the user confirms it.

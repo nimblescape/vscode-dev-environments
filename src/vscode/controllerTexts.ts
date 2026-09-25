@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // User-visible texts of the controller that messages.ts lacks (plain language, NFR-02); to be moved there.
 // No `vscode` import.
 

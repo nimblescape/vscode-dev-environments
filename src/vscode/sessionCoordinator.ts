@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Session Coordinator (concept 7.2, 7.9, 7.10): the window side of the stop-on-close mechanism. It writes the window
 // status file at activation and every 15 seconds, removes the pending connection file of the connected environment,
 // writes monitor.json, starts the Session Monitor process when none runs, and writes `closing` plus the reopen record in

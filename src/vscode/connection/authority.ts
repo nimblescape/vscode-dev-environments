@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // The folder URI format of the Dev Containers extension for attached containers (concept 7.8, implementation notes 11).
 // This module is the only place that knows the format (NFR-06, RK-1). It does not import `vscode`, so it is unit-tested.
 //

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Image and Feature references (concept 7.7, implementation notes 9).
 // The grammar follows the Docker reference format (github.com/distribution/reference).
 

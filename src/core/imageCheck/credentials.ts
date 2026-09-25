@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Registry credentials that Docker uses (concept 7.7 "Registry requires a sign-in", concept section 9,
 // implementation notes 9): `~/.docker/config.json` with `auths`, `credsStore`, and `credHelpers`.
 // Credentials are read only for the registry of an image, and never stored.

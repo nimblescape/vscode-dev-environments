@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Extension entry (esbuild entry of dist/extension.js): the composition root. activate() builds the components, registers
 // the commands and listeners, and runs the tasks of the window role (concept 7.9, 7.10, 7.14). Only the open pipeline
 // of a restored window (role A) is awaited; everything else runs in the background.

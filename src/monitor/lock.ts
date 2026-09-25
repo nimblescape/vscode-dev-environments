@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
 // Single instance of the Session Monitor (concept 7.9): monitor.lock holds the process ID of the running monitor as
 // decimal text. The running monitor refreshes the modification time of the file in every tick.
 import * as crypto from 'crypto';
