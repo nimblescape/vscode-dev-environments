@@ -907,8 +907,13 @@ describe('open pipeline on a seeded environment', () => {
       for (const { id, name } of entries) {
         await registry.remove(id);
         cli.run(['rm', '-f', name]);
-        for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
         cli.run(['volume', 'rm', name]);
+      }
+      // By reference, not by ID: the two builds are identical, so both tags can name one image ID.
+      for (const { id } of entries) {
+        for (const reference of cli.lines(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', environmentImageRepository(id)])) {
+          cli.run(['image', 'rm', reference]);
+        }
       }
     }
   });
