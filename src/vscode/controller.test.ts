@@ -1569,6 +1569,38 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
   });
 
+  it.each<[string, boolean]>([
+    ['a repository row', false],
+    ['a row that names the environment', true],
+  ])('Try again after an account change: %s', async (_name, named) => {
+    await h.registry.add(environment());
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    // The user signs in with another account while the error shows, then presses Try again.
+    fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      return Actions.tryAgain;
+    });
+    const own = environment({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devenv-acme-api-c1d2e3f4', owner: OTHER_ACCOUNT });
+    h.service.open.mockImplementation(async () => {
+      await h.registry.add(own);
+      return openResult(own);
+    });
+    await run('start', named ? row('acme/api', environment()) : row('acme/api'));
+    if (named) {
+      // An environment that the command named stays that environment (the service refuses it: another account).
+      await settle(() => h.service.openEnvironment.mock.calls.length === 2, 'the second open');
+      expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID]);
+      expect(h.service.open).not.toHaveBeenCalled();
+    } else {
+      // A repository gets the environment of the account that is signed in now: its first open (D-3).
+      await settle(() => h.connection.open.mock.calls.length === 1, 'the connection of the other account');
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
+      expect(warningMessages()).toEqual([]);
+      expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('asks for a sign-in for an environment when nobody is signed in', async () => {
     await h.registry.add(environment());
     h.auth.getAccount.mockResolvedValue(undefined);

@@ -136,6 +136,12 @@ interface Target {
    * bar item, the switcher), or else the environment of the repository of the signed-in account (concept 7.5, D-3).
    */
   environment?: Environment;
+  /**
+   * The command names `environment` (a row, the status bar item, the switcher, a restored window). Otherwise the
+   * environment belongs to the repository for the account that was signed in, and Try again looks it up again for the
+   * account that is signed in then (D-3).
+   */
+  named?: boolean;
 }
 
 interface StartOptions {
@@ -1715,7 +1721,7 @@ export class Controller implements vscode.Disposable {
         // The environment of the row while it exists; otherwise (a row without environment, or one deleted meanwhile)
         // the environment of the repository of the signed-in account.
         const named = argument.environmentId !== undefined ? await registry.get(argument.environmentId) : undefined;
-        if (named) return { repository: argument.repository, info, environment: named };
+        if (named) return { repository: argument.repository, info, environment: named, named: true };
         const target = await this.repositoryTargetFor(argument.repository, signIn);
         return { ...target, info: target.info ?? info };
       }
@@ -1748,7 +1754,7 @@ export class Controller implements vscode.Disposable {
   }
 
   private environmentTarget(environment: Environment): Target {
-    return { repository: environment.repository, info: this.deps.sidebar.repositoryInfo(environment.repository), environment };
+    return { repository: environment.repository, info: this.deps.sidebar.repositoryInfo(environment.repository), environment, named: true };
   }
 
   /**
@@ -1766,11 +1772,12 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The target with the current registry entry (for Try again, and after a change of the environment): its environment
-   * while it exists, otherwise the environment of the repository of the signed-in account, if any.
+   * The target with the current registry entry (for Try again, and after a change of the environment): a named
+   * environment while it exists, otherwise the environment of the repository of the account that is signed in now, if
+   * any. A repository never carries the environment of the account that was signed in before (D-3).
    */
   private async refreshedTarget(target: Target): Promise<Target> {
-    const current = target.environment ? await this.deps.registry.get(target.environment.id) : undefined;
+    const current = target.named && target.environment ? await this.deps.registry.get(target.environment.id) : undefined;
     const fresh = current
       ? this.environmentTarget(current)
       : await this.repositoryTargetFor(target.environment?.repository ?? target.repository, false);
