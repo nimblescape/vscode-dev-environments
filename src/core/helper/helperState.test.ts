@@ -42,6 +42,20 @@ describe('parseHelperState', () => {
     expect(parseHelperState(state)).toEqual(state);
   });
 
+  it('keeps the marks of a build without --pull, of a check, and of the cleanup', () => {
+    const state = {
+      version: 1,
+      images: {
+        [TAG]: { builtAt: TIME, builtWithoutPull: TIME, attemptedAt: TIME, latestBaseDigest: 'sha256:def', lastUsedAt: TIME },
+        'devenv-helper:0123456789ac': { foreignSince: TIME, lastUsedAt: TIME },
+        'devenv-helper:0123456789ad': { removedAt: TIME },
+      },
+    };
+    expect(parseHelperState(state)).toEqual(state);
+    const invalid = { version: 1, images: { [TAG]: { builtWithoutPull: 'true', attemptedAt: 'x', foreignSince: 1, removedAt: 'soon' } } };
+    expect(parseHelperState(invalid)).toEqual({ version: 1, images: { [TAG]: {} } });
+  });
+
   it('gives an empty state for another version or a value that is not an object', () => {
     for (const value of [undefined, null, 'x', [], { version: 2, images: { [TAG]: {} } }, { images: { [TAG]: {} } }]) {
       expect(parseHelperState(value)).toEqual(emptyHelperState());

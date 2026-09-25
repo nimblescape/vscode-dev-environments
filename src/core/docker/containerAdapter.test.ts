@@ -585,20 +585,34 @@ describe('images', () => {
       { ID: '', Repository: 'x', Tag: '1' },
       { Repository: 'x', Tag: '1' },
     ];
-    const { docker, runner } = adapter(() => ok(`${lines.map((line) => JSON.stringify(line)).join('\n')}\nWARNING: not JSON\n`));
+    const all = `${lines.map((line) => JSON.stringify(line)).join('\n')}\nWARNING: not JSON\n`;
+    // The classic image store lists a dangling image in both listings.
+    const { docker, runner } = adapter((call) => ok(call.args.includes('dangling=true') ? `${JSON.stringify(lines[3])}\n` : all));
     expect(await docker.listImagesByLabel('devenv.helper=true')).toEqual([
       { id: id1, tags: ['devenv-helper:76fa66d93464', 'mine:backup'], createdAt: '2026-09-25 02:31:55 +0200 CEST' },
       { id: id2, tags: [], createdAt: '2026-09-24 22:37:12 +0200 CEST' },
       { id: id3, tags: [], createdAt: '' },
     ]);
-    expect(runner.calls[0].args).toEqual([
-      'image',
-      'ls',
-      '--filter',
-      'label=devenv.helper=true',
-      '--no-trunc',
-      '--format',
-      '{{json .}}',
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['image', 'ls', '--filter', 'label=devenv.helper=true', '--no-trunc', '--format', '{{json .}}'],
+      ['image', 'ls', '--filter', 'label=devenv.helper=true', '--filter', 'dangling=true', '--no-trunc', '--format', '{{json .}}'],
+    ]);
+  });
+
+  it('listImagesByLabel includes dangling images that only the dangling filter lists (containerd image store)', async () => {
+    const tagged = `sha256:${'4'.repeat(64)}`;
+    const dangling = `sha256:${'5'.repeat(64)}`;
+    // Docker Desktop with the containerd image store: `docker image ls` without `-a` hides untagged images.
+    const { docker } = adapter((call) =>
+      ok(
+        call.args.includes('dangling=true')
+          ? `${JSON.stringify({ ID: dangling, Repository: '<none>', Tag: '<none>', CreatedAt: 'b' })}\n`
+          : `${JSON.stringify({ ID: tagged, Repository: 'devenv-helper', Tag: '0123456789ab', CreatedAt: 'a' })}\n`,
+      ),
+    );
+    expect(await docker.listImagesByLabel('devenv.helper=true')).toEqual([
+      { id: tagged, tags: ['devenv-helper:0123456789ab'], createdAt: 'a' },
+      { id: dangling, tags: [], createdAt: 'b' },
     ]);
   });
 

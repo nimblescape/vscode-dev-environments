@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
@@ -52,6 +52,8 @@ class FakeDocker implements HelperDocker {
 
   /** Calls of imageId: each one is a run of ensureHelperImage with a state file. */
   imageIdCalls = 0;
+  /** Calls of listImagesByLabel: the cleanup, or the removal of the previous image after a rebuild. */
+  listCalls = 0;
   readonly removals: string[] = [];
 
   async imageExists(reference: string): Promise<boolean> {
@@ -70,6 +72,7 @@ class FakeDocker implements HelperDocker {
   }
 
   async listImagesByLabel(): Promise<ImageInfo[]> {
+    this.listCalls++;
     return [...this.images].map((tag) => ({ id: `id:${tag}`, tags: [tag], createdAt: '' }));
   }
 
@@ -387,6 +390,7 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
   function setup(answer: () => Promise<string | 'unreachable' | undefined> = async () => DIGEST) {
     let now = START;
     const lookups: string[] = [];
+    const checks: Array<Promise<void>> = [];
     const baseDigest: BaseDigestLookup = (reference) => {
       lookups.push(reference);
       return answer();
@@ -401,6 +405,7 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
       clock: { now: () => now },
       statePath,
       baseDigest,
+      onBaseImageCheck: (check) => checks.push(check),
     };
     return {
       helper: new WorkspaceHelper(deps),
@@ -408,8 +413,10 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
       advance: (ms: number) => {
         now += ms;
       },
-      iso: () => new Date(now).toISOString(),
+      iso: (offsetMs = 0) => new Date(now + offsetMs).toISOString(),
       state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
+      /** Waits for the checks of the base image that ensureImage started in the background. */
+      settled: () => Promise.all(checks.splice(0)),
     };
   }
 
@@ -430,8 +437,9 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
 
   it('uses the existing image when the registry cannot be reached', async () => {
     docker.images.add(TAG);
-    const { helper, lookups, state } = setup(async () => 'unreachable');
+    const { helper, lookups, state, settled } = setup(async () => 'unreachable');
     expect(await helper.ensureImage()).toBe(TAG);
+    await settled();
     expect(lookups).toHaveLength(1);
     expect(docker.builds).toHaveLength(0);
     expect(state().images[TAG].checkedAt).toBeUndefined();
@@ -440,7 +448,7 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
   });
 
   it('reuses the image for an hour; after that, ensureImage checks again, and the helper runs only record the use', async () => {
-    const { helper, lookups, advance, iso, state } = setup();
+    const { helper, lookups, advance, iso, state, settled } = setup();
     await helper.ensureImage();
     const calls = docker.imageIdCalls;
     expect(calls).toBeGreaterThan(0);
@@ -458,12 +466,102 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
 
     // The open pipeline (ensureImage) runs ensureHelperImage again: the weekly check is due.
     await helper.ensureImage();
+    await settled();
     expect(docker.imageIdCalls).toBe(calls + 1);
     expect(lookups).toHaveLength(2);
     expect(state().images[TAG].checkedAt).toBe(iso());
     await helper.ensureImage();
     expect(docker.imageIdCalls).toBe(calls + 1);
     expect(docker.builds).toHaveLength(1);
+  });
+});
+
+describe('WorkspaceHelper helper runs in a new window (implementation notes 7)', () => {
+  const START = Date.parse('2026-09-24T12:00:00Z');
+  const DIGEST_A = `sha256:${'a'.repeat(64)}`;
+  const DIGEST_B = `sha256:${'b'.repeat(64)}`;
+
+  function newWindow() {
+    let now = START;
+    const lookups: string[] = [];
+    const checks: Array<Promise<void>> = [];
+    const statePath = path.join(dir, 'storage', 'helper.json');
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'darwin',
+      clock: { now: () => now },
+      statePath,
+      baseDigest: async (reference) => {
+        lookups.push(reference);
+        return DIGEST_B;
+      },
+      onBaseImageCheck: (check) => checks.push(check),
+    });
+    const iso = (offsetMs = 0) => new Date(now + offsetMs).toISOString();
+    return {
+      helper,
+      lookups,
+      iso,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
+      settled: () => Promise.all(checks.splice(0)),
+      /** The helper exists, its weekly check and the cleanup are 8 days overdue, and its base image changed. */
+      overdue: () => {
+        docker.images.add(TAG);
+        fs.mkdirSync(path.dirname(statePath), { recursive: true });
+        const old = iso(-8 * 24 * 60 * 60 * 1000);
+        const record = { baseImage: 'node:22-bookworm-slim', baseDigest: DIGEST_A, builtAt: old, checkedAt: old, lastUsedAt: old };
+        fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old }));
+      },
+    };
+  }
+
+  it('never checks, rebuilds, or cleans up in the first helper run (a stop, a delete, a branch switch)', async () => {
+    const w = newWindow();
+    w.overdue();
+    const result = await w.helper.run('vol', ['true'], { docker: false, network: false });
+    expect(result.exitCode).toBe(0);
+    await w.settled();
+    expect(docker.runs).toHaveLength(1);
+    expect(w.lookups).toEqual([]);
+    expect(docker.builds).toEqual([]);
+    expect(docker.listCalls).toBe(0);
+    expect(docker.removals).toEqual([]);
+    expect(w.state().images[TAG].lastUsedAt).toBe(w.iso());
+    expect(w.state().images[TAG].checkedAt).toBe(w.iso(-8 * 24 * 60 * 60 * 1000));
+
+    // The open pipeline (ensureImage) in the same window does the maintenance: the check (in the background) and the
+    // cleanup. The rebuild that the check asks for comes with the next ensureImage.
+    await w.helper.ensureImage();
+    await w.settled();
+    expect(w.lookups).toHaveLength(1);
+    expect(docker.listCalls).toBe(1);
+    expect(w.state().images[TAG].latestBaseDigest).toBe(DIGEST_B);
+    w.advance(HELPER_IMAGE_RECHECK_MS);
+    await w.helper.ensureImage();
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ pull: true, noCache: true });
+  });
+
+  it('builds a missing tag once in the first helper run, and the open pipeline then maintains without a second build', async () => {
+    const w = newWindow();
+    let release: () => void = () => undefined;
+    docker.buildHandler = () => new Promise<void>((resolve) => (release = resolve));
+    const run = w.helper.run('vol', ['true'], { docker: false, network: false });
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const ensured = w.helper.ensureImage();
+    release();
+    expect((await run).exitCode).toBe(0);
+    expect(await ensured).toBe(TAG);
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ pull: true });
+    // ensureImage ran ensureHelperImage again, with the maintenance: the cleanup is due in a new state file.
+    expect(docker.listCalls).toBe(1);
   });
 });
 

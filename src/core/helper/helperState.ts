@@ -1,6 +1,7 @@
 // State of the workspace helper images (implementation notes 4 and 7): `helper.json` in the global storage folder.
 // Per helper tag, it records the digest of the base image of the last build and when the tag was built, checked, and
-// last used, so that the base image is checked once a week and helper images that no window uses are removed.
+// last used, so that the base image is checked once a week and helper images that no window uses are removed; for tags
+// of other installations and removed tags, the marks of the cleanup.
 // The state is advisory: two windows may read and write it at the same time. Each write is atomic, and each update
 // reads the file again right before it writes, so a lost update costs at most a second check or a second build.
 import { writeJsonAtomic } from '../storage/atomicJson';
@@ -13,9 +14,25 @@ export interface HelperImageRecord {
   /** Registry digest of `baseImage`, read right before the last build (or at the first check of an older image). */
   baseDigest?: string;
   builtAt?: string;
+  /**
+   * The last build ran without `--pull` (the registry did not answer, or the build with `--pull` failed), so it may have
+   * used an old local base image: the next check that gets a digest makes the next ensure build the tag again.
+   */
+  builtWithoutPull?: string;
   /** Last check of the base image digest that got an answer from the registry. */
   checkedAt?: string;
+  /** Last check of the base image digest that got no answer (it is tried again after a day). */
+  attemptedAt?: string;
+  /** Registry digest of `baseImage` found by a check that asks for a rebuild: the next ensure builds the tag again. */
+  latestBaseDigest?: string;
   lastUsedAt?: string;
+  /**
+   * The cleanup first saw this tag, and it never was the tag of this installation: a helper of another extension version,
+   * possibly of another installation of VS Code (for example Insiders, with its own helper.json).
+   */
+  foreignSince?: string;
+  /** The cleanup removed the tag (a tombstone): if the tag comes back, another installation uses it, and it stays. */
+  removedAt?: string;
 }
 
 export interface HelperState {
@@ -36,8 +53,27 @@ export function isHelperImageTag(tag: string): boolean {
   return HELPER_TAG.test(tag);
 }
 
-const RECORD_FIELDS = ['baseImage', 'baseDigest', 'builtAt', 'checkedAt', 'lastUsedAt'] as const;
-const TIME_FIELDS: ReadonlySet<string> = new Set(['builtAt', 'checkedAt', 'lastUsedAt']);
+const RECORD_FIELDS = [
+  'baseImage',
+  'baseDigest',
+  'builtAt',
+  'builtWithoutPull',
+  'checkedAt',
+  'attemptedAt',
+  'latestBaseDigest',
+  'lastUsedAt',
+  'foreignSince',
+  'removedAt',
+] as const;
+const TIME_FIELDS: ReadonlySet<string> = new Set([
+  'builtAt',
+  'builtWithoutPull',
+  'checkedAt',
+  'attemptedAt',
+  'lastUsedAt',
+  'foreignSince',
+  'removedAt',
+]);
 
 export function emptyHelperState(): HelperState {
   return { version: 1, images: {} };

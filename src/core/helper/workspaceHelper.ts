@@ -26,7 +26,13 @@ import {
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
-import { HELPER_LAST_USED_INTERVAL_MS, ensureHelperImage, recordHelperImageUse, type BaseDigestLookup } from './helperImage';
+import {
+  HELPER_LAST_USED_INTERVAL_MS,
+  ensureHelperImage,
+  recordHelperImageUse,
+  type BaseDigestLookup,
+  type HelperBuildKind,
+} from './helperImage';
 import {
   OVERRIDE_CONFIG_PATH,
   SECRETS_FOLDER,
@@ -62,12 +68,25 @@ export interface HelperDeps {
   clock?: Clock;
   /**
    * `helper.json` in the global storage folder (StoragePaths.helperState). With it, ensureImage also checks the base
-   * image weekly and removes old helper images daily (ensureHelperImage). Without it, the image is only built when its
-   * tag is missing.
+   * image weekly (in the background), rebuilds the image when a check asked for it, and removes old helper images daily
+   * (ensureHelperImage); the helper runs only build a missing tag and record the use. Without it, the image is only
+   * built when its tag is missing.
    */
   statePath?: string;
   /** Current digest of the base image of the helper (registryBaseDigest). Without it, the base image is not checked. */
   baseDigest?: BaseDigestLookup;
+  /** Called with each check of the base image that ensureImage starts in the background (for tests). */
+  onBaseImageCheck?: (check: Promise<void>) => void;
+}
+
+/** Options of WorkspaceHelper.ensureImage. */
+export interface EnsureImageOptions {
+  onOutput?: (text: string) => void;
+  signal?: AbortSignal;
+  /** `false` when the setting updateImagesOnConnect is off: no check of the base image (default `true`). */
+  checkBaseImage?: boolean;
+  /** Called right before a build of the helper image: `create` for a missing tag, `refresh` for a rebuild. */
+  onBuild?: (kind: HelperBuildKind) => void;
 }
 
 /**
@@ -272,6 +291,8 @@ interface StreamOptions {
 /** Workspace helper (implementation notes 7, concept 7.6). */
 export class WorkspaceHelper {
   private imagePromise: Promise<string> | undefined;
+  /** Whether the cached image promise comes from ensureImage (with the maintenance), not from a helper run. */
+  private imageMaintained = false;
   /** When the cached image promise resolved, and its tag. */
   private imageReadyAt: number | undefined;
   private imageTag: string | undefined;
@@ -287,11 +308,13 @@ export class WorkspaceHelper {
 
   /**
    * ensureHelperImage, shared by concurrent callers (cached promise; retried after a failure). With `statePath`, it also
-   * checks the base image and removes old helper images when that is due (implementation notes 7). The open pipeline
-   * calls it before the helper runs; a result older than HELPER_IMAGE_RECHECK_MS is not reused. A failed build throws
-   * UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors pass through.
+   * does the maintenance that is due (implementation notes 7): a rebuild that a check asked for, the check of the base
+   * image (in the background), the cleanup of old helper images. The open pipeline calls it before the helper runs; a
+   * result older than HELPER_IMAGE_RECHECK_MS, or one of a helper run (without the maintenance), is not reused. A failed
+   * build throws UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors
+   * pass through.
    */
-  async ensureImage(options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<string> {
+  async ensureImage(options: EnsureImageOptions = {}): Promise<string> {
     return this.image(options, true);
   }
 
@@ -556,11 +579,19 @@ export class WorkspaceHelper {
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
   /**
-   * The helper tag. `recheck` (ensureImage): a result older than HELPER_IMAGE_RECHECK_MS runs ensureHelperImage again.
-   * The helper runs reuse the result of any age and only record the use (at most once per hour), so that no check of
-   * the base image and no rebuild delays a stop, a delete, or a branch switch.
+   * The helper tag. `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older than
+   * HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
+   * and only record the use (at most once per hour); without a result (a new window), they run ensureHelperImage without
+   * the maintenance, which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays
+   * a stop, a delete, or a branch switch.
    */
-  private async image(options: { onOutput?: (text: string) => void; signal?: AbortSignal }, recheck: boolean): Promise<string> {
+  private async image(options: EnsureImageOptions, recheck: boolean): Promise<string> {
+    if (recheck && this.imagePromise && !this.imageMaintained) {
+      // The result of a helper run: wait until it is ready (a missing tag is built only once), then maintain.
+      const pending = this.imagePromise;
+      if (this.imageReadyAt === undefined) await pending.catch(() => undefined);
+      if (this.imagePromise === pending) this.resetImage();
+    }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
       if (recheck && Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS) this.resetImage();
@@ -572,6 +603,10 @@ export class WorkspaceHelper {
         signal: options.signal,
         statePath: this.deps.statePath,
         baseDigest: this.deps.baseDigest,
+        maintain: recheck,
+        checkBaseImage: options.checkBaseImage,
+        onBuild: options.onBuild,
+        onBaseImageCheck: this.deps.onBaseImageCheck,
         clock: this.clock,
         logger: this.deps.logger,
       }).then(
@@ -591,6 +626,7 @@ export class WorkspaceHelper {
         },
       );
       this.imagePromise = promise;
+      this.imageMaintained = recheck;
     }
     try {
       return await this.imagePromise;
@@ -603,6 +639,7 @@ export class WorkspaceHelper {
 
   private resetImage(): void {
     this.imagePromise = undefined;
+    this.imageMaintained = false;
     this.imageReadyAt = undefined;
   }
 

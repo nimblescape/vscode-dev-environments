@@ -1,6 +1,6 @@
 // Image of the workspace helper (implementation notes 7): built locally from resources/helper/Dockerfile. With a state
-// file, the base image is checked once a week (a changed base image rebuilds the same tag), and helper images that no
-// window uses anymore are removed once a day.
+// file, the base image is checked once a week in the background (a changed base image rebuilds the same tag at the next
+// ensure), and helper images that no window uses anymore are removed once a day.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -35,6 +35,13 @@ export const HELPER_UNUSED_LIMIT_MS = 7 * DAY_MS;
 export const HELPER_CLEANUP_INTERVAL_MS = DAY_MS;
 /** `lastUsedAt` of a helper tag is written at most this often. */
 export const HELPER_LAST_USED_INTERVAL_MS = HOUR_MS;
+/** A check of the base image that got no answer from the registry is tried again after this time. */
+export const HELPER_RETRY_INTERVAL_MS = DAY_MS;
+/**
+ * A helper tag that the cleanup removed and that comes back (another installation of VS Code built it again) stays for
+ * this long after the removal. Then the tombstone expires: the tag gets a new grace period, and an unlisted tag is forgotten.
+ */
+export const HELPER_TOMBSTONE_MS = 90 * DAY_MS;
 
 /** The part of ContainerAdapter that the helper image needs. */
 export type HelperImageDocker = Pick<
@@ -90,6 +97,9 @@ export function helperImageTag(dockerfileContent: string, cliVersion: string = D
   return `${HELPER_IMAGE_REPOSITORY}:${hash.slice(0, 12)}`;
 }
 
+/** `create`: a missing tag is built; `refresh`: an existing tag is built again from a new base image. */
+export type HelperBuildKind = 'create' | 'refresh';
+
 export interface EnsureHelperImageOptions {
   onOutput?: (text: string) => void;
   signal?: AbortSignal;
@@ -102,11 +112,31 @@ export interface EnsureHelperImageOptions {
   baseDigest?: BaseDigestLookup;
   /** Time limit of `baseDigest`; after it, the registry counts as unreachable. Default IMAGE_CHECK_TIMEOUT_MS. */
   baseDigestTimeoutMs?: number;
+  /**
+   * `false` for the helper runs (default `true`): only a missing tag is built and the use is recorded; the check of the
+   * base image, a rebuild that a check asked for, and the cleanup are left to the open pipeline.
+   */
+  maintain?: boolean;
+  /**
+   * `false` when the setting updateImagesOnConnect is off (default `true`): the base image is not checked, and a rebuild
+   * that an earlier check asked for waits. A missing tag is still built with `--pull`.
+   */
+  checkBaseImage?: boolean;
+  /** Called right before a build of the helper image. */
+  onBuild?: (kind: HelperBuildKind) => void;
+  /**
+   * Called with the check of the base image when it starts. It runs in the background, after this function returned; the
+   * promise never rejects (for tests, and for callers that want to wait for it).
+   */
+  onBaseImageCheck?: (check: Promise<void>) => void;
   clock?: Clock;
   logger?: Logger;
 }
 
 type BuildFlags = { pull?: boolean; noCache?: boolean };
+
+/** How a build or a check changes the record of the tag: a function of the current record. */
+type RecordChange = (record: HelperImageRecord | undefined) => HelperImageRecord;
 
 interface Maintenance {
   docker: HelperImageDocker;
@@ -126,12 +156,16 @@ interface Maintenance {
  * the image is missing and cannot be built.
  *
  * With `statePath` (implementation notes 7):
- * - A missing tag is built with `--pull`, so a new helper starts from the current base image (without `--pull` when the
- *   registry cannot be reached: the local base image and the build cache may still build it).
- * - An existing tag whose base image was not checked for 7 days: the registry digest of the base image is compared
- *   with the recorded one. A changed base image rebuilds the same tag with `--pull --no-cache`; the previous image is
- *   then removed if it has no tag anymore. No connection, or a failed rebuild, keeps the existing image.
- * - `lastUsedAt` of the tag is written (at most once per hour), then the cleanup runs (at most once per day).
+ * - A missing tag is built with `--pull`, so a new helper starts from the current base image. Without `--pull` when the
+ *   registry cannot be reached, or when the build with `--pull` fails (for example the pull limit of Docker Hub): the
+ *   local base image and the build cache may still build it, and the next check that reaches the registry asks for a
+ *   rebuild from the current base image.
+ * - `maintain` (not for the helper runs): a rebuild that an earlier check asked for runs now, with `--pull --no-cache`;
+ *   the previous image is then removed if it has no tag anymore. A failed rebuild keeps the existing image. When the
+ *   check of the base image is due (7 days after the last answer of the registry, a day after an attempt without an
+ *   answer), it starts in the background, under its own time limit: this function does not wait for it. It compares the
+ *   registry digest of the base image with the recorded one; a change asks the next ensure for a rebuild.
+ * - `lastUsedAt` of the tag is written (at most once per hour); with `maintain`, the cleanup runs (at most once per day).
  * Problems of the check, the state file, and the cleanup are logged and never make this function fail.
  */
 export async function ensureHelperImage(
@@ -154,6 +188,7 @@ export async function ensureHelperImage(
     });
   if (options.statePath === undefined) {
     if (await docker.imageExists(tag)) return tag;
+    options.onBuild?.('create');
     await build({});
     return tag;
   }
@@ -181,9 +216,10 @@ export async function recordHelperImageUse(
   const clock = options.clock ?? systemClock;
   try {
     const state = await readHelperState(statePath);
-    if (!isDue(state.images[tag]?.lastUsedAt, clock.now(), HELPER_LAST_USED_INTERVAL_MS)) return;
+    const record = state.images[tag];
+    if (!isDue(record?.lastUsedAt, clock.now(), HELPER_LAST_USED_INTERVAL_MS) && !isForeign(record)) return;
     await updateHelperState(statePath, (fresh) => {
-      fresh.images[tag] = { ...fresh.images[tag], lastUsedAt: isoTime(clock) };
+      fresh.images[tag] = { ...owned(fresh.images[tag]), lastUsedAt: isoTime(clock) };
     });
   } catch (error) {
     (options.logger ?? silentLogger).warn(`The state of the workspace helper image could not be written: ${errorMessage(error)}`);
@@ -211,102 +247,212 @@ function isDue(time: string | undefined, now: number, intervalMs: number): boole
   return age === undefined || age < 0 || age >= intervalMs;
 }
 
+/** True if the record marks the tag as one of another installation, or as removed. */
+function isForeign(record: HelperImageRecord | undefined): boolean {
+  return record?.foreignSince !== undefined || record?.removedAt !== undefined;
+}
+
+/** The record of a tag that this installation uses: without the marks of the cleanup for foreign and removed tags. */
+function owned(record: HelperImageRecord | undefined): HelperImageRecord {
+  const { foreignSince: _foreign, removedAt: _removed, ...rest } = record ?? {};
+  return rest;
+}
+
 async function ensureWithState(m: Maintenance): Promise<string> {
-  const { docker, tag } = m;
+  const { docker, tag, options } = m;
+  const maintain = options.maintain !== false;
+  const checkBaseImage = options.checkBaseImage !== false;
   const recorded = (await readHelperState(m.statePath)).images[tag];
   let currentId = await docker.imageId(tag);
-  // `replace`: the record of a new build replaces the old record of the tag (for example after an image prune).
-  let change: { record: HelperImageRecord; replace: boolean } | undefined;
+  let change: RecordChange | undefined;
 
   if (currentId === undefined) {
-    const digest = await lookUpBaseDigest(m);
-    await m.build({ pull: digest !== 'unreachable' });
-    const now = isoTime(m.clock);
-    const record: HelperImageRecord = { builtAt: now };
-    if (m.baseImage !== undefined) record.baseImage = m.baseImage;
-    // Without an answer of the registry, checkedAt stays empty: the next job reads the digest.
-    if (digest !== undefined && digest !== 'unreachable') {
-      record.baseDigest = digest;
-      record.checkedAt = now;
-    }
-    change = { record, replace: true };
+    change = await create(m, checkBaseImage);
     currentId = await imageIdQuietly(m);
-  } else if (
-    m.baseImage !== undefined &&
-    m.options.baseDigest &&
-    isDue(recorded?.checkedAt, m.clock.now(), HELPER_CHECK_INTERVAL_MS)
-  ) {
-    const refreshed = await refresh(m, m.baseImage, recorded, currentId);
-    if (refreshed.record) change = { record: refreshed.record, replace: false };
-    currentId = refreshed.currentId;
+  } else if (maintain && checkBaseImage && m.baseImage !== undefined && recorded?.latestBaseDigest !== undefined) {
+    const rebuilt = await rebuild(m, m.baseImage, recorded, recorded.latestBaseDigest, currentId);
+    change = rebuilt.change;
+    currentId = rebuilt.currentId;
   }
 
-  if (change || isDue(recorded?.lastUsedAt, m.clock.now(), HELPER_LAST_USED_INTERVAL_MS)) {
-    const record = change?.record ?? {};
-    const replace = change?.replace === true;
+  // The check starts now, so its request runs while the open pipeline goes on; its result is written after the writes
+  // of this function.
+  const record = change ? change(recorded) : recorded;
+  const check = maintain && checkBaseImage && isCheckDue(m, record) ? lookUpBaseDigest(m, undefined) : undefined;
+
+  if (change || isForeign(recorded) || isDue(recorded?.lastUsedAt, m.clock.now(), HELPER_LAST_USED_INTERVAL_MS)) {
     await writeState(m, (state) => {
-      state.images[tag] = { ...(replace ? {} : state.images[tag]), ...record, lastUsedAt: isoTime(m.clock) };
+      const fresh = state.images[tag];
+      state.images[tag] = { ...owned(change ? change(fresh) : fresh), lastUsedAt: isoTime(m.clock) };
     });
   }
   // Without the ID of the current image, nothing is removed.
-  if (currentId !== undefined) await cleanUpIfDue(m, currentId);
+  if (maintain && currentId !== undefined) await cleanUpIfDue(m, currentId);
+  if (check && m.baseImage !== undefined) {
+    const baseImage = m.baseImage;
+    const done = check
+      .then((digest) => recordCheck(m, baseImage, digest))
+      .catch((error: unknown) => {
+        m.logger.warn(`The check of the base image ${baseImage} of the workspace helper failed: ${errorMessage(error)}`);
+      });
+    options.onBaseImageCheck?.(done);
+  }
   return tag;
 }
 
+/** The weekly check of the base image is due: 7 days after the last answer of the registry, a day after an attempt. */
+function isCheckDue(m: Maintenance, record: HelperImageRecord | undefined): boolean {
+  if (!m.options.baseDigest || m.baseImage === undefined) return false;
+  const now = m.clock.now();
+  return isDue(record?.checkedAt, now, HELPER_CHECK_INTERVAL_MS) && isDue(record?.attemptedAt, now, HELPER_RETRY_INTERVAL_MS);
+}
+
 /**
- * Step 3 of the refresh (implementation notes 7): compares the registry digest of the base image with the recorded one.
- * Returns the fields to record (none when the registry could not be reached, so the next job checks again) and the ID
- * of the current image of the tag.
+ * Step 2 (implementation notes 7): builds a missing tag. The registry digest of the base image is read first (the build
+ * takes much longer than this read), to decide about `--pull` and to record the digest. Returns the new record: it
+ * replaces an old record of the tag (for example after an image prune).
  */
-async function refresh(
+async function create(m: Maintenance, checkBaseImage: boolean): Promise<RecordChange> {
+  const lookedUp = checkBaseImage && m.options.baseDigest !== undefined && m.baseImage !== undefined;
+  const digest = lookedUp ? await lookUpBaseDigest(m, m.options.signal) : undefined;
+  const pulled = await buildMissing(m, digest !== 'unreachable');
+  const now = isoTime(m.clock);
+  const record: HelperImageRecord = { builtAt: now };
+  if (m.baseImage !== undefined) record.baseImage = m.baseImage;
+  if (!pulled) {
+    // Maybe built from an old local base image: the next check that gets a digest asks for a rebuild.
+    record.builtWithoutPull = now;
+  } else if (digest !== undefined && digest !== 'unreachable') {
+    record.baseDigest = digest;
+    record.checkedAt = now;
+  }
+  // No digest yet: the check runs again in a day. Without a lookup (no check of the base image), at the next ensure.
+  if (lookedUp && record.checkedAt === undefined) record.attemptedAt = now;
+  return () => record;
+}
+
+/**
+ * Builds a missing tag, with `--pull` unless `pull` is false. A build with `--pull` that fails (the pull of the daemon
+ * can fail where the request of the extension host worked: the pull limit, stored credentials that the registry
+ * refuses, a proxy) is tried again without it. Returns whether the build pulled the base image. Throws when the tag
+ * cannot be built.
+ */
+async function buildMissing(m: Maintenance, pull: boolean): Promise<boolean> {
+  m.options.onBuild?.('create');
+  try {
+    await m.build({ pull });
+    return pull;
+  } catch (error) {
+    if (!pull || isAbortError(error) || m.options.signal?.aborted) throw error;
+    m.logger.warn(
+      `The workspace helper image ${m.tag} could not be built with a fresh base image. It is built from the local base image: ${errorMessage(error)}`,
+    );
+  }
+  await m.build({ pull: false });
+  return false;
+}
+
+/**
+ * Step 3 (implementation notes 7), the rebuild that a check asked for: the same tag with `--pull --no-cache`, then the
+ * removal of the previous image if it has no tag anymore. A failed rebuild keeps the existing image, and the next check
+ * is in a week. An abort passes through and changes nothing, so the next ensure builds again.
+ */
+async function rebuild(
   m: Maintenance,
   baseImage: string,
-  recorded: HelperImageRecord | undefined,
+  recorded: HelperImageRecord,
+  digest: string,
   currentId: string,
-): Promise<{ record?: HelperImageRecord; currentId: string | undefined }> {
+): Promise<{ change: RecordChange; currentId: string | undefined }> {
   const { tag, logger } = m;
-  const digest = await lookUpBaseDigest(m);
-  const now = isoTime(m.clock);
-  if (digest === 'unreachable') {
-    logger.info(`The base image ${baseImage} of the workspace helper could not be checked: the registry did not answer. The existing image is used.`);
-    return { currentId };
-  }
-  if (digest === undefined) {
-    logger.warn(`The registry returned no digest for the base image ${baseImage} of the workspace helper. It is checked again in a week.`);
-    return { record: { checkedAt: now }, currentId };
-  }
-  const known = recorded?.baseImage === undefined || recorded.baseImage === baseImage ? recorded?.baseDigest : undefined;
-  if (known === undefined) {
-    // An image built before the digest was recorded: the current digest is the reference from now on, without a rebuild.
-    return { record: { baseImage, baseDigest: digest, checkedAt: now }, currentId };
-  }
-  if (known.toLowerCase() === digest.toLowerCase()) return { record: { checkedAt: now }, currentId };
-
-  logger.info(`The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again.`);
+  logger.info(
+    recorded.builtWithoutPull !== undefined
+      ? `The workspace helper image ${tag} was built from the local base image. It is built again from the current base image ${baseImage}.`
+      : `The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again.`,
+  );
+  m.options.onBuild?.('refresh');
   try {
     // A fresh base image, and no cache: the Debian packages and the Docker CLI are installed again, too.
     await m.build({ pull: true, noCache: true });
   } catch (error) {
-    if (isAbortError(error)) throw error;
+    if (isAbortError(error) || m.options.signal?.aborted) throw error;
     // Docker moves the tag only after a successful build: the existing image stays. The next check is in a week.
     logger.warn(`The workspace helper image ${tag} could not be built again. The existing image is used: ${errorMessage(error)}`);
-    return { record: { checkedAt: now }, currentId };
+    const checkedAt = isoTime(m.clock);
+    return {
+      change: (record) => {
+        const { latestBaseDigest: _latest, ...rest } = record ?? {};
+        return { ...rest, checkedAt };
+      },
+      currentId,
+    };
   }
   const builtAt = isoTime(m.clock);
   const newId = await imageIdQuietly(m);
   if (newId !== undefined && newId !== currentId) await removePreviousImage(m, currentId, newId);
-  return { record: { baseImage, baseDigest: digest, builtAt, checkedAt: builtAt }, currentId: newId };
+  return {
+    change: (record) => {
+      const { latestBaseDigest: _latest, builtWithoutPull: _unpulled, attemptedAt: _attempted, ...rest } = record ?? {};
+      return { ...rest, baseImage, baseDigest: digest, builtAt, checkedAt: builtAt };
+    },
+    currentId: newId,
+  };
+}
+
+/**
+ * Step 3 (implementation notes 7), the result of the check of the base image, in the background. No answer: the check
+ * runs again in a day. No digest: in a week. A digest that differs from the recorded one, or any digest for an image
+ * built without `--pull`, asks the next ensure for a rebuild. An image without a recorded digest (built before the
+ * state existed, or by a build whose lookup got no digest) gets the digest, without a rebuild.
+ */
+async function recordCheck(m: Maintenance, baseImage: string, digest: string | 'unreachable' | undefined): Promise<void> {
+  const { tag, logger } = m;
+  const now = isoTime(m.clock);
+  if (digest === 'unreachable') {
+    logger.info(`The base image ${baseImage} of the workspace helper could not be checked: the registry did not answer. It is checked again in a day.`);
+    await writeState(m, (state) => {
+      state.images[tag] = { ...state.images[tag], attemptedAt: now };
+    });
+    return;
+  }
+  if (digest === undefined) {
+    logger.warn(`The registry returned no digest for the base image ${baseImage} of the workspace helper. It is checked again in a week.`);
+  }
+  let rebuildReason: 'changed' | 'unpulled' | undefined;
+  await writeState(m, (state) => {
+    const { attemptedAt: _attempted, ...current } = state.images[tag] ?? {};
+    if (digest === undefined) {
+      state.images[tag] = { ...current, checkedAt: now };
+      return;
+    }
+    // A rebuild that another window asked for is decided again with this digest.
+    const { latestBaseDigest: _latest, ...record } = current;
+    const known = record.baseImage === undefined || record.baseImage === baseImage ? record.baseDigest : undefined;
+    rebuildReason =
+      record.builtWithoutPull !== undefined
+        ? 'unpulled'
+        : known !== undefined && known.toLowerCase() !== digest.toLowerCase()
+          ? 'changed'
+          : undefined;
+    if (rebuildReason) state.images[tag] = { ...record, latestBaseDigest: digest, checkedAt: now };
+    else if (known === undefined) state.images[tag] = { ...record, baseImage, baseDigest: digest, checkedAt: now };
+    else state.images[tag] = { ...record, checkedAt: now };
+  });
+  if (rebuildReason === 'changed') {
+    logger.info(`The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again at the next open.`);
+  } else if (rebuildReason === 'unpulled') {
+    logger.info(`The workspace helper image ${tag} was built from the local base image. It is built again from the current base image at the next open.`);
+  }
 }
 
 /**
  * `baseDigest` for the base image, under its time limit: a lookup that does not answer in time counts as
- * `'unreachable'`, so an offline registry never blocks the helper. Rejects with an AbortError when the signal aborts.
+ * `'unreachable'`. Rejects with an AbortError when `signal` aborts; without a signal, it never rejects.
  */
-async function lookUpBaseDigest(m: Maintenance): Promise<string | 'unreachable' | undefined> {
+async function lookUpBaseDigest(m: Maintenance, signal: AbortSignal | undefined): Promise<string | 'unreachable' | undefined> {
   const lookup = m.options.baseDigest;
   const baseImage = m.baseImage;
   if (!lookup || baseImage === undefined) return undefined;
-  const signal = m.options.signal;
   if (signal?.aborted) throw abortError();
   const controller = new AbortController();
   const result = await new Promise<string | 'unreachable' | undefined>((resolve) => {
@@ -386,10 +532,12 @@ async function removeHelperImage(m: Maintenance, image: ImageInfo, reference: st
 
 /**
  * Step 5 (implementation notes 7), at most once per day: of the images with the label devenv.helper=true, except the
- * image of the current tag, it removes dangling images, and helper tags that the state knows and that no window used
- * for 7 days. A helper tag that the state does not know gets `lastUsedAt = now`: a helper of another extension version
- * that is still used (old windows during an update) is not removed at once. Tags of other repositories are never
- * removed.
+ * image of the current tag, it removes dangling images, and helper tags that no window of this installation used for 7
+ * days. A helper tag that the state does not know is foreign (another extension version, possibly of another installation
+ * of VS Code with its own helper.json, which never writes `lastUsedAt` here): it gets a grace period of 7 days, so old
+ * windows during an update keep their helper. A removed tag gets a tombstone: when it comes back, another installation
+ * built it again and uses it, so it stays (for HELPER_TOMBSTONE_MS), and two installations do not remove each other's
+ * helper in a loop. Tags of other repositories are never removed.
  */
 async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   const nowMs = m.clock.now();
@@ -411,8 +559,13 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
     }
     for (const tag of image.tags.filter(isHelperImageTag)) {
       if (tag === m.tag) continue;
-      const age = ageMs(state.images[tag]?.lastUsedAt, nowMs);
-      if (age === undefined || age < 0) {
+      const record = state.images[tag];
+      if (hasTombstone(record, nowMs)) {
+        m.logger.info(`The workspace helper image ${tag} was built again after its removal: another installation uses it. It is kept.`);
+        continue;
+      }
+      const age = ageMs(record?.lastUsedAt, nowMs);
+      if (record === undefined || record.removedAt !== undefined || age === undefined || age < 0) {
         graced.push(tag);
       } else if (age >= HELPER_UNUSED_LIMIT_MS) {
         m.logger.info(`The workspace helper image ${tag} was not used for ${Math.floor(age / DAY_MS)} days. It is removed.`);
@@ -424,16 +577,33 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   await writeState(m, (fresh) => {
     fresh.lastCleanupAt = now;
     for (const tag of graced) {
-      const age = ageMs(fresh.images[tag]?.lastUsedAt, nowMs);
-      if (age === undefined || age < 0) fresh.images[tag] = { ...fresh.images[tag], lastUsedAt: now };
+      const record = fresh.images[tag];
+      if (hasTombstone(record, nowMs)) continue;
+      if (record === undefined || record.removedAt !== undefined) {
+        fresh.images[tag] = { foreignSince: now, lastUsedAt: now };
+      } else {
+        const age = ageMs(record.lastUsedAt, nowMs);
+        if (age === undefined || age < 0) fresh.images[tag] = { ...record, lastUsedAt: now };
+      }
     }
-    for (const tag of removed) delete fresh.images[tag];
-    // Records of tags that do not exist anymore (for example removed by the user) are dropped when they are old.
+    for (const tag of removed) fresh.images[tag] = { removedAt: now };
+    // Records of tags that do not exist anymore (for example removed by the user) are dropped when they are old; a
+    // tombstone when it expires.
     for (const [tag, record] of Object.entries(fresh.images)) {
       if (tag === m.tag || listed.has(tag)) continue;
-      if (!isRecent(record.lastUsedAt, nowMs) && !isRecent(record.builtAt, nowMs)) delete fresh.images[tag];
+      if (record.removedAt !== undefined) {
+        if (!hasTombstone(record, nowMs)) delete fresh.images[tag];
+      } else if (!isRecent(record.lastUsedAt, nowMs) && !isRecent(record.builtAt, nowMs)) {
+        delete fresh.images[tag];
+      }
     }
   });
+}
+
+/** True if the cleanup removed the tag less than HELPER_TOMBSTONE_MS ago. */
+function hasTombstone(record: HelperImageRecord | undefined, now: number): boolean {
+  const age = ageMs(record?.removedAt, now);
+  return age !== undefined && age >= 0 && age < HELPER_TOMBSTONE_MS;
 }
 
 function isRecent(time: string | undefined, now: number): boolean {

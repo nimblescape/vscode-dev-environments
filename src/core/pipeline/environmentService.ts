@@ -91,6 +91,7 @@ export const PipelineTexts = {
   environmentBusy: (repository: string) =>
     `${repository} is being changed in another window. Try again when this is finished.`,
   preparingHelper: 'The workspace helper is being prepared. This happens once and can take a few minutes.',
+  updatingHelper: 'The workspace helper is being updated. This can take a few minutes.',
   lifecycleCommandFailed: (command: string | undefined) =>
     `The ${command ?? 'lifecycle command'} of the environment failed. The environment is opened anyway.`,
 } as const;
@@ -110,6 +111,7 @@ export type EnvironmentDocker = Pick<
   | 'removeVolume'
   | 'listEnvironmentVolumes'
   | 'imageExists'
+  | 'imageId'
   | 'removeImage'
   | 'listImageTags'
 > & {
@@ -1583,19 +1585,25 @@ export class EnvironmentService {
 
   /**
    * Builds the helper image if needed. The build is shown as a detail of the current step: the steps of concept 6.5
-   * keep their order ("Preparing environment" is the build of the environment image).
+   * keep their order ("Preparing environment" is the build of the environment image). The check of the base image of
+   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7).
    */
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
     let announced = false;
+    const announce = (text: string): void => {
+      if (announced) return;
+      announced = true;
+      ctx.steps.detail(text);
+    };
     try {
       await this.deps.helper.ensureImage({
         onOutput: (text) => {
-          if (!announced) {
-            announced = true;
-            ctx.steps.detail(PipelineTexts.preparingHelper);
-          }
+          announce(PipelineTexts.preparingHelper);
           this.logger.output(text);
         },
+        // A new helper after an extension update, or the rebuild of an existing one from a new base image.
+        onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
+        checkBaseImage: this.deps.settings().updateImagesOnConnect,
         signal: ctx.signal,
       });
     } catch (error) {
@@ -1701,11 +1709,23 @@ export class EnvironmentService {
       if (inUse.has(baseImageKey(reference, digest))) continue;
       const image = digestReference(reference, digest);
       if (!image) continue;
-      // Assumption (V-9): a pulled base image keeps the registry digest of the check as its repository digest, so
-      // `docker image rm <name>@<digest>` finds it, also with the containerd image store. Docker refuses to remove an
-      // image that a container or another image uses (removeImage then returns false).
-      await this.quietly(`remove the base image ${image}`, () => this.deps.docker.removeImage(image));
+      await this.quietly(`remove the base image ${image}`, () => this.removeBaseImage(image, reference));
     }
+  }
+
+  /**
+   * Removes a base image by its digest reference `<name>@<digest>`. Assumption (V-9): a pulled base image keeps the
+   * registry digest of the check as its repository digest, so this reference finds it. The containerd image store then
+   * removes the image with its tag; the classic image store of Docker Engine removes only the digest reference, and the
+   * tag keeps the image. So the tag is removed too when it still names the same image (a tag that a pull moved to a
+   * newer image stays). Docker refuses to remove an image that a container or another image uses (removeImage then
+   * returns false).
+   */
+  private async removeBaseImage(image: string, reference: string): Promise<void> {
+    const { docker } = this.deps;
+    const id = await docker.imageId(image);
+    if (!(await docker.removeImage(image)) || id === undefined) return;
+    if ((await docker.imageId(reference)) === id) await docker.removeImage(reference);
   }
 
   private async removeAdditionalVolumes(env: Environment): Promise<void> {

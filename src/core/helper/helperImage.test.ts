@@ -1,19 +1,22 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { devcontainerCliVersion } from '../../../scripts/cliVersion.mjs';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
 import type { HttpTransport } from '../http';
+import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/imageCheck';
 import { RegistryClient, type DigestResult } from '../imageCheck/registryClient';
 import type { ImageReference } from '../imageCheck/reference';
-import type { Logger } from '../ports';
+import { abortError, type Logger } from '../ports';
 import {
   DEVCONTAINER_CLI_VERSION,
   HELPER_CHECK_INTERVAL_MS,
   HELPER_CLEANUP_INTERVAL_MS,
   HELPER_LAST_USED_INTERVAL_MS,
+  HELPER_RETRY_INTERVAL_MS,
+  HELPER_TOMBSTONE_MS,
   HELPER_UNUSED_LIMIT_MS,
   ensureHelperImage,
   helperImageTag,
@@ -251,6 +254,8 @@ class Harness {
   readonly statePath = path.join(path.dirname(this.file), 'storage', 'helper.json');
   readonly tag = helperImageTag(HELPER_DOCKERFILE);
   readonly lookups: Array<{ reference: string; signal?: AbortSignal }> = [];
+  /** Checks of the base image that ensure started in the background, not awaited yet. */
+  readonly checks: Array<Promise<void>> = [];
   now = START;
   answer: (signal?: AbortSignal) => Promise<LookupAnswer> = async () => DIGEST_A;
   readonly clock = { now: () => this.now };
@@ -265,8 +270,14 @@ class Harness {
       baseDigest: this.baseDigest,
       clock: this.clock,
       logger: this.logger,
+      onBaseImageCheck: (check) => this.checks.push(check),
       ...options,
     });
+  }
+
+  /** Waits for the checks of the base image that ensure started in the background. */
+  async settled(): Promise<void> {
+    await Promise.all(this.checks.splice(0));
   }
 
   advance(ms: number): void {
@@ -307,26 +318,90 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     });
   });
 
-  it('builds without --pull when the registry does not answer, and reads the digest at the next job without a rebuild', async () => {
+  it('builds without --pull when the registry does not answer, and builds again from the current base image after the next check', async () => {
     const h = new Harness();
     h.answer = async () => 'unreachable';
     await h.ensure();
     expect(h.docker.builds[0].pull).toBe(false);
-    // No digest and no checkedAt: the next job checks again.
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso() });
+    // No digest and no checkedAt, but the mark: the image may come from an old local base image.
+    expect(h.state().images[h.tag]).toEqual({
+      baseImage: BASE,
+      builtAt: h.iso(),
+      builtWithoutPull: h.iso(),
+      attemptedAt: h.iso(),
+      lastUsedAt: h.iso(),
+    });
+    const firstId = h.docker.idOf(h.tag);
 
+    // The registry answers again: the check is tried again after a day.
     h.answer = async () => DIGEST_A;
     h.advance(HOUR);
     await h.ensure();
-    expect(h.docker.builds).toHaveLength(1);
+    expect(h.lookups).toHaveLength(1);
+    h.advance(HELPER_RETRY_INTERVAL_MS);
+    await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(2);
+    // The digest is not taken over as the digest of the image: the next ensure builds it again.
+    expect(h.docker.builds).toHaveLength(1);
+    expect(h.state().images[h.tag]).toMatchObject({ latestBaseDigest: DIGEST_A, checkedAt: h.iso(), builtWithoutPull: h.iso(-DAY - HOUR) });
+    expect(h.state().images[h.tag].baseDigest).toBeUndefined();
+
+    h.advance(HOUR);
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(2);
+    expect(h.docker.builds[1]).toMatchObject({ pull: true, noCache: true });
+    expect(h.docker.idOf(h.tag)).not.toBe(firstId);
+    expect(h.logger.lines.join('\n')).toContain('was built from the local base image. It is built again from the current base image');
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
-      builtAt: h.iso(-HOUR),
+      builtAt: h.iso(),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
     });
+    await h.ensure();
+    await h.settled();
+    expect(h.docker.builds).toHaveLength(2);
+    expect(h.lookups).toHaveLength(2);
+  });
+
+  it('keeps the mark of a build without --pull when the rebuild fails, and tries again after the next weekly check', async () => {
+    const h = new Harness();
+    h.answer = async () => 'unreachable';
+    await h.ensure();
+    const firstId = h.docker.idOf(h.tag);
+    h.answer = async () => DIGEST_A;
+    h.advance(DAY);
+    await h.ensure();
+    await h.settled();
+    h.docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'toomanyrequests: You have reached your pull rate limit');
+    };
+    h.advance(HOUR);
+    expect(await h.ensure()).toBe(h.tag);
+    expect(h.docker.builds.map((build) => [build.pull, build.noCache])).toEqual([
+      [false, undefined],
+      [true, true],
+    ]);
+    expect(h.docker.idOf(h.tag)).toBe(firstId);
+    const record = h.state().images[h.tag];
+    expect(record).toMatchObject({ builtWithoutPull: h.iso(-DAY - HOUR), checkedAt: h.iso() });
+    expect(record.latestBaseDigest).toBeUndefined();
+    expect(record.baseDigest).toBeUndefined();
+
+    // No new attempt at each open; the next weekly check asks for the rebuild again.
+    h.docker.buildHandler = async () => undefined;
+    h.advance(HOUR);
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(2);
+    h.advance(HELPER_CHECK_INTERVAL_MS);
+    await h.ensure();
+    await h.settled();
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(3);
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A });
+    expect(h.state().images[h.tag].builtWithoutPull).toBeUndefined();
   });
 
   it('builds with --pull without a digest lookup', async () => {
@@ -353,13 +428,88 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     });
   });
 
-  it('throws when a missing tag cannot be built, and records nothing', async () => {
+  it('throws when a missing tag cannot be built, also not without --pull, and records nothing', async () => {
     const h = new Harness();
     h.docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'network error');
     };
     await expect(h.ensure()).rejects.toBeInstanceOf(CommandError);
+    expect(h.docker.builds.map((build) => build.pull)).toEqual([true, false]);
     expect(fs.existsSync(h.statePath)).toBe(false);
+  });
+
+  it('builds a missing tag from the local base image when the build with --pull fails', async () => {
+    // The request of the extension host got a digest, but the pull of the daemon fails (for example the pull limit).
+    const h = new Harness();
+    h.docker.buildHandler = async (options) => {
+      if (options.pull) throw new CommandError('docker build', 1, '', 'toomanyrequests: You have reached your pull rate limit');
+    };
+    expect(await h.ensure()).toBe(h.tag);
+    expect(h.docker.builds.map((build) => build.pull)).toEqual([true, false]);
+    expect(h.docker.idOf(h.tag)).toBeDefined();
+    expect(h.warnings().join('\n')).toMatch(/could not be built with a fresh base image\. It is built from the local base image: .*toomanyrequests/);
+    // The digest of the registry is not the digest of the image, so it is not recorded; the mark asks for a rebuild.
+    expect(h.state().images[h.tag]).toEqual({
+      baseImage: BASE,
+      builtAt: h.iso(),
+      builtWithoutPull: h.iso(),
+      attemptedAt: h.iso(),
+      lastUsedAt: h.iso(),
+    });
+
+    // The next check (a day later) asks for a build with a fresh base image, and the next ensure runs it.
+    h.docker.buildHandler = async () => undefined;
+    h.advance(HELPER_RETRY_INTERVAL_MS);
+    await h.ensure();
+    await h.settled();
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(3);
+    expect(h.docker.builds[2]).toMatchObject({ pull: true, noCache: true });
+    expect(h.state().images[h.tag]).toEqual({
+      baseImage: BASE,
+      baseDigest: DIGEST_A,
+      builtAt: h.iso(),
+      checkedAt: h.iso(),
+      lastUsedAt: h.iso(),
+    });
+  });
+
+  it('does not build again without --pull after an abort, or after a build that already ran without --pull', async () => {
+    const h = new Harness();
+    h.docker.buildHandler = async () => {
+      throw abortError();
+    };
+    await expect(h.ensure()).rejects.toMatchObject({ name: 'AbortError' });
+    expect(h.docker.builds).toHaveLength(1);
+
+    const offline = new Harness();
+    offline.answer = async () => 'unreachable';
+    offline.docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'pull access denied');
+    };
+    await expect(offline.ensure()).rejects.toBeInstanceOf(CommandError);
+    expect(offline.docker.builds.map((build) => build.pull)).toEqual([false]);
+    expect(fs.existsSync(offline.statePath)).toBe(false);
+  });
+
+  it('rejects with an AbortError when the signal aborts during the lookup before the build of a missing tag', async () => {
+    const h = new Harness();
+    const controller = new AbortController();
+    h.answer = () => new Promise<LookupAnswer>(() => {});
+    setTimeout(() => controller.abort(), 5);
+    await expect(h.ensure({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(h.lookups[0].signal?.aborted).toBe(true);
+    expect(h.docker.builds).toHaveLength(0);
+    expect(fs.existsSync(h.statePath)).toBe(false);
+  });
+
+  it('builds a missing tag with --pull and without a lookup when the check of the base image is off', async () => {
+    const h = new Harness();
+    await h.ensure({ checkBaseImage: false });
+    await h.settled();
+    expect(h.lookups).toHaveLength(0);
+    expect(h.docker.builds[0]).toMatchObject({ pull: true });
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso() });
   });
 
   it('checks the base image of the real Dockerfile of the extension', async () => {
@@ -393,9 +543,19 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     return { h, oldId };
   }
 
+  /** An existing helper image whose check (8 days ago) is due, and whose base image changed to DIGEST_B. */
+  async function changed(): Promise<{ h: Harness; oldId: string }> {
+    const result = existing(8 * DAY);
+    result.h.answer = async () => DIGEST_B;
+    await result.h.ensure();
+    await result.h.settled();
+    return result;
+  }
+
   it('does not check within 7 days', async () => {
     const { h } = existing(HELPER_CHECK_INTERVAL_MS - HOUR);
     await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(0);
     expect(h.docker.builds).toHaveLength(0);
   });
@@ -403,6 +563,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
   it('only updates checkedAt when the digest is unchanged', async () => {
     const { h, oldId } = existing(HELPER_CHECK_INTERVAL_MS);
     await h.ensure();
+    await h.settled();
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual([BASE]);
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
@@ -416,6 +577,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
 
     h.advance(HELPER_CHECK_INTERVAL_MS - HOUR);
     await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(1);
   });
 
@@ -423,23 +585,51 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     const h = new Harness();
     const id = h.docker.addImage([h.tag]);
     await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(1);
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(id);
     expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, baseDigest: DIGEST_A, checkedAt: h.iso(), lastUsedAt: h.iso() });
   });
 
-  it('rebuilds the same tag with --pull --no-cache when the base image changed, and removes the previous image', async () => {
-    const { h, oldId } = existing(8 * DAY);
-    h.answer = async () => DIGEST_B;
+  it('does not wait for the check: a registry that does not answer never delays the ensure', async () => {
+    const { h } = existing(8 * DAY);
+    h.answer = () => new Promise<LookupAnswer>(() => {});
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      expect(await h.ensure()).toBe(h.tag);
+      // The ensure returned while the lookup still runs: it waited neither for the registry nor for the time limit.
+      expect(h.lookups).toHaveLength(1);
+      expect(h.lookups[0].signal?.aborted).toBe(false);
+      expect(h.checks).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(IMAGE_CHECK_TIMEOUT_MS);
+      await h.settled();
+    } finally {
+      vi.useRealTimers();
+    }
+    // The time limit of the check ended the lookup.
+    expect(h.lookups[0].signal?.aborted).toBe(true);
+    expect(h.docker.builds).toHaveLength(0);
+    expect(h.state().images[h.tag]).toMatchObject({ checkedAt: h.iso(-8 * DAY), attemptedAt: h.iso() });
+  });
+
+  it('asks the next ensure to rebuild the same tag with --pull --no-cache when the base image changed, and removes the previous image', async () => {
+    const { h, oldId } = await changed();
+    // The check itself builds nothing: the ensure that started it did not wait for it.
+    expect(h.docker.builds).toHaveLength(0);
+    expect(h.logger.lines.join('\n')).toContain(`has changed. The image ${h.tag} is built again at the next open.`);
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B, checkedAt: h.iso() });
+
     const output: string[] = [];
+    const builds: string[] = [];
     h.docker.buildHandler = async (options) => options.onOutput?.('#1 building\n');
-    expect(await h.ensure({ onOutput: (text) => output.push(text) })).toBe(h.tag);
+    expect(await h.ensure({ onOutput: (text) => output.push(text), onBuild: (kind) => builds.push(kind) })).toBe(h.tag);
 
     expect(h.docker.builds).toHaveLength(1);
     expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, noCache: true, labels: { 'devenv.helper': 'true' } });
-    // The build output reaches onOutput: the pipeline shows that the helper is being prepared.
+    // The build output reaches onOutput, and onBuild tells that an existing helper is updated.
     expect(output).toEqual(['#1 building\n']);
+    expect(builds).toEqual(['refresh']);
     const newId = h.docker.idOf(h.tag);
     expect(newId).toBeDefined();
     expect(newId).not.toBe(oldId);
@@ -452,12 +642,13 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
     });
+    await h.settled();
+    expect(h.lookups).toHaveLength(1);
   });
 
   it('keeps the previous image when it still has another tag', async () => {
-    const { h, oldId } = existing(8 * DAY);
+    const { h, oldId } = await changed();
     h.docker.images.get(oldId)!.tags.push('mine:backup');
-    h.answer = async () => DIGEST_B;
     await h.ensure();
     expect(h.docker.builds).toHaveLength(1);
     expect(h.docker.removals).toEqual([]);
@@ -465,9 +656,8 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
   });
 
   it('keeps a previous image that a running helper uses, and removes it at the next cleanup', async () => {
-    const { h, oldId } = existing(8 * DAY);
+    const { h, oldId } = await changed();
     h.docker.inUse.add(oldId);
-    h.answer = async () => DIGEST_B;
     await h.ensure();
     expect(h.docker.removals).toEqual([oldId]);
     expect(h.docker.images.get(oldId)?.tags).toEqual([]);
@@ -480,8 +670,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
   });
 
   it('keeps the existing image when the rebuild fails, and checks again in a week', async () => {
-    const { h, oldId } = existing(8 * DAY);
-    h.answer = async () => DIGEST_B;
+    const { h, oldId } = await changed();
     h.docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
     };
@@ -498,38 +687,55 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
       lastUsedAt: h.iso(),
     });
 
+    // Not at each open: the next check, a week later, asks for the rebuild again.
+    h.docker.buildHandler = async () => undefined;
     h.advance(HELPER_CHECK_INTERVAL_MS - HOUR);
     await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(1);
     expect(h.docker.builds).toHaveLength(1);
+    h.advance(HOUR);
+    await h.ensure();
+    await h.settled();
+    await h.ensure();
+    expect(h.lookups).toHaveLength(2);
+    expect(h.docker.builds).toHaveLength(2);
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_B });
   });
 
-  it('keeps the image and does not update checkedAt when the registry cannot be reached', async () => {
+  it('keeps the image and tries again after a day, not at each open, when the registry cannot be reached', async () => {
     const { h, oldId } = existing(8 * DAY);
     h.answer = async () => 'unreachable';
     expect(await h.ensure()).toBe(h.tag);
+    await h.settled();
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
-    expect(h.state().images[h.tag].checkedAt).toBe(h.iso(-8 * DAY));
-    expect(h.state().images[h.tag].baseDigest).toBe(DIGEST_A);
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, checkedAt: h.iso(-8 * DAY), attemptedAt: h.iso() });
+    expect(h.logger.lines.join('\n')).toContain('the registry did not answer. It is checked again in a day.');
 
-    // The next job checks again.
-    h.advance(HOUR);
+    // Opens within the day do not check again.
     h.answer = async () => DIGEST_A;
+    h.advance(HELPER_RETRY_INTERVAL_MS - HOUR);
     await h.ensure();
+    await h.settled();
+    expect(h.lookups).toHaveLength(1);
+
+    h.advance(HOUR);
+    await h.ensure();
+    await h.settled();
     expect(h.lookups).toHaveLength(2);
     expect(h.state().images[h.tag].checkedAt).toBe(h.iso());
+    expect(h.state().images[h.tag].attemptedAt).toBeUndefined();
   });
 
-  it('counts a lookup without an answer in time as unreachable, so an offline registry never blocks', async () => {
+  it('counts a lookup without an answer in time as unreachable', async () => {
     const { h } = existing(8 * DAY);
     h.answer = () => new Promise<LookupAnswer>(() => {});
-    const started = Date.now();
     expect(await h.ensure({ baseDigestTimeoutMs: 20 })).toBe(h.tag);
-    expect(Date.now() - started).toBeLessThan(2000);
+    await h.settled();
     expect(h.lookups[0].signal?.aborted).toBe(true);
     expect(h.docker.builds).toHaveLength(0);
-    expect(h.state().images[h.tag].checkedAt).toBe(h.iso(-8 * DAY));
+    expect(h.state().images[h.tag]).toMatchObject({ checkedAt: h.iso(-8 * DAY), attemptedAt: h.iso() });
   });
 
   it('counts a failing lookup as unreachable, also one that throws at once', async () => {
@@ -538,14 +744,17 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
       throw new Error('socket hang up');
     };
     expect(await h.ensure()).toBe(h.tag);
+    await h.settled();
     expect(h.docker.builds).toHaveLength(0);
-    expect(h.state().images[h.tag].checkedAt).toBe(h.iso(-8 * DAY));
+    expect(h.state().images[h.tag]).toMatchObject({ checkedAt: h.iso(-8 * DAY), attemptedAt: h.iso() });
     expect(h.warnings().join('\n')).toContain('socket hang up');
 
     const throwing: BaseDigestLookup = () => {
       throw new Error('not a promise');
     };
+    h.advance(HELPER_RETRY_INTERVAL_MS);
     expect(await h.ensure({ baseDigest: throwing })).toBe(h.tag);
+    await h.settled();
     expect(h.docker.builds).toHaveLength(0);
     expect(h.warnings().join('\n')).toContain('not a promise');
   });
@@ -554,24 +763,27 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     const { h } = existing(8 * DAY);
     h.answer = async () => undefined;
     await h.ensure();
+    await h.settled();
     expect(h.docker.builds).toHaveLength(0);
     expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, checkedAt: h.iso() });
   });
 
-  it('rejects with an AbortError when the signal aborts during the check, without a build', async () => {
+  it('is not stopped by an abort of the open: the check runs in the background with its own time limit', async () => {
     const { h } = existing(8 * DAY);
+    let answer: (value: LookupAnswer) => void = () => undefined;
+    h.answer = () => new Promise<LookupAnswer>((resolve) => (answer = resolve));
     const controller = new AbortController();
-    h.answer = () => new Promise<LookupAnswer>(() => {});
-    setTimeout(() => controller.abort(), 5);
-    await expect(h.ensure({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
-    expect(h.lookups[0].signal?.aborted).toBe(true);
-    expect(h.docker.builds).toHaveLength(0);
-    expect(h.state().images[h.tag].checkedAt).toBe(h.iso(-8 * DAY));
+    expect(await h.ensure({ signal: controller.signal })).toBe(h.tag);
+    controller.abort();
+    expect(h.lookups[0].signal).not.toBe(controller.signal);
+    expect(h.lookups[0].signal?.aborted).toBe(false);
+    answer(DIGEST_A);
+    await h.settled();
+    expect(h.state().images[h.tag].checkedAt).toBe(h.iso());
   });
 
-  it('passes an abort during the rebuild through, and checks again at the next job', async () => {
-    const { h, oldId } = existing(8 * DAY);
-    h.answer = async () => DIGEST_B;
+  it('passes an abort during the rebuild through, and builds again at the next ensure', async () => {
+    const { h, oldId } = await changed();
     const abort = new Error('The operation was cancelled.');
     abort.name = 'AbortError';
     h.docker.buildHandler = async () => {
@@ -579,7 +791,51 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     };
     await expect(h.ensure()).rejects.toBe(abort);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
-    expect(h.state().images[h.tag].checkedAt).toBe(h.iso(-8 * DAY));
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B });
+
+    h.docker.buildHandler = async () => undefined;
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(2);
+    expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_B });
+  });
+
+  it('neither checks nor rebuilds when the check of the base image is off, and rebuilds when it is on again', async () => {
+    const { h } = existing(8 * DAY);
+    await h.ensure({ checkBaseImage: false });
+    await h.settled();
+    expect(h.lookups).toHaveLength(0);
+
+    // A rebuild that an earlier check asked for waits, too.
+    const pending = await changed();
+    await pending.h.ensure({ checkBaseImage: false });
+    expect(pending.h.docker.builds).toHaveLength(0);
+    await pending.h.ensure();
+    expect(pending.h.docker.builds).toHaveLength(1);
+  });
+
+  it('leaves the check, the rebuild, and the cleanup to the next ensure with maintenance when `maintain` is false', async () => {
+    const { h } = await changed();
+    h.writeState({ ...h.state(), lastCleanupAt: h.iso(-2 * DAY) });
+    h.advance(HELPER_CHECK_INTERVAL_MS);
+    h.docker.addImage([]);
+    await h.ensure({ maintain: false });
+    await h.settled();
+    expect(h.lookups).toHaveLength(1);
+    expect(h.docker.builds).toHaveLength(0);
+    expect(h.docker.labelQueries).toEqual([]);
+    expect(h.state().images[h.tag].lastUsedAt).toBe(h.iso());
+
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(1);
+    expect(h.docker.labelQueries.length).toBeGreaterThan(0);
+  });
+
+  it('builds a missing tag also when `maintain` is false', async () => {
+    const h = new Harness();
+    await h.ensure({ maintain: false });
+    expect(h.docker.builds).toHaveLength(1);
+    expect(h.docker.builds[0]).toMatchObject({ pull: true });
+    expect(h.docker.labelQueries).toEqual([]);
   });
 });
 
@@ -611,6 +867,7 @@ describe('ensureHelperImage with a state file: lastUsedAt and the state file', (
     fs.writeFileSync(h.statePath, '{ not json');
     h.docker.addImage([h.tag]);
     expect(await h.ensure()).toBe(h.tag);
+    await h.settled();
     expect(h.docker.builds).toHaveLength(0);
     expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, checkedAt: h.iso() });
   });
@@ -685,7 +942,9 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     expect(h.docker.images.has(danglingId)).toBe(false);
     for (const id of [currentId, recentId, unlabeledId, unlabeledDanglingId, derivedId]) expect(h.docker.images.has(id)).toBe(true);
     const state = h.state();
-    expect(Object.keys(state.images).sort()).toEqual([OTHER_TAG, h.tag].sort());
+    expect(Object.keys(state.images).sort()).toEqual([OLD_TAG, OTHER_TAG, h.tag].sort());
+    // A tombstone: if the tag comes back, another installation uses it.
+    expect(state.images[OLD_TAG]).toEqual({ removedAt: h.iso() });
     expect(state.lastCleanupAt).toBe(h.iso());
 
     // Tags of other repositories are never removed, however long ago they were used.
@@ -708,7 +967,7 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     const otherId = h.docker.addImage([OTHER_TAG]);
     await h.ensure();
     expect(h.docker.removals).toEqual([]);
-    expect(h.state().images[OTHER_TAG]).toEqual({ lastUsedAt: h.iso() });
+    expect(h.state().images[OTHER_TAG]).toEqual({ foreignSince: h.iso(), lastUsedAt: h.iso() });
 
     h.advance(HELPER_UNUSED_LIMIT_MS - HOUR);
     await h.ensure();
@@ -719,7 +978,7 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     await h.ensure();
     expect(h.docker.removals).toEqual([OTHER_TAG]);
     expect(h.docker.images.has(otherId)).toBe(false);
-    expect(h.state().images[OTHER_TAG]).toBeUndefined();
+    expect(h.state().images[OTHER_TAG]).toEqual({ removedAt: h.iso() });
   });
 
   it('keeps a helper tag that another window used within 7 days', async () => {
@@ -772,7 +1031,11 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     h.advance(HELPER_CLEANUP_INTERVAL_MS);
     await h.ensure();
     for (const id of [oldId, otherId, danglingId]) expect(h.docker.images.has(id)).toBe(false);
-    expect(Object.keys(h.state().images)).toEqual([h.tag]);
+    expect(h.state().images).toEqual({
+      [h.tag]: expect.objectContaining({ baseDigest: DIGEST_A }),
+      [OLD_TAG]: { removedAt: h.iso() },
+      [OTHER_TAG]: { removedAt: h.iso() },
+    });
   });
 
   it('skips the cleanup when the images cannot be listed, and tries again at the next job', async () => {
@@ -809,6 +1072,113 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     await h.ensure();
     expect(h.docker.removals).toEqual([]);
     expect(Object.keys(h.state().images).sort()).toEqual([OTHER_TAG, h.tag].sort());
+  });
+});
+
+describe('ensureHelperImage with a state file: two installations on one Docker engine', () => {
+  // VS Code and VS Code Insiders have their own global storage folder (so their own helper.json) and share one Docker
+  // engine. With different extension versions, each one's helper tag is foreign to the other.
+  const DOCKERFILE_A = `${HELPER_DOCKERFILE}RUN echo a\n`;
+  const DOCKERFILE_B = `${HELPER_DOCKERFILE}RUN echo b\n`;
+
+  function installations() {
+    const h = new Harness();
+    const install = (name: string, content: string) => {
+      const file = path.join(path.dirname(h.file), name, 'Dockerfile');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content);
+      const statePath = path.join(path.dirname(h.file), name, 'storage', 'helper.json');
+      return {
+        tag: helperImageTag(content),
+        statePath,
+        ensure: async () => {
+          const checks: Array<Promise<void>> = [];
+          const options = { statePath, baseDigest: h.baseDigest, clock: h.clock, logger: h.logger };
+          await ensureHelperImage(h.docker, file, { ...options, onBaseImageCheck: (check) => checks.push(check) });
+          await Promise.all(checks);
+        },
+        state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
+      };
+    };
+    return { h, stable: install('stable', DOCKERFILE_A), insiders: install('insiders', DOCKERFILE_B) };
+  }
+
+  it('removes the helper of the other installation at most once, and keeps it when it comes back', async () => {
+    const { h, stable, insiders } = installations();
+    expect(stable.tag).not.toBe(insiders.tag);
+    for (let day = 0; day < 40; day++) {
+      await stable.ensure();
+      h.advance(2 * HOUR);
+      await insiders.ensure();
+      h.advance(DAY - 2 * HOUR);
+    }
+    const removals = (tag: string) => h.docker.removals.filter((reference) => reference === tag).length;
+    expect(removals(insiders.tag)).toBe(1);
+    expect(removals(stable.tag)).toBe(1);
+    // Each one built its helper twice: at the first open, and once after the other one removed it.
+    expect(h.docker.builds.filter((build) => build.tag === stable.tag)).toHaveLength(2);
+    expect(h.docker.builds.filter((build) => build.tag === insiders.tag)).toHaveLength(2);
+    expect(h.docker.idOf(stable.tag)).toBeDefined();
+    expect(h.docker.idOf(insiders.tag)).toBeDefined();
+    expect(stable.state().images[insiders.tag]?.removedAt).toBeDefined();
+    expect(h.logger.lines.join('\n')).toContain(`${insiders.tag} was built again after its removal: another installation uses it. It is kept.`);
+  });
+});
+
+describe('ensureHelperImage with a state file: tombstones of removed helper tags', () => {
+  function current(records: Record<string, HelperState['images'][string]> = {}) {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
+    h.writeState({
+      version: 1,
+      images: { [h.tag]: { baseImage: BASE, baseDigest: DIGEST_A, checkedAt: h.iso(), lastUsedAt: h.iso() }, ...records },
+    });
+    return h;
+  }
+
+  it('still removes an old tag of this installation after 7 days without use, and keeps it when it comes back', async () => {
+    const h = current({ [OLD_TAG]: { baseImage: BASE, builtAt: h0(-30 * DAY), lastUsedAt: h0(-HELPER_UNUSED_LIMIT_MS) } });
+    h.docker.addImage([OLD_TAG]);
+    await h.ensure();
+    expect(h.docker.removals).toEqual([OLD_TAG]);
+    expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h.iso() });
+
+    // Another installation with that extension version builds it again: it stays.
+    h.docker.addImage([OLD_TAG]);
+    for (let day = 0; day < 20; day++) {
+      h.advance(DAY);
+      await h.ensure();
+    }
+    expect(h.docker.removals).toEqual([OLD_TAG]);
+    expect(h.docker.idOf(OLD_TAG)).toBeDefined();
+  });
+
+  it('keeps a tombstone through the pruning of old records, and drops it when it expires', async () => {
+    const h = current({ [OLD_TAG]: { removedAt: h0(-30 * DAY) }, [OTHER_TAG]: { removedAt: h0(-HELPER_TOMBSTONE_MS) } });
+    await h.ensure();
+    expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h0(-30 * DAY) });
+    expect(h.state().images[OTHER_TAG]).toBeUndefined();
+  });
+
+  it('gives a tag whose tombstone expired a new grace period', async () => {
+    const h = current({ [OTHER_TAG]: { removedAt: h0(-HELPER_TOMBSTONE_MS) } });
+    const otherId = h.docker.addImage([OTHER_TAG]);
+    await h.ensure();
+    expect(h.docker.images.has(otherId)).toBe(true);
+    expect(h.state().images[OTHER_TAG]).toEqual({ foreignSince: h.iso(), lastUsedAt: h.iso() });
+  });
+
+  it('drops the marks of the cleanup when the tag becomes the tag of this installation', async () => {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
+    h.writeState({ version: 1, images: { [h.tag]: { foreignSince: h.iso(-DAY), lastUsedAt: h.iso(-DAY + HOUR) } }, lastCleanupAt: h.iso() });
+    await h.ensure();
+    await h.settled();
+    expect(h.state().images[h.tag].foreignSince).toBeUndefined();
+
+    h.writeState({ version: 1, images: { [OTHER_TAG]: { removedAt: h.iso(-DAY) } } });
+    await recordHelperImageUse(h.statePath, OTHER_TAG, { clock: h.clock });
+    expect(h.state().images[OTHER_TAG]).toEqual({ lastUsedAt: h.iso() });
   });
 });
 

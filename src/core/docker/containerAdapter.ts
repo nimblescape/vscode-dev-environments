@@ -501,26 +501,31 @@ export class ContainerAdapter {
   }
 
   /**
-   * Local images with a label (`docker image ls --filter label=<label> --no-trunc`), for example `devenv.helper=true`.
-   * Dangling images are included, with no tags. One entry per image ID, with all its tags. Throws CommandError.
+   * Local images with a label (`docker image ls --filter label=<label> --no-trunc`, then the same with
+   * `--filter dangling=true`), for example `devenv.helper=true`. Dangling images are included, with no tags. One entry
+   * per image ID, with all its tags. Throws CommandError.
    */
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {
-    const args = ['image', 'ls', '--filter', `label=${label}`, '--no-trunc', '--format', '{{json .}}'];
-    const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     const images = new Map<string, ImageInfo>();
-    for (const item of parseJsonLines(stdout)) {
-      if (!isRecord(item) || typeof item.ID !== 'string' || item.ID === '') continue;
-      let image = images.get(item.ID);
-      if (!image) {
-        image = { id: item.ID, tags: [], createdAt: typeof item.CreatedAt === 'string' ? item.CreatedAt : '' };
-        images.set(item.ID, image);
+    // The containerd image store lists dangling images only with `--filter dangling=true` (or `-a`). `-a` would also
+    // list the intermediate images of the classic builder, which are not dangling.
+    for (const filters of [[], ['--filter', 'dangling=true']]) {
+      const args = ['image', 'ls', '--filter', `label=${label}`, ...filters, '--no-trunc', '--format', '{{json .}}'];
+      const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+      for (const item of parseJsonLines(stdout)) {
+        if (!isRecord(item) || typeof item.ID !== 'string' || item.ID === '') continue;
+        let image = images.get(item.ID);
+        if (!image) {
+          image = { id: item.ID, tags: [], createdAt: typeof item.CreatedAt === 'string' ? item.CreatedAt : '' };
+          images.set(item.ID, image);
+        }
+        // A dangling image is listed as `<none>:<none>`.
+        const { Repository: repository, Tag: tag } = item;
+        if (typeof repository !== 'string' || typeof tag !== 'string') continue;
+        if (!repository || !tag || repository === '<none>' || tag === '<none>') continue;
+        const reference = `${repository}:${tag}`;
+        if (!image.tags.includes(reference)) image.tags.push(reference);
       }
-      // A dangling image is listed as `<none>:<none>`.
-      const { Repository: repository, Tag: tag } = item;
-      if (typeof repository !== 'string' || typeof tag !== 'string') continue;
-      if (!repository || !tag || repository === '<none>' || tag === '<none>') continue;
-      const reference = `${repository}:${tag}`;
-      if (!image.tags.includes(reference)) image.tags.push(reference);
     }
     return [...images.values()];
   }

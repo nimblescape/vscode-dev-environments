@@ -72,6 +72,8 @@ export class FakeDocker implements EnvironmentDocker {
   readonly containers = new Map<string, ContainerInfo>();
   readonly volumes = new Map<string, Record<string, string>>();
   readonly images = new Set<string>();
+  /** Image IDs of references that name one image (a tag and a digest reference). Default: an image per reference. */
+  readonly imageIds = new Map<string, string>();
   /** Changing calls, in order: `pull x`, `rm x`, `rmi x`, `stop x`, `volume create x`, `volume rm x`, `start x`. */
   readonly log: string[] = [];
   readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal }> = [];
@@ -179,6 +181,11 @@ export class FakeDocker implements EnvironmentDocker {
 
   async imageExists(reference: string): Promise<boolean> {
     return this.images.has(reference);
+  }
+
+  async imageId(reference: string): Promise<string | undefined> {
+    if (!this.images.has(reference)) return undefined;
+    return this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
   }
 
   async removeImage(reference: string): Promise<boolean> {

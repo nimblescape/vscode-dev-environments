@@ -298,6 +298,7 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:docker": "vitest run --config vitest.docker.config.ts",
     "vscode:prepublish": "node esbuild.mjs --production",
     "package": "vsce package --no-dependencies --skip-license --allow-missing-repository"
   },

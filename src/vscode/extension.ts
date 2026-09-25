@@ -103,7 +103,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
     env,
     // Implementation notes 7: the weekly check of the base image uses the registry client (and the credentials) of the
-    // image check, under its time limit of 5 seconds.
+    // image check, with its own time limit of 5 seconds, in the background of the open.
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
   });

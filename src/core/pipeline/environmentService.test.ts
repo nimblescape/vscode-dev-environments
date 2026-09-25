@@ -1,8 +1,11 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { CommandError, UserFacingError } from '../errors';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
+import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
+import type { EnsureImageOptions } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import {
   LABEL_ENVIRONMENT_ID,
@@ -521,6 +524,24 @@ describe('open: existing environment', () => {
     expect(h.progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
   });
 
+  it('keeps the tag of the base image that the pull moved to the new image (classic image store)', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
+    h.docker.images.add(oldBase);
+    h.docker.images.add(BASE_IMAGE);
+    h.docker.imageIds.set(oldBase, 'sha256:old-base');
+    h.docker.imageIds.set(BASE_IMAGE, 'sha256:old-base');
+    const pull = h.docker.pullImage.bind(h.docker);
+    h.docker.pullImage = async (reference, pullOptions) => {
+      await pull(reference, pullOptions);
+      h.docker.imageIds.set(reference, 'sha256:new-base');
+    };
+    await h.service.open(TARGET, options());
+    expect(h.docker.images.has(oldBase)).toBe(false);
+    expect(h.docker.images.has(BASE_IMAGE)).toBe(true);
+    expect(h.docker.log).not.toContain(`rmi ${BASE_IMAGE}`);
+  });
+
   it('keeps a base image that another environment still uses', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     await seedEnvironment(h, {
@@ -869,6 +890,96 @@ describe('open: existing environment', () => {
     await h.service.open(TARGET, options());
     expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
     expect(h.progress.details).toEqual([PipelineTexts.preparingHelper, '']);
+  });
+
+  it('shows the rebuild of an existing helper image from a new base image as an update, not as a first preparation', async () => {
+    await seedEnvironment(h);
+    const original = h.helper.ensureImage.bind(h.helper);
+    h.helper.ensureImage = async (opts?: EnsureImageOptions) => {
+      opts?.onBuild?.('refresh');
+      opts?.onOutput?.('#5 [2/4] RUN apt-get update');
+      return original();
+    };
+    await h.service.open(TARGET, options());
+    expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
+    expect(h.progress.details).toEqual([PipelineTexts.updatingHelper, '']);
+    expect(PipelineTexts.updatingHelper).not.toMatch(/once/);
+  });
+
+  it('checks the base image of the helper only when the setting updateImagesOnConnect is on', async () => {
+    await seedEnvironment(h);
+    const seen: Array<boolean | undefined> = [];
+    const original = h.helper.ensureImage.bind(h.helper);
+    h.helper.ensureImage = async (opts?: EnsureImageOptions) => {
+      seen.push(opts?.checkBaseImage);
+      return original();
+    };
+    await h.service.open(TARGET, options());
+    await h.service.stop(ENV_ID);
+    h.settings.updateImagesOnConnect = false;
+    await h.service.open(TARGET, options());
+    expect(seen).toEqual([true, false]);
+  });
+
+  it('does not wait for the check of the base image of the helper: the image check runs meanwhile, so both share its time limit', async () => {
+    await seedEnvironment(h);
+    const dockerfilePath = path.join(h.root, 'helper', 'Dockerfile');
+    fs.mkdirSync(path.dirname(dockerfilePath), { recursive: true });
+    fs.writeFileSync(dockerfilePath, 'FROM node:24-trixie-slim\n');
+    const tag = helperImageTag('FROM node:24-trixie-slim\n');
+    const eightDaysAgo = new Date(T0 - 8 * 24 * 60 * 60 * 1000).toISOString();
+    fs.writeFileSync(
+      h.paths.helperState,
+      JSON.stringify({
+        version: 1,
+        images: { [tag]: { baseImage: 'node:24-trixie-slim', baseDigest: DIGEST_OLD, checkedAt: eightDaysAgo, lastUsedAt: eightDaysAgo } },
+        lastCleanupAt: new Date(T0).toISOString(),
+      }),
+    );
+    const helperDocker: HelperImageDocker = {
+      imageExists: async () => true,
+      imageId: async () => 'sha256:helper',
+      buildImage: async () => {
+        throw new Error('no build expected');
+      },
+      listImagesByLabel: async () => [],
+      removeImage: async () => false,
+    };
+    // The registry does not answer the helper: its lookup runs until its time limit (5 seconds) ends it.
+    let lookupSignal: AbortSignal | undefined;
+    let answer: (value: 'unreachable') => void = () => undefined;
+    const checks: Array<Promise<void>> = [];
+    h.helper.ensureImage = (opts?: EnsureImageOptions) =>
+      ensureHelperImage(helperDocker, dockerfilePath, {
+        ...opts,
+        statePath: h.paths.helperState,
+        clock: { now: () => T0 },
+        baseDigest: (_reference, signal) => {
+          lookupSignal = signal;
+          return new Promise((resolve) => (answer = resolve));
+        },
+        onBaseImageCheck: (check) => checks.push(check),
+      });
+    let helperLookupRunning: boolean | undefined;
+    const check = h.checker.check.bind(h.checker);
+    h.checker.check = async (references) => {
+      helperLookupRunning = lookupSignal !== undefined && !lookupSignal.aborted;
+      return check(references);
+    };
+
+    await h.service.open(TARGET, options());
+    expect(h.checker.calls).toHaveLength(1);
+    // The image check started while the lookup of the helper still ran: the two waits overlap, and the start is delayed
+    // by one time limit at most (NFR-08), not by two.
+    expect(helperLookupRunning).toBe(true);
+
+    answer('unreachable');
+    await Promise.all(checks);
+    expect(lookupSignal?.aborted).toBe(true);
+    expect(JSON.parse(fs.readFileSync(h.paths.helperState, 'utf8')).images[tag]).toMatchObject({
+      checkedAt: eightDaysAgo,
+      attemptedAt: new Date(T0).toISOString(),
+    });
   });
 
   it('offers the sign-in once per registry that requires it', async () => {
@@ -1464,6 +1575,22 @@ describe('delete', () => {
     expect(await h.sessionFiles.readReopen()).toBeUndefined();
     // The other environment keeps its image.
     expect(h.docker.images.has(environmentImageName(OTHER_ID, 1))).toBe(true);
+  });
+
+  it('removes the tag of an unused base image that the removal by digest keeps (classic image store)', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
+    // The classic image store: the tag and the digest reference name the same image; `docker image rm <digest
+    // reference>` removes only that reference.
+    h.docker.images.add(oldBase);
+    h.docker.images.add(BASE_IMAGE);
+    h.docker.imageIds.set(oldBase, 'sha256:base');
+    h.docker.imageIds.set(BASE_IMAGE, 'sha256:base');
+    h.docker.images.add('mcr.microsoft.com/devcontainers/base:other');
+    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    expect(h.docker.log.filter((line) => line.startsWith('rmi mcr.'))).toEqual([`rmi ${oldBase}`, `rmi ${BASE_IMAGE}`]);
+    expect(h.docker.images.has(BASE_IMAGE)).toBe(false);
+    expect(h.docker.images.has('mcr.microsoft.com/devcontainers/base:other')).toBe(true);
   });
 
   it('keeps additional volumes unless asked, and a reopen record of another environment', async () => {

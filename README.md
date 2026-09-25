@@ -70,7 +70,8 @@ Git on your computer is not needed.
 
 ```sh
 npm install
-npm run build     # bundles dist/extension.js and dist/sessionMonitor.js
-npm test          # unit tests, without VS Code and without Docker
-npm run package   # creates the .vsix file
+npm run build         # bundles dist/extension.js and dist/sessionMonitor.js
+npm test              # unit tests, without VS Code and without Docker
+npm run test:docker   # integration tests against the running Docker engine
+npm run package       # creates the .vsix file
 ```
