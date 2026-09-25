@@ -33,13 +33,14 @@ import { Messages } from '../../src/core/messages';
 import {
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
+  LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   environmentImageRepository,
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
-import { isoTime, systemClock } from '../../src/core/ports';
+import { isoTime, systemClock, type GitHubAuth } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
@@ -162,7 +163,7 @@ describe('open pipeline on a seeded environment', () => {
   const offlineHelper = helperWithDueCheck(offlineTransport, 'offline');
   const hangingHelper = helperWithDueCheck(hangingTransport, 'hanging');
 
-  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper): EnvironmentService {
+  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): EnvironmentService {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
     return new EnvironmentService({
       docker,
@@ -171,7 +172,7 @@ describe('open pipeline on a seeded environment', () => {
       registry,
       sessionFiles,
       imageChecker: timedChecker(new ImageChecker(client, log), label, checks),
-      auth: fakeAuth,
+      auth,
       ui,
       logger: log,
       clock: systemClock,
@@ -864,6 +865,51 @@ describe('open pipeline on a seeded environment', () => {
       cli.run(['rm', '-f', name]);
       for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
       cli.run(['volume', 'rm', name]);
+    }
+  });
+
+  it('two accounts, one repository: two volumes and two containers, each with the identity of its owner; both come back after a lost registry (D-3)', async () => {
+    const repository = 'devenv-test/shared';
+    const second = { id: '4343', login: 'devenv-test-second' };
+    const secondService = service(registryTransport, 'second account', helper, { ...fakeAuth, getAccount: async () => second });
+    const config = JSON.stringify({ name: 'Shared', build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`] });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    const owners = [TEST_ACCOUNT, second];
+    const entries = owners.map((account) => {
+      const id = newEnvironmentId();
+      return { account, id, name: resourceName(repository, id) };
+    });
+    try {
+      const now = isoTime(systemClock);
+      for (const { account, id, name } of entries) {
+        await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: account.id, [TEST_RUN_LABEL]: run.runId });
+        const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/shared', config, dockerfile], { docker: false, network: false });
+        expect(seeded.exitCode, seeded.stderr).toBe(0);
+        // The registry keeps one environment per repository and account, so both entries are added.
+        await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: account });
+      }
+      await timings.measure('first open of the first account', () => online.openEnvironment(entries[0].id, { progress: new RecordingProgress() }));
+      await timings.measure('first open of the second account', () => secondService.openEnvironment(entries[1].id, { progress: new RecordingProgress() }));
+      // Each account's own environment cannot be opened by the other one.
+      await expect(online.openEnvironment(entries[1].id, { progress: new RecordingProgress() })).rejects.toMatchObject({ code: 'otherAccount' });
+      expect(new Set(entries.map(({ name }) => name)).size).toBe(2);
+      for (const { account, name } of entries) {
+        expect(cli.volume(name)).toBeDefined();
+        expect(cli.container(name)?.State.Running).toBe(true);
+        const email = cli.run(['exec', '-u', REMOTE_USER, name, 'git', 'config', '--get', 'user.email']);
+        expect(email.out, email.err).toBe(`${account.id}+${account.login}@users.noreply.github.com`);
+      }
+      // A lost registry: both environments come back from the labels of their volumes, each with its owner.
+      for (const { id } of entries) await registry.remove(id);
+      expect(await online.reconcileFromVolumes()).toBeGreaterThanOrEqual(2);
+      for (const { account, id } of entries) expect((await registry.get(id))?.owner?.id).toBe(account.id);
+    } finally {
+      for (const { id, name } of entries) {
+        await registry.remove(id);
+        cli.run(['rm', '-f', name]);
+        for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+        cli.run(['volume', 'rm', name]);
+      }
     }
   });
 
