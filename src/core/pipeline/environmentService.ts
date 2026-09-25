@@ -1429,6 +1429,7 @@ export class EnvironmentService {
     const outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown);
     if (container?.state === 'running' && !outdated) {
       this.logger.info(`The container ${container.name} runs already.`);
+      await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
       await this.prepareGit(ctx);
       return { created: false, container };
     }
@@ -1550,12 +1551,17 @@ export class EnvironmentService {
       });
     } catch (error) {
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
-      if (!kept) throw error;
+      if (!kept) {
+        // A container that `up` created before it failed or was cancelled mounts its volumes already.
+        await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
+        throw error;
+      }
       result = kept;
     }
     // A volume named with ${devcontainerId} gets its name only at `up`, so neither the configuration nor the image
-    // metadata named it: the new container does.
-    if (createsContainer) await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
+    // metadata named it: the container does. Also for an existing container, whose volumes an earlier failed or cancelled
+    // `up` may not have recorded.
+    await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
     const failure = nonEmptyString(result.lifecycleCommandFailure);
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image);
   }

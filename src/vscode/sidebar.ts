@@ -70,6 +70,8 @@ export class Sidebar implements vscode.Disposable {
   private lookups: ReadonlyMap<string, RepositoryInfo | null> = new Map();
   private timer: NodeJS.Timeout | undefined;
   private signInOffered = false;
+  /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
+  private accountChanges = 0;
   private disposed = false;
   private readonly renderTask = new CoalescingTask(() => this.renderNow());
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
@@ -158,7 +160,10 @@ export class Sidebar implements vscode.Disposable {
   async onSessionChanged(options: { again?: boolean } = {}): Promise<void> {
     const account = await this.readAccount();
     // Another account: its own stored list at once, never the list of the previous one (concept 6.2).
-    if (account?.id !== this.account?.id) await this.useAccount(account);
+    if (account?.id !== this.account?.id) {
+      this.accountChanges++;
+      await this.useAccount(account);
+    }
     this.setSignedIn(account !== undefined && (await this.authSignedIn()));
     this.renderInBackground();
     if (this.signedIn) await this.refreshDiscovery({ again: options.again ?? true });
@@ -291,8 +296,13 @@ export class Sidebar implements vscode.Disposable {
 
   private async refreshDiscoveryNow(): Promise<DiscoveryData | undefined> {
     if (this.disposed) return this.data;
-    const token = await this.deps.auth.getToken({ interactive: false });
-    const account = token === undefined ? undefined : await this.readAccount();
+    // Token and account of one session: the list is stored for the account, and the claims give entries to it.
+    const changes = this.accountChanges;
+    const session = await this.readSession();
+    // The account changed while the session was read: the refresh of that change uses the new session.
+    if (changes !== this.accountChanges) return this.data;
+    const token = session?.token;
+    const account = session?.account;
     if (account?.id !== this.account?.id) await this.useAccount(account);
     // A session whose token GitHub rejected does not count as signed in (auth.ts): no refresh, which would fail again,
     // until Sign in with GitHub replaces the token.
@@ -400,6 +410,15 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /** The account of the GitHub session, without a dialog. */
+  private async readSession(): Promise<{ token: string; account: GitHubAccount } | undefined> {
+    try {
+      return await this.deps.auth.getSession({ interactive: false });
+    } catch (error) {
+      this.deps.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
   private async readAccount(): Promise<GitHubAccount | undefined> {
     try {
       return await this.deps.auth.getAccount({ interactive: false });

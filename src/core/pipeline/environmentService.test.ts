@@ -2957,6 +2957,28 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.docker.volumes.has('0k5q7r2m-history')).toBe(false);
     });
 
+    it('are recorded from a container whose `up` failed after it created the container, at once and at the next open', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=${devcontainerId}-history,target=/h,type=volume'] };
+      h.helper.containerVolumes = ['0k5q7r2m-history'];
+      const up = h.helper.up.bind(h.helper);
+      let fail = true;
+      h.helper.up = async (p) => {
+        const result = await up(p);
+        if (fail) throw new Error('up failed after the container was created');
+        return result;
+      };
+      await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
+      // An entry without it (for example of a version before this record) gets it at the next open of the container.
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        delete entry.additionalVolumes;
+      });
+      fail = false;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
+    });
+
     it('are recorded from the merged configuration too (a Feature of an existing container)', async () => {
       await seedEnvironment(h);
       h.helper.merged = { mounts: ['source=feature-cache,target=/c,type=volume'] };

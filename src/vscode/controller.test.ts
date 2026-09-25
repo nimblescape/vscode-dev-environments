@@ -2163,8 +2163,13 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.claims.claim).not.toHaveBeenCalled();
     expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
-    // For example another account signed in at the sign-in of the claim: it was not asked, so the message says so.
-    expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
+    // For example another account signed in at the sign-in of the claim: it was not asked, so the message says so, with
+    // Try again, which runs the command again for the account that is signed in now.
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
+      ControllerTexts.accountChangedDuringClaim('acme/api'),
+      Actions.showDetails,
+      Actions.tryAgain,
+    );
   });
 
   it('role A: claims nothing when the session changed, and closes the connection', async () => {

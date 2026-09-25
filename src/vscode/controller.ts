@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
-import { UserFacingError, errorMessage } from '../core/errors';
+import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
 import { CONFIG_FOLDER_OWNER_COMMAND, parseOwnerIds } from '../core/helper/containerGit';
 import { Actions, DOCKER_DOWNLOAD_URL, Messages, formatChanges } from '../core/messages';
 import { GITHUB_TOKEN_FILE, repositoryFolder, splitRepository } from '../core/names';
@@ -244,14 +244,18 @@ export class Controller implements vscode.Disposable {
       showLog: async () => this.logger.show(),
       signIn: () => this.signIn(),
     };
+    const run = async (name: CommandName, argument: unknown): Promise<void> => {
+      try {
+        await handlers[name](argument);
+      } catch (error) {
+        // An entry of an older version that a command could not assign yet (for example the account changed during the
+        // claim): Try again runs the command again, for the account that is signed in then.
+        const again = isUserFacingError(error) && error.code === 'environmentUnassigned' ? () => run(name, argument) : undefined;
+        this.showError(error, again);
+      }
+    };
     return (Object.keys(handlers) as CommandName[]).map((name) =>
-      vscode.commands.registerCommand(Commands[name], async (argument: unknown) => {
-        try {
-          await handlers[name](argument);
-        } catch (error) {
-          this.showError(error);
-        }
-      }),
+      vscode.commands.registerCommand(Commands[name], (argument: unknown) => run(name, argument)),
     );
   }
 
