@@ -635,15 +635,26 @@ export class Controller implements vscode.Disposable {
       },
     );
     if (!picked) return;
+    await this.applyConfiguration(target, picked.configPath);
+  }
+
+  /**
+   * Select configuration… after the pick. Try again of a first open that failed runs this step again with the same
+   * configuration, for the environment of the repository that the account signed in now has then, as the command does.
+   */
+  private async applyConfiguration(target: Target, configPath: string): Promise<void> {
+    const environment = target.environment;
     if (!environment) {
-      await this.startTarget(target, { configPath: picked.configPath });
+      await this.startTarget(target, { configPath }, async () =>
+        this.applyConfiguration(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), configPath),
+      );
       return;
     }
-    if (picked.configPath === environment.configPath) {
-      this.logger.info(`${repository} uses the configuration ${picked.configPath} already.`);
+    if (configPath === environment.configPath) {
+      this.logger.info(`${this.displayName(target)} uses the configuration ${configPath} already.`);
       return;
     }
-    await this.rebuildEnvironment(target, environment, { reason: 'configurationSelected', configPath: picked.configPath });
+    await this.rebuildEnvironment(target, environment, { reason: 'configurationSelected', configPath });
   }
 
   /** Switch branch… (concept 6.2, 7.5). */
@@ -659,11 +670,24 @@ export class Controller implements vscode.Disposable {
       : undefined;
     const branch = await this.pickBranch(this.displayName(target), token, current, target.info?.defaultBranch ?? undefined);
     if (!branch) return;
+    await this.switchToBranch(target, branch);
+  }
+
+  /**
+   * Switch branch… after the pick. Try again of a first open that failed runs this step again with the same branch, for
+   * the environment of the repository that the account signed in now has then (its own, an older entry that it claims,
+   * or none), as the command does.
+   */
+  private async switchToBranch(target: Target, branch: string): Promise<void> {
+    const environment = target.environment;
     if (!environment) {
       // Concept 6.2: without an environment, the first Start creates it on the selected branch.
-      await this.startTarget(target, { branch });
+      await this.startTarget(target, { branch }, async () =>
+        this.switchToBranch(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), branch),
+      );
       return;
     }
+    const current = this.deps.sidebar.liveBranch(environment.id) ?? environment.gitSummary?.branch ?? undefined;
     if (branch === current && this.isConnectedHere(environment)) {
       this.logger.info(`${this.displayName(target)} is on the branch ${branch} already.`);
       return;
@@ -751,7 +775,8 @@ export class Controller implements vscode.Disposable {
    * Start flow (concept 6.2, 6.6, 7.6, 7.11): the open pipeline, then the connection of this window. The window stays
    * connected to its previous environment while the pipeline runs (a switch is the same flow).
    */
-  private async startTarget(target: Target, options: StartOptions = {}): Promise<void> {
+  /** `retry`: Try again after a failure; by default a Start of the target again (a first open of a command sets its own). */
+  private async startTarget(target: Target, options: StartOptions = {}, retry?: () => Promise<void>): Promise<void> {
     const { service, connection } = this.deps;
     const environment = target.environment;
     const repository = this.displayName(target);
@@ -826,31 +851,10 @@ export class Controller implements vscode.Disposable {
             }),
         }),
       // Try again is a Start: a repository takes the account of a session with a working token, as at the first try.
-      { retry: async () => this.retryStart(target, options) },
+      { retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'))) },
     );
     // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
     if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
-  }
-
-  /**
-   * Try again of a Start. The options apply to a first open only: when the account signed in now has an environment of
-   * the repository already (the account changed after the failure), Switch branch… and Select configuration… go their
-   * own way for an existing environment, as when the command runs again.
-   */
-  private async retryStart(target: Target, options: StartOptions): Promise<void> {
-    const fresh = await this.refreshedTarget(target, 'token');
-    const environment = fresh.environment;
-    if (!environment || (!options.branch && !options.configPath)) {
-      await this.startTarget(fresh, environment ? {} : options);
-      return;
-    }
-    if (options.branch) {
-      await this.switchEnvironmentBranch(fresh, environment, options.branch);
-    } else if (options.configPath && options.configPath !== environment.configPath) {
-      await this.rebuildEnvironment(fresh, environment, { reason: 'configurationSelected', configPath: options.configPath });
-    } else {
-      await this.startTarget(fresh);
-    }
   }
 
   /** Runs a flow that ends by connecting this window, with its number for `connect`. */

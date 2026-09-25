@@ -2360,6 +2360,66 @@ describe('Accounts (concept 7.5)', () => {
     });
   });
 
+  describe('Try again of a first open of Switch branch… with an entry of an older version', () => {
+    beforeEach(async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      h.service.open.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+      fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
+    });
+
+    async function switchToFeature(): Promise<void> {
+      const command = run('switchBranch', row('acme/api'));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+    }
+
+    it('asks about the entry again, and tells the open not to ask a second time when the user declines', async () => {
+      await switchToFeature();
+      await settle(() => h.service.open.mock.calls.length === 2, 'Try again');
+      expect(h.claims.claim).toHaveBeenCalledTimes(2);
+      expect(h.service.open.mock.calls.map((call) => call[1])).toEqual([
+        expect.objectContaining({ branch: 'feature-x', olderEnvironmentAsked: true }),
+        expect.objectContaining({ branch: 'feature-x', olderEnvironmentAsked: true }),
+      ]);
+    });
+
+    it('switches the branch of the entry when the user accepts it at Try again', async () => {
+      h.claims.claim
+        .mockResolvedValueOnce([])
+        .mockImplementationOnce(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
+          await h.registry.updateEnvironment(ENV_ID, (entry) => {
+            entry.owner = account;
+          });
+          return options.environmentIds;
+        });
+      await switchToFeature();
+      await settle(() => h.service.switchBranch.mock.calls.length === 1, 'Try again');
+      expect(h.service.open).toHaveBeenCalledTimes(1);
+      expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
+    });
+  });
+
+  it('Try again of a first open of Select configuration… with the configuration of the environment of the new account already does nothing more', async () => {
+    await h.registry.add(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' }));
+    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
+    h.service.open.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    let retried = false;
+    fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      h.auth.getToken.mockResolvedValue('gho_other');
+      retried = true;
+      return Actions.tryAgain;
+    });
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ configPath: string }>) =>
+      items.find((item) => item.configPath === '.devcontainer/devcontainer.json'),
+    );
+    await run('selectConfiguration', row('acme/api'));
+    await settle(() => retried && h.logger.info.mock.calls.some((call: unknown[]) => String(call[0]).includes('uses the configuration')), 'Try again');
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.open).toHaveBeenCalledTimes(1);
+  });
+
   it('offers no Try again of the command for errors other than an unassigned environment', async () => {
     // Refresh has no Try again of its own: a failure reaches the error display of the command.
     h.sidebar.refreshDiscovery.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
