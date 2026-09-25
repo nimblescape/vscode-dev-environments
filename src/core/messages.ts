@@ -83,6 +83,12 @@ export const Messages = {
    */
   olderEnvironmentNotAssigned: (repository: string) =>
     `The environment of ${repository} was created with an older version of Dev Environments and is not assigned to a GitHub account yet. It could not be assigned to the signed-in account: GitHub did not confirm the access to ${repository}, or the assignment was not confirmed. Try again later.`,
+  /**
+   * Concept 7.5: the entry of an older version of the repository stays without owner, and it uses named volumes of the
+   * repository that a new environment would share. Nothing is created; the next Start asks again.
+   */
+  olderEnvironmentUsesVolumes: (repository: string) =>
+    `The environment of ${repository} was created with an older version of Dev Environments and uses named volumes of the repository. A new environment would share them, so none was created. Assign the older environment to your account to use it.`,
   otherAccountConnection: (repository: string) =>
     `The environment of ${repository} does not belong to the GitHub account that is signed in. This window closes its connection.`,
   gitSetupFailed: 'Git in the environment could not be prepared. Pushing to GitHub may not work.',

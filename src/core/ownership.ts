@@ -105,6 +105,8 @@ export interface ClaimOptions {
    * or at a rate limit): whether the account may take it over is not known yet.
    */
   onUnanswered?: (environmentId: string) => void;
+  /** In the `interactive` mode: ask also about an entry that the user declined in this session (a new Start of it). */
+  askAgain?: boolean;
 }
 
 /**
@@ -189,7 +191,8 @@ export class EnvironmentClaims {
         continue;
       }
       const allowed =
-        isUnambiguousClaim(info, account) || (mode === 'interactive' && (await this.confirmed(environment, account)));
+        isUnambiguousClaim(info, account) ||
+        (mode === 'interactive' && (await this.confirmed(environment, account, options.askAgain === true)));
       if (!allowed) {
         logger.info(`The environment ${environment.id} stays hidden: it is assigned to an account only after a confirmation.`);
         continue;
@@ -203,10 +206,13 @@ export class EnvironmentClaims {
     return claimed;
   }
 
-  /** Asks ClaimDeps.confirm once per account and entry in this session. False without it, and when it fails. */
-  private async confirmed(environment: Environment, account: GitHubAccount): Promise<boolean> {
+  /**
+   * Asks ClaimDeps.confirm once per account and entry in this session (`askAgain`: also after a decline). False without
+   * it, and when it fails.
+   */
+  private async confirmed(environment: Environment, account: GitHubAccount, askAgain: boolean): Promise<boolean> {
     const key = `${account.id}/${environment.id}`;
-    if (!this.deps.confirm || this.declined.has(key)) return false;
+    if (!this.deps.confirm || (this.declined.has(key) && !askAgain)) return false;
     let answer: boolean;
     try {
       answer = await this.deps.confirm(environment, account);

@@ -638,6 +638,7 @@ export class EnvironmentService {
       await this.deps.claims.claim(session.account, session.token, {
         mode: 'interactive',
         environmentIds: [older.id],
+        askAgain: true,
         signal,
         onUnanswered: () => {
           unanswered = true;
@@ -649,6 +650,12 @@ export class EnvironmentService {
         this.logger.info(`The environment ${older.id} of an older version could not be given to the signed-in account. No second environment is created.`);
         throw environmentUnassigned(repository);
       }
+    }
+    if ((older.additionalVolumes ?? []).length > 0) {
+      // A new environment of the repository would mount the named volumes of the entry (the policy refuses them after the
+      // clone): nothing is created, and the next Start asks again.
+      this.logger.info(`The environment ${older.id} of an older version uses named volumes of the repository. No second environment is created.`);
+      throw new UserFacingError('environmentUnassigned', Messages.olderEnvironmentUsesVolumes(repository));
     }
     this.logger.info(`The environment ${older.id} of an older version stays hidden. The signed-in account gets an environment of its own.`);
     return undefined;
@@ -1590,19 +1597,25 @@ export class EnvironmentService {
 
   /**
    * Concept section 9 "Host access": what the policy checks for `env`, with what it needs to know about the named volumes
-   * that the configuration mounts: the volumes of the environments that do not belong to the owner of `env` (their
-   * additional volumes), also of an entry of an older version without owner, which may hold the work of another person
-   * until an account takes it over; and the labels of the volumes that exist.
+   * that the configuration mounts: the volumes of the environments of other accounts (their additional volumes), and of
+   * an entry of an older version without owner of the same repository, which may hold the work of another person until
+   * an account takes it over, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
    */
   private async hostAccessInput(env: Environment, input: Omit<HostAccessInput, 'ownVolume'>): Promise<HostAccessInput> {
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
     const others = (await this.deps.registry.list()).filter(
-      (other) => other.id !== env.id && (other.owner === undefined || other.owner.id !== env.owner?.id),
+      (other) =>
+        other.id !== env.id &&
+        (other.owner === undefined ? repositoryKey(other.repository) === repositoryKey(env.repository) : other.owner.id !== env.owner?.id),
     );
+    // A volume that the environment recorded itself stays its own: older entries of one person shared volumes before
+    // the environments were separated by account.
+    const own = new Set(env.additionalVolumes ?? []);
+    const foreignVolumes = others.flatMap((other) => other.additionalVolumes ?? []).filter((name) => !own.has(name));
     const names = mountedVolumeNames(checked);
     const volumeLabels: Record<string, Record<string, string>> = {};
     if (names.length > 0) for (const volume of await this.deps.docker.inspectVolumes(names)) volumeLabels[volume.name] = volume.labels;
-    return { ...checked, foreignVolumes: others.flatMap((other) => other.additionalVolumes ?? []), volumeLabels };
+    return { ...checked, foreignVolumes, volumeLabels };
   }
 
   /**
@@ -2154,6 +2167,13 @@ export class EnvironmentService {
       const repository = volume.labels[LABEL_REPOSITORY];
       if (!isStorageId(id) || !isRepositoryName(repository)) {
         this.logger.warn(`The volume ${volume.name} has invalid labels and is skipped.`);
+        continue;
+      }
+      // Only a volume with the name that the extension gives the environment of these labels: a configuration cannot
+      // create such a volume (the host access policy refuses these names and the labels of volumes), so labels on any
+      // other volume do not make it an environment.
+      if (volume.name.toLowerCase() !== resourceName(repository, id).toLowerCase()) {
+        this.logger.warn(`The volume ${volume.name} has the labels of an environment but not its name. It is skipped.`);
         continue;
       }
       // The owner label of the volume gives the entry its owner again; its login follows at the next open.

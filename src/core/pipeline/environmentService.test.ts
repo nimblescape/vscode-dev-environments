@@ -1520,11 +1520,24 @@ describe('open: registry lost', () => {
   });
 
   it('creates the environment when only volumes of other repositories exist, and restores those', async () => {
-    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web' });
+    h.docker.volumes.delete(OLD_NAME);
+    h.docker.volumes.set(resourceName('acme/web', OTHER_ID), { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web' });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).not.toBe(OTHER_ID);
     expect(h.helper.clones).toHaveLength(1);
     expect((await h.registry.list()).map((e) => e.repository).sort()).toEqual(['acme/api', 'acme/web']);
+  });
+
+  it('restores no volume that has the labels of an environment but another name (labels that a mount could set)', async () => {
+    h.docker.volumes.delete(OLD_NAME);
+    h.docker.volumes.set('myvol', { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // The name of another repository's environment with the labels of this repository.
+    h.docker.volumes.set(resourceName('acme/web', OTHER_ID), { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    expect(await h.service.reconcileFromVolumes()).toBe(0);
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).not.toBe(OTHER_ID);
+    expect(result.environment.volumeName).toBe(resourceName(REPO, result.environment.id));
+    expect(h.helper.gitPreparations.map((preparation) => preparation.volumeName)).toEqual([result.environment.volumeName]);
   });
 });
 
@@ -2828,13 +2841,29 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.helper.ups).toEqual([]);
     });
 
-    it('are refused when an entry of an older version without owner uses them: it may hold the work of another person', async () => {
-      await otherEnvironment(null);
+    it('are refused when an entry of an older version without owner of the same repository uses them: it may hold the work of another person', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, owner: null, container: null, extra: { additionalVolumes: [SHARED] } });
       await seedEnvironment(h, { container: null });
       h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
       const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
       expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
       expect(h.helper.ups).toEqual([]);
+    });
+
+    it('are allowed when an entry of an older version without owner of another repository uses them (one person shared them before)', async () => {
+      await otherEnvironment(null);
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+
+    it('are allowed when the environment recorded them itself, also when another account uses them', async () => {
+      await otherEnvironment(OTHER_ACCOUNT);
+      await seedEnvironment(h, { container: null, extra: { additionalVolumes: [SHARED] } });
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
     });
 
     it('are recorded with the parser of the policy: a quoted --mount field, and a volume of a Feature in the image metadata', async () => {

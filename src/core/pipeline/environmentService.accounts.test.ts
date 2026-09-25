@@ -278,6 +278,25 @@ describe('entries of an older version at Start (concept 7.5, D-3)', () => {
     expect(h.helper.clones).toHaveLength(1);
   });
 
+  it('creates nothing when the user declines an entry that uses named volumes of the repository, and asks again at the next Start', async () => {
+    const answers = [false, false, true];
+    const { confirm } = withClaims(() => answers.shift() ?? false);
+    await seedEnvironment(h, { owner: null, extra: { additionalVolumes: ['api-node_modules'] } });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('environmentUnassigned');
+      expect(error.message).toBe(Messages.olderEnvironmentUsesVolumes(REPO));
+    }
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(h.helper.clones).toEqual([]);
+    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
+    // Assign at the third Start: the entry is used.
+    const result = await h.service.open(TARGET, options());
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(result.environment.id).toBe(ENV_ID);
+    expect(result.environment.owner).toEqual(ACCOUNT);
+  });
+
   it('creates an environment of the account when GitHub does not return the repository of the entry to it', async () => {
     const { confirm } = withClaims(() => true, async () => undefined);
     await seedEnvironment(h, { owner: null });

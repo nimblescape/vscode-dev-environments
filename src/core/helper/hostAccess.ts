@@ -384,7 +384,11 @@ export interface MountSpec {
   /** Lower case. `undefined` when the entry names none. */
   type?: string;
   source?: string;
-  /** `volume-driver` or `volume-opt` are set: a "volume" that can be a folder of the computer. */
+  /**
+   * Options of the volume other than `volume-nocopy` and `volume-subpath`: `volume-driver` and `volume-opt` (a "volume"
+   * that can be a folder of the computer) and `volume-label` (labels of a volume that the mount creates, for example the
+   * labels by which the extension restores the environments of a lost registry).
+   */
   volumeOptions: boolean;
   /** The text, when it cannot be read as Docker reads it (csvFields). */
   unreadable?: string;
@@ -436,7 +440,7 @@ export function parseMountString(spec: string): MountSpec {
     const value = index < 0 ? '' : field.slice(index + 1).trim();
     if (key === 'type') mount.type = value.toLowerCase();
     else if (key === 'source' || key === 'src') mount.source = value;
-    else if (key === 'volume-driver' || key === 'volume-opt') mount.volumeOptions = true;
+    else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') mount.volumeOptions = true;
   }
   return mount;
 }
@@ -454,7 +458,7 @@ function parseMountEntry(entry: unknown): MountSpec {
   if (entry.source) parts.push(`src=${String(entry.source)}`);
   parts.push(`dst=${String(entry.target)}`);
   const mount = parseMountString(parts.join(','));
-  if ('volumeDriver' in entry || 'volumeOptions' in entry || 'volume-driver' in entry || 'volume-opt' in entry) {
+  if (Object.keys(entry).some((key) => /^volume(-?(driver|opt|options|label|labels))$/i.test(key))) {
     mount.volumeOptions = true;
   }
   return mount;
