@@ -35,9 +35,18 @@ interface GraphQLRequest {
 
 type Reply = { status?: number; body: unknown } | Error;
 
-/** Answers each request after `delayMs`, and records the requests and the most requests that were open at once. */
+/** True for a batch of configuration lookups (`configurationsQuery`). */
+function isLookup(request: GraphQLRequest): boolean {
+  return request.query.startsWith('query Configurations(');
+}
+
+/**
+ * Answers each request after `delayMs`, and records the requests and the most requests that were open at once. A batch
+ * of configuration lookups is answered from the `rootFile` and `folder` of the nodes that the list pages returned.
+ */
 class AsyncFakeGitHub implements HttpTransport {
   readonly requests: GraphQLRequest[] = [];
+  private readonly nodes = new Map<string, Record<string, unknown>>();
   open = 0;
   peak = 0;
   constructor(
@@ -60,12 +69,37 @@ class AsyncFakeGitHub implements HttpTransport {
     } finally {
       this.open--;
     }
+    if (isLookup(parsed)) {
+      const data: Record<string, unknown> = {};
+      for (let i = 0; `o${i}` in parsed.variables; i++) {
+        const node = this.nodes.get(`${String(parsed.variables[`o${i}`])}/${String(parsed.variables[`n${i}`])}`);
+        data[`r${i}`] = node ? { rootFile: node.rootFile ?? null, folder: node.folder ?? null } : null;
+      }
+      return { status: 200, headers: {}, body: JSON.stringify({ data }) };
+    }
     const reply = this.handler(parsed);
     if (reply instanceof Error) throw reply;
+    const data = (reply.body as { data?: Record<string, { repositories?: { nodes?: unknown[] } } | null> } | null)?.data;
+    for (const owner of [data?.viewer, data?.repositoryOwner]) {
+      for (const node of owner?.repositories?.nodes ?? []) {
+        const record = node as Record<string, unknown> | null;
+        if (record && typeof record.nameWithOwner === 'string') this.nodes.set(record.nameWithOwner, record);
+      }
+    }
     return { status: reply.status ?? 200, headers: {}, body: JSON.stringify(reply.body) };
   }
   ofQuery(query: string): GraphQLRequest[] {
     return this.requests.filter((request) => request.query === query);
+  }
+  /** The requests without the batches of configuration lookups. */
+  listRequests(): GraphQLRequest[] {
+    return this.requests.filter((request) => !isLookup(request));
+  }
+  /** The repositories of each batch of configuration lookups, as `owner/name`. */
+  lookupBatches(): string[][] {
+    return this.requests.filter(isLookup).map((request) =>
+      Array.from({ length: Object.keys(request.variables).length / 2 }, (_, i) => `${String(request.variables[`o${i}`])}/${String(request.variables[`n${i}`])}`),
+    );
   }
 }
 
@@ -149,19 +183,21 @@ describe('DiscoveryService.refresh with a scan scope', () => {
     const logger = recordingLogger();
     const result = await service(transport, ['acme', ' Beta ', 'ACME'], logger).refresh(TOKEN, ACCOUNT_ID);
 
-    expect(transport.requests.map((request) => request.query)).toEqual([SCOPE_VIEWER_QUERY, OWNER_REPOSITORIES_QUERY, OWNER_REPOSITORIES_QUERY]);
+    expect(transport.listRequests().map((request) => request.query)).toEqual([SCOPE_VIEWER_QUERY, OWNER_REPOSITORIES_QUERY, OWNER_REPOSITORIES_QUERY]);
     expect(transport.requests[0].variables).toEqual({});
     expect(transport.ofQuery(OWNER_REPOSITORIES_QUERY).map((request) => request.variables)).toEqual([
-      { login: 'acme', cursor: null, pageSize: 50, withConfigurations: true },
-      { login: 'Beta', cursor: null, pageSize: 50, withConfigurations: true },
+      { login: 'acme', cursor: null, pageSize: 100 },
+      { login: 'Beta', cursor: null, pageSize: 100 },
     ]);
+    // The lookups of all listed repositories, only of the owners of the scope, in one batch.
+    expect(transport.lookupBatches().map((batch) => [...batch].sort())).toEqual([['Beta/api', 'Beta/empty', 'acme/api', 'acme/empty']]);
     expect(transport.ofQuery(DISCOVERY_QUERY)).toHaveLength(0);
     expect(result.repositories.map((info) => info.nameWithOwner)).toEqual(['acme/api', 'Beta/api']);
     expect(result.organizations).toEqual(['acme', 'beta', 'gamma']);
     expect(result.scope).toEqual(['acme', 'beta']);
     expect(result.hints).toEqual([]);
     expect(parseDiscoveryData(JSON.parse(fs.readFileSync(file, 'utf8')))).toEqual(result);
-    expect(logger.lines.some((line) => /loaded in \d+\.\d seconds with 3 requests \(scan scope: acme, Beta\)/.test(line))).toBe(true);
+    expect(logger.lines.some((line) => /loaded in \d+\.\d seconds with 4 requests \(scan scope: acme, Beta\)/.test(line))).toBe(true);
     expect(logger.lines.join('\n')).not.toContain(TOKEN);
   });
 
@@ -176,7 +212,7 @@ describe('DiscoveryService.refresh with a scan scope', () => {
     const result = await service(transport, ['octo', 'acme'], undefined).refresh(TOKEN, ACCOUNT_ID);
     expect(VIEWER_REPOSITORIES_QUERY).toMatch(/affiliations: \[OWNER\]\s+ownerAffiliations: \[OWNER\]/);
     expect(transport.ofQuery(VIEWER_REPOSITORIES_QUERY).map((request) => request.variables)).toEqual([
-      { cursor: null, pageSize: 50, withConfigurations: true },
+      { cursor: null, pageSize: 100 },
     ]);
     expect(ownersAskedAbout(transport.requests)).toEqual(['acme']);
     expect(result.repositories.map((info) => info.nameWithOwner)).toEqual(['Octo/dotfiles', 'acme/api']);
@@ -260,7 +296,8 @@ describe('DiscoveryService.refresh with a scan scope', () => {
     const result = await service(transport, ['secure-org'], recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'secure-org', kind: 'saml', url: 'https://github.com/orgs/secure-org/sso' }]);
     expect(result.repositories.map((info) => info.nameWithOwner)).toEqual(['secure-org/open']);
-    expect(transport.requests.map((request) => request.query)).toEqual([SCOPE_VIEWER_QUERY, OWNER_REPOSITORIES_QUERY]);
+    expect(transport.listRequests().map((request) => request.query)).toEqual([SCOPE_VIEWER_QUERY, OWNER_REPOSITORIES_QUERY]);
+    expect(transport.lookupBatches()).toEqual([['secure-org/open']]);
   });
 
   it('gives an owner that SAML hides completely the SAML hint, not the not-found hint', async () => {
@@ -276,10 +313,10 @@ describe('DiscoveryService.refresh with a scan scope', () => {
   it('retries a page of an owner with fewer repositories when GitHub does not answer in time', async () => {
     const transport = new AsyncFakeGitHub((request) => {
       if (request.query === SCOPE_VIEWER_QUERY) return viewerReply();
-      return request.variables.pageSize === 50 ? { status: 502, body: { message: 'Server Error' } } : ownerReply('acme', [repoNode('acme/api')]);
+      return request.variables.pageSize === 100 ? { status: 502, body: { message: 'Server Error' } } : ownerReply('acme', [repoNode('acme/api')]);
     });
     const result = await service(transport, ['acme'], recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
-    expect(transport.ofQuery(OWNER_REPOSITORIES_QUERY).map((request) => request.variables.pageSize)).toEqual([50, 25]);
+    expect(transport.ofQuery(OWNER_REPOSITORIES_QUERY).map((request) => request.variables.pageSize)).toEqual([100, 50]);
     expect(result.repositories).toHaveLength(1);
   });
 
@@ -306,21 +343,27 @@ describe('DiscoveryService.refresh with a scan scope', () => {
       body: { data: { viewer: { login: 'octo', databaseId: 1001, organizations: connection([]), repositories: connection([repoNode('acme/api')]) } } },
     }));
     const result: DiscoveryData = await service(transport, []).refresh(TOKEN, ACCOUNT_ID);
-    expect(transport.requests.map((request) => request.query)).toEqual([DISCOVERY_QUERY]);
+    expect(transport.listRequests().map((request) => request.query)).toEqual([DISCOVERY_QUERY]);
+    expect(transport.lookupBatches()).toEqual([['acme/api']]);
     expect(result.scope).toEqual([]);
   });
 });
 
-describe('the first load and uncertain detections', () => {
-  it('does not keep a repository as without configuration when an error points into its node', async () => {
+describe('uncertain detections', () => {
+  it('reads an unchanged repository again when an error of the list page points into its node', async () => {
+    let withError = false;
     const transport = new AsyncFakeGitHub(() => ({
       body: {
-        data: { viewer: { login: 'octo', databaseId: 1001, organizations: connection([]), repositories: connection([repoNode('acme/timeout', false), repoNode('acme/empty', false)]) } },
-        errors: [{ message: 'Something went wrong', path: ['viewer', 'repositories', 'nodes', 0, 'folder'] }],
+        data: { viewer: { login: 'octo', databaseId: 1001, organizations: connection([]), repositories: connection([repoNode('acme/flaky', false), repoNode('acme/empty', false)]) } },
+        ...(withError ? { errors: [{ message: 'Something went wrong', path: ['viewer', 'repositories', 'nodes', 0, 'defaultBranchRef'] }] } : {}),
       },
     }));
+    await service(transport, [], recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
+    withError = true;
+    const before = transport.lookupBatches().length;
     const result = await service(transport, [], recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
-    expect(result.withoutConfiguration).toEqual([{ nameWithOwner: 'acme/empty', pushedAt: '2026-09-20T10:00:00Z', defaultBranch: 'main' }]);
+    expect(transport.lookupBatches().slice(before)).toEqual([['acme/flaky']]);
+    expect(result.withoutConfiguration?.map((entry) => entry.nameWithOwner)).toEqual(['acme/flaky', 'acme/empty']);
   });
 });
 
@@ -344,11 +387,12 @@ describe('DiscoveryService.viewerOrganizations (organization selector)', () => {
 });
 
 describe('the queries of the scan scope', () => {
-  it('ask about one owner by its login, with the configuration lookups only on request', () => {
+  it('ask about one owner by its login, without the configuration lookups', () => {
     expect(OWNER_REPOSITORIES_QUERY).toMatch(/repositoryOwner\(login: \$login\)/);
     expect(OWNER_REPOSITORIES_QUERY).toMatch(/\.\.\. on Organization \{/);
     expect(OWNER_REPOSITORIES_QUERY).toMatch(/\.\.\. on User \{\s+repositories\([^)]*ownerAffiliations: \[OWNER\]/);
-    expect(OWNER_REPOSITORIES_QUERY).toContain('...ConfigurationLookups @include(if: $withConfigurations)');
+    expect(OWNER_REPOSITORIES_QUERY).not.toMatch(/rootFile|folder|ConfigurationLookups/);
+    expect(VIEWER_REPOSITORIES_QUERY).not.toMatch(/rootFile|folder|ConfigurationLookups/);
     expect(OWNER_REPOSITORIES_QUERY).toContain('orderBy: { field: PUSHED_AT, direction: DESC }');
     // The account query lists no repository.
     expect(SCOPE_VIEWER_QUERY).not.toMatch(/repositories/);

@@ -11,9 +11,10 @@ export class Semaphore {
 
   constructor(private readonly limit: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  /** A `priority` call waits before the others (for example the next page of a list before more lookups). */
+  async run<T>(fn: () => Promise<T>, priority = false): Promise<T> {
     if (this.active >= Math.max(1, this.limit)) {
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
+      await new Promise<void>((resolve) => (priority ? this.waiting.unshift(resolve) : this.waiting.push(resolve)));
     } else {
       this.active++;
     }

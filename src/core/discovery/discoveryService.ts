@@ -9,7 +9,7 @@ import { allOrAbort, Semaphore } from '../concurrency';
 import { readJson, writeJsonAtomic } from '../storage/atomicJson';
 import type { GitHubViewer } from '../helper/containerGit';
 import { splitRepository } from '../names';
-import { isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
+import { abortError, isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
 import type {
   CheckedRepository,
   DiscoveryData,
@@ -29,11 +29,12 @@ import {
 } from './githubApi';
 import { normalizeScope, scopeLogins } from './scope';
 
-/** Repositories per request (concept 7.4). */
-export const DISCOVERY_PAGE_SIZE = 50;
-/** Repositories per request of a refresh with a stored list: without the configuration lookups, so the most GitHub allows. */
-export const DISCOVERY_LIST_PAGE_SIZE = 100;
-/** Repositories per request of the configuration lookups of new and changed repositories (concept 7.4). */
+/** Repositories per list request (concept 7.4): without the configuration lookups, so the most that GitHub allows. */
+export const DISCOVERY_PAGE_SIZE = 100;
+/**
+ * Repositories per request of the configuration lookups (concept 7.4). Assumption (V-5): GitHub answers 50 repositories
+ * with the lookups within its time limit in most cases (about 3 seconds).
+ */
 export const LOOKUP_BATCH_SIZE = 50;
 /** Smallest page size when GitHub does not answer a page in time. */
 export const DISCOVERY_MIN_PAGE_SIZE = 10;
@@ -92,10 +93,30 @@ const REPOSITORY_FIELDS_FRAGMENT = `fragment RepositoryFields on Repository {
   }
 }`;
 
+/** The fields of a repository without the configuration lookups, which make a request slow. */
+const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Repository {
+  id
+  name
+  nameWithOwner
+  url
+  isArchived
+  isFork
+  isPrivate
+  viewerPermission
+  pushedAt
+  owner {
+    login
+  }
+  defaultBranchRef {
+    name
+  }
+}`;
+
 /**
- * The discovery query of concept 7.4 with `owner { login }` and `isPrivate`. The first page also reads the login of
- * the user and the organizations where the user is a member (`$withOrganizations`).
- * Variables: `cursor` (String, null for the first page), `pageSize` (Int, normally 50), `withOrganizations` (Boolean).
+ * The list query of concept 7.4 with `owner { login }`, `isPrivate`, and `viewerPermission`, without the configuration
+ * lookups, which make a request slow: they follow in batches (`configurationsQuery`). The first page also reads the
+ * login of the user and the organizations where the user is a member (`$withOrganizations`).
+ * Variables: `cursor` (String, null for the first page), `pageSize` (Int, normally 100), `withOrganizations` (Boolean).
  */
 // Assumption (V-5): `affiliations` and `ownerAffiliations` with OWNER, COLLABORATOR, ORGANIZATION_MEMBER return all
 // repositories that the user can access, including organization repositories through teams. Internal repositories of
@@ -125,13 +146,12 @@ export const DISCOVERY_QUERY = `query Discover($cursor: String, $pageSize: Int!,
         endCursor
       }
       nodes {
-        ...RepositoryFields
+        ...RepositoryListFields
       }
     }
   }
 }
-${REPOSITORY_FIELDS_FRAGMENT}
-${CONFIGURATION_FOLDER_FRAGMENT}`;
+${REPOSITORY_LIST_FIELDS_FRAGMENT}`;
 
 /** Further pages of the organizations of the user (more than 100 organizations). */
 export const ORGANIZATIONS_QUERY = `query Organizations($cursor: String) {
@@ -193,25 +213,6 @@ export const BRANCH_CONFIGURATIONS_QUERY = `query BranchConfigurations($owner: S
 }
 ${CONFIGURATION_FOLDER_FRAGMENT}`;
 
-/** The fields of a repository without the configuration lookups, which make a request slow. */
-const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Repository {
-  id
-  name
-  nameWithOwner
-  url
-  isArchived
-  isFork
-  isPrivate
-  viewerPermission
-  pushedAt
-  owner {
-    login
-  }
-  defaultBranchRef {
-    name
-  }
-}`;
-
 // `HEAD` is the default branch (concept 7.4).
 const CONFIGURATION_LOOKUPS_FRAGMENT = `fragment ConfigurationLookups on Repository {
   rootFile: object(expression: "HEAD:.devcontainer.json") {
@@ -222,7 +223,7 @@ const CONFIGURATION_LOOKUPS_FRAGMENT = `fragment ConfigurationLookups on Reposit
   }
 }`;
 
-/** One page of a repository connection of the scan scope; the configuration lookups only with `$withConfigurations`. */
+/** One page of a repository connection of the scan scope, without the configuration lookups. */
 function scopeConnection(argumentsText: string): string {
   return `repositories(
         first: $pageSize
@@ -235,46 +236,9 @@ function scopeConnection(argumentsText: string): string {
         }
         nodes {
           ...RepositoryListFields
-          ...ConfigurationLookups @include(if: $withConfigurations)
         }
       }`;
 }
-
-/**
- * DISCOVERY_QUERY without the configuration lookups, for a refresh with a stored list (incremental detection, concept
- * 7.4). Variables: `cursor`, `pageSize` (normally 100), `withOrganizations`.
- */
-export const DISCOVERY_LIST_QUERY = `query DiscoverList($cursor: String, $pageSize: Int!, $withOrganizations: Boolean!) {
-  viewer {
-    login
-    databaseId
-    organizations(first: ${ORGANIZATIONS_PAGE_SIZE}) @include(if: $withOrganizations) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        login
-      }
-    }
-    repositories(
-      first: $pageSize
-      after: $cursor
-      affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
-      ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
-      orderBy: { field: PUSHED_AT, direction: DESC }
-    ) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        ...RepositoryListFields
-      }
-    }
-  }
-}
-${REPOSITORY_LIST_FIELDS_FRAGMENT}`;
 
 /**
  * The signed-in account and its organizations, without repositories: the first request of a refresh with a scan scope,
@@ -298,9 +262,9 @@ export const SCOPE_VIEWER_QUERY = `query ScopeViewer {
 
 /**
  * The repositories of one organization or user account of the scan scope (concept 7.4), last push first.
- * Variables: `login`, `cursor`, `pageSize`, `withConfigurations`. `repositoryOwner` is `null` for an unknown login.
+ * Variables: `login`, `cursor`, `pageSize`. `repositoryOwner` is `null` for an unknown login.
  */
-export const OWNER_REPOSITORIES_QUERY = `query OwnerRepositories($login: String!, $cursor: String, $pageSize: Int!, $withConfigurations: Boolean!) {
+export const OWNER_REPOSITORIES_QUERY = `query OwnerRepositories($login: String!, $cursor: String, $pageSize: Int!) {
   repositoryOwner(login: $login) {
     __typename
     login
@@ -312,23 +276,19 @@ export const OWNER_REPOSITORIES_QUERY = `query OwnerRepositories($login: String!
     }
   }
 }
-${REPOSITORY_LIST_FIELDS_FRAGMENT}
-${CONFIGURATION_LOOKUPS_FRAGMENT}
-${CONFIGURATION_FOLDER_FRAGMENT}`;
+${REPOSITORY_LIST_FIELDS_FRAGMENT}`;
 
 /**
  * The repositories of the signed-in account itself when it is in the scan scope: `viewer` also returns its private
- * repositories. Variables: `cursor`, `pageSize`, `withConfigurations`.
+ * repositories. Variables: `cursor`, `pageSize`.
  */
-export const VIEWER_REPOSITORIES_QUERY = `query ViewerRepositories($cursor: String, $pageSize: Int!, $withConfigurations: Boolean!) {
+export const VIEWER_REPOSITORIES_QUERY = `query ViewerRepositories($cursor: String, $pageSize: Int!) {
   viewer {
     login
     ${scopeConnection('affiliations: [OWNER]\n        ownerAffiliations: [OWNER]\n        ')}
   }
 }
-${REPOSITORY_LIST_FIELDS_FRAGMENT}
-${CONFIGURATION_LOOKUPS_FRAGMENT}
-${CONFIGURATION_FOLDER_FRAGMENT}`;
+${REPOSITORY_LIST_FIELDS_FRAGMENT}`;
 
 /**
  * The configuration lookups of up to LOOKUP_BATCH_SIZE repositories in one request, as aliases `r0`, `r1`, …
@@ -456,7 +416,7 @@ export interface PartialDiscovery {
   accountId: string;
   /**
    * The repositories with a configuration found so far, in the scope of the refresh (`scope`); no organizations and no
-   * hints yet. During an incremental refresh, new and changed repositories join after their lookup.
+   * hints yet. A repository whose configurations are read joins after its batch of lookups.
    */
   data: DiscoveryData;
 }
@@ -467,14 +427,21 @@ interface RefreshRun {
   accountId: string;
   scope: string[];
   limiter: Semaphore;
+  /** Aborts every request of the refresh at its first failure (`failure`), or when the signal of the caller aborts. */
+  controller: AbortController;
+  failure?: { error: unknown };
+  onAbort: () => void;
   requests: number;
+  lookupRequests: number;
+  /** The configuration lookups, started while the list still loads. */
+  lookups: LookupQueue;
   errors: CollectedError[];
   viewerLogin: string;
   /** The collectors of the scan in the order of the result: one for the full list, or one per owner of the scope. */
   collectors: RepositoryCollector[];
 }
 
-/** The repositories of a scan, before the configuration lookups of an incremental refresh, the organizations, and the hints. */
+/** The repositories of a scan, before the organizations and the hints. */
 interface ScanResult {
   viewerLogin: string;
   organizations: Connection<LoginNode> | null | undefined;
@@ -491,7 +458,7 @@ interface OwnerScan {
 
 /**
  * The stored detection results of a refresh with a stored list (incremental detection), or `undefined` for the first
- * load, which reads the configurations of all repositories in the same requests as the list.
+ * load, which reads the configurations of all repositories.
  */
 type Detections = Map<string, StoredDetection> | undefined;
 
@@ -529,12 +496,14 @@ export class DiscoveryService {
 
   /**
    * Full discovery for the account `accountId` with its token, in the scan scope of DiscoveryOptions.scope (concept 7.4):
-   * - empty scope: all pages of `viewer.repositories` with up to 50 repositories each, one after another, in the order of
-   *   the API (last push first);
+   * - empty scope: all pages of `viewer.repositories` with up to 100 repositories each, without the configuration
+   *   lookups, one after another, in the order of the API (last push first);
    * - configured scope: first the account and its organizations, then the repositories of each owner of the scope, the
-   *   owners in parallel (at most DISCOVERY_CONCURRENCY requests at the same time), the pages of one owner one after
-   *   another. No request is about another owner. An owner that GitHub does not return gets a `notFound` hint.
-   * Keeps only repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth
+   *   owners in parallel, the pages of one owner one after another. No request is about another owner. An owner that
+   *   GitHub does not return gets a `notFound` hint.
+   * The configuration lookups follow in batches of LOOKUP_BATCH_SIZE, each started as soon as its repositories are listed:
+   * for all repositories on the first load, else only for new and changed ones (incremental detection). All requests
+   * share the limit of DISCOVERY_CONCURRENCY at the same time; the list pages go first. Keeps only repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth
    * app access restrictions become one hint per organization. Partial data with errors is used. Stores the result with
    * its scope atomically in the file of the account and returns it. Throws on a network failure, an HTTP error, when
    * GitHub does not return the list, or when the token belongs to another account (a sign-in changed the session
@@ -543,30 +512,24 @@ export class DiscoveryService {
   async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
     const started = this.clock.now();
     const logins = scopeLogins(this.options.scope?.() ?? []);
-    const run: RefreshRun = {
-      token,
-      accountId,
-      scope: normalizeScope(logins),
-      limiter: new Semaphore(DISCOVERY_CONCURRENCY),
-      requests: 0,
-      errors: [],
-      viewerLogin: '',
-      collectors: [],
-    };
+    const run = this.newRun(token, accountId, normalizeScope(logins), DISCOVERY_CONCURRENCY, signal);
     // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
     // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
     const previous = await this.loadStored(accountId).catch(() => undefined);
     const detections: Detections = previous ? storedDetections(previous) : undefined;
-    const scan =
-      logins.length === 0
-        ? await this.scanAll(run, accountId, detections, signal)
-        : await this.scanScope(run, accountId, logins, detections, signal);
-    const pending = scan.collector.pending();
-    if (pending.length > 0) {
-      const before = run.requests;
-      await this.lookUpConfigurations(run, pending, signal);
+    let scan: ScanResult;
+    try {
+      scan = logins.length === 0 ? await this.scanAll(run, accountId, detections) : await this.scanScope(run, accountId, logins, detections);
+      await run.lookups.finish();
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      throw run.failure ? run.failure.error : error;
+    } finally {
+      signal?.removeEventListener('abort', run.onAbort);
+    }
+    if (run.lookups.count > 0) {
       this.logger.info(
-        `Repository list: ${pending.length} new or changed repositories, configurations read with ${run.requests - before} requests.`,
+        `Repository list: configurations of ${run.lookups.count} ${detections ? 'new or changed ' : ''}repositories read with ${run.lookupRequests} requests.`,
       );
     }
 
@@ -623,19 +586,14 @@ export class DiscoveryService {
    * page of organizations only shortens the list.
    */
   async viewerOrganizations(token: string, signal?: AbortSignal): Promise<{ login: string; organizations: string[] }> {
-    const run: RefreshRun = {
-      token,
-      accountId: '',
-      scope: [],
-      limiter: new Semaphore(1),
-      requests: 0,
-      errors: [],
-      viewerLogin: '',
-      collectors: [],
-    };
-    const viewer = await this.scopeViewer(run, signal);
-    const organizations = await this.collectOrganizations(viewer.organizations, run, signal);
-    return { login: viewer.login, organizations };
+    const run = this.newRun(token, '', [], 1, signal);
+    try {
+      const viewer = await this.scopeViewer(run);
+      const organizations = await this.collectOrganizations(viewer.organizations, run, run.controller.signal);
+      return { login: viewer.login, organizations };
+    } finally {
+      signal?.removeEventListener('abort', run.onAbort);
+    }
   }
 
   /** The account of the token: user ID, login, and profile name. Throws when GitHub does not return it. */
@@ -725,19 +683,14 @@ export class DiscoveryService {
   }
 
   /** Empty scan scope: all pages of `viewer.repositories`, one after another (GitHub has no parallel cursor). */
-  private async scanAll(
-    run: RefreshRun,
-    accountId: string,
-    detections: Detections,
-    signal: AbortSignal | undefined,
-  ): Promise<ScanResult> {
+  private async scanAll(run: RefreshRun, accountId: string, detections: Detections): Promise<ScanResult> {
     const collector = new RepositoryCollector(detections);
     run.collectors = [collector];
     let viewerLogin = '';
     let organizations: Connection<LoginNode> | null | undefined;
     let cursor: string | null = null;
     const usedCursors = new Set<string>();
-    let pageSize = detections ? DISCOVERY_LIST_PAGE_SIZE : DISCOVERY_PAGE_SIZE;
+    let pageSize = DISCOVERY_PAGE_SIZE;
     let pages = 0;
 
     for (;;) {
@@ -749,11 +702,10 @@ export class DiscoveryService {
       const after: string | null = cursor;
       const page = await this.fetchPage(
         run,
-        detections ? DISCOVERY_LIST_QUERY : DISCOVERY_QUERY,
+        DISCOVERY_QUERY,
         (size) => ({ cursor: after, pageSize: size, withOrganizations }),
         pageSize,
         (data: DiscoverData | undefined) => (isPageViewer(data?.viewer) ? data.viewer : undefined),
-        signal,
       );
       pages++;
       pageSize = page.pageSize;
@@ -765,7 +717,7 @@ export class DiscoveryService {
         run.viewerLogin = viewerLogin;
       }
       for (const error of page.errors) run.errors.push({ error, data: page.data });
-      collector.addPage(asArray(viewer.repositories.nodes), page.errors);
+      run.lookups.add(collector.addPage(asArray(viewer.repositories.nodes), page.errors));
       this.reportPartial(run);
       const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
       if (next === undefined) break;
@@ -783,16 +735,15 @@ export class DiscoveryService {
     accountId: string,
     logins: readonly string[],
     detections: Detections,
-    signal: AbortSignal | undefined,
   ): Promise<ScanResult> {
-    const viewer = await this.scopeViewer(run, signal);
+    const viewer = await this.scopeViewer(run);
     checkAccount(viewer.databaseId, accountId);
     run.viewerLogin = viewer.login;
     run.collectors = logins.map(() => new RepositoryCollector(detections));
-    const scans = await allOrAbort(
-      logins.map((login, index) => ({ login, collector: run.collectors[index] })),
-      ({ login, collector }, ownerSignal) => this.scanOwner(run, login, viewer.login, collector, ownerSignal),
-      signal,
+    const scans = await Promise.all(
+      logins.map((login, index) =>
+        this.guard(run, this.scanOwner(run, login, viewer.login, run.collectors[index])),
+      ),
     );
     const collector = new RepositoryCollector(detections);
     const missingOwners: string[] = [];
@@ -806,9 +757,8 @@ export class DiscoveryService {
   /** The signed-in account and the first page of its organizations. Throws when GitHub does not return the account. */
   private async scopeViewer(
     run: RefreshRun,
-    signal: AbortSignal | undefined,
   ): Promise<{ login: string; databaseId: number | null | undefined; organizations: Connection<LoginNode> | null | undefined }> {
-    const result = await this.request<ScopeViewerData>(run, SCOPE_VIEWER_QUERY, {}, signal);
+    const result = await this.request<ScopeViewerData>(run, SCOPE_VIEWER_QUERY, {}, run.controller.signal, true);
     const viewer = result.data?.viewer;
     if (!isRecord(viewer) || typeof viewer.login !== 'string' || viewer.login === '') {
       throw new Error(`GitHub did not return the account: ${describeGraphQLErrors(result.errors)}`);
@@ -826,13 +776,11 @@ export class DiscoveryService {
     login: string,
     viewerLogin: string,
     collector: RepositoryCollector,
-    signal: AbortSignal | undefined,
   ): Promise<OwnerScan> {
     const own = login.toLowerCase() === viewerLogin.toLowerCase();
-    const detections = collector.detections;
     let cursor: string | null = null;
     const usedCursors = new Set<string>();
-    let pageSize = detections ? DISCOVERY_LIST_PAGE_SIZE : DISCOVERY_PAGE_SIZE;
+    let pageSize = DISCOVERY_PAGE_SIZE;
     let pages = 0;
     for (;;) {
       if (pages >= MAX_PAGES) {
@@ -843,16 +791,15 @@ export class DiscoveryService {
       const page = await this.fetchPage(
         run,
         own ? VIEWER_REPOSITORIES_QUERY : OWNER_REPOSITORIES_QUERY,
-        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size, withConfigurations: !detections }),
+        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size }),
         pageSize,
         (data: OwnerPageData | undefined, errors) => readOwnerPage(own ? data?.viewer : data?.repositoryOwner, data, errors),
-        signal,
       );
       pages++;
       pageSize = page.pageSize;
       for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
       if (page.value === MISSING_OWNER) return { collector, missing: pages === 1 };
-      collector.addPage(asArray(page.value.nodes), page.errors);
+      run.lookups.add(collector.addPage(asArray(page.value.nodes), page.errors));
       this.reportPartial(run);
       const next = nextCursor(page.value.pageInfo, usedCursors);
       if (next === undefined) break;
@@ -862,19 +809,42 @@ export class DiscoveryService {
   }
 
   /**
-   * Incremental detection: the configurations of new and changed repositories, in aliased batches of LOOKUP_BATCH_SIZE,
-   * at most DISCOVERY_CONCURRENCY requests at the same time. A batch that GitHub does not answer in time is split.
+   * The state of one refresh. Its requests share one limit of `concurrency` requests at the same time, and one abort:
+   * the first failure (`guard`) or an abort of `signal` stops all of them.
    */
-  private async lookUpConfigurations(
-    run: RefreshRun,
-    entries: CollectedRepository[],
-    signal: AbortSignal | undefined,
-  ): Promise<void> {
-    const batches: CollectedRepository[][] = [];
-    for (let start = 0; start < entries.length; start += LOOKUP_BATCH_SIZE) {
-      batches.push(entries.slice(start, start + LOOKUP_BATCH_SIZE));
+  private newRun(token: string, accountId: string, scope: string[], concurrency: number, signal: AbortSignal | undefined): RefreshRun {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const run: RefreshRun = {
+      token,
+      accountId,
+      scope,
+      limiter: new Semaphore(concurrency),
+      controller,
+      onAbort,
+      requests: 0,
+      lookupRequests: 0,
+      lookups: new LookupQueue((batch) => this.guard(run, this.lookUpBatch(run, batch, controller.signal))),
+      errors: [],
+      viewerLogin: '',
+      collectors: [],
+    };
+    return run;
+  }
+
+  /** The first failure of a part of the refresh stops the other parts; the refresh then fails with it. */
+  private async guard<T>(run: RefreshRun, work: Promise<T>): Promise<T> {
+    try {
+      return await work;
+    } catch (error) {
+      if (!run.failure && !isAbortError(error)) {
+        run.failure = { error };
+        run.controller.abort();
+      }
+      throw error;
     }
-    await allOrAbort(batches, (batch, batchSignal) => this.lookUpBatch(run, batch, batchSignal), signal);
   }
 
   private async lookUpBatch(run: RefreshRun, batch: CollectedRepository[], signal: AbortSignal): Promise<void> {
@@ -886,6 +856,7 @@ export class DiscoveryService {
     let failure: unknown;
     let retryable: boolean;
     try {
+      run.lookupRequests++;
       const result = await this.request<Record<string, ConfigurationNode | null>>(run, configurationsQuery(batch.length), variables, signal);
       const data = result.data;
       const answered = isRecord(data) && batch.some((_entry, index) => isRecord(data[`r${index}`]));
@@ -943,17 +914,21 @@ export class DiscoveryService {
     }
   }
 
-  /** One GraphQL request of a refresh, within the limit of parallel requests. */
+  /**
+   * One GraphQL request of a refresh, within the limit of parallel requests. A `priority` request (a page of the list)
+   * goes before the waiting lookups, so the list keeps loading while the lookups run.
+   */
   private request<T>(
     run: RefreshRun,
     query: string,
     variables: Record<string, unknown>,
     signal: AbortSignal | undefined,
+    priority = false,
   ): Promise<{ data?: T; errors?: GraphQLError[] }> {
     return run.limiter.run(() => {
       run.requests++;
       return this.api.graphql<T>(query, variables, run.token, signal);
-    });
+    }, priority);
   }
 
   /**
@@ -966,14 +941,13 @@ export class DiscoveryService {
     variables: (pageSize: number) => Record<string, unknown>,
     initialPageSize: number,
     read: (data: D | undefined, errors: GraphQLError[] | undefined) => P | undefined,
-    signal: AbortSignal | undefined,
   ): Promise<{ value: P; errors: GraphQLError[]; data: unknown; pageSize: number }> {
     let pageSize = initialPageSize;
     for (;;) {
       let failure: unknown;
       let retryable: boolean;
       try {
-        const result = await this.request<D>(run, query, variables(pageSize), signal);
+        const result = await this.request<D>(run, query, variables(pageSize), run.controller.signal, true);
         const value = read(result.data, result.errors);
         if (value !== undefined) return { value, errors: result.errors ?? [], data: result.data, pageSize };
         failure = new Error(`GitHub did not return the repository list: ${describeGraphQLErrors(result.errors)}`);
@@ -983,7 +957,6 @@ export class DiscoveryService {
         failure = error;
         retryable = isRetryableError(error);
       }
-      // Assumption (V-5): 50 repositories with the configuration lookups fit into the time limit of GitHub in most cases.
       if (!retryable || pageSize <= DISCOVERY_MIN_PAGE_SIZE) throw failure;
       pageSize = Math.max(DISCOVERY_MIN_PAGE_SIZE, Math.floor(pageSize / 2));
       this.logger.warn(`Repository list: GitHub did not answer in time. Trying again with ${pageSize} repositories per request.`);
@@ -1302,9 +1275,9 @@ interface CollectedRepository {
 }
 
 /**
- * Collects the repositories of a scan in the order of the pages, each repository once. The first load takes the
- * configurations from the page; a refresh with a stored list takes them from the stored detection of an unchanged
- * repository, and marks the others for a lookup.
+ * Collects the repositories of a scan in the order of the pages, each repository once. The first load marks every
+ * repository for a lookup; a refresh with a stored list takes the configurations of an unchanged repository from the
+ * stored detection, and marks the others for a lookup.
  */
 class RepositoryCollector {
   private readonly entries: CollectedRepository[] = [];
@@ -1314,34 +1287,31 @@ class RepositoryCollector {
 
   constructor(readonly detections: Detections) {}
 
-  addPage(nodes: ReadonlyArray<RepositoryNode | null>, errors: readonly GraphQLError[]): void {
+  /**
+   * Adds the repositories of a page. Returns the new ones whose configurations must be read: all on the first load, else
+   * the new and changed ones, and those that an error of the page points into.
+   */
+  addPage(nodes: ReadonlyArray<RepositoryNode | null>, errors: readonly GraphQLError[]): CollectedRepository[] {
     const uncertain = nodesWithErrors(errors);
+    const lookups: CollectedRepository[] = [];
     nodes.forEach((node, index) => {
       this.scanned++;
       if (!isRecord(node)) return;
       const info = toRepositoryInfo(node);
       if (!info) return;
-      if (!this.detections) {
-        this.add({ info, checked: !uncertain.has(index), lookup: false });
-        return;
-      }
-      const stored = this.detections.get(info.nameWithOwner.toLowerCase());
-      if (stored && !needsConfigurationLookup(info, stored)) {
-        this.add({ info: { ...info, configPaths: [...stored.configPaths] }, checked: true, lookup: false });
-      } else {
-        this.add({ info, checked: false, lookup: true });
-      }
+      const stored = this.detections?.get(info.nameWithOwner.toLowerCase());
+      const entry: CollectedRepository =
+        stored && !uncertain.has(index) && !needsConfigurationLookup(info, stored)
+          ? { info: { ...info, configPaths: [...stored.configPaths] }, checked: true, lookup: false }
+          : { info, checked: false, lookup: true };
+      if (this.add(entry) && entry.lookup) lookups.push(entry);
     });
+    return lookups;
   }
 
   addAll(other: RepositoryCollector): void {
     this.scanned += other.scanned;
     for (const entry of other.entries) this.add(entry);
-  }
-
-  /** The repositories whose configurations must still be read. The entries are updated in place. */
-  pending(): CollectedRepository[] {
-    return this.entries.filter((entry) => entry.lookup);
   }
 
   repositories(): RepositoryInfo[] {
@@ -1354,12 +1324,45 @@ class RepositoryCollector {
       .map((entry) => checkedRepository(entry.info));
   }
 
-  private add(entry: CollectedRepository): void {
+  /** False for a repository that was added before. */
+  private add(entry: CollectedRepository): boolean {
     // The order by last push can move a repository to another page while the pages load.
     const key = entry.info.nameWithOwner.toLowerCase();
-    if (this.seen.has(key)) return;
+    if (this.seen.has(key)) return false;
     this.seen.add(key);
     this.entries.push(entry);
+    return true;
+  }
+}
+
+/**
+ * The configuration lookups of a refresh (concept 7.4): a batch starts as soon as LOOKUP_BATCH_SIZE repositories are
+ * listed, while the list still loads; `finish` starts the rest and waits for all batches.
+ */
+class LookupQueue {
+  private buffer: CollectedRepository[] = [];
+  private readonly running: Array<Promise<void>> = [];
+  /** Repositories handed to a lookup. */
+  count = 0;
+
+  constructor(private readonly start: (batch: CollectedRepository[]) => Promise<void>) {}
+
+  add(entries: readonly CollectedRepository[]): void {
+    this.buffer.push(...entries);
+    this.count += entries.length;
+    while (this.buffer.length >= LOOKUP_BATCH_SIZE) this.launch(this.buffer.splice(0, LOOKUP_BATCH_SIZE));
+  }
+
+  async finish(): Promise<void> {
+    if (this.buffer.length > 0) this.launch(this.buffer.splice(0));
+    await Promise.all(this.running);
+  }
+
+  private launch(batch: CollectedRepository[]): void {
+    const promise = this.start(batch);
+    // The failure reaches the refresh through `finish` (and the abort of the run); no unhandled rejection meanwhile.
+    promise.catch(() => undefined);
+    this.running.push(promise);
   }
 }
 
