@@ -826,10 +826,31 @@ export class Controller implements vscode.Disposable {
             }),
         }),
       // Try again is a Start: a repository takes the account of a session with a working token, as at the first try.
-      { retry: async () => this.startTarget(await this.refreshedTarget(target, 'token'), options) },
+      { retry: async () => this.retryStart(target, options) },
     );
     // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
     if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
+  }
+
+  /**
+   * Try again of a Start. The options apply to a first open only: when the account signed in now has an environment of
+   * the repository already (the account changed after the failure), Switch branch… and Select configuration… go their
+   * own way for an existing environment, as when the command runs again.
+   */
+  private async retryStart(target: Target, options: StartOptions): Promise<void> {
+    const fresh = await this.refreshedTarget(target, 'token');
+    const environment = fresh.environment;
+    if (!environment || (!options.branch && !options.configPath)) {
+      await this.startTarget(fresh, environment ? {} : options);
+      return;
+    }
+    if (options.branch) {
+      await this.switchEnvironmentBranch(fresh, environment, options.branch);
+    } else if (options.configPath && options.configPath !== environment.configPath) {
+      await this.rebuildEnvironment(fresh, environment, { reason: 'configurationSelected', configPath: options.configPath });
+    } else {
+      await this.startTarget(fresh);
+    }
   }
 
   /** Runs a flow that ends by connecting this window, with its number for `connect`. */
