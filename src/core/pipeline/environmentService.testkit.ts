@@ -311,6 +311,8 @@ export class FakeHelper implements EnvironmentHelper {
   lifecycleFailureReport: 'error' | 'result' = 'error';
   gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
   switchError: Maybe<Error>;
+  /** Named volumes that a container created by `up` mounts besides the workspace volume. */
+  containerVolumes: string[] = [];
   prepareGitError: Maybe<Error>;
   /** More entries of the label devcontainer.metadata of a built image (for example of a Feature). */
   buildMetadata: Array<Record<string, unknown>> = [];
@@ -424,7 +426,9 @@ export class FakeHelper implements EnvironmentHelper {
         const [key, ...value] = runArgs[index + 1].split('=');
         labels[key] = value.join('=');
       });
-      containerId = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels }).id;
+      const created = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels });
+      if (this.containerVolumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes: [p.volumeName, ...this.containerVolumes] });
+      containerId = created.id;
     }
     const failure = this.lifecycleFailure(image);
     if (failure !== undefined) {

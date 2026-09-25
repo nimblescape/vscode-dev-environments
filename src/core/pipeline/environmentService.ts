@@ -1553,8 +1553,30 @@ export class EnvironmentService {
       if (!kept) throw error;
       result = kept;
     }
+    // A volume named with ${devcontainerId} gets its name only at `up`, so neither the configuration nor the image
+    // metadata named it: the new container does.
+    if (createsContainer) await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
     const failure = nonEmptyString(result.lifecycleCommandFailure);
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image);
+  }
+
+  /** The named volumes that the container of the environment mounts join its additional volumes (ownVolumes). */
+  private async recordContainerVolumes(ctx: PipelineContext): Promise<void> {
+    const container = await this.deps.docker.findContainer(ctx.env.id);
+    const volumes = await this.ownVolumes(container?.volumes ?? [], ctx.env.volumeName);
+    await this.recordMetadataVolumes(ctx, volumes);
+  }
+
+  /**
+   * The volumes of `names` that the pipeline records as additional volumes: not the workspace volume, and not a volume
+   * that the policy gives to something else by its name (foreignVolumeName: an anonymous volume, the helper cache, another
+   * environment, the Dev Containers extension) or by its labels (volumeLabelOwner).
+   */
+  private async ownVolumes(names: readonly string[], workspaceVolume: string): Promise<string[]> {
+    const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined);
+    if (candidates.length === 0) return [];
+    const labels = new Map((await this.deps.docker.inspectVolumes(candidates)).map((volume) => [volume.name, volume.labels]));
+    return candidates.filter((name) => volumeLabelOwner(labels.get(name) ?? {}) === undefined);
   }
 
   /**
@@ -2213,18 +2235,11 @@ export class EnvironmentService {
     // to something else by its name (an anonymous volume of the container, a volume of the Dev Containers extension, of
     // the helper, or of another environment, foreignVolumeName) or by its labels (volumeLabelOwner).
     const containers = await docker.listEnvironmentContainers();
-    const mounted = new Map<string, string[]>();
     for (const candidate of candidates) {
-      const volumes = containers
+      const mounted = containers
         .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
-        .flatMap((container) => container.volumes ?? [])
-        .filter((name) => name !== candidate.volumeName && foreignVolumeName(name) === undefined);
-      if (volumes.length > 0) mounted.set(candidate.id, [...new Set(volumes)]);
-    }
-    const names = [...new Set([...mounted.values()].flat())];
-    const labels = new Map(names.length > 0 ? (await docker.inspectVolumes(names)).map((volume) => [volume.name, volume.labels]) : []);
-    for (const candidate of candidates) {
-      const volumes = (mounted.get(candidate.id) ?? []).filter((name) => volumeLabelOwner(labels.get(name) ?? {}) === undefined);
+        .flatMap((container) => container.volumes ?? []);
+      const volumes = await this.ownVolumes(mounted, candidate.volumeName);
       if (volumes.length > 0) candidate.additionalVolumes = volumes;
     }
     const skipped: string[] = [];

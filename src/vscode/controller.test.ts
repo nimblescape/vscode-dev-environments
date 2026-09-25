@@ -1802,6 +1802,17 @@ describe('Accounts (concept 7.5)', () => {
     },
   );
 
+  it.each(['start', 'stop', 'delete'] as const)('%s of a named entry of an older version ends when the user cancels the sign-in of the claim', async (command) => {
+    await h.registry.add(environment({ owner: undefined }));
+    h.auth.getSession.mockImplementation(async (options: { interactive: boolean }) =>
+      options.interactive ? undefined : { token: 'gho_token', account: ACCOUNT },
+    );
+    await run(command, row('acme/api', environment({ owner: undefined })));
+    expect(warningMessages()).toEqual([Messages.signInRequired]);
+    expect(h.claims.claim).not.toHaveBeenCalled();
+    for (const call of Object.values(h.service)) expect(call).not.toHaveBeenCalled();
+  });
+
   it('keeps an environment of an older version hidden when the claim fails, without calling it one of another account', async () => {
     // For example without internet access: GitHub cannot confirm the access, and nobody owns the entry. A repository row
     // goes to the open pipeline, which claims the entry or refuses (environmentUnassigned).
@@ -2152,7 +2163,8 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.claims.claim).not.toHaveBeenCalled();
     expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([Messages.olderEnvironmentNotAssigned('acme/api')]);
+    // For example another account signed in at the sign-in of the claim: it was not asked, so the message says so.
+    expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
   });
 
   it('role A: claims nothing when the session changed, and closes the connection', async () => {

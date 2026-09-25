@@ -1708,6 +1708,10 @@ export class Controller implements vscode.Disposable {
     if (!session) return environment;
     if (session.account.id !== account.id) {
       this.logger.info(`The GitHub session changed. The environment ${environment.id} is not claimed.`);
+      // A command says so (not "not assigned"): the account that is signed in now was not asked.
+      if (mode === 'interactive') {
+        throw new UserFacingError('environmentUnassigned', ControllerTexts.accountChangedDuringClaim(this.displayName({ repository: environment.repository })));
+      }
       return environment;
     }
     await this.deps.claims.claim(session.account, session.token, { mode, environmentIds: [environment.id], ...(askAgain ? { askAgain } : {}) });

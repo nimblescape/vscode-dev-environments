@@ -2945,6 +2945,18 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.helper.ups).toHaveLength(1);
     });
 
+    it('are recorded from the container that `up` creates: a name with ${devcontainerId} gets its name only there', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=${devcontainerId}-history,target=/h,type=volume'] };
+      h.helper.containerVolumes = ['0k5q7r2m-history', 'ab'.repeat(32), 'vscode'];
+      await h.service.openEnvironment(ENV_ID, options());
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
+      // Delete can remove it.
+      h.docker.volumes.set('0k5q7r2m-history', {});
+      await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['0k5q7r2m-history'] }));
+      expect(h.docker.volumes.has('0k5q7r2m-history')).toBe(false);
+    });
+
     it('are recorded from the merged configuration too (a Feature of an existing container)', async () => {
       await seedEnvironment(h);
       h.helper.merged = { mounts: ['source=feature-cache,target=/c,type=volume'] };
