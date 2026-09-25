@@ -140,7 +140,10 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   });
 
   const tree = new RepositoriesTreeProvider(logger);
-  const view = vscode.window.createTreeView<TreeNode>(REPOSITORIES_VIEW_ID, { treeDataProvider: tree });
+  const view = vscode.window.createTreeView<TreeNode>(REPOSITORIES_VIEW_ID, {
+    treeDataProvider: tree,
+    showCollapseAll: true,
+  });
   const statusBar = new EnvironmentStatusBar();
   context.subscriptions.push(tree, view, statusBar);
   const sidebar = new Sidebar({

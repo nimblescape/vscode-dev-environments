@@ -153,7 +153,7 @@ The sidebar shows one list of repositories. The list contains:
 A repository has at most one environment (see [D-3](#13-decisions)): a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Start** of a repository creates its environment. The environment stays until the user selects **Delete**.
 
 ```text
-DEV ENVIRONMENTS                                              [Search] [Refresh]
+DEV ENVIRONMENTS                               [Search] [Refresh] [Collapse All]
   ▾ acme-university
       ● api        main (python)   Connected                  [Stop] [Delete] [⋯]
       ◐ docs       main            Running                    [Stop] [Delete] [⋯]
