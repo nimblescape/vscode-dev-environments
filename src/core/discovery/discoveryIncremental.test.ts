@@ -44,6 +44,8 @@ class FakeGitHub implements HttpTransport {
   lookupErrors = new Set<string>();
   /** The lookup of these repositories answers the root file, but its folder part fails with an error. */
   folderErrors = new Set<string>();
+  /** The lookup of these repositories answers nothing, and the batch has a timeout error that points into no repository. */
+  cutShort = new Set<string>();
   /** Answers with a timeout error while a batch has more than this many repositories. */
   batchLimit = Infinity;
   open = 0;
@@ -101,6 +103,9 @@ class FakeGitHub implements HttpTransport {
         if (this.lookupErrors.has(name)) {
           data[`r${i}`] = null;
           errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`] });
+        } else if (this.cutShort.has(name)) {
+          data[`r${i}`] = { rootFile: null, folder: null };
+          errors.push({ message: 'Something went wrong while executing your query. This may be the result of a timeout.' });
         } else if (this.folderErrors.has(name)) {
           data[`r${i}`] = { rootFile: { __typename: 'Blob' }, folder: null };
           errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`, 'folder'] });
@@ -215,6 +220,22 @@ describe('incremental detection, empty scope', () => {
     github.requests.length = 0;
     await service().refresh(TOKEN, ACCOUNT_ID);
     expect(github.lookups()).toEqual([]);
+  });
+
+  it('reads a batch again whose answer has an error that points into no repository (a timeout that cut it short)', async () => {
+    github.repos = [repo('acme/api'), repo('acme/web')];
+    github.cutShort.add('acme/api');
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(names(first.repositories)).toEqual(['acme/web']);
+    // Not stored as a repository without configuration: its detection is not certain.
+    expect(first.withoutConfiguration ?? []).toEqual([]);
+    expect(first.uncertain).toEqual(['acme/web']);
+    github.requests.length = 0;
+    github.cutShort.clear();
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups().map((request) => request.variables)).toEqual([{ o0: 'acme', n0: 'api', o1: 'acme', n1: 'web' }]);
+    expect(names(second.repositories)).toEqual(['acme/api', 'acme/web']);
+    expect(second.uncertain).toBeUndefined();
   });
 
   it('reads the configurations only of new repositories and of repositories with another pushedAt', async () => {

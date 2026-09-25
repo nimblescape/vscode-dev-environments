@@ -864,17 +864,21 @@ export class DiscoveryService {
       const answered = isRecord(data) && batch.some((_entry, index) => isRecord(data[`r${index}`]));
       if (isRecord(data) && (answered || !isTimeoutResponse(result.errors))) {
         const uncertain = new Set<number>();
+        // An error that points into no repository (for example a timeout that cut the answer short) can have left out
+        // parts of any of them: no detection of the batch is certain.
+        let allUncertain = false;
         for (const error of result.errors ?? []) {
           const match = typeof error.path?.[0] === 'string' ? /^r(\d+)$/.exec(error.path[0]) : null;
           const entry = match ? batch[Number(match[1])] : undefined;
           if (match) uncertain.add(Number(match[1]));
+          else allUncertain = true;
           run.errors.push({ error, data, organization: entry?.info.owner });
         }
         batch.forEach((entry, index) => {
           const node = data[`r${index}`];
           // A repository that GitHub does not return now (renamed, removed, or no access) is read again next time.
           entry.info = { ...entry.info, configPaths: isRecord(node) ? detectConfigurations(node) : [] };
-          entry.checked = isRecord(node) && !uncertain.has(index);
+          entry.checked = isRecord(node) && !allUncertain && !uncertain.has(index);
           entry.lookup = false;
         });
         this.reportPartial(run);
