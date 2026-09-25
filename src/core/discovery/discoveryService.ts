@@ -10,8 +10,16 @@ import { readJson, writeJsonAtomic } from '../storage/atomicJson';
 import type { GitHubViewer } from '../helper/containerGit';
 import { splitRepository } from '../names';
 import { isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
-import type { DiscoveryData, ExtensionSettings, OrganizationHint, OrganizationHintKind, RepositoryInfo } from '../types';
+import type {
+  CheckedRepository,
+  DiscoveryData,
+  ExtensionSettings,
+  OrganizationHint,
+  OrganizationHintKind,
+  RepositoryInfo,
+} from '../types';
 import { detectConfigurations, type ConfigurationNode } from './detect';
+import { checkedRepository, needsConfigurationLookup, nodesWithErrors, storedDetections, type StoredDetection } from './incremental';
 import {
   describeGraphQLErrors,
   GitHubApiError,
@@ -23,6 +31,10 @@ import { normalizeScope, scopeLogins } from './scope';
 
 /** Repositories per request (concept 7.4). */
 export const DISCOVERY_PAGE_SIZE = 50;
+/** Repositories per request of a refresh with a stored list: without the configuration lookups, so the most GitHub allows. */
+export const DISCOVERY_LIST_PAGE_SIZE = 100;
+/** Repositories per request of the configuration lookups of new and changed repositories (concept 7.4). */
+export const LOOKUP_BATCH_SIZE = 50;
 /** Smallest page size when GitHub does not answer a page in time. */
 export const DISCOVERY_MIN_PAGE_SIZE = 10;
 /** Requests of one refresh that run at the same time at most (concept 7.4). */
@@ -229,6 +241,42 @@ function scopeConnection(argumentsText: string): string {
 }
 
 /**
+ * DISCOVERY_QUERY without the configuration lookups, for a refresh with a stored list (incremental detection, concept
+ * 7.4). Variables: `cursor`, `pageSize` (normally 100), `withOrganizations`.
+ */
+export const DISCOVERY_LIST_QUERY = `query DiscoverList($cursor: String, $pageSize: Int!, $withOrganizations: Boolean!) {
+  viewer {
+    login
+    databaseId
+    organizations(first: ${ORGANIZATIONS_PAGE_SIZE}) @include(if: $withOrganizations) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        login
+      }
+    }
+    repositories(
+      first: $pageSize
+      after: $cursor
+      affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
+      ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
+      orderBy: { field: PUSHED_AT, direction: DESC }
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        ...RepositoryListFields
+      }
+    }
+  }
+}
+${REPOSITORY_LIST_FIELDS_FRAGMENT}`;
+
+/**
  * The signed-in account and its organizations, without repositories: the first request of a refresh with a scan scope,
  * and the list of the organization selector. Further pages of organizations: ORGANIZATIONS_QUERY.
  */
@@ -281,6 +329,20 @@ export const VIEWER_REPOSITORIES_QUERY = `query ViewerRepositories($cursor: Stri
 ${REPOSITORY_LIST_FIELDS_FRAGMENT}
 ${CONFIGURATION_LOOKUPS_FRAGMENT}
 ${CONFIGURATION_FOLDER_FRAGMENT}`;
+
+/**
+ * The configuration lookups of up to LOOKUP_BATCH_SIZE repositories in one request, as aliases `r0`, `r1`, …
+ * Variables: `o<i>` (owner) and `n<i>` (name) of each repository.
+ */
+export function configurationsQuery(count: number): string {
+  const variables: string[] = [];
+  const fields: string[] = [];
+  for (let i = 0; i < count; i++) {
+    variables.push(`$o${i}: String!, $n${i}: String!`);
+    fields.push(`  r${i}: repository(owner: $o${i}, name: $n${i}) {\n    ...ConfigurationLookups\n  }`);
+  }
+  return `query Configurations(${variables.join(', ')}) {\n${fields.join('\n')}\n}\n${CONFIGURATION_LOOKUPS_FRAGMENT}\n${CONFIGURATION_FOLDER_FRAGMENT}`;
+}
 
 /** Query that reads one repository of each given organization. An organization that restricts access answers with an error. */
 export function organizationAccessQuery(count: number): string {
@@ -396,22 +458,26 @@ interface RefreshRun {
   errors: CollectedError[];
 }
 
-/** The repositories of a scan, before the organizations and the hints are collected. */
+/** The repositories of a scan, before the configuration lookups of an incremental refresh, the organizations, and the hints. */
 interface ScanResult {
   viewerLogin: string;
   organizations: Connection<LoginNode> | null | undefined;
-  repositories: RepositoryInfo[];
-  /** Repository nodes that GitHub returned, with and without configuration. */
-  scanned: number;
+  collector: RepositoryCollector;
   /** Owners of the scan scope that GitHub did not return (unknown, or no access). */
   missingOwners: string[];
 }
 
-/** The repository nodes of one owner of the scan scope. `missing`: GitHub did not return the owner. */
+/** The repositories of one owner of the scan scope. `missing`: GitHub did not return the owner. */
 interface OwnerScan {
-  nodes: Array<RepositoryNode | null>;
+  collector: RepositoryCollector;
   missing: boolean;
 }
+
+/**
+ * The stored detection results of a refresh with a stored list (incremental detection), or `undefined` for the first
+ * load, which reads the configurations of all repositories in the same requests as the list.
+ */
+type Detections = Map<string, StoredDetection> | undefined;
 
 /** An owner of the scan scope that GitHub does not return: `repositoryOwner` is `null`. */
 const MISSING_OWNER = 'missing';
@@ -451,8 +517,22 @@ export class DiscoveryService {
     const started = this.clock.now();
     const logins = scopeLogins(this.options.scope?.() ?? []);
     const run: RefreshRun = { token, limiter: new Semaphore(DISCOVERY_CONCURRENCY), requests: 0, errors: [] };
+    // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
+    // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
+    const previous = await this.loadStored(accountId).catch(() => undefined);
+    const detections: Detections = previous ? storedDetections(previous) : undefined;
     const scan =
-      logins.length === 0 ? await this.scanAll(run, accountId, signal) : await this.scanScope(run, accountId, logins, signal);
+      logins.length === 0
+        ? await this.scanAll(run, accountId, detections, signal)
+        : await this.scanScope(run, accountId, logins, detections, signal);
+    const pending = scan.collector.pending();
+    if (pending.length > 0) {
+      const before = run.requests;
+      await this.lookUpConfigurations(run, pending, signal);
+      this.logger.info(
+        `Repository list: ${pending.length} new or changed repositories, configurations read with ${run.requests - before} requests.`,
+      );
+    }
 
     const organizations = await this.collectOrganizations(scan.organizations, run, signal);
     const hints = new HintCollector(scan.viewerLogin);
@@ -472,7 +552,7 @@ export class DiscoveryService {
     for (const owner of scan.missingOwners) hints.addNotFound(owner);
     this.logErrors(run.errors);
 
-    const repositories = scan.repositories;
+    const repositories = scan.collector.repositories();
     const result: DiscoveryData = {
       version: 1,
       fetchedAt: isoTime(this.clock),
@@ -481,9 +561,10 @@ export class DiscoveryService {
       repositories,
       hints: hints.list(),
       scope: normalizeScope(logins),
+      withoutConfiguration: scan.collector.withoutConfiguration(),
     };
     this.logger.info(
-      `Repository list: ${repositories.length} of ${scan.scanned} repositories have a Dev Container configuration` +
+      `Repository list: ${repositories.length} of ${scan.collector.scanned} repositories have a Dev Container configuration` +
         (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization or were not found.` : '.'),
     );
     const seconds = Math.max(0, this.clock.now() - started) / 1000;
@@ -587,13 +668,18 @@ export class DiscoveryService {
   }
 
   /** Empty scan scope: all pages of `viewer.repositories`, one after another (GitHub has no parallel cursor). */
-  private async scanAll(run: RefreshRun, accountId: string, signal: AbortSignal | undefined): Promise<ScanResult> {
-    const collector = new RepositoryCollector();
+  private async scanAll(
+    run: RefreshRun,
+    accountId: string,
+    detections: Detections,
+    signal: AbortSignal | undefined,
+  ): Promise<ScanResult> {
+    const collector = new RepositoryCollector(detections);
     let viewerLogin = '';
     let organizations: Connection<LoginNode> | null | undefined;
     let cursor: string | null = null;
     const usedCursors = new Set<string>();
-    let pageSize = DISCOVERY_PAGE_SIZE;
+    let pageSize = detections ? DISCOVERY_LIST_PAGE_SIZE : DISCOVERY_PAGE_SIZE;
     let pages = 0;
 
     for (;;) {
@@ -605,7 +691,7 @@ export class DiscoveryService {
       const after: string | null = cursor;
       const page = await this.fetchPage(
         run,
-        DISCOVERY_QUERY,
+        detections ? DISCOVERY_LIST_QUERY : DISCOVERY_QUERY,
         (size) => ({ cursor: after, pageSize: size, withOrganizations }),
         pageSize,
         (data: DiscoverData | undefined) => (isPageViewer(data?.viewer) ? data.viewer : undefined),
@@ -620,12 +706,12 @@ export class DiscoveryService {
         checkAccount(viewer.databaseId, accountId);
       }
       for (const error of page.errors) run.errors.push({ error, data: page.data });
-      collector.addNodes(asArray(viewer.repositories.nodes));
+      collector.addPage(asArray(viewer.repositories.nodes), page.errors);
       const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
       if (next === undefined) break;
       cursor = next;
     }
-    return { viewerLogin, organizations, repositories: collector.repositories, scanned: collector.scanned, missingOwners: [] };
+    return { viewerLogin, organizations, collector, missingOwners: [] };
   }
 
   /**
@@ -636,24 +722,23 @@ export class DiscoveryService {
     run: RefreshRun,
     accountId: string,
     logins: readonly string[],
+    detections: Detections,
     signal: AbortSignal | undefined,
   ): Promise<ScanResult> {
     const viewer = await this.scopeViewer(run, signal);
     checkAccount(viewer.databaseId, accountId);
-    const scans = await allOrAbort(logins, (login, ownerSignal) => this.scanOwner(run, login, viewer.login, ownerSignal), signal);
-    const collector = new RepositoryCollector();
+    const scans = await allOrAbort(
+      logins,
+      (login, ownerSignal) => this.scanOwner(run, login, viewer.login, detections, ownerSignal),
+      signal,
+    );
+    const collector = new RepositoryCollector(detections);
     const missingOwners: string[] = [];
     scans.forEach((scan, index) => {
       if (scan.missing) missingOwners.push(logins[index]);
-      collector.addNodes(scan.nodes);
+      collector.addAll(scan.collector);
     });
-    return {
-      viewerLogin: viewer.login,
-      organizations: viewer.organizations,
-      repositories: collector.repositories,
-      scanned: collector.scanned,
-      missingOwners,
-    };
+    return { viewerLogin: viewer.login, organizations: viewer.organizations, collector, missingOwners };
   }
 
   /** The signed-in account and the first page of its organizations. Throws when GitHub does not return the account. */
@@ -678,13 +763,14 @@ export class DiscoveryService {
     run: RefreshRun,
     login: string,
     viewerLogin: string,
+    detections: Detections,
     signal: AbortSignal | undefined,
   ): Promise<OwnerScan> {
     const own = login.toLowerCase() === viewerLogin.toLowerCase();
-    const nodes: Array<RepositoryNode | null> = [];
+    const collector = new RepositoryCollector(detections);
     let cursor: string | null = null;
     const usedCursors = new Set<string>();
-    let pageSize = DISCOVERY_PAGE_SIZE;
+    let pageSize = detections ? DISCOVERY_LIST_PAGE_SIZE : DISCOVERY_PAGE_SIZE;
     let pages = 0;
     for (;;) {
       if (pages >= MAX_PAGES) {
@@ -695,7 +781,7 @@ export class DiscoveryService {
       const page = await this.fetchPage(
         run,
         own ? VIEWER_REPOSITORIES_QUERY : OWNER_REPOSITORIES_QUERY,
-        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size, withConfigurations: true }),
+        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size, withConfigurations: !detections }),
         pageSize,
         (data: OwnerPageData | undefined, errors) => readOwnerPage(own ? data?.viewer : data?.repositoryOwner, data, errors),
         signal,
@@ -703,13 +789,71 @@ export class DiscoveryService {
       pages++;
       pageSize = page.pageSize;
       for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
-      if (page.value === MISSING_OWNER) return { nodes, missing: nodes.length === 0 };
-      nodes.push(...asArray(page.value.nodes));
+      if (page.value === MISSING_OWNER) return { collector, missing: pages === 1 };
+      collector.addPage(asArray(page.value.nodes), page.errors);
       const next = nextCursor(page.value.pageInfo, usedCursors);
       if (next === undefined) break;
       cursor = next;
     }
-    return { nodes, missing: false };
+    return { collector, missing: false };
+  }
+
+  /**
+   * Incremental detection: the configurations of new and changed repositories, in aliased batches of LOOKUP_BATCH_SIZE,
+   * at most DISCOVERY_CONCURRENCY requests at the same time. A batch that GitHub does not answer in time is split.
+   */
+  private async lookUpConfigurations(
+    run: RefreshRun,
+    entries: CollectedRepository[],
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const batches: CollectedRepository[][] = [];
+    for (let start = 0; start < entries.length; start += LOOKUP_BATCH_SIZE) {
+      batches.push(entries.slice(start, start + LOOKUP_BATCH_SIZE));
+    }
+    await allOrAbort(batches, (batch, batchSignal) => this.lookUpBatch(run, batch, batchSignal), signal);
+  }
+
+  private async lookUpBatch(run: RefreshRun, batch: CollectedRepository[], signal: AbortSignal): Promise<void> {
+    const variables: Record<string, unknown> = {};
+    batch.forEach((entry, index) => {
+      variables[`o${index}`] = entry.info.owner;
+      variables[`n${index}`] = entry.info.name;
+    });
+    let failure: unknown;
+    let retryable: boolean;
+    try {
+      const result = await this.request<Record<string, ConfigurationNode | null>>(run, configurationsQuery(batch.length), variables, signal);
+      const data = result.data;
+      const answered = isRecord(data) && batch.some((_entry, index) => isRecord(data[`r${index}`]));
+      if (isRecord(data) && (answered || !isTimeoutResponse(result.errors))) {
+        const uncertain = new Set<number>();
+        for (const error of result.errors ?? []) {
+          const match = typeof error.path?.[0] === 'string' ? /^r(\d+)$/.exec(error.path[0]) : null;
+          const entry = match ? batch[Number(match[1])] : undefined;
+          if (match) uncertain.add(Number(match[1]));
+          run.errors.push({ error, data, organization: entry?.info.owner });
+        }
+        batch.forEach((entry, index) => {
+          const node = data[`r${index}`];
+          // A repository that GitHub does not return now (renamed, removed, or no access) is read again next time.
+          entry.info = { ...entry.info, configPaths: isRecord(node) ? detectConfigurations(node) : [] };
+          entry.checked = isRecord(node) && !uncertain.has(index);
+          entry.lookup = false;
+        });
+        return;
+      }
+      failure = new Error(`GitHub did not return the configurations of the repositories: ${describeGraphQLErrors(result.errors)}`);
+      retryable = isTimeoutResponse(result.errors);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      failure = error;
+      retryable = isRetryableError(error);
+    }
+    if (!retryable || batch.length <= DISCOVERY_MIN_PAGE_SIZE) throw failure;
+    this.logger.warn('Repository list: GitHub did not read the configurations in time. Trying again in smaller requests.');
+    const half = Math.ceil(batch.length / 2);
+    await allOrAbort([batch.slice(0, half), batch.slice(half)], (part, partSignal) => this.lookUpBatch(run, part, partSignal), signal);
   }
 
   /** One GraphQL request of a refresh, within the limit of parallel requests. */
@@ -1061,24 +1205,74 @@ function readOwnerPage(
   return data !== undefined && notReturned && expected ? MISSING_OWNER : undefined;
 }
 
-/** Collects the repositories with a configuration, in the order of the pages, each repository once. */
-class RepositoryCollector {
-  readonly repositories: RepositoryInfo[] = [];
-  scanned = 0;
-  private readonly seen = new Set<string>();
+/** A repository of a scan. */
+interface CollectedRepository {
+  info: RepositoryInfo;
+  /** The detection is certain and is kept for the next refresh. */
+  checked: boolean;
+  /** Its configurations must still be read (incremental detection). */
+  lookup: boolean;
+}
 
-  addNodes(nodes: ReadonlyArray<RepositoryNode | null>): void {
-    for (const node of nodes) {
+/**
+ * Collects the repositories of a scan in the order of the pages, each repository once. The first load takes the
+ * configurations from the page; a refresh with a stored list takes them from the stored detection of an unchanged
+ * repository, and marks the others for a lookup.
+ */
+class RepositoryCollector {
+  private readonly entries: CollectedRepository[] = [];
+  private readonly seen = new Set<string>();
+  /** Repository nodes that GitHub returned, with and without configuration. */
+  scanned = 0;
+
+  constructor(private readonly detections: Detections) {}
+
+  addPage(nodes: ReadonlyArray<RepositoryNode | null>, errors: readonly GraphQLError[]): void {
+    const uncertain = nodesWithErrors(errors);
+    nodes.forEach((node, index) => {
       this.scanned++;
-      if (!isRecord(node)) continue;
+      if (!isRecord(node)) return;
       const info = toRepositoryInfo(node);
-      if (!info) continue;
-      // The order by last push can move a repository to another page while the pages load.
-      const key = info.nameWithOwner.toLowerCase();
-      if (this.seen.has(key)) continue;
-      this.seen.add(key);
-      if (info.configPaths.length > 0) this.repositories.push(info);
-    }
+      if (!info) return;
+      if (!this.detections) {
+        this.add({ info, checked: !uncertain.has(index), lookup: false });
+        return;
+      }
+      const stored = this.detections.get(info.nameWithOwner.toLowerCase());
+      if (stored && !needsConfigurationLookup(info, stored)) {
+        this.add({ info: { ...info, configPaths: [...stored.configPaths] }, checked: true, lookup: false });
+      } else {
+        this.add({ info, checked: false, lookup: true });
+      }
+    });
+  }
+
+  addAll(other: RepositoryCollector): void {
+    this.scanned += other.scanned;
+    for (const entry of other.entries) this.add(entry);
+  }
+
+  /** The repositories whose configurations must still be read. The entries are updated in place. */
+  pending(): CollectedRepository[] {
+    return this.entries.filter((entry) => entry.lookup);
+  }
+
+  repositories(): RepositoryInfo[] {
+    return this.entries.filter((entry) => entry.info.configPaths.length > 0).map((entry) => entry.info);
+  }
+
+  withoutConfiguration(): CheckedRepository[] {
+    return this.entries
+      .filter((entry) => entry.checked && entry.info.configPaths.length === 0)
+      .map((entry) => checkedRepository(entry.info));
+  }
+
+  private add(entry: CollectedRepository): void {
+    // The order by last push can move a repository to another page while the pages load.
+    const key = entry.info.nameWithOwner.toLowerCase();
+    if (this.seen.has(key)) return;
+    this.seen.add(key);
+    this.entries.push(entry);
   }
 }
 
@@ -1164,5 +1358,18 @@ export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
     hints: Array.isArray(value.hints) ? value.hints.filter(isOrganizationHint) : [],
     // Lists of older versions have no scope: they were built from all repositories.
     ...(isStringArray(value.scope) ? { scope: normalizeScope(value.scope) } : {}),
+    ...(Array.isArray(value.withoutConfiguration)
+      ? { withoutConfiguration: value.withoutConfiguration.filter(isCheckedRepository).map(checkedRepository) }
+      : {}),
   };
+}
+
+function isCheckedRepository(value: unknown): value is CheckedRepository {
+  return (
+    isRecord(value) &&
+    typeof value.nameWithOwner === 'string' &&
+    value.nameWithOwner.includes('/') &&
+    (value.pushedAt === null || typeof value.pushedAt === 'string') &&
+    (value.defaultBranch === null || typeof value.defaultBranch === 'string')
+  );
 }

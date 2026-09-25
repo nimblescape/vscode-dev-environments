@@ -158,6 +158,16 @@ export interface OrganizationHint {
   url: string;
 }
 
+/**
+ * A repository of the last discovery without a Dev Container configuration, with the state of GitHub its detection was
+ * read from (incremental detection, concept 7.4).
+ */
+export interface CheckedRepository {
+  nameWithOwner: string;
+  pushedAt: string | null;
+  defaultBranch: string | null;
+}
+
 /** Content of repositories-<account ID>.json. */
 export interface DiscoveryData {
   version: 1;
@@ -172,6 +182,11 @@ export interface DiscoveryData {
    * repositories that the account can access (lists of older versions have none).
    */
   scope?: string[];
+  /**
+   * The repositories of the scan that have no configuration, so that a later refresh reads the configurations only of
+   * new and changed repositories. Missing in lists of older versions.
+   */
+  withoutConfiguration?: CheckedRepository[];
 }
 
 /** Content of sessions/<window-id>.json (concept 7.9). */

@@ -311,6 +311,19 @@ describe('DiscoveryService.refresh with a scan scope', () => {
   });
 });
 
+describe('the first load and uncertain detections', () => {
+  it('does not keep a repository as without configuration when an error points into its node', async () => {
+    const transport = new AsyncFakeGitHub(() => ({
+      body: {
+        data: { viewer: { login: 'octo', databaseId: 1001, organizations: connection([]), repositories: connection([repoNode('acme/timeout', false), repoNode('acme/empty', false)]) } },
+        errors: [{ message: 'Something went wrong', path: ['viewer', 'repositories', 'nodes', 0, 'folder'] }],
+      },
+    }));
+    const result = await service(transport, [], recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
+    expect(result.withoutConfiguration).toEqual([{ nameWithOwner: 'acme/empty', pushedAt: '2026-09-20T10:00:00Z', defaultBranch: 'main' }]);
+  });
+});
+
 describe('the queries of the scan scope', () => {
   it('ask about one owner by its login, with the configuration lookups only on request', () => {
     expect(OWNER_REPOSITORIES_QUERY).toMatch(/repositoryOwner\(login: \$login\)/);
