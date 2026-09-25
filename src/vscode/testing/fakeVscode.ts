@@ -55,6 +55,7 @@ export const ProgressLocation = { SourceControl: 1, Window: 10, Notification: 15
 export const StatusBarAlignment = { Left: 1, Right: 2 } as const;
 export const TreeItemCollapsibleState = { None: 0, Collapsed: 1, Expanded: 2 } as const;
 export const QuickPickItemKind = { Separator: -1, Default: 0 } as const;
+export const ConfigurationTarget = { Global: 1, Workspace: 2, WorkspaceFolder: 3 } as const;
 
 export interface FakeStatusBarItem {
   id: string;
@@ -94,6 +95,7 @@ export const fakeVscode = {
   StatusBarAlignment,
   TreeItemCollapsibleState,
   QuickPickItemKind,
+  ConfigurationTarget,
   window: {
     createOutputChannel: vi.fn(),
     createStatusBarItem: vi.fn(),

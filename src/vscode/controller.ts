@@ -45,6 +45,7 @@ import {
 } from './disconnectRequests';
 import { showError as presentError } from './errors';
 import type { OutputChannelLogger } from './logger';
+import { selectOwners } from './ownerSelector';
 import type { VsCodePipelineUi } from './pipelineUi';
 import { runWithProgress, type BusyChange } from './progress';
 import type { SessionCoordinator } from './sessionCoordinator';
@@ -228,7 +229,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 12 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 14 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -243,6 +244,8 @@ export class Controller implements vscode.Disposable {
       search: () => this.search(),
       showLog: async () => this.logger.show(),
       signIn: () => this.signIn(),
+      selectOwners: () => this.selectOwners(),
+      selectOwnersFiltered: () => this.selectOwners(),
     };
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
@@ -759,6 +762,18 @@ export class Controller implements vscode.Disposable {
     const info = await pickRepository(repositories, ControllerTexts.selectRepositoryToStart);
     if (!info) return;
     await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner, 'token'));
+  }
+
+  /** Select Organizations… (concept 6.2, 8): writes the setting `owners`, the scan scope of the list. */
+  async selectOwners(): Promise<void> {
+    await selectOwners({
+      auth: this.deps.auth,
+      discoveryData: () => this.deps.sidebar.discoveryData,
+      discovery: this.deps.discovery,
+      settings: this.deps.settings,
+      signIn: () => this.signIn(),
+      logger: this.logger,
+    });
   }
 
   /** Sign in with GitHub (concept 6.1 step 1). */

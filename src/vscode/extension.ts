@@ -35,6 +35,7 @@ import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
 import { OutputChannelLogger } from './logger';
+import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { SessionCoordinator } from './sessionCoordinator';
@@ -269,6 +270,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
       if (!affectsSettings(event)) return;
       const previous = settings;
       settings = readSettings();
+      updateOwnersContextKey(settings.owners, logger);
       // Concept 7.4: another scan scope loads the list again at once.
       if (!sameScope(previous.owners, settings.owners)) {
         background(sidebar.onScopeChanged(), 'load the repository list of the selected organizations');
@@ -279,6 +281,8 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     }),
   );
 
+  // The icon of Select Organizations… in the view title bar.
+  updateOwnersContextKey(settings.owners, logger);
   // Concept 6.1 step 3: the stored list at once, then the background refresh.
   background(sidebar.initialize(), 'show the repository list');
   if (view.visible) {

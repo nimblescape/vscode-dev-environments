@@ -139,6 +139,18 @@
         "command": "devEnvironments.signIn",
         "title": "Sign in with GitHub",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.selectOwners",
+        "title": "Select Organizations…",
+        "category": "Dev Environments",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "devEnvironments.selectOwnersFiltered",
+        "title": "Select Organizations…",
+        "category": "Dev Environments",
+        "icon": "$(filter-filled)"
       }
     ],
     "submenus": [
@@ -149,7 +161,23 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "devEnvironments.selectOwnersFiltered",
+          "when": "false"
+        }
+      ],
       "view/title": [
+        {
+          "command": "devEnvironments.selectOwners",
+          "when": "view == devEnvironments.repositories && !devEnvironments.ownersFiltered",
+          "group": "navigation@0"
+        },
+        {
+          "command": "devEnvironments.selectOwnersFiltered",
+          "when": "view == devEnvironments.repositories && devEnvironments.ownersFiltered",
+          "group": "navigation@0"
+        },
         {
           "command": "devEnvironments.search",
           "when": "view == devEnvironments.repositories",

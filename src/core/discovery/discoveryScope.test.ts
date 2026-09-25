@@ -324,6 +324,25 @@ describe('the first load and uncertain detections', () => {
   });
 });
 
+describe('DiscoveryService.viewerOrganizations (organization selector)', () => {
+  it('reads the account and all pages of its organizations, without any repository, also with a scan scope', async () => {
+    const transport = new AsyncFakeGitHub((request) => {
+      if (request.query === SCOPE_VIEWER_QUERY) {
+        return { body: { data: { viewer: { login: 'octo', databaseId: 1001, organizations: { pageInfo: { hasNextPage: true, endCursor: 'o1' }, nodes: [{ login: 'acme' }] } } } } };
+      }
+      return { body: { data: { viewer: { organizations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ login: 'beta' }] } } } } };
+    });
+    await expect(service(transport, ['acme']).viewerOrganizations(TOKEN)).resolves.toEqual({ login: 'octo', organizations: ['acme', 'beta'] });
+    expect(transport.requests.map((request) => request.query.match(/^query \w+/)?.[0])).toEqual(['query ScopeViewer', 'query Organizations']);
+    expect(JSON.stringify(transport.requests)).not.toMatch(/repositories\(/);
+  });
+
+  it('throws when GitHub does not return the account', async () => {
+    const transport = new AsyncFakeGitHub(() => ({ body: { errors: [{ message: 'Bad credentials' }] } }));
+    await expect(service(transport, []).viewerOrganizations(TOKEN)).rejects.toThrow(/did not return the account/);
+  });
+});
+
 describe('the queries of the scan scope', () => {
   it('ask about one owner by its login, with the configuration lookups only on request', () => {
     expect(OWNER_REPOSITORIES_QUERY).toMatch(/repositoryOwner\(login: \$login\)/);

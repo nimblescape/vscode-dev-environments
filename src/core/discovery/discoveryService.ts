@@ -617,6 +617,27 @@ export class DiscoveryService {
     return result;
   }
 
+  /**
+   * The login of the account of the token and the organizations where it is a member, without any repository (for the
+   * organization selector; allowed with any scan scope). Throws when GitHub does not return the account; a failed further
+   * page of organizations only shortens the list.
+   */
+  async viewerOrganizations(token: string, signal?: AbortSignal): Promise<{ login: string; organizations: string[] }> {
+    const run: RefreshRun = {
+      token,
+      accountId: '',
+      scope: [],
+      limiter: new Semaphore(1),
+      requests: 0,
+      errors: [],
+      viewerLogin: '',
+      collectors: [],
+    };
+    const viewer = await this.scopeViewer(run, signal);
+    const organizations = await this.collectOrganizations(viewer.organizations, run, signal);
+    return { login: viewer.login, organizations };
+  }
+
   /** The account of the token: user ID, login, and profile name. Throws when GitHub does not return it. */
   async viewer(token: string, signal?: AbortSignal): Promise<GitHubViewer> {
     const result = await this.api.graphql<ViewerData>(VIEWER_QUERY, {}, token, signal);
