@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { silentLogger } from '../core/ports';
-import { GITHUB_SCOPES, PACKAGES_SCOPES, SIGNED_IN_CONTEXT_KEY, VsCodeGitHubAuth } from './auth';
+import { GITHUB_SCOPES, PACKAGES_SCOPES, SIGNED_IN_CONTEXT_KEY, VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 const session = (token: string) => ({ id: token, accessToken: token, account: { id: '1', label: 'octocat' }, scopes: [] });
@@ -198,5 +198,15 @@ describe('VsCodeGitHubAuth (concept section 9)', () => {
       expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org', 'read:packages'], { forceNewSession: true });
       auth.dispose();
     });
+  });
+
+  it('reports the rejected credentials of ghcr.io (the GitHub session), and of no other registry', () => {
+    const reportRejectedToken = vi.fn();
+    const report = ghcrRejectionReporter({ reportRejectedToken });
+    report('ghcr.io', { username: 'octocat', password: 'gho_1' });
+    report('GHCR.IO', { username: 'octocat', password: 'gho_2' });
+    report('docker.io', { username: 'user', password: 'dckr_pat' });
+    report('ghcr.io.example.com', { username: 'user', password: 'other' });
+    expect(reportRejectedToken.mock.calls).toEqual([['gho_1'], ['gho_2']]);
   });
 });

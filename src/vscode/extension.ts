@@ -29,7 +29,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
-import { VsCodeGitHubAuth } from './auth';
+import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
@@ -104,9 +104,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   // The sign-in fix: a 401 of GitHub (here the token service of ghcr.io for the GitHub session) reaches auth.ts, which
   // ignores tokens that belong to no current session (for example a token of the Docker credentials).
   const registryClient = new RegistryClient(nodeHttpsTransport, withGitHubPackagesFallback(credentials.provider(), auth), logger, {
-    onCredentialsRejected: (registry, rejected) => {
-      if (registry.toLowerCase() === 'ghcr.io') auth.reportRejectedToken(rejected.password);
-    },
+    onCredentialsRejected: ghcrRejectionReporter(auth),
   });
   const imageChecker = new ImageChecker(registryClient, logger);
   const helper = new WorkspaceHelper({

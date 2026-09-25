@@ -214,6 +214,18 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   }
 }
 
+/**
+ * The listener of RegistryClient for credentials that a token service rejected (HTTP 401): for ghcr.io, whose
+ * credentials may be the GitHub session (withGitHubPackagesFallback), the password is reported to `auth`, which ignores
+ * a token that belongs to no current session (for example one of the Docker credentials). Other registries report
+ * nothing: their credentials are not the GitHub session.
+ */
+export function ghcrRejectionReporter(auth: Pick<VsCodeGitHubAuth, 'reportRejectedToken'>): (registry: string, credentials: Credentials) => void {
+  return (registry, credentials) => {
+    if (registry.toLowerCase() === 'ghcr.io') auth.reportRejectedToken(credentials.password);
+  };
+}
+
 function scopeKey(scopes: readonly string[]): string {
   return [...scopes].sort().join(' ');
 }

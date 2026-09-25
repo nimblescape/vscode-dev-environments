@@ -132,6 +132,11 @@ describe('Sign in with GitHub replaces a token that GitHub rejected', () => {
     // No loop: the rejected token is not tried again by itself.
     for (let index = 0; index < 20; index++) await flush();
     expect(refresh).toHaveBeenCalledTimes(1);
+    // Nor by a refresh of the view (the timer, Refresh with the session present, the focus): no request with it.
+    await sidebar.refreshDiscovery({ again: true });
+    await sidebar.onSessionChanged({ again: true });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(sidebar.isSignedIn).toBe(false);
 
     await controller.signIn();
     expect(fakeVscode.authentication.getSession).toHaveBeenCalledWith('github', ['repo', 'read:org'], { forceNewSession: true });
