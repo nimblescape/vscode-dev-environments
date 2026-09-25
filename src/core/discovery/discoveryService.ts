@@ -5,6 +5,7 @@
 // Discovery Service (concept 7.4): finds the repositories with a Dev Container configuration through the GitHub
 // GraphQL API and stores the result in repositories-<account ID>.json, one file per GitHub account (concept 6.2). Security
 // (concept section 9): the token is only passed on to the GitHubApi; the stored file contains metadata only.
+import { allOrAbort, Semaphore } from '../concurrency';
 import { readJson, writeJsonAtomic } from '../storage/atomicJson';
 import type { GitHubViewer } from '../helper/containerGit';
 import { splitRepository } from '../names';
@@ -18,11 +19,14 @@ import {
   type GitHubApi,
   type GraphQLError,
 } from './githubApi';
+import { normalizeScope, scopeLogins } from './scope';
 
 /** Repositories per request (concept 7.4). */
 export const DISCOVERY_PAGE_SIZE = 50;
 /** Smallest page size when GitHub does not answer a page in time. */
 export const DISCOVERY_MIN_PAGE_SIZE = 10;
+/** Requests of one refresh that run at the same time at most (concept 7.4). */
+export const DISCOVERY_CONCURRENCY = 4;
 /** Protection against a pagination that never ends. */
 const MAX_PAGES = 1000;
 const ORGANIZATIONS_PAGE_SIZE = 100;
@@ -177,6 +181,107 @@ export const BRANCH_CONFIGURATIONS_QUERY = `query BranchConfigurations($owner: S
 }
 ${CONFIGURATION_FOLDER_FRAGMENT}`;
 
+/** The fields of a repository without the configuration lookups, which make a request slow. */
+const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Repository {
+  id
+  name
+  nameWithOwner
+  url
+  isArchived
+  isFork
+  isPrivate
+  viewerPermission
+  pushedAt
+  owner {
+    login
+  }
+  defaultBranchRef {
+    name
+  }
+}`;
+
+// `HEAD` is the default branch (concept 7.4).
+const CONFIGURATION_LOOKUPS_FRAGMENT = `fragment ConfigurationLookups on Repository {
+  rootFile: object(expression: "HEAD:.devcontainer.json") {
+    __typename
+  }
+  folder: object(expression: "HEAD:.devcontainer") {
+    ...ConfigurationFolder
+  }
+}`;
+
+/** One page of a repository connection of the scan scope; the configuration lookups only with `$withConfigurations`. */
+function scopeConnection(argumentsText: string): string {
+  return `repositories(
+        first: $pageSize
+        after: $cursor
+        ${argumentsText}orderBy: { field: PUSHED_AT, direction: DESC }
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          ...RepositoryListFields
+          ...ConfigurationLookups @include(if: $withConfigurations)
+        }
+      }`;
+}
+
+/**
+ * The signed-in account and its organizations, without repositories: the first request of a refresh with a scan scope,
+ * and the list of the organization selector. Further pages of organizations: ORGANIZATIONS_QUERY.
+ */
+export const SCOPE_VIEWER_QUERY = `query ScopeViewer {
+  viewer {
+    login
+    databaseId
+    organizations(first: ${ORGANIZATIONS_PAGE_SIZE}) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        login
+      }
+    }
+  }
+}`;
+
+/**
+ * The repositories of one organization or user account of the scan scope (concept 7.4), last push first.
+ * Variables: `login`, `cursor`, `pageSize`, `withConfigurations`. `repositoryOwner` is `null` for an unknown login.
+ */
+export const OWNER_REPOSITORIES_QUERY = `query OwnerRepositories($login: String!, $cursor: String, $pageSize: Int!, $withConfigurations: Boolean!) {
+  repositoryOwner(login: $login) {
+    __typename
+    login
+    ... on Organization {
+      ${scopeConnection('')}
+    }
+    ... on User {
+      ${scopeConnection('ownerAffiliations: [OWNER]\n        ')}
+    }
+  }
+}
+${REPOSITORY_LIST_FIELDS_FRAGMENT}
+${CONFIGURATION_LOOKUPS_FRAGMENT}
+${CONFIGURATION_FOLDER_FRAGMENT}`;
+
+/**
+ * The repositories of the signed-in account itself when it is in the scan scope: `viewer` also returns its private
+ * repositories. Variables: `cursor`, `pageSize`, `withConfigurations`.
+ */
+export const VIEWER_REPOSITORIES_QUERY = `query ViewerRepositories($cursor: String, $pageSize: Int!, $withConfigurations: Boolean!) {
+  viewer {
+    login
+    ${scopeConnection('affiliations: [OWNER]\n        ownerAffiliations: [OWNER]\n        ')}
+  }
+}
+${REPOSITORY_LIST_FIELDS_FRAGMENT}
+${CONFIGURATION_LOOKUPS_FRAGMENT}
+${CONFIGURATION_FOLDER_FRAGMENT}`;
+
 /** Query that reads one repository of each given organization. An organization that restricts access answers with an error. */
 export function organizationAccessQuery(count: number): string {
   const variables: string[] = [];
@@ -262,7 +367,54 @@ interface BranchConfigurationsData {
 interface CollectedError {
   error: GraphQLError;
   data: unknown;
+  /** The organization or account that the request was about, for a request about one owner of the scan scope. */
+  organization?: string;
 }
+
+interface ScopeViewerData {
+  viewer?: { login?: string; databaseId?: number | null; organizations?: Connection<LoginNode> | null } | null;
+}
+
+interface OwnerPageData {
+  repositoryOwner?: { login?: string; repositories?: Connection<RepositoryNode> | null } | null;
+  viewer?: { login?: string; repositories?: Connection<RepositoryNode> | null } | null;
+}
+
+export interface DiscoveryOptions {
+  /**
+   * The setting `owners`, read at each refresh: the scan scope (concept 7.4). Configured, the refresh asks GitHub only
+   * about the repositories of these organizations and accounts. Empty (default): all repositories of the account.
+   */
+  scope?: () => readonly string[];
+}
+
+/** The requests of one refresh: the token, the limit of parallel requests, the collected errors, and a counter for the log. */
+interface RefreshRun {
+  token: string;
+  limiter: Semaphore;
+  requests: number;
+  errors: CollectedError[];
+}
+
+/** The repositories of a scan, before the organizations and the hints are collected. */
+interface ScanResult {
+  viewerLogin: string;
+  organizations: Connection<LoginNode> | null | undefined;
+  repositories: RepositoryInfo[];
+  /** Repository nodes that GitHub returned, with and without configuration. */
+  scanned: number;
+  /** Owners of the scan scope that GitHub did not return (unknown, or no access). */
+  missingOwners: string[];
+}
+
+/** The repository nodes of one owner of the scan scope. `missing`: GitHub did not return the owner. */
+interface OwnerScan {
+  nodes: Array<RepositoryNode | null>;
+  missing: boolean;
+}
+
+/** An owner of the scan scope that GitHub does not return: `repositoryOwner` is `null`. */
+const MISSING_OWNER = 'missing';
 
 export class DiscoveryService {
   constructor(
@@ -271,6 +423,7 @@ export class DiscoveryService {
     private readonly fileOf: (accountId: string) => string,
     private readonly logger: Logger = silentLogger,
     private readonly clock: Clock = systemClock,
+    private readonly options: DiscoveryOptions = {},
   ) {}
 
   /**
@@ -282,85 +435,61 @@ export class DiscoveryService {
   }
 
   /**
-   * Full discovery for the account `accountId` with its token: all pages with up to 50 repositories each, in the order of
-   * the API (last push first). Keeps only repositories with at least one configuration. Errors for organizations with
-   * SAML single sign-on or OAuth app access restrictions become one hint per organization. Partial data with errors is
-   * used. Stores the result atomically in the file of the account and returns it. Throws on a network failure, an HTTP
-   * error, when GitHub does not return the list, or when the token belongs to another account (a sign-in changed the
-   * session meanwhile); the stored file then stays unchanged.
+   * Full discovery for the account `accountId` with its token, in the scan scope of DiscoveryOptions.scope (concept 7.4):
+   * - empty scope: all pages of `viewer.repositories` with up to 50 repositories each, one after another, in the order of
+   *   the API (last push first);
+   * - configured scope: first the account and its organizations, then the repositories of each owner of the scope, the
+   *   owners in parallel (at most DISCOVERY_CONCURRENCY requests at the same time), the pages of one owner one after
+   *   another. No request is about another owner. An owner that GitHub does not return gets a `notFound` hint.
+   * Keeps only repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth
+   * app access restrictions become one hint per organization. Partial data with errors is used. Stores the result with
+   * its scope atomically in the file of the account and returns it. Throws on a network failure, an HTTP error, when
+   * GitHub does not return the list, or when the token belongs to another account (a sign-in changed the session
+   * meanwhile); the stored file then stays unchanged.
    */
   async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
-    const repositories: RepositoryInfo[] = [];
-    const seen = new Set<string>();
-    const errors: CollectedError[] = [];
-    let viewerLogin = '';
-    let organizationsConnection: Connection<LoginNode> | null | undefined;
-    let cursor: string | null = null;
-    const usedCursors = new Set<string>();
-    let pageSize = DISCOVERY_PAGE_SIZE;
-    let scanned = 0;
-    let pages = 0;
+    const started = this.clock.now();
+    const logins = scopeLogins(this.options.scope?.() ?? []);
+    const run: RefreshRun = { token, limiter: new Semaphore(DISCOVERY_CONCURRENCY), requests: 0, errors: [] };
+    const scan =
+      logins.length === 0 ? await this.scanAll(run, accountId, signal) : await this.scanScope(run, accountId, logins, signal);
 
-    for (;;) {
-      if (pages >= MAX_PAGES) {
-        this.logger.warn(`Repository list: stopped after ${pages} pages.`);
-        break;
-      }
-      const page = await this.fetchRepositoryPage(cursor, pages === 0, pageSize, token, signal);
-      pages++;
-      pageSize = page.pageSize;
-      if (pages === 1) {
-        viewerLogin = page.viewer.login;
-        organizationsConnection = page.viewer.organizations;
-        const viewerId = page.viewer.databaseId;
-        if (typeof viewerId === 'number' && String(viewerId) !== accountId) {
-          throw new Error('The GitHub session changed while the repository list was loaded.');
-        }
-      }
-      for (const error of page.errors) errors.push({ error, data: page.data });
-
-      const connection = page.viewer.repositories;
-      for (const node of asArray(connection.nodes)) {
-        scanned++;
-        if (!isRecord(node)) continue;
-        const info = toRepositoryInfo(node);
-        if (!info) continue;
-        // The order by last push can move a repository to another page while the pages load.
-        const key = info.nameWithOwner.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        if (info.configPaths.length > 0) repositories.push(info);
-      }
-
-      const next = nextCursor(connection.pageInfo, usedCursors);
-      if (next === undefined) break;
-      cursor = next;
-    }
-
-    const organizations = await this.collectOrganizations(organizationsConnection, errors, token, signal);
-    const hints = new HintCollector(viewerLogin);
-    for (const { error, data } of errors) hints.add(error, data);
+    const organizations = await this.collectOrganizations(scan.organizations, run, signal);
+    const hints = new HintCollector(scan.viewerLogin);
+    for (const { error, data, organization } of run.errors) hints.add(error, data, organization);
     if (hints.unattributed > 0) {
+      // With a scan scope, only organizations of the scope are asked.
+      const scope = new Set(normalizeScope(logins));
       await this.probeOrganizations(
-        organizations.filter((organization) => !hints.has(organization)),
+        organizations.filter(
+          (organization) => !hints.has(organization) && (scope.size === 0 || scope.has(organization.toLowerCase())),
+        ),
         hints,
-        token,
+        run,
         signal,
       );
     }
-    this.logErrors(errors);
+    for (const owner of scan.missingOwners) hints.addNotFound(owner);
+    this.logErrors(run.errors);
 
+    const repositories = scan.repositories;
     const result: DiscoveryData = {
       version: 1,
       fetchedAt: isoTime(this.clock),
-      viewerLogin,
+      viewerLogin: scan.viewerLogin,
       organizations,
       repositories,
       hints: hints.list(),
+      scope: normalizeScope(logins),
     };
     this.logger.info(
-      `Repository list: ${repositories.length} of ${scanned} repositories have a Dev Container configuration` +
-        (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization.` : '.'),
+      `Repository list: ${repositories.length} of ${scan.scanned} repositories have a Dev Container configuration` +
+        (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization or were not found.` : '.'),
+    );
+    const seconds = Math.max(0, this.clock.now() - started) / 1000;
+    this.logger.info(
+      `Repository list: loaded in ${seconds.toFixed(1)} seconds with ${run.requests} requests` +
+        (logins.length > 0 ? ` (scan scope: ${logins.join(', ')}).` : '.'),
     );
     try {
       await writeJsonAtomic(this.fileOf(accountId), result);
@@ -457,33 +586,165 @@ export class DiscoveryService {
     throw new Error(`GitHub did not answer the query for the repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
   }
 
-  private async fetchRepositoryPage(
-    cursor: string | null,
-    withOrganizations: boolean,
-    initialPageSize: number,
-    token: string,
+  /** Empty scan scope: all pages of `viewer.repositories`, one after another (GitHub has no parallel cursor). */
+  private async scanAll(run: RefreshRun, accountId: string, signal: AbortSignal | undefined): Promise<ScanResult> {
+    const collector = new RepositoryCollector();
+    let viewerLogin = '';
+    let organizations: Connection<LoginNode> | null | undefined;
+    let cursor: string | null = null;
+    const usedCursors = new Set<string>();
+    let pageSize = DISCOVERY_PAGE_SIZE;
+    let pages = 0;
+
+    for (;;) {
+      if (pages >= MAX_PAGES) {
+        this.logger.warn(`Repository list: stopped after ${pages} pages.`);
+        break;
+      }
+      const withOrganizations = pages === 0;
+      const after: string | null = cursor;
+      const page = await this.fetchPage(
+        run,
+        DISCOVERY_QUERY,
+        (size) => ({ cursor: after, pageSize: size, withOrganizations }),
+        pageSize,
+        (data: DiscoverData | undefined) => (isPageViewer(data?.viewer) ? data.viewer : undefined),
+        signal,
+      );
+      pages++;
+      pageSize = page.pageSize;
+      const viewer = page.value;
+      if (pages === 1) {
+        viewerLogin = viewer.login;
+        organizations = viewer.organizations;
+        checkAccount(viewer.databaseId, accountId);
+      }
+      for (const error of page.errors) run.errors.push({ error, data: page.data });
+      collector.addNodes(asArray(viewer.repositories.nodes));
+      const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
+      if (next === undefined) break;
+      cursor = next;
+    }
+    return { viewerLogin, organizations, repositories: collector.repositories, scanned: collector.scanned, missingOwners: [] };
+  }
+
+  /**
+   * Configured scan scope: the account and its organizations (no repository), then each owner of the scope in parallel.
+   * The first failure of an owner stops the others.
+   */
+  private async scanScope(
+    run: RefreshRun,
+    accountId: string,
+    logins: readonly string[],
     signal: AbortSignal | undefined,
-  ): Promise<{ viewer: PageViewer; errors: GraphQLError[]; data: unknown; pageSize: number }> {
+  ): Promise<ScanResult> {
+    const viewer = await this.scopeViewer(run, signal);
+    checkAccount(viewer.databaseId, accountId);
+    const scans = await allOrAbort(logins, (login, ownerSignal) => this.scanOwner(run, login, viewer.login, ownerSignal), signal);
+    const collector = new RepositoryCollector();
+    const missingOwners: string[] = [];
+    scans.forEach((scan, index) => {
+      if (scan.missing) missingOwners.push(logins[index]);
+      collector.addNodes(scan.nodes);
+    });
+    return {
+      viewerLogin: viewer.login,
+      organizations: viewer.organizations,
+      repositories: collector.repositories,
+      scanned: collector.scanned,
+      missingOwners,
+    };
+  }
+
+  /** The signed-in account and the first page of its organizations. Throws when GitHub does not return the account. */
+  private async scopeViewer(
+    run: RefreshRun,
+    signal: AbortSignal | undefined,
+  ): Promise<{ login: string; databaseId: number | null | undefined; organizations: Connection<LoginNode> | null | undefined }> {
+    const result = await this.request<ScopeViewerData>(run, SCOPE_VIEWER_QUERY, {}, signal);
+    const viewer = result.data?.viewer;
+    if (!isRecord(viewer) || typeof viewer.login !== 'string' || viewer.login === '') {
+      throw new Error(`GitHub did not return the account: ${describeGraphQLErrors(result.errors)}`);
+    }
+    for (const error of result.errors ?? []) run.errors.push({ error, data: result.data });
+    return { login: viewer.login, databaseId: viewer.databaseId, organizations: viewer.organizations };
+  }
+
+  /**
+   * All pages of one owner of the scan scope, one after another. The signed-in account itself is read through `viewer`,
+   * which includes its private repositories.
+   */
+  private async scanOwner(
+    run: RefreshRun,
+    login: string,
+    viewerLogin: string,
+    signal: AbortSignal | undefined,
+  ): Promise<OwnerScan> {
+    const own = login.toLowerCase() === viewerLogin.toLowerCase();
+    const nodes: Array<RepositoryNode | null> = [];
+    let cursor: string | null = null;
+    const usedCursors = new Set<string>();
+    let pageSize = DISCOVERY_PAGE_SIZE;
+    let pages = 0;
+    for (;;) {
+      if (pages >= MAX_PAGES) {
+        this.logger.warn(`Repository list: stopped after ${pages} pages of ${login}.`);
+        break;
+      }
+      const after: string | null = cursor;
+      const page = await this.fetchPage(
+        run,
+        own ? VIEWER_REPOSITORIES_QUERY : OWNER_REPOSITORIES_QUERY,
+        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size, withConfigurations: true }),
+        pageSize,
+        (data: OwnerPageData | undefined, errors) => readOwnerPage(own ? data?.viewer : data?.repositoryOwner, data, errors),
+        signal,
+      );
+      pages++;
+      pageSize = page.pageSize;
+      for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
+      if (page.value === MISSING_OWNER) return { nodes, missing: nodes.length === 0 };
+      nodes.push(...asArray(page.value.nodes));
+      const next = nextCursor(page.value.pageInfo, usedCursors);
+      if (next === undefined) break;
+      cursor = next;
+    }
+    return { nodes, missing: false };
+  }
+
+  /** One GraphQL request of a refresh, within the limit of parallel requests. */
+  private request<T>(
+    run: RefreshRun,
+    query: string,
+    variables: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+  ): Promise<{ data?: T; errors?: GraphQLError[] }> {
+    return run.limiter.run(() => {
+      run.requests++;
+      return this.api.graphql<T>(query, variables, run.token, signal);
+    });
+  }
+
+  /**
+   * One page of a repository list. `read` returns the usable part of the response, or `undefined` when GitHub did not
+   * return the list. GitHub stops a query that takes too long: then the page is asked again with fewer repositories.
+   */
+  private async fetchPage<D, P>(
+    run: RefreshRun,
+    query: string,
+    variables: (pageSize: number) => Record<string, unknown>,
+    initialPageSize: number,
+    read: (data: D | undefined, errors: GraphQLError[] | undefined) => P | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<{ value: P; errors: GraphQLError[]; data: unknown; pageSize: number }> {
     let pageSize = initialPageSize;
     for (;;) {
       let failure: unknown;
       let retryable: boolean;
       try {
-        const result = await this.api.graphql<DiscoverData>(
-          DISCOVERY_QUERY,
-          { cursor, pageSize, withOrganizations },
-          token,
-          signal,
-        );
-        const viewer = result.data?.viewer;
-        if (isPageViewer(viewer)) {
-          return {
-            viewer,
-            errors: result.errors ?? [],
-            data: result.data,
-            pageSize,
-          };
-        }
+        const result = await this.request<D>(run, query, variables(pageSize), signal);
+        const value = read(result.data, result.errors);
+        if (value !== undefined) return { value, errors: result.errors ?? [], data: result.data, pageSize };
         failure = new Error(`GitHub did not return the repository list: ${describeGraphQLErrors(result.errors)}`);
         retryable = isTimeoutResponse(result.errors);
       } catch (error) {
@@ -491,7 +752,6 @@ export class DiscoveryService {
         failure = error;
         retryable = isRetryableError(error);
       }
-      // GitHub stops a query that takes too long. A smaller page needs less time.
       // Assumption (V-5): 50 repositories with the configuration lookups fit into the time limit of GitHub in most cases.
       if (!retryable || pageSize <= DISCOVERY_MIN_PAGE_SIZE) throw failure;
       pageSize = Math.max(DISCOVERY_MIN_PAGE_SIZE, Math.floor(pageSize / 2));
@@ -502,8 +762,7 @@ export class DiscoveryService {
   /** Organizations of the first page, plus further pages. A failed further page only shortens the list. */
   private async collectOrganizations(
     first: Connection<LoginNode> | null | undefined,
-    errors: CollectedError[],
-    token: string,
+    run: RefreshRun,
     signal: AbortSignal | undefined,
   ): Promise<string[]> {
     const logins = new Map<string, string>();
@@ -522,8 +781,8 @@ export class DiscoveryService {
       const cursor = nextCursor(connection?.pageInfo, usedCursors);
       if (cursor === undefined) break;
       try {
-        const result = await this.api.graphql<OrganizationsData>(ORGANIZATIONS_QUERY, { cursor }, token, signal);
-        for (const error of result.errors ?? []) errors.push({ error, data: result.data });
+        const result = await this.request<OrganizationsData>(run, ORGANIZATIONS_QUERY, { cursor }, signal);
+        for (const error of result.errors ?? []) run.errors.push({ error, data: result.data });
         connection = result.data?.viewer?.organizations;
         addAll(connection);
       } catch (error) {
@@ -545,7 +804,7 @@ export class DiscoveryService {
   private async probeOrganizations(
     candidates: string[],
     hints: HintCollector,
-    token: string,
+    run: RefreshRun,
     signal: AbortSignal | undefined,
   ): Promise<void> {
     for (let start = 0; start < candidates.length; start += PROBE_CHUNK_SIZE) {
@@ -555,12 +814,7 @@ export class DiscoveryService {
         variables[`o${index}`] = login;
       });
       try {
-        const result = await this.api.graphql<Record<string, unknown>>(
-          organizationAccessQuery(chunk.length),
-          variables,
-          token,
-          signal,
-        );
+        const result = await this.request<Record<string, unknown>>(run, organizationAccessQuery(chunk.length), variables, signal);
         for (const error of result.errors ?? []) {
           const alias = error.path?.[0];
           const match = typeof alias === 'string' ? /^o(\d+)$/.exec(alias) : null;
@@ -618,7 +872,7 @@ export function isTrustedOwner(data: DiscoveryData | undefined, owner: string): 
 // ---------------------------------------------------------------------------------------------------------------------
 // Organization hints
 
-const HINT_PRIORITY: Record<OrganizationHintKind, number> = { saml: 3, oauthRestricted: 2, other: 1 };
+const HINT_PRIORITY: Record<OrganizationHintKind, number> = { saml: 3, oauthRestricted: 2, other: 1, notFound: 0 };
 const LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const MESSAGE_ORGANIZATION_PATTERNS = [
   // "… the `acme` organization has enabled OAuth App access restrictions …"
@@ -647,6 +901,7 @@ export function hintUrl(kind: OrganizationHintKind, organization: string): strin
     case 'oauthRestricted':
       return OAUTH_APP_CONNECTIONS_URL;
     case 'other':
+    case 'notFound':
       return `https://github.com/${login}`;
   }
 }
@@ -723,6 +978,13 @@ class HintCollector {
     this.hints.set(key, { organization: name, kind, url: hintUrl(kind, name) });
   }
 
+  /** An owner of the scan scope that GitHub did not return. A hint of another kind for it wins. */
+  addNotFound(owner: string): void {
+    const key = owner.toLowerCase();
+    if (key === '' || this.hints.has(key)) return;
+    this.hints.set(key, { organization: owner, kind: 'notFound', url: hintUrl('notFound', owner) });
+  }
+
   has(organization: string): boolean {
     return this.hints.has(organization.toLowerCase());
   }
@@ -777,6 +1039,49 @@ function isTimeoutResponse(errors: GraphQLError[] | undefined): boolean {
   return errors.some((error) => TIMEOUT_PATTERN.test(error.message));
 }
 
+/** Throws when the list belongs to another account than `accountId` (a sign-in changed the session meanwhile). */
+function checkAccount(databaseId: number | null | undefined, accountId: string): void {
+  if (typeof databaseId === 'number' && String(databaseId) !== accountId) {
+    throw new Error('The GitHub session changed while the repository list was loaded.');
+  }
+}
+
+/**
+ * The repository connection of a page of an owner of the scan scope, `MISSING_OWNER` when GitHub does not return the
+ * owner (unknown login, or no access), or `undefined` when the page failed.
+ */
+function readOwnerPage(
+  owner: { repositories?: Connection<RepositoryNode> | null } | null | undefined,
+  data: unknown,
+  errors: GraphQLError[] | undefined,
+): Connection<RepositoryNode> | typeof MISSING_OWNER | undefined {
+  if (isRecord(owner) && isRecord(owner.repositories)) return owner.repositories;
+  const notReturned = owner === null || (isRecord(owner) && owner.repositories === null);
+  const expected = (errors ?? []).every((error) => error.type === 'NOT_FOUND' || classifyGraphQLError(error) !== undefined);
+  return data !== undefined && notReturned && expected ? MISSING_OWNER : undefined;
+}
+
+/** Collects the repositories with a configuration, in the order of the pages, each repository once. */
+class RepositoryCollector {
+  readonly repositories: RepositoryInfo[] = [];
+  scanned = 0;
+  private readonly seen = new Set<string>();
+
+  addNodes(nodes: ReadonlyArray<RepositoryNode | null>): void {
+    for (const node of nodes) {
+      this.scanned++;
+      if (!isRecord(node)) continue;
+      const info = toRepositoryInfo(node);
+      if (!info) continue;
+      // The order by last push can move a repository to another page while the pages load.
+      const key = info.nameWithOwner.toLowerCase();
+      if (this.seen.has(key)) continue;
+      this.seen.add(key);
+      if (info.configPaths.length > 0) this.repositories.push(info);
+    }
+  }
+}
+
 function isGitHubUrl(url: string): boolean {
   return url.startsWith('https://github.com/');
 }
@@ -808,7 +1113,7 @@ function toRepositoryInfo(node: RepositoryNode): RepositoryInfo | undefined {
 // ---------------------------------------------------------------------------------------------------------------------
 // Stored file
 
-const HINT_KINDS: readonly OrganizationHintKind[] = ['saml', 'oauthRestricted', 'other'];
+const HINT_KINDS: readonly OrganizationHintKind[] = ['saml', 'oauthRestricted', 'other', 'notFound'];
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
@@ -857,5 +1162,7 @@ export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
     organizations: value.organizations.filter((item): item is string => typeof item === 'string'),
     repositories: value.repositories.filter(isRepositoryInfo),
     hints: Array.isArray(value.hints) ? value.hints.filter(isOrganizationHint) : [],
+    // Lists of older versions have no scope: they were built from all repositories.
+    ...(isStringArray(value.scope) ? { scope: normalizeScope(value.scope) } : {}),
   };
 }

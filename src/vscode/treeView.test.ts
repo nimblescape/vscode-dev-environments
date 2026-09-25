@@ -124,3 +124,24 @@ describe('RepositoriesTreeProvider', () => {
     provider.dispose();
   });
 });
+
+describe('hint row of an owner that GitHub does not return', () => {
+  beforeEach(() => resetFakeVscode());
+
+  it('offers no authorization, only the page of the owner', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const hint: HintRow = {
+      kind: 'hint',
+      id: 'hint:nobody',
+      organization: 'nobody',
+      notFound: true,
+      label: 'The organization nobody was not found or is not accessible.',
+      url: 'https://github.com/nobody',
+    };
+    const item = provider.getTreeItem(hint) as unknown as TreeItem;
+    expect(item.label).toBe('The organization nobody was not found or is not accessible.');
+    expect(item.description).toBeUndefined();
+    expect(item.tooltip).toBe('Open: https://github.com/nobody');
+    expect(item.command).toMatchObject({ command: 'vscode.open', title: 'Open' });
+  });
+});

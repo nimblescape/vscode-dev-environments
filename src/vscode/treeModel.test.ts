@@ -782,3 +782,26 @@ describe('switcher helpers', () => {
     expect(ordered.map((entry) => entry.nameWithOwner)).toEqual(['acme/new', 'acme/a', 'acme/b', 'acme/none']);
   });
 });
+
+describe('hint of an owner of the scan scope that GitHub does not return', () => {
+  it('names the owner with the not-found text and opens its page', () => {
+    const hints = [{ organization: 'Nobody-Here', kind: 'notFound' as const, url: 'https://github.com/Nobody-Here' }];
+    const groups = buildTreeModel(
+      input({
+        settings: { owners: ['nobody-here', 'acme'], includeArchived: false, includeForks: true },
+        discovery: discovery([repo('acme/api')], { hints }),
+      }),
+    );
+    const group = groups.find((candidate) => candidate.owner === 'Nobody-Here');
+    expect(group?.children).toEqual([
+      {
+        kind: 'hint',
+        id: 'hint:nobody-here',
+        organization: 'Nobody-Here',
+        notFound: true,
+        label: 'The organization Nobody-Here was not found or is not accessible.',
+        url: 'https://github.com/Nobody-Here',
+      },
+    ]);
+  });
+});

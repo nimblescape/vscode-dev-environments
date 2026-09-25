@@ -125,6 +125,9 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     }),
     (accountId) => paths.repositoriesFile(accountId),
     logger,
+    systemClock,
+    // Concept 7.4: the setting `owners` is the scan scope; GitHub is asked only about these owners.
+    { scope: () => getSettings().owners },
   );
   fs.promises
     .rm(paths.legacyRepositories, { force: true })

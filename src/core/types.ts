@@ -144,7 +144,11 @@ export interface RepositoryInfo {
   configPaths: string[];
 }
 
-export type OrganizationHintKind = 'saml' | 'oauthRestricted' | 'other';
+/**
+ * `saml`, `oauthRestricted`, `other`: GitHub refuses the access. `notFound`: an organization or account of the scan scope
+ * (setting `owners`) does not exist, or the account cannot see it.
+ */
+export type OrganizationHintKind = 'saml' | 'oauthRestricted' | 'other' | 'notFound';
 
 /** Hint for an organization whose repositories the API did not return (concept 7.4). */
 export interface OrganizationHint {
@@ -163,6 +167,11 @@ export interface DiscoveryData {
   organizations: string[];
   repositories: RepositoryInfo[];
   hints: OrganizationHint[];
+  /**
+   * The scan scope that the list was built with (lower-case logins, sorted; `normalizeScope`). Missing or empty: all
+   * repositories that the account can access (lists of older versions have none).
+   */
+  scope?: string[];
 }
 
 /** Content of sessions/<window-id>.json (concept 7.9). */

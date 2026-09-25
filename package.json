@@ -282,7 +282,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Show only repositories of these accounts or organizations. An empty list shows all."
+          "description": "Scan only the repositories of these organizations or accounts. An empty list scans all repositories that you can access."
         },
         "devEnvLauncher.includeArchived": {
           "type": "boolean",

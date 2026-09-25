@@ -114,10 +114,12 @@ function signInItem(row: SignInRow): vscode.TreeItem {
 function hintItem(hint: HintRow): vscode.TreeItem {
   const item = new vscode.TreeItem(hint.label, vscode.TreeItemCollapsibleState.None);
   item.id = hint.id;
-  item.description = Actions.authorize;
-  item.tooltip = `${Actions.authorize}: ${hint.url}`;
+  // An owner that GitHub does not return has nothing to authorize: the row opens its page.
+  const action = hint.notFound ? Actions.open : Actions.authorize;
+  if (!hint.notFound) item.description = action;
+  item.tooltip = `${action}: ${hint.url}`;
   item.contextValue = 'hint';
   item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
-  item.command = { command: 'vscode.open', title: Actions.authorize, arguments: [vscode.Uri.parse(hint.url)] };
+  item.command = { command: 'vscode.open', title: action, arguments: [vscode.Uri.parse(hint.url)] };
   return item;
 }
