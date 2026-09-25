@@ -2326,8 +2326,9 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.claims.claim.mock.calls.length === 1, 'the command again');
     expect(h.claims.claim).toHaveBeenCalledWith(OTHER_ACCOUNT, 'gho_other', expect.objectContaining({ environmentIds: [ENV_ID] }));
     expect(h.claims.claim).toHaveBeenCalledTimes(1);
-    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
+    // The pipeline starts after the claim finished (its registry write included).
     await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
     expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
   });
 
