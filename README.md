@@ -30,7 +30,9 @@ Git on your computer is not needed.
    - **⋯**: Switch Branch…, Select Configuration… (only for repositories with several configurations), Rebuild, and Show on GitHub.
 4. To go to another environment, use **Dev Environments: Switch Environment…** (`Ctrl+Alt+E`, on macOS `Cmd+Alt+E`), or select the status bar item. The same window connects to the other environment.
 
-**Search** and **Refresh** are at the top of the view. **Dev Environments: Show Log** opens the complete log.
+**Select Organizations…**, **Search**, and **Refresh** are at the top of the view. **Select Organizations…** limits the list to the organizations and accounts that you select: only their repositories are scanned, which is faster when you can access many repositories. Select none to see all repositories again. **Dev Environments: Show Log** opens the complete log.
+
+The first load of the list can take some time with many repositories; the view shows the repositories as they arrive. Later updates read only the repositories that changed.
 
 ## Settings
 
@@ -41,7 +43,7 @@ Git on your computer is not needed.
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time in seconds before a stop. It prevents a stop during a window reload. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection. |
 | `devEnvLauncher.respectShutdownActionNone` | `false` | If `true`, a repository with `"shutdownAction": "none"` keeps its container running after close. |
-| `devEnvLauncher.owners` | `[]` | Show only repositories of these accounts or organizations. An empty list shows all. |
+| `devEnvLauncher.owners` | `[]` | Scan only the repositories of these organizations or accounts. An empty list scans all repositories that you can access. **Select Organizations…** changes it. |
 | `devEnvLauncher.includeArchived` | `false` | Show archived repositories. |
 | `devEnvLauncher.includeForks` | `true` | Show forked repositories. |
 | `devEnvLauncher.refreshIntervalMinutes` | `60` | Interval in minutes of the background update of the repository list. |
@@ -61,6 +63,7 @@ Git on your computer is not needed.
 - Work that runs in the container after its window has closed, for example a long build in a terminal, ends when the container stops.
 - On Linux with Docker Engine, the extension cannot start the Docker service, because this needs administrator rights.
 - Docker Compose configurations are not supported yet.
+- With **Select Organizations…**, GitHub is asked only about the selected owners. Your environments of repositories of other owners stay in the list, but without the check whether the repository is still on GitHub. An environment created with an older version of Dev Environments that is not assigned to a GitHub account yet stays hidden while its owner is not selected.
 
 ## Privacy
 
