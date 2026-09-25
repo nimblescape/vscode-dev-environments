@@ -1,0 +1,94 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+
+import { silentLogger } from '../core/ports';
+import { GITHUB_SCOPES, PACKAGES_SCOPES, SIGNED_IN_CONTEXT_KEY, VsCodeGitHubAuth } from './auth';
+import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
+
+const session = (token: string) => ({ id: token, accessToken: token, account: { id: '1', label: 'octocat' }, scopes: [] });
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('VsCodeGitHubAuth (concept section 9)', () => {
+  beforeEach(() => resetFakeVscode());
+  const { getSession } = fakeVscode.authentication;
+
+  it('requests the scopes repo and read:org, with a dialog only when interactive', async () => {
+    expect(GITHUB_SCOPES).toEqual(['repo', 'read:org']);
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    getSession.mockResolvedValue(session('gho_silent'));
+    await expect(auth.getToken({ interactive: false })).resolves.toBe('gho_silent');
+    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true });
+    await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_silent');
+    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { createIfNone: true });
+    auth.dispose();
+  });
+
+  it('shares one sign-in dialog between parallel interactive requests', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    let answer!: (value: unknown) => void;
+    getSession.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    const first = auth.getToken({ interactive: true });
+    const second = auth.getToken({ interactive: true });
+    answer(session('gho_1'));
+    await expect(Promise.all([first, second])).resolves.toEqual(['gho_1', 'gho_1']);
+    expect(getSession).toHaveBeenCalledTimes(1);
+    getSession.mockResolvedValue(session('gho_2'));
+    await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_2');
+    auth.dispose();
+  });
+
+  it('returns undefined when the user cancels the sign-in', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    getSession.mockRejectedValue(new Error('User did not consent to login.'));
+    await expect(auth.getToken({ interactive: true })).resolves.toBeUndefined();
+    await expect(auth.getToken({ interactive: false })).resolves.toBeUndefined();
+    await expect(auth.renewToken()).resolves.toBeUndefined();
+    auth.dispose();
+  });
+
+  it('gives ghcr.io credentials from a session with the additional scope read:packages', async () => {
+    expect(PACKAGES_SCOPES).toEqual(['repo', 'read:org', 'read:packages']);
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    getSession.mockResolvedValue(session('gho_packages'));
+    await expect(auth.getPackagesCredentials({ interactive: false })).resolves.toEqual({
+      username: 'octocat',
+      password: 'gho_packages',
+    });
+    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org', 'read:packages'], { silent: true });
+    auth.dispose();
+  });
+
+  it('asks for a new session when GitHub rejected the token', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    getSession.mockResolvedValue(session('gho_new'));
+    await expect(auth.renewToken()).resolves.toBe('gho_new');
+    const [, scopes, options] = getSession.mock.calls[0];
+    expect(scopes).toEqual(['repo', 'read:org']);
+    expect(options.forceNewSession).toBeTruthy();
+    auth.dispose();
+  });
+
+  it('keeps the context key up to date and reports session changes of GitHub only', async () => {
+    const auth = new VsCodeGitHubAuth(silentLogger);
+    const changes = vi.fn();
+    auth.onDidChangeSession(changes);
+    getSession.mockResolvedValue(session('gho_1'));
+    await expect(auth.updateContextKey()).resolves.toBe(true);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenLastCalledWith('setContext', SIGNED_IN_CONTEXT_KEY, true);
+
+    getSession.mockResolvedValue(undefined);
+    fakeVscode.fireSessionChange('microsoft');
+    await flush();
+    expect(changes).not.toHaveBeenCalled();
+    fakeVscode.fireSessionChange('github');
+    await flush();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenLastCalledWith('setContext', SIGNED_IN_CONTEXT_KEY, false);
+    expect(changes).toHaveBeenCalledTimes(1);
+
+    auth.dispose();
+    fakeVscode.fireSessionChange('github');
+    await flush();
+    expect(changes).toHaveBeenCalledTimes(1);
+  });
+});

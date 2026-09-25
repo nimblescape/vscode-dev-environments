@@ -1,0 +1,24 @@
+# Dependabot (implementation notes 2). @devcontainers/cli is the version of the Dev Container CLI in the workspace helper:
+# it gets a pull request of its own, which CI checks with the contract tests and `npm run test:docker`.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-dependencies:
+        dependency-type: development
+        patterns: ['*']
+        exclude-patterns:
+          - '@devcontainers/cli'
+    ignore:
+      # @types/vscode stays at the version of engines.vscode, @types/node at Node.js 20 (the runtime of VS Code 1.90).
+      - dependency-name: '@types/vscode'
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

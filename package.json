@@ -1,0 +1,313 @@
+{
+  "name": "vscode-dev-environments",
+  "displayName": "Dev Environments",
+  "description": "Open your GitHub repositories in local dev containers with one action.",
+  "version": "0.1.0",
+  "publisher": "nimblescape",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "extensionDependencies": [
+    "ms-vscode-remote.remote-containers"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onResolveRemoteAuthority:attached-container"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "devEnvironments",
+          "title": "Dev Environments",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "devEnvironments": [
+        {
+          "id": "devEnvironments.repositories",
+          "name": "Dev Environments"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)",
+        "when": "!devEnvironments.signedIn"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "Loading your repositories…",
+        "when": "devEnvironments.signedIn && !devEnvironments.loaded"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "No repository with a Dev Container configuration was found.\n[Refresh](command:devEnvironments.refresh)",
+        "when": "devEnvironments.signedIn && devEnvironments.loaded && !devEnvironments.loadFailed"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "The repository list could not be loaded. Check the internet connection and try again.\n[Refresh](command:devEnvironments.refresh)\n[Show Log](command:devEnvironments.showLog)",
+        "when": "devEnvironments.signedIn && devEnvironments.loadFailed"
+      }
+    ],
+    "commands": [
+      {
+        "command": "devEnvironments.start",
+        "title": "Start",
+        "category": "Dev Environments",
+        "icon": "$(play)"
+      },
+      {
+        "command": "devEnvironments.stop",
+        "title": "Stop",
+        "category": "Dev Environments",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "devEnvironments.delete",
+        "title": "Delete",
+        "category": "Dev Environments",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "devEnvironments.switchBranch",
+        "title": "Switch Branch…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.selectConfiguration",
+        "title": "Select Configuration…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.rebuild",
+        "title": "Rebuild",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.showOnGitHub",
+        "title": "Show on GitHub",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.switchEnvironment",
+        "title": "Switch Environment…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.refresh",
+        "title": "Refresh",
+        "category": "Dev Environments",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "devEnvironments.search",
+        "title": "Search",
+        "category": "Dev Environments",
+        "icon": "$(search)"
+      },
+      {
+        "command": "devEnvironments.showLog",
+        "title": "Show Log",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.signIn",
+        "title": "Sign in with GitHub",
+        "category": "Dev Environments"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "devEnvironments.more",
+        "label": "More Actions",
+        "icon": "$(ellipsis)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "devEnvironments.search",
+          "when": "view == devEnvironments.repositories",
+          "group": "navigation@1"
+        },
+        {
+          "command": "devEnvironments.refresh",
+          "when": "view == devEnvironments.repositories",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "devEnvironments.start",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStart/",
+          "group": "inline@1"
+        },
+        {
+          "command": "devEnvironments.stop",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStop/",
+          "group": "inline@2"
+        },
+        {
+          "command": "devEnvironments.delete",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canDelete/",
+          "group": "inline@3"
+        },
+        {
+          "submenu": "devEnvironments.more",
+          "when": "view == devEnvironments.repositories && viewItem =~ /^repository/",
+          "group": "inline@4"
+        },
+        {
+          "command": "devEnvironments.start",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStart/",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "devEnvironments.stop",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStop/",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "devEnvironments.delete",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canDelete/",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "devEnvironments.switchBranch",
+          "when": "view == devEnvironments.repositories && viewItem =~ /^repository/",
+          "group": "2_more@1"
+        },
+        {
+          "command": "devEnvironments.selectConfiguration",
+          "when": "view == devEnvironments.repositories && viewItem =~ /multiConfig/",
+          "group": "2_more@2"
+        },
+        {
+          "command": "devEnvironments.rebuild",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canRebuild/",
+          "group": "2_more@3"
+        },
+        {
+          "command": "devEnvironments.showOnGitHub",
+          "when": "view == devEnvironments.repositories && viewItem =~ /onGitHub/",
+          "group": "2_more@4"
+        }
+      ],
+      "devEnvironments.more": [
+        {
+          "command": "devEnvironments.switchBranch",
+          "group": "1_more@1"
+        },
+        {
+          "command": "devEnvironments.selectConfiguration",
+          "when": "viewItem =~ /multiConfig/",
+          "group": "1_more@2"
+        },
+        {
+          "command": "devEnvironments.rebuild",
+          "when": "viewItem =~ /canRebuild/",
+          "group": "1_more@3"
+        },
+        {
+          "command": "devEnvironments.showOnGitHub",
+          "when": "viewItem =~ /onGitHub/",
+          "group": "1_more@4"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "devEnvironments.switchEnvironment",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e"
+      }
+    ],
+    "configuration": {
+      "title": "Dev Environments",
+      "properties": {
+        "devEnvLauncher.reopenLastOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the last used environment when VS Code starts."
+        },
+        "devEnvLauncher.stopOnClose": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stop the environment when no window uses it. If false, the container keeps running."
+        },
+        "devEnvLauncher.waitingTimeSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "description": "Waiting time in seconds before a stop. It prevents a stop during a window reload."
+        },
+        "devEnvLauncher.updateImagesOnConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check for newer images at each connection."
+        },
+        "devEnvLauncher.respectShutdownActionNone": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, a repository with \"shutdownAction\": \"none\" keeps its container running after close."
+        },
+        "devEnvLauncher.owners": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Show only repositories of these accounts or organizations. An empty list shows all."
+        },
+        "devEnvLauncher.includeArchived": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show archived repositories."
+        },
+        "devEnvLauncher.includeForks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show forked repositories."
+        },
+        "devEnvLauncher.refreshIntervalMinutes": {
+          "type": "number",
+          "default": 60,
+          "minimum": 1,
+          "maximum": 35791,
+          "description": "Interval in minutes of the background update of the repository list."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "package": "vsce package --no-dependencies --skip-license --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@devcontainers/cli": "0.89.0",
+    "@types/node": "^20.19.0",
+    "@types/vscode": "~1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
