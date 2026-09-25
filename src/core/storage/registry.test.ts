@@ -682,6 +682,31 @@ describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.
     expect(readRaw()).toEqual({ version: 1, environments: [] });
   });
 
+  it('keeps a copy of the file before a write drops invalid records, because dropping them loosens the policy', async () => {
+    const logger = recordingLogger();
+    const valid = { name: 'ok', owner: OCTO, keptAt: '2026-09-24T15:40:00.000Z' };
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/a')], keptVolumes: [valid, { name: 'bad', keptAt: 5 }] });
+    const registry = new EnvironmentRegistry(paths, fixedClock(), { logger });
+    await expect(registry.needsRestore()).resolves.toBe(false);
+    await registry.remove(ID_A);
+    const copy = `${paths.registry}.backup-${T0}`;
+    expect(JSON.parse(fs.readFileSync(copy, 'utf8')).keptVolumes).toHaveLength(2);
+    expect(logger.warnings).toEqual([`The environment registry contained 1 invalid records of kept volumes. A copy was saved as ${copy}.`]);
+    expect(readRaw()).toEqual({ version: 1, environments: [], keptVolumes: [valid] });
+  });
+
+  it('forgets the records of volumes that no longer exist, of every owner', async () => {
+    const registry = new EnvironmentRegistry(paths, fixedClock());
+    await registry.add(environment(ID_A, 'o/a', { owner: OCTO }));
+    await registry.add(environment(ID_B, 'o/a', { owner: STAUSSH }));
+    await registry.remove(ID_A, { kept: ['shared', 'other'] });
+    await registry.remove(ID_B, { kept: ['shared'] });
+    await registry.forgetKeptVolumes(['shared']);
+    expect((await registry.keptVolumes()).map((record) => record.name)).toEqual(['other']);
+    await registry.forgetKeptVolumes(['other']);
+    expect(readRaw()).toEqual({ version: 1, environments: [] });
+  });
+
   it('reads files without the list, and leaves out invalid records', async () => {
     writeRaw({ version: 1, environments: [], keptVolumes: 'no' });
     await expect(new EnvironmentRegistry(paths).keptVolumes()).resolves.toEqual([]);

@@ -825,7 +825,8 @@ export class Controller implements vscode.Disposable {
               await this.connect(result, progress, request, signal);
             }),
         }),
-      { retry: async () => this.startTarget(await this.refreshedTarget(target), options) },
+      // Try again is a Start: a repository takes the account of a session with a working token, as at the first try.
+      { retry: async () => this.startTarget(await this.refreshedTarget(target, 'token'), options) },
     );
     // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
     if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
@@ -1812,13 +1813,14 @@ export class Controller implements vscode.Disposable {
   /**
    * The target with the current registry entry (for Try again, and after a change of the environment): a named
    * environment while it exists, otherwise the environment of the repository of the account that is signed in now, if
-   * any. A repository never carries the environment of the account that was signed in before (D-3).
+   * any. A repository never carries the environment of the account that was signed in before (D-3). `signIn` as for
+   * `repositoryTargetFor`.
    */
-  private async refreshedTarget(target: Target): Promise<Target> {
+  private async refreshedTarget(target: Target, signIn: boolean | 'token' = false): Promise<Target> {
     const current = target.named && target.environment ? await this.deps.registry.get(target.environment.id) : undefined;
     const fresh = current
       ? this.environmentTarget(current)
-      : await this.repositoryTargetFor(target.environment?.repository ?? target.repository, false);
+      : await this.repositoryTargetFor(target.environment?.repository ?? target.repository, signIn);
     return { ...fresh, info: fresh.info ?? target.info };
   }
 

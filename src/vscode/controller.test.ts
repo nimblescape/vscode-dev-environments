@@ -2240,6 +2240,57 @@ describe('Accounts (concept 7.5)', () => {
       expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
     });
 
+    it('the repository choice of the switcher does the same', async () => {
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      fakeVscode.window.showQuickPick.mockImplementation(
+        async (items: Array<{ choice?: { kind: string }; repository?: RepositoryInfo }>) =>
+          items.find((item) => item.choice?.kind === 'openRepository') ?? items.find((item) => item.repository?.nameWithOwner === 'acme/api'),
+      );
+      await run('switchEnvironment');
+      expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+      expect(h.service.openEnvironment).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+    });
+
+    it('Select configuration… of the repository creates the environment of the new account with the configuration', async () => {
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ configPath: string }>) =>
+        items.find((item) => item.configPath === '.devcontainer/python/devcontainer.json'),
+      );
+      await run('selectConfiguration', row('acme/api'));
+      expect(h.service.listConfigurations).not.toHaveBeenCalled();
+      expect(h.service.openEnvironment).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(
+        expect.objectContaining({ repository: 'acme/api' }),
+        expect.objectContaining({ configPath: '.devcontainer/python/devcontainer.json' }),
+      );
+      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+    });
+
+    it('Try again of a Start that failed asks for the new sign-in before it chooses the environment', async () => {
+      // The first try: the token works, the session belongs to ACCOUNT, and the pipeline fails.
+      h.auth.getSession.mockImplementation(async () => ({ token: 'gho_token', account: ACCOUNT }));
+      h.auth.getAccount.mockResolvedValue(ACCOUNT);
+      h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+      // While the message shows, GitHub starts to reject the token; at the new sign-in, OTHER_ACCOUNT signs in.
+      fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
+        h.auth.getSession.mockImplementation(async (options?: { interactive: boolean }) => {
+          if (!options?.interactive) return { token: 'gho_rejected', account: ACCOUNT };
+          h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+          return { token: 'gho_other', account: OTHER_ACCOUNT };
+        });
+        return Actions.tryAgain;
+      });
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
+      await run('search');
+      await settle(() => h.service.open.mock.calls.length === 1, 'Try again');
+      expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+    });
+
     it('Stop of the repository asks for no new sign-in (it needs no token)', async () => {
       await run('stop', row('acme/api'));
       expect(h.auth.getSession).not.toHaveBeenCalledWith({ interactive: true });

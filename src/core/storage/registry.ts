@@ -215,6 +215,21 @@ export class EnvironmentRegistry {
     });
   }
 
+  /**
+   * Drops the records of the kept volumes `names`, of every owner: the caller found that these volumes no longer exist,
+   * so a volume of that name that is created later holds none of the data that the records protect.
+   */
+  async forgetKeptVolumes(names: readonly string[]): Promise<void> {
+    if (names.length === 0) return;
+    await this.update((file) => {
+      if (!file.keptVolumes) return;
+      const gone = new Set(names);
+      const records = file.keptVolumes.filter((record) => !gone.has(record.name));
+      if (records.length > 0) file.keptVolumes = records;
+      else delete file.keptVolumes;
+    });
+  }
+
   /** The additional volumes that Deletes kept (see `remove`). */
   async keptVolumes(): Promise<KeptVolume[]> {
     return (await this.read()).keptVolumes ?? [];
@@ -247,7 +262,7 @@ export class EnvironmentRegistry {
     const result = await mutator(file);
     file.version = REGISTRY_VERSION;
     if (JSON.stringify(file) !== before) {
-      if (parsed.state === 'invalid' || parsed.dropped > 0) await this.backup(parsed);
+      if (parsed.state === 'invalid' || parsed.dropped > 0 || parsed.droppedRecords > 0) await this.backup(parsed);
       await retryTransient(() => writeJsonAtomic(this.paths.registry, file));
     }
     return result;
@@ -258,7 +273,11 @@ export class EnvironmentRegistry {
     const copy = `${this.paths.registry}.backup-${this.clock.now()}`;
     await retryTransient(() => fs.promises.copyFile(this.paths.registry, copy));
     const reason =
-      parsed.state === 'invalid' ? 'was not valid' : `contained ${parsed.dropped} invalid environment entries`;
+      parsed.state === 'invalid'
+        ? 'was not valid'
+        : parsed.dropped > 0
+          ? `contained ${parsed.dropped} invalid environment entries`
+          : `contained ${parsed.droppedRecords} invalid records of kept volumes`;
     this.logger.warn(`The environment registry ${reason}. A copy was saved as ${copy}.`);
   }
 }
@@ -374,6 +393,8 @@ interface ParsedRegistry {
   version?: number;
   /** Number of entries left out (invalid, or a repeated ID). */
   dropped: number;
+  /** Number of records of kept volumes left out as invalid (a list that is no list counts as one). */
+  droppedRecords: number;
 }
 
 function emptyRegistry(): RegistryFile {
@@ -381,20 +402,20 @@ function emptyRegistry(): RegistryFile {
 }
 
 function parseRegistry(text: string | undefined): ParsedRegistry {
-  if (text === undefined) return { state: 'missing', file: emptyRegistry(), dropped: 0 };
+  if (text === undefined) return { state: 'missing', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   const value = parseJson(text);
-  if (!isRecord(value)) return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+  if (!isRecord(value)) return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
 
   // A file without a version is taken as version 1: only this extension writes the file.
   const version = value.version;
   if (version !== undefined && version !== REGISTRY_VERSION) {
     if (typeof version === 'number' && Number.isFinite(version) && version > REGISTRY_VERSION) {
-      return { state: 'newer', file: emptyRegistry(), version, dropped: 0 };
+      return { state: 'newer', file: emptyRegistry(), version, dropped: 0, droppedRecords: 0 };
     }
-    return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+    return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   }
   if (value.environments !== undefined && !Array.isArray(value.environments)) {
-    return { state: 'invalid', file: emptyRegistry(), dropped: 0 };
+    return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
   }
 
   const entries: unknown[] = Array.isArray(value.environments) ? value.environments : [];
@@ -406,16 +427,19 @@ function parseRegistry(text: string | undefined): ParsedRegistry {
     ids.add(environment.id);
     environments.push(environment);
   }
-  // Invalid records of kept volumes are left out: the list only makes the policy stricter.
+  // Invalid records of kept volumes are left out. That makes the policy looser (the volume of such a record is no longer
+  // refused to other accounts), so the next write keeps a copy of the file first, as for invalid entries.
+  let droppedRecords = 0;
   if (value.keptVolumes !== undefined) {
     const kept = Array.isArray(value.keptVolumes) ? value.keptVolumes.filter(isKeptVolume) : [];
+    droppedRecords = Array.isArray(value.keptVolumes) ? value.keptVolumes.length - kept.length : 1;
     if (kept.length > 0) value.keptVolumes = kept;
     else delete value.keptVolumes;
   }
   // The parsed object is kept, so fields that this version does not know survive a read-modify-write.
   value.version = REGISTRY_VERSION;
   value.environments = environments;
-  return { state: 'ok', file: value as unknown as RegistryFile, dropped: entries.length - environments.length };
+  return { state: 'ok', file: value as unknown as RegistryFile, dropped: entries.length - environments.length, droppedRecords };
 }
 
 type Check = (value: unknown) => boolean;

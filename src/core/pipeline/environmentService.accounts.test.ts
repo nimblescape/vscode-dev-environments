@@ -302,6 +302,53 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     expect(result.environment.owner).toEqual(ACCOUNT);
   });
 
+  it('drops the records of a kept volume that was removed outside the extension, so a new volume of that name is not refused to its account', async () => {
+    await otherAccountDeletesAndKeeps();
+    // docker volume prune; then an environment of ACCOUNT creates a new volume of that name.
+    h.docker.volumes.delete(DATA);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    await h.service.open(TARGET, options());
+    expect(await h.registry.keptVolumes()).toEqual([]);
+    h.docker.volumes.set(DATA, {});
+    // The Delete of ACCOUNT keeps it; its next environment may use it, and a later Delete may remove it.
+    await h.service.delete((await h.registry.list())[0].id, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[DATA, ACCOUNT.id]]);
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.additionalVolumes).toContain(DATA);
+    await h.service.delete(result.environment.id, { progress: h.progress, additionalVolumesToRemove: [DATA] });
+    expect(h.docker.volumes.has(DATA)).toBe(false);
+    expect(await h.registry.keptVolumes()).toEqual([]);
+  });
+
+  it('records no kept volume that does not exist at the Delete', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { additionalVolumes: [DATA, 'gone'] } });
+    h.docker.volumes.set(DATA, {});
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect((await h.registry.keptVolumes()).map((record) => record.name)).toEqual([DATA]);
+  });
+
+  it('keeps the account of the volumes that a failed first open leaves behind', async () => {
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    // `up` creates the volume of the mount, then fails.
+    h.helper.upError = () => {
+      h.docker.volumes.set(DATA, {});
+      return new Error('postCreateCommand failed');
+    };
+    await rejection(h.service.open(TARGET, options()));
+    expect(await h.registry.list()).toEqual([]);
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[DATA, ACCOUNT.id]]);
+    h.helper.upError = () => undefined;
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`volume ${DATA} of another environment`));
+    // Its own account may use it.
+    signIn(ACCOUNT, TOKEN);
+    expect((await h.service.open(TARGET, options())).environment.owner).toEqual(ACCOUNT);
+  });
+
   it('forgets the record when a later Delete removes the volume, and never removes a volume that another account kept', async () => {
     await otherAccountDeletesAndKeeps();
     // An entry of one person from before the separation by account recorded the same volume.
