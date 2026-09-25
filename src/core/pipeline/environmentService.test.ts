@@ -2828,10 +2828,28 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.helper.ups).toEqual([]);
     });
 
-    it.each<[string, GitHubAccount | null]>([
-      ['an environment of the same account', ACCOUNT],
-      ['an entry of an older version without owner', null],
-    ])('are allowed when %s uses them', async (_name, owner) => {
+    it('are refused when an entry of an older version without owner uses them: it may hold the work of another person', async () => {
+      await otherEnvironment(null);
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('are recorded with the parser of the policy: a quoted --mount field, and a volume of a Feature in the image metadata', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['"source=quoted-cache",target=/q,type=volume'] };
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [{ type: 'volume', source: 'feature-store', target: '/f' }] }]));
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['quoted-cache', 'feature-store']);
+      // The next open keeps the volume of the Feature (it is not in the configuration).
+      await h.service.openEnvironment(ENV_ID, options());
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['quoted-cache', 'feature-store']);
+    });
+
+    it.each<[string, GitHubAccount | null]>([['an environment of the same account', ACCOUNT]])('are allowed when %s uses them', async (_name, owner) => {
       await otherEnvironment(owner);
       await seedEnvironment(h, { container: null });
       h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };

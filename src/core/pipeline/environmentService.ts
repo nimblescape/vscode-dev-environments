@@ -11,7 +11,7 @@ import { ContainerAdapter, type ContainerInfo } from '../docker/containerAdapter
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
-import { additionalNamedVolumes, checkConfiguration } from '../helper/configChecks';
+import { checkConfiguration } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
 import { hostAccessReport, mountedVolumeNames, removedRunArgs, type HostAccessInput, type HostAccessReport } from '../helper/hostAccess';
@@ -301,6 +301,11 @@ interface LoadedConfiguration {
   config: DevcontainerConfig;
   dockerfileText?: string;
   references: ConfigReferences;
+  /**
+   * The named volumes that the configuration and its merged configuration mount, other than the workspace volume, read
+   * with the parser of the host access policy (mountedVolumeNames): the additional volumes of the registry entry.
+   */
+  mountedVolumes: string[];
 }
 
 /** State of one pipeline run. */
@@ -994,7 +999,8 @@ export class EnvironmentService {
       signal: ctx.signal,
     });
     // Concept section 9 "Host access": checked before any build or container start.
-    const report = hostAccessReport(await this.hostAccessInput(env, { config, merged }));
+    const checked = await this.hostAccessInput(env, { config, merged });
+    const report = hostAccessReport(checked);
     if (isRefused(report)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
       throw new HostAccessError(report);
@@ -1022,6 +1028,7 @@ export class EnvironmentService {
       config,
       dockerfileText: files.dockerfileText,
       references: collectReferences(config, files.dockerfileText),
+      mountedVolumes: mountedVolumeNames(checked),
     };
   }
 
@@ -1055,12 +1062,15 @@ export class EnvironmentService {
    * is stored.
    */
   private async saveConfiguration(ctx: PipelineContext, loaded: LoadedConfiguration, record: BuildRecord | undefined): Promise<void> {
-    const additionalVolumes = additionalNamedVolumes(loaded.config).filter((name) => name !== ctx.env.volumeName);
+    const additionalVolumes = loaded.mountedVolumes.filter((name) => name !== ctx.env.volumeName);
     const configPath = loaded.fallback && record !== undefined ? ctx.configPath : loaded.configPath;
     await this.updateEntry(ctx, (entry) => {
       entry.configPath = configPath;
       entry.shutdownActionNone = loaded.config.shutdownAction === 'none';
-      entry.additionalVolumes = additionalVolumes;
+      // Volumes recorded before stay: the image metadata adds its own (recordMetadataVolumes), and a volume that the
+      // environment used may still hold its data.
+      const recorded = entry.additionalVolumes ?? [];
+      entry.additionalVolumes = [...recorded, ...additionalVolumes.filter((name) => !recorded.includes(name))];
       // A refused update of another configuration is not tried again anyway.
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
@@ -1580,14 +1590,14 @@ export class EnvironmentService {
 
   /**
    * Concept section 9 "Host access": what the policy checks for `env`, with what it needs to know about the named volumes
-   * that the configuration mounts: the volumes of the environments of other GitHub accounts (their additional volumes;
-   * an entry without owner counts when an account has taken it over and opens it), and the labels of the volumes that
-   * exist.
+   * that the configuration mounts: the volumes of the environments that do not belong to the owner of `env` (their
+   * additional volumes), also of an entry of an older version without owner, which may hold the work of another person
+   * until an account takes it over; and the labels of the volumes that exist.
    */
   private async hostAccessInput(env: Environment, input: Omit<HostAccessInput, 'ownVolume'>): Promise<HostAccessInput> {
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
     const others = (await this.deps.registry.list()).filter(
-      (other) => other.id !== env.id && other.owner !== undefined && other.owner.id !== env.owner?.id,
+      (other) => other.id !== env.id && (other.owner === undefined || other.owner.id !== env.owner?.id),
     );
     const names = mountedVolumeNames(checked);
     const volumeLabels: Record<string, Record<string, string>> = {};
@@ -1614,10 +1624,27 @@ export class EnvironmentService {
         this.logger.warn(`The label devcontainer.metadata of ${image} is not valid JSON.`);
       }
     }
-    const report = hostAccessReport(await this.hostAccessInput(ctx.env, { metadata }));
-    if (!isRefused(report)) return;
+    const checked = await this.hostAccessInput(ctx.env, { metadata });
+    const report = hostAccessReport(checked);
+    if (!isRefused(report)) {
+      await this.recordMetadataVolumes(ctx, mountedVolumeNames(checked));
+      return;
+    }
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);
+  }
+
+  /**
+   * The named volumes that the base image and the Features mount (image metadata) join the additional volumes of the
+   * entry, so that the policy refuses them to the environments of other accounts too.
+   */
+  private async recordMetadataVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
+    const added = names.filter((name) => name !== ctx.env.volumeName && !(ctx.env.additionalVolumes ?? []).includes(name));
+    if (added.length === 0) return;
+    await this.updateEntry(ctx, (entry) => {
+      const current = entry.additionalVolumes ?? [];
+      entry.additionalVolumes = [...current, ...added.filter((name) => !current.includes(name))];
+    });
   }
 
   /**
