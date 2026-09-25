@@ -53,6 +53,8 @@ export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
 const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
+/** An absolute path that the shell reads as one word, without quotes (otherwise: no Homebrew, the download instead). */
+const SAFE_PATH_PATTERN = /^\/[A-Za-z0-9_./+-]+$/;
 /** A user name that `usermod` accepts and that the shell reads as one word, without quotes. */
 const USER_NAME_PATTERN = /^[a-z_][a-z0-9_.-]*\$?$/i;
 
@@ -100,6 +102,11 @@ export interface InstallPlanInput {
   osRelease?: Readonly<Record<string, string>>;
   /** True if the tool is installed (`brew` in PATH, /opt/homebrew/bin, or /usr/local/bin; `winget` in PATH). */
   has: (tool: SetupTool) => boolean;
+  /**
+   * macOS: the full path of the `brew` that `has('brew')` found. The command names it, so that the terminal (with its
+   * fixed search path) runs this Homebrew, also one outside /opt/homebrew and /usr/local, and the confirmation shows it.
+   */
+  brewPath?: string;
   /** The login name of the user (Linux: joins the group docker). Missing or unusual: the documentation instead. */
   userName?: string;
   /**
@@ -190,9 +197,11 @@ const DEBIAN_ARCHITECTURES: Record<string, string> = {
 export function installPlan(input: InstallPlanInput): InstallPlan {
   const { platform, arch } = input;
   if (platform === 'darwin' || platform === 'win32') {
-    if (platform === 'darwin' && input.has('brew')) {
+    const brew = input.brewPath === undefined ? 'brew' : SAFE_PATH_PATTERN.test(input.brewPath) ? input.brewPath : undefined;
+    if (platform === 'darwin' && input.has('brew') && brew !== undefined) {
       // The cask links the CLI into /usr/local/bin with sudo, so Homebrew may ask for the password.
-      return { kind: 'terminal', commands: [BREW_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionBrew };
+      const command = brew === 'brew' ? BREW_INSTALL_COMMAND : `${brew} install --cask docker-desktop`;
+      return { kind: 'terminal', commands: [command], needsAdmin: true, description: DockerSetupTexts.descriptionBrew };
     }
     if (platform === 'win32' && input.has('winget')) {
       return { kind: 'terminal', commands: [WINGET_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionWinget };
@@ -316,13 +325,66 @@ export interface InstallTerminalOptions {
 const MAC_INSTALL_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
 const LINUX_INSTALL_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 /** Variables of the extension host that the install terminal keeps on macOS and Linux (a proxy of the computer). */
-const KEPT_VARIABLES = ['LANG', 'LC_ALL', 'http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'];
+const KEPT_VARIABLES = [
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'TMPDIR',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'all_proxy',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  // Certificates of a company network.
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'CURL_CA_BUNDLE',
+];
+/** Settings of Homebrew (for example HOMEBREW_CASK_OPTS, a mirror), kept on macOS. */
+const KEPT_PREFIX_MAC = 'HOMEBREW_';
+/** Variables of Windows that the install terminal keeps; everything else (also PATH) is fixed. */
+const KEPT_WINDOWS_VARIABLES = [
+  'SystemRoot',
+  'SystemDrive',
+  'windir',
+  'ComSpec',
+  'PATHEXT',
+  'OS',
+  'PROCESSOR_ARCHITECTURE',
+  'NUMBER_OF_PROCESSORS',
+  'USERNAME',
+  'USERDOMAIN',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'TEMP',
+  'TMP',
+  'ProgramData',
+  'ProgramFiles',
+  'ProgramFiles(x86)',
+  'ProgramW6432',
+  'CommonProgramFiles',
+  'CommonProgramFiles(x86)',
+  'CommonProgramW6432',
+  'COMPUTERNAME',
+  'PUBLIC',
+  'ALLUSERSPROFILE',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+];
 
 /**
  * The install terminal: a fixed shell of the system, the home folder, and a fixed environment (`strictEnv`), so that
  * neither the terminal settings of a workspace (profiles, `terminal.integrated.env.*`) nor files of the opened folder
- * change what the listed commands run. On Windows the environment of the extension host (VS Code's own, which no
- * workspace setting changes), because winget lives in the user's WindowsApps folder.
+ * change what the listed commands run. The search path is fixed on every platform (on Windows the folders of the system
+ * and the WindowsApps folder of the user, where winget lives); a few variables of the computer are kept (language,
+ * proxy, certificates, on macOS the settings of Homebrew, on Windows the folders of the user).
  */
 export function installTerminalOptions(
   platform: NodeJS.Platform,
@@ -331,9 +393,20 @@ export function installTerminalOptions(
   userName: string | undefined,
 ): InstallTerminalOptions {
   if (platform === 'win32') {
-    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT ?? 'C:\\Windows';
+    // Names of variables are not case-sensitive on Windows.
+    const byName = new Map(Object.entries(env).map(([name, value]) => [name.toLowerCase(), value]));
+    const systemRoot = byName.get('systemroot') ?? 'C:\\Windows';
     const kept: Record<string, string> = {};
-    for (const [name, value] of Object.entries(env)) if (value !== undefined) kept[name] = value;
+    for (const name of KEPT_WINDOWS_VARIABLES) {
+      const value = byName.get(name.toLowerCase());
+      if (value !== undefined) kept[name] = value;
+    }
+    kept.SystemRoot = systemRoot;
+    // wsl.exe is in System32; winget in the WindowsApps folder of the user.
+    const folders = [`${systemRoot}\\System32`, systemRoot, `${systemRoot}\\System32\\Wbem`, `${systemRoot}\\System32\\WindowsPowerShell\\v1.0`];
+    const localAppData = byName.get('localappdata');
+    if (localAppData) folders.push(`${localAppData}\\Microsoft\\WindowsApps`);
+    kept.PATH = folders.join(';');
     return { shellPath: `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`, cwd: home, env: kept, strictEnv: true };
   }
   const fixed: Record<string, string> = { PATH: platform === 'darwin' ? MAC_INSTALL_PATH : LINUX_INSTALL_PATH, HOME: home };
@@ -344,6 +417,9 @@ export function installTerminalOptions(
   for (const name of KEPT_VARIABLES) {
     const value = env[name];
     if (value !== undefined) fixed[name] = value;
+  }
+  if (platform === 'darwin') {
+    for (const [name, value] of Object.entries(env)) if (name.startsWith(KEPT_PREFIX_MAC) && value !== undefined) fixed[name] = value;
   }
   return { shellPath: '/bin/sh', cwd: home, env: fixed, strictEnv: true };
 }

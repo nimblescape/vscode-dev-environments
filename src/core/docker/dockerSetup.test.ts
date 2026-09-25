@@ -289,14 +289,43 @@ describe('the install terminal', () => {
     expect(installTerminalOptions('darwin', env, '/Users/octo', 'octo').env.PATH).toBe('/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
   });
 
-  it('uses the PowerShell of the system on Windows, in the home folder, with the environment of VS Code', () => {
-    const options = installTerminalOptions('win32', { SystemRoot: 'D:\\Windows', Path: 'C:\\x' }, 'C:\\Users\\octo', 'octo');
+  it('uses the PowerShell of the system on Windows, in the home folder, with a fixed search path', () => {
+    const hostEnv = {
+      SystemRoot: 'D:\\Windows',
+      // A folder of a repository first (for example of an activated virtual environment): never in the terminal.
+      Path: 'C:\\repo\\.venv\\Scripts;D:\\Windows\\System32',
+      LOCALAPPDATA: 'C:\\Users\\octo\\AppData\\Local',
+      USERPROFILE: 'C:\\Users\\octo',
+      ELECTRON_RUN_AS_NODE: '1',
+      VSCODE_PID: '42',
+    };
+    const options = installTerminalOptions('win32', hostEnv, 'C:\\Users\\octo', 'octo');
     expect(options).toEqual({
       shellPath: 'D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
       cwd: 'C:\\Users\\octo',
       strictEnv: true,
-      env: { SystemRoot: 'D:\\Windows', Path: 'C:\\x' },
+      env: {
+        SystemRoot: 'D:\\Windows',
+        USERPROFILE: 'C:\\Users\\octo',
+        LOCALAPPDATA: 'C:\\Users\\octo\\AppData\\Local',
+        PATH: 'D:\\Windows\\System32;D:\\Windows;D:\\Windows\\System32\\Wbem;D:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Users\\octo\\AppData\\Local\\Microsoft\\WindowsApps',
+      },
     });
+  });
+
+  it('keeps the settings of Homebrew, a proxy, and certificates of the computer on macOS', () => {
+    const hostEnv = { HOMEBREW_CASK_OPTS: '--appdir=~/Applications', ALL_PROXY: 'socks5://p:1080', SSL_CERT_FILE: '/etc/ca.pem', OTHER: 'x' };
+    const options = installTerminalOptions('darwin', hostEnv, '/Users/octo', 'octo');
+    expect(options.env).toMatchObject({ HOMEBREW_CASK_OPTS: '--appdir=~/Applications', ALL_PROXY: 'socks5://p:1080', SSL_CERT_FILE: '/etc/ca.pem' });
+    expect(options.env.OTHER).toBeUndefined();
+    // Settings of Homebrew only on macOS.
+    expect(installTerminalOptions('linux', hostEnv, '/home/octo', 'octo').env.HOMEBREW_CASK_OPTS).toBeUndefined();
+  });
+
+  it('names the Homebrew that was found, also outside /opt/homebrew and /usr/local; an unusual path means the download', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/octo/homebrew/bin/brew' });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['/Users/octo/homebrew/bin/brew install --cask docker-desktop']);
+    expect(installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/o c/brew' }).kind).toBe('download');
   });
 });
 

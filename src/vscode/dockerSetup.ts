@@ -75,6 +75,8 @@ export const DockerSetupUiTexts = {
   dockerRunning: 'Docker is running.',
   showDetails: 'Show details',
   alreadyInstalled: 'Docker is already installed on this computer.',
+  notMarked: (file: string) =>
+    `The installer was downloaded, but it could not be marked as downloaded, so the system would not check its signature. It was not opened: ${file}`,
   wslAlreadyInstalled: 'WSL 2 is already installed on this computer.',
 } as const;
 
@@ -134,6 +136,7 @@ export async function readInstallPlanInput(
     osRelease,
     // findExecutable also searches /opt/homebrew/bin and /usr/local/bin on macOS.
     has: (tool) => findExecutable(tool, env, platform) !== undefined,
+    brewPath: platform === 'darwin' ? findExecutable('brew', env, platform) : undefined,
     userName: currentUserName(),
     existingDockerSource,
   };
@@ -351,7 +354,11 @@ export class DockerSetup implements vscode.Disposable {
       return;
     }
     this.deps.logger.info(`Docker Desktop was downloaded to ${target}.`);
-    await this.markAsDownloaded(target, plan.url);
+    if (!(await this.markAsDownloaded(target, plan.url))) {
+      // The confirmation said that the system checks the installer; it would not.
+      this.showErrorWithDetails(DockerSetupUiTexts.notMarked(target));
+      return;
+    }
     try {
       if (plan.open === 'dmg') await (this.deps.launch ?? launchDetachedProcess)(MAC_OPEN, [target]);
       // The installer asks for elevation itself; the shell of the system (not a child process) handles that prompt.
@@ -365,9 +372,9 @@ export class DockerSetup implements vscode.Disposable {
 
   /**
    * Marks the downloaded installer as a file from the internet, as a browser does, so that the system checks its
-   * signature (Gatekeeper on macOS, SmartScreen on Windows). A failure is logged; the installer opens anyway.
+   * signature (Gatekeeper on macOS, SmartScreen on Windows). False (logged) when that failed: the installer does not open.
    */
-  private async markAsDownloaded(file: string, url: string): Promise<void> {
+  private async markAsDownloaded(file: string, url: string): Promise<boolean> {
     try {
       if (this.deps.platform === 'darwin') {
         const result = await this.deps.runner.run(XATTR, ['-w', 'com.apple.quarantine', quarantineAttribute(this.clock.now()), file], { timeoutMs: 10_000 });
@@ -375,8 +382,10 @@ export class DockerSetup implements vscode.Disposable {
       } else if (this.deps.platform === 'win32') {
         await fs.promises.writeFile(`${file}:Zone.Identifier`, zoneIdentifier(url));
       }
+      return true;
     } catch (error) {
       this.deps.logger.warn(`The installer could not be marked as downloaded: ${errorMessage(error)}`);
+      return false;
     }
   }
 

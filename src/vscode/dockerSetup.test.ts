@@ -311,6 +311,7 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
       reports.push(progressOptions);
       return task({ report: (value: unknown) => reports.push(value) }, { onCancellationRequested: () => ({ dispose() {} }) });
     });
+    runner.run.mockResolvedValue({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
     confirmWith(DockerSetupTexts.download);
     await dockerSetup.install();
     const target = path.join(os.tmpdir(), 'devenv-downloads-test', 'Docker.dmg');
@@ -327,6 +328,20 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     const xattr = runner.run.mock.calls.find((call) => call[0] === '/usr/bin/xattr');
     expect(xattr?.[1]).toEqual(['-w', 'com.apple.quarantine', expect.stringMatching(/^0081;[0-9a-f]+;Dev Environments;$/), target]);
     expect(runner.run.mock.invocationCallOrder[runner.run.mock.calls.indexOf(xattr!)]).toBeLessThan(launch.mock.invocationCallOrder[0]);
+    dockerSetup.dispose();
+  });
+
+  it('does not open an installer that could not be marked as downloaded (the system would not check it)', async () => {
+    const { dockerSetup, launch, runner } = setup(false);
+    fakeVscode.window.withProgress.mockImplementation(async (_options: unknown, task: (...args: unknown[]) => Promise<unknown>) =>
+      task({ report: () => {} }, { onCancellationRequested: () => ({ dispose() {} }) }),
+    );
+    runner.run.mockResolvedValue({ exitCode: 1, stdout: '', stderr: 'Operation not permitted', timedOut: false });
+    confirmWith(DockerSetupTexts.download);
+    await dockerSetup.install();
+    const target = path.join(os.tmpdir(), 'devenv-downloads-test', 'Docker.dmg');
+    expect(launch).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(DockerSetupUiTexts.notMarked(target), DockerSetupUiTexts.showDetails);
     dockerSetup.dispose();
   });
 
