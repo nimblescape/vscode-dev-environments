@@ -164,6 +164,11 @@ export class Sidebar implements vscode.Disposable {
    * may contain repositories outside the new scope, and a refresh with the new scope starts at once. Never rejects.
    */
   async onScopeChanged(): Promise<void> {
+    // The part of a first load of the previous scope is not shown either.
+    if (this.partial && !this.isOfCurrentScope(this.partial)) {
+      this.partial = undefined;
+      this.progressiveAccountId = undefined;
+    }
     if (this.data && !this.isOfCurrentScope(this.data)) {
       this.data = undefined;
       this.lookups = new Map();
@@ -202,7 +207,7 @@ export class Sidebar implements vscode.Disposable {
 
   /** GitHub data of a repository: from the discovery (or the part of the first load), or from a single lookup. */
   repositoryInfo(repository: string): RepositoryInfo | undefined {
-    return findRepositoryInfo(repository, this.data ?? this.partial, this.lookups);
+    return findRepositoryInfo(repository, this.data ?? this.shownPartial(), this.lookups);
   }
 
   /**
@@ -214,6 +219,13 @@ export class Sidebar implements vscode.Disposable {
     if (result.accountId !== this.account?.id || !this.isOfCurrentScope(result.data)) return;
     this.partial = result.data;
     this.renderInBackground();
+  }
+
+  /** The part of the first load that the view may show: of the signed-in account and of the current scope only. */
+  private shownPartial(): DiscoveryData | undefined {
+    const partial = this.partial;
+    if (!partial || this.progressiveAccountId === undefined || this.progressiveAccountId !== this.account?.id) return undefined;
+    return this.isOfCurrentScope(partial) ? partial : undefined;
   }
 
   /** Branch read from the running container at the last state refresh. */
@@ -282,7 +294,7 @@ export class Sidebar implements vscode.Disposable {
     // Only the environments of the signed-in account; hidden ones are not counted or named anywhere (concept 7.5).
     const environments = availableEnvironments(entries, account);
     const groups = buildTreeModel({
-      discovery: this.data ?? this.partial,
+      discovery: this.data ?? this.shownPartial(),
       settings: this.deps.settings(),
       environments,
       runtime: this.runtime,
@@ -441,6 +453,9 @@ export class Sidebar implements vscode.Disposable {
     this.account = account;
     this.data = undefined;
     this.lookups = new Map();
+    // The part of the first load of the previous account is never shown to this one.
+    this.partial = undefined;
+    this.progressiveAccountId = undefined;
     this.setLoadFailed(false);
     if (!account) return;
     const stored = await this.deps.discovery.loadStored(account.id).catch((error: unknown) => {

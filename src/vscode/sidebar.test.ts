@@ -561,6 +561,36 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
   });
 
+  it('never shows the part of the first load of one account to another account (concept section 9)', async () => {
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>(() => undefined));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('octo/private-a')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['octo/private-a']);
+    // Another account signs in while the first load of OCTO still runs; it has no stored list.
+    h.auth.getAccount.mockResolvedValue(OTHER);
+    // The refresh of OTHER waits behind the running one; the view changes at once.
+    void h.sidebar.onSessionChanged();
+    await vi.waitFor(() => expect(h.sidebar.currentAccount?.id).toBe(OTHER.id));
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(h.sidebar.repositoryInfo('octo/private-a')).toBeUndefined();
+  });
+
+  it('stops showing the part of the first load when the scope changes', async () => {
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>(() => undefined));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('octo/private-a'), info('acme/api')]));
+    h.settings.owners = ['acme'];
+    void h.sidebar.onScopeChanged();
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(h.sidebar.repositoryInfo('octo/private-a')).toBeUndefined();
+    expect(h.sidebar.repositoryInfo('acme/api')).toBeUndefined();
+  });
+
   it('ignores a part of another account, of another scope, and after the refresh', async () => {
     let finish: (value: DiscoveryData) => void = () => undefined;
     h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
