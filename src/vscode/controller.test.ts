@@ -2297,6 +2297,29 @@ describe('Accounts (concept 7.5)', () => {
     });
   });
 
+  it('connects the environment whose branch Switch branch… switched, also when the account changed during the switch', async () => {
+    await h.registry.add(environment());
+    await h.registry.add(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' }));
+    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+    h.service.switchBranch.mockImplementation(async () => {
+      // Another account signs in while the branch is switched.
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      h.auth.getToken.mockResolvedValue('gho_other');
+    });
+    // The Command Palette: a repository, then the branch.
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
+    const command = run('switchBranch');
+    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+    h.quickPicks[0].pick('feature-x');
+    await command;
+    expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, expect.anything(), expect.anything());
+    expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID]);
+    expect(h.service.open).not.toHaveBeenCalled();
+    // The environment of ACCOUNT is refused to OTHER_ACCOUNT, as after any account change during an open.
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
+  });
+
   it('offers no Try again of the command for errors other than an unassigned environment', async () => {
     // Refresh has no Try again of its own: a failure reaches the error display of the command.
     h.sidebar.refreshDiscovery.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));

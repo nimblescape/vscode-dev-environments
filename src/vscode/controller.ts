@@ -993,7 +993,9 @@ export class Controller implements vscode.Disposable {
       return;
     }
     // Concept 6.2: Switch branch… connects the current window; the pipeline applies the rule for a changed configuration.
-    await this.startTarget(await this.refreshedTarget(target));
+    // It connects the environment whose branch it switched, also when the target was a repository: after an account
+    // change during the switch, the pipeline refuses that environment (otherAccount) instead of opening another one.
+    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }));
   }
 
   /**
