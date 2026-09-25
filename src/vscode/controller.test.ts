@@ -1704,6 +1704,18 @@ describe('Accounts (concept 7.5)', () => {
       expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
     });
 
+    it('Switch branch… ends when the user cancels the sign-in of the claim, without asking again', async () => {
+      await h.registry.add(environment({ owner: undefined }));
+      h.auth.getSession.mockImplementation(async (options: { interactive: boolean }) =>
+        options.interactive ? undefined : { token: 'gho_token', account: ACCOUNT },
+      );
+      await run('switchBranch', row('acme/api'));
+      expect(warningMessages()).toEqual([Messages.signInRequired]);
+      expect(h.auth.getToken).not.toHaveBeenCalledWith({ interactive: true });
+      expect(h.claims.claim).not.toHaveBeenCalled();
+      expect(h.quickPicks).toEqual([]);
+    });
+
     it('Select configuration… claims the entry first and rebuilds it with the selected configuration', async () => {
       await h.registry.add(environment({ owner: undefined }));
       claims(true);

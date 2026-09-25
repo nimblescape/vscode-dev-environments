@@ -1703,6 +1703,8 @@ export class Controller implements vscode.Disposable {
       this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
       return environment;
     }
+    // A command whose sign-in the user cancelled ends here: it would ask for the same sign-in again.
+    if (!session && mode === 'interactive') throw new UserFacingError('signInRequired', Messages.signInRequired);
     if (!session) return environment;
     if (session.account.id !== account.id) {
       this.logger.info(`The GitHub session changed. The environment ${environment.id} is not claimed.`);

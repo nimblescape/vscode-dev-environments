@@ -14,7 +14,15 @@ import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '.
 import { checkConfiguration } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
-import { hostAccessReport, mountedVolumeNames, removedRunArgs, volumeLabelOwner, type HostAccessInput, type HostAccessReport } from '../helper/hostAccess';
+import {
+  foreignVolumeName,
+  hostAccessReport,
+  mountedVolumeNames,
+  removedRunArgs,
+  volumeLabelOwner,
+  type HostAccessInput,
+  type HostAccessReport,
+} from '../helper/hostAccess';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { WorkspaceHelper } from '../helper/workspaceHelper';
 import {
@@ -429,9 +437,6 @@ function configurationError(error: unknown): unknown {
   if (isUserFacingError(error) || isAbortError(error)) return error;
   return new UserFacingError('buildFailed', Messages.buildFailed, errorDetail(error));
 }
-
-/** The name that Docker gives an anonymous volume: 64 hexadecimal characters. */
-const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
 
 function repositoryKey(repository: string): string {
   return repository.toLowerCase();
@@ -2204,15 +2209,16 @@ export class EnvironmentService {
     if (candidates.length === 0) return 0;
     // The additional volumes are not on the workspace volume: the container of the environment, which a lost registry does
     // not remove, still mounts them. Without them, another account's environment could take them over as its own.
-    // Only the volumes that the pipeline records (named volumes of the configuration): not the anonymous volumes of the
-    // container (a VOLUME of the image), nor a volume that another program created (its labels, volumeLabelOwner).
+    // Only the volumes that the pipeline records (named volumes of the configuration): not a volume that the policy gives
+    // to something else by its name (an anonymous volume of the container, a volume of the Dev Containers extension, of
+    // the helper, or of another environment, foreignVolumeName) or by its labels (volumeLabelOwner).
     const containers = await docker.listEnvironmentContainers();
     const mounted = new Map<string, string[]>();
     for (const candidate of candidates) {
       const volumes = containers
         .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
         .flatMap((container) => container.volumes ?? [])
-        .filter((name) => name !== candidate.volumeName && !ANONYMOUS_VOLUME_NAME.test(name));
+        .filter((name) => name !== candidate.volumeName && foreignVolumeName(name) === undefined);
       if (volumes.length > 0) mounted.set(candidate.id, [...new Set(volumes)]);
     }
     const names = [...new Set([...mounted.values()].flat())];
@@ -2453,7 +2459,7 @@ export class EnvironmentService {
         this.logger.info(`The volume ${name} is kept, because another environment uses it too.`);
         continue;
       }
-      const owner = volumeLabelOwner(labels.get(name) ?? {});
+      const owner = foreignVolumeName(name) ?? volumeLabelOwner(labels.get(name) ?? {});
       if (owner !== undefined) {
         this.logger.info(`The volume ${name} is kept, because ${owner} created it.`);
         continue;

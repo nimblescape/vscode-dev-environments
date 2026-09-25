@@ -70,6 +70,8 @@ describe('host access policy: mounts (concept section 9 "Host access")', () => {
     ['volumes whose names only look similar', 'source=vscode-extensions,target=/x,type=volume', []],
     ['a hash of another length (SHA-1)', `source=api-${'a'.repeat(40)},target=/x,type=volume`, []],
     ['a hash in upper case', `source=api-${'A'.repeat(32)},target=/x,type=volume`, []],
+    // An anonymous volume of another container, named by Docker (older Docker versions do not label it).
+    ['a volume named like an anonymous volume', `source=${'ab'.repeat(32)},target=/x,type=volume`, [`volume ${'ab'.repeat(32)} of another container`]],
     ['a volume with driver options (a folder of the computer)', 'type=volume,source=v,target=/x,volume-opt=type=none,volume-opt=device=/Users/x', ['volume options of the mount v']],
     ['a volume with a driver', 'type=volume,source=v,target=/x,volume-driver=local', ['volume options of the mount v']],
     // Labels on a volume that the mount creates: the labels by which the extension restores environments after a lost registry.
@@ -136,6 +138,7 @@ describe('host access policy: runArgs', () => {
     ['a port in the long syntax after an unknown key', ['-p', 'x=y,published=8080,target=80'], ['published port x=y,published=8080,target=80']],
     ['a port in the long syntax with --publish=', ['--publish=published=9090,target=90'], ['published port published=9090,target=90']],
     ['a port in the long syntax attached to -p', ['-ppublished=8080,target=80'], ['published port published=8080,target=80']],
+    ['-v with a volume named like an anonymous volume', ['-v', `${'cd'.repeat(32)}:/x`], [`volume ${'cd'.repeat(32)} of another container`]],
     ['--mount with volume labels', ['--mount', 'type=volume,source=myvol,target=/x,volume-label=devenv.repository=acme/api'], ['volume options of the mount myvol']],
     ['a port in the long syntax behind 127.0.0.1', ['-p', '127.0.0.1::published=8080,target=80'], ['published port 127.0.0.1::published=8080,target=80']],
     ['all ports', ['-P'], ['publishing all ports (-P)']],

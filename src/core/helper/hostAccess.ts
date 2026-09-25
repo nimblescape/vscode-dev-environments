@@ -547,6 +547,23 @@ function isDevContainersVolume(name: string): boolean {
   return name === 'vscode' || name === 'vsc-remote-containers' || /-([0-9a-f]{32}|[0-9a-f]{64})$/.test(name);
 }
 
+/** Docker's name of an anonymous volume: 64 hexadecimal characters. */
+const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
+
+/**
+ * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
+ * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
+ * the Dev Containers extension. The restore of a lost registry and Delete use the same rule, so that no such volume
+ * becomes an additional volume of an environment.
+ */
+export function foreignVolumeName(name: string): string | undefined {
+  if (name === HELPER_CACHE_VOLUME) return 'the workspace helper';
+  if (ENVIRONMENT_VOLUME_PATTERN.test(name)) return 'another environment';
+  if (ANONYMOUS_VOLUME_NAME.test(name)) return 'another container';
+  if (isDevContainersVolume(name)) return 'the Dev Containers extension';
+  return undefined;
+}
+
 /**
  * The program that created an existing volume, by its labels, for a volume that a repository did not create by its
  * mounts (Docker gives such a volume no labels): Docker Compose (the volume of a project, for example the data of a
@@ -574,9 +591,9 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
  */
 function volumeNameProblems(name: string, volumes: VolumeContext): string[] {
   if (name === '' || name === volumes.own) return [];
-  if (name === HELPER_CACHE_VOLUME) return [`volume ${name} of the workspace helper`];
-  if (ENVIRONMENT_VOLUME_PATTERN.test(name) || volumes.foreign.has(name)) return [`volume ${name} of another environment`];
-  if (isDevContainersVolume(name)) return [`volume ${name} of the Dev Containers extension`];
+  if (volumes.foreign.has(name)) return [`volume ${name} of another environment`];
+  const byName = foreignVolumeName(name);
+  if (byName !== undefined) return [`volume ${name} of ${byName}`];
   const owner = volumeLabelOwner(volumes.labels[name] ?? {});
   return owner === undefined ? [] : [`volume ${name} of ${owner}`];
 }

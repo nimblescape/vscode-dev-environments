@@ -1766,6 +1766,15 @@ describe('delete', () => {
     expect(h.logger.infos).toContain('The volume db is kept, because the Docker Compose project shop created it.');
   });
 
+  it('keeps a recorded volume that the policy gives to something else by its name, also when the user confirmed it', async () => {
+    await seedEnvironment(h, { extra: { additionalVolumes: ['vscode', 'api-data'] } });
+    h.docker.volumes.set('vscode', {});
+    h.docker.volumes.set('api-data', {});
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['vscode', 'api-data'] }));
+    expect(h.docker.volumes.has('vscode')).toBe(true);
+    expect(h.docker.volumes.has('api-data')).toBe(false);
+  });
+
   it('removes the tag of an unused base image that the removal by digest keeps (classic image store)', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
@@ -2043,6 +2052,16 @@ describe('reconcileFromVolumes', () => {
     h.docker.containers.set(container.id, { ...container, volumes: [name, anonymous] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
+  });
+
+  it('restores no volume that the policy gives to something else by its name', async () => {
+    const name = resourceName(REPO, OTHER_ID);
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-acme-web-12345678'];
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
   });
 
   it('restores one environment per repository and owner: two accounts, and one entry of an older version (concept D-3)', async () => {
