@@ -106,7 +106,7 @@ export const fakeVscode = {
     createQuickPick: vi.fn(),
     withProgress: vi.fn(),
   },
-  env: { openExternal: vi.fn() },
+  env: { openExternal: vi.fn(), remoteName: undefined as string | undefined },
   commands: { executeCommand: vi.fn(), registerCommand: vi.fn() },
   workspace: { getConfiguration: vi.fn() },
   authentication: {
@@ -125,6 +125,7 @@ export const fakeVscode = {
 export function resetFakeVscode(): void {
   const { window } = fakeVscode;
   fakeVscode.statusBarItems.length = 0;
+  fakeVscode.env.remoteName = undefined;
   fakeVscode.outputChannels.length = 0;
   for (const mock of [
     ...Object.values(window),

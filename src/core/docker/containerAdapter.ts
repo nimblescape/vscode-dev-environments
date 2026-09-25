@@ -87,6 +87,11 @@ export interface ContainerAdapterOptions {
   findDocker?: (env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string | undefined;
   /** Default: the system clock. */
   clock?: Clock;
+  /**
+   * Called with the result of each `docker info` (daemonStatus), for the context key of the Docker setup. Docker is not
+   * asked for it: only the checks that run anyway are reported.
+   */
+  onDaemonStatus?: (running: boolean) => void;
 }
 
 type ObjectKind = 'container' | 'volume' | 'image';
@@ -266,6 +271,7 @@ export class ContainerAdapter {
   private readonly rawEnv: NodeJS.ProcessEnv;
   private readonly findDocker: ContainerAdapterOptions['findDocker'];
   private readonly clock: Clock;
+  private readonly onDaemonStatus: ContainerAdapterOptions['onDaemonStatus'];
   private lookedUpAt: number | undefined;
 
   /**
@@ -288,6 +294,7 @@ export class ContainerAdapter {
     this.env = dockerProcessEnv(env, platform, dockerPath);
     this.findDocker = options.findDocker;
     this.clock = options.clock ?? systemClock;
+    this.onDaemonStatus = options.onDaemonStatus;
     // The caller has just looked the CLI up.
     this.lookedUpAt = this.clock.now();
   }
@@ -326,11 +333,20 @@ export class ContainerAdapter {
     }
   }
 
-  /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS. */
-  private lookUpCliIfMissing(): void {
+  /**
+   * True if the Docker CLI was found. With `findDocker`, a missing CLI is looked up again now, without the waiting time
+   * of `isInstalled` (after an installation was started, the CLI is looked up more often).
+   */
+  lookUpCliNow(): boolean {
+    this.lookUpCliIfMissing(true);
+    return this.path !== undefined;
+  }
+
+  /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS unless `force` is set. */
+  private lookUpCliIfMissing(force = false): void {
     if (this.path !== undefined || !this.findDocker) return;
     const now = this.clock.now();
-    if (this.lookedUpAt !== undefined && Math.abs(now - this.lookedUpAt) < DOCKER_CLI_LOOKUP_RETRY_MS) return;
+    if (!force && this.lookedUpAt !== undefined && Math.abs(now - this.lookedUpAt) < DOCKER_CLI_LOOKUP_RETRY_MS) return;
     this.lookedUpAt = now;
     let found: string | undefined;
     try {
@@ -357,6 +373,16 @@ export class ContainerAdapter {
    * Without a CLI, the engine counts as not running.
    */
   async daemonStatus(signal?: AbortSignal, timeoutMs: number = DOCKER_INFO_TIMEOUT_MS): Promise<DaemonStatus> {
+    const status = await this.queryDaemonStatus(signal, timeoutMs);
+    try {
+      this.onDaemonStatus?.(status.running);
+    } catch (error) {
+      this.logger.warn(`The Docker state could not be reported: ${errorMessage(error)}`);
+    }
+    return status;
+  }
+
+  private async queryDaemonStatus(signal: AbortSignal | undefined, timeoutMs: number): Promise<DaemonStatus> {
     if (!this.isInstalled()) return { running: false, detail: 'The Docker CLI was not found.' };
     let result: RunResult;
     try {

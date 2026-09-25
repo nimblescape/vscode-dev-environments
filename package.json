@@ -55,6 +55,11 @@
     "viewsWelcome": [
       {
         "view": "devEnvironments.repositories",
+        "contents": "Dev Environments runs your environments in Docker, which is not installed on this computer.\n[Install Docker…](command:devEnvironments.installDocker)",
+        "when": "devEnvironments.dockerMissing"
+      },
+      {
+        "view": "devEnvironments.repositories",
         "contents": "Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)",
         "when": "!devEnvironments.signedIn"
       },
@@ -151,6 +156,11 @@
         "title": "Select Organizations…",
         "category": "Dev Environments",
         "icon": "$(filter-filled)"
+      },
+      {
+        "command": "devEnvironments.installDocker",
+        "title": "Install Docker…",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [

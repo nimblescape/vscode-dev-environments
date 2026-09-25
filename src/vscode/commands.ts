@@ -20,6 +20,7 @@ export const Commands = {
   selectOwners: 'devEnvironments.selectOwners',
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devEnvironments.selectOwnersFiltered',
+  installDocker: 'devEnvironments.installDocker',
 } as const;
 
 export type CommandName = keyof typeof Commands;

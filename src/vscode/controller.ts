@@ -11,7 +11,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
 import { CONFIG_FOLDER_OWNER_COMMAND, parseOwnerIds } from '../core/helper/containerGit';
-import { Actions, DOCKER_DOWNLOAD_URL, Messages, formatChanges } from '../core/messages';
+import { Actions, Messages, formatChanges } from '../core/messages';
 import { GITHUB_TOKEN_FILE, repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
@@ -43,6 +43,7 @@ import {
   type DisconnectRequest,
   type DisconnectRequests,
 } from './disconnectRequests';
+import type { DockerSetup } from './dockerSetup';
 import { showError as presentError } from './errors';
 import type { OutputChannelLogger } from './logger';
 import { selectOwners } from './ownerSelector';
@@ -111,6 +112,8 @@ export interface ControllerDeps {
   sidebar: Sidebar;
   statusBar: EnvironmentStatusBar;
   settings: () => ExtensionSettings;
+  /** The Docker setup (concept 6.1 step 2): the walkthrough and its commands. */
+  dockerSetup: Pick<DockerSetup, 'openWizard'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
   viewVisible: () => boolean;
   clock?: Clock;
@@ -229,7 +232,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 14 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 15 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -246,6 +249,7 @@ export class Controller implements vscode.Disposable {
       signIn: () => this.signIn(),
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
+      installDocker: () => this.deps.dockerSetup.openWizard(),
     };
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
@@ -312,17 +316,18 @@ export class Controller implements vscode.Disposable {
     }
   }
 
-  /** Concept 6.1 step 2: when the view shows for the first time in this window, check that Docker is installed. */
+  /**
+   * Concept 6.1 step 2: when the view shows for the first time in this window, check that Docker is installed. The action
+   * Install Docker… opens the walkthrough.
+   */
   onViewVisible(): void {
     if (this.dockerChecked) return;
     this.dockerChecked = true;
     if (this.deps.docker.isInstalled()) return;
     this.logger.warn('The Docker CLI was not found.');
     vscode.window
-      .showWarningMessage(Messages.dockerNotInstalled, Actions.openDownloadPage)
-      .then((choice) =>
-        choice === Actions.openDownloadPage ? vscode.env.openExternal(vscode.Uri.parse(DOCKER_DOWNLOAD_URL)) : undefined,
-      )
+      .showWarningMessage(Messages.dockerNotInstalled, Actions.installDocker)
+      .then((choice) => (choice === Actions.installDocker ? vscode.commands.executeCommand(Commands.installDocker) : undefined))
       .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
   }
 

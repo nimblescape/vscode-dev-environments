@@ -111,7 +111,8 @@ export const Messages = {
 } as const;
 
 export const Actions = {
-  openDownloadPage: 'Open download page',
+  /** Opens the walkthrough "Set up Docker for Dev Environments" (command devEnvironments.installDocker). */
+  installDocker: 'Install Docker…',
   showDetails: 'Show details',
   tryAgain: 'Try again',
   signIn: 'Sign in',
@@ -142,8 +143,6 @@ export const StateTexts = {
   filesMissing: 'Files missing',
   notOnGitHub: 'not on GitHub',
 } as const;
-
-export const DOCKER_DOWNLOAD_URL = 'https://www.docker.com/products/docker-desktop/';
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */
 export function formatChanges(summary: { uncommittedFiles: number; unpushedCommits: number; stashes?: number }): string {
