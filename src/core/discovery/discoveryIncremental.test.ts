@@ -298,3 +298,56 @@ describe('incremental detection with a scan scope', () => {
     expect(result.scope).toEqual(['beta']);
   });
 });
+
+describe('progressive results (DiscoveryService.onPartialResult)', () => {
+  it('reports the repositories found so far after each page of the first load', async () => {
+    github.repos = Array.from({ length: 70 }, (_, i) => repo(`acme/r${i}`, i < 60));
+    const discovery = service();
+    const parts: Array<{ accountId: string; count: number; scope: string[] | undefined }> = [];
+    const subscription = discovery.onPartialResult(({ accountId, data }) =>
+      parts.push({ accountId, count: data.repositories.length, scope: data.scope }),
+    );
+    const result = await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toEqual([
+      { accountId: ACCOUNT_ID, count: 50, scope: [] },
+      { accountId: ACCOUNT_ID, count: 60, scope: [] },
+    ]);
+    expect(result.repositories).toHaveLength(60);
+
+    subscription.dispose();
+    parts.length = 0;
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toEqual([]);
+  });
+
+  it('reports each page of each owner of the scope, in the order of the scope', async () => {
+    owners = ['beta', 'acme'];
+    github.repos = [repo('acme/api'), repo('beta/tool')];
+    const discovery = service();
+    const parts: string[][] = [];
+    discovery.onPartialResult(({ data }) => parts.push(names(data.repositories)));
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toHaveLength(2);
+    expect(parts[1]).toEqual(['beta/tool', 'acme/api']);
+  });
+
+  it('reports the unchanged repositories after the list, and the changed ones after their lookup', async () => {
+    github.repos = [repo('acme/api')];
+    const discovery = service();
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    github.repos = [repo('acme/api'), repo('acme/new')];
+    const parts: string[][] = [];
+    discovery.onPartialResult(({ data }) => parts.push(names(data.repositories)));
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toEqual([['acme/api'], ['acme/api', 'acme/new']]);
+  });
+
+  it('keeps loading when a listener fails', async () => {
+    github.repos = [repo('acme/api')];
+    const discovery = service(recordingLogger());
+    discovery.onPartialResult(() => {
+      throw new Error('listener failed');
+    });
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).resolves.toMatchObject({ repositories: [expect.objectContaining({ nameWithOwner: 'acme/api' })] });
+  });
+});

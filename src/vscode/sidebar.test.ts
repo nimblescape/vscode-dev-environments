@@ -520,3 +520,76 @@ describe('Sidebar and the scan scope (setting owners, concept 7.4)', () => {
     expect(rowOf('octo/outside').environment?.id).toBe(GONE);
   });
 });
+
+describe('Sidebar progressive display (concept 7.4)', () => {
+  const part = (repositories: RepositoryInfo[], accountId = OCTO.id) => ({ accountId, data: { ...data(repositories), scope: [] } });
+
+  it('shows the repositories as they arrive during the first load, then the complete list', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    expect(h.sidebar.repositoryInfo('acme/api')?.nameWithOwner).toBe('acme/api');
+    h.sidebar.onPartialResult(part([info('acme/api'), info('acme/web')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/web']);
+    // The trust of an owner still waits for the complete list.
+    expect(h.sidebar.discoveryData).toBeUndefined();
+
+    finish(data([info('acme/api'), info('acme/web'), info('acme/zeta')]));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/web', 'acme/zeta']);
+  });
+
+  it('replaces a shown list only when the refresh is complete', async () => {
+    h.discovery.loadStored.mockResolvedValue(data([info('acme/old')]));
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/old']);
+    finish(data([info('acme/api')]));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+  });
+
+  it('ignores a part of another account, of another scope, and after the refresh', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('staussh/secret')], OTHER.id));
+    h.sidebar.onPartialResult({ accountId: OCTO.id, data: { ...data([info('acme/api')]), scope: ['acme'] } });
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+
+    finish(data([]));
+    await h.sidebar.refreshDiscovery();
+    h.sidebar.onPartialResult(part([info('acme/late')]));
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+  });
+
+  it('shows no part of a first load that failed', async () => {
+    let fail: (error: Error) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((_resolve, reject) => (fail = reject)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows()).toHaveLength(1);
+    fail(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOAD_FAILED_CONTEXT_KEY, true);
+  });
+});

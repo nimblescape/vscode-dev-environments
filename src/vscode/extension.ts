@@ -217,7 +217,14 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     settings: getSettings,
     viewVisible: () => view.visible,
   });
-  context.subscriptions.push(sidebar, controller, ...controller.registerCommands(), controller.watchDisconnectRequests());
+  context.subscriptions.push(
+    sidebar,
+    controller,
+    ...controller.registerCommands(),
+    controller.watchDisconnectRequests(),
+    // Concept 7.4: the first load shows the repositories as they arrive.
+    discovery.onPartialResult((result) => sidebar.onPartialResult(result)),
+  );
 
   const background = (promise: Promise<unknown>, what: string): void => {
     promise.catch((error: unknown) => logger.error(`Could not ${what}.`, error));

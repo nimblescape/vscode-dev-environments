@@ -9,7 +9,7 @@
 // sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
-import type { DiscoveryService } from '../core/discovery/discoveryService';
+import type { DiscoveryService, PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
@@ -69,6 +69,12 @@ export class Sidebar implements vscode.Disposable {
   private runtime: ReadonlyMap<string, EnvironmentRuntime> | undefined;
   private liveBranches: ReadonlyMap<string, string> = new Map();
   private lookups: ReadonlyMap<string, RepositoryInfo | null> = new Map();
+  /**
+   * Progressive display (concept 7.4): the refresh that runs while the view shows no list (the first load, or a list of
+   * another scope) shows the repositories as they arrive, for this account.
+   */
+  private progressiveAccountId: string | undefined;
+  private partial: DiscoveryData | undefined;
   private timer: NodeJS.Timeout | undefined;
   private signInOffered = false;
   /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
@@ -194,9 +200,20 @@ export class Sidebar implements vscode.Disposable {
     this.timer = setInterval(() => void this.refreshDiscovery(), minutes * 60_000);
   }
 
-  /** GitHub data of a repository: from the discovery, or from a single lookup. */
+  /** GitHub data of a repository: from the discovery (or the part of the first load), or from a single lookup. */
   repositoryInfo(repository: string): RepositoryInfo | undefined {
-    return findRepositoryInfo(repository, this.data, this.lookups);
+    return findRepositoryInfo(repository, this.data ?? this.partial, this.lookups);
+  }
+
+  /**
+   * A part of the list of a running refresh (DiscoveryService.onPartialResult). Shown only while the view has no list of
+   * the account; a later refresh replaces the shown list only when it is complete, so the view does not flicker.
+   */
+  onPartialResult(result: PartialDiscovery): void {
+    if (this.disposed || this.data !== undefined || result.accountId !== this.progressiveAccountId) return;
+    if (result.accountId !== this.account?.id || !this.isOfCurrentScope(result.data)) return;
+    this.partial = result.data;
+    this.renderInBackground();
   }
 
   /** Branch read from the running container at the last state refresh. */
@@ -265,7 +282,7 @@ export class Sidebar implements vscode.Disposable {
     // Only the environments of the signed-in account; hidden ones are not counted or named anywhere (concept 7.5).
     const environments = availableEnvironments(entries, account);
     const groups = buildTreeModel({
-      discovery: this.data,
+      discovery: this.data ?? this.partial,
       settings: this.deps.settings(),
       environments,
       runtime: this.runtime,
@@ -327,6 +344,8 @@ export class Sidebar implements vscode.Disposable {
       this.renderInBackground();
       return this.data;
     }
+    this.progressiveAccountId = this.data === undefined ? account.id : undefined;
+    this.partial = undefined;
     try {
       const data = await vscode.window.withProgress({ location: { viewId: REPOSITORIES_VIEW_ID } }, () =>
         this.deps.discovery.refresh(token, account.id),
@@ -347,6 +366,12 @@ export class Sidebar implements vscode.Disposable {
       const shown = this.data ? 'The stored list is shown.' : 'No stored list exists.';
       this.deps.logger.warn(`The repository list could not be updated. ${shown} ${errorMessage(error)}`);
       this.setLoadFailed(this.data === undefined);
+    } finally {
+      this.progressiveAccountId = undefined;
+      if (this.partial) {
+        this.partial = undefined;
+        this.renderInBackground();
+      }
     }
     this.setLoaded();
     this.renderInBackground();

@@ -450,12 +450,28 @@ export interface DiscoveryOptions {
   scope?: () => readonly string[];
 }
 
+/** A part of the result of a running refresh (DiscoveryService.onPartialResult). */
+export interface PartialDiscovery {
+  /** The account whose list is loading. */
+  accountId: string;
+  /**
+   * The repositories with a configuration found so far, in the scope of the refresh (`scope`); no organizations and no
+   * hints yet. During an incremental refresh, new and changed repositories join after their lookup.
+   */
+  data: DiscoveryData;
+}
+
 /** The requests of one refresh: the token, the limit of parallel requests, the collected errors, and a counter for the log. */
 interface RefreshRun {
   token: string;
+  accountId: string;
+  scope: string[];
   limiter: Semaphore;
   requests: number;
   errors: CollectedError[];
+  viewerLogin: string;
+  /** The collectors of the scan in the order of the result: one for the full list, or one per owner of the scope. */
+  collectors: RepositoryCollector[];
 }
 
 /** The repositories of a scan, before the configuration lookups of an incremental refresh, the organizations, and the hints. */
@@ -492,6 +508,17 @@ export class DiscoveryService {
     private readonly options: DiscoveryOptions = {},
   ) {}
 
+  private readonly partialListeners = new Set<(result: PartialDiscovery) => void>();
+
+  /**
+   * Progressive display (concept 7.4): `listener` gets the repositories found so far after each page of the list, and
+   * after each batch of configuration lookups. The complete list is the result of `refresh`.
+   */
+  onPartialResult(listener: (result: PartialDiscovery) => void): { dispose(): void } {
+    this.partialListeners.add(listener);
+    return { dispose: () => this.partialListeners.delete(listener) };
+  }
+
   /**
    * The stored result of the last discovery of the account `accountId`. `undefined` if there is none or if the file is
    * not valid. The list of another account is never read.
@@ -516,7 +543,16 @@ export class DiscoveryService {
   async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
     const started = this.clock.now();
     const logins = scopeLogins(this.options.scope?.() ?? []);
-    const run: RefreshRun = { token, limiter: new Semaphore(DISCOVERY_CONCURRENCY), requests: 0, errors: [] };
+    const run: RefreshRun = {
+      token,
+      accountId,
+      scope: normalizeScope(logins),
+      limiter: new Semaphore(DISCOVERY_CONCURRENCY),
+      requests: 0,
+      errors: [],
+      viewerLogin: '',
+      collectors: [],
+    };
     // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
     // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
     const previous = await this.loadStored(accountId).catch(() => undefined);
@@ -675,6 +711,7 @@ export class DiscoveryService {
     signal: AbortSignal | undefined,
   ): Promise<ScanResult> {
     const collector = new RepositoryCollector(detections);
+    run.collectors = [collector];
     let viewerLogin = '';
     let organizations: Connection<LoginNode> | null | undefined;
     let cursor: string | null = null;
@@ -704,9 +741,11 @@ export class DiscoveryService {
         viewerLogin = viewer.login;
         organizations = viewer.organizations;
         checkAccount(viewer.databaseId, accountId);
+        run.viewerLogin = viewerLogin;
       }
       for (const error of page.errors) run.errors.push({ error, data: page.data });
       collector.addPage(asArray(viewer.repositories.nodes), page.errors);
+      this.reportPartial(run);
       const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
       if (next === undefined) break;
       cursor = next;
@@ -727,9 +766,11 @@ export class DiscoveryService {
   ): Promise<ScanResult> {
     const viewer = await this.scopeViewer(run, signal);
     checkAccount(viewer.databaseId, accountId);
+    run.viewerLogin = viewer.login;
+    run.collectors = logins.map(() => new RepositoryCollector(detections));
     const scans = await allOrAbort(
-      logins,
-      (login, ownerSignal) => this.scanOwner(run, login, viewer.login, detections, ownerSignal),
+      logins.map((login, index) => ({ login, collector: run.collectors[index] })),
+      ({ login, collector }, ownerSignal) => this.scanOwner(run, login, viewer.login, collector, ownerSignal),
       signal,
     );
     const collector = new RepositoryCollector(detections);
@@ -763,11 +804,11 @@ export class DiscoveryService {
     run: RefreshRun,
     login: string,
     viewerLogin: string,
-    detections: Detections,
+    collector: RepositoryCollector,
     signal: AbortSignal | undefined,
   ): Promise<OwnerScan> {
     const own = login.toLowerCase() === viewerLogin.toLowerCase();
-    const collector = new RepositoryCollector(detections);
+    const detections = collector.detections;
     let cursor: string | null = null;
     const usedCursors = new Set<string>();
     let pageSize = detections ? DISCOVERY_LIST_PAGE_SIZE : DISCOVERY_PAGE_SIZE;
@@ -791,6 +832,7 @@ export class DiscoveryService {
       for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
       if (page.value === MISSING_OWNER) return { collector, missing: pages === 1 };
       collector.addPage(asArray(page.value.nodes), page.errors);
+      this.reportPartial(run);
       const next = nextCursor(page.value.pageInfo, usedCursors);
       if (next === undefined) break;
       cursor = next;
@@ -841,6 +883,7 @@ export class DiscoveryService {
           entry.checked = isRecord(node) && !uncertain.has(index);
           entry.lookup = false;
         });
+        this.reportPartial(run);
         return;
       }
       failure = new Error(`GitHub did not return the configurations of the repositories: ${describeGraphQLErrors(result.errors)}`);
@@ -854,6 +897,29 @@ export class DiscoveryService {
     this.logger.warn('Repository list: GitHub did not read the configurations in time. Trying again in smaller requests.');
     const half = Math.ceil(batch.length / 2);
     await allOrAbort([batch.slice(0, half), batch.slice(half)], (part, partSignal) => this.lookUpBatch(run, part, partSignal), signal);
+  }
+
+  /** Gives the repositories found so far to the listeners of onPartialResult. A failing listener is logged. */
+  private reportPartial(run: RefreshRun): void {
+    if (this.partialListeners.size === 0) return;
+    const merged = new RepositoryCollector(undefined);
+    for (const collector of run.collectors) merged.addAll(collector);
+    const data: DiscoveryData = {
+      version: 1,
+      fetchedAt: isoTime(this.clock),
+      viewerLogin: run.viewerLogin,
+      organizations: [],
+      repositories: merged.repositories(),
+      hints: [],
+      scope: [...run.scope],
+    };
+    for (const listener of this.partialListeners) {
+      try {
+        listener({ accountId: run.accountId, data });
+      } catch (error) {
+        this.logger.warn(`Repository list: a part of the list could not be shown: ${errorText(error)}`);
+      }
+    }
   }
 
   /** One GraphQL request of a refresh, within the limit of parallel requests. */
@@ -1225,7 +1291,7 @@ class RepositoryCollector {
   /** Repository nodes that GitHub returned, with and without configuration. */
   scanned = 0;
 
-  constructor(private readonly detections: Detections) {}
+  constructor(readonly detections: Detections) {}
 
   addPage(nodes: ReadonlyArray<RepositoryNode | null>, errors: readonly GraphQLError[]): void {
     const uncertain = nodesWithErrors(errors);
