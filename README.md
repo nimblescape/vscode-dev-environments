@@ -46,7 +46,7 @@ When Docker is not installed, the view shows **Install Docker…** above the sig
 3. **Start Docker**. At its first start, Docker Desktop shows its own dialogs once. On Linux, `sudo systemctl enable --now docker` starts the Docker service.
 4. **Sign in with GitHub**.
 
-Nothing runs without your confirmation: a dialog first lists the exact commands, or the download address and the file. Commands run visibly in a terminal of VS Code, where you enter your password if one is needed. Downloads come only from Docker over HTTPS, and the installers are signed by Docker. Docker Desktop is free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription (Docker Subscription Service Agreement). The installation works only in a local window, not in a remote window.
+Nothing runs without your confirmation: a dialog first lists the exact commands, or the download address and the file. Commands run visibly in a terminal of VS Code, where you enter your password if one is needed. Downloads come only from Docker over HTTPS, and the installers are signed by Docker; your system checks the signature when the installer opens. Settings of the opened workspace do not change what runs in the terminal. If Docker is installed already, nothing is installed. Docker Desktop is free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription (Docker Subscription Service Agreement). The installation works only in a local window, not in a remote window.
 
 ## Settings
 

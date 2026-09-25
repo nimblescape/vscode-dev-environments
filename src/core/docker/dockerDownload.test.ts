@@ -53,6 +53,17 @@ describe('downloadFile', () => {
     expect(fs.existsSync(`${target}.download`)).toBe(false);
   });
 
+  it('never writes through a file or link that is at the place of the partial file', async () => {
+    const victim = path.join(path.dirname(target), 'victim.txt');
+    fs.writeFileSync(victim, 'ORIGINAL');
+    fs.symlinkSync(victim, `${target}.download`);
+    const { get } = fakeGet({ [URL_DMG]: () => respond(200, 'installer') });
+    await downloadFile({ url: URL_DMG, target, get });
+    expect(fs.readFileSync(victim, 'utf8')).toBe('ORIGINAL');
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(target, 'utf8')).toBe('installer');
+  });
+
   it('follows HTTPS redirects', async () => {
     const mirror = 'https://desktop.docker.com/mac/main/arm64/123456/Docker.dmg';
     const { get, urls } = fakeGet({
@@ -66,19 +77,22 @@ describe('downloadFile', () => {
 
   it('refuses a redirect that leaves HTTPS', async () => {
     const { get } = fakeGet({ [URL_DMG]: () => respond(301, '', { location: 'http://desktop.docker.com/Docker.dmg' }) });
-    await expect(downloadFile({ url: URL_DMG, target, get })).rejects.toThrow(/not HTTPS on docker\.com/);
+    await expect(downloadFile({ url: URL_DMG, target, get })).rejects.toThrow(/not HTTPS on desktop\.docker\.com/);
     expect(fs.existsSync(target)).toBe(false);
   });
 
   it.each([
     ['another domain', 'https://desktop.docker.com.evil.example/Docker.dmg', false],
     ['a look-alike domain', 'https://evildocker.com/Docker.dmg', false],
-    ['another host of Docker', 'https://download.docker.com/Docker.dmg', true],
-  ])('follows a redirect to %s only on docker.com', async (_name, location, allowed) => {
+    // Only the download host itself (concept section 9): not even another host of Docker.
+    ['another host of Docker', 'https://download.docker.com/Docker.dmg', false],
+    ['the hub of Docker', 'https://hub.docker.com/Docker.dmg', false],
+    ['a versioned file of the download host', 'https://desktop.docker.com/mac/main/arm64/1/Docker.dmg', true],
+  ])('follows a redirect to %s only on desktop.docker.com', async (_name, location, allowed) => {
     const { get } = fakeGet({ [URL_DMG]: () => respond(302, '', { location }), [location]: () => respond(200, 'dmg') });
     const result = downloadFile({ url: URL_DMG, target, get });
     if (allowed) await expect(result).resolves.toBeUndefined();
-    else await expect(result).rejects.toThrow(/not HTTPS on docker\.com/);
+    else await expect(result).rejects.toThrow(/not HTTPS on desktop\.docker\.com/);
   });
 
   it('refuses a URL that is not HTTPS on desktop.docker.com, without a request', async () => {

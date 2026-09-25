@@ -74,7 +74,7 @@ function setup(installed: boolean, options: SetupOptions = {}) {
     platform,
     env: {},
     onDidChangeInstalled: changed,
-    planInput: async () => ({ platform, arch: 'arm64', has: (tool: SetupTool) => tools.includes(tool), ...options.input }),
+    planInput: async () => ({ platform, arch: 'arm64', has: (tool: SetupTool) => tools.includes(tool), userName: 'octo', ...options.input }),
     downloadFolder: path.join(os.tmpdir(), 'devenv-downloads-test'),
     download,
     launch,
@@ -249,10 +249,33 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     const { dockerSetup } = setup(false, { platform: 'linux', input: { arch: 'x64', osRelease } });
     confirmWith(DockerSetupTexts.install);
     await dockerSetup.install();
-    const plan = installPlan({ platform: 'linux', arch: 'x64', osRelease, has: () => false });
+    const plan = installPlan({ platform: 'linux', arch: 'x64', osRelease, has: () => false, userName: 'octo' });
     if (plan.kind !== 'terminal') throw new Error('terminal plan expected');
     expect(fakeVscode.terminals[0].lines).toEqual([plan.commands.join(' && ')]);
     expect(modalCalls()[0][1].detail).toContain(DockerSetupTexts.adminPassword);
+    dockerSetup.dispose();
+  });
+
+  it('runs the commands in a terminal with a fixed shell, folder, and environment (no setting of the workspace applies)', async () => {
+    const osRelease = { ID: 'ubuntu', VERSION_CODENAME: 'noble' };
+    const { dockerSetup } = setup(false, { platform: 'linux', input: { arch: 'x64', osRelease } });
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.install();
+    const options = fakeVscode.window.createTerminal.mock.calls[0][0] as { name: string; shellPath: string; cwd: string; strictEnv: boolean; env: Record<string, string> };
+    expect(options).toMatchObject({ name: 'Install Docker', shellPath: '/bin/sh', cwd: os.homedir(), strictEnv: true });
+    expect(options.env.PATH).toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
+    expect(fakeVscode.terminals[0].lines[0]).toMatch(/&& sudo usermod -aG docker octo$/);
+    dockerSetup.dispose();
+  });
+
+  it('installs nothing when Docker is installed already (the walkthrough stays reachable)', async () => {
+    const { dockerSetup, download } = setup(true, { tools: ['brew'] });
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.install();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(fakeVscode.terminals).toEqual([]);
+    expect(download).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.alreadyInstalled);
     dockerSetup.dispose();
   });
 
@@ -278,7 +301,7 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
   });
 
   it('downloads the .dmg with a cancellable progress after the confirmation, then opens it', async () => {
-    const { dockerSetup, download, launch } = setup(false, {
+    const { dockerSetup, download, launch, runner } = setup(false, {
       download: async (options) => {
         options.onProgress?.(3 * 1_048_576, 10 * 1_048_576);
       },
@@ -300,11 +323,16 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(reports[1]).toEqual({ message: '3 of 10 MB', increment: 30 });
     expect(launch).toHaveBeenCalledWith('/usr/bin/open', [target]);
     expect(fakeVscode.terminals).toEqual([]);
+    // Marked as downloaded before it opens, so that Gatekeeper checks the signature of Docker.
+    const xattr = runner.run.mock.calls.find((call) => call[0] === '/usr/bin/xattr');
+    expect(xattr?.[1]).toEqual(['-w', 'com.apple.quarantine', expect.stringMatching(/^0081;[0-9a-f]+;Dev Environments;$/), target]);
+    expect(runner.run.mock.invocationCallOrder[runner.run.mock.calls.indexOf(xattr!)]).toBeLessThan(launch.mock.invocationCallOrder[0]);
     dockerSetup.dispose();
   });
 
   it('starts the downloaded installer on Windows through the shell of the system', async () => {
     const { dockerSetup, launch } = setup(false, { platform: 'win32', input: { arch: 'x64' } });
+    fs.mkdirSync(path.join(os.tmpdir(), 'devenv-downloads-test'), { recursive: true });
     fakeVscode.window.withProgress.mockImplementation(async (_options: unknown, task: (...args: unknown[]) => Promise<unknown>) =>
       task({ report: () => {} }, { onCancellationRequested: () => ({ dispose() {} }) }),
     );
@@ -314,6 +342,10 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     const opened = fakeVscode.env.openExternal.mock.calls[0][0] as { scheme: string; fsPath: string };
     expect(opened.scheme).toBe('file');
     expect(opened.fsPath).toBe(path.join(os.tmpdir(), 'devenv-downloads-test', 'Docker Desktop Installer.exe'));
+    // Marked as downloaded from the internet (zone 3), so that Windows checks it.
+    const zone = `${opened.fsPath}:Zone.Identifier`;
+    expect(fs.readFileSync(zone, 'utf8')).toContain('ZoneId=3');
+    fs.rmSync(zone, { force: true });
     dockerSetup.dispose();
   });
 
@@ -358,19 +390,21 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     dockerSetup.initialize();
     confirmWith(DockerSetupTexts.install);
     await dockerSetup.install();
-    vi.advanceTimersByTime(5_000);
+    // Once before the installation (Docker is not installed yet), then every 5 seconds.
     expect(docker.lookUpCliNow).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(5_000);
+    expect(docker.lookUpCliNow).toHaveBeenCalledTimes(2);
     docker.lookUpCliNow.mockReturnValue(true);
     fakeVscode.window.showInformationMessage.mockResolvedValue(DockerSetupUiTexts.startDocker);
     vi.advanceTimersByTime(5_000);
-    expect(docker.lookUpCliNow).toHaveBeenCalledTimes(2);
+    expect(docker.lookUpCliNow).toHaveBeenCalledTimes(3);
     expect(changed).toHaveBeenCalledTimes(1);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.installedStartNow, DockerSetupUiTexts.startDocker);
     await flush();
     expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(DOCKER_SETUP_START_COMMAND);
     expect(DOCKER_SETUP_START_COMMAND).toBe(Commands.dockerSetupStart);
     vi.advanceTimersByTime(60_000);
-    expect(docker.lookUpCliNow).toHaveBeenCalledTimes(2);
+    expect(docker.lookUpCliNow).toHaveBeenCalledTimes(3);
     dockerSetup.dispose();
   });
 
@@ -380,7 +414,8 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     await dockerSetup.install();
     vi.advanceTimersByTime(30 * 60_000);
     const calls = docker.lookUpCliNow.mock.calls.length;
-    expect(calls).toBe(360);
+    // The check before the installation, then 360 lookups every 5 seconds.
+    expect(calls).toBe(1 + 360);
     vi.advanceTimersByTime(60_000);
     expect(docker.lookUpCliNow).toHaveBeenCalledTimes(calls);
     dockerSetup.dispose();
@@ -479,6 +514,18 @@ describe('DockerSetup: WSL 2 (walkthrough step 1, Windows)', () => {
     expect(installed.runner.run).not.toHaveBeenCalled();
     mac.dockerSetup.dispose();
     installed.dockerSetup.dispose();
+  });
+
+  it('runs no wsl --install when WSL 2 is installed already', async () => {
+    const { dockerSetup } = setup(false, { platform: 'win32', wsl: () => status(0) });
+    dockerSetup.initialize();
+    await flush();
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.installWsl();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(fakeVscode.terminals).toEqual([]);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.wslAlreadyInstalled);
+    dockerSetup.dispose();
   });
 
   it('runs wsl --install in the terminal after the confirmation, then checks again', async () => {

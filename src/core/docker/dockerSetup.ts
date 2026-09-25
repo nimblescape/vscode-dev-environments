@@ -53,7 +53,13 @@ export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
 const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
-const DOCKER_GROUP_COMMAND = 'sudo usermod -aG docker $USER';
+/** A user name that `usermod` accepts and that the shell reads as one word, without quotes. */
+const USER_NAME_PATTERN = /^[a-z_][a-z0-9_.-]*\$?$/i;
+
+/** The user joins the group docker; the name is written out, so the confirmation shows exactly what runs. */
+export function dockerGroupCommand(userName: string): string {
+  return `sudo usermod -aG docker ${userName}`;
+}
 /** Fedora 41 and later have DNF 5, whose `config-manager` has a new syntax. */
 const FEDORA_DNF5_VERSION = 41;
 
@@ -64,15 +70,17 @@ export const DockerSetupTexts = {
   descriptionEngine: (distribution: string) =>
     `Docker Engine is installed from the official package repository of Docker for ${distribution} (download.docker.com).`,
   linuxGroupNote:
-    'Your user is added to the group docker, so that you can use Docker without sudo. Sign out and sign in again afterwards (or run newgrp docker in a terminal).',
+    'Your user is added to the group docker, so that you can use Docker without sudo. Sign out and sign in again afterwards (or run newgrp docker in a terminal). ' +
+    'If packages of your distribution for Docker, containerd, or runc are installed, the packages of Docker replace them; the package manager lists them and asks before it removes anything. Images and volumes are kept.',
   confirmInstall: 'Install Docker?',
   confirmCommands: 'These commands run in a terminal of VS Code, where you can follow them:',
   adminPassword: 'An administrator password may be requested in the terminal.',
   confirmDownload: 'Download and open the installer of Docker Desktop?',
   downloadFrom: (url: string, file: string) => `The installer is downloaded over HTTPS from Docker:\n${url}\n\nIt is saved as:\n${file}`,
-  downloadMac: 'Then it opens. Drag Docker to the Applications folder. The installer is signed and notarized by Docker.',
+  downloadMac:
+    'Then it opens. Drag Docker to the Applications folder. The installer is signed and notarized by Docker; the file is marked as downloaded, so that macOS checks this when Docker starts the first time.',
   downloadWindows:
-    'Then it starts. The installer is signed by Docker. Windows may ask for an administrator password or for your permission.',
+    'Then it starts. The installer is signed by Docker; the file is marked as downloaded, so that Windows checks it. Windows may ask for an administrator password or for your permission.',
   confirmWsl: 'Install WSL 2?',
   wslRestart: 'Windows asks for administrator permission. Restart the computer afterwards.',
   confirmStartEngine: 'Start the Docker service?',
@@ -92,6 +100,13 @@ export interface InstallPlanInput {
   osRelease?: Readonly<Record<string, string>>;
   /** True if the tool is installed (`brew` in PATH, /opt/homebrew/bin, or /usr/local/bin; `winget` in PATH). */
   has: (tool: SetupTool) => boolean;
+  /** The login name of the user (Linux: joins the group docker). Missing or unusual: the documentation instead. */
+  userName?: string;
+  /**
+   * Ubuntu and Debian: apt already has a source of download.docker.com (for example docker.list of an earlier
+   * installation). A second source with another key would stop apt for every package: the documentation instead.
+   */
+  existingDockerSource?: boolean;
 }
 
 export type InstallPlan =
@@ -186,18 +201,25 @@ export function installPlan(input: InstallPlanInput): InstallPlan {
     if (!url) return { kind: 'manual', url: DOCKER_DESKTOP_DOCS_URL };
     return { kind: 'download', url, fileName: fileNameOf(url), open: platform === 'darwin' ? 'dmg' : 'exe' };
   }
-  if (platform === 'linux') return linuxPlan(arch, input.osRelease ?? {});
+  if (platform === 'linux') return linuxPlan(arch, input.osRelease ?? {}, input.userName, input.existingDockerSource === true);
   return { kind: 'manual', url: DOCKER_ENGINE_INSTALL_URL };
 }
 
-function linuxPlan(arch: string, osRelease: Readonly<Record<string, string>>): InstallPlan {
+function linuxPlan(
+  arch: string,
+  osRelease: Readonly<Record<string, string>>,
+  userName: string | undefined,
+  existingDockerSource: boolean,
+): InstallPlan {
   const id = (osRelease.ID ?? '').toLowerCase();
   const manual: InstallPlan = { kind: 'manual', url: DOCKER_ENGINE_INSTALL_URL };
+  if (!userName || !USER_NAME_PATTERN.test(userName)) return manual;
   let setup: string[];
   let distribution: string;
   switch (id) {
     case 'ubuntu':
     case 'debian': {
+      if (existingDockerSource) return manual;
       const codename = id === 'ubuntu' ? osRelease.UBUNTU_CODENAME || osRelease.VERSION_CODENAME : osRelease.VERSION_CODENAME;
       const architecture = DEBIAN_ARCHITECTURES[arch];
       if (!codename || !/^[a-z0-9-]+$/.test(codename) || !architecture) return manual;
@@ -231,7 +253,7 @@ function linuxPlan(arch: string, osRelease: Readonly<Record<string, string>>): I
   }
   return {
     kind: 'terminal',
-    commands: [...setup, DOCKER_GROUP_COMMAND],
+    commands: [...setup, dockerGroupCommand(userName)],
     needsAdmin: true,
     description: DockerSetupTexts.descriptionEngine(distribution),
     note: DockerSetupTexts.linuxGroupNote,
@@ -262,6 +284,68 @@ function aptSetup(base: string, codename: string, architecture: string): string[
     'sudo apt update',
     `sudo apt install ${DOCKER_ENGINE_PACKAGES}`,
   ];
+}
+
+/** True if a file of /etc/apt/sources.list(.d) names the package repository of Docker. */
+export function namesDockerSource(content: string): boolean {
+  return /download\.docker\.com/i.test(content);
+}
+
+/**
+ * The value of the extended attribute com.apple.quarantine of a downloaded file (flags 0081: downloaded, not yet
+ * approved), so that Gatekeeper checks the signature and notarization of Docker when it starts the first time.
+ */
+export function quarantineAttribute(nowMs: number): string {
+  return `0081;${Math.floor(nowMs / 1000).toString(16)};Dev Environments;`;
+}
+
+/** The stream Zone.Identifier of a file downloaded from the internet (zone 3), so that Windows checks it (SmartScreen). */
+export function zoneIdentifier(url: string): string {
+  return `[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=${url}\r\n`;
+}
+
+/** The terminal in which the commands run (vscode.TerminalOptions without the name). */
+export interface InstallTerminalOptions {
+  shellPath: string;
+  cwd: string;
+  env: Record<string, string>;
+  strictEnv: true;
+}
+
+/** Search path of the install terminal on macOS (Homebrew on Apple silicon and Intel first) and on Linux. */
+const MAC_INSTALL_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+const LINUX_INSTALL_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+/** Variables of the extension host that the install terminal keeps on macOS and Linux (a proxy of the computer). */
+const KEPT_VARIABLES = ['LANG', 'LC_ALL', 'http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'];
+
+/**
+ * The install terminal: a fixed shell of the system, the home folder, and a fixed environment (`strictEnv`), so that
+ * neither the terminal settings of a workspace (profiles, `terminal.integrated.env.*`) nor files of the opened folder
+ * change what the listed commands run. On Windows the environment of the extension host (VS Code's own, which no
+ * workspace setting changes), because winget lives in the user's WindowsApps folder.
+ */
+export function installTerminalOptions(
+  platform: NodeJS.Platform,
+  env: Readonly<Record<string, string | undefined>>,
+  home: string,
+  userName: string | undefined,
+): InstallTerminalOptions {
+  if (platform === 'win32') {
+    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT ?? 'C:\\Windows';
+    const kept: Record<string, string> = {};
+    for (const [name, value] of Object.entries(env)) if (value !== undefined) kept[name] = value;
+    return { shellPath: `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`, cwd: home, env: kept, strictEnv: true };
+  }
+  const fixed: Record<string, string> = { PATH: platform === 'darwin' ? MAC_INSTALL_PATH : LINUX_INSTALL_PATH, HOME: home };
+  if (userName) {
+    fixed.USER = userName;
+    fixed.LOGNAME = userName;
+  }
+  for (const name of KEPT_VARIABLES) {
+    const value = env[name];
+    if (value !== undefined) fixed[name] = value;
+  }
+  return { shellPath: '/bin/sh', cwd: home, env: fixed, strictEnv: true };
 }
 
 /** The lines that the terminal gets: one line with `&&` (stops at the first error), on Windows one line per command. */

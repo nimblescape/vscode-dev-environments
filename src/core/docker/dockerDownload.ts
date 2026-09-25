@@ -47,11 +47,6 @@ function header(headers: DownloadResponse['headers'], name: string): string | un
   return Array.isArray(value) ? value[0] : value;
 }
 
-function isDockerHttpsUrl(url: URL): boolean {
-  const host = url.hostname.toLowerCase();
-  return url.protocol === 'https:' && (host === 'docker.com' || host.endsWith('.docker.com'));
-}
-
 /** Ends a response that is not read, so that its connection is released. */
 function discard(response: DownloadResponse): void {
   const body = response.body as NodeJS.ReadableStream & { destroy?: () => void };
@@ -59,14 +54,17 @@ function discard(response: DownloadResponse): void {
 }
 
 /**
- * Downloads `url` to `target`. Throws when the URL is not an HTTPS URL of desktop.docker.com, when a redirect leaves
- * HTTPS, on an HTTP error, and with an AbortError when the signal aborts. Existing `target` is replaced only after a
+ * Downloads `url` to `target`. Throws when the URL, or the target of a redirect, is not an HTTPS URL of
+ * desktop.docker.com, on an HTTP error, and with an AbortError when the signal aborts. Existing `target` is replaced only after a
  * complete download.
  */
 export async function downloadFile(options: DownloadOptions): Promise<void> {
   const get = options.get ?? nodeHttpsGet;
   const signal = options.signal ?? new AbortController().signal;
   if (!isOfficialDownloadUrl(options.url)) throw new Error(`Downloads come only from https://desktop.docker.com: ${options.url}`);
+  // The partial file is always a new file ('wx' below), never one that exists or a link that another program put there.
+  // Removed before the request: the body must not start to flow before the pipeline reads it.
+  await fs.promises.rm(`${options.target}.download`, { force: true });
   let url = options.url;
   let response: DownloadResponse | undefined;
   for (let redirects = 0; ; redirects++) {
@@ -76,13 +74,12 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
     if (response.statusCode < 300 || response.statusCode >= 400 || !location) break;
     discard(response);
     if (redirects >= MAX_REDIRECTS) throw new Error(`Too many redirects for ${options.url}.`);
-    const next = new URL(location, url);
-    // Docker's link of the latest version points to a versioned file; it may be served by another host of Docker, but
-    // never by another domain and never without HTTPS.
-    if (!isDockerHttpsUrl(next)) {
-      throw new Error(`The download of ${options.url} was redirected to ${next.href}, which is not HTTPS on docker.com.`);
+    const next = new URL(location, url).href;
+    // Docker's link of the latest version points to a versioned file of the same host: a redirect never leaves it.
+    if (!isOfficialDownloadUrl(next)) {
+      throw new Error(`The download of ${options.url} was redirected to ${next}, which is not HTTPS on desktop.docker.com.`);
     }
-    url = next.href;
+    url = next;
   }
   if (response.statusCode !== 200) {
     discard(response);
@@ -97,7 +94,7 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
   });
   const partial = `${options.target}.download`;
   try {
-    await pipeline(response.body, fs.createWriteStream(partial), { signal });
+    await pipeline(response.body, fs.createWriteStream(partial, { flags: 'wx' }), { signal });
     if (total !== undefined && received !== total) {
       throw new Error(`The download of ${url} ended after ${received} of ${total} bytes.`);
     }

@@ -30,6 +30,10 @@ import {
   type DockerSetupState,
   type InstallPlan,
   type SetupTool,
+  installTerminalOptions,
+  namesDockerSource,
+  quarantineAttribute,
+  zoneIdentifier,
 } from './dockerSetup';
 
 const tools =
@@ -38,7 +42,9 @@ const tools =
     present.includes(tool);
 
 const PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
-const GROUP = 'sudo usermod -aG docker $USER';
+const USER_NAME = 'octo';
+/** The user name is written out, so that the confirmation shows exactly what runs. */
+const GROUP = 'sudo usermod -aG docker octo';
 
 function aptCommands(id: 'ubuntu' | 'debian', codename: string, architecture: string): string[] {
   const base = `https://download.docker.com/linux/${id}`;
@@ -200,13 +206,13 @@ describe('installPlan on Linux', () => {
     ['Arch Linux', 'x64', { ID: 'arch' }, { kind: 'manual', url: DOCKER_ENGINE_INSTALL_URL }],
     ['no /etc/os-release', 'x64', {}, { kind: 'manual', url: DOCKER_ENGINE_INSTALL_URL }],
   ])('%s', (_name, arch, osRelease, expected) => {
-    expect(installPlan({ platform: 'linux', arch, osRelease, has: tools('brew', 'winget') })).toEqual(expected);
+    expect(installPlan({ platform: 'linux', userName: USER_NAME, arch, osRelease, has: tools('brew', 'winget') })).toEqual(expected);
   });
 
   it('does not depend on the tools', () => {
     const osRelease = { ID: 'ubuntu', VERSION_CODENAME: 'noble' };
-    expect(installPlan({ platform: 'linux', arch: 'x64', osRelease, has: tools() })).toEqual(
-      installPlan({ platform: 'linux', arch: 'x64', osRelease, has: tools('brew', 'winget') }),
+    expect(installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease, has: tools() })).toEqual(
+      installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease, has: tools('brew', 'winget') }),
     );
   });
 
@@ -218,12 +224,86 @@ describe('installPlan on Linux', () => {
       { ID: 'rhel', VERSION_ID: '9' },
       { ID: 'centos', VERSION_ID: '9' },
     ]) {
-      const plan = installPlan({ platform: 'linux', arch: 'x64', osRelease, has: tools() });
+      const plan = installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease, has: tools() });
       if (plan.kind !== 'terminal') throw new Error('terminal plan expected');
       const urls = plan.commands.join(' ').match(/\w+:\/\/[^\s\\']+/g) ?? [];
       expect(urls.length).toBeGreaterThan(0);
       for (const url of urls) expect(url).toMatch(/^https:\/\/download\.docker\.com\/linux\//);
     }
+  });
+});
+
+describe('installPlan on Linux: user name and existing sources', () => {
+  const ubuntu = { ID: 'ubuntu', VERSION_CODENAME: 'noble' };
+
+  it('writes the resolved user name, and uses the documentation without a usable one', () => {
+    const plan = installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease: ubuntu, has: tools() });
+    expect(plan.kind === 'terminal' && plan.commands.at(-1)).toBe(GROUP);
+    for (const userName of [undefined, '', 'a b', 'x;rm -rf ~', '$(id)', '-o']) {
+      expect(installPlan({ platform: 'linux', userName, arch: 'x64', osRelease: ubuntu, has: tools() })).toEqual({
+        kind: 'manual',
+        url: DOCKER_ENGINE_INSTALL_URL,
+      });
+    }
+  });
+
+  it('uses the documentation when apt has a source of Docker already (a second one would stop apt)', () => {
+    expect(installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease: ubuntu, has: tools(), existingDockerSource: true })).toEqual({
+      kind: 'manual',
+      url: DOCKER_ENGINE_INSTALL_URL,
+    });
+    // dnf is not affected.
+    const fedora = installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease: { ID: 'fedora', VERSION_ID: '41' }, has: tools(), existingDockerSource: true });
+    expect(fedora.kind).toBe('terminal');
+  });
+
+  it('finds a source of Docker in a file of apt', () => {
+    expect(namesDockerSource('deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable\n')).toBe(true);
+    expect(namesDockerSource('Types: deb\nURIs: https://DOWNLOAD.docker.com/linux/debian\n')).toBe(true);
+    expect(namesDockerSource('deb http://archive.ubuntu.com/ubuntu noble main\n')).toBe(false);
+  });
+
+  it('says in the confirmation that packages of the distribution may be replaced', () => {
+    const plan = installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease: ubuntu, has: tools() });
+    expect(installConfirmation(plan)?.detail).toContain('the packages of Docker replace them');
+  });
+});
+
+describe('the install terminal', () => {
+  const env = { PATH: '/workspace/evil/bin:/usr/bin', HOME: '/elsewhere', EVIL: '1', https_proxy: 'http://proxy:3128', LANG: 'de_AT.UTF-8' };
+
+  it('uses /bin/sh, the home folder, and a fixed search path on macOS and Linux; keeps only the proxy and the language', () => {
+    expect(installTerminalOptions('linux', env, '/home/octo', 'octo')).toEqual({
+      shellPath: '/bin/sh',
+      cwd: '/home/octo',
+      strictEnv: true,
+      env: {
+        PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        HOME: '/home/octo',
+        USER: 'octo',
+        LOGNAME: 'octo',
+        LANG: 'de_AT.UTF-8',
+        https_proxy: 'http://proxy:3128',
+      },
+    });
+    expect(installTerminalOptions('darwin', env, '/Users/octo', 'octo').env.PATH).toBe('/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
+  });
+
+  it('uses the PowerShell of the system on Windows, in the home folder, with the environment of VS Code', () => {
+    const options = installTerminalOptions('win32', { SystemRoot: 'D:\\Windows', Path: 'C:\\x' }, 'C:\\Users\\octo', 'octo');
+    expect(options).toEqual({
+      shellPath: 'D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+      cwd: 'C:\\Users\\octo',
+      strictEnv: true,
+      env: { SystemRoot: 'D:\\Windows', Path: 'C:\\x' },
+    });
+  });
+});
+
+describe('marks of a downloaded installer', () => {
+  it('gives the quarantine value of macOS and the zone of Windows', () => {
+    expect(quarantineAttribute(Date.parse('2026-09-25T12:00:00Z'))).toBe(`0081;${(Date.parse('2026-09-25T12:00:00Z') / 1000).toString(16)};Dev Environments;`);
+    expect(zoneIdentifier('https://desktop.docker.com/x.exe')).toBe('[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://desktop.docker.com/x.exe\r\n');
   });
 });
 
@@ -309,7 +389,7 @@ describe('terminal lines', () => {
 
 describe('confirmation', () => {
   it('lists exactly the commands of a terminal plan, in order, one per line, with the password note', () => {
-    const plan = installPlan({ platform: 'linux', arch: 'x64', osRelease: { ID: 'ubuntu', VERSION_CODENAME: 'noble' }, has: tools() });
+    const plan = installPlan({ platform: 'linux', userName: USER_NAME, arch: 'x64', osRelease: { ID: 'ubuntu', VERSION_CODENAME: 'noble' }, has: tools() });
     if (plan.kind !== 'terminal') throw new Error('terminal plan expected');
     const confirmation = installConfirmation(plan);
     expect(confirmation).toEqual({
