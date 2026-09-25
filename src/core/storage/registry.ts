@@ -193,9 +193,8 @@ export class EnvironmentRegistry {
     });
   }
 
-  /** Removes an environment. A missing ID is not an error. */
   /**
-   * Removes the entry `id`. `volumes.kept`: additional volumes of the entry that its Delete kept; they are recorded with
+   * Removes the entry `id`; a missing ID is not an error. `volumes.kept`: additional volumes of the entry that its Delete kept; they are recorded with
    * the owner of the entry, besides the records of other owners of the same name (each keeps its data there).
    * `volumes.removed`: volumes that no longer exist; all their records are dropped. One change of the file, so no
    * volume is ever without its record.
@@ -492,11 +491,12 @@ function isRefusedUpdate(value: unknown): value is RefusedUpdate {
   );
 }
 
-/** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */
+/** A record of a volume that a Delete kept: its name, the time, and the owner account unless it had none. */
 function isKeptVolume(value: unknown): value is KeptVolume {
   return isRecord(value) && isNonEmptyString(value.name) && isString(value.keptAt) && (value.owner === undefined || isOwner(value.owner));
 }
 
+/** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */
 function isOwner(value: unknown): value is GitHubAccount {
   return isRecord(value) && isStorageId(value.id) && isString(value.login);
 }

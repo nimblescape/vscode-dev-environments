@@ -2476,9 +2476,9 @@ export class EnvironmentService {
    * Concept 7.14 Delete step 4: the additional volumes that the user confirmed (`confirmed`, as the question listed them)
    * and that the environment still records. Kept: a volume that another environment records, and an existing volume whose
    * labels show that another program created it (volumeLabelOwner), for example a volume of Docker Compose that took a
-   * name that the environment used before.
+   * name that the environment used before, and a volume that the Delete of an environment of another account kept.
+   * Returns the names of the removed volumes.
    */
-  /** Removes the confirmed additional volumes that nobody else uses. Returns the names of the removed volumes. */
   private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<string[]> {
     const volumes = (env.additionalVolumes ?? []).filter((name) => confirmed.includes(name));
     if (volumes.length === 0) return [];
