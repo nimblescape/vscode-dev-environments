@@ -120,7 +120,9 @@ export interface HintRow {
   /** `hint:` + lower-case organization. */
   id: string;
   organization: string;
-  /** `Messages.organizationNotAuthorized(organization)`. */
+  /** Set for an owner of the scan scope that GitHub did not return: the row opens its page, there is nothing to authorize. */
+  notFound?: true;
+  /** `Messages.organizationNotAuthorized(organization)`, or `Messages.organizationNotFound(organization)`. */
   label: string;
   url: string;
 }
@@ -316,7 +318,11 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
         kind: 'hint',
         id,
         organization: hint.organization,
-        label: Messages.organizationNotAuthorized(hint.organization),
+        ...(hint.kind === 'notFound' ? { notFound: true as const } : {}),
+        label:
+          hint.kind === 'notFound'
+            ? Messages.organizationNotFound(hint.organization)
+            : Messages.organizationNotAuthorized(hint.organization),
         url: hint.url,
       });
     }

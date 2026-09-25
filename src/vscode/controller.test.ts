@@ -487,7 +487,7 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    expect(declared).toHaveLength(12);
+    expect(declared).toHaveLength(14);
   });
 
   it('uses the settings and the context keys of package.json', () => {

@@ -144,7 +144,7 @@ This extension offers the same one-action experience with local containers. It u
 
 1. The extension adds an icon to the activity bar. Its view shows a short welcome text and one button: **Sign in with GitHub**. The sign-in uses the built-in GitHub authentication of VS Code.
 2. The extension checks that Docker is installed. If not, it shows one message with a link to the download page of Docker Desktop. If Docker is installed but not running, the extension starts it later, when an environment needs it. Git on the computer is not needed, because the workspace helper contains Git.
-3. The repository list loads. The first load can take some seconds. Later, the view shows the stored list at once and updates it in the background.
+3. The repository list loads. The first load can take some seconds; the view shows the repositories as they arrive. Later, the view shows the stored list at once and updates it in the background, which reads the configurations only of new and changed repositories (see [7.4](#74-repository-discovery)). With many repositories, **Select Organizations…** limits the list, and the scan, to some organizations.
 
 ### 6.2 Sidebar view
 
@@ -158,7 +158,7 @@ Environments of another account are not in the list, and the list does not name 
 A repository has at most one environment per GitHub account (see [D-3](#13-decisions)): a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Start** of a repository by an account creates the environment of that account. The environment stays until the user selects **Delete**.
 
 ```text
-DEV ENVIRONMENTS                               [Search] [Refresh] [Collapse All]
+DEV ENVIRONMENTS         [Select Organizations] [Search] [Refresh] [Collapse All]
   ▾ acme-university
       ● api        main (python)   Connected                  [Stop] [Delete] [⋯]
       ◐ docs       main            Running                    [Stop] [Delete] [⋯]
@@ -170,6 +170,8 @@ DEV ENVIRONMENTS                               [Search] [Refresh] [Collapse All]
 ```
 
 The list groups the repositories by owner. In each group, the repositories with an environment come first, then the other repositories in alphabetical order.
+
+**Title bar.** **Select Organizations…** opens a list with the signed-in account (marked "your account"), every organization where the account is a member, and the owners of the setting `owners` that are in neither list, so that they can be removed. The current setting is selected. **OK** writes the selection to the setting `owners` (user settings), and the list loads again with the new scan scope (see [7.4](#74-repository-discovery)); no selection means all repositories. The icon is an empty filter while the setting is empty, and a filled filter while it limits the list. Without a sign-in, the command asks to sign in first.
 
 **Row.** A row shows:
 
@@ -356,9 +358,9 @@ flowchart LR
 
 ### 7.4 Repository discovery
 
-The Discovery Service uses the GitHub GraphQL API. One request returns up to 50 repositories. The same request checks whether each repository contains a Dev Container configuration.
+The Discovery Service uses the GitHub GraphQL API. It loads the repository list and the configuration lookups in separate requests, because the lookups make a request slow (about 3 seconds for 50 repositories): a list request returns up to 100 repositories without lookups, and a lookup request checks up to 50 repositories for a Dev Container configuration. The lookups start while the list still loads (see **First load** below).
 
-Illustration of the query (not final; argument details to verify in [V-5](#11-verification-before-implementation)):
+Illustration of the fields (not final; argument details to verify in [V-5](#11-verification-before-implementation)). The list query reads them without `rootFile` and `folder`, with `first: 100`; a lookup request reads `rootFile` and `folder` of up to 50 repositories by owner and name:
 
 ```graphql
 query Discover($cursor: String) {
@@ -410,6 +412,19 @@ Further rules:
 - The result is stored in the global storage of the extension, one list per GitHub account. The view shows the stored list of the signed-in account at once. It updates the list in the background: at start, every 60 minutes, and when the user selects **Refresh**. Without internet access, the view shows the stored list and skips the update.
 - An organization can restrict access for OAuth apps, or require SAML single sign-on authorization. In this case, the API returns errors for the repositories of this organization. The view shows one hint per organization with a link to authorize. An organization owner may need to approve the OAuth app that VS Code uses for the GitHub sign-in.
 - Internal repositories of other organizations in the same enterprise are possibly not included in this query. See [V-5](#11-verification-before-implementation).
+
+**Scan scope.** The setting `owners` ([section 8](#8-settings)) is the scan scope:
+
+- Empty (default): the extension scans all repositories that the account can access, with the query above. GitHub has no parallel cursor, so its pages load one after another.
+- Configured (logins of organizations or user accounts, case-insensitive): the extension asks GitHub only about the repositories of these owners, one query per owner (`repositoryOwner(login:)`; for the signed-in account itself `viewer.repositories` with the affiliation `OWNER`, so that its private repositories are included). The owners load in parallel, with at most 4 requests at the same time; the pages of one owner load one after another. Before them, one request reads the account and its organizations, without repositories. An owner that GitHub does not return gets the hint row "The organization X was not found or is not accessible." (no error dialog); an organization with SAML single sign-on or OAuth app access restrictions gets its usual hint.
+- No other repository is asked about. Environments of repositories outside the scope stay in the list, per the rules of [7.5](#75-environment-model-and-workspace-volume), but GitHub is not asked whether their repository still exists, so they never show `not on GitHub`. An environment of an older version without owner whose repository is outside the scope is not checked either, so it stays hidden until the scope includes its owner (or the scope is empty).
+- The stored list records the scope it was built with. A list of another scope is not shown, because it may contain repositories outside the current scope: the view shows the loading state and loads the list again. A change of the setting loads the list again at once.
+
+**Incremental detection.** The configuration lookups (`rootFile`, `folder`) make a request slow: GitHub needs about 3 seconds for 50 repositories with them. The stored list keeps the detection result of every scanned repository, with or without configuration, together with its `pushedAt` and its default branch. The list requests read only the list fields (100 repositories per request). The configurations are read in aliased batch queries of up to 50 repositories (`r0: repository(owner:, name:) { rootFile … folder … }`): on the first load (nothing stored) for all repositories, on a later refresh only for repositories that are new, or whose `pushedAt` or default branch changed. A lookup that fails is repeated at the next refresh. Each refresh writes its duration and its number of requests to the log.
+
+**First load.** A batch starts as soon as 50 repositories are listed, while the next list pages load; at most 4 requests run at the same time, and the next list page goes before waiting batches. The list pages of the empty scope load one after another (one cursor); with a scan scope, the owners load in parallel. Estimate for 664 repositories and the empty scope: 7 list requests and 14 lookup requests, 21 requests in total (plus further pages of organizations for more than 100 organizations, and the organization probe when GitHub hides repositories without naming the organization). With about 3 seconds per batch and 4 batches at the same time, the 14 batches need about 4 rounds, about 12 seconds; the list pages (without lookups, assumed about 1 second each, not measured yet) overlap with them. The first load takes about 12 to 15 seconds instead of about 43 seconds for 14 combined requests one after another. A batch that GitHub does not answer in time is split in halves; a list page that GitHub does not answer in time is asked again with fewer repositories.
+
+**Progressive display.** While the view has no list of the account (the first load, or after a change of the scope), it shows the repositories with a configuration as they arrive, as their batches finish. A later refresh replaces a shown list only when it is complete, so the view does not flicker.
 
 ### 7.5 Environment model and workspace volume
 
@@ -823,7 +838,7 @@ The prefix `devEnvLauncher` is a working name (see [D-1](#13-decisions)).
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time before a stop. It prevents a stop during a window reload. [V-4](#11-verification-before-implementation) measures the reload time to confirm the value. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection (see [7.7](#77-image-update-check)) |
 | `devEnvLauncher.respectShutdownActionNone` | `false` | If `true`, a repository with `"shutdownAction": "none"` keeps its container running after close |
-| `devEnvLauncher.owners` | `[]` | Show only repositories of these accounts or organizations. An empty list shows all. |
+| `devEnvLauncher.owners` | `[]` | Scan only the repositories of these organizations or accounts. An empty list scans all repositories that you can access. See [7.4](#74-repository-discovery). **Select Organizations…** in the title bar of the view changes it (see [6.2](#62-sidebar-view)). |
 | `devEnvLauncher.includeArchived` | `false` | Show archived repositories |
 | `devEnvLauncher.includeForks` | `true` | Show forked repositories |
 | `devEnvLauncher.refreshIntervalMinutes` | `60` | Interval of the background update of the repository list |

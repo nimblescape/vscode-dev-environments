@@ -144,7 +144,11 @@ export interface RepositoryInfo {
   configPaths: string[];
 }
 
-export type OrganizationHintKind = 'saml' | 'oauthRestricted' | 'other';
+/**
+ * `saml`, `oauthRestricted`, `other`: GitHub refuses the access. `notFound`: an organization or account of the scan scope
+ * (setting `owners`) does not exist, or the account cannot see it.
+ */
+export type OrganizationHintKind = 'saml' | 'oauthRestricted' | 'other' | 'notFound';
 
 /** Hint for an organization whose repositories the API did not return (concept 7.4). */
 export interface OrganizationHint {
@@ -152,6 +156,16 @@ export interface OrganizationHint {
   kind: OrganizationHintKind;
   /** URL where the user can authorize the access. */
   url: string;
+}
+
+/**
+ * A repository of the last discovery without a Dev Container configuration, with the state of GitHub its detection was
+ * read from (incremental detection, concept 7.4).
+ */
+export interface CheckedRepository {
+  nameWithOwner: string;
+  pushedAt: string | null;
+  defaultBranch: string | null;
 }
 
 /** Content of repositories-<account ID>.json. */
@@ -163,6 +177,21 @@ export interface DiscoveryData {
   organizations: string[];
   repositories: RepositoryInfo[];
   hints: OrganizationHint[];
+  /**
+   * The scan scope that the list was built with (lower-case logins, sorted; `normalizeScope`). Missing or empty: all
+   * repositories that the account can access (lists of older versions have none).
+   */
+  scope?: string[];
+  /**
+   * The repositories of the scan that have no configuration, so that a later refresh reads the configurations only of
+   * new and changed repositories. Missing in lists of older versions.
+   */
+  withoutConfiguration?: CheckedRepository[];
+  /**
+   * Repositories with a configuration whose lookup was not complete (a GraphQL error in its part of the answer), by
+   * `owner/name`: the next refresh reads their configurations again (concept 7.4). Missing when there are none.
+   */
+  uncertain?: string[];
 }
 
 /** Content of sessions/<window-id>.json (concept 7.9). */

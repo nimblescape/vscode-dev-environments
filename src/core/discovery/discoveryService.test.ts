@@ -39,19 +39,53 @@ interface GraphQLRequest {
 
 type Reply = { status?: number; body: unknown } | Error;
 
-/** Answers each GraphQL request with the handler. Records the parsed requests. */
+/** True for a batch of configuration lookups (`configurationsQuery`). */
+function isLookup(request: GraphQLRequest): boolean {
+  return request.query.startsWith('query Configurations(');
+}
+
+/**
+ * Answers each GraphQL request with the handler. Records the parsed requests. A batch of configuration lookups is
+ * answered from the `rootFile` and `folder` of the repository nodes that the list pages returned before, like GitHub.
+ */
 class FakeGitHub implements HttpTransport {
   readonly requests: GraphQLRequest[] = [];
+  private readonly nodes = new Map<string, Record<string, unknown>>();
   constructor(private readonly handler: (request: GraphQLRequest, index: number) => Reply) {}
   async request(request: HttpRequest): Promise<HttpResponse> {
     const parsed = JSON.parse(request.body ?? '{}') as GraphQLRequest;
     this.requests.push(parsed);
+    if (isLookup(parsed)) return { status: 200, headers: {}, body: JSON.stringify(this.lookups(parsed.variables)) };
     const reply = this.handler(parsed, this.requests.length - 1);
     if (reply instanceof Error) throw reply;
+    const body = reply.body as { data?: { viewer?: { repositories?: { nodes?: unknown[] } } } } | null;
+    for (const node of body?.data?.viewer?.repositories?.nodes ?? []) {
+      const record = node as Record<string, unknown> | null;
+      if (record && typeof record.nameWithOwner === 'string') this.nodes.set(record.nameWithOwner, record);
+    }
     return { status: reply.status ?? 200, headers: {}, body: JSON.stringify(reply.body) };
   }
   ofQuery(query: string): GraphQLRequest[] {
     return this.requests.filter((request) => request.query === query);
+  }
+  /** The requests without the batches of configuration lookups. */
+  listRequests(): GraphQLRequest[] {
+    return this.requests.filter((request) => !isLookup(request));
+  }
+  /** The repositories of each batch of configuration lookups, as `owner/name`. */
+  lookupBatches(): string[][] {
+    return this.requests.filter(isLookup).map((request) => {
+      const count = Object.keys(request.variables).length / 2;
+      return Array.from({ length: count }, (_, i) => `${String(request.variables[`o${i}`])}/${String(request.variables[`n${i}`])}`);
+    });
+  }
+  private lookups(variables: Record<string, unknown>): unknown {
+    const data: Record<string, unknown> = {};
+    for (let i = 0; `o${i}` in variables; i++) {
+      const node = this.nodes.get(`${String(variables[`o${i}`])}/${String(variables[`n${i}`])}`);
+      data[`r${i}`] = node ? { rootFile: node.rootFile ?? null, folder: node.folder ?? null } : null;
+    }
+    return { data };
   }
 }
 
@@ -166,10 +200,13 @@ describe('DiscoveryService.refresh', () => {
     const logger = recordingLogger();
     const result = await service(transport, logger).refresh(TOKEN, ACCOUNT_ID);
 
-    expect(transport.requests).toHaveLength(2);
+    // Concept 7.4: the list pages without the configuration lookups, then the lookups of all listed repositories.
+    expect(transport.requests).toHaveLength(3);
     expect(transport.requests[0].query).toBe(DISCOVERY_QUERY);
-    expect(transport.requests[0].variables).toEqual({ cursor: null, pageSize: 50, withOrganizations: true });
-    expect(transport.requests[1].variables).toEqual({ cursor: 'c1', pageSize: 50, withOrganizations: false });
+    expect(DISCOVERY_QUERY).not.toMatch(/rootFile|folder/);
+    expect(transport.requests[0].variables).toEqual({ cursor: null, pageSize: 100, withOrganizations: true });
+    expect(transport.requests[1].variables).toEqual({ cursor: 'c1', pageSize: 100, withOrganizations: false });
+    expect(transport.lookupBatches()).toEqual([['octo/zeta', 'acme/api', 'octo/empty', 'acme/alpha']]);
 
     expect(result.version).toBe(1);
     expect(result.fetchedAt).toBe('2026-09-24T12:00:00.000Z');
@@ -260,7 +297,9 @@ describe('DiscoveryService.refresh', () => {
     );
     const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'acme-university', kind: 'oauthRestricted', url: OAUTH_APP_CONNECTIONS_URL }]);
-    expect(transport.requests).toHaveLength(1);
+    // No probe: the list page and the lookup of the one listed repository.
+    expect(transport.listRequests()).toHaveLength(1);
+    expect(transport.lookupBatches()).toEqual([['octo/a']]);
   });
 
   it('takes the organization from the data when the path points into an existing node', async () => {
@@ -271,7 +310,8 @@ describe('DiscoveryService.refresh', () => {
     );
     const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
     expect(result.hints).toEqual([{ organization: 'secure-org', kind: 'saml', url: 'https://github.com/orgs/secure-org/sso' }]);
-    expect(transport.requests).toHaveLength(1);
+    expect(transport.listRequests()).toHaveLength(1);
+    expect(transport.lookupBatches()).toEqual([['secure-org/api']]);
   });
 
   it('keeps one hint per organization, SAML before OAuth, across pages', async () => {
@@ -383,20 +423,21 @@ describe('DiscoveryService.refresh', () => {
 
   it('retries a page with a smaller page size when GitHub does not answer in time, and keeps the smaller size', async () => {
     const transport = new FakeGitHub((request) => {
-      if (request.variables.pageSize === 50) return { status: 502, body: { message: 'Server Error' } };
+      if (request.variables.pageSize === 100) return { status: 502, body: { message: 'Server Error' } };
       if (request.variables.cursor === null) return discoverPage([repoNode('octo/a')], { hasNextPage: true, endCursor: 'c1' });
       return discoverPage([repoNode('octo/b')]);
     });
     const logger = recordingLogger();
     const result = await service(transport, logger).refresh(TOKEN, ACCOUNT_ID);
-    expect(transport.requests.map((request) => [request.variables.cursor, request.variables.pageSize])).toEqual([
+    expect(transport.listRequests().map((request) => [request.variables.cursor, request.variables.pageSize])).toEqual([
+      [null, 100],
       [null, 50],
-      [null, 25],
-      ['c1', 25],
+      ['c1', 50],
     ]);
     expect(transport.requests[1].variables.withOrganizations).toBe(true);
+    expect(transport.lookupBatches()).toEqual([['octo/a', 'octo/b']]);
     expect(result.repositories.map((repository) => repository.nameWithOwner)).toEqual(['octo/a', 'octo/b']);
-    expect(logger.lines.some((line) => line.includes('25 repositories per request'))).toBe(true);
+    expect(logger.lines.some((line) => line.includes('50 repositories per request'))).toBe(true);
   });
 
   it('retries a GraphQL timeout error down to the minimum page size, then throws', async () => {
@@ -404,7 +445,7 @@ describe('DiscoveryService.refresh', () => {
       body: { data: null, errors: [{ message: 'Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug.' }] },
     }));
     await expect(service(transport).refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/Something went wrong/);
-    expect(transport.requests.map((request) => request.variables.pageSize)).toEqual([50, 25, 12, 10]);
+    expect(transport.requests.map((request) => request.variables.pageSize)).toEqual([100, 50, 25, 12, 10]);
   });
 
   it('stops when the API repeats a cursor', async () => {
@@ -412,7 +453,8 @@ describe('DiscoveryService.refresh', () => {
       discoverPage([repoNode(request.variables.cursor === null ? 'octo/a' : 'octo/b')], { hasNextPage: true, endCursor: 'same' }),
     );
     const result = await service(transport).refresh(TOKEN, ACCOUNT_ID);
-    expect(transport.requests).toHaveLength(2);
+    expect(transport.listRequests()).toHaveLength(2);
+    expect(transport.lookupBatches()).toEqual([['octo/a', 'octo/b']]);
     expect(result.repositories).toHaveLength(2);
   });
 

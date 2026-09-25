@@ -195,6 +195,23 @@ describe('EnvironmentClaims', () => {
     expect(logged).toContain('now belongs to the GitHub account scalarion');
   });
 
+  it('does not ask GitHub about an entry outside the scan scope, which stays hidden, also in the interactive mode', async () => {
+    await registry.add(environment('inside', 'scalarion/app'));
+    await registry.add(environment('outside', 'majikmate/module-ts'));
+    const getRepository = vi.fn(async (repository: string) => info(repository, { viewerPermission: 'WRITE' }));
+    const confirm = vi.fn(async () => true);
+    const logger = recordingLogger();
+    const inScope = vi.fn((repository: string) => repository.startsWith('scalarion/'));
+    const claims = new EnvironmentClaims({ registry, getRepository, confirm, inScope, logger });
+
+    await expect(claims.claim(SCALARION, 'gho_scalarion', { mode: 'interactive' })).resolves.toEqual(['inside']);
+    expect(getRepository.mock.calls.map((call) => call[0])).toEqual(['scalarion/app']);
+    expect(confirm).not.toHaveBeenCalled();
+    expect((await registry.get('outside'))?.owner).toBeUndefined();
+    expect(logger.lines.join('\n')).toContain('The environment outside stays hidden: its repository is outside the organizations that are scanned.');
+    expect(logger.lines.join('\n')).not.toContain('majikmate/module-ts');
+  });
+
   it('asks in the interactive mode before it claims an entry of a public or shared repository', async () => {
     await registry.add(environment('public', 'torvalds/linux'));
     await registry.add(environment('shared', 'majikmate/module-ts'));

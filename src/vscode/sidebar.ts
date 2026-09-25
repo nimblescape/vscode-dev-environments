@@ -9,8 +9,9 @@
 // sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
-import type { DiscoveryService } from '../core/discovery/discoveryService';
+import type { DiscoveryService, PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
+import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
 import { availableEnvironments, type EnvironmentClaims } from '../core/ownership';
@@ -68,6 +69,12 @@ export class Sidebar implements vscode.Disposable {
   private runtime: ReadonlyMap<string, EnvironmentRuntime> | undefined;
   private liveBranches: ReadonlyMap<string, string> = new Map();
   private lookups: ReadonlyMap<string, RepositoryInfo | null> = new Map();
+  /**
+   * Progressive display (concept 7.4): the refresh that runs while the view shows no list (the first load, or a list of
+   * another scope) shows the repositories as they arrive, for this account.
+   */
+  private progressiveAccountId: string | undefined;
+  private partial: DiscoveryData | undefined;
   private timer: NodeJS.Timeout | undefined;
   private signInOffered = false;
   /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
@@ -153,6 +160,26 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
+   * The setting `owners` (the scan scope, concept 7.4) changed: a list of another scope is not shown anymore, because it
+   * may contain repositories outside the new scope, and a refresh with the new scope starts at once. Never rejects.
+   */
+  async onScopeChanged(): Promise<void> {
+    // The part of a first load of the previous scope is not shown either.
+    if (this.partial && !this.isOfCurrentScope(this.partial)) {
+      this.partial = undefined;
+      this.progressiveAccountId = undefined;
+    }
+    if (this.data && !this.isOfCurrentScope(this.data)) {
+      this.data = undefined;
+      this.lookups = new Map();
+      this.setLoaded(false);
+      this.setLoadFailed(false);
+    }
+    this.renderInBackground();
+    if (this.signedIn) await this.refreshDiscovery({ again: true });
+  }
+
+  /**
    * Sign-in, sign-out, or account change: new state, then a new list. `again` (default true) starts one more refresh
    * after a running one, because the account may have changed; `again: false` reuses a running refresh.
    * Never rejects.
@@ -178,9 +205,27 @@ export class Sidebar implements vscode.Disposable {
     this.timer = setInterval(() => void this.refreshDiscovery(), minutes * 60_000);
   }
 
-  /** GitHub data of a repository: from the discovery, or from a single lookup. */
+  /** GitHub data of a repository: from the discovery (or the part of the first load), or from a single lookup. */
   repositoryInfo(repository: string): RepositoryInfo | undefined {
-    return findRepositoryInfo(repository, this.data, this.lookups);
+    return findRepositoryInfo(repository, this.data ?? this.shownPartial(), this.lookups);
+  }
+
+  /**
+   * A part of the list of a running refresh (DiscoveryService.onPartialResult). Shown only while the view has no list of
+   * the account; a later refresh replaces the shown list only when it is complete, so the view does not flicker.
+   */
+  onPartialResult(result: PartialDiscovery): void {
+    if (this.disposed || this.data !== undefined || result.accountId !== this.progressiveAccountId) return;
+    if (result.accountId !== this.account?.id || !this.isOfCurrentScope(result.data)) return;
+    this.partial = result.data;
+    this.renderInBackground();
+  }
+
+  /** The part of the first load that the view may show: of the signed-in account and of the current scope only. */
+  private shownPartial(): DiscoveryData | undefined {
+    const partial = this.partial;
+    if (!partial || this.progressiveAccountId === undefined || this.progressiveAccountId !== this.account?.id) return undefined;
+    return this.isOfCurrentScope(partial) ? partial : undefined;
   }
 
   /** Branch read from the running container at the last state refresh. */
@@ -249,7 +294,7 @@ export class Sidebar implements vscode.Disposable {
     // Only the environments of the signed-in account; hidden ones are not counted or named anywhere (concept 7.5).
     const environments = availableEnvironments(entries, account);
     const groups = buildTreeModel({
-      discovery: this.data,
+      discovery: this.data ?? this.shownPartial(),
       settings: this.deps.settings(),
       environments,
       runtime: this.runtime,
@@ -311,12 +356,16 @@ export class Sidebar implements vscode.Disposable {
       this.renderInBackground();
       return this.data;
     }
+    this.progressiveAccountId = this.data === undefined ? account.id : undefined;
+    this.partial = undefined;
     try {
       const data = await vscode.window.withProgress({ location: { viewId: REPOSITORIES_VIEW_ID } }, () =>
         this.deps.discovery.refresh(token, account.id),
       );
       // The account changed while the list loaded: the list is not shown (the next refresh loads the new one).
       if (this.account?.id !== account.id) return this.data;
+      // The scope changed while the list loaded: the refresh that the change requested loads the list of the new scope.
+      if (!this.isOfCurrentScope(data)) return this.data;
       this.data = data;
       this.setLoadFailed(false);
       // Concept 7.5: environments of an older version become available when this account can access the repository.
@@ -329,6 +378,12 @@ export class Sidebar implements vscode.Disposable {
       const shown = this.data ? 'The stored list is shown.' : 'No stored list exists.';
       this.deps.logger.warn(`The repository list could not be updated. ${shown} ${errorMessage(error)}`);
       this.setLoadFailed(this.data === undefined);
+    } finally {
+      this.progressiveAccountId = undefined;
+      if (this.partial) {
+        this.partial = undefined;
+        this.renderInBackground();
+      }
     }
     this.setLoaded();
     this.renderInBackground();
@@ -343,7 +398,8 @@ export class Sidebar implements vscode.Disposable {
   private async lookUpUnlisted(data: DiscoveryData, token: string): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
     const environments = await this.availableEnvironments();
-    for (const repository of repositoriesToLookUp(environments, data.repositories)) {
+    // Concept 7.4: GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
+    for (const repository of repositoriesToLookUp(environments, data.repositories, this.deps.settings().owners)) {
       if (this.disposed) break;
       try {
         const info = await this.deps.discovery.getRepository(repository, token);
@@ -397,6 +453,9 @@ export class Sidebar implements vscode.Disposable {
     this.account = account;
     this.data = undefined;
     this.lookups = new Map();
+    // The part of the first load of the previous account is never shown to this one.
+    this.partial = undefined;
+    this.progressiveAccountId = undefined;
     this.setLoadFailed(false);
     if (!account) return;
     const stored = await this.deps.discovery.loadStored(account.id).catch((error: unknown) => {
@@ -405,6 +464,11 @@ export class Sidebar implements vscode.Disposable {
     });
     // Another change of the account meanwhile wins.
     if (this.account?.id !== account.id) return;
+    // A list of another scan scope may contain repositories outside the current one: the view waits for the refresh.
+    if (stored && !this.isOfCurrentScope(stored)) {
+      this.deps.logger.info('The stored repository list was loaded for other organizations. It is loaded again.');
+      return;
+    }
     this.data = stored;
     this.setLoaded(stored !== undefined);
   }
@@ -417,6 +481,11 @@ export class Sidebar implements vscode.Disposable {
       this.deps.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
       return undefined;
     }
+  }
+
+  /** True if the list was built with the scan scope of the current settings (a list without scope: all repositories). */
+  private isOfCurrentScope(data: DiscoveryData): boolean {
+    return sameScope(data.scope, this.deps.settings().owners);
   }
 
   /** The account of the GitHub session, without a dialog. */

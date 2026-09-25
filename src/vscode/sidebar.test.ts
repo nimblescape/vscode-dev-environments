@@ -96,6 +96,8 @@ interface Harness {
     isSignedIn: ReturnType<typeof vi.fn>;
     updateContextKey: ReturnType<typeof vi.fn>;
   };
+  /** The settings that the sidebar reads; a test can change them. */
+  settings: ExtensionSettings;
 }
 
 function createHarness(): Harness {
@@ -138,6 +140,7 @@ function createHarness(): Harness {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
   const getRepository = discovery.getRepository as unknown as (repository: string, token: string) => Promise<RepositoryInfo | undefined>;
   const claims = new EnvironmentClaims({ registry, getRepository: (repository, token) => getRepository(repository, token), logger });
+  const settings: ExtensionSettings = { ...SETTINGS, owners: [...SETTINGS.owners] };
   const sidebar = new Sidebar({
     claims,
     logger,
@@ -149,11 +152,11 @@ function createHarness(): Harness {
     discovery,
     auth,
     tree,
-    settings: () => SETTINGS,
+    settings: () => settings,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
-  return { root, registry, sessionFiles, sidebar, models, signedInFlags, coordinator, service, docker, discovery, auth };
+  return { root, registry, sessionFiles, sidebar, models, signedInFlags, coordinator, service, docker, discovery, auth, settings };
 }
 
 let h: Harness;
@@ -434,5 +437,189 @@ describe('Sidebar', () => {
     await h.sidebar.initialize();
     await h.sidebar.refreshDiscovery();
     expect(h.discovery.refresh).toHaveBeenCalledWith('gho_token', OCTO.id);
+  });
+});
+
+describe('Sidebar and the scan scope (setting owners, concept 7.4)', () => {
+  const scoped = (repositories: RepositoryInfo[], scope: string[]): DiscoveryData => ({ ...data(repositories), scope });
+
+  it('does not show a stored list of another scope, and shows the list of the refresh with the current scope', async () => {
+    h.settings.owners = ['acme'];
+    // A list of an older version: all repositories.
+    h.discovery.loadStored.mockResolvedValue(data([info('acme/web'), info('octo/dotfiles')]));
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(h.sidebar.discoveryData).toBeUndefined();
+    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalledWith('setContext', LOADED_CONTEXT_KEY, true);
+    expect(h.discovery.refresh).toHaveBeenCalledTimes(1);
+
+    finish(scoped([info('acme/api')], ['acme']));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOADED_CONTEXT_KEY, true);
+  });
+
+  it('shows a stored list of the same scope at once, whatever the order and case of the setting', async () => {
+    h.settings.owners = ['Beta', 'ACME'];
+    h.discovery.loadStored.mockResolvedValue(scoped([info('acme/web')], ['acme', 'beta']));
+    h.discovery.refresh.mockImplementation(() => new Promise(() => undefined));
+    await h.sidebar.initialize();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/web']);
+  });
+
+  it('rescans at once after a change of the setting, and hides the list of the previous scope meanwhile', async () => {
+    h.discovery.refresh.mockResolvedValue(scoped([info('acme/api'), info('octo/dotfiles')], []));
+    await signedIn();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository).sort()).toEqual(['acme/api', 'octo/dotfiles']);
+
+    h.settings.owners = ['acme'];
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    const changed = h.sidebar.onScopeChanged();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(2));
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenLastCalledWith('setContext', LOADED_CONTEXT_KEY, false);
+
+    finish(scoped([info('acme/api')], ['acme']));
+    await changed;
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+  });
+
+  it('does not show a list whose scope changed while it loaded', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.settings.owners = ['acme'];
+    finish(scoped([info('acme/api'), info('octo/dotfiles')], []));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(h.sidebar.discoveryData).toBeUndefined();
+    expect(rows()).toEqual([]);
+  });
+
+  it('asks GitHub only about unlisted repositories of the scope, and keeps the others without `not on GitHub`', async () => {
+    h.settings.owners = ['acme'];
+    await h.registry.add(environment(API, 'acme/api'));
+    await h.registry.add(environment(OLD, 'acme/unlisted'));
+    await h.registry.add(environment(GONE, 'octo/outside'));
+    h.discovery.refresh.mockResolvedValue(scoped([info('acme/api')], ['acme']));
+    await signedIn();
+    await h.sidebar.render();
+    expect(h.discovery.getRepository.mock.calls.map((call) => call[0])).toEqual(['acme/unlisted']);
+    expect(rowOf('acme/unlisted').notOnGitHub).toBe(true);
+    // Listed per the account rules, without a lookup and without the label.
+    expect(rowOf('octo/outside').notOnGitHub).toBe(false);
+    expect(rowOf('octo/outside').environment?.id).toBe(GONE);
+  });
+});
+
+describe('Sidebar progressive display (concept 7.4)', () => {
+  const part = (repositories: RepositoryInfo[], accountId = OCTO.id) => ({ accountId, data: { ...data(repositories), scope: [] } });
+
+  it('shows the repositories as they arrive during the first load, then the complete list', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    expect(h.sidebar.repositoryInfo('acme/api')?.nameWithOwner).toBe('acme/api');
+    h.sidebar.onPartialResult(part([info('acme/api'), info('acme/web')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/web']);
+    // The trust of an owner still waits for the complete list.
+    expect(h.sidebar.discoveryData).toBeUndefined();
+
+    finish(data([info('acme/api'), info('acme/web'), info('acme/zeta')]));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/web', 'acme/zeta']);
+  });
+
+  it('replaces a shown list only when the refresh is complete', async () => {
+    h.discovery.loadStored.mockResolvedValue(data([info('acme/old')]));
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/old']);
+    finish(data([info('acme/api')]));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+  });
+
+  it('never shows the part of the first load of one account to another account (concept section 9)', async () => {
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>(() => undefined));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('octo/private-a')]));
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['octo/private-a']);
+    // Another account signs in while the first load of OCTO still runs; it has no stored list.
+    h.auth.getAccount.mockResolvedValue(OTHER);
+    // The refresh of OTHER waits behind the running one; the view changes at once.
+    void h.sidebar.onSessionChanged();
+    await vi.waitFor(() => expect(h.sidebar.currentAccount?.id).toBe(OTHER.id));
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(h.sidebar.repositoryInfo('octo/private-a')).toBeUndefined();
+  });
+
+  it('stops showing the part of the first load when the scope changes', async () => {
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>(() => undefined));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('octo/private-a'), info('acme/api')]));
+    h.settings.owners = ['acme'];
+    void h.sidebar.onScopeChanged();
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(h.sidebar.repositoryInfo('octo/private-a')).toBeUndefined();
+    expect(h.sidebar.repositoryInfo('acme/api')).toBeUndefined();
+  });
+
+  it('ignores a part of another account, of another scope, and after the refresh', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('staussh/secret')], OTHER.id));
+    h.sidebar.onPartialResult({ accountId: OCTO.id, data: { ...data([info('acme/api')]), scope: ['acme'] } });
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+
+    finish(data([]));
+    await h.sidebar.refreshDiscovery();
+    h.sidebar.onPartialResult(part([info('acme/late')]));
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+  });
+
+  it('shows no part of a first load that failed', async () => {
+    let fail: (error: Error) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((_resolve, reject) => (fail = reject)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.sidebar.onPartialResult(part([info('acme/api')]));
+    await h.sidebar.render();
+    expect(rows()).toHaveLength(1);
+    fail(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    expect(rows()).toEqual([]);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOAD_FAILED_CONTEXT_KEY, true);
   });
 });

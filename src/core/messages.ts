@@ -27,6 +27,8 @@ export const Messages = {
   registrySignIn: (registry: string) => `The registry ${registry} requires a sign-in.`,
   organizationNotAuthorized: (organization: string) =>
     `Access to the organization ${organization} is not authorized.`,
+  /** Concept 7.4: an owner of the setting `owners` that GitHub does not return (unknown, or no access). */
+  organizationNotFound: (organization: string) => `The organization ${organization} was not found or is not accessible.`,
   newerImage: 'A newer image is available. The environment is updated. Your files are kept.',
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',

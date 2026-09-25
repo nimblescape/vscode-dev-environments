@@ -91,6 +91,11 @@ export interface ClaimDeps {
    * for yes. Only the `interactive` mode asks. Without it, only unambiguous entries are claimed.
    */
   confirm?(environment: Environment, account: GitHubAccount): Promise<boolean>;
+  /**
+   * The scan scope (setting `owners`, concept 7.4): false for a repository outside of it. GitHub is not asked about such
+   * a repository, so its entry stays without owner and hidden. Default: every repository is in the scope.
+   */
+  inScope?(repository: string): boolean;
   logger: Logger;
 }
 
@@ -176,6 +181,10 @@ export class EnvironmentClaims {
       // The repository name of an entry that stays hidden is not shown, not even in the log.
       if (!canClaim(environments, environment, account)) {
         logger.info(`The environment ${environment.id} stays hidden: the signed-in account has an environment of its repository.`);
+        continue;
+      }
+      if (this.deps.inScope && !this.deps.inScope(environment.repository)) {
+        logger.info(`The environment ${environment.id} stays hidden: its repository is outside the organizations that are scanned.`);
         continue;
       }
       let info: RepositoryInfo | undefined;

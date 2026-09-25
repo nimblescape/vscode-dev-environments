@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Incremental detection of the discovery (concept 7.4): after the first load, a refresh reads the configurations only
+// of new and changed repositories, in aliased batches.
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
+import type { Logger } from '../ports';
+import { GitHubApi } from './githubApi';
+import {
+  DISCOVERY_QUERY,
+  DiscoveryService,
+  LOOKUP_BATCH_SIZE,
+  OWNER_REPOSITORIES_QUERY,
+  SCOPE_VIEWER_QUERY,
+} from './discoveryService';
+
+const TOKEN = 'gho_secretTokenValue123';
+const ACCOUNT_ID = '1001';
+const clock = { now: () => Date.parse('2026-09-25T12:00:00.000Z') };
+
+interface GraphQLRequest {
+  query: string;
+  variables: Record<string, unknown>;
+}
+
+interface FakeRepository {
+  nameWithOwner: string;
+  pushedAt: string;
+  config: boolean;
+}
+
+/**
+ * A small GitHub: answers the list queries, the owner queries, and the batches of configuration lookups from `repos`.
+ * `lookupErrors` makes the lookup of these repositories fail with an error.
+ */
+class FakeGitHub implements HttpTransport {
+  readonly requests: GraphQLRequest[] = [];
+  repos: FakeRepository[] = [];
+  lookupErrors = new Set<string>();
+  /** The lookup of these repositories answers the root file, but its folder part fails with an error. */
+  folderErrors = new Set<string>();
+  /** The lookup of these repositories answers nothing, and the batch has a timeout error that points into no repository. */
+  cutShort = new Set<string>();
+  /** Answers with a timeout error while a batch has more than this many repositories. */
+  batchLimit = Infinity;
+  open = 0;
+  peak = 0;
+  /** Time of a batch of lookups: GitHub needs much longer for them than for a list page. */
+  lookupDelayMs = 3;
+  /** `start <operation>` and `end <operation>` of each request, in order. */
+  readonly events: string[] = [];
+
+  async request(request: HttpRequest): Promise<HttpResponse> {
+    const parsed = JSON.parse(request.body ?? '{}') as GraphQLRequest;
+    this.requests.push(parsed);
+    const name = /^query (\w+)/.exec(parsed.query)?.[1] ?? '?';
+    this.events.push(`start ${name}`);
+    this.open++;
+    this.peak = Math.max(this.peak, this.open);
+    await new Promise((resolve) => setTimeout(resolve, name === 'Configurations' ? this.lookupDelayMs : 3));
+    this.open--;
+    this.events.push(`end ${name}`);
+    return { status: 200, headers: {}, body: JSON.stringify(this.answer(parsed)) };
+  }
+
+  ofQuery(query: string): GraphQLRequest[] {
+    return this.requests.filter((request) => request.query === query);
+  }
+
+  lookups(): GraphQLRequest[] {
+    return this.requests.filter((request) => request.query.startsWith('query Configurations('));
+  }
+
+  private answer({ query, variables }: GraphQLRequest): unknown {
+    if (query === DISCOVERY_QUERY) {
+      const repositories = this.page(this.repos, variables);
+      return { data: { viewer: { login: 'octo', databaseId: 1001, organizations: { pageInfo: { hasNextPage: false }, nodes: [] }, repositories } } };
+    }
+    if (query === SCOPE_VIEWER_QUERY) {
+      return { data: { viewer: { login: 'octo', databaseId: 1001, organizations: { pageInfo: { hasNextPage: false }, nodes: [{ login: 'acme' }] } } } };
+    }
+    if (query === OWNER_REPOSITORIES_QUERY) {
+      const login = String(variables.login).toLowerCase();
+      const own = this.repos.filter((repo) => repo.nameWithOwner.split('/')[0].toLowerCase() === login);
+      const repositories = this.page(own, variables);
+      return { data: { repositoryOwner: { __typename: 'Organization', login, repositories } } };
+    }
+    if (query.startsWith('query Configurations(')) {
+      const count = Object.keys(variables).length / 2;
+      if (count > this.batchLimit) {
+        return { data: null, errors: [{ message: 'Something went wrong while executing your query. This may be the result of a timeout.' }] };
+      }
+      const data: Record<string, unknown> = {};
+      const errors: unknown[] = [];
+      for (let i = 0; i < count; i++) {
+        const name = `${String(variables[`o${i}`])}/${String(variables[`n${i}`])}`;
+        const repo = this.repos.find((candidate) => candidate.nameWithOwner === name);
+        if (this.lookupErrors.has(name)) {
+          data[`r${i}`] = null;
+          errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`] });
+        } else if (this.cutShort.has(name)) {
+          data[`r${i}`] = { rootFile: null, folder: null };
+          errors.push({ message: 'Something went wrong while executing your query. This may be the result of a timeout.' });
+        } else if (this.folderErrors.has(name)) {
+          data[`r${i}`] = { rootFile: { __typename: 'Blob' }, folder: null };
+          errors.push({ type: 'SERVICE_UNAVAILABLE', message: 'Something failed', path: [`r${i}`, 'folder'] });
+        } else {
+          data[`r${i}`] = repo ? lookups(repo) : null;
+        }
+      }
+      return { data, ...(errors.length > 0 ? { errors } : {}) };
+    }
+    throw new Error(`unexpected query ${query.slice(0, 40)}`);
+  }
+
+  private page(repos: FakeRepository[], variables: Record<string, unknown>): unknown {
+    const start = variables.cursor === null ? 0 : Number(variables.cursor);
+    const size = Number(variables.pageSize);
+    const slice = repos.slice(start, start + size);
+    const end = start + slice.length;
+    return {
+      pageInfo: { hasNextPage: end < repos.length, endCursor: String(end) },
+      nodes: slice.map((repo) => listFields(repo)),
+    };
+  }
+}
+
+function listFields(repo: FakeRepository): Record<string, unknown> {
+  const [owner, name] = repo.nameWithOwner.split('/');
+  return {
+    id: `R_${repo.nameWithOwner}`,
+    name,
+    nameWithOwner: repo.nameWithOwner,
+    url: `https://github.com/${repo.nameWithOwner}`,
+    isArchived: false,
+    isFork: false,
+    isPrivate: true,
+    pushedAt: repo.pushedAt,
+    owner: { login: owner },
+    defaultBranchRef: { name: 'main' },
+  };
+}
+
+function lookups(repo: FakeRepository): Record<string, unknown> {
+  return { rootFile: repo.config ? { __typename: 'Blob' } : null, folder: null };
+}
+
+function repo(nameWithOwner: string, config = true, pushedAt = '2026-09-20T10:00:00Z'): FakeRepository {
+  return { nameWithOwner, pushedAt, config };
+}
+
+function recordingLogger(): Logger & { lines: string[] } {
+  const lines: string[] = [];
+  return { lines, info: (m) => lines.push(m), warn: (m) => lines.push(m), error: (m) => lines.push(m), output: (t) => lines.push(t) };
+}
+
+let dir: string;
+let file: string;
+let github: FakeGitHub;
+let owners: string[];
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-incremental-'));
+  file = path.join(dir, `repositories-${ACCOUNT_ID}.json`);
+  github = new FakeGitHub();
+  owners = [];
+});
+
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function service(logger?: Logger): DiscoveryService {
+  return new DiscoveryService(new GitHubApi(github), () => file, logger, clock, { scope: () => owners });
+}
+
+/** The operation name of a request, for example `query Configurations`. */
+const operation = (request: GraphQLRequest) => /^query \w+/.exec(request.query)?.[0];
+const names = (list: Array<{ nameWithOwner: string }>) => list.map((item) => item.nameWithOwner);
+
+describe('incremental detection, empty scope', () => {
+  it('reads the configurations of all repositories on the first load, and stores the repositories without one', async () => {
+    github.repos = [repo('acme/api'), repo('acme/empty', false)];
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual(['query Discover', 'query Configurations']);
+    expect(github.lookups()[0].variables).toEqual({ o0: 'acme', n0: 'api', o1: 'acme', n1: 'empty' });
+    expect(names(result.repositories)).toEqual(['acme/api']);
+    expect(result.withoutConfiguration).toEqual([{ nameWithOwner: 'acme/empty', pushedAt: '2026-09-20T10:00:00Z', defaultBranch: 'main' }]);
+  });
+
+  it('reads only the list when nothing changed: no configuration lookup, 100 repositories per request', async () => {
+    github.repos = [repo('acme/api'), repo('acme/empty', false)];
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    github.requests.length = 0;
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => request.query)).toEqual([DISCOVERY_QUERY]);
+    expect(github.requests[0].variables).toEqual({ cursor: null, pageSize: 100, withOrganizations: true });
+    expect(DISCOVERY_QUERY).not.toMatch(/rootFile|folder|ConfigurationLookups/);
+    expect(second.repositories).toEqual(first.repositories);
+    expect(second.withoutConfiguration).toEqual(first.withoutConfiguration);
+  });
+
+  it('reads a repository again whose lookup failed in part, although it found a configuration (concept 7.4)', async () => {
+    github.repos = [repo('acme/api'), repo('acme/web')];
+    github.folderErrors.add('acme/api');
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(names(first.repositories)).toEqual(['acme/api', 'acme/web']);
+    expect(first.uncertain).toEqual(['acme/api']);
+    github.requests.length = 0;
+    github.folderErrors.clear();
+    // No push since: only the repository whose detection was not certain is read again.
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups().map((request) => request.variables)).toEqual([{ o0: 'acme', n0: 'api' }]);
+    expect(second.uncertain).toBeUndefined();
+    github.requests.length = 0;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups()).toEqual([]);
+  });
+
+  it('reads a batch again whose answer has an error that points into no repository (a timeout that cut it short)', async () => {
+    github.repos = [repo('acme/api'), repo('acme/web')];
+    github.cutShort.add('acme/api');
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(names(first.repositories)).toEqual(['acme/web']);
+    // Not stored as a repository without configuration: its detection is not certain.
+    expect(first.withoutConfiguration ?? []).toEqual([]);
+    expect(first.uncertain).toEqual(['acme/web']);
+    github.requests.length = 0;
+    github.cutShort.clear();
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups().map((request) => request.variables)).toEqual([{ o0: 'acme', n0: 'api', o1: 'acme', n1: 'web' }]);
+    expect(names(second.repositories)).toEqual(['acme/api', 'acme/web']);
+    expect(second.uncertain).toBeUndefined();
+  });
+
+  it('reads the configurations only of new repositories and of repositories with another pushedAt', async () => {
+    github.repos = [repo('acme/api'), repo('acme/web'), repo('acme/empty', false), repo('acme/stale', false)];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.requests.length = 0;
+    github.repos = [
+      repo('acme/api'),
+      // The configuration was removed with a push.
+      repo('acme/web', false, '2026-09-24T09:00:00Z'),
+      // A configuration was added with a push.
+      repo('acme/empty', true, '2026-09-24T10:00:00Z'),
+      // Changed on GitHub without a push: not read again, the stored result stays.
+      repo('acme/stale', true),
+      repo('acme/new'),
+    ];
+    const logger = recordingLogger();
+    const result = await service(logger).refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual(['query Discover', 'query Configurations']);
+    expect(github.lookups()[0].variables).toEqual({ o0: 'acme', n0: 'web', o1: 'acme', n1: 'empty', o2: 'acme', n2: 'new' });
+    expect(names(result.repositories)).toEqual(['acme/api', 'acme/empty', 'acme/new']);
+    expect(names(result.withoutConfiguration ?? [])).toEqual(['acme/web', 'acme/stale']);
+    expect(logger.lines).toContain('Repository list: configurations of 3 new or changed repositories read with 1 requests.');
+    expect(logger.lines.some((line) => /^Repository list: loaded in \d+\.\d seconds with 2 requests\.$/.test(line))).toBe(true);
+  });
+
+  it('reads the changed repositories in batches of 50, at most 4 requests at the same time', async () => {
+    const many = Array.from({ length: 230 }, (_, i) => repo(`acme/r${i}`, i % 2 === 0));
+    github.repos = many;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.requests.length = 0;
+    github.peak = 0;
+    github.repos = many.map((item) => ({ ...item, pushedAt: '2026-09-25T08:00:00Z' }));
+    github.lookupDelayMs = 30;
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(LOOKUP_BATCH_SIZE).toBe(50);
+    expect(github.lookups().map((request) => Object.keys(request.variables).length / 2)).toEqual([50, 50, 50, 50, 30]);
+    expect(github.peak).toBe(4);
+    expect(result.repositories).toHaveLength(115);
+  });
+
+  it('splits a batch that GitHub does not answer in time', async () => {
+    github.repos = [repo('acme/a')];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.repos = Array.from({ length: 40 }, (_, i) => repo(`acme/n${i}`));
+    github.batchLimit = 20;
+    github.requests.length = 0;
+    const result = await service(recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups().map((request) => Object.keys(request.variables).length / 2)).toEqual([40, 20, 20]);
+    expect(result.repositories).toHaveLength(40);
+  });
+
+  it('reads a repository again whose lookup failed, and does not keep it as without configuration', async () => {
+    github.repos = [repo('acme/api')];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.repos = [repo('acme/api'), repo('acme/flaky')];
+    github.lookupErrors.add('acme/flaky');
+    const second = await service(recordingLogger()).refresh(TOKEN, ACCOUNT_ID);
+    expect(names(second.repositories)).toEqual(['acme/api']);
+    expect(second.withoutConfiguration).toEqual([]);
+    github.lookupErrors.clear();
+    github.requests.length = 0;
+    const third = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.lookups()[0].variables).toEqual({ o0: 'acme', n0: 'flaky' });
+    expect(names(third.repositories)).toEqual(['acme/api', 'acme/flaky']);
+  });
+
+  it('reads the repositories without configuration of a list of an older version once', async () => {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ version: 1, fetchedAt: '', viewerLogin: 'octo', organizations: [], hints: [], repositories: [] }),
+    );
+    github.repos = [repo('acme/empty', false)];
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual(['query Discover', 'query Configurations']);
+    expect(names(result.withoutConfiguration ?? [])).toEqual(['acme/empty']);
+  });
+});
+
+describe('incremental detection with a scan scope', () => {
+  it('lists the owners without lookups, and reads only the changed repositories of the scope', async () => {
+    owners = ['acme'];
+    github.repos = [repo('acme/api'), repo('acme/web', false), repo('other/secret')];
+    const first = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.ofQuery(OWNER_REPOSITORIES_QUERY).map((request) => request.variables)).toEqual([
+      { login: 'acme', cursor: null, pageSize: 100 },
+    ]);
+    expect(github.lookups().map((request) => request.variables)).toEqual([{ o0: 'acme', n0: 'api', o1: 'acme', n1: 'web' }]);
+    expect(names(first.repositories)).toEqual(['acme/api']);
+    github.requests.length = 0;
+    github.repos = [repo('acme/api'), repo('acme/web', true, '2026-09-24T09:00:00Z'), repo('other/secret', true, '2026-09-24T09:00:00Z')];
+    const second = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual([
+      'query ScopeViewer',
+      'query OwnerRepositories',
+      'query Configurations',
+    ]);
+    expect(github.ofQuery(OWNER_REPOSITORIES_QUERY)[0].variables).toEqual({ login: 'acme', cursor: null, pageSize: 100 });
+    expect(github.lookups()[0].variables).toEqual({ o0: 'acme', n0: 'web' });
+    expect(JSON.stringify(github.requests)).not.toContain('other');
+    expect(names(second.repositories)).toEqual(['acme/api', 'acme/web']);
+  });
+
+  it('uses the stored detections of a list of another scope, but lists only the owners of the new scope', async () => {
+    github.repos = [repo('acme/api'), repo('beta/tool')];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    owners = ['beta'];
+    github.requests.length = 0;
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual(['query ScopeViewer', 'query OwnerRepositories']);
+    expect(names(result.repositories)).toEqual(['beta/tool']);
+    expect(result.scope).toEqual(['beta']);
+  });
+});
+
+describe('progressive results (DiscoveryService.onPartialResult)', () => {
+  it('reports the repositories found so far after each page of the first load', async () => {
+    github.repos = Array.from({ length: 70 }, (_, i) => repo(`acme/r${i}`, i < 60));
+    const discovery = service();
+    const parts: Array<{ accountId: string; count: number; scope: string[] | undefined }> = [];
+    const subscription = discovery.onPartialResult(({ accountId, data }) =>
+      parts.push({ accountId, count: data.repositories.length, scope: data.scope }),
+    );
+    const result = await discovery.refresh(TOKEN, ACCOUNT_ID);
+    // After the list page (no configuration known yet), then after each batch of lookups.
+    expect(parts).toEqual([
+      { accountId: ACCOUNT_ID, count: 0, scope: [] },
+      { accountId: ACCOUNT_ID, count: 50, scope: [] },
+      { accountId: ACCOUNT_ID, count: 60, scope: [] },
+    ]);
+    expect(result.repositories).toHaveLength(60);
+
+    subscription.dispose();
+    parts.length = 0;
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toEqual([]);
+  });
+
+  it('reports each page of each owner of the scope, in the order of the scope', async () => {
+    owners = ['beta', 'acme'];
+    github.repos = [repo('acme/api'), repo('beta/tool')];
+    const discovery = service();
+    const parts: string[][] = [];
+    discovery.onPartialResult(({ data }) => parts.push(names(data.repositories)));
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    // One report per owner page, then the batch with the repositories of both owners.
+    expect(parts).toEqual([[], [], ['beta/tool', 'acme/api']]);
+  });
+
+  it('reports the unchanged repositories after the list, and the changed ones after their lookup', async () => {
+    github.repos = [repo('acme/api')];
+    const discovery = service();
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    github.repos = [repo('acme/api'), repo('acme/new')];
+    const parts: string[][] = [];
+    discovery.onPartialResult(({ data }) => parts.push(names(data.repositories)));
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(parts).toEqual([['acme/api'], ['acme/api', 'acme/new']]);
+  });
+
+  it('keeps loading when a listener fails', async () => {
+    github.repos = [repo('acme/api')];
+    const discovery = service(recordingLogger());
+    discovery.onPartialResult(() => {
+      throw new Error('listener failed');
+    });
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).resolves.toMatchObject({ repositories: [expect.objectContaining({ nameWithOwner: 'acme/api' })] });
+  });
+});
+
+describe('the first load (concept 7.4): list pages, then pipelined lookups of all repositories', () => {
+  it('lists 100 repositories per page and reads all configurations in batches of 50, at most 4 requests at once', async () => {
+    github.repos = Array.from({ length: 664 }, (_, i) => repo(`acme/r${i}`, i % 3 === 0));
+    github.lookupDelayMs = 30;
+    const logger = recordingLogger();
+    const result = await service(logger).refresh(TOKEN, ACCOUNT_ID);
+    const lists = github.ofQuery(DISCOVERY_QUERY);
+    expect(lists.map((request) => [request.variables.cursor, request.variables.pageSize])).toEqual([
+      [null, 100],
+      ['100', 100],
+      ['200', 100],
+      ['300', 100],
+      ['400', 100],
+      ['500', 100],
+      ['600', 100],
+    ]);
+    // 664 repositories: 7 list pages and 14 batches, 21 requests.
+    expect(github.lookups().map((request) => Object.keys(request.variables).length / 2)).toEqual([...Array(13).fill(50), 14]);
+    expect(github.requests).toHaveLength(21);
+    expect(github.peak).toBe(4);
+    const looked = github.lookups().flatMap((request) =>
+      Array.from({ length: Object.keys(request.variables).length / 2 }, (_, i) => `acme/${String(request.variables[`n${i}`])}`),
+    );
+    expect(new Set(looked).size).toBe(664);
+    expect(result.repositories).toHaveLength(222);
+    expect(result.withoutConfiguration).toHaveLength(442);
+    expect(logger.lines).toContain('Repository list: configurations of 664 repositories read with 14 requests.');
+    expect(logger.lines.some((line) => /^Repository list: loaded in \d+\.\d seconds with 21 requests\.$/.test(line))).toBe(true);
+  });
+
+  it('starts a batch as soon as its repositories are listed, before the last list page', async () => {
+    github.repos = Array.from({ length: 250 }, (_, i) => repo(`acme/r${i}`));
+    github.lookupDelayMs = 30;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    const firstLookup = github.events.indexOf('start Configurations');
+    const lastList = github.events.lastIndexOf('start Discover');
+    expect(firstLookup).toBeGreaterThan(github.events.indexOf('end Discover'));
+    expect(firstLookup).toBeLessThan(lastList);
+    // The list does not wait for the slow lookups: the second page starts while the first batches run.
+    const starts = github.events.map((event, index) => [event, index] as const).filter(([event]) => event === 'start Discover');
+    expect(starts[1][1]).toBeLessThan(github.events.indexOf('end Configurations'));
+  });
+
+  it('pipelines the lookups with the pages of the owners of a scope too', async () => {
+    owners = ['acme', 'beta'];
+    github.repos = [...Array.from({ length: 150 }, (_, i) => repo(`acme/a${i}`)), ...Array.from({ length: 150 }, (_, i) => repo(`beta/b${i}`))];
+    github.lookupDelayMs = 30;
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.ofQuery(OWNER_REPOSITORIES_QUERY)).toHaveLength(4);
+    expect(github.lookups()).toHaveLength(6);
+    expect(github.peak).toBe(4);
+    expect(github.events.indexOf('start Configurations')).toBeLessThan(github.events.lastIndexOf('start OwnerRepositories'));
+    expect(result.repositories).toHaveLength(300);
+  });
+
+  it('fails as a whole when a batch fails, stops the list, and keeps the stored file', async () => {
+    fs.writeFileSync(file, 'previous');
+    github.repos = Array.from({ length: 450 }, (_, i) => repo(`acme/r${i}`));
+    const transport: HttpTransport = {
+      request: async (request) => {
+        const parsed = JSON.parse(request.body ?? '{}') as GraphQLRequest;
+        if (parsed.query.startsWith('query Configurations(')) {
+          return { status: 200, headers: {}, body: JSON.stringify({ data: null, errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded' }] }) };
+        }
+        return github.request(request);
+      },
+    };
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock);
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/API rate limit exceeded/);
+    expect(github.ofQuery(DISCOVERY_QUERY).length).toBeLessThan(5);
+    expect(fs.readFileSync(file, 'utf8')).toBe('previous');
+  });
+
+  it('turns a SAML error of a batch into the hint of the owner of the repository', async () => {
+    github.repos = [repo('secure-org/api'), repo('acme/web')];
+    github.lookupErrors.add('secure-org/api');
+    const transport: HttpTransport = {
+      request: async (request) => {
+        const response = await github.request(request);
+        return { ...response, body: response.body.replace('"type":"SERVICE_UNAVAILABLE","message":"Something failed"', `"type":"FORBIDDEN","message":"Resource protected by organization SAML enforcement."`) };
+      },
+    };
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock);
+    const result = await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(result.hints).toEqual([{ organization: 'secure-org', kind: 'saml', url: 'https://github.com/orgs/secure-org/sso' }]);
+    expect(names(result.repositories)).toEqual(['acme/web']);
+  });
+
+  it('reports the repositories with a configuration as their batches finish', async () => {
+    github.repos = Array.from({ length: 120 }, (_, i) => repo(`acme/r${i}`, i < 70));
+    const discovery = service();
+    const counts: number[] = [];
+    discovery.onPartialResult(({ data }) => counts.push(data.repositories.length));
+    await discovery.refresh(TOKEN, ACCOUNT_ID);
+    expect(counts[0]).toBe(0);
+    expect([...counts].sort((a, b) => a - b)).toEqual(counts);
+    expect(counts.at(-1)).toBe(70);
+    // One report per list page (2) and per batch (3).
+    expect(counts).toHaveLength(5);
+  });
+});
