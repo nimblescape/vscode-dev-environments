@@ -350,6 +350,10 @@ export class Controller implements vscode.Disposable {
     if (!environment) return;
     this.current = { environment, containerName, lost: false };
     this.updateStatusBar();
+    // Concept 7.5: an account change while the window checked its environment (for example during the claim) found no
+    // environment of this window yet. Check the account again now that the window has one; the window leaves (and the
+    // token file is removed) when the environment is not the account's.
+    if (!(await this.stillAvailable(environment))) return;
     const repository = this.displayName({ repository: environment.repository });
     if (pipelineJustRan(pending, environment.id, this.clock.now())) {
       this.logger.info(`The open pipeline of ${repository} has just run for this window.`);
@@ -387,6 +391,9 @@ export class Controller implements vscode.Disposable {
           });
           return;
         }
+        // The pipeline refuses an environment that the account signed in now may not use (otherAccount): the window leaves
+        // it and its token file, instead of keeping the connection.
+        if (this.current?.environment.id === environment.id && !(await this.stillAvailable(environment))) return;
         // The window shows its own connection error; the status bar offers Reconnect.
         if (this.current) {
           this.current.lost = true;
@@ -1370,7 +1377,17 @@ export class Controller implements vscode.Disposable {
     this.current = { environment, containerName, lost: false };
     await this.deps.coordinator.setEnvironment(environment.id);
     this.updateStatusBar();
+    if (!(await this.stillAvailable(environment))) return;
     this.background(this.readWindowBranch(), 'read the branch of the environment');
+  }
+
+  /**
+   * Checks the account again right after the window took `environment` (the check of `ownWindowEnvironment` ran before
+   * awaits, during which the account can change without the window noticing). False when the window left it.
+   */
+  private async stillAvailable(environment: Environment): Promise<boolean> {
+    await this.onSessionChanged();
+    return this.current?.environment.id === environment.id;
   }
 
   /**

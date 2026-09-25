@@ -1847,6 +1847,64 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.statusBar.showNotConnected).toHaveBeenCalled();
   });
 
+  it('role A: a restored window leaves, and takes the token out, when another account signs in during its claim', async () => {
+    const env = environment({ owner: undefined });
+    await h.registry.add(env);
+    // The unambiguous claim assigns the entry to ACCOUNT; meanwhile OTHER_ACCOUNT signs in (the session event finds no
+    // environment of the window yet).
+    h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        entry.owner = account;
+      });
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      await h.controller.onSessionChanged();
+      return options.environmentIds;
+    });
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
+    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
+    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+  });
+
+  it('role A: a restored window leaves when its open pipeline refuses the environment after an account change', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    // The account changes while the pipeline runs; the session event is not handled yet when the pipeline fails.
+    h.service.openEnvironment.mockImplementationOnce(async () => {
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      throw new UserFacingError('otherAccount', Messages.otherAccount('acme/api'));
+    });
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
+    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+  });
+
+  it('role A: a window adopted after a restore of the registry leaves when the account changed during its checks', async () => {
+    const env = environment();
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    // registry.json is missing; the restore adds the entry of this window.
+    fs.rmSync(h.paths.registry, { force: true });
+    h.service.reconcileFromVolumes.mockImplementation(async () => {
+      await h.registry.add(env);
+      return 1;
+    });
+    // OTHER_ACCOUNT signs in while the window checks the version of the container.
+    h.docker.findContainer.mockImplementation(async () => {
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      await h.controller.onSessionChanged();
+      return containerInfo(String(CONTAINER_VERSION));
+    });
+    await h.controller.reconcileIfRegistryLost();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
+    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
+    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+  });
+
   it('role A: without a sign-in, the window closes its connection', async () => {
     const env = environment();
     await h.registry.add(env);
