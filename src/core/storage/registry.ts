@@ -9,7 +9,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isoTime, silentLogger, sleep, systemClock, type Clock, type Logger } from '../ports';
-import type { BuildRecord, BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RefusedUpdate, RegistryFile } from '../types';
+import type {
+  BuildRecord,
+  BusyMark,
+  BusyOperation,
+  Environment,
+  GitHubAccount,
+  GitSummary,
+  KeptVolume,
+  RefusedUpdate,
+  RegistryFile,
+} from '../types';
 import { writeJsonAtomic } from './atomicJson';
 import { errorCode, isStorageId, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
 
@@ -184,10 +194,31 @@ export class EnvironmentRegistry {
   }
 
   /** Removes an environment. A missing ID is not an error. */
-  async remove(id: string): Promise<void> {
+  /**
+   * Removes the entry `id`. `volumes.kept`: additional volumes of the entry that its Delete kept; they are recorded with
+   * the owner of the entry, besides the records of other owners of the same name (each keeps its data there).
+   * `volumes.removed`: volumes that no longer exist; all their records are dropped. One change of the file, so no
+   * volume is ever without its record.
+   */
+  async remove(id: string, volumes: { kept?: readonly string[]; removed?: readonly string[] } = {}): Promise<void> {
     await this.update((file) => {
+      const entry = file.environments.find((environment) => environment.id === id);
       file.environments = file.environments.filter((environment) => environment.id !== id);
+      const removed = new Set(volumes.removed ?? []);
+      const records = (file.keptVolumes ?? []).filter((record) => !removed.has(record.name));
+      const keptAt = isoTime(this.clock);
+      for (const name of entry ? new Set(volumes.kept ?? []) : []) {
+        if (removed.has(name) || records.some((record) => record.name === name && record.owner?.id === entry?.owner?.id)) continue;
+        records.push({ name, ...(entry?.owner ? { owner: entry.owner } : {}), keptAt });
+      }
+      if (records.length > 0) file.keptVolumes = records;
+      else delete file.keptVolumes;
     });
+  }
+
+  /** The additional volumes that Deletes kept (see `remove`). */
+  async keptVolumes(): Promise<KeptVolume[]> {
+    return (await this.read()).keptVolumes ?? [];
   }
 
   /**
@@ -376,6 +407,12 @@ function parseRegistry(text: string | undefined): ParsedRegistry {
     ids.add(environment.id);
     environments.push(environment);
   }
+  // Invalid records of kept volumes are left out: the list only makes the policy stricter.
+  if (value.keptVolumes !== undefined) {
+    const kept = Array.isArray(value.keptVolumes) ? value.keptVolumes.filter(isKeptVolume) : [];
+    if (kept.length > 0) value.keptVolumes = kept;
+    else delete value.keptVolumes;
+  }
   // The parsed object is kept, so fields that this version does not know survive a read-modify-write.
   value.version = REGISTRY_VERSION;
   value.environments = environments;
@@ -456,6 +493,10 @@ function isRefusedUpdate(value: unknown): value is RefusedUpdate {
 }
 
 /** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */
+function isKeptVolume(value: unknown): value is KeptVolume {
+  return isRecord(value) && isNonEmptyString(value.name) && isString(value.keptAt) && (value.owner === undefined || isOwner(value.owner));
+}
+
 function isOwner(value: unknown): value is GitHubAccount {
   return isRecord(value) && isStorageId(value.id) && isString(value.login);
 }

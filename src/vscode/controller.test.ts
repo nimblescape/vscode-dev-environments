@@ -37,6 +37,7 @@ const WINDOW_ID = 'window-1';
 const OTHER_WINDOW_ID = 'window-2';
 const OTHER_PID = 4242;
 const ENV_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+const OTHER_ENV_ID = '7c1d2e3f-0000-4000-8000-000000000002';
 const CONTAINER = 'devenv-acme-api-3f2a9c1e';
 /** The signed-in account; the environments of the tests belong to it unless a test names another owner. */
 const ACCOUNT: GitHubAccount = { id: '1001', login: 'octo' };
@@ -2175,7 +2176,12 @@ describe('Accounts (concept 7.5)', () => {
 
   it('Try again after the account changed during the claim runs the same command again for the account signed in now', async () => {
     await h.registry.add(environment({ owner: undefined }));
-    h.auth.getSession.mockResolvedValueOnce({ token: 'gho_other', account: OTHER_ACCOUNT });
+    // The first run read ACCOUNT; OTHER_ACCOUNT signed in at the sign-in of the claim and stays signed in.
+    h.auth.getSession.mockImplementationOnce(async () => {
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      h.auth.getToken.mockResolvedValue('gho_other');
+      return { token: 'gho_other', account: OTHER_ACCOUNT };
+    });
     h.claims.claim.mockImplementation(async (account: GitHubAccount, _token: string, options: { environmentIds: string[] }) => {
       await h.registry.updateEnvironment(ENV_ID, (entry) => {
         entry.owner = account;
@@ -2186,9 +2192,58 @@ describe('Accounts (concept 7.5)', () => {
     await run('start', row('acme/api', environment({ owner: undefined })));
     // The second run reads the account and the session again: now they match, so the claim runs, for the same row.
     await settle(() => h.claims.claim.mock.calls.length === 1, 'the command again');
-    expect(h.claims.claim).toHaveBeenCalledWith(ACCOUNT, 'gho_token', expect.objectContaining({ environmentIds: [ENV_ID] }));
+    expect(h.claims.claim).toHaveBeenCalledWith(OTHER_ACCOUNT, 'gho_other', expect.objectContaining({ environmentIds: [ENV_ID] }));
+    expect(h.claims.claim).toHaveBeenCalledTimes(1);
+    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
     await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
     expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
+  });
+
+  describe('a repository command while GitHub rejects the token, when another account signs in at the new sign-in', () => {
+    // The rejected session still names ACCOUNT (auth.ts: getAccount asks for no new sign-in); the session with a working
+    // token, which the new sign-in gives, belongs to OTHER_ACCOUNT.
+    beforeEach(async () => {
+      await h.registry.add(environment());
+      h.auth.getSession.mockImplementation(async (options?: { interactive: boolean }) => {
+        if (!options?.interactive) return { token: 'gho_rejected', account: ACCOUNT };
+        h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+        h.auth.getToken.mockResolvedValue('gho_other');
+        return { token: 'gho_other', account: OTHER_ACCOUNT };
+      });
+      // The pipeline creates the environment of the account of its session.
+      h.service.open.mockResolvedValue(openResult(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT })));
+    });
+
+    it('Start of the repository uses the environment of the new account, not the one of the account before', async () => {
+      await run('start', row('acme/api'));
+      expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+      expect(h.service.openEnvironment).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+    });
+
+    it('Search does the same', async () => {
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
+      await run('search');
+      expect(h.service.openEnvironment).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+    });
+
+    it('Switch branch… of the repository creates the environment of the new account on the branch', async () => {
+      const command = run('switchBranch', row('acme/api'));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+      expect(h.service.switchBranch).not.toHaveBeenCalled();
+      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ branch: 'feature-x' }));
+      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+    });
+
+    it('Stop of the repository asks for no new sign-in (it needs no token)', async () => {
+      await run('stop', row('acme/api'));
+      expect(h.auth.getSession).not.toHaveBeenCalledWith({ interactive: true });
+    });
   });
 
   it('offers no Try again of the command for errors other than an unassigned environment', async () => {

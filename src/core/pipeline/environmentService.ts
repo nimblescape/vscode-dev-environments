@@ -170,7 +170,7 @@ export type EnvironmentHelper = Pick<
 /** The part of EnvironmentRegistry that the service uses. */
 export type EnvironmentStore = Pick<
   EnvironmentRegistry,
-  'get' | 'list' | 'findForAccount' | 'findUnowned' | 'add' | 'update' | 'updateEnvironment' | 'remove'
+  'get' | 'list' | 'read' | 'findForAccount' | 'findUnowned' | 'add' | 'update' | 'updateEnvironment' | 'remove'
 >;
 
 /** The part of SessionFiles that the service uses. */
@@ -1646,20 +1646,25 @@ export class EnvironmentService {
    * Concept section 9 "Host access": what the policy checks for `env`, with what it needs to know about the named volumes
    * that the configuration mounts: the volumes of the environments of other accounts (their additional volumes), and of
    * the entries of an older version without owner, which may hold the work of another person until an account takes them
-   * over, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
+   * over, and the volumes that the Delete of an environment of another account (or of such an entry) kept while they
+   * exist, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
    */
   private async hostAccessInput(env: Environment, input: Omit<HostAccessInput, 'ownVolume'>): Promise<HostAccessInput> {
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
-    const others = (await this.deps.registry.list()).filter(
-      (other) => other.id !== env.id && (other.owner === undefined || other.owner.id !== env.owner?.id),
-    );
-    // A volume that the environment recorded itself stays its own: older entries of one person shared volumes before
-    // the environments were separated by account.
-    const own = new Set(env.additionalVolumes ?? []);
-    const foreignVolumes = others.flatMap((other) => other.additionalVolumes ?? []).filter((name) => !own.has(name));
+    const file = await this.deps.registry.read();
+    const otherOwner = (owner: GitHubAccount | undefined) => owner === undefined || owner.id !== env.owner?.id;
+    const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));
     const names = mountedVolumeNames(checked);
     const volumeLabels: Record<string, Record<string, string>> = {};
     if (names.length > 0) for (const volume of await this.deps.docker.inspectVolumes(names)) volumeLabels[volume.name] = volume.labels;
+    // A kept volume that was removed since is no longer anybody's: a new one of that name is empty.
+    const kept = (file.keptVolumes ?? []).filter((record) => otherOwner(record.owner) && record.name in volumeLabels);
+    // A volume that the environment recorded itself stays its own: older entries of one person shared volumes before
+    // the environments were separated by account.
+    const own = new Set(env.additionalVolumes ?? []);
+    const foreignVolumes = [...others.flatMap((other) => other.additionalVolumes ?? []), ...kept.map((record) => record.name)].filter(
+      (name) => !own.has(name),
+    );
     return { ...checked, foreignVolumes, volumeLabels };
   }
 
@@ -2061,9 +2066,12 @@ export class EnvironmentService {
       await this.removeEnvironmentImages(env, undefined, env.buildRecord);
       // Step 4: the workspace volume; additional volumes only when the user confirmed it.
       await this.removeVolumeWithRetry(env.volumeName);
-      if (options.additionalVolumesToRemove.length > 0) await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove);
-      // Step 5: the registry entry and the files that reference the environment.
-      await this.deps.registry.remove(env.id);
+      const removedVolumes =
+        options.additionalVolumesToRemove.length > 0 ? await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove) : [];
+      // Step 5: the registry entry and the files that reference the environment. The additional volumes that stay keep
+      // their owner in the registry: the environments of other accounts must not mount them (concept section 9).
+      const keptVolumes = (env.additionalVolumes ?? []).filter((name) => !removedVolumes.includes(name));
+      await this.deps.registry.remove(env.id, { kept: keptVolumes, removed: removedVolumes });
       removed = true;
       await this.removeEnvironmentFiles(env.id);
       this.logger.info(`The environment of ${env.repository} was deleted.`);
@@ -2470,13 +2478,18 @@ export class EnvironmentService {
    * labels show that another program created it (volumeLabelOwner), for example a volume of Docker Compose that took a
    * name that the environment used before.
    */
-  private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<void> {
+  /** Removes the confirmed additional volumes that nobody else uses. Returns the names of the removed volumes. */
+  private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<string[]> {
     const volumes = (env.additionalVolumes ?? []).filter((name) => confirmed.includes(name));
-    if (volumes.length === 0) return;
-    const others = (await this.deps.registry.list()).filter((other) => other.id !== env.id);
+    if (volumes.length === 0) return [];
+    const file = await this.deps.registry.read();
+    const others = file.environments.filter((other) => other.id !== env.id);
+    // A volume that the Delete of an environment of another account kept holds that account's data.
+    const keptByOthers = (file.keptVolumes ?? []).filter((record) => record.owner?.id !== env.owner?.id).map((record) => record.name);
     const labels = new Map((await this.deps.docker.inspectVolumes(volumes)).map((volume) => [volume.name, volume.labels]));
+    const removed: string[] = [];
     for (const name of volumes) {
-      if (others.some((other) => other.volumeName === name || (other.additionalVolumes ?? []).includes(name))) {
+      if (others.some((other) => other.volumeName === name || (other.additionalVolumes ?? []).includes(name)) || keptByOthers.includes(name)) {
         this.logger.info(`The volume ${name} is kept, because another environment uses it too.`);
         continue;
       }
@@ -2485,8 +2498,14 @@ export class EnvironmentService {
         this.logger.info(`The volume ${name} is kept, because ${owner} created it.`);
         continue;
       }
-      await this.quietly(`remove the volume ${name}`, () => this.deps.docker.removeVolume(name));
+      try {
+        await this.deps.docker.removeVolume(name);
+        removed.push(name);
+      } catch (error) {
+        this.logger.warn(`Could not remove the volume ${name}: ${errorMessage(error)}`);
+      }
     }
+    return removed;
   }
 
   private async removeVolumeWithRetry(name: string): Promise<void> {

@@ -705,7 +705,7 @@ export class Controller implements vscode.Disposable {
       if (target) await this.startTarget(target);
       return;
     }
-    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner, true));
+    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner, 'token'));
   }
 
   /** Refresh: the repository list (sign-in first when needed), a lost registry, and the states. */
@@ -727,7 +727,7 @@ export class Controller implements vscode.Disposable {
     }
     const info = await pickRepository(repositories, ControllerTexts.selectRepositoryToStart);
     if (!info) return;
-    await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner, true));
+    await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner, 'token'));
   }
 
   /** Sign in with GitHub (concept 6.1 step 1). */
@@ -1722,6 +1722,19 @@ export class Controller implements vscode.Disposable {
     return (await this.deps.registry.get(environment.id)) ?? environment;
   }
 
+  /**
+   * The account of a session with a working token: while GitHub rejects the token of the session, the user signs in
+   * again first (auth.ts). `undefined` without a sign-in, or when the session cannot be read.
+   */
+  private async readWorkingAccount(): Promise<GitHubAccount | undefined> {
+    try {
+      return (await this.deps.auth.getSession({ interactive: true }))?.account;
+    } catch (error) {
+      this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
   /** The signed-in account; `undefined` without a sign-in, or when the session cannot be read. */
   private async readAccount(interactive = false): Promise<GitHubAccount | undefined> {
     try {
@@ -1734,8 +1747,9 @@ export class Controller implements vscode.Disposable {
 
   private async resolveTargetOfAnyAccount(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const { registry, sidebar } = this.deps;
-    // Show on GitHub needs neither an environment nor a sign-in.
-    const signIn = pick !== 'gitHub';
+    // Show on GitHub needs neither an environment nor a sign-in; Start, Switch branch…, and Select configuration… need a
+    // working token.
+    const signIn = pick === 'gitHub' ? false : pick === 'open' || pick === 'repository' ? 'token' : true;
     switch (argument.kind) {
       case 'row': {
         const info = sidebar.repositoryInfo(argument.repository) ?? argument.info;
@@ -1782,11 +1796,14 @@ export class Controller implements vscode.Disposable {
    * The target of a repository, with the environment of the repository of the signed-in account, if it has one (concept
    * 7.5, D-3). The environments of other accounts are not looked at: they neither block nor name anything, and the first
    * Start of an account creates its own. The account decides the environment, so with `signIn` a sign-in is asked for
-   * when nobody is signed in; without it, the target has no environment then.
+   * when nobody is signed in; without it, the target has no environment then. With `'token'` (a command that needs a
+   * working token: Start, Switch branch…, Select configuration…) the account comes from a session with a working token,
+   * so that the new sign-in while GitHub rejects the token happens before the environment is chosen: an account change
+   * at that sign-in then chooses the environment of the new account.
    */
-  private async repositoryTargetFor(repository: string, signIn: boolean): Promise<Target> {
+  private async repositoryTargetFor(repository: string, signIn: boolean | 'token'): Promise<Target> {
     const info = this.deps.sidebar.repositoryInfo(repository);
-    const account = await this.readAccount(signIn);
+    const account = signIn === 'token' ? await this.readWorkingAccount() : await this.readAccount(signIn);
     if (signIn && !account) throw new UserFacingError('signInRequired', Messages.signInRequired);
     const environment = account ? await this.deps.registry.findForAccount(repository, account.id) : undefined;
     return { repository, info, environment };

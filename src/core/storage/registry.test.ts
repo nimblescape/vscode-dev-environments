@@ -647,6 +647,50 @@ describe('EnvironmentRegistry changes', () => {
   });
 });
 
+describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.14 step 4)', () => {
+  it('records the kept volumes with the owner of the removed entry, in the same change as the removal', async () => {
+    const registry = new EnvironmentRegistry(paths, fixedClock());
+    await registry.add(environment(ID_A, 'o/a', { owner: OCTO, additionalVolumes: ['a-data', 'a-cache'] }));
+    await registry.remove(ID_A, { kept: ['a-data', 'a-data'], removed: ['a-cache'] });
+    expect(readRaw()).toEqual({ version: 1, environments: [], keptVolumes: [{ name: 'a-data', owner: OCTO, keptAt: new Date(T0).toISOString() }] });
+    await expect(registry.keptVolumes()).resolves.toEqual([{ name: 'a-data', owner: OCTO, keptAt: new Date(T0).toISOString() }]);
+  });
+
+  it('records a volume of an entry without owner without owner, and nothing for a missing entry', async () => {
+    const registry = new EnvironmentRegistry(paths, fixedClock());
+    await registry.add(environment(ID_A, 'o/a', { additionalVolumes: ['a-data'] }));
+    await registry.remove(ID_A, { kept: ['a-data'] });
+    await registry.remove('missing', { kept: ['b-data'] });
+    await expect(registry.keptVolumes()).resolves.toEqual([{ name: 'a-data', keptAt: new Date(T0).toISOString() }]);
+  });
+
+  it('keeps one record per volume and owner, and drops all records of a removed volume', async () => {
+    const registry = new EnvironmentRegistry(paths, fixedClock());
+    await registry.add(environment(ID_A, 'o/a', { owner: OCTO }));
+    await registry.add(environment(ID_B, 'o/a', { owner: STAUSSH }));
+    await registry.add(environment(ID_C, 'o/c', { owner: OCTO }));
+    await registry.remove(ID_A, { kept: ['shared'] });
+    await registry.remove(ID_B, { kept: ['shared'] });
+    await registry.add(environment(ID_D, 'o/a', { owner: OCTO }));
+    await registry.remove(ID_D, { kept: ['shared'] });
+    expect((await registry.keptVolumes()).map((record) => [record.name, record.owner?.login])).toEqual([
+      ['shared', 'octo'],
+      ['shared', 'staussh'],
+    ]);
+    await registry.remove(ID_C, { removed: ['shared'] });
+    await expect(registry.keptVolumes()).resolves.toEqual([]);
+    expect(readRaw()).toEqual({ version: 1, environments: [] });
+  });
+
+  it('reads files without the list, and leaves out invalid records', async () => {
+    writeRaw({ version: 1, environments: [], keptVolumes: 'no' });
+    await expect(new EnvironmentRegistry(paths).keptVolumes()).resolves.toEqual([]);
+    const valid = { name: 'ok', owner: OCTO, keptAt: '2026-09-24T15:40:00.000Z' };
+    writeRaw({ version: 1, environments: [], keptVolumes: [valid, { name: '', keptAt: 'x' }, { name: 'x' }, { name: 'y', keptAt: 'x', owner: { id: 1 } }] });
+    await expect(new EnvironmentRegistry(paths).keptVolumes()).resolves.toEqual([valid]);
+  });
+});
+
 describe('EnvironmentRegistry across processes', () => {
   it('applies every change of several processes', async () => {
     const script = path.join(root, 'worker.js');

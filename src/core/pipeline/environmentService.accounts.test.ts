@@ -246,6 +246,83 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
   });
 });
 
+describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)', () => {
+  const DATA = 'api-data';
+  const MOUNT = `source=${DATA},target=/data,type=volume`;
+
+  /** The environment of OTHER_ACCOUNT used `DATA`; its Delete keeps it. */
+  async function otherAccountDeletesAndKeeps(): Promise<void> {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { additionalVolumes: [DATA] } });
+    h.docker.volumes.set(DATA, {});
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    signIn(ACCOUNT, TOKEN);
+  }
+
+  it('keeps the volume for its account: the environment of another account of the repository must not mount it', async () => {
+    await otherAccountDeletesAndKeeps();
+    expect(await h.registry.list()).toEqual([]);
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+    expect(await h.registry.keptVolumes()).toEqual([{ name: DATA, owner: OTHER_ACCOUNT, keptAt: expect.any(String) }]);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`volume ${DATA} of another environment`));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+  });
+
+  it('lets a new environment of the same account use the volume again', async () => {
+    await otherAccountDeletesAndKeeps();
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
+    expect(result.environment.additionalVolumes).toContain(DATA);
+  });
+
+  it('records the volumes that the Delete after missing files keeps without asking', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, volume: false, container: null, extra: { additionalVolumes: [DATA] } });
+    h.docker.volumes.set(DATA, {});
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    h.ui.filesMissingAnswer = 'deleteEnvironment';
+    expect((await rejection(h.service.open(TARGET, options()))).code).toBe('cancelled');
+    expect(await h.registry.list()).toEqual([]);
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner])).toEqual([[DATA, OTHER_ACCOUNT]]);
+    signIn(ACCOUNT, TOKEN);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+  });
+
+  it('no longer refuses the name once the kept volume is gone: a new volume of that name is empty', async () => {
+    await otherAccountDeletesAndKeeps();
+    h.docker.volumes.delete(DATA);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.owner).toEqual(ACCOUNT);
+  });
+
+  it('forgets the record when a later Delete removes the volume, and never removes a volume that another account kept', async () => {
+    await otherAccountDeletesAndKeeps();
+    // An entry of one person from before the separation by account recorded the same volume.
+    await seedEnvironment(h, { id: OTHER_ID, container: null, extra: { additionalVolumes: [DATA, 'web-cache'] } });
+    h.docker.volumes.set('web-cache', {});
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [DATA, 'web-cache'] });
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+    expect(h.docker.volumes.has('web-cache')).toBe(false);
+    // The volume that stays keeps the record of the account that kept it, and gets one of this account too; the environments
+    // of both accounts are refused it now (each may hold data of the other).
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([
+      [DATA, OTHER_ACCOUNT.id],
+      [DATA, ACCOUNT.id],
+    ]);
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+  });
+});
+
 describe('entries of an older version at Start (concept 7.5, D-3)', () => {
   it('claims the entry of the repository for the account after the question, and uses it', async () => {
     const { confirm } = withClaims(() => true);
