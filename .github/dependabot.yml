@@ -18,6 +18,11 @@ updates:
         update-types: ['version-update:semver-major', 'version-update:semver-minor']
       - dependency-name: '@types/node'
         update-types: ['version-update:semver-major']
+      # vitest 5 and @vscode/vsce 4 need Node.js 22; CI runs Node.js 20, the runtime of VS Code 1.90.
+      - dependency-name: 'vitest'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@vscode/vsce'
+        update-types: ['version-update:semver-major']
   - package-ecosystem: github-actions
     directory: /
     schedule:
