@@ -185,8 +185,11 @@ export interface PendingOperation {
   reason: 'manual' | 'update' | 'configChanged' | 'configurationSelected';
   /** New configuration path, for `configurationSelected`. */
   configPath?: string;
-  /** For `delete`: also remove the additional named volumes of the configuration. */
-  removeAdditionalVolumes?: boolean;
+  /**
+   * For `delete`: the additional named volumes that the user confirmed for removal, as the question listed them. A volume
+   * that the environment recorded after the question is kept.
+   */
+  additionalVolumesToRemove?: string[];
 }
 
 /** Content of reopen.json (concept 7.10). */

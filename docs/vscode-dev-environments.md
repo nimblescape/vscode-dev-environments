@@ -787,7 +787,7 @@ After a rebuild:
 1. Safety check in the workspace volume, through the workspace helper: uncommitted changes (`git status`), unpushed commits, and stashes. If one of them exists, a dialog shows the numbers and offers: Open environment, Delete anyway, Cancel.
 2. If a window is connected to the environment, the extension closes the remote connection first.
 3. The extension removes the container and the environment image. It also removes base images that no other environment image uses.
-4. It removes the workspace volume. Additional named volumes of the configuration (for example for a database) are removed only if the user confirms it.
+4. It removes the workspace volume. The additional named volumes that the environment used (of its configurations, its Features, and its base image, for example for a database) are removed only if the user confirms it, and only those that the question listed. A volume that another environment uses too, or whose labels show that another program created it (for example Docker Compose), is kept.
 5. It removes the registry entry.
 
 ### 7.15 Environment states

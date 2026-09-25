@@ -194,7 +194,7 @@ interface Harness {
     openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
     stop: ReturnType<typeof vi.fn<(id: string) => Promise<void>>>;
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
-    delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { removeAdditionalVolumes: boolean }) => Promise<void>>>;
+    delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     switchBranch: ReturnType<typeof vi.fn<(id: string, branch: string, options: OperationOptions) => Promise<void>>>;
     configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean>>>;
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
@@ -817,7 +817,7 @@ describe('Delete', () => {
       Actions.deleteAnyway,
     ]);
     expect(calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ removeAdditionalVolumes: false }));
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
   it('opens the environment instead when the user selects Open environment', async () => {
@@ -848,7 +848,7 @@ describe('Delete', () => {
     expect(h.service.delete).not.toHaveBeenCalled();
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     expect(await h.disconnectRequests.read(ENV_ID)).toEqual(
-      expect.objectContaining({ operation: 'delete', reason: 'manual', removeAdditionalVolumes: true, requestedBy: WINDOW_ID }),
+      expect.objectContaining({ operation: 'delete', reason: 'manual', additionalVolumesToRemove: ['api-db'], requestedBy: WINDOW_ID }),
     );
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowContinues('acme/api'));
   });
@@ -867,7 +867,7 @@ describe('Delete', () => {
       delete entry.busy;
     });
     await command;
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ removeAdditionalVolumes: false }));
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
   it('does not wait and deletes nothing when the user cancels the wait', async () => {
@@ -905,7 +905,7 @@ describe('Delete', () => {
     await run('delete', row('acme/api', env));
     expect(h.service.delete).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readOperations()).toEqual([
-      expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', removeAdditionalVolumes: true }),
+      expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', additionalVolumesToRemove: ['api-db'] }),
     ]);
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(
       expect.objectContaining({ operation: 'delete', windowId: WINDOW_ID, pid: process.pid }),
@@ -1354,7 +1354,7 @@ describe('Window roles', () => {
       requestedAt: iso(NOW - 5000),
       requestedBy: 'old-window',
       reason: 'manual',
-      removeAdditionalVolumes: true,
+      additionalVolumesToRemove: ['api-db'],
     });
     await h.sessionFiles.writeOperation({
       environmentId: 'b1c2d3e4-0000-4000-8000-000000000002',
@@ -1364,7 +1364,7 @@ describe('Window roles', () => {
       reason: 'manual',
     });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ removeAdditionalVolumes: true }));
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
     expect(h.service.stop).toHaveBeenCalledWith('b1c2d3e4-0000-4000-8000-000000000002');
     expect(fs.readdirSync(h.paths.operationsDir)).toEqual([]);
     expect(h.connection.open).not.toHaveBeenCalled();
@@ -1439,12 +1439,12 @@ describe('Connection of this window', () => {
       requestedAt: iso(NOW - 2000),
       requestedBy: OTHER_WINDOW_ID,
       reason: 'manual',
-      removeAdditionalVolumes: true,
+      additionalVolumesToRemove: ['api-db'],
     });
     h.controller.onHeartbeat();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(await h.sessionFiles.readOperations()).toEqual([
-      expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', requestedBy: WINDOW_ID, removeAdditionalVolumes: true }),
+      expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', requestedBy: WINDOW_ID, additionalVolumesToRemove: ['api-db'] }),
     ]);
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(expect.objectContaining({ operation: 'delete', windowId: WINDOW_ID }));
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();

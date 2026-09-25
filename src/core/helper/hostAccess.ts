@@ -554,7 +554,7 @@ function isDevContainersVolume(name: string): boolean {
  * (an anonymous volume of another container), or Dev Environments (the workspace volume of another environment).
  * `undefined` for a volume without such labels.
  */
-function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
+export function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
   const keys = Object.keys(labels);
   if (keys.some((key) => key.startsWith('com.docker.compose.'))) {
     const project = labels['com.docker.compose.project'];

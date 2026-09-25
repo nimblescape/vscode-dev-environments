@@ -102,7 +102,7 @@ export const Messages = {
   deleteUnsaved: (repository: string, changes: string) =>
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   deleteAdditionalVolumes: (volumes: string) =>
-    `The configuration also uses these volumes: ${volumes}. Remove them too?`,
+    `The environment also used these volumes: ${volumes}. Remove them too?`,
   helperFailed: 'The workspace helper could not be prepared.',
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,

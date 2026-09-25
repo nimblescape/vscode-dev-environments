@@ -14,7 +14,7 @@ import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '.
 import { checkConfiguration } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
-import { hostAccessReport, mountedVolumeNames, removedRunArgs, type HostAccessInput, type HostAccessReport } from '../helper/hostAccess';
+import { hostAccessReport, mountedVolumeNames, removedRunArgs, volumeLabelOwner, type HostAccessInput, type HostAccessReport } from '../helper/hostAccess';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { WorkspaceHelper } from '../helper/workspaceHelper';
 import {
@@ -880,7 +880,7 @@ export class EnvironmentService {
     const choice = await this.deps.ui.filesMissing(env.repository);
     this.throwIfCancelled(ctx.signal);
     if (choice === 'deleteEnvironment') {
-      await this.deleteLocked(env, { progress, signal: ctx.signal, removeAdditionalVolumes: false });
+      await this.deleteLocked(env, { progress, signal: ctx.signal, additionalVolumesToRemove: [] });
       throw cancelledError();
     }
     if (choice !== 'cloneAgain') throw cancelledError();
@@ -1975,7 +1975,7 @@ export class EnvironmentService {
   }
 
   /** Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. */
-  async delete(environmentId: string, options: OperationOptions & { removeAdditionalVolumes: boolean }): Promise<void> {
+  async delete(environmentId: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }): Promise<void> {
     const environment = await this.deps.registry.get(environmentId);
     if (!environment) {
       await this.removeEnvironmentFiles(environmentId);
@@ -1998,7 +1998,7 @@ export class EnvironmentService {
 
   private async deleteLocked(
     environment: Environment,
-    options: OperationOptions & { removeAdditionalVolumes: boolean },
+    options: OperationOptions & { additionalVolumesToRemove: readonly string[] },
   ): Promise<void> {
     const { docker } = this.deps;
     const steps = new StepReporter(options.progress, this.logger);
@@ -2016,7 +2016,7 @@ export class EnvironmentService {
       await this.removeEnvironmentImages(env, undefined, env.buildRecord);
       // Step 4: the workspace volume; additional volumes only when the user confirmed it.
       await this.removeVolumeWithRetry(env.volumeName);
-      if (options.removeAdditionalVolumes) await this.removeAdditionalVolumes(env);
+      if (options.additionalVolumesToRemove.length > 0) await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove);
       // Step 5: the registry entry and the files that reference the environment.
       await this.deps.registry.remove(env.id);
       removed = true;
@@ -2406,13 +2406,25 @@ export class EnvironmentService {
     if ((await docker.imageId(reference)) === id) await docker.removeImage(reference);
   }
 
-  private async removeAdditionalVolumes(env: Environment): Promise<void> {
-    const volumes = env.additionalVolumes ?? [];
+  /**
+   * Concept 7.14 Delete step 4: the additional volumes that the user confirmed (`confirmed`, as the question listed them)
+   * and that the environment still records. Kept: a volume that another environment records, and an existing volume whose
+   * labels show that another program created it (volumeLabelOwner), for example a volume of Docker Compose that took a
+   * name that the environment used before.
+   */
+  private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<void> {
+    const volumes = (env.additionalVolumes ?? []).filter((name) => confirmed.includes(name));
     if (volumes.length === 0) return;
     const others = (await this.deps.registry.list()).filter((other) => other.id !== env.id);
+    const labels = new Map((await this.deps.docker.inspectVolumes(volumes)).map((volume) => [volume.name, volume.labels]));
     for (const name of volumes) {
       if (others.some((other) => other.volumeName === name || (other.additionalVolumes ?? []).includes(name))) {
         this.logger.info(`The volume ${name} is kept, because another environment uses it too.`);
+        continue;
+      }
+      const owner = volumeLabelOwner(labels.get(name) ?? {});
+      if (owner !== undefined) {
+        this.logger.info(`The volume ${name} is kept, because ${owner} created it.`);
         continue;
       }
       await this.quietly(`remove the volume ${name}`, () => this.deps.docker.removeVolume(name));

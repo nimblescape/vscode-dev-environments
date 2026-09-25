@@ -923,7 +923,7 @@ describe('open pipeline on a seeded environment', () => {
     const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
 
-    await timings.measure('delete', () => online.delete(environmentId, { progress, removeAdditionalVolumes: false }));
+    await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));
     expect(containersOfEnvironment()).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.lines(['image', 'ls', '-q', imageRepository])).toEqual([]);

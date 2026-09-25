@@ -258,7 +258,8 @@ export function isPendingOperation(value: unknown): value is PendingOperation {
     typeof value.requestedBy === 'string' &&
     isKeyOf(OPERATION_REASONS, value.reason) &&
     (value.configPath === undefined || isNonEmptyString(value.configPath)) &&
-    (value.removeAdditionalVolumes === undefined || typeof value.removeAdditionalVolumes === 'boolean')
+    (value.additionalVolumesToRemove === undefined ||
+      (Array.isArray(value.additionalVolumesToRemove) && value.additionalVolumesToRemove.every(isNonEmptyString)))
   );
 }
 

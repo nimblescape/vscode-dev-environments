@@ -173,7 +173,7 @@ interface LeftEnvironment {
   reason: 'account' | 'outdated';
 }
 
-type HandOffRequest = Pick<PendingOperation, 'operation' | 'reason' | 'configPath' | 'removeAdditionalVolumes'>;
+type HandOffRequest = Pick<PendingOperation, 'operation' | 'reason' | 'configPath' | 'additionalVolumesToRemove'>;
 
 /** What a command without argument asks for: `open` is a repository that the command opens (Start). */
 type PickKind = 'open' | 'repository' | 'environment' | 'gitHub';
@@ -546,7 +546,7 @@ export class Controller implements vscode.Disposable {
         }
         const confirmed = (await this.deps.registry.get(environment.id)) ?? environment;
         const volumes = confirmed.additionalVolumes ?? [];
-        let removeAdditionalVolumes = false;
+        let additionalVolumesToRemove: string[] = [];
         if (volumes.length > 0) {
           const choice = await vscode.window.showWarningMessage(
             Messages.deleteAdditionalVolumes(volumes.join(', ')),
@@ -555,7 +555,7 @@ export class Controller implements vscode.Disposable {
             Actions.keep,
           );
           if (choice === undefined) return;
-          removeAdditionalVolumes = choice === Actions.remove;
+          additionalVolumesToRemove = choice === Actions.remove ? [...volumes] : [];
         }
         // Concept 7.15: Delete is possible in every state; during an operation of another window it runs afterwards.
         if (!(await this.waitForOtherWindowOperation(repository, environment.id))) return;
@@ -564,7 +564,7 @@ export class Controller implements vscode.Disposable {
           this.logger.info(`The environment of ${repository} does not exist anymore. Nothing is deleted.`);
           return;
         }
-        const request: HandOffRequest = { operation: 'delete', reason: 'manual', removeAdditionalVolumes };
+        const request: HandOffRequest = { operation: 'delete', reason: 'manual', additionalVolumesToRemove };
         if (this.isConnectedHere(current)) {
           await this.handOffNow(repository, current, request, 'delete');
           return;
@@ -574,7 +574,7 @@ export class Controller implements vscode.Disposable {
           await this.requestOtherWindowHandOff(repository, current, request);
           return;
         }
-        await this.deleteWithProgress(repository, current, removeAdditionalVolumes);
+        await this.deleteWithProgress(repository, current, additionalVolumesToRemove);
       },
       { retry: () => this.delete({ kind: 'environment', environmentId: environment.id }) },
     );
@@ -900,12 +900,12 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  private deleteWithProgress(repository: string, environment: Environment, removeAdditionalVolumes: boolean): Promise<void> {
+  private deleteWithProgress(repository: string, environment: Environment, additionalVolumesToRemove: readonly string[]): Promise<void> {
     // Not cancellable: a delete that stops half-way helps nobody.
     return runWithProgress({
       title: ControllerTexts.deleting(repository),
       repository,
-      task: (progress, signal) => this.deps.service.delete(environment.id, { progress, signal, removeAdditionalVolumes }),
+      task: (progress, signal) => this.deps.service.delete(environment.id, { progress, signal, additionalVolumesToRemove }),
     });
   }
 
@@ -1017,7 +1017,7 @@ export class Controller implements vscode.Disposable {
         requestedBy: coordinator.windowId,
         reason: request.reason,
         configPath: request.configPath,
-        removeAdditionalVolumes: request.removeAdditionalVolumes,
+        additionalVolumesToRemove: request.additionalVolumesToRemove,
       });
       await connection.closeRemoteConnection();
     } catch (error) {
@@ -1164,7 +1164,7 @@ export class Controller implements vscode.Disposable {
       requestedBy: this.deps.coordinator.windowId,
       reason: request.reason,
       configPath: request.configPath,
-      removeAdditionalVolumes: request.removeAdditionalVolumes,
+      additionalVolumesToRemove: request.additionalVolumesToRemove,
     };
     await this.deps.disconnectRequests.write(sent);
     this.logger.info(
@@ -1231,7 +1231,7 @@ export class Controller implements vscode.Disposable {
         operation: request.operation,
         reason: request.reason,
         configPath: request.configPath,
-        removeAdditionalVolumes: request.removeAdditionalVolumes,
+        additionalVolumesToRemove: request.additionalVolumesToRemove,
       },
       HAND_OFF_BUSY[request.operation],
     );
@@ -1261,7 +1261,7 @@ export class Controller implements vscode.Disposable {
           await this.operation(
             this.displayName(target),
             'Delete',
-            () => this.deleteWithProgress(this.displayName(target), environment, operation.removeAdditionalVolumes === true),
+            () => this.deleteWithProgress(this.displayName(target), environment, operation.additionalVolumesToRemove ?? []),
             { retry: () => this.delete({ kind: 'environment', environmentId: environment.id }) },
           );
           return;

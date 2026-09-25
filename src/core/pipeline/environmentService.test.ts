@@ -1736,7 +1736,7 @@ describe('delete', () => {
     await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'delete', requestedAt: new Date(0).toISOString(), requestedBy: WINDOW_ID, reason: 'manual' });
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: new Date(0).toISOString() });
 
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: true }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-data', 'shared-cache'] }));
 
     expect(h.docker.containersOf(ENV_ID)).toEqual([]);
     expect(h.docker.images.has(IMAGE_1)).toBe(false);
@@ -1753,6 +1753,19 @@ describe('delete', () => {
     expect(h.docker.images.has(environmentImageName(OTHER_ID, 1))).toBe(true);
   });
 
+  it('removes only the confirmed additional volumes, and keeps a volume that another program created under a recorded name', async () => {
+    // `late` was recorded after the question (for example by a rebuild in another window); `db` now belongs to Compose.
+    await seedEnvironment(h, { extra: { additionalVolumes: ['api-data', 'db', 'late'] } });
+    h.docker.volumes.set('api-data', {});
+    h.docker.volumes.set('db', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' });
+    h.docker.volumes.set('late', {});
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-data', 'db', 'gone'] }));
+    expect(h.docker.volumes.has('api-data')).toBe(false);
+    expect(h.docker.volumes.has('db')).toBe(true);
+    expect(h.docker.volumes.has('late')).toBe(true);
+    expect(h.logger.infos).toContain('The volume db is kept, because the Docker Compose project shop created it.');
+  });
+
   it('removes the tag of an unused base image that the removal by digest keeps (classic image store)', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
@@ -1763,7 +1776,7 @@ describe('delete', () => {
     h.docker.imageIds.set(oldBase, 'sha256:base');
     h.docker.imageIds.set(BASE_IMAGE, 'sha256:base');
     h.docker.images.add('mcr.microsoft.com/devcontainers/base:other');
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(h.docker.log.filter((line) => line.startsWith('rmi mcr.'))).toEqual([`rmi ${oldBase}`, `rmi ${BASE_IMAGE}`]);
     expect(h.docker.images.has(BASE_IMAGE)).toBe(false);
     expect(h.docker.images.has('mcr.microsoft.com/devcontainers/base:other')).toBe(true);
@@ -1773,7 +1786,7 @@ describe('delete', () => {
     await seedEnvironment(h, { extra: { additionalVolumes: ['api-data'] } });
     h.docker.volumes.set('api-data', {});
     h.sessionFiles.writeReopenSync({ environmentId: OTHER_ID, closedAt: new Date(0).toISOString() });
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(h.docker.volumes.has('api-data')).toBe(true);
     expect((await h.sessionFiles.readReopen())?.environmentId).toBe(OTHER_ID);
   });
@@ -1781,14 +1794,14 @@ describe('delete', () => {
   it('keeps a base image that another environment uses', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', record: { images: { [BASE_IMAGE]: DIGEST_OLD }, environmentImage: environmentImageName(OTHER_ID, 1) } });
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(h.docker.log.filter((l) => l.includes(DIGEST_OLD))).toEqual([]);
   });
 
   it('keeps the entry and clears the busy mark when the volume cannot be removed', async () => {
     await seedEnvironment(h);
     h.docker.volumesInUse.add(NAME);
-    await expect(h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }))).rejects.toBeInstanceOf(CommandError);
+    await expect(h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }))).rejects.toBeInstanceOf(CommandError);
     const env = await entry();
     expect(env).toBeDefined();
     expect(env?.busy).toBeUndefined();
@@ -1803,13 +1816,13 @@ describe('delete', () => {
       busy = (await entry())?.busy;
       return original(name);
     };
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(busy?.operation).toBe('delete');
   });
 
   it('removes only the files of an environment that is not in the registry', async () => {
     await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
-    await h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(await pendingIds()).toEqual([]);
     expect(h.docker.log).toEqual([]);
   });
@@ -2121,7 +2134,7 @@ describe('accounts (concept 7.5, section 9 "Accounts")', () => {
     await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: 'running' });
     const operations: Array<[string, () => Promise<unknown>]> = [
       ['stop', () => h.service.stop(ENV_ID)],
-      ['delete', () => h.service.delete(ENV_ID, options({ removeAdditionalVolumes: false }))],
+      ['delete', () => h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }))],
       ['safetyCheck', () => h.service.safetyCheck(ENV_ID, options())],
       ['switchBranch', () => h.service.switchBranch(ENV_ID, 'dev', options())],
       ['listConfigurations', () => h.service.listConfigurations(ENV_ID, options())],

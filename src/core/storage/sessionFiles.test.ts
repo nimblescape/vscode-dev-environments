@@ -143,12 +143,12 @@ describe('pending operations', () => {
   it('writes and reads operations', async () => {
     await files.writeOperation(operation(ENV_A));
     await files.writeOperation(
-      operation(ENV_B, { operation: 'delete', reason: 'configurationSelected', configPath: '.devcontainer/py/devcontainer.json', removeAdditionalVolumes: true }),
+      operation(ENV_B, { operation: 'delete', reason: 'configurationSelected', configPath: '.devcontainer/py/devcontainer.json', additionalVolumesToRemove: ['api-db'] }),
     );
     const operations = await files.readOperations();
     expect(operations).toEqual([
       operation(ENV_A),
-      operation(ENV_B, { operation: 'delete', reason: 'configurationSelected', configPath: '.devcontainer/py/devcontainer.json', removeAdditionalVolumes: true }),
+      operation(ENV_B, { operation: 'delete', reason: 'configurationSelected', configPath: '.devcontainer/py/devcontainer.json', additionalVolumesToRemove: ['api-db'] }),
     ]);
   });
 
@@ -340,7 +340,9 @@ describe('validators', () => {
     expect(isPendingOperation(operation(ENV_A))).toBe(true);
     expect(isPendingOperation({ ...operation(ENV_A), reason: 'whim' })).toBe(false);
     expect(isPendingOperation({ ...operation(ENV_A), configPath: 3 })).toBe(false);
-    expect(isPendingOperation({ ...operation(ENV_A), removeAdditionalVolumes: 'yes' })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: 'yes' })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db', 3] })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db'] })).toBe(true);
     expect(isReopenRecord({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isReopenRecord(null)).toBe(false);
     expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
