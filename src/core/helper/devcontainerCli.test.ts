@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { devContainersSettings } from '../devContainers';
 import { CommandError } from '../errors';
 import {
   DevcontainerCommandError,
@@ -16,7 +17,7 @@ import {
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
-import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 
 describe('argument builders', () => {
   it('read-configuration', () => {

@@ -377,7 +377,7 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The open pipeline of ${repository} has just run for this window.`);
     } else {
       this.logger.info(`This window was restored or reloaded. The open pipeline of ${repository} runs before it connects.`);
-      // Assumption (V-2): activation through onResolveRemoteAuthority:attached-container blocks the connection until
+      // Assumption (V-2): activation through ATTACHED_CONTAINER_ACTIVATION_EVENT blocks the connection until
       // activate() resolves, also when the pipeline starts Docker or updates the environment for several minutes.
       const succeeded = await this.operation(
         repository,

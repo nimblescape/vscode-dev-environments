@@ -27,8 +27,8 @@ import {
   HOME_GIT_CONFIG_CONTENT,
   containerEnvironment,
   containerGitSupport,
-  devContainersSettings,
 } from '../../src/core/helper/containerGit';
+import { devContainersSettings } from '../../src/core/devContainers';
 import { Messages } from '../../src/core/messages';
 import {
   LABEL_ENVIRONMENT_ID,

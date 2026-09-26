@@ -1882,9 +1882,9 @@ export class EnvironmentService {
 
   /**
    * Concept section 9: what Git of a new container supports of container-only Git (containerGitSupport). Git before 2.9
-   * may use the forwarding credential helper of the Dev Containers extension, so the user gets a warning; Git 2.9 to 2.31
-   * ignores GIT_CONFIG_GLOBAL and gets the configuration of the volume only through ~/.gitconfig, which is logged. A
-   * container without Git needs nothing. Never fails the open.
+   * may use the forwarding credential helper of the Dev Containers extension (forwardingHelperReachesGit), so the user
+   * gets a warning; Git 2.9 to 2.31 ignores GIT_CONFIG_GLOBAL and gets the configuration of the volume only through
+   * ~/.gitconfig, which is logged. A container without Git needs nothing. Never fails the open.
    */
   private async checkGitVersion(ctx: PipelineContext, container: string, user: string): Promise<void> {
     let output: string;

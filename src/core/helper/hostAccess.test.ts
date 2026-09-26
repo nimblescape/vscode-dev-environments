@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { devContainersSettings } from '../devContainers';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -11,7 +12,7 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../names';
-import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_STOP_TIMEOUT_SECONDS,
@@ -891,5 +892,57 @@ describe('GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account (con
     const merged = { containerEnv: containerEnvironment(), remoteEnv: remoteEnvironment() };
     expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
     expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('variables of the account of the GitHub CLI (user decision 2026-09-26, concept section 9)', () => {
+  const NAMES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST'];
+  const REASON = 'the GitHub CLI would use it instead of the sign-in of the account that owns the environment';
+  const FORMS: Array<[form: string, runArgs: (name: string) => string[]]> = [
+    ['-e NAME=value', (name) => ['-e', `${name}=x`]],
+    ['-e NAME', (name) => ['-e', name]],
+    ['--env NAME=value', (name) => ['--env', `${name}=x`]],
+    ['--env NAME', (name) => ['--env', name]],
+    ['--env=NAME=value', (name) => [`--env=${name}=x`]],
+    ['--env=NAME', (name) => [`--env=${name}`]],
+    ['-eNAME=value', (name) => [`-e${name}=x`]],
+    ['-eNAME', (name) => [`-e${name}`]],
+  ];
+
+  it.each(NAMES.flatMap((name) => FORMS.map(([form, runArgs]) => [name, form, runArgs(name)] as const)))(
+    '%s in runArgs as %s',
+    (name, _form, runArgs) => {
+      expect(configProblems({ runArgs: [...runArgs] })).toEqual([`variable ${name} in runArgs (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of the repository configuration',
+    (name, property) => {
+      expect(configProblems({ [property]: { [name]: 'ghp_x' } })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of an entry of the image metadata',
+    (name, property) => {
+      const metadata = [{ id: 'base' }, { id: 'feature', [property]: { [name]: 'x' } }];
+      expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it('compares without case and surrounding spaces, and allows other variables of the GitHub CLI', () => {
+    expect(configProblems({ containerEnv: { ' gh_token ': 'x' }, runArgs: ['-e', 'github_token'] })).toEqual([
+      `variable github_token in runArgs (${REASON})`,
+      `variable gh_token in containerEnv (${REASON})`,
+    ]);
+    expect(configProblems({ containerEnv: { GH_PAGER: 'cat', GITHUB_TOKEN_FILE: '/x' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] })).toEqual([]);
+  });
+
+  it('is a refusal of access, not an unsupported option', () => {
+    expect(hostAccessReport({ config: { containerEnv: { GH_TOKEN: 'x' } }, ownVolume: OWN })).toEqual({
+      hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
+      unsupported: [],
+    });
   });
 });

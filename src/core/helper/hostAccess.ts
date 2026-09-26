@@ -19,7 +19,14 @@ import {
   VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
 } from '../names';
-import { isContainerGitVariable } from './containerGit';
+import {
+  DEV_CONTAINERS_VOLUMES,
+  exposingLocalPortHostValues,
+  hasDevContainersVolumeLabel,
+  isDevContainersCloneVolumeName,
+  LOCAL_PORT_HOST_SETTING,
+} from '../devContainers';
+import { GITHUB_CLI_ACCOUNT_REASON, isContainerGitVariable, isGitHubCliAccountVariable } from './containerGit';
 
 export interface HostAccessInput {
   /** The repository configuration, as `devcontainer read-configuration` resolved it (`configuration`). */
@@ -373,40 +380,43 @@ function hasCommand(value: unknown): boolean {
 }
 
 /**
- * The variables of container-only Git in `containerEnv` and `remoteEnv` of the configuration or of an entry of the image
- * metadata (isContainerGitVariable): the override configuration would replace those that it sets without a word,
- * because its values win, and the others (for example GIT_CONFIG_PARAMETERS) would change the configuration of Git in
- * the container.
+ * The item of a variable that a configuration may not set, or `undefined` when it may: a variable of container-only Git
+ * (isContainerGitVariable), named alone, or a variable that chooses the account of the GitHub CLI
+ * (isGitHubCliAccountVariable), with the reason. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
+ */
+function refusedVariableItem(name: string, where: string): string | undefined {
+  if (isContainerGitVariable(name)) return `variable ${name} in ${where}`;
+  if (isGitHubCliAccountVariable(name)) return `variable ${name} in ${where} (${GITHUB_CLI_ACCOUNT_REASON})`;
+  return undefined;
+}
+
+/**
+ * The variables of container-only Git and of the account of the GitHub CLI in `containerEnv` and `remoteEnv` of the
+ * configuration or of an entry of the image metadata (refusedVariableItem): the override configuration would replace
+ * those that it sets without a word, because its values win, the others (for example GIT_CONFIG_PARAMETERS) would
+ * change the configuration of Git in the container, and a token or host of the GitHub CLI would win over the sign-in of
+ * the owner account.
  */
 function environmentProblems(config: Record<string, unknown>): string[] {
   const items: string[] = [];
   for (const property of ['containerEnv', 'remoteEnv']) {
     const env = config[property];
     if (!isRecord(env)) continue;
-    for (const name of Object.keys(env)) if (isContainerGitVariable(name)) items.push(`variable ${name.trim()} in ${property}`);
+    for (const name of Object.keys(env)) {
+      const item = refusedVariableItem(name.trim(), property);
+      if (item !== undefined) items.push(item);
+    }
   }
   return items;
 }
 
 /**
- * `remote.localPortHost` in the VS Code settings of a configuration (`customizations.vscode.settings`: one object per
- * entry, a list of them in the merged configuration; flat or nested keys). The Dev Containers extension writes these
- * settings into the settings of the container, and the window applies them: with any value other than `localhost`, VS
- * Code forwards the ports of the container on all addresses of the computer (VS Code 1.139, tunnel service:
- * `!e||e==="localhost"?"127.0.0.1":"0.0.0.0"`), not only on localhost. The setting of the user stays the user's choice.
+ * `remote.localPortHost` other than `localhost` in the VS Code settings of a configuration (exposingLocalPortHostValues,
+ * ../devContainers.ts: the window applies the settings of the container, and forwards ports on all addresses of the
+ * computer for such a value).
  */
 function portHostProblems(customizations: unknown): string[] {
-  const vscode = isRecord(customizations) ? customizations.vscode : undefined;
-  const items: string[] = [];
-  for (const entry of Array.isArray(vscode) ? vscode : [vscode]) {
-    const settings = isRecord(entry) && isRecord(entry.settings) ? entry.settings : undefined;
-    if (!settings) continue;
-    const nested = isRecord(settings.remote) ? settings.remote.localPortHost : undefined;
-    for (const value of [settings['remote.localPortHost'], nested]) {
-      if (value && value !== 'localhost') items.push(`setting remote.localPortHost ${JSON.stringify(value)}`);
-    }
-  }
-  return items;
+  return exposingLocalPortHostValues(customizations).map((value) => `setting ${LOCAL_PORT_HOST_SETTING} ${JSON.stringify(value)}`);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -573,29 +583,13 @@ export function mountedVolumeNames(input: HostAccessInput): string[] {
   return [...names];
 }
 
-/**
- * The volumes of the Dev Containers extension (remote-containers 0.470.0, extension.js) by their names alone: `vscode`,
- * its cache of VS Code Server for the dev containers that it creates, and `vsc-remote-containers`, its proposal for a
- * named volume of "Clone Repository in Container Volume". A container with such a volume could change the VS Code
- * Server or the repositories of the other dev containers of the user.
- */
-const DEV_CONTAINERS_VOLUMES: readonly string[] = ['vscode', 'vsc-remote-containers'];
-
-/**
- * The other names of the clone volumes of the Dev Containers extension end in a hexadecimal MD5 or SHA-256 hash
- * (`vsc-<repository>-<md5>`, `<repository>-<md5>`, `<repository>-<sha256>`). A repository may use such a name too, so
- * the name alone does not decide: such a volume is refused when it exists and is not the environment's own
- * (volumeNameProblems).
- */
-const HASH_SUFFIXED_VOLUME = /-([0-9a-f]{32}|[0-9a-f]{64})$/;
-
 /** Docker's name of an anonymous volume: 64 hexadecimal characters. */
 const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
 
 /**
  * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
- * the Dev Containers extension (`vscode`, `vsc-remote-containers`). Only for the host access policy: whether a volume
+ * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume
  * is an environment's own is decided by its labels (isOwnVolume).
  */
 export function foreignVolumeName(name: string): string | undefined {
@@ -622,7 +616,7 @@ export function isOwnVolume(labels: Readonly<Record<string, string>>, environmen
 /**
  * The program that created an existing volume, by its labels, for a volume that a repository did not create by its
  * mounts (Docker gives such a volume no labels): Docker Compose (the volume of a project, for example the data of a
- * database), the Dev Containers extension (`vsch.*`: its clones of repositories; `dev.container.volume`), Docker itself
+ * database), the Dev Containers extension (hasDevContainersVolumeLabel), Docker itself
  * (an anonymous volume of another container), or Dev Environments (a volume of an environment, devenv.environment-id).
  * `undefined` for a volume without such labels.
  */
@@ -632,7 +626,7 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
     const project = labels['com.docker.compose.project'];
     return project ? `the Docker Compose project ${project}` : 'Docker Compose';
   }
-  if (keys.some((key) => key.startsWith('vsch.') || key === 'dev.container.volume')) return 'the Dev Containers extension';
+  if (hasDevContainersVolumeLabel(labels)) return 'the Dev Containers extension';
   if (keys.includes('com.docker.volume.anonymous')) return 'another container';
   if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   return undefined;
@@ -678,8 +672,9 @@ function volumeNameProblems(name: string, volumes: VolumeContext): string[] {
   }
   const owner = volumeLabelOwner(labels);
   if (owner !== undefined) return [`volume ${name} of ${owner}`];
-  // An existing volume named like a clone volume of the Dev Containers extension, which older versions did not label.
-  if (HASH_SUFFIXED_VOLUME.test(name)) return [`volume ${name} of another program`];
+  // An existing volume named like a clone volume of the Dev Containers extension (isDevContainersCloneVolumeName), which
+  // older versions did not label.
+  if (isDevContainersCloneVolumeName(name)) return [`volume ${name} of another program`];
   return [];
 }
 
@@ -841,13 +836,16 @@ function labelProblems(value: string): Problem[] {
 }
 
 /**
- * `-e`/`--env`: no variable of container-only Git (isContainerGitVariable), with or without a value. `docker run` gets
- * the runArgs after the containerEnv of the override configuration, so the value of the runArgs would win.
+ * `-e`/`--env`: no variable of container-only Git and no variable of the account of the GitHub CLI
+ * (refusedVariableItem), with or without a value. `docker run` gets the runArgs after the containerEnv of the override
+ * configuration, so the value of the runArgs would win; a `-e NAME` without a value takes the value of the workspace
+ * helper, or removes the variable.
  */
 function envProblems(value: string): string[] {
   const index = value.indexOf('=');
   const name = (index < 0 ? value : value.slice(0, index)).trim();
-  return isContainerGitVariable(name) ? [`variable ${name} in runArgs`] : [];
+  const item = refusedVariableItem(name, 'runArgs');
+  return item === undefined ? [] : [item];
 }
 
 /**

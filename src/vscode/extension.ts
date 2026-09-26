@@ -318,7 +318,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
 
   if (currentEnvironment && containerName) {
     // Role A: the open pipeline runs before VS Code connects this window (awaited).
-    // Assumption (V-2): VS Code waits for activate() before it resolves the attached-container authority.
+    // Assumption (V-2, ATTACHED_CONTAINER_ACTIVATION_EVENT): VS Code waits for activate() before it resolves the authority.
     const pending = await started;
     await controller.openAttachedWindow(currentEnvironment, containerName, pending);
     return;

@@ -535,7 +535,7 @@ export class WorkspaceHelper {
 
   /**
    * devcontainer up with the override configuration. The override configuration is passed on stdin and written to a
-   * temporary file inside the helper. --skip-post-attach (V-1). Throws DevcontainerCommandError.
+   * temporary file inside the helper. SKIP_POST_ATTACH_ARG (V-1). Throws DevcontainerCommandError.
    * A failed lifecycle command (isLifecycleCommandFailure) does not throw when its container runs: like the Dev
    * Containers extension, which connects and reports the failed command, the container is kept (concept 7.6, 7.7).
    * The result then has outcome 'success', the container ID, and `lifecycleCommandFailure`.
