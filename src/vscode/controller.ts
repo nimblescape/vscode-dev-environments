@@ -50,6 +50,7 @@ import type { OutputChannelLogger } from './logger';
 import { selectOwners } from './ownerSelector';
 import type { VsCodePipelineUi } from './pipelineUi';
 import { runWithProgress, type BusyChange } from './progress';
+import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { SETTINGS_SECTION, hostAccessChecksOffValue } from './settings';
 import type { Sidebar } from './sidebar';
@@ -122,6 +123,8 @@ export interface ControllerDeps {
   settings: () => ExtensionSettings;
   /** The Docker setup (concept 6.1 step 2): the walkthrough and its commands. */
   dockerSetup: Pick<DockerSetup, 'openWizard' | 'install' | 'start' | 'installWsl'>;
+  /** The editor of the setting repositoryGroups (concept 6.2). */
+  repositoryGroupsEditor: Pick<RepositoryGroupsEditor, 'open'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
   viewVisible: () => boolean;
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
@@ -252,7 +255,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 24 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 25 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -274,6 +277,7 @@ export class Controller implements vscode.Disposable {
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
       installDocker: () => this.deps.dockerSetup.openWizard(),
+      editRepositoryGroups: () => this.deps.repositoryGroupsEditor.open(),
       turnOffHostAccessChecks: (argument) => this.turnOffHostAccessChecks(parseCommandArgument(argument)),
       turnOnHostAccessChecks: (argument) => this.turnOnHostAccessChecks(parseCommandArgument(argument)),
       dockerSetupInstall: () => this.deps.dockerSetup.install(),

@@ -229,6 +229,7 @@ interface Harness {
   };
   claims: { claim: ReturnType<typeof vi.fn> };
   dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
+  repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -314,6 +315,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     start: vi.fn(async () => {}),
     installWsl: vi.fn(async () => {}),
   };
+  const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -357,6 +359,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     statusBar,
     settings: () => settings,
     dockerSetup,
+    repositoryGroupsEditor,
     viewVisible: () => false,
     clock,
     isAlive: (pid: number) => alive.has(pid),
@@ -407,6 +410,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     auth,
     claims,
     dockerSetup,
+    repositoryGroupsEditor,
     ui,
     discovery,
     sidebar,
@@ -504,6 +508,30 @@ function recreateHarness(options: Parameters<typeof createHarness>[0]): void {
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function welcomeManifest(): {
+  contributes: {
+    commands: Array<{ command: string; title: string; category: string }>;
+    viewsWelcome: Array<{ view: string; contents: string; when: string }>;
+  };
+} {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+}
+
+/**
+ * The contents of the welcome view entries that VS Code shows, in order. A small evaluator for the `when` clauses:
+ * `&&` of keys (context keys and the platform keys isMac, isWindows, isLinux), each optionally negated.
+ */
+function shownWelcome(context: Record<string, boolean>): string[] {
+  return welcomeManifest()
+    .contributes.viewsWelcome.filter((view) =>
+      view.when.split('&&').every((term) => {
+        const text = term.trim();
+        return text.startsWith('!') ? !context[text.slice(1)] : context[text] === true;
+      }),
+    )
+    .map((view) => view.contents);
+}
+
 describe('Controller commands', () => {
   it('registers exactly the commands of package.json', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
@@ -514,7 +542,8 @@ describe('Controller commands', () => {
     // 20 since unit 10: Turn Off Host Access Checks… and Turn On Host Access Checks (the switch per repository).
     // 24 since unit 14 (spec: open in a new window): Start in New Window, Start in Current Window, and the switcher for
     // a new window and for the current window.
-    expect(declared).toHaveLength(24);
+    // 25 since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups….
+    expect(declared).toHaveLength(25);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -533,23 +562,20 @@ describe('Controller commands', () => {
     expect(defaults).toEqual({ ...DEFAULT_SETTINGS });
     const keys = new Set(manifest.contributes.viewsWelcome.flatMap((view) => view.when.match(/devEnvironments\.\w+/g) ?? []));
     // Exactly the keys that the extension sets.
-    expect([...keys].sort()).toEqual([DockerContextKeys.missing, LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort());
+    expect([...keys].sort()).toEqual(
+      [DockerContextKeys.setupRequired, DockerContextKeys.wslReady, LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort(),
+    );
+    // The other terms are the platform keys of VS Code.
+    const others = new Set(
+      manifest.contributes.viewsWelcome.flatMap((view) =>
+        view.when.split('&&').map((term) => term.trim().replace(/^!/, '')).filter((term) => !term.startsWith('devEnvironments.')),
+      ),
+    );
+    expect([...others].sort()).toEqual(['isLinux', 'isMac', 'isWindows']);
   });
 
   it('shows "could not be loaded", not "no repository was found", after a failed first load (package.json)', () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
-      contributes: { viewsWelcome: Array<{ contents: string; when: string }> };
-    };
-    // A small evaluator for the `when` clauses of the welcome views: `&&` of keys, each optionally negated.
-    const shown = (context: Record<string, boolean>): string[] =>
-      manifest.contributes.viewsWelcome
-        .filter((view) =>
-          view.when.split('&&').every((term) => {
-            const text = term.trim();
-            return text.startsWith('!') ? !context[text.slice(1)] : context[text] === true;
-          }),
-        )
-        .map((view) => view.contents.split('\n')[0]);
+    const shown = (context: Record<string, boolean>): string[] => shownWelcome(context).map((contents) => contents.split('\n')[0]);
     const signedIn = { [SIGNED_IN_CONTEXT_KEY]: true };
     expect(shown({ ...signedIn, [LOADED_CONTEXT_KEY]: true, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([
       'The repository list could not be loaded. Check the internet connection and try again.',
@@ -561,35 +587,93 @@ describe('Controller commands', () => {
     expect(shown({ [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
     ]);
-    // Without Docker: the Docker entry first, and the sign-in entry below it.
-    expect(shown({ [DockerContextKeys.missing]: true })).toEqual([
-      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
-      'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
-    ]);
-    expect(shown({ ...signedIn, [DockerContextKeys.missing]: true })).toEqual([
-      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
-      'Loading your repositories…',
-    ]);
+    // A missing CLI alone (a remote Docker host, unit 7) does not show the setup: the list entries as usual.
+    expect(shown({ ...signedIn, [DockerContextKeys.missing]: true, isMac: true })).toEqual(['Loading your repositories…']);
   });
 
-  it('shows the Docker entry first with the exact text and the command Install Docker…', () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
-      contributes: {
-        commands: Array<{ command: string; title: string; category: string }>;
-        viewsWelcome: Array<{ view: string; contents: string; when: string }>;
-      };
-    };
-    expect(manifest.contributes.viewsWelcome[0]).toEqual({
-      view: 'devEnvironments.repositories',
-      contents:
-        'Dev Environments runs your environments in Docker, which is not installed on this computer.\n[Install Docker…](command:devEnvironments.installDocker)',
-      when: 'devEnvironments.dockerMissing',
+  // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+  // shall not be shown, instead, the side view shall show the install docker wizard". The sidebar then has no rows
+  // (sidebar.test.ts), so the view shows these entries: the steps of the walkthrough, each with its button, then the
+  // sign-in while not signed in.
+  describe('Docker setup in the sidebar (package.json viewsWelcome)', () => {
+    const setup = { [DockerContextKeys.missing]: true, [DockerContextKeys.setupRequired]: true };
+    const intro = 'Dev Environments runs your environments in Docker, which is not installed on this computer. Set it up in these steps:';
+    const after =
+      'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.\n[Open the Setup Guide](command:devEnvironments.installDocker)';
+    const signIn =
+      'Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)';
+    const installWsl =
+      '1. Install WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs. Windows asks for administrator permission; restart the computer afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)';
+    const wslInstalled = '1. WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs:\n✓ WSL 2 is installed.';
+    const installMac =
+      '1. Install Docker Desktop, with Homebrew or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+    const installWindows =
+      '2. Install Docker Desktop, with winget or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+    const installLinux =
+      '1. Install Docker Engine from the package repository of Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+
+    it('shows the steps of macOS, then the sign-in', () => {
+      expect(shownWelcome({ ...setup, isMac: true })).toEqual([intro, installMac, after, signIn]);
     });
-    expect(manifest.contributes.viewsWelcome[1].when).toBe('!devEnvironments.signedIn');
-    expect(manifest.contributes.commands.find((command) => command.command === Commands.installDocker)).toEqual({
-      command: 'devEnvironments.installDocker',
-      title: 'Install Docker…',
-      category: 'Dev Environments',
+
+    it('shows the steps of Windows with WSL 2 first, and a check mark instead of its button once WSL 2 is ready', () => {
+      expect(shownWelcome({ ...setup, isWindows: true })).toEqual([intro, installWsl, installWindows, after, signIn]);
+      expect(shownWelcome({ ...setup, isWindows: true, [DockerContextKeys.wslReady]: true })).toEqual([
+        intro,
+        wslInstalled,
+        installWindows,
+        after,
+        signIn,
+      ]);
+    });
+
+    it('shows the steps of Linux', () => {
+      expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, after, signIn]);
+    });
+
+    it('numbers the steps 1, 2, … on each platform', () => {
+      for (const platform of <Array<Record<string, boolean>>>[{ isMac: true },{ isLinux: true }, { isWindows: true }, { isWindows: true, [DockerContextKeys.wslReady]: true }]) {
+        const numbers = shownWelcome({ ...setup, ...platform })
+          .map((contents) => /^(\d+)\. /.exec(contents)?.[1])
+          .filter((number) => number !== undefined)
+          .map(Number);
+        expect(numbers).toEqual(numbers.map((_number, index) => index + 1));
+        expect(numbers.length).toBeGreaterThan(0);
+      }
+    });
+
+    it('shows no list entry under the setup, also when signed in, loaded, or after a failed load', () => {
+      const signedIn = { ...setup, isMac: true, [SIGNED_IN_CONTEXT_KEY]: true };
+      expect(shownWelcome(signedIn)).toEqual([intro, installMac, after]);
+      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
+      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
+      expect(shownWelcome({ ...signedIn, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
+      // Every entry but the sign-in either belongs to the setup or is hidden under it.
+      for (const view of welcomeManifest().contributes.viewsWelcome) {
+        if (view.when === '!devEnvironments.signedIn') continue;
+        const terms = view.when.split('&&').map((term) => term.trim());
+        expect(terms.includes(DockerContextKeys.setupRequired) || terms.includes(`!${DockerContextKeys.setupRequired}`)).toBe(true);
+      }
+    });
+
+    it('uses only commands of contributes.commands in the welcome view', () => {
+      const manifest = welcomeManifest();
+      const declared = new Set(manifest.contributes.commands.map((command) => command.command));
+      const used = manifest.contributes.viewsWelcome.flatMap((view) => [...view.contents.matchAll(/\(command:([\w.]+)\)/g)].map((match) => match[1]));
+      expect(used).toEqual(
+        expect.arrayContaining([
+          Commands.installDocker,
+          'devEnvironments.dockerSetup.install',
+          'devEnvironments.dockerSetup.installWsl',
+          'devEnvironments.signIn',
+        ]),
+      );
+      for (const command of used) expect(declared.has(command), command).toBe(true);
+      expect(manifest.contributes.commands.find((command) => command.command === Commands.installDocker)).toEqual({
+        command: 'devEnvironments.installDocker',
+        title: 'Install Docker…',
+        category: 'Dev Environments',
+      });
     });
   });
 
@@ -1723,6 +1807,11 @@ describe('Connection of this window', () => {
   it('opens the walkthrough with Install Docker…', async () => {
     await run('installDocker');
     expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the editor of the repository groups with Edit Repository Groups…', async () => {
+    await run('editRepositoryGroups');
+    expect(h.repositoryGroupsEditor.open).toHaveBeenCalledTimes(1);
   });
 
   it('runs the buttons of the walkthrough', async () => {

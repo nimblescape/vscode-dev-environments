@@ -39,6 +39,7 @@ import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
+import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
 import { Sidebar } from './sidebar';
@@ -194,7 +195,9 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   });
   const statusBar = new EnvironmentStatusBar();
   context.subscriptions.push(tree, view, statusBar);
-  // Concept 6.1 step 2: the welcome view and the row "Install Docker…" while no Docker CLI is found.
+  // Concept 6.1 step 2: while no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the
+  // repositories. User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the
+  // repositories shall not be shown, instead, the side view shall show the install docker wizard".
   const setup = new DockerSetup({
     docker,
     runner,
@@ -202,9 +205,12 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     showLog: () => logger.show(),
     platform,
     env,
+    // The CLI was found or lost: the sidebar renders again and shows the repositories or the setup.
     onDidChangeInstalled: () => {
       sidebar.render().catch((error: unknown) => logger.error('Could not update the sidebar.', error));
     },
+    // Remote Docker hosts do not exist yet: unit 7 supplies this value (the only place that decides it).
+    remoteDockerHostConfigured: () => false,
   });
   dockerSetup = setup;
   context.subscriptions.push(setup);
@@ -220,9 +226,16 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     claims,
     tree,
     settings: getSettings,
-    dockerMissing: () => setup.dockerMissing,
+    dockerSetupRequired: () => setup.setupRequired,
   });
   setup.initialize();
+  const repositoryGroupsEditor = new RepositoryGroupsEditor({
+    extensionUri: context.extensionUri,
+    logger,
+    groupingInput: () => sidebar.groupingInput(),
+    onDidRender: sidebar.onDidRender,
+  });
+  context.subscriptions.push(repositoryGroupsEditor);
   const controller = new Controller({
     logger,
     registry,
@@ -242,6 +255,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     statusBar,
     settings: getSettings,
     dockerSetup: setup,
+    repositoryGroupsEditor,
     viewVisible: () => view.visible,
     development: context.extensionMode === vscode.ExtensionMode.Development,
   });

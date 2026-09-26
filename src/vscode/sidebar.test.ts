@@ -17,7 +17,9 @@ import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SLOW_GROUPING_MS, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
-import { TreeTexts, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
+import { parseRepositoryGroups } from './repositoryGroups';
+import { buildGroupsPreview, entriesFromSetting } from './repositoryGroupsEditorModel';
+import { TreeTexts, buildTreeModel, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -86,8 +88,8 @@ interface Harness {
   sidebar: Sidebar;
   models: OwnerGroup[][];
   signedInFlags: boolean[];
-  dockerMissingFlags: boolean[];
-  dockerMissing: { value: boolean };
+  /** The Docker setup is required (the view gets an empty model). */
+  setupRequired: { value: boolean };
   coordinator: { environmentId: string | null; otherActiveWindows: ReturnType<typeof vi.fn<() => Promise<WindowStatus[]>>> };
   service: { inspectStates: ReturnType<typeof vi.fn>; currentBranch: ReturnType<typeof vi.fn> };
   docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn> };
@@ -113,14 +115,12 @@ function createHarness(): Harness {
   const registry = new EnvironmentRegistry(paths, clock);
   const sessionFiles = new SessionFiles(paths, clock);
   const models: OwnerGroup[][] = [];
-  const dockerMissing = { value: false };
+  const setupRequired = { value: false };
   const signedInFlags: boolean[] = [];
-  const dockerMissingFlags: boolean[] = [];
   const tree = {
-    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean; dockerMissing?: boolean }) => {
+    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean }) => {
       models.push(groups);
       signedInFlags.push(options.signedIn ?? true);
-      dockerMissingFlags.push(options.dockerMissing ?? false);
     },
     getModel: () => models[models.length - 1] ?? [],
   };
@@ -161,7 +161,7 @@ function createHarness(): Harness {
     auth,
     tree,
     settings: () => settings,
-    dockerMissing: () => dockerMissing.value,
+    dockerSetupRequired: () => setupRequired.value,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
@@ -172,8 +172,7 @@ function createHarness(): Harness {
     sidebar,
     models,
     signedInFlags,
-    dockerMissingFlags,
-    dockerMissing,
+    setupRequired,
     coordinator,
     service,
     docker,
@@ -215,11 +214,26 @@ function rowOf(repository: string): RepositoryRow {
 }
 
 describe('Sidebar', () => {
-  it('passes the Docker state to the view at each render, without asking Docker', async () => {
+  // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+  // shall not be shown, instead, the side view shall show the install docker wizard".
+  it('gives the view an empty model while the Docker setup is required, and the full model once Docker is found', async () => {
+    h.setupRequired.value = true;
+    await signedIn();
     await h.sidebar.render();
-    h.dockerMissing.value = true;
+    // The discovery ran in the background, but the view has no rows at all: VS Code shows the welcome view.
+    expect(h.discovery.refresh).toHaveBeenCalled();
+    expect(h.models.length).toBeGreaterThan(0);
+    expect(h.models.every((groups) => groups.length === 0)).toBe(true);
+    // The Command Palette (switcher) still gets the repositories.
+    expect(repositoryRows(h.sidebar.model()).map((row) => row.repository)).toEqual(['acme/api']);
+    // Docker is found: DockerSetup calls render (onDidChangeInstalled), and the list appears at once.
+    h.setupRequired.value = false;
     await h.sidebar.render();
-    expect(h.dockerMissingFlags).toEqual([false, true]);
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    // Lost again: the view is empty again.
+    h.setupRequired.value = true;
+    await h.sidebar.render();
+    expect(h.models[h.models.length - 1]).toEqual([]);
     expect(h.docker.isRunning).not.toHaveBeenCalled();
     expect(h.docker.isInstalled).not.toHaveBeenCalled();
   });
@@ -667,6 +681,36 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(3);
     // Without valid entries, the view lists the repositories as without the setting.
     expect(rows().map((row) => row.label)).toEqual(['api', 'web-shop']);
+  });
+
+  it('gives the input of its last render, so the preview of the groups editor equals the view (unit 16)', async () => {
+    const example = String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`;
+    h.discovery.refresh.mockResolvedValue(
+      data([
+        info('school/2026-3cWI-SWP-module-oop-EnesHA81'),
+        info('school/2026-3cWI-SWP-module-oop-felix-he021'),
+        info('school/2025-3bWI-SWP-module-oop-hailo'),
+        info('school/website'),
+      ]),
+    );
+    expect(h.sidebar.groupingInput()).toBeUndefined();
+    const rendered = vi.fn();
+    h.sidebar.onDidRender(rendered);
+    h.settings.repositoryGroups = [example];
+    await signedIn();
+    await h.sidebar.render();
+    expect(rendered).toHaveBeenCalled();
+    const input = h.sidebar.groupingInput();
+    expect(input?.repositoryGroups).toBeUndefined();
+    const shown = h.models[h.models.length - 1];
+    // The view is buildTreeModel of that input with the patterns of the setting.
+    expect(buildTreeModel({ ...input!, repositoryGroups: parseRepositoryGroups(h.settings.repositoryGroups).patterns })).toEqual(shown);
+    // The preview of the editor for the same setting shows the same tree and hides what the view hides.
+    const preview = buildGroupsPreview(input, entriesFromSetting(h.settings.repositoryGroups).entries);
+    const labels = (nodes: ReadonlyArray<{ label: string; children?: unknown }>): unknown[] =>
+      nodes.map((node) => (Array.isArray(node.children) ? [node.label, labels(node.children as never)] : node.label));
+    expect(preview.owners.map((owner) => [owner.owner, labels(owner.tree)])).toEqual(shown.map((group) => [group.owner, labels(group.children as never)]));
+    expect(preview.owners[0].hidden).toEqual(['website']);
   });
 
   it('names the setting repositoryGroups once when grouping is slow, and never without patterns', async () => {

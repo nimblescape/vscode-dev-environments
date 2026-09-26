@@ -32,9 +32,6 @@ export const TreeTexts = {
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
   signIn: 'Sign in with GitHub',
   signInTooltip: 'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
-  /** Label of the Docker row (the title of the command devEnvironments.installDocker). */
-  installDocker: 'Install Docker…',
-  installDockerTooltip: 'Dev Environments runs your environments in Docker, which is not installed on this computer.',
 } as const;
 
 /** Container and volume state of one environment, as Docker reports it. */
@@ -160,19 +157,6 @@ export interface SignInRow {
 
 export const SIGN_IN_ROW_ID = 'signIn';
 
-/**
- * Row at the top of the view when no Docker CLI is found and the view lists environments: the welcome view with its
- * Install Docker button only shows while the view is empty.
- */
-export interface InstallDockerRow {
-  kind: 'installDocker';
-  id: typeof INSTALL_DOCKER_ROW_ID;
-  label: string;
-  tooltip: string;
-}
-
-export const INSTALL_DOCKER_ROW_ID = 'installDocker';
-
 export interface OwnerGroup {
   kind: 'owner';
   /** `owner:` + lower-case owner. */
@@ -180,10 +164,10 @@ export interface OwnerGroup {
   owner: string;
   /**
    * Hints first, then the repositories in alphabetical order, with or without an environment (user decision 2026-09-26).
-   * With the setting `repositoryGroups`, when a repository of the owner matches a pattern: hints first, then the root
-   * node of each named entry that a repository of the owner matches (in the order of the setting), then the top-level
-   * group nodes, then the rows at the top level (of patterns without levels, and repositories with an environment that
-   * match no pattern), each in alphabetical order. When no repository of the owner matches, the plain list.
+   * With the setting `repositoryGroups`, when a repository of the owner matches a pattern: hints first, then the nodes
+   * and rows in the order of the patterns that put them there (user decision 2026-09-26; within one pattern group nodes
+   * before rows, each alphabetically), then the repositories with an environment that match no pattern. When no
+   * repository of the owner matches, the plain list.
    */
   children: Array<RepositoryRow | HintRow | GroupNode>;
 }
@@ -211,7 +195,7 @@ export interface GroupNode {
    * environment of this window.
    */
   expanded: boolean;
-  /** Group nodes in alphabetical order first, then the rows in alphabetical order of their label. */
+  /** In the order of the patterns that put them here, then group nodes before rows, then alphabetically (groupRows). */
   children: Array<GroupNode | RepositoryRow>;
 }
 
@@ -430,8 +414,10 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
  * label path under the same parent, so equal paths of different unnamed patterns are one node. Rows without environment
  * that match no pattern are hidden (the patterns filter); rows with an environment stay directly under the owner
  * (environments are always listed).
- * Order: the named roots in the order of the setting, then the group nodes in alphabetical order, then the rows in
- * alphabetical order of their label.
+ * Order (user decision 2026-09-26: "the nodes shall be ordered according to the regexp order in the settings"): on
+ * each level, by the first pattern of the setting that puts a node there (a named root by its own pattern; a group
+ * node by the first pattern among the repositories below it; a row by its pattern), then group nodes before rows,
+ * then alphabetically. Rows with an environment that match no pattern come last.
  */
 function groupRows(
   owner: string,
@@ -445,10 +431,16 @@ function groupRows(
   const top: Array<GroupNode | RepositoryRow> = [];
   const namedRoots = new Map<number, GroupNode>();
   const nodes = new Map<string, GroupNode>();
+  // The index of the first pattern that puts a node or row on its level (sortGroupChildren).
+  const order = new WeakMap<GroupNode | RepositoryRow, number>();
+  const note = (item: GroupNode | RepositoryRow, index: number) => order.set(item, Math.min(order.get(item) ?? index, index));
   for (const row of [...withEnvironment, ...others]) {
     const match = matchRepositoryGroup(patterns, row.name);
     if (!match) {
-      if (row.environment) top.push(row);
+      if (row.environment) {
+        top.push(row);
+        order.set(row, Number.POSITIVE_INFINITY);
+      }
       continue;
     }
     matched = true;
@@ -469,6 +461,8 @@ function groupRows(
           children: [],
         };
         namedRoots.set(pattern.index, root);
+        top.push(root);
+        order.set(root, pattern.index);
       }
       children = root.children;
     }
@@ -483,56 +477,49 @@ function groupRows(
         nodes.set(id, node);
         children.push(node);
       }
+      note(node, pattern.index);
       if (isCurrent) node.expanded = true;
       children = node.children;
     }
-    children.push(match.label === row.label ? row : { ...row, label: match.label });
+    const placed = match.label === row.label ? row : { ...row, label: match.label };
+    order.set(placed, pattern.index);
+    children.push(placed);
   }
   if (!matched) return undefined;
-  const roots = [...namedRoots.entries()].sort(([a], [b]) => a - b).map(([, root]) => root);
-  for (const root of roots) root.children = sortGroupChildren(root.children);
-  return [...roots, ...sortGroupChildren(top)];
+  return sortGroupChildren(top, order);
 }
 
-/** Group nodes first, in alphabetical order; then the rows, by label, then by repository and ID. Sorts all levels. */
-function sortGroupChildren(children: ReadonlyArray<GroupNode | RepositoryRow>): Array<GroupNode | RepositoryRow> {
-  const groupNodes: GroupNode[] = [];
-  const rows: RepositoryRow[] = [];
-  for (const child of children) {
-    if (child.kind === 'group') {
-      child.children = sortGroupChildren(child.children);
-      groupNodes.push(child);
-    } else {
-      rows.push(child);
-    }
-  }
-  groupNodes.sort((a, b) => compareNames(a.label, b.label) || compareNames(a.id, b.id));
-  rows.sort((a, b) => compareNames(a.label, b.label) || compareNames(a.repository, b.repository) || compareNames(a.id, b.id));
-  return [...groupNodes, ...rows];
+/**
+ * Sorts all levels: by the index of the first pattern that puts the node or row there (`order`; see groupRows), then
+ * group nodes before rows, then group nodes by label and rows by label, repository, and ID.
+ */
+function sortGroupChildren(
+  children: ReadonlyArray<GroupNode | RepositoryRow>,
+  order: WeakMap<GroupNode | RepositoryRow, number>,
+): Array<GroupNode | RepositoryRow> {
+  for (const child of children) if (child.kind === 'group') child.children = sortGroupChildren(child.children, order);
+  const rank = (item: GroupNode | RepositoryRow) => order.get(item) ?? Number.POSITIVE_INFINITY;
+  return [...children].sort((a, b) => {
+    if (rank(a) !== rank(b)) return rank(a) < rank(b) ? -1 : 1;
+    if (a.kind !== b.kind) return a.kind === 'group' ? -1 : 1;
+    if (a.kind === 'group' && b.kind === 'group') return compareNames(a.label, b.label) || compareNames(a.id, b.id);
+    const ra = a as RepositoryRow;
+    const rb = b as RepositoryRow;
+    return compareNames(ra.label, rb.label) || compareNames(ra.repository, rb.repository) || compareNames(ra.id, rb.id);
+  });
 }
 
 /**
  * Top-level nodes of the view: the groups, with the rows that stand for the welcome view when the view is not empty (an
- * empty view shows the welcome view with its buttons instead): first the Docker row when no Docker CLI is found, then
- * the sign-in row when the user is not signed in.
+ * empty view shows the welcome view with its buttons instead): the sign-in row when the user is not signed in.
+ * No Docker row: while no Docker CLI is found, the sidebar passes an empty model, so the view shows the Docker setup of
+ * the welcome view (user decision 2026-09-26: "when no remote docker is configured and local docker is not available,
+ * the repositories shall not be shown, instead, the side view shall show the install docker wizard").
  */
-export function rootNodes(
-  groups: readonly OwnerGroup[],
-  signedIn: boolean,
-  dockerMissing = false,
-): Array<InstallDockerRow | SignInRow | OwnerGroup> {
+export function rootNodes(groups: readonly OwnerGroup[], signedIn: boolean): Array<SignInRow | OwnerGroup> {
   if (groups.length === 0) return [];
-  const rows: Array<InstallDockerRow | SignInRow> = [];
-  if (dockerMissing) {
-    rows.push({
-      kind: 'installDocker',
-      id: INSTALL_DOCKER_ROW_ID,
-      label: TreeTexts.installDocker,
-      tooltip: TreeTexts.installDockerTooltip,
-    });
-  }
-  if (!signedIn) rows.push({ kind: 'signIn', id: SIGN_IN_ROW_ID, label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip });
-  return [...rows, ...groups];
+  if (signedIn) return [...groups];
+  return [{ kind: 'signIn', id: SIGN_IN_ROW_ID, label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip }, ...groups];
 }
 
 /** All repository rows of the model, in display order, also those inside the nodes of `repositoryGroups`. */

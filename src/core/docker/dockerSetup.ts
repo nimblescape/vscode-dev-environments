@@ -6,10 +6,12 @@
 // computer, the confirmation before anything runs, and the context keys of the setup walkthrough. Pure functions; the
 // VS Code side (terminal, download, walkthrough) is in src/vscode/dockerSetup.ts.
 
-/** Context keys of the welcome view, the sidebar row, and the walkthrough steps (package.json). */
+/** Context keys of the welcome view and the walkthrough steps (package.json). */
 export const DockerContextKeys = {
   /** No Docker CLI was found. */
   missing: 'devEnvironments.dockerMissing',
+  /** `dockerSetupRequired`: the sidebar shows the Docker setup instead of the repositories (welcome view). */
+  setupRequired: 'devEnvironments.dockerSetupRequired',
   /** A Docker CLI was found (the opposite of `missing`; walkthrough step "Install Docker"). */
   installed: 'devEnvironments.dockerInstalled',
   /** The last `docker info` succeeded (walkthrough step "Start Docker"). */
@@ -49,6 +51,8 @@ export const WSL_INSTALL_COMMAND = 'wsl --install';
 export const LINUX_ENGINE_START_COMMAND = 'sudo systemctl enable --now docker';
 /** Homebrew cask of Docker Desktop (the former cask `docker` was renamed to `docker-desktop`). */
 export const BREW_INSTALL_COMMAND = 'brew install --cask docker-desktop';
+/** Where the cask docker-desktop puts Docker Desktop. */
+export const DOCKER_APP_PATH = '/Applications/Docker.app';
 export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
@@ -68,6 +72,8 @@ const FEDORA_DNF5_VERSION = 41;
 // User-visible texts that messages.ts lacks; to be moved there.
 export const DockerSetupTexts = {
   descriptionBrew: 'Docker Desktop is installed with Homebrew from its official cask docker-desktop.',
+  brewStaleCask:
+    'Homebrew still lists Docker Desktop, but the app is missing. Homebrew first removes its old entry (your Docker data stays), then installs Docker Desktop.',
   descriptionWinget: 'Docker Desktop is installed with winget from its official package Docker.DockerDesktop.',
   descriptionEngine: (distribution: string) =>
     `Docker Engine is installed from the official package repository of Docker for ${distribution} (download.docker.com).`,
@@ -107,6 +113,13 @@ export interface InstallPlanInput {
    * fixed search path) runs this Homebrew, also one outside /opt/homebrew and /usr/local, and the confirmation shows it.
    */
   brewPath?: string;
+  /**
+   * macOS: Homebrew records the cask docker-desktop (the folder `Caskroom/docker-desktop` of its prefix exists, see
+   * `brewCaskroomFolder`).
+   */
+  brewCaskRecorded?: boolean;
+  /** macOS: Docker.app exists (in /Applications, ~/Applications, or the appdir of HOMEBREW_CASK_OPTS). */
+  dockerAppPresent?: boolean;
   /** The login name of the user (Linux: joins the group docker). Missing or unusual: the documentation instead. */
   userName?: string;
   /**
@@ -177,6 +190,16 @@ function fileNameOf(url: string): string {
   return decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '');
 }
 
+/**
+ * The folder in which Homebrew records the cask docker-desktop: `Caskroom/docker-desktop` of the prefix of the `brew`
+ * at `brewPath` (the parent of its folder bin, for example /opt/homebrew or /usr/local).
+ */
+export function brewCaskroomFolder(brewPath: string): string {
+  const bin = brewPath.replace(/\/+$/, '').replace(/\/[^/]*$/, '');
+  const prefix = bin.replace(/\/[^/]*$/, '');
+  return `${prefix}/Caskroom/docker-desktop`;
+}
+
 /** Debian architecture name of a Node.js architecture, as `dpkg --print-architecture` gives it. */
 const DEBIAN_ARCHITECTURES: Record<string, string> = {
   x64: 'amd64',
@@ -189,6 +212,7 @@ const DEBIAN_ARCHITECTURES: Record<string, string> = {
 /**
  * How Docker is installed on this computer:
  * - macOS: Homebrew → `brew install --cask docker-desktop`; otherwise the .dmg of Docker Desktop (Apple silicon or Intel).
+ *   Homebrew still records the cask but Docker.app is gone: first `brew uninstall --cask --force docker-desktop`.
  * - Windows: winget → `winget install … Docker.DockerDesktop`; otherwise the installer .exe (x64 or Arm).
  * - Linux: Docker Engine from the repository of Docker for Ubuntu, Debian, Fedora, RHEL, and CentOS (the commands of
  *   https://docs.docker.com/engine/install/), then the user joins the group docker. Other distributions: the documentation.
@@ -201,6 +225,19 @@ export function installPlan(input: InstallPlanInput): InstallPlan {
     if (platform === 'darwin' && input.has('brew') && brew !== undefined) {
       // The cask links the CLI into /usr/local/bin with sudo, so Homebrew may ask for the password.
       const command = brew === 'brew' ? BREW_INSTALL_COMMAND : `${brew} install --cask docker-desktop`;
+      if (input.brewCaskRecorded === true && input.dockerAppPresent === false) {
+        // Homebrew still records docker-desktop, but Docker.app was removed by hand: `install` would upgrade the
+        // recorded version, remove its services and helpers, and then stop because the app is not there. `--force`
+        // drops the record although the app files are missing; it does not touch the Docker data.
+        // NEVER `--zap`: it deletes ~/Library/Containers/com.docker.docker, which holds all Docker volumes (the
+        // workspaces of the user: data loss).
+        return {
+          kind: 'terminal',
+          commands: [`${brew} uninstall --cask --force docker-desktop`, command],
+          needsAdmin: true,
+          description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+        };
+      }
       return { kind: 'terminal', commands: [command], needsAdmin: true, description: DockerSetupTexts.descriptionBrew };
     }
     if (platform === 'win32' && input.has('winget')) {
@@ -505,24 +542,33 @@ export function nextDockerSetupState(state: DockerSetupState, event: DockerSetup
   }
 }
 
+/**
+ * True while the sidebar shows the Docker setup instead of the repositories. User decision 2026-09-26: "when no remote
+ * docker is configured and local docker is not available, the repositories shall not be shown, instead, the side view
+ * shall show the install docker wizard". Local Docker is not available when no Docker CLI is found (`dockerMissing`).
+ * Docker that is installed but does not run is available: the extension starts it when it is needed (FR-14).
+ */
+export function dockerSetupRequired(dockerMissing: boolean, remoteDockerHostConfigured: boolean): boolean {
+  return dockerMissing && !remoteDockerHostConfigured;
+}
+
 /** Values of the context keys of a state. */
-export function dockerContextValues(state: DockerSetupState): Record<DockerContextKey, boolean> {
+export function dockerContextValues(state: DockerSetupState, remoteDockerHostConfigured: boolean): Record<DockerContextKey, boolean> {
   return {
     [DockerContextKeys.missing]: !state.cliFound,
     [DockerContextKeys.installed]: state.cliFound,
     [DockerContextKeys.ready]: state.cliFound && state.engineRunning,
     [DockerContextKeys.wslReady]: state.wslReady,
+    [DockerContextKeys.setupRequired]: dockerSetupRequired(!state.cliFound, remoteDockerHostConfigured),
   };
 }
 
 /** The context keys that change from `before` to `after` (all keys when `before` is undefined: nothing was set yet). */
 export function changedContextValues(
-  before: DockerSetupState | undefined,
-  after: DockerSetupState,
+  before: Readonly<Record<DockerContextKey, boolean>> | undefined,
+  after: Readonly<Record<DockerContextKey, boolean>>,
 ): Array<[DockerContextKey, boolean]> {
-  const next = dockerContextValues(after);
-  const previous = before ? dockerContextValues(before) : undefined;
-  return (Object.keys(next) as DockerContextKey[]).filter((key) => previous?.[key] !== next[key]).map((key) => [key, next[key]]);
+  return (Object.keys(after) as DockerContextKey[]).filter((key) => before?.[key] !== after[key]).map((key) => [key, after[key]]);
 }
 
 /** True while the CLI is looked up every 10 s: only while it is missing. */

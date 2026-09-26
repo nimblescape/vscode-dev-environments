@@ -21,7 +21,7 @@ Git on your computer is not needed.
 
 ## How to use it
 
-1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, select **Install Docker…** (see [Installing Docker](#installing-docker)).
+1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, the view shows the steps to set it up instead of the repositories (see [Installing Docker](#installing-docker)).
 2. Select **Sign in with GitHub**. The list shows your repositories with a Dev Container configuration, grouped by owner.
 3. Use the actions of a repository:
    - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window.
@@ -37,7 +37,7 @@ The first load of the list can take some time with many repositories; the view s
 
 ## Installing Docker
 
-When Docker is not installed, the view shows **Install Docker…** above the sign-in. It opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
+When Docker is not installed, the view shows no repositories, but the steps to set Docker up, each with its button: on Windows **Install WSL 2**, then **Install Docker**. After the installation, your repositories appear in the view, and Docker is started when it is needed. **Open the Setup Guide** opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
 
 1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards).
 2. **Install Docker**:
@@ -64,7 +64,14 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 | `devEnvLauncher.includeForks` | `true` | Show forked repositories. |
 | `devEnvLauncher.refreshIntervalMinutes` | `60` | Interval in minutes of the background update of the repository list. |
 | `devEnvLauncher.hostAccessChecksOff` | `[]` | Repositories (`owner/name`) whose host access checks are off (see below). Only the user settings count: a workspace or folder setting cannot turn a check off. **Turn Off Host Access Checks…** and **Turn On Host Access Checks** in the context menu of a repository change it. Turning the checks off applies when the container is created next (for example with **Rebuild**); an existing container keeps its current settings, such as ports bound to this computer only. |
-| `devEnvLauncher.repositoryGroups` | `[]` | Regular expressions that filter and group the repositories in the sidebar by name. The capturing groups become the levels of the tree: the first group is the top level under the owner, the last group is the label of the repository. An entry with a `name` gets its own node. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment; an owner without a match keeps its plain list. Example: `["^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$"]`. Only the user settings can set it. Avoid nested repetitions such as `(a+)+`: they can make VS Code stop responding (the view names the setting when grouping is slow). |
+| `devEnvLauncher.repositoryGroups` | `[]` | Regular expressions that filter and group the repositories in the sidebar by name. The capturing groups become the levels of the tree: the first group is the top level under the owner, the last group is the label of the repository. An entry with a `name` gets its own node. The nodes are in the order of the entries. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment; an owner without a match keeps its plain list. Example: `["^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$"]`. Only the user settings can set it. Avoid nested repetitions such as `(a+)+`: they can make VS Code stop responding (the view names the setting when grouping is slow). **Dev Environments: Edit Repository Groups…** edits it (see below). |
+
+**Edit Repository Groups.** The Settings editor of VS Code can only open `settings.json` for `devEnvLauncher.repositoryGroups`. **Dev Environments: Edit Repository Groups…** (Command Palette, or the **…** menu at the top of the view) opens an editor for it:
+
+- Each entry has an optional name, the regular expression, and the flags `i` (ignore case), `u` (Unicode), and `s` (dot matches line breaks). Add, remove, and move entries with the buttons; an entry that is not valid shows its error at once.
+- The preview shows, for the repositories that the view has loaded, how many repositories each entry takes, the resulting tree of each owner, and which repositories would be hidden. Repositories with an environment are always shown.
+- Type a repository name in **Test a Repository Name** to see which entry matches it and where its row goes.
+- **Save** writes the user settings and changes only this setting in `settings.json`; your other settings and comments stay. If you changed the setting in `settings.json` while the editor was open, Save keeps that change and adds yours; it asks only about an entry that both changed differently. **Cancel**, or closing the tab, discards your changes.
 
 ## Known limits
 
@@ -103,6 +110,8 @@ npm run build         # bundles dist/extension.js and dist/sessionMonitor.js
 npm test              # unit tests, without VS Code and without Docker
 npm run test:docker   # integration tests against the running Docker engine
 npm run package       # creates the .vsix file
+npm run install-local # creates the .vsix file and installs it into the VS Code profile this folder is open in
+                      # (every window, also new ones of a debug run); -- --profile <name> names another profile
 ```
 
 © 2026 Hannes Stauss (scalarion@nimblescape.com) · [MIT License](https://github.com/nimblescape/vscode-dev-environments/blob/main/LICENSE).
