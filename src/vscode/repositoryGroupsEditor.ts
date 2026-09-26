@@ -29,6 +29,7 @@ import {
   editorState,
   entriesFromSetting,
   parseEditorRequest,
+  refusedRequestSeq,
   sameSettingValue,
   toSettingValue,
   type EditorEntry,
@@ -65,6 +66,11 @@ interface EditorSession {
   base: unknown;
   /** The generation of the entries of the webview; an update or Save of another one is stale (edited from another value). */
   generation: number;
+  /**
+   * The generation of the last Load settings.json: an update or Save of an older one is ignored, because the user
+   * dropped that draft (it only gets a state, so the webview is not left read-only).
+   */
+  reloaded: number;
   /** The last generation handed out, for a load or an offer. */
   issued: number;
   /**
@@ -104,6 +110,9 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       enableCommandUris: false,
       enableForms: false,
       localResourceRoots: [assets],
+      // A hidden tab keeps its page: its `seq`, the update that waits for its delay, and its draft stay as they are, so
+      // hide and show start no second page with its own counters. The cost is the memory of a hidden page.
+      retainContextWhenHidden: true,
     });
     const base = readSettingValue();
     const { entries, notices } = entriesFromSetting(base);
@@ -111,6 +120,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       panel,
       base,
       generation: 0,
+      reloaded: 0,
       issued: 0,
       offers: new Map(),
       loaded: entries,
@@ -157,13 +167,22 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     const request = parseEditorRequest(raw, { generation: session.generation });
     if (!request) {
       this.deps.logger.warn('The repository groups editor sent a message that is not valid. It is ignored.');
+      // The webview may wait for an answer (it is read-only after Save): it gets a state of the draft of the extension.
+      session.seq = Math.max(session.seq, refusedRequestSeq(raw) ?? 0);
+      this.refresh(session, GroupsEditorTexts.refusedMessage);
       return;
     }
     switch (request.type) {
       case 'stale':
         // Edited from an earlier load (the generation does not change during Save, and the webview is read-only then).
         // Nothing is written; the entries become the draft again, with the current generation, and the status says so.
+        // A draft from before Load settings.json stays dropped: it only gets a state.
         if (session.saving) return;
+        if (request.generation < session.reloaded) {
+          session.seq = Math.max(session.seq, request.seq);
+          this.refresh(session);
+          return;
+        }
         session.entries = request.entries;
         if (request.testName !== undefined) session.testName = request.testName;
         session.seq = Math.max(session.seq, request.seq);
@@ -196,6 +215,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       case 'reload':
         if (session.saving) return;
         this.load(session, readSettingValue(), GroupsEditorTexts.loaded);
+        session.reloaded = session.generation;
         return;
       case 'cancel':
         session.panel.dispose();
@@ -348,6 +368,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     const message: EditorLoadMessage = {
       type: 'load',
       generation: session.generation,
+      seq: session.seq,
       entries: session.entries,
       notices: session.notices,
       testName: session.testName,

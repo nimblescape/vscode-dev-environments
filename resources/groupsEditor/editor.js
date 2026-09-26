@@ -15,6 +15,8 @@
     { flag: 's', label: 's', title: 'Dot matches line breaks' },
   ];
   const UPDATE_DELAY_MS = 150;
+  /** EditorLimits.entries of repositoryGroupsEditorModel.ts: the extension refuses a longer list. */
+  const MAX_ENTRIES = 200;
 
   /** @type {{name: string, pattern: string, flags: string}[]} */
   let entries = [];
@@ -26,6 +28,10 @@
   let answered = 0;
   /** The `seq` of the Save that runs: the editor is read-only until its state (`saving: false`) arrives. */
   let savingSeq = undefined;
+  /** Load settings.json was pressed: the editor is read-only until the load arrives. */
+  let reloading = false;
+  /** The last state of the extension said that a Save runs (for example one of a page before this one). */
+  let extensionSaving = false;
   let lastState = undefined;
   /** Open state of the preview nodes that the user changed, by owner and label path. */
   const openNodes = new Map();
@@ -76,6 +82,8 @@
   function renderEntries(focus) {
     list.replaceChildren(...entries.map((entry, index) => entryRow(entry, index)));
     $('no-entries').hidden = entries.length > 0;
+    $('add').disabled = entries.length >= MAX_ENTRIES;
+    $('entries-full').hidden = entries.length < MAX_ENTRIES;
     if (lastState) applyChecks(lastState);
     if (focus) {
       const target = document.getElementById(focus);
@@ -170,15 +178,21 @@
   }
 
   $('add').addEventListener('click', () => {
+    if (entries.length >= MAX_ENTRIES) return;
     entries.push({ name: '', pattern: '', flags: '' });
     renderEntries(`entry-${entries.length - 1}-pattern`);
     sendUpdate();
   });
 
   // While Save waits for the check or for an answer, the extension takes no edits: the form is read-only until then.
+  // The same holds from Load settings.json until its load.
+  function updateForm() {
+    $('form').disabled = savingSeq !== undefined || reloading || extensionSaving;
+  }
+
   function setSaving(value) {
     savingSeq = value;
-    $('form').disabled = value !== undefined;
+    updateForm();
   }
 
   $('save').addEventListener('click', () => {
@@ -193,18 +207,11 @@
     // Load settings.json drops the draft: a keystroke that still waits is dropped with it, not sent after the load.
     clearTimeout(timer);
     timer = undefined;
+    reloading = true;
+    updateForm();
     send({ type: 'reload' });
   });
   $('test-name').addEventListener('input', scheduleUpdate);
-
-  // A hidden tab loses this page: the last change goes to the extension first, which keeps the draft.
-  function flushUpdate() {
-    if (timer !== undefined) sendUpdate();
-  }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushUpdate();
-  });
-  window.addEventListener('pagehide', flushUpdate);
 
   // ---- State from the extension ------------------------------------------------------------------------------
 
@@ -221,6 +228,8 @@
   }
 
   function applyState(state) {
+    extensionSaving = state.saving === true;
+    updateForm();
     if (typeof state.seq === 'number' && state.seq > answered) answered = state.seq;
     if (savingSeq !== undefined && state.seq >= savingSeq && !state.saving) setSaving(undefined);
     // An answer to an older update: the entries changed since; the next answer follows.
@@ -345,7 +354,9 @@
   function load(message) {
     clearTimeout(timer);
     timer = undefined;
-    // The extension has the entries of this load: nothing of the draft is unanswered.
+    // The extension has the entries of this load: nothing of the draft is unanswered. A page that starts again
+    // continues from the `seq` of the extension, so its edits and its Save count as newer than the states before.
+    if (typeof message.seq === 'number' && message.seq > seq) seq = message.seq;
     answered = seq;
     entries = message.entries.map((entry) => ({
       name: String(entry.name),
@@ -368,12 +379,14 @@
     if (!message || typeof message !== 'object') return;
     if (message.type === 'load' && Array.isArray(message.entries)) {
       load(message);
+      reloading = false;
+      updateForm();
     } else if (message.type === 'external' && Array.isArray(message.entries) && typeof message.generation === 'number') {
       // settings.json changed the setting. Without edits that the extension may not have, show the new value; otherwise
       // keep the draft, show the banner, and send the draft (the extension keeps its base until an accept).
-      if (timer !== undefined || seq > answered || savingSeq !== undefined) {
+      if (timer !== undefined || seq > answered || savingSeq !== undefined || reloading) {
         $('changed').hidden = false;
-        flushUpdate();
+        if (timer !== undefined) sendUpdate();
         return;
       }
       load(message);

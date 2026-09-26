@@ -186,6 +186,8 @@ describe('RepositoryGroupsEditor', () => {
   it('opens one panel with scripts from the extension only, and loads the user setting', async () => {
     const { editor, panel } = await openEditor();
     expect(panel.options).toMatchObject({ enableScripts: true, enableCommandUris: false, localResourceRoots: [expect.anything()] });
+    // Review round 6 of PR #21, finding 1: a hidden tab keeps its page (its seq, its timer, and its draft).
+    expect(panel.options).toMatchObject({ retainContextWhenHidden: true });
     expect(panel.webview.html).toContain("default-src 'none'");
     expect(panel.webview.html).toContain('webview:file:///ext/resources/groupsEditor/editor.js');
     expect(loaded(panel).entries).toEqual([
@@ -205,8 +207,40 @@ describe('RepositoryGroupsEditor', () => {
     panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ name: '', pattern: '^a', flags: 'g' }] });
     await flush();
     expect(update).not.toHaveBeenCalled();
-    expect(panel.posted).toHaveLength(before);
+    expect(panel.posted.slice(before).map((message) => message.type)).toEqual(['state']);
     expect(logger.warn).toHaveBeenCalled();
+  });
+
+  // Review round 6 of PR #21, finding 2: the webview is read-only after its Save until a state answers it, so every
+  // refused update or Save is answered with a state of the draft that the extension has (its seq, if it has a valid one).
+  it('answers a refused update or Save with a state of the current draft, so the webview unlocks', async () => {
+    const { panel } = await openEditor();
+    const draft = loaded(panel).entries;
+    const tooMany = Array.from({ length: 201 }, () => ({ name: '', pattern: '^a', flags: '' }));
+    panel.receive({ type: 'save', seq: 5, generation: gen(panel), entries: tooMany });
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+    expect(lastState(panel)).toMatchObject({ seq: 5, saving: false, dirty: false, status: GroupsEditorTexts.refusedMessage });
+    expect((lastState(panel) as unknown as { checks: unknown[] }).checks).toHaveLength(draft.length);
+    panel.receive({ type: 'update', seq: 6, generation: gen(panel), entries: tooMany, testName: '' });
+    await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 6, status: GroupsEditorTexts.refusedMessage });
+    // Without a valid seq, the state has the current one.
+    panel.receive({ type: 'update', seq: -1, generation: gen(panel), entries: [], testName: '' });
+    await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 6, status: GroupsEditorTexts.refusedMessage });
+    expect(loadCount(panel)).toBe(1);
+  });
+
+  // Review round 6 of PR #21, finding 1: a load carries the seq of the extension, which a new page continues.
+  it('sends its seq with a load', async () => {
+    const { panel } = await openEditor();
+    expect(loaded(panel)).toMatchObject({ seq: 0 });
+    panel.receive({ type: 'update', seq: 40, generation: gen(panel), entries: loaded(panel).entries, testName: '' });
+    await flush();
+    panel.receive({ type: 'ready' });
+    await flush();
+    expect(loaded(panel)).toMatchObject({ seq: 40 });
   });
 
   it('checks the entries again before it saves', async () => {
@@ -342,7 +376,11 @@ describe('RepositoryGroupsEditor', () => {
     it('keeps the entries of a stale Save and says so', async () => {
       const { panel } = await openEditor();
       const old = gen(panel);
-      panel.receive({ type: 'reload' });
+      // The webview took an offer of settings.json: the entries of `old` were edited from another value.
+      changeStored(THEIRS);
+      await flush();
+      const offer = panel.posted[panel.posted.length - 1] as unknown as { generation: number };
+      panel.receive({ type: 'accept', generation: offer.generation });
       await flush();
       const mine = [{ name: '', pattern: '^mine-(.+)$', flags: 'i' }];
       panel.receive({ type: 'save', seq: 3, generation: old, entries: mine });
@@ -362,13 +400,39 @@ describe('RepositoryGroupsEditor', () => {
     it('keeps the entries of a stale update and says so', async () => {
       const { panel } = await openEditor();
       const old = gen(panel);
-      panel.receive({ type: 'reload' });
+      // The webview took an offer of settings.json: the entries of `old` were edited from another value.
+      changeStored(THEIRS);
+      await flush();
+      const offer = panel.posted[panel.posted.length - 1] as unknown as { generation: number };
+      panel.receive({ type: 'accept', generation: offer.generation });
       await flush();
       const mine = [{ name: '', pattern: '^mine-(.+)$', flags: '' }];
       panel.receive({ type: 'update', seq: 2, generation: old, entries: mine, testName: 'mine-x' });
       await flush();
       expect(loaded(panel)).toMatchObject({ entries: mine, testName: 'mine-x' });
       expect(lastState(panel)).toMatchObject({ seq: 2, dirty: true, status: GroupsEditorTexts.staleKept });
+    });
+
+    // Review round 6 of PR #21, finding 3: Load settings.json drops the draft; a late update does not bring it back.
+    it('ignores an update or Save of a generation before a processed Load settings.json', async () => {
+      const { panel } = await editedDraft();
+      const old = gen(panel);
+      panel.receive({ type: 'reload' });
+      await flush();
+      const loads = loadCount(panel);
+      panel.receive({ type: 'update', seq: 2, generation: old, entries: [{ name: '', pattern: '^old-(.+)$', flags: '' }], testName: '' });
+      await flush();
+      panel.receive({ type: 'save', seq: 3, generation: old, entries: [{ name: '', pattern: '^old-(.+)$', flags: '' }] });
+      await flush();
+      expect(update).not.toHaveBeenCalled();
+      expect(loadCount(panel)).toBe(loads);
+      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
+      // The webview still gets an answer, for the draft of settings.json.
+      expect(lastState(panel)).toMatchObject({ seq: 3, dirty: false, changedOutside: false });
+      // Save of the current generation writes the draft of settings.json.
+      panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries: loaded(panel).entries });
+      await flush();
+      expect(lastState(panel)).toMatchObject({ seq: 4, status: GroupsEditorTexts.saved });
     });
 
     // Nit of the review of PR #21: settings.json already holds the draft.

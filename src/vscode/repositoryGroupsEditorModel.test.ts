@@ -20,6 +20,7 @@ import {
   MAX_SHOWN_ENTRY,
   MAX_SHOWN_LINES,
   parseEditorRequest,
+  refusedRequestSeq,
   sameSettingValue,
   testRepositoryName,
   toSettingValue,
@@ -323,14 +324,27 @@ describe('messages of the webview', () => {
     });
     expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [] }, context)).toEqual({ type: 'save', seq: 0, generation: 5, entries: [] });
     // An update of an earlier load: its entries were edited from another value.
-    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid] }, context)).toEqual({ type: 'stale', seq: 0, entries: [valid] });
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid] }, context)).toEqual({
+      type: 'stale',
+      seq: 0,
+      generation: 4,
+      entries: [valid],
+    });
     expect(parseEditorRequest({ type: 'update', seq: 2, generation: 6, entries: [valid], testName: 'x' }, context)).toEqual({
       type: 'stale',
       seq: 2,
+      generation: 6,
       entries: [valid],
       testName: 'x',
     });
     expect(parseEditorRequest({ type: 'accept', generation: 7 }, context)).toEqual({ type: 'accept', generation: 7 });
+  });
+
+  it('reads the seq of a refused message only when it is a valid one', () => {
+    expect(refusedRequestSeq({ type: 'save', seq: 4, generation: 5, entries: 'x' })).toBe(4);
+    for (const raw of [{ type: 'save', seq: -1 }, { type: 'save', seq: 1.5 }, { type: 'save', seq: '4' }, [4], null, 'save']) {
+      expect(refusedRequestSeq(raw)).toBeUndefined();
+    }
   });
 
   it('checks a stale update or Save as strictly as a current one', () => {

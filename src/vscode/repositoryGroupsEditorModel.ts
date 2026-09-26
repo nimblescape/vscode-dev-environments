@@ -67,6 +67,8 @@ export const GroupsEditorTexts = {
   loaded: 'Loaded the setting from settings.json.',
   alreadySaved: 'Saved: settings.json already holds these entries, so nothing had to be written.',
   staleKept: 'settings.json changed while you were editing; your edits are kept, press Save again.',
+  refusedMessage:
+    'The editor sent entries that cannot be used; they were not taken over, and the preview shows the entries before. Nothing was saved.',
   entryTooSlow:
     'This regular expression takes too long for the repository names of the view (for example a nested repetition such as (a+)+). It would make VS Code stop responding. Change it before you save.',
   previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
@@ -216,9 +218,9 @@ export type EditorRequest =
   | { type: 'accept'; generation: number }
   /**
    * An update or Save for entries of an earlier load (edited from another value): nothing is written, and the editor
-   * keeps these entries with a status. `testName` only for an update.
+   * keeps these entries with a status (unless Load settings.json replaced that load). `testName` only for an update.
    */
-  | { type: 'stale'; seq: number; entries: EditorEntry[]; testName?: string };
+  | { type: 'stale'; seq: number; generation: number; entries: EditorEntry[]; testName?: string };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
@@ -242,13 +244,20 @@ export function parseEditorRequest(raw: unknown, context: { generation: number }
       if (!entries) return undefined;
       if (raw.type === 'update' && !isText(raw.testName, EditorLimits.testName)) return undefined;
       const testName = raw.type === 'update' ? (raw.testName as string) : undefined;
-      if (raw.generation !== context.generation) return { type: 'stale', seq: raw.seq, entries, ...(testName !== undefined ? { testName } : {}) };
+      if (raw.generation !== context.generation) {
+        return { type: 'stale', seq: raw.seq, generation: raw.generation, entries, ...(testName !== undefined ? { testName } : {}) };
+      }
       if (testName === undefined) return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
       return { type: 'update', seq: raw.seq, generation: raw.generation, entries, testName };
     }
     default:
       return undefined;
   }
+}
+
+/** The `seq` of a message that parseEditorRequest refused, when it has a valid one (to answer it with a state). */
+export function refusedRequestSeq(raw: unknown): number | undefined {
+  return isPlainObject(raw) && isSeq(raw.seq) ? raw.seq : undefined;
 }
 
 /** The entries of a message. */
@@ -557,6 +566,8 @@ export interface EditorLoadMessage {
   type: 'load';
   /** Counts the loads; the webview sends it back with its updates. */
   generation: number;
+  /** The highest `seq` that the extension has seen: the webview continues from it (also a page that starts again). */
+  seq: number;
   entries: EditorEntry[];
   notices: string[];
   /** The text of the test field, so a restored webview shows the text of its result. */
@@ -664,6 +675,7 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <p id="no-entries" class="muted" hidden>No entries: the view shows the plain list of each owner.</p>
 <ol id="entries"></ol>
 <button type="button" id="add">Add Entry</button>
+<p id="entries-full" class="muted" hidden>The editor takes at most ${EditorLimits.entries} entries.</p>
 </section>
 <div class="actions">
 <button type="button" id="save">Save</button>

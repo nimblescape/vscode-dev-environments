@@ -2,13 +2,14 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The script of the webview (resources/groupsEditor/editor.js) in a small stand-in of the DOM (review finding 7): a
-// change that waits for its delay is sent when the tab is hidden, and a load restores the test name and the generation;
-// a change of settings.json (`external`) does not drop a draft the extension has not seen, and Save makes the form read-only.
+// The script of the webview (resources/groupsEditor/editor.js) in a small stand-in of the DOM (review finding 7): a load
+// restores the test name, the generation, and the `seq` of the extension; a change of settings.json (`external`) does not
+// drop a draft the extension has not seen; Save and Load settings.json make the form read-only; Add stops at the limit.
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vm from 'vm';
 import { describe, expect, it } from 'vitest';
+import { EditorLimits } from './repositoryGroupsEditorModel';
 
 type Listener = (event?: unknown) => void;
 
@@ -59,13 +60,20 @@ function loadScript() {
   });
   const window = new StubElement();
   const posted: Array<Record<string, unknown>> = [];
+  /** The callbacks of the timers that wait; a cleared timer is removed. */
   const timers: Array<() => void> = [];
   const context = vm.createContext({
     document,
     window,
     acquireVsCodeApi: () => ({ postMessage: (message: Record<string, unknown>) => posted.push(message) }),
-    setTimeout: (callback: () => void) => timers.push(callback),
-    clearTimeout: () => {},
+    setTimeout: (callback: () => void) => {
+      timers.push(callback);
+      return callback;
+    },
+    clearTimeout: (handle: unknown) => {
+      const index = timers.indexOf(handle as () => void);
+      if (index >= 0) timers.splice(index, 1);
+    },
   });
   const source = fs.readFileSync(path.join(__dirname, '..', '..', 'resources', 'groupsEditor', 'editor.js'), 'utf8');
   vm.runInContext(source, context);
@@ -102,25 +110,6 @@ describe('editor.js', () => {
     expect(page.posted[1]).toEqual({ type: 'save', seq: 1, generation: 3, entries: [] });
   });
 
-  it('sends a waiting change at once when the tab is hidden or the page goes away', () => {
-    const page = loadScript();
-    page.window.dispatch('message', { data: { type: 'load', generation: 0, entries: [], notices: [], testName: '' } });
-    const testName = page.elements.get('test-name');
-    if (!testName) throw new Error('no test field');
-    testName.value = 'web-shop';
-    testName.dispatch('input');
-    expect(page.posted).toHaveLength(1);
-    page.document.visibilityState = 'hidden';
-    page.document.dispatch('visibilitychange');
-    expect(page.posted[1]).toEqual({ type: 'update', seq: 1, generation: 0, entries: [], testName: 'web-shop' });
-    // Nothing waits any more: no second message.
-    page.window.dispatch('pagehide');
-    expect(page.posted).toHaveLength(2);
-    testName.dispatch('input');
-    page.window.dispatch('pagehide');
-    expect(page.posted[2]).toMatchObject({ type: 'update', seq: 2 });
-  });
-
   // Review of PR #21, F1: settings.json changes the setting while a keystroke still waits for its delay.
   describe('when settings.json changed the setting (external)', () => {
     function typed() {
@@ -148,8 +137,7 @@ describe('editor.js', () => {
 
     it('keeps a draft whose update the extension has not answered yet', () => {
       const page = typed();
-      page.document.visibilityState = 'hidden';
-      page.document.dispatch('visibilitychange');
+      page.timers.shift()!();
       expect(page.posted).toHaveLength(2);
       page.receive({ type: 'external', generation: 2, entries: [THEIRS], notices: [] });
       expect(page.byId('entry-0-pattern').value).toBe('^www-(.+)$');
@@ -159,7 +147,7 @@ describe('editor.js', () => {
 
     it('shows the new value at once when every edit was answered, and accepts its generation', () => {
       const page = typed();
-      page.window.dispatch('pagehide');
+      page.timers.shift()!();
       expect(page.posted[1]).toMatchObject({ type: 'update', seq: 1 });
       page.receive(state(1));
       page.receive({ type: 'external', generation: 2, entries: [THEIRS], notices: [] });
@@ -172,9 +160,27 @@ describe('editor.js', () => {
     it('Load settings.json drops a waiting keystroke instead of sending it after the reload', () => {
       const page = typed();
       page.byId('reload').dispatch('click');
-      page.document.visibilityState = 'hidden';
-      page.document.dispatch('visibilitychange');
+      for (const timer of page.timers.splice(0)) timer();
       expect(page.posted.slice(1)).toEqual([{ type: 'reload' }]);
+    });
+
+    // Review round 6 of PR #21, finding 3: Load settings.json is read-only until its load, the same way as Save.
+    it('Load settings.json makes the form read-only until the load of that reload', () => {
+      const page = typed();
+      page.receive(state(0));
+      const form = page.byId('form');
+      expect(form.disabled).toBe(false);
+      page.byId('reload').dispatch('click');
+      expect(form.disabled).toBe(true);
+      expect(page.timers).toHaveLength(0);
+      // A state computed before the reload keeps it read-only, and an offer does not replace the draft meanwhile.
+      page.receive(state(0));
+      page.receive({ type: 'external', generation: 2, entries: [THEIRS], notices: [] });
+      expect(form.disabled).toBe(true);
+      expect(page.posted.slice(1)).toEqual([{ type: 'reload' }]);
+      page.receive({ type: 'load', seq: 0, generation: 3, entries: [THEIRS], notices: [], testName: '' });
+      expect(form.disabled).toBe(false);
+      expect(page.byId('entry-0-pattern').value).toBe('^theirs-(.+)$');
     });
   });
 
@@ -198,5 +204,64 @@ describe('editor.js', () => {
     page.receive(state(1, { dirty: false, status: 'Saved to the user settings.' }));
     expect(form.disabled).toBe(false);
     expect(page.byId('status').textContent).toBe('Saved to the user settings.');
+  });
+
+  // Review round 6 of PR #21, finding 1: a page that starts again (or any load) takes the `seq` of the extension.
+  describe('takes the seq of the extension from a load', () => {
+    function restarted() {
+      const page = loadScript();
+      page.receive({ type: 'load', seq: 40, generation: 2, entries: [ENTRY], notices: [], testName: '' });
+      page.receive(state(40, { dirty: false }));
+      const pattern = page.byId('entry-0-pattern');
+      pattern.value = '^web-x(.+)$';
+      pattern.dispatch('input');
+      page.timers.shift()!();
+      expect(page.posted[1]).toMatchObject({ type: 'update', seq: 41 });
+      return page;
+    }
+
+    it('a state computed before Save does not end the read-only form', () => {
+      const page = restarted();
+      page.byId('save').dispatch('click');
+      expect(page.posted[2]).toMatchObject({ type: 'save', seq: 42 });
+      page.receive(state(41));
+      expect(page.byId('form').disabled).toBe(true);
+      page.receive(state(42, { dirty: false }));
+      expect(page.byId('form').disabled).toBe(false);
+    });
+
+    it('an update without its state keeps the draft when settings.json changes', () => {
+      const page = restarted();
+      page.receive({ type: 'external', generation: 3, entries: [THEIRS], notices: [] });
+      expect(page.byId('entry-0-pattern').value).toBe('^web-x(.+)$');
+      expect(page.posted.filter((message) => message.type === 'accept')).toEqual([]);
+    });
+
+    it('a state with saving: true makes the form read-only until a state without it', () => {
+      const page = loadScript();
+      page.receive({ type: 'load', seq: 7, generation: 2, entries: [ENTRY], notices: [], testName: '' });
+      page.receive(state(7, { saving: true }));
+      expect(page.byId('form').disabled).toBe(true);
+      page.receive(state(7));
+      expect(page.byId('form').disabled).toBe(false);
+    });
+  });
+
+  // Review round 6 of PR #21, finding 2: the extension refuses more entries than EditorLimits.entries.
+  it(`disables Add at ${EditorLimits.entries} entries`, () => {
+    const page = loadScript();
+    const entries = Array.from({ length: EditorLimits.entries - 1 }, (_value, index) => ({ name: '', pattern: `^e${index}`, flags: '' }));
+    page.receive({ type: 'load', seq: 0, generation: 1, entries, notices: [], testName: '' });
+    const add = page.byId('add');
+    expect(add.disabled).toBe(false);
+    add.dispatch('click');
+    expect(page.posted[1]).toMatchObject({ type: 'update', seq: 1 });
+    expect((page.posted[1].entries as unknown[]).length).toBe(EditorLimits.entries);
+    expect(add.disabled).toBe(true);
+    add.dispatch('click');
+    expect(page.posted).toHaveLength(2);
+    // Remove enables it again.
+    page.byId(`entry-0-remove`).dispatch('click');
+    expect(add.disabled).toBe(false);
   });
 });
