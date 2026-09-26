@@ -18,7 +18,8 @@ export const EditorLimits = {
   entries: 200,
   name: 200,
   pattern: 5000,
-  testName: 300,
+  /** An owner (39 characters at most on GitHub), a slash, and a repository name (100 at most). */
+  testName: 140,
 } as const;
 
 /** At most this many nodes of the tree are sent to the preview, over all owners; the rest is counted. */
@@ -67,6 +68,14 @@ export const GroupsEditorTexts = {
   keepTheirs: 'Keep settings.json',
   saveCancelled: 'Nothing was saved.',
   saved: 'Saved to the user settings.',
+  entryTooSlow:
+    'This regular expression takes too long for the repository names of the view (for example a nested repetition such as (a+)+). It would make VS Code stop responding. Change it before you save.',
+  previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
+  testTooSlow: 'The test was stopped: the regular expressions took more than 1 second for this name.',
+  tooSlowNotSaved: 'A regular expression takes too long for the repository names of the view. Nothing was saved.',
+  orderConflict:
+    'The entries of devEnvLauncher.repositoryGroups were moved both in this editor and in settings.json. Which order do you want to keep?',
+  orderConflictDetail: 'The other changes of both sides are kept either way.',
   savedMerged: 'Saved to the user settings, together with the changes made in settings.json meanwhile.',
   slow: (milliseconds: number) =>
     `Grouping took ${milliseconds} ms. A regular expression may be slow, for example one with a nested repetition such as (a+)+.`,
@@ -184,32 +193,35 @@ function stableJson(value: unknown): string {
 /** Messages of the webview. Every message is checked with parseEditorRequest; anything else is dropped. */
 export type EditorRequest =
   | { type: 'ready' }
-  | { type: 'update'; seq: number; entries: EditorEntry[]; testName: string }
-  | { type: 'save'; seq: number; entries: EditorEntry[] }
+  | { type: 'update'; seq: number; generation: number; entries: EditorEntry[]; testName: string }
+  | { type: 'save'; seq: number; generation: number; entries: EditorEntry[] }
   | { type: 'reload' }
-  | { type: 'cancel' };
+  | { type: 'cancel' }
+  /** An update or Save for entries of an earlier load (their origins name another base): ignored. */
+  | { type: 'stale' };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
- * wrong types, flags other than i, u, and s, and texts or lists over EditorLimits are refused.
+ * wrong types, flags other than i, u, and s, and texts or lists over EditorLimits are refused. `generation` counts the
+ * loads of the editor; an update or Save of another load is `stale`.
  */
-export function parseEditorRequest(raw: unknown, context: { baseLength: number }): EditorRequest | undefined {
+export function parseEditorRequest(raw: unknown, context: { baseLength: number; generation: number }): EditorRequest | undefined {
   if (!isPlainObject(raw)) return undefined;
   switch (raw.type) {
     case 'ready':
     case 'reload':
     case 'cancel':
       return hasOnlyKeys(raw, ['type']) ? { type: raw.type } : undefined;
-    case 'update': {
-      if (!hasOnlyKeys(raw, ['type', 'seq', 'entries', 'testName']) || !isSeq(raw.seq)) return undefined;
-      const entries = parseEntries(raw.entries, context.baseLength);
-      if (!entries || !isText(raw.testName, EditorLimits.testName)) return undefined;
-      return { type: 'update', seq: raw.seq, entries, testName: raw.testName };
-    }
+    case 'update':
     case 'save': {
-      if (!hasOnlyKeys(raw, ['type', 'seq', 'entries']) || !isSeq(raw.seq)) return undefined;
+      const keys = raw.type === 'update' ? ['type', 'seq', 'generation', 'entries', 'testName'] : ['type', 'seq', 'generation', 'entries'];
+      if (!hasOnlyKeys(raw, keys) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
+      if (raw.generation !== context.generation) return { type: 'stale' };
       const entries = parseEntries(raw.entries, context.baseLength);
-      return entries ? { type: 'save', seq: raw.seq, entries } : undefined;
+      if (!entries) return undefined;
+      if (raw.type === 'save') return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
+      if (!isText(raw.testName, EditorLimits.testName)) return undefined;
+      return { type: 'update', seq: raw.seq, generation: raw.generation, entries, testName: raw.testName };
     }
     default:
       return undefined;
@@ -272,31 +284,38 @@ export interface MergeConflict {
 
 export type ConflictChoice = 'mine' | 'theirs';
 
+/** The answers to the questions of a merge: per base index, and for the order. */
+export interface MergeChoices {
+  entries?: ReadonlyMap<number, ConflictChoice>;
+  order?: ConflictChoice;
+}
+
 export type MergeOutcome =
-  | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[] }
-  | { status: 'conflicts'; conflicts: MergeConflict[] };
+  | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[]; orderConflict: boolean }
+  /** Questions without an answer in the choices: the entries, and whether both sides moved entries differently. */
+  | { status: 'conflicts'; conflicts: MergeConflict[]; orderConflict: boolean };
 
 type SideState = { kind: 'unchanged' } | { kind: 'removed' } | { kind: 'edited'; value: unknown };
 
 type Token = { kind: 'base'; index: number } | { kind: 'new'; value: unknown };
 
 /**
- * Save never overwrites a change made in settings.json meanwhile: a 3-way merge of the setting value. `base` is the
- * value that the editor loaded (the value when it opened or was last saved or loaded), `ours` the entries of the editor
- * (each with the `origin` it was loaded from, none when added), and `theirs` the value stored now. The changes of the
- * editor (additions, removals, edits, and moves) are applied to `theirs`; entries that only settings.json added or
- * changed stay. An element changed on both sides in the same way is no conflict. An element changed differently on both
- * sides (also removed on one side and edited on the other) is a conflict: without a choice in `choices` (by base index)
- * the result lists the conflicts and no value. The elements of `theirs` are matched to the base by content (longest
- * common subsequence of the entries, then entries with the same pattern or name, then by position in the gaps). The
- * order: the order of the editor when it moved entries, otherwise the order of settings.json; the entries that only the
- * other side has are placed after their predecessor on that side.
+ * Save never overwrites a change made in settings.json meanwhile: a 3-way merge of the setting value by the identity of
+ * the entries. `base` is the value that the editor loaded (when it opened, or was last saved or loaded), `ours` the
+ * entries of the editor (each with the `origin` it was loaded from, none when added), and `theirs` the value stored
+ * now. The elements of `theirs` are matched to the base over the whole list (alignToBase), so an entry that
+ * settings.json only moved keeps its identity. Per identity: the change of the one side that changed it wins; the same
+ * change on both sides is no conflict; different changes (also removed on one side and edited on the other) are a
+ * conflict, answered in `choices.entries` by base index. Additions of both sides stay, with their multiplicity (an entry
+ * that both sides added once is written once). The order: the order of the side that moved entries; when both moved
+ * entries differently, a question (`orderConflict`, answered in `choices.order`); otherwise the order of settings.json.
+ * The entries that only the other side has are placed after their predecessor on that side.
  */
 export function mergeRepositoryGroups(
   baseValue: unknown,
   ours: readonly EditorEntry[],
   theirsValue: unknown,
-  choices: ReadonlyMap<number, ConflictChoice> = new Map(),
+  choices: MergeChoices = {},
 ): MergeOutcome {
   const base = Array.isArray(baseValue) ? (baseValue as unknown[]) : [];
   const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
@@ -316,7 +335,7 @@ export function mergeRepositoryGroups(
     }
   });
 
-  // settings.json: its elements matched to the base by content.
+  // settings.json: its elements matched to the base by content, over the whole list.
   const theirsOrigins = alignToBase(base, theirs);
   const theirsByOrigin = new Map<number, unknown>();
   const theirsTokens: Token[] = theirs.map((value, position) => {
@@ -332,9 +351,8 @@ export function mergeRepositoryGroups(
     return entryKey(value) === baseKeys[index] ? { kind: 'unchanged' } : { kind: 'edited', value };
   };
 
-  // The decision per base element: its value, or `undefined` when it is removed.
   const conflicts: MergeConflict[] = [];
-  let unresolved = false;
+  const unresolved: MergeConflict[] = [];
   const decided = new Map<number, { keep: true; value: unknown } | { keep: false }>();
   base.forEach((baseEntry, index) => {
     const mine = state(oursByOrigin, index);
@@ -347,26 +365,45 @@ export function mergeRepositoryGroups(
     if (mine.kind === 'edited' && other.kind === 'edited' && entryKey(mine.value) === entryKey(other.value)) {
       return decided.set(index, { keep: true, value: other.value });
     }
-    conflicts.push({
+    const conflict: MergeConflict = {
       baseIndex: index,
       base: baseEntry,
       ...(mine.kind === 'edited' ? { mine: mine.value } : {}),
       ...(other.kind === 'edited' ? { theirs: other.value } : {}),
-    });
-    const choice = choices.get(index);
+    };
+    conflicts.push(conflict);
+    const choice = choices.entries?.get(index);
     if (choice === undefined) {
-      unresolved = true;
+      unresolved.push(conflict);
       return decided.set(index, { keep: false });
     }
     return decided.set(index, choice === 'mine' ? valueOf(mine, oursByOrigin) : valueOf(other, theirsByOrigin));
   });
-  if (unresolved) return { status: 'conflicts', conflicts };
+
+  // The order: of the side that moved entries; a question when both moved them differently.
+  const oursMoved = isReordered(oursTokens);
+  const theirsMoved = isReordered(theirsTokens);
+  let orderConflict = false;
+  let skeletonSide: ConflictChoice = oursMoved ? 'mine' : 'theirs';
+  if (oursMoved && theirsMoved) {
+    const inOurs = new Set(oursByOrigin.keys());
+    const inTheirs = new Set(theirsByOrigin.keys());
+    const common = (tokens: Token[], other: Set<number>) =>
+      tokens.flatMap((token) => (token.kind === 'base' && other.has(token.index) ? [token.index] : []));
+    orderConflict = common(oursTokens, inTheirs).join(',') !== common(theirsTokens, inOurs).join(',');
+    if (orderConflict) skeletonSide = choices.order ?? 'mine';
+  }
+  const orderUnresolved = orderConflict && choices.order === undefined;
+  if (unresolved.length > 0 || orderUnresolved) return { status: 'conflicts', conflicts: unresolved, orderConflict: orderUnresolved };
 
   const kept = (token: Token) => token.kind === 'new' || decided.get(token.index)?.keep === true;
-  const oursMoved = isReordered(oursTokens.filter(kept));
-  const [skeleton, other] = oursMoved ? [oursTokens, theirsTokens] : [theirsTokens, oursTokens];
+  const [skeleton, other] = skeletonSide === 'mine' ? [oursTokens, theirsTokens] : [theirsTokens, oursTokens];
   const merged: Token[] = skeleton.filter(kept);
-  const newKeys = new Set(merged.filter((token) => token.kind === 'new').map((token) => entryKey((token as { value: unknown }).value)));
+  // Additions of the skeleton side, per entry: an equal addition of the other side is the same entry.
+  const unmatchedNew = new Map<string, number>();
+  for (const token of merged) {
+    if (token.kind === 'new') unmatchedNew.set(entryKey(token.value), (unmatchedNew.get(entryKey(token.value)) ?? 0) + 1);
+  }
   let last = -1;
   for (const token of other) {
     if (token.kind === 'base') {
@@ -377,14 +414,13 @@ export function mergeRepositoryGroups(
       }
       if (!kept(token)) continue;
     } else {
-      // Both sides added the same entry: once.
       const key = entryKey(token.value);
-      if (newKeys.has(key)) {
-        const at = merged.findIndex((placed) => placed.kind === 'new' && entryKey(placed.value) === key);
-        if (at >= 0) last = at;
+      const left = unmatchedNew.get(key) ?? 0;
+      if (left > 0) {
+        unmatchedNew.set(key, left - 1);
+        last = merged.findIndex((placed) => placed.kind === 'new' && entryKey(placed.value) === key);
         continue;
       }
-      newKeys.add(key);
     }
     merged.splice(last + 1, 0, token);
     last += 1;
@@ -394,7 +430,7 @@ export function mergeRepositoryGroups(
     const decision = decided.get(token.index);
     return decision?.keep ? decision.value : undefined;
   });
-  return { status: 'merged', value, conflicts };
+  return { status: 'merged', value, conflicts, orderConflict };
 }
 
 /** The base indices of the tokens that come from the base are not in increasing order: the entries were moved. */
@@ -409,61 +445,59 @@ function isReordered(tokens: readonly Token[]): boolean {
 }
 
 /**
- * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition: equal
- * entries by the longest common subsequence; in each gap between them, the entries with the same pattern or the same
- * name, then the rest by position when both sides of the gap have the same number of entries.
+ * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition. The
+ * matching looks at the whole list, so a moved entry keeps its identity: first equal entries (each base entry once, so
+ * duplicates keep their multiplicity), then entries with the same pattern, then with the same name; last, the
+ * remaining entries after the same matched neighbor, in order (an entry whose pattern and name both changed, also next
+ * to an addition).
  */
 function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Array<number | undefined> {
-  const a = base.map(entryKey);
-  const b = theirs.map(entryKey);
-  const lengths: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      lengths[i][j] = a[i] === b[j] ? lengths[i + 1][j + 1] + 1 : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
-    }
-  }
   const origins = new Array<number | undefined>(theirs.length).fill(undefined);
-  const pairGap = (baseGap: number[], theirsGap: number[]) => {
-    const restBase: number[] = [];
-    const used = new Set<number>();
-    for (const i of baseGap) {
-      const fields = entryFieldsOf(base[i]);
-      const j = theirsGap.find((candidate) => {
-        if (used.has(candidate)) return false;
-        const other = entryFieldsOf(theirs[candidate]);
-        if (!fields || !other) return false;
-        return fields.pattern === other.pattern || (fields.name !== undefined && fields.name === other.name);
-      });
-      if (j === undefined) restBase.push(i);
-      else {
-        used.add(j);
-        origins[j] = i;
-      }
-    }
-    const restTheirs = theirsGap.filter((j) => !used.has(j));
-    if (restBase.length === restTheirs.length) restBase.forEach((i, k) => (origins[restTheirs[k]] = i));
-  };
-  let i = 0;
-  let j = 0;
-  let baseGap: number[] = [];
-  let theirsGap: number[] = [];
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
-      pairGap(baseGap, theirsGap);
-      baseGap = [];
-      theirsGap = [];
+  const used = new Set<number>();
+  const pass = (same: (baseIndex: number, theirsIndex: number) => boolean) => {
+    theirs.forEach((_value, j) => {
+      if (origins[j] !== undefined) return;
+      const i = base.findIndex((_entry, candidate) => !used.has(candidate) && same(candidate, j));
+      if (i < 0) return;
       origins[j] = i;
-      i++;
-      j++;
-    } else if (lengths[i + 1][j] >= lengths[i][j + 1]) {
-      baseGap.push(i++);
-    } else {
-      theirsGap.push(j++);
-    }
+      used.add(i);
+    });
+  };
+  const baseKeys = base.map(entryKey);
+  const theirsKeys = theirs.map(entryKey);
+  const baseFields = base.map(entryFieldsOf);
+  const theirsFields = theirs.map(entryFieldsOf);
+  pass((i, j) => baseKeys[i] === theirsKeys[j]);
+  pass((i, j) => baseFields[i] !== undefined && baseFields[i]?.pattern === theirsFields[j]?.pattern);
+  pass((i, j) => baseFields[i]?.name !== undefined && baseFields[i]?.name === theirsFields[j]?.name);
+
+  // Neighbors: the position in `theirs` of the nearest matched entry before.
+  const theirsPositionOf = new Map<number, number>();
+  origins.forEach((origin, j) => origin !== undefined && theirsPositionOf.set(origin, j));
+  const baseAnchor = (i: number) => {
+    for (let k = i - 1; k >= 0; k--) if (theirsPositionOf.has(k)) return theirsPositionOf.get(k) ?? -1;
+    return -1;
+  };
+  const theirsAnchor = (j: number) => {
+    for (let k = j - 1; k >= 0; k--) if (origins[k] !== undefined) return k;
+    return -1;
+  };
+  const leftBase = new Map<number, number[]>();
+  base.forEach((_entry, i) => {
+    if (used.has(i)) return;
+    const anchor = baseAnchor(i);
+    leftBase.set(anchor, [...(leftBase.get(anchor) ?? []), i]);
+  });
+  const leftTheirs = new Map<number, number[]>();
+  theirs.forEach((_value, j) => {
+    if (origins[j] !== undefined) return;
+    const anchor = theirsAnchor(j);
+    leftTheirs.set(anchor, [...(leftTheirs.get(anchor) ?? []), j]);
+  });
+  for (const [anchor, baseIndices] of leftBase) {
+    const theirsIndices = leftTheirs.get(anchor) ?? [];
+    baseIndices.slice(0, theirsIndices.length).forEach((i, k) => (origins[theirsIndices[k]] = i));
   }
-  while (i < a.length) baseGap.push(i++);
-  while (j < b.length) theirsGap.push(j++);
-  pairGap(baseGap, theirsGap);
   return origins;
 }
 
@@ -476,7 +510,9 @@ function entryFieldsOf(entry: unknown): { name?: string; pattern: string; flags?
   if (name !== undefined && typeof name !== 'string') return undefined;
   if (flags !== undefined && typeof flags !== 'string') return undefined;
   const trimmed = name?.trim();
-  return { ...(trimmed ? { name: trimmed } : {}), pattern, ...(flags ? { flags } : {}) };
+  // The order of the flags and a repeated flag do not change the meaning ('si' is 'is').
+  const sorted = [...new Set(flags ?? '')].sort().join('');
+  return { ...(trimmed ? { name: trimmed } : {}), pattern, ...(sorted ? { flags: sorted } : {}) };
 }
 
 /**
@@ -537,6 +573,8 @@ export interface GroupsPreview {
   owners: OwnerPreview[];
   /** Nodes left out after MAX_PREVIEW_NODES. */
   truncated: number;
+  /** The regular expressions took longer than the time limit on the loaded names: no preview (PreviewRun). */
+  tooSlow?: boolean;
 }
 
 /**
@@ -662,13 +700,76 @@ export function testRepositoryName(entries: readonly EditorEntry[], text: string
   };
 }
 
+// ---- Preview job (runs in a worker thread) ----------------------------------------------------------------------
+
+/**
+ * The work of the preview and the test field, which runs the regular expressions of the draft. It runs in a worker
+ * thread (groupsPreviewWorker.ts) with a time limit (groupsPreviewRunner.ts), because a regular expression with a nested
+ * repetition such as `(\w+)+$` can take seconds for one name and would stop the extension host.
+ */
+export interface PreviewJob {
+  id: number;
+  entries: EditorEntry[];
+  testName: string;
+  /** The sidebar input without functions (cloneableInput), or `undefined` before the first render. */
+  input: TreeInput | undefined;
+}
+
+/** Messages of the worker: `probe` before each entry runs on all names, then the preview, then the test. */
+export type PreviewJobMessage =
+  | { type: 'probe'; id: number; entryIndex: number }
+  | { type: 'preview'; id: number; preview: GroupsPreview }
+  | { type: 'test'; id: number; test?: NameTest };
+
+/** The result of a preview job for the editor: what finished within the time limit. */
+export interface PreviewRun {
+  preview?: GroupsPreview;
+  test?: NameTest;
+  /** The names of the view took too long: no preview; `slowEntry` is the entry that ran when the limit was reached. */
+  previewTooSlow?: boolean;
+  slowEntry?: number;
+  /** The test name took too long (the preview finished). */
+  testTooSlow?: boolean;
+  /** The worker failed. */
+  failed?: boolean;
+}
+
+/** The input of the sidebar for a worker message: without `formatTime`, which a structured clone cannot copy. */
+export function cloneableInput(input: TreeInput | undefined): TreeInput | undefined {
+  if (!input) return undefined;
+  const { formatTime: _formatTime, ...rest } = input;
+  return rest;
+}
+
+/**
+ * Runs a preview job and reports each step through `post`: before an entry runs on all names of the view a `probe`
+ * (so a stopped worker names the slow entry), then the preview, then the test of the name.
+ */
+export function runPreviewJob(job: PreviewJob, post: (message: PreviewJobMessage) => void): void {
+  if (job.input) {
+    const { patterns } = parseRepositoryGroups(toSettingValue(job.entries));
+    const names = [...new Set(repositoryRows(buildTreeModel({ ...job.input, repositoryGroups: [] })).map((row) => row.name))];
+    for (const pattern of patterns) {
+      post({ type: 'probe', id: job.id, entryIndex: pattern.index });
+      for (const name of names) pattern.regex.exec(name);
+    }
+  }
+  post({ type: 'preview', id: job.id, preview: buildGroupsPreview(job.input, job.entries) });
+  const test = testRepositoryName(job.entries, job.testName);
+  post({ type: 'test', id: job.id, ...(test ? { test } : {}) });
+}
+
 // ---- State of the webview ---------------------------------------------------------------------------------------
 
-/** Message to the webview: the entries to show (at the start, and after Load Setting). */
+/** Message to the webview: the entries to show (at the start, and after Load Setting or Save). */
 export interface EditorLoadMessage {
   type: 'load';
+  /** Counts the loads; the webview sends it back with its updates. */
+  generation: number;
   entries: EditorEntry[];
   notices: string[];
+  /** The text of the test field, so a restored webview shows the text of its result. */
+  testName: string;
 }
 
 /** Message to the webview: everything the extension computes for the entries of the webview. */
@@ -688,26 +789,31 @@ export interface EditorStateMessage {
   status?: string;
 }
 
-/** The state for the webview: checks, preview, and the test of the name. */
+/** The state for the webview: the checks, and the preview and the test of a preview job (PreviewRun). */
 export function editorState(options: {
   seq: number;
   entries: readonly EditorEntry[];
   loaded: readonly EditorEntry[];
-  testName: string;
-  input: TreeInput | undefined;
+  run: PreviewRun | undefined;
   changedOutside: boolean;
   status?: string;
 }): EditorStateMessage {
-  const checks = checkEntries(options.entries);
-  const test = testRepositoryName(options.entries, options.testName);
+  const run = options.run ?? {};
+  const checks = checkEntries(options.entries).map((check, index) =>
+    run.previewTooSlow && run.slowEntry === index && check.error === undefined ? { error: GroupsEditorTexts.entryTooSlow } : check,
+  );
+  const preview: GroupsPreview = run.previewTooSlow
+    ? { loaded: true, owners: [], truncated: 0, tooSlow: true }
+    : (run.preview ?? { loaded: false, owners: [], truncated: 0 });
+  const test: NameTest | undefined = run.testTooSlow ? { matched: false, text: GroupsEditorTexts.testTooSlow, path: [] } : run.test;
   return {
     type: 'state',
     seq: options.seq,
     checks,
-    canSave: canSave(checks),
+    canSave: canSave(checks) && !run.previewTooSlow,
     dirty: !sameSettingValue(toSettingValue(options.entries), toSettingValue(options.loaded)),
     changedOutside: options.changedOutside,
-    preview: buildGroupsPreview(options.input, options.entries),
+    preview,
     ...(test ? { test } : {}),
     ...(options.status !== undefined ? { status: options.status } : {}),
   };

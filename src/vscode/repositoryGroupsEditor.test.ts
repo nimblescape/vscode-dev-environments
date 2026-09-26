@@ -84,13 +84,37 @@ vi.mock('vscode', async () => {
 
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
-import { GroupsEditorTexts } from './repositoryGroupsEditorModel';
+import type { PreviewRunner } from './groupsPreviewRunner';
+import { GroupsEditorTexts, runPreviewJob, type PreviewJobMessage, type PreviewRun } from './repositoryGroupsEditorModel';
+
+/** Runs the job in this thread, as the worker does; `next` replaces the result of the next job. */
+function inlineRunner(): PreviewRunner & { next: PreviewRun | undefined; run: ReturnType<typeof vi.fn> } {
+  const runner = {
+    next: undefined as PreviewRun | undefined,
+    run: vi.fn(async (job: Parameters<PreviewRunner['run']>[0]): Promise<PreviewRun> => {
+      if (runner.next) {
+        const next = runner.next;
+        runner.next = undefined;
+        return next;
+      }
+      const run: PreviewRun = {};
+      runPreviewJob({ ...job, id: 1 }, (message: PreviewJobMessage) => {
+        if (message.type === 'preview') run.preview = message.preview;
+        if (message.type === 'test' && message.test) run.test = message.test;
+      });
+      return run;
+    }),
+    dispose: vi.fn(),
+  };
+  return runner;
+}
 
 const EXAMPLE = String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`;
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 let logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
 let update: ReturnType<typeof vi.fn>;
+let runner: ReturnType<typeof inlineRunner>;
 
 beforeEach(() => {
   resetFakeVscode();
@@ -105,6 +129,7 @@ beforeEach(() => {
     update,
   }));
   logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  runner = inlineRunner();
 });
 
 async function openEditor(): Promise<{ editor: RepositoryGroupsEditor; panel: FakePanel }> {
@@ -113,12 +138,18 @@ async function openEditor(): Promise<{ editor: RepositoryGroupsEditor; panel: Fa
     logger: logger as never,
     groupingInput: () => undefined,
     onDidRender: () => ({ dispose() {} }),
+    previewRunner: runner,
   });
   await editor.open();
   const panel = hoisted.panels[hoisted.panels.length - 1] as FakePanel;
   panel.receive({ type: 'ready' });
   await flush();
   return { editor, panel };
+}
+
+/** The generation of the last load, which the webview sends back. */
+function gen(panel: FakePanel): number {
+  return (loaded(panel) as unknown as { generation: number }).generation;
 }
 
 function loaded(panel: FakePanel) {
@@ -146,7 +177,7 @@ describe('RepositoryGroupsEditor', () => {
   it('ignores a message that is not valid', async () => {
     const { panel } = await openEditor();
     const before = panel.posted.length;
-    panel.receive({ type: 'save', seq: 1, entries: [{ name: '', pattern: '^a', flags: 'g' }] });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ name: '', pattern: '^a', flags: 'g' }] });
     await flush();
     expect(update).not.toHaveBeenCalled();
     expect(panel.posted).toHaveLength(before);
@@ -155,7 +186,7 @@ describe('RepositoryGroupsEditor', () => {
 
   it('checks the entries again before it saves', async () => {
     const { panel } = await openEditor();
-    panel.receive({ type: 'save', seq: 1, entries: [{ name: '', pattern: '(', flags: '' }] });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ name: '', pattern: '(', flags: '' }] });
     await flush();
     expect(update).not.toHaveBeenCalled();
     const state = panel.posted[panel.posted.length - 1];
@@ -165,7 +196,7 @@ describe('RepositoryGroupsEditor', () => {
   it('writes the user settings (Global) as strings and objects, and loads the written value as the new base', async () => {
     const { panel } = await openEditor();
     const [example] = loaded(panel).entries;
-    panel.receive({ type: 'save', seq: 2, entries: [example, { name: '', pattern: '^api-(.+)$', flags: 'i' }] });
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [example, { name: '', pattern: '^api-(.+)$', flags: 'i' }] });
     await flush();
     expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { pattern: '^api-(.+)$', flags: 'i' }], fakeVscode.ConfigurationTarget.Global);
     expect(loaded(panel).entries).toEqual([
@@ -180,8 +211,10 @@ describe('RepositoryGroupsEditor', () => {
     const [example, web] = loaded(panel).entries;
     hoisted.stored.value = ['^first', EXAMPLE, { name: 'Web', pattern: '^web-(.+)$' }];
     for (const listener of hoisted.configurationListeners) listener({ affectsConfiguration: () => true });
+    // The state is computed with the preview job (asynchronous since the worker thread).
+    await flush();
     expect(panel.posted[panel.posted.length - 1]).toMatchObject({ type: 'state', changedOutside: true });
-    panel.receive({ type: 'save', seq: 3, entries: [example, { ...web, pattern: '^www-(.+)$' }] });
+    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries: [example, { ...web, pattern: '^www-(.+)$' }] });
     await flush();
     expect(update).toHaveBeenCalledWith(
       'repositoryGroups',
@@ -197,7 +230,7 @@ describe('RepositoryGroupsEditor', () => {
     const [example, web] = loaded(panel).entries;
     hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
     const entries = [example, { ...web, pattern: '^www-(.+)$' }];
-    panel.receive({ type: 'save', seq: 3, entries });
+    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries });
     await flush();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
       GroupsEditorTexts.conflict(2),
@@ -208,7 +241,7 @@ describe('RepositoryGroupsEditor', () => {
     expect(update).not.toHaveBeenCalled();
 
     fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.keepMine);
-    panel.receive({ type: 'save', seq: 4, entries });
+    panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries });
     await flush();
     expect(update).toHaveBeenCalledWith(
       'repositoryGroups',
@@ -219,15 +252,72 @@ describe('RepositoryGroupsEditor', () => {
 
   it('removes the setting when the list is empty, and discards the draft with Cancel', async () => {
     const { editor, panel } = await openEditor();
-    panel.receive({ type: 'save', seq: 1, entries: [] });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [] });
     await flush();
     expect(update).toHaveBeenCalledWith('repositoryGroups', undefined, fakeVscode.ConfigurationTarget.Global);
-    panel.receive({ type: 'update', seq: 2, entries: [{ name: '', pattern: '^x', flags: '' }], testName: '' });
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries: [{ name: '', pattern: '^x', flags: '' }], testName: '' });
     panel.receive({ type: 'cancel' });
     await flush();
     expect(panel.disposed).toBe(true);
     expect(update).toHaveBeenCalledTimes(1);
     await editor.open();
     expect(hoisted.panels).toHaveLength(2);
+  });
+  it('ignores updates of an earlier load and during Save, and gives the test name back with a load', async () => {
+    const { panel } = await openEditor();
+    const [example, web] = loaded(panel).entries;
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: [example, web], testName: 'school/web-shop' });
+    await flush();
+    let answer: (value: unknown) => void = () => {};
+    hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
+    fakeVscode.window.showWarningMessage.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    const oldGeneration = gen(panel);
+    panel.receive({ type: 'save', seq: 2, generation: oldGeneration, entries: [example, { ...web, pattern: '^www-(.+)$' }] });
+    await flush();
+    // While the question of Save is open, an update does not change the draft that Save writes.
+    panel.receive({ type: 'update', seq: 3, generation: oldGeneration, entries: [], testName: 'school/web-shop' });
+    answer(GroupsEditorTexts.keepMine);
+    await flush();
+    expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
+    const load = loaded(panel) as unknown as { generation: number; testName: string };
+    expect(load.generation).toBe(oldGeneration + 1);
+    expect(load.testName).toBe('school/web-shop');
+    // An update of the earlier load names origins of another base: ignored without a warning.
+    update.mockClear();
+    panel.receive({ type: 'save', seq: 4, generation: oldGeneration, entries: [] });
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('asks once about the order when both sides moved entries differently', async () => {
+    hoisted.stored.value = ['^a', '^b', '^c'];
+    const { panel } = await openEditor();
+    const [a, b, c] = loaded(panel).entries;
+    hoisted.stored.value = ['^b', '^a', '^c'];
+    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.keepTheirs);
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [c, a, b] });
+    await flush();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
+      GroupsEditorTexts.orderConflict,
+      expect.objectContaining({ modal: true }),
+      GroupsEditorTexts.keepMine,
+      GroupsEditorTexts.keepTheirs,
+    );
+    // Nothing else changed, so the stored value stays.
+    expect(update).not.toHaveBeenCalled();
+    expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(['^b', '^a', '^c']);
+  });
+
+  it('does not save a regular expression that is too slow for the names of the view, and names it', async () => {
+    const { panel } = await openEditor();
+    const [example] = loaded(panel).entries;
+    runner.next = { previewTooSlow: true, slowEntry: 1 };
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example, { name: '', pattern: String.raw`^(\w+)+$`, flags: '' }] });
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+    const states = panel.posted.filter((message) => message.type === 'state');
+    expect(states[states.length - 1]).toMatchObject({ status: GroupsEditorTexts.tooSlowNotSaved });
   });
 });

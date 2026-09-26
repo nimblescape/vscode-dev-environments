@@ -19,7 +19,11 @@ import {
   sameSettingValue,
   testRepositoryName,
   toSettingValue,
+  cloneableInput,
+  runPreviewJob,
   type EditorEntry,
+  type MergeChoices,
+  type PreviewJobMessage,
   type PreviewNode,
 } from './repositoryGroupsEditorModel';
 import { buildTreeModel, type GroupNode, type HintRow, type RepositoryRow, type TreeInput } from './treeModel';
@@ -60,6 +64,8 @@ function environment(id: string, repository: string): Environment {
 function discovery(repositories: RepositoryInfo[]): DiscoveryData {
   return { version: 1, fetchedAt: T0, viewerLogin: 'me', organizations: [], repositories, hints: [] };
 }
+
+const input_ = (overrides: Partial<TreeInput> = {}): TreeInput => input(overrides);
 
 function input(overrides: Partial<TreeInput> = {}): TreeInput {
   return {
@@ -279,20 +285,23 @@ describe('test of a repository name', () => {
 });
 
 describe('messages of the webview', () => {
-  const context = { baseLength: 2 };
+  const context = { baseLength: 2, generation: 5 };
   const valid = { name: 'A', pattern: '^a', flags: 'is' };
 
   it('accepts exactly the messages of the editor', () => {
     expect(parseEditorRequest({ type: 'ready' }, context)).toEqual({ type: 'ready' });
     expect(parseEditorRequest({ type: 'reload' }, context)).toEqual({ type: 'reload' });
     expect(parseEditorRequest({ type: 'cancel' }, context)).toEqual({ type: 'cancel' });
-    expect(parseEditorRequest({ type: 'update', seq: 3, entries: [valid, { ...valid, origin: 1 }], testName: 'x' }, context)).toEqual({
+    expect(parseEditorRequest({ type: 'update', seq: 3, generation: 5, entries: [valid, { ...valid, origin: 1 }], testName: 'x' }, context)).toEqual({
       type: 'update',
       seq: 3,
+      generation: 5,
       entries: [valid, { ...valid, origin: 1 }],
       testName: 'x',
     });
-    expect(parseEditorRequest({ type: 'save', seq: 0, entries: [] }, context)).toEqual({ type: 'save', seq: 0, entries: [] });
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [] }, context)).toEqual({ type: 'save', seq: 0, generation: 5, entries: [] });
+    // An update of an earlier load: its origins name another base.
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [{ ...valid, origin: 9 }] }, context)).toEqual({ type: 'stale' });
   });
 
   it.each<[string, unknown]>([
@@ -301,52 +310,67 @@ describe('messages of the webview', () => {
     ['null', null],
     ['an unknown type', { type: 'write' }],
     ['an extra property', { type: 'ready', extra: 1 }],
-    ['a missing property', { type: 'update', seq: 1, entries: [] }],
-    ['a sequence that is no whole number', { type: 'save', seq: 1.5, entries: [] }],
-    ['a negative sequence', { type: 'save', seq: -1, entries: [] }],
-    ['entries that are no list', { type: 'save', seq: 1, entries: {} }],
-    ['an entry that is a string', { type: 'save', seq: 1, entries: ['^a'] }],
-    ['an entry with an extra property', { type: 'save', seq: 1, entries: [{ ...valid, regex: '^a' }] }],
-    ['an entry without flags', { type: 'save', seq: 1, entries: [{ name: '', pattern: '^a' }] }],
-    ['a pattern that is no text', { type: 'save', seq: 1, entries: [{ ...valid, pattern: 1 }] }],
-    ['the flag g', { type: 'save', seq: 1, entries: [{ ...valid, flags: 'g' }] }],
-    ['a repeated flag', { type: 'save', seq: 1, entries: [{ ...valid, flags: 'ii' }] }],
-    ['an origin outside the loaded value', { type: 'save', seq: 1, entries: [{ ...valid, origin: 2 }] }],
-    ['an origin twice', { type: 'save', seq: 1, entries: [{ ...valid, origin: 0 }, { ...valid, origin: 0 }] }],
-    ['an origin that is no whole number', { type: 'save', seq: 1, entries: [{ ...valid, origin: '0' }] }],
-    ['a pattern over the limit', { type: 'save', seq: 1, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }] }],
-    ['a name over the limit', { type: 'save', seq: 1, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }] }],
-    ['too many entries', { type: 'save', seq: 1, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid) }],
-    ['a test name over the limit', { type: 'update', seq: 1, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a missing property', { type: 'update', seq: 1, generation: 5, entries: [] }],
+    ['a missing generation', { type: 'save', seq: 1, entries: [] }],
+    ['a generation that is no number', { type: 'save', seq: 1, generation: '5', entries: [] }],
+    ['a sequence that is no whole number', { type: 'save', seq: 1.5, generation: 5, entries: [] }],
+    ['a negative sequence', { type: 'save', seq: -1, generation: 5, entries: [] }],
+    ['entries that are no list', { type: 'save', seq: 1, generation: 5, entries: {} }],
+    ['an entry that is a string', { type: 'save', seq: 1, generation: 5, entries: ['^a'] }],
+    ['an entry with an extra property', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, regex: '^a' }] }],
+    ['an entry without flags', { type: 'save', seq: 1, generation: 5, entries: [{ name: '', pattern: '^a' }] }],
+    ['a pattern that is no text', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 1 }] }],
+    ['the flag g', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'g' }] }],
+    ['a repeated flag', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'ii' }] }],
+    ['an origin outside the loaded value', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: 2 }] }],
+    ['an origin twice', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: 0 }, { ...valid, origin: 0 }] }],
+    ['an origin that is no whole number', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: '0' }] }],
+    ['a pattern over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }] }],
+    ['a name over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }] }],
+    ['too many entries', { type: 'save', seq: 1, generation: 5, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid) }],
+    ['a test name over the limit', { type: 'update', seq: 1, generation: 5, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
     ['an object with another prototype', Object.assign(Object.create({ polluted: true }) as object, { type: 'ready' })],
   ])('refuses %s', (_case, raw) => {
     expect(parseEditorRequest(raw, context)).toBeUndefined();
   });
 
   it('sorts the flags of an entry', () => {
-    const request = parseEditorRequest({ type: 'save', seq: 1, entries: [{ ...valid, flags: 'si' }] }, context);
-    expect(request).toEqual({ type: 'save', seq: 1, entries: [{ ...valid, flags: 'is' }] });
+    const request = parseEditorRequest({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'si' }] }, context);
+    expect(request).toEqual({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'is' }] });
   });
 });
 
 describe('state and HTML of the webview', () => {
-  it('computes the checks, the dirty flag, and the test for the webview', () => {
+  it('computes the checks, the dirty flag, the preview, and the test of a preview job for the webview', () => {
     const loaded = entriesFromSetting([EXAMPLE]).entries;
+    const test = testRepositoryName(loaded, 'x');
     const state = editorState({
       seq: 4,
       entries: [...loaded, entry('(')],
       loaded,
-      testName: 'x',
-      input: undefined,
+      run: { preview: { loaded: false, owners: [], truncated: 0 }, ...(test ? { test } : {}) },
       changedOutside: true,
     });
     expect(state).toMatchObject({ type: 'state', seq: 4, canSave: false, dirty: true, changedOutside: true });
     expect(state.checks).toHaveLength(2);
     expect(state.test?.matched).toBe(false);
-    expect(editorState({ seq: 0, entries: loaded, loaded, testName: '', input: undefined, changedOutside: false })).toMatchObject({
+    expect(editorState({ seq: 0, entries: loaded, loaded, run: undefined, changedOutside: false })).toMatchObject({
       canSave: true,
       dirty: false,
+      preview: { loaded: false },
     });
+  });
+
+  it('names the entry that was too slow, and keeps Save off', () => {
+    const entries = [entry('^a-(.+)$'), entry(String.raw`^(\w+)+$`)];
+    const state = editorState({ seq: 1, entries, loaded: [], run: { previewTooSlow: true, slowEntry: 1 }, changedOutside: false });
+    expect(state.checks[0]).toEqual({ note: GroupsEditorTexts.oneCapturingGroup });
+    expect(state.checks[1]).toEqual({ error: GroupsEditorTexts.entryTooSlow });
+    expect(state.canSave).toBe(false);
+    expect(state.preview).toEqual({ loaded: true, owners: [], truncated: 0, tooSlow: true });
+    const slowTest = editorState({ seq: 1, entries, loaded: [], run: { preview: buildGroupsPreview(undefined, entries), testTooSlow: true }, changedOutside: false });
+    expect(slowTest.test).toEqual({ matched: false, text: GroupsEditorTexts.testTooSlow, path: [] });
+    expect(slowTest.canSave).toBe(true);
   });
 
   it('has a strict Content Security Policy: nothing by default, the script only with the nonce, no remote content', () => {
@@ -371,51 +395,43 @@ describe('state and HTML of the webview', () => {
 describe('merge at Save (3-way)', () => {
   const BASE = ['^a', '^b', '^c'];
   const loaded = () => entriesFromSetting(BASE).entries;
-  const merge = (ours: EditorEntry[], theirs: unknown, choices?: Map<number, 'mine' | 'theirs'>) =>
-    mergeRepositoryGroups(BASE, ours, theirs, choices);
+  const merge = (ours: EditorEntry[], theirs: unknown, choices?: MergeChoices) => mergeRepositoryGroups(BASE, ours, theirs, choices);
+  const mine = (index: number, choice: 'mine' | 'theirs' = 'mine'): MergeChoices => ({ entries: new Map([[index, choice]]) });
+  const merged = (value: unknown[]) => ({ status: 'merged', value, conflicts: [], orderConflict: false });
 
   it('changes nothing when neither side changed', () => {
-    expect(merge(loaded(), [...BASE])).toEqual({ status: 'merged', value: BASE, conflicts: [] });
+    expect(merge(loaded(), [...BASE])).toEqual(merged(BASE));
   });
 
   it('applies the changes of the editor alone: edit, removal, addition, and move', () => {
-    const [a, b, c] = loaded();
-    expect(merge([{ ...b, pattern: '^B' }, a, entry('^d', 'D')], [...BASE])).toEqual({
-      status: 'merged',
-      value: ['^B', '^a', { name: 'D', pattern: '^d' }],
-      conflicts: [],
-    });
-    expect(c.origin).toBe(2);
+    const [a, b] = loaded();
+    expect(merge([{ ...b, pattern: '^B' }, a, entry('^d', 'D')], [...BASE])).toEqual(
+      merged(['^B', '^a', { name: 'D', pattern: '^d' }]),
+    );
   });
 
   it('keeps the changes of settings.json alone', () => {
     const theirs = ['^x', '^a', { name: 'B', pattern: '^b' }, '^c', '^y'];
-    expect(merge(loaded(), theirs)).toEqual({ status: 'merged', value: theirs, conflicts: [] });
-    expect(merge(loaded(), undefined)).toEqual({ status: 'merged', value: [], conflicts: [] });
+    expect(merge(loaded(), theirs)).toEqual(merged(theirs));
+    expect(merge(loaded(), undefined)).toEqual(merged([]));
   });
 
   it('merges changes of different entries on both sides', () => {
     const [a, b, c] = loaded();
-    const ours = [{ ...a, pattern: '^A' }, b, c, entry('^mine')];
-    const theirs = ['^theirs', '^a', '^b', '^C'];
-    expect(merge(ours, theirs)).toEqual({
-      status: 'merged',
-      value: ['^theirs', '^A', '^b', '^C', '^mine'],
-      conflicts: [],
-    });
+    expect(merge([{ ...a, pattern: '^A' }, b, c, entry('^mine')], ['^theirs', '^a', '^b', '^C'])).toEqual(
+      merged(['^theirs', '^A', '^b', '^C', '^mine']),
+    );
     // A removal in the editor and an edit of another entry in settings.json.
-    expect(merge([a, c], ['^a', '^b', '^C2'])).toEqual({ status: 'merged', value: ['^a', '^C2'], conflicts: [] });
+    expect(merge([a, c], ['^a', '^b', '^C2'])).toEqual(merged(['^a', '^C2']));
     // An addition in the editor stays after its predecessor when settings.json removed an entry.
-    expect(merge([a, b, entry('^new'), c], ['^a', '^c'])).toEqual({ status: 'merged', value: ['^a', '^new', '^c'], conflicts: [] });
+    expect(merge([a, b, entry('^new'), c], ['^a', '^c'])).toEqual(merged(['^a', '^new', '^c']));
   });
 
   it('is no conflict when both sides changed an entry in the same way', () => {
     const [a, b, c] = loaded();
-    expect(merge([a, { ...b, name: 'B' }, c], ['^a', { pattern: '^b', name: 'B' }, '^c'])).toEqual({
-      status: 'merged',
-      value: ['^a', { pattern: '^b', name: 'B' }, '^c'],
-      conflicts: [],
-    });
+    expect(merge([a, { ...b, name: 'B' }, c], ['^a', { pattern: '^b', name: 'B' }, '^c'])).toEqual(
+      merged(['^a', { pattern: '^b', name: 'B' }, '^c']),
+    );
     // The same addition on both sides is written once.
     expect(merge([a, b, c, entry('^d')], ['^a', '^b', '^c', '^d'])).toMatchObject({ value: ['^a', '^b', '^c', '^d'] });
   });
@@ -424,32 +440,78 @@ describe('merge at Save (3-way)', () => {
     const [a, b, c] = loaded();
     const ours = [{ ...a, pattern: '^A' }, { ...b, pattern: '^B1' }, c];
     const theirs = ['^a', '^B2', '^c', '^t'];
-    const outcome = merge(ours, theirs);
-    expect(outcome).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B1', theirs: '^B2' }] });
-    expect(merge(ours, theirs, new Map([[1, 'mine']]))).toMatchObject({ status: 'merged', value: ['^A', '^B1', '^c', '^t'] });
-    expect(merge(ours, theirs, new Map([[1, 'theirs']]))).toMatchObject({ status: 'merged', value: ['^A', '^B2', '^c', '^t'] });
+    expect(merge(ours, theirs)).toEqual({
+      status: 'conflicts',
+      conflicts: [{ baseIndex: 1, base: '^b', mine: '^B1', theirs: '^B2' }],
+      orderConflict: false,
+    });
+    expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^A', '^B1', '^c', '^t'] });
+    expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: ['^A', '^B2', '^c', '^t'] });
   });
 
-  it('asks when the editor edits an entry that settings.json removed', () => {
+  it('asks when the editor edits an entry that settings.json removed, and the other way', () => {
     const [a, b, c] = loaded();
     const ours = [a, { ...b, pattern: '^B' }, c];
     const theirs = ['^a', '^c'];
-    expect(merge(ours, theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B' }] });
-    expect(merge(ours, theirs, new Map([[1, 'mine']]))).toMatchObject({ status: 'merged', value: ['^a', '^B', '^c'] });
-    expect(merge(ours, theirs, new Map([[1, 'theirs']]))).toMatchObject({ status: 'merged', value: ['^a', '^c'] });
-    // And the other way: removed in the editor, edited in settings.json.
-    expect(merge([a, c], ['^a', '^B2', '^c'])).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', theirs: '^B2' }] });
+    expect(merge(ours, theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B' }], orderConflict: false });
+    expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^B', '^c'] });
+    expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: ['^a', '^c'] });
+    expect(merge([a, c], ['^a', '^B2', '^c'])).toEqual({
+      status: 'conflicts',
+      conflicts: [{ baseIndex: 1, base: '^b', theirs: '^B2' }],
+      orderConflict: false,
+    });
   });
 
   it('merges a move on one side with an edit on the other', () => {
     const [a, b, c] = loaded();
-    // Moved in the editor, edited in settings.json.
-    expect(merge([c, a, b], ['^A', '^b', '^c'])).toEqual({ status: 'merged', value: ['^c', '^A', '^b'], conflicts: [] });
-    // Moved in settings.json, edited in the editor.
-    expect(merge([{ ...a, pattern: '^A' }, b, c], ['^c', '^a', '^b'])).toEqual({
-      status: 'merged',
-      value: ['^c', '^A', '^b'],
-      conflicts: [],
+    expect(merge([c, a, b], ['^A', '^b', '^c'])).toEqual(merged(['^c', '^A', '^b']));
+    expect(merge([{ ...a, pattern: '^A' }, b, c], ['^c', '^a', '^b'])).toEqual(merged(['^c', '^A', '^b']));
+  });
+
+  // Review finding 1: an entry that settings.json only moved keeps its identity.
+  it('applies a removal in the editor to an entry that settings.json moved', () => {
+    const [, b, c] = loaded();
+    expect(merge([b, c], ['^b', '^c', '^a'])).toEqual(merged(['^b', '^c']));
+  });
+
+  it('applies an edit in the editor to an entry that settings.json moved, without a question', () => {
+    const [a, b, c] = loaded();
+    expect(merge([{ ...a, pattern: '^A2' }, b, c], ['^b', '^c', '^a'])).toEqual(merged(['^b', '^c', '^A2']));
+  });
+
+  it('asks once about the order when both sides moved the entries differently', () => {
+    const [a, b, c] = loaded();
+    const ours = [c, a, b];
+    const theirs = ['^b', '^a', '^c'];
+    expect(merge(ours, theirs)).toEqual({ status: 'conflicts', conflicts: [], orderConflict: true });
+    expect(merge(ours, theirs, { order: 'mine' })).toMatchObject({ status: 'merged', value: ['^c', '^a', '^b'], orderConflict: true });
+    expect(merge(ours, theirs, { order: 'theirs' })).toMatchObject({ status: 'merged', value: ['^b', '^a', '^c'] });
+    // The same move on both sides is no question.
+    expect(merge([c, a, b], ['^c', '^a', '^b'])).toEqual(merged(['^c', '^a', '^b']));
+  });
+
+  // Review finding 2: settings.json edits an entry and adds another one next to it.
+  it('recognizes an entry that settings.json edited next to an addition', () => {
+    const base = [{ name: 'X', pattern: '^x-(.+)$' }, '^z'];
+    const ours = entriesFromSetting(base).entries;
+    const theirs = [{ name: 'X', pattern: '^xx-(.+)$' }, '^y', '^z'];
+    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual(merged(theirs));
+    // An edit of the same entry in the editor asks, and the question shows the entry of settings.json.
+    ours[0] = { ...ours[0], flags: 'i' };
+    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual({
+      status: 'conflicts',
+      conflicts: [{ baseIndex: 0, base: base[0], mine: { name: 'X', pattern: '^x-(.+)$', flags: 'i' }, theirs: theirs[0] }],
+      orderConflict: false,
+    });
+    // An unnamed entry whose pattern changed, between the same neighbors, also next to an addition.
+    expect(mergeRepositoryGroups(['^a', '^b', '^c'], loaded(), ['^a', '^b2', '^c'])).toEqual(merged(['^a', '^b2', '^c']));
+    const [a, b, c] = loaded();
+    expect(merge([a, b, c, entry('^mine')], ['^a', '^b2', '^y', '^c'])).toEqual(merged(['^a', '^b2', '^y', '^c', '^mine']));
+    expect(merge([a, { ...b, name: 'B' }, c], ['^a', '^b2', '^y', '^c'])).toEqual({
+      status: 'conflicts',
+      conflicts: [{ baseIndex: 1, base: '^b', mine: { name: 'B', pattern: '^b' }, theirs: '^b2' }],
+      orderConflict: false,
     });
   });
 
@@ -458,16 +520,65 @@ describe('merge at Save (3-way)', () => {
     const ours = entriesFromSetting(base).entries;
     ours[1] = { ...ours[1], pattern: '^X' };
     const theirs = ['^new', { name: 'Courses', pattern: '^c-(.+)$', flags: 'i' }, '^x'];
-    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual({
-      status: 'merged',
-      value: ['^new', { name: 'Courses', pattern: '^c-(.+)$', flags: 'i' }, '^X'],
-      conflicts: [],
-    });
+    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual(merged(['^new', { name: 'Courses', pattern: '^c-(.+)$', flags: 'i' }, '^X']));
+  });
+
+  // Review finding 4: the editor writes the flags in the order ius; an untouched entry is not an edit.
+  it('does not count another order of the flags as a change', () => {
+    const base = [{ pattern: '^a', flags: 'si' }, '^b'];
+    const ours = entriesFromSetting(base).entries;
+    expect(ours[0].flags).toBe('is');
+    const theirs = [{ pattern: '^a', flags: 'is', name: 'A' }, '^b'];
+    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual(merged(theirs));
+  });
+
+  // Review finding 5: duplicates keep their multiplicity.
+  it('keeps an entry that settings.json added twice, also when the editor moved entries', () => {
+    const [a, b, c] = loaded();
+    // The additions follow their predecessor in settings.json (^c), in the order of the editor.
+    expect(merge([c, a, b], ['^a', '^b', '^c', '^d', '^d'])).toEqual(merged(['^c', '^d', '^d', '^a', '^b']));
+    expect(merge([a, b, c, entry('^d')], ['^a', '^b', '^c', '^d', '^d'])).toMatchObject({ value: ['^a', '^b', '^c', '^d', '^d'] });
+    // A duplicate in the base: each copy is an entry of its own.
+    const base = ['^a', '^a'];
+    const ours = entriesFromSetting(base).entries;
+    expect(mergeRepositoryGroups(base, [ours[0]], ['^a', '^a', '^n'])).toEqual(merged(['^a', '^n']));
   });
 
   it('removes the entries of the wrong type that the editor could not show, unless settings.json changed them', () => {
     const base = [3, '^a'];
     const ours = entriesFromSetting(base).entries;
-    expect(mergeRepositoryGroups(base, ours, [3, '^a'])).toEqual({ status: 'merged', value: ['^a'], conflicts: [] });
+    expect(mergeRepositoryGroups(base, ours, [3, '^a'])).toEqual(merged(['^a']));
+  });
+});
+
+describe('preview job (worker thread)', () => {
+  it('reports each entry before it runs on the names, then the preview, then the test', () => {
+    const messages: PreviewJobMessage[] = [];
+    const entries = [entry('^x-'), entry('('), entry(EXAMPLE)];
+    const input = cloneableInput(
+      input_({ discovery: discovery([repo('school/2025-3bWI-SWP-module-oop-hailo')]), formatTime: () => 'never cloned' }),
+    );
+    expect(input && 'formatTime' in input).toBe(false);
+    runPreviewJob({ id: 7, entries, testName: 'school/2026-3cWI-SWP-module-oop-EnesHA81', input }, (message) => messages.push(message));
+    expect(messages.map((message) => [message.type, message.type === 'probe' ? message.entryIndex : undefined])).toEqual([
+      ['probe', 0],
+      ['probe', 2],
+      ['preview', undefined],
+      ['test', undefined],
+    ]);
+    expect(messages.every((message) => message.id === 7)).toBe(true);
+    expect(messages[2]).toMatchObject({ preview: { loaded: true, owners: [{ owner: 'school', counts: [0, 0, 1] }] } });
+    expect(messages[3]).toMatchObject({ test: { matched: true, path: ['school', '2026-3cWI-SWP', 'module-oop', 'EnesHA81'] } });
+    // The messages can be sent to another thread (structured clone).
+    expect(structuredClone(messages)).toEqual(messages);
+  });
+
+  it('without a render of the sidebar, runs no entry and reports no preview', () => {
+    const messages: PreviewJobMessage[] = [];
+    runPreviewJob({ id: 1, entries: [entry(EXAMPLE)], testName: '', input: undefined }, (message) => messages.push(message));
+    expect(messages).toEqual([
+      { type: 'preview', id: 1, preview: { loaded: false, owners: [], truncated: 0 } },
+      { type: 'test', id: 1 },
+    ]);
   });
 });

@@ -71,7 +71,8 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - Each entry has an optional name, the regular expression, and the flags `i` (ignore case), `u` (Unicode), and `s` (dot matches line breaks). Add, remove, and move entries with the buttons; an entry that is not valid shows its error at once.
 - The preview shows, for the repositories that the view has loaded, how many repositories each entry takes, the resulting tree of each owner, and which repositories would be hidden. Repositories with an environment are always shown.
 - Type a repository name in **Test a Repository Name** to see which entry matches it and where its row goes.
-- **Save** writes the user settings and changes only this setting in `settings.json`; your other settings and comments stay. If you changed the setting in `settings.json` while the editor was open, Save keeps that change and adds yours; it asks only about an entry that both changed differently. **Cancel**, or closing the tab, discards your changes.
+- The preview and the test stop after 1 second: a regular expression that takes longer for your repository names is marked as too slow and cannot be saved, because the view would become slow with it.
+- **Save** writes the user settings and changes only this setting in `settings.json`; your other settings and comments stay. If you changed the setting in `settings.json` while the editor was open, Save keeps those changes, also moved entries, and adds yours. It asks only about an entry that both changed differently, and once about the order when both moved entries differently. **Cancel**, or closing the tab, discards your changes.
 
 ## Known limits
 

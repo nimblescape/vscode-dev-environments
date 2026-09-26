@@ -19,6 +19,8 @@
   /** @type {{name: string, pattern: string, flags: string, origin?: number}[]} */
   let entries = [];
   let seq = 0;
+  /** The load of the extension that the entries come from; sent back with each update. */
+  let generation = 0;
   let timer = undefined;
   let lastState = undefined;
   /** Open state of the preview nodes that the user changed, by owner and label path. */
@@ -55,7 +57,7 @@
     clearTimeout(timer);
     timer = undefined;
     seq += 1;
-    send({ type: 'update', seq, entries: entriesForMessage(), testName: $('test-name').value });
+    send({ type: 'update', seq, generation, entries: entriesForMessage(), testName: $('test-name').value });
   }
 
   function scheduleUpdate() {
@@ -177,11 +179,20 @@
     clearTimeout(timer);
     timer = undefined;
     seq += 1;
-    send({ type: 'save', seq, entries: entriesForMessage() });
+    send({ type: 'save', seq, generation, entries: entriesForMessage() });
   });
   $('cancel').addEventListener('click', () => send({ type: 'cancel' }));
   $('reload').addEventListener('click', () => send({ type: 'reload' }));
   $('test-name').addEventListener('input', scheduleUpdate);
+
+  // A hidden tab loses this page: the last change goes to the extension first, which keeps the draft.
+  function flushUpdate() {
+    if (timer !== undefined) sendUpdate();
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushUpdate();
+  });
+  window.addEventListener('pagehide', flushUpdate);
 
   // ---- State from the extension ------------------------------------------------------------------------------
 
@@ -224,6 +235,12 @@
 
   function renderPreview(preview) {
     const box = $('preview');
+    if (preview.tooSlow) {
+      box.replaceChildren(
+        el('p', { className: 'error', text: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.' }),
+      );
+      return;
+    }
     if (!preview.loaded) {
       box.replaceChildren(el('p', { className: 'muted', text: 'No repositories are loaded in the Dev Environments view yet. Open the view and sign in to see a preview.' }));
       return;
@@ -327,6 +344,8 @@
         return item;
       });
       lastState = undefined;
+      if (typeof message.generation === 'number') generation = message.generation;
+      if (typeof message.testName === 'string') $('test-name').value = message.testName;
       renderNotices(Array.isArray(message.notices) ? message.notices.map(String) : []);
       renderEntries();
     } else if (message.type === 'state') {

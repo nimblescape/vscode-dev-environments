@@ -1,6 +1,7 @@
 **
 !dist/extension.js
 !dist/sessionMonitor.js
+!dist/groupsPreviewWorker.js
 !resources/**
 !package.json
 !README.md
