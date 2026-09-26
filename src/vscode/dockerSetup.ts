@@ -140,7 +140,7 @@ export async function readInstallPlanInput(
     // findExecutable also searches /opt/homebrew/bin and /usr/local/bin on macOS.
     has: (tool) => findExecutable(tool, env, platform) !== undefined,
     brewPath,
-    ...(platform === 'darwin' ? readBrewCaskState(brewPath) : {}),
+    ...(platform === 'darwin' ? readBrewCaskState(brewPath, fs.existsSync, env.HOMEBREW_CASK_OPTS, os.homedir()) : {}),
     userName: currentUserName(),
     existingDockerSource,
   };
@@ -148,16 +148,30 @@ export async function readInstallPlanInput(
 
 /**
  * macOS: whether Homebrew records the cask docker-desktop (in the prefix of the `brew` that was found) and whether
- * /Applications/Docker.app exists. Without a Homebrew the cask counts as not recorded.
+ * Docker.app exists. Without a Homebrew the cask counts as not recorded. Docker.app counts as present in
+ * /Applications, in ~/Applications, and in the folder of `--appdir` in HOMEBREW_CASK_OPTS: a cask installed with another
+ * appdir must not be uninstalled as "missing" (that would quit Docker Desktop and remove a working app).
  */
 export function readBrewCaskState(
   brewPath: string | undefined,
   exists: (file: string) => boolean = fs.existsSync,
+  caskOpts?: string,
+  home?: string,
 ): Pick<InstallPlanInput, 'brewCaskRecorded' | 'dockerAppPresent'> {
   return {
     brewCaskRecorded: brewPath !== undefined && exists(brewCaskroomFolder(brewPath)),
-    dockerAppPresent: exists(DOCKER_APP_PATH),
+    dockerAppPresent: dockerAppLocations(caskOpts, home).some((location) => exists(location)),
   };
+}
+
+/** The places where a cask may have put Docker.app (see readBrewCaskState). */
+export function dockerAppLocations(caskOpts: string | undefined, home: string | undefined): string[] {
+  const expand = (folder: string) => (home && (folder === '~' || folder.startsWith('~/')) ? home + folder.slice(1) : folder);
+  const locations = [DOCKER_APP_PATH];
+  if (home) locations.push(`${home}/Applications/Docker.app`);
+  const match = /(?:^|\s)--appdir(?:=|\s+)(["']?)([^"'\s]+)\1/.exec(caskOpts ?? '');
+  if (match) locations.push(`${expand(match[2]).replace(/\/+$/, '')}/Docker.app`);
+  return [...new Set(locations)];
 }
 
 function currentUserName(): string | undefined {

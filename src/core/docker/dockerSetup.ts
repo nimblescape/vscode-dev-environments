@@ -116,7 +116,7 @@ export interface InstallPlanInput {
    * `brewCaskroomFolder`).
    */
   brewCaskRecorded?: boolean;
-  /** macOS: /Applications/Docker.app exists. */
+  /** macOS: Docker.app exists (in /Applications, ~/Applications, or the appdir of HOMEBREW_CASK_OPTS). */
   dockerAppPresent?: boolean;
   /** The login name of the user (Linux: joins the group docker). Missing or unusual: the documentation instead. */
   userName?: string;

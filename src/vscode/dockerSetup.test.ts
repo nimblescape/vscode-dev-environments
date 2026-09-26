@@ -31,6 +31,7 @@ import {
   DockerSetupUiTexts,
   INSTALL_TERMINAL_NAME,
   OPEN_WALKTHROUGH_COMMAND,
+  dockerAppLocations,
   readBrewCaskState,
   type DockerSetupDeps,
 } from './dockerSetup';
@@ -464,6 +465,38 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(download).not.toHaveBeenCalled();
     expect(runner.run).not.toHaveBeenCalled();
     dockerSetup.dispose();
+  });
+});
+
+describe('Docker.app outside /Applications (review of the stale-cask fix)', () => {
+  it('counts Docker.app in ~/Applications as present, so a working app is not uninstalled', () => {
+    const state = readBrewCaskState(
+      '/opt/homebrew/bin/brew',
+      (file) => ['/opt/homebrew/Caskroom/docker-desktop', '/Users/u/Applications/Docker.app'].includes(file),
+      undefined,
+      '/Users/u',
+    );
+    expect(state).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+  });
+
+  it('counts Docker.app in the --appdir of HOMEBREW_CASK_OPTS as present', () => {
+    for (const opts of ['--appdir=~/Apps', '--no-quarantine --appdir ~/Apps', '--appdir="~/Apps/"']) {
+      const state = readBrewCaskState(
+        '/opt/homebrew/bin/brew',
+        (file) => ['/opt/homebrew/Caskroom/docker-desktop', '/Users/u/Apps/Docker.app'].includes(file),
+        opts,
+        '/Users/u',
+      );
+      expect(state, opts).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+    }
+  });
+
+  it('lists /Applications, ~/Applications, and the appdir once each', () => {
+    expect(dockerAppLocations('--appdir=/Applications', '/Users/u')).toEqual([
+      '/Applications/Docker.app',
+      '/Users/u/Applications/Docker.app',
+    ]);
+    expect(dockerAppLocations(undefined, undefined)).toEqual(['/Applications/Docker.app']);
   });
 });
 
