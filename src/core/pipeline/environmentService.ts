@@ -2292,7 +2292,7 @@ export class EnvironmentService {
         // Not here yet: Compose pulls it in the workspace helper (a limit, implementation notes section 15).
         continue;
       }
-      items.push(...imageLabelItems(reference, labels));
+      items.push(...imageLabelItems(reference, labels, composeProjectName(ctx.env.id)));
     }
     return items;
   }
@@ -2556,7 +2556,7 @@ export class EnvironmentService {
   ): Promise<string[]> {
     const checked = await this.hostAccessInput(ctx.env, { metadata });
     const report = hostAccessReport(checked, checksOn);
-    for (const item of [...imageLabelItems(image, labels), ...moreItems]) if (!report.hostAccess.includes(item)) report.hostAccess.push(item);
+    for (const item of [...imageLabelItems(image, labels, composeProjectName(ctx.env.id)), ...moreItems]) if (!report.hostAccess.includes(item)) report.hostAccess.push(item);
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);

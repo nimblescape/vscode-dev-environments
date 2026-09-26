@@ -563,12 +563,21 @@ export function foreignNetworkItem(name: string, state: NetworkState | undefined
  * except `devcontainer.metadata`, the only label that the Dev Container CLI puts on the images that it builds (CLI
  * 0.89.0: `var EI="devcontainer.metadata"`; `devcontainer.local_folder` and `devcontainer.config_file` are labels of
  * containers). For example `LABEL devenv.compose-service=x` in a Dockerfile would hide the container from the lookups
- * of the extension. Refused whatever the switch says (HostAccessClass `protected`).
+ * of the extension. Of the labels of Docker Compose, only `com.docker.compose.project` with another value than
+ * `ownProject` (the Compose project of the environment) is refused: Compose puts `com.docker.compose.project`,
+ * `.service`, and `.version` on each image that it builds for the project, and a container of the environment with
+ * the label of another project could be removed by the Delete of that project. Refused whatever the switch says
+ * (HostAccessClass `protected`).
  */
-export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
-  return Object.keys(labels)
-    .filter((key) => key.trim() !== 'devcontainer.metadata' && (RESERVED_LABEL.test(key.trim()) || RESERVED_COMPOSE_LABEL.test(key.trim())))
-    .map((key) => `label ${key.trim()} of the image ${image}`);
+export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>, ownProject?: string): string[] {
+  return Object.entries(labels)
+    .filter(([rawKey, value]) => {
+      const key = rawKey.trim();
+      if (key === 'devcontainer.metadata') return false;
+      if (RESERVED_LABEL.test(key)) return true;
+      return key.toLowerCase() === COMPOSE_PROJECT_LABEL && String(value).trim() !== ownProject;
+    })
+    .map(([key]) => `label ${key.trim()} of the image ${image}`);
 }
 
 /** The repository configuration, the merged configuration, and the entries of the image metadata that are objects. */

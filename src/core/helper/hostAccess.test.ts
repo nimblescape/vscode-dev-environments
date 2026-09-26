@@ -1102,4 +1102,16 @@ describe('imageLabelItems', () => {
       'label com.docker.compose.project of the image devenv-e0000001:2',
     ]);
   });
+
+  it('allows the labels that Docker Compose puts on the images it builds for the own project (review round 1 CI)', () => {
+    const built = { 'com.docker.compose.project': 'devenv-e0000001', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(imageLabelItems('devenv-e0000001-app', built, 'devenv-e0000001')).toEqual([]);
+    expect(imageLabelItems('devenv-e0000001-app', built, 'devenv-e0000002')).toEqual([
+      'label com.docker.compose.project of the image devenv-e0000001-app',
+    ]);
+    // A single container has no project: an image of any project is refused, the other Compose labels are not.
+    expect(imageLabelItems('x', { 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'shop' })).toEqual([
+      'label com.docker.compose.project of the image x',
+    ]);
+  });
 });
