@@ -58,37 +58,55 @@ export function parseRepositoryGroups(entries: readonly unknown[] | undefined): 
   const patterns: RepositoryGroupPattern[] = [];
   const problems: RepositoryGroupProblem[] = [];
   (entries ?? []).forEach((entry, index) => {
-    const shown = describeEntry(entry);
-    const fields = entryFields(entry);
-    if (!fields) {
-      problems.push({ index, message: RepositoryGroupTexts.wrongType(shown) });
-      return;
-    }
-    if (fields.pattern === '') {
-      problems.push({ index, message: RepositoryGroupTexts.empty(shown) });
-      return;
-    }
-    let flags = '';
-    let ignored = '';
-    for (const flag of fields.flags) {
-      if (ALLOWED_FLAGS.includes(flag)) {
-        if (!flags.includes(flag)) flags += flag;
-      } else if (!ignored.includes(flag)) {
-        ignored += flag;
-      }
-    }
-    let regex: RegExp;
-    try {
-      regex = new RegExp(fields.pattern, flags);
-    } catch (error) {
-      problems.push({ index, message: RepositoryGroupTexts.invalid(shown, error instanceof Error ? error.message : String(error)) });
-      return;
-    }
-    if (ignored !== '') problems.push({ index, message: RepositoryGroupTexts.ignoredFlags(shown, ignored) });
-    const name = fields.name?.trim();
-    patterns.push({ index, ...(name ? { name } : {}), source: fields.pattern, regex });
+    const checked = checkRepositoryGroupEntry(entry, index);
+    for (const { message } of checked.issues) problems.push({ index, message });
+    if (checked.pattern) patterns.push(checked.pattern);
   });
   return { patterns, problems };
+}
+
+/** A problem of one entry, with its kind, for the editor of the setting (repositoryGroupsEditorModel.ts). */
+export interface RepositoryGroupIssue {
+  /** `wrongType`, `empty`, and `invalid` leave the entry out; `ignoredFlags` keeps it without those flags. */
+  kind: 'wrongType' | 'empty' | 'invalid' | 'ignoredFlags';
+  /** `invalid`: the error of the regular expression; `ignoredFlags`: the ignored flags. */
+  detail?: string;
+  /** The text of RepositoryGroupTexts that parseRepositoryGroups reports. */
+  message: string;
+}
+
+/**
+ * Checks and compiles one entry of the setting, at position `index`: the rules of parseRepositoryGroups, which uses it
+ * for each entry. `pattern` is missing when the entry is left out.
+ */
+export function checkRepositoryGroupEntry(
+  entry: unknown,
+  index: number,
+): { pattern?: RepositoryGroupPattern; issues: RepositoryGroupIssue[] } {
+  const shown = describeEntry(entry);
+  const fields = entryFields(entry);
+  if (!fields) return { issues: [{ kind: 'wrongType', message: RepositoryGroupTexts.wrongType(shown) }] };
+  if (fields.pattern === '') return { issues: [{ kind: 'empty', message: RepositoryGroupTexts.empty(shown) }] };
+  let flags = '';
+  let ignored = '';
+  for (const flag of fields.flags) {
+    if (ALLOWED_FLAGS.includes(flag)) {
+      if (!flags.includes(flag)) flags += flag;
+    } else if (!ignored.includes(flag)) {
+      ignored += flag;
+    }
+  }
+  let regex: RegExp;
+  try {
+    regex = new RegExp(fields.pattern, flags);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { issues: [{ kind: 'invalid', detail, message: RepositoryGroupTexts.invalid(shown, detail) }] };
+  }
+  const issues: RepositoryGroupIssue[] =
+    ignored !== '' ? [{ kind: 'ignoredFlags', detail: ignored, message: RepositoryGroupTexts.ignoredFlags(shown, ignored) }] : [];
+  const name = fields.name?.trim();
+  return { pattern: { index, ...(name ? { name } : {}), source: fields.pattern, regex }, issues };
 }
 
 /** Place of a repository in the groups: the pattern that matched, the group levels, and the label of the row. */

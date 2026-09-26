@@ -272,6 +272,11 @@
         "icon": "$(filter-filled)"
       },
       {
+        "command": "devEnvironments.editRepositoryGroups",
+        "title": "Edit Repository Groups…",
+        "category": "Dev Environments"
+      },
+      {
         "command": "devEnvironments.installDocker",
         "title": "Install Docker…",
         "category": "Dev Environments"
@@ -372,6 +377,11 @@
           "command": "devEnvironments.refresh",
           "when": "view == devEnvironments.repositories",
           "group": "navigation@2"
+        },
+        {
+          "command": "devEnvironments.editRepositoryGroups",
+          "when": "view == devEnvironments.repositories",
+          "group": "1_settings@1"
         }
       ],
       "view/item/context": [
@@ -605,7 +615,7 @@
               }
             ]
           },
-          "markdownDescription": "Regular expressions that filter and group the repositories in the sidebar. Each one is matched against the repository name without the owner. In each owner where at least one repository matches, the sidebar hides the repositories that match none (repositories with an environment are always shown); an owner without a match keeps its plain list. Capturing groups become levels of the tree: the first group is the top level, the last group is the label of the repository. A repository goes under the first regular expression that matches. An entry with a `name` gets its own node with that name. Example: `^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`. Only the user settings can set this list."
+          "markdownDescription": "Regular expressions that filter and group the repositories in the sidebar. Each one is matched against the repository name without the owner. In each owner where at least one repository matches, the sidebar hides the repositories that match none (repositories with an environment are always shown); an owner without a match keeps its plain list. Capturing groups become levels of the tree: the first group is the top level, the last group is the label of the repository. A repository goes under the first regular expression that matches. An entry with a `name` gets its own node with that name. Example: `^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`. Only the user settings can set this list. [Edit repository groups](command:devEnvironments.editRepositoryGroups) opens an editor with a preview."
         }
       }
     }
