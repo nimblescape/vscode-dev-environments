@@ -1008,7 +1008,9 @@ describe('setting repositoryGroups (unit 9)', () => {
         repositoryGroups: patterns('^(web)-(shop)$', '^(web|api)-(.+)$', { name: 'Libraries', pattern: '^lib-(.+)$' }, '^(web)-(.+)$'),
       }),
     );
-    expect(tree(groups)).toEqual([['o', [['Libraries', ['x']], ['api', ['core']], ['web', ['blog', 'shop']]]]]);
+    // User decision 2026-09-26: "the nodes shall be ordered according to the regexp order in the settings". The merged
+    // node web counts from its first pattern (0), and in it shop (pattern 0) comes before blog (pattern 1).
+    expect(tree(groups)).toEqual([['o', [['web', ['shop', 'blog']], ['api', ['core']], ['Libraries', ['x']]]]]);
     expect(allNodes(groups).filter((entry) => entry.id === 'group:o:-:web')).toHaveLength(1);
   });
 
@@ -1088,7 +1090,8 @@ describe('setting repositoryGroups (unit 9)', () => {
         }),
       );
       expect(tree(groups)).toEqual([
-        ['a', [['Libraries', ['core']], ['web', ['shop']], 'misc']],
+        // In the order of the patterns (user decision 2026-09-26), rows that match no pattern last.
+        ['a', [['web', ['shop']], ['Libraries', ['core']], 'misc']],
         ['b', [['Libraries', ['util']]]],
         ['c', ['misc', 'tools']],
       ]);
@@ -1120,7 +1123,7 @@ describe('setting repositoryGroups (unit 9)', () => {
     expect(row(groups, 'a/gone').notOnGitHub).toBe(true);
   });
 
-  it('puts hints first, then the named roots in the order of the setting, then the nodes, then the rows', () => {
+  it('puts hints first, then the nodes and rows in the order of their patterns, then the rows that match no pattern', () => {
     const hints = [{ organization: 'a', kind: 'saml' as const, url: 'https://github.com/orgs/a/sso' }];
     const groups = buildTreeModel(
       input({
@@ -1129,8 +1132,27 @@ describe('setting repositoryGroups (unit 9)', () => {
         repositoryGroups: patterns({ name: 'Zulu', pattern: '^z-' }, { name: 'Alpha', pattern: '^y-' }, '^(\\w)-(\\d)$', '^solo$'),
       }),
     );
+    // User decision 2026-09-26: the order of the patterns in the setting; within one pattern nodes first, then by name.
     expect(tree(groups)).toEqual([
-      ['a', ['hint:a', ['Zulu', ['z-1']], ['Alpha', ['y-1']], ['a', ['1']], ['b', ['1']], 'keep', 'solo']],
+      ['a', ['hint:a', ['Zulu', ['z-1']], ['Alpha', ['y-1']], ['a', ['1']], ['b', ['1']], 'solo', 'keep']],
+    ]);
+  });
+
+  it('orders the nodes by the order of the patterns in the setting (the setting of the user, 2026-09-26)', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([
+          repo('o/2026-3cWI-SWP-module-oop-EnesHA81'),
+          repo('o/2026-3cWI-SWP-module-oop'),
+          repo('o/2026-3cWI-SWP-module-oop-felix'),
+          repo('o/2026-3cWI-SWP-module-io'),
+        ]),
+        repositoryGroups: patterns('^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)$', '^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$'),
+      }),
+    );
+    // Pattern 1 (the templates) before pattern 2 (the student repositories), also where the labels are equal.
+    expect(tree(groups)).toEqual([
+      ['o', [['2026-3cWI-SWP', ['module-io', 'module-oop', ['module-oop', ['EnesHA81', 'felix']]]]]],
     ]);
   });
 
