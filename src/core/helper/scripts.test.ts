@@ -1109,6 +1109,12 @@ describe('READ_FILES_SCRIPT', () => {
     return JSON.parse(result.stdout);
   }
 
+  it('reads a configuration in a folder whose name has a backslash (review round 6, note of S)', () => {
+    const repo = tempDir();
+    write(path.join(repo, '.devcontainer', 'a\\b', 'devcontainer.json'), '{ "image": "alpine" }');
+    expect(read(repo, '.devcontainer/a\\b/devcontainer.json')).toEqual({ configText: '{ "image": "alpine" }' });
+  });
+
   it('reads the configuration and its Dockerfile (JSONC, relative to the configuration folder)', () => {
     const repo = tempDir();
     const configText = `{

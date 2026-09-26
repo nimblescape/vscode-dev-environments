@@ -17,6 +17,7 @@ import {
   overrideRunArgs,
   runArgsProblems,
   singleImageReferences,
+  unresolvedVariants,
   type HostAccessClass,
   type HostAccessInput,
 } from './hostAccess';
@@ -659,5 +660,102 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
       expect(runArgs.some((arg) => arg.startsWith('devenv.config-path'))).toBe(false);
       expect(hostAccessProblems({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
     }
+  });
+});
+
+describe('review round 6 of unit 6 (S6-1, P6-2)', () => {
+  const dockerfile = (text: string): HostAccessInput => input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileText: text });
+  const classes = (checked: HostAccessInput) => hostAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
+  const VARIANTS8 = Array.from({ length: 8 }, (_, i) => `\${X${i}:-${'abcdefgh'[i]}}`).join('');
+  const timed = <T,>(run: () => T): { result: T; ms: number } => {
+    const start = Date.now();
+    const result = run();
+    return { result, ms: Date.now() - start };
+  };
+
+  it('refuses a COPY --from reference with 8 variables and 4000 characters quickly as too long (S6-1)', () => {
+    const { result, ms } = timed(() => hostAccessReport(dockerfile(`FROM alpine\nCOPY --from=${VARIANTS8}${'a'.repeat(4000)} / /\n`), false));
+    expect(result).toEqual({ hostAccess: [], unsupported: [`COPY --from image ${VARIANTS8}… (the image reference is too long)`] });
+    expect(ms).toBeLessThan(1000);
+  });
+
+  it('makes the variants of a long reference in linear time (S6-1)', () => {
+    const { result, ms } = timed(() => unresolvedVariants(`${VARIANTS8}${'a'.repeat(4000)}`));
+    expect(result).toHaveLength(256);
+    expect(ms).toBeLessThan(1000);
+  });
+
+  it('refuses a value of FROM, --from, or from= longer than 1024 characters, also when it expands to a short text (S6-1)', () => {
+    const long = `\${A:-${'a'.repeat(1100)}}`;
+    const shown = `${long.slice(0, 64)}…`;
+    expect(classes(dockerfile(`ARG A=alpine\nFROM ${long}\n`))).toEqual([`unsupported: FROM image ${shown} (the image reference is too long)`]);
+    expect(classes(dockerfile(`FROM alpine\nARG A=x\nCOPY --from=${long} / /\n`))).toEqual([`unsupported: COPY --from image ${shown} (the image reference is too long)`]);
+    expect(classes(dockerfile(`FROM alpine\nARG A=x\nRUN --mount=type=bind,from=${long},target=/x true\n`))).toEqual([
+      `unsupported: RUN --mount image ${shown} (the image reference is too long)`,
+    ]);
+    // The image of the configuration too.
+    const image = `alpine:${'1'.repeat(1100)}`;
+    expect(hostAccessReport(input({ image }), false)).toEqual({ hostAccess: [], unsupported: [`image ${image.slice(0, 64)}… (the image reference is too long)`] });
+    // 1024 characters are still read.
+    expect(classes(dockerfile(`FROM alpine:${'1'.repeat(1024 - 'alpine:'.length)}\n`))).toEqual([]);
+  });
+
+  it.each([
+    ['resolved', 'ARG A\nFROM NEST\n'],
+    ['not resolved', 'FROM NEST\n'],
+    ['in an ARG', 'ARG A\nARG B=NEST\nFROM alpine:$B\n'],
+  ])('refuses a nesting of ${…} deeper than 32 levels (%s) as unsupported, without an exception (S6-1)', (_, template) => {
+    const nest = (levels: number, name: string) => `\${${name}:-`.repeat(levels) + 'x' + '}'.repeat(levels);
+    const name = template.startsWith('FROM') ? 'TARGETARCH' : 'A';
+    for (const levels of [33, 5000]) {
+      const text = template.replace('NEST', nest(levels, name));
+      const { result, ms } = timed(() => hostAccessClassification(dockerfile(text)));
+      expect(result.length).toBe(1);
+      expect(result[0].class).toBe('unsupported');
+      expect(ms).toBeLessThan(1000);
+    }
+    // 32 levels are evaluated.
+    const allowed = hostAccessClassification(dockerfile(template.replace('NEST', nest(32, name))));
+    expect(allowed.filter((finding) => finding.class === 'unsupported')).toEqual([]);
+  });
+
+  it('gives no variants for a nesting deeper than 32 levels, without an exception (S6-1)', () => {
+    const nest = (levels: number) => '${A:-'.repeat(levels) + 'x' + '}'.repeat(levels);
+    expect(unresolvedVariants(nest(32))).toEqual(['', 'x']);
+    expect(unresolvedVariants(nest(33))).toBeUndefined();
+    expect(unresolvedVariants(nest(20000))).toBeUndefined();
+  });
+
+  it('refuses ARGs that double their value as unsupported, without an exception (S6-1)', () => {
+    for (const n of [20, 26, 40]) {
+      const text =
+        'ARG A0=abcdefgh\n' +
+        Array.from({ length: n }, (_, i) => `ARG A${i + 1}=\${A${i}}\${A${i}}`).join('\n') +
+        `\nFROM alpine:\${A${n}}\nARG A${n}\nCOPY --from=x\${A${n}}\${TARGETARCH} / /\n`;
+      const { result, ms } = timed(() => hostAccessClassification(dockerfile(text)));
+      expect(result.map((finding) => finding.class)).toEqual(['unsupported', 'unsupported']);
+      expect(result.every((finding) => finding.item.endsWith('(the image reference is too long)'))).toBe(true);
+      expect(ms).toBeLessThan(1000);
+    }
+  });
+
+  it.each([
+    'FROM node:20 AS deps\nFROM node:20\nCOPY --from=${STAGE:-0} /a /b\n',
+    'FROM node:20 AS deps\nFROM node:20\nRUN --mount=type=bind,from=${STAGE:-1},target=/x true\n',
+    'FROM alpine AS cafe\nFROM ${TARGETVARIANT}cafe\n',
+    'FROM alpine AS b1\nFROM b${TARGETVARIANT}1\n',
+    'FROM alpine AS cafe\nFROM alpine\nCOPY --from=${STAGE:-CAFE} / /x\n',
+  ])('allows a variant that names a stage or a stage index in %j (P6-2)', (text) => {
+    expect(classes(dockerfile(text))).toEqual([]);
+  });
+
+  it.each([
+    // A later stage is no stage for FROM; an index is no stage for FROM.
+    ['FROM ${TARGETVARIANT}cafe\nFROM alpine AS cafe\n', 'FROM image ${TARGETVARIANT}cafe'],
+    ['FROM ${TARGETVARIANT:-0}\n', 'FROM image ${TARGETVARIANT:-0}'],
+    // The other variant is still an image ID.
+    ['FROM alpine AS cafe\nFROM alpine\nCOPY --from=${STAGE:+be}cafe / /x\n', 'COPY --from image ${STAGE:+be}cafe'],
+  ])('still refuses %j (P6-2)', (text, item) => {
+    expect(classes(dockerfile(text))).toEqual([`protected: ${item} (with its variables that are not resolved, it can name an image of another environment or an image ID)`]);
   });
 });

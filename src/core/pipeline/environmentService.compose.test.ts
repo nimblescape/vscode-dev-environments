@@ -1399,18 +1399,20 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(COMPOSE_PATH);
   });
 
-  it('restores the configuration path from a container of another service when the dev container is gone (D4-2)', async () => {
+  it('keeps the default configuration path when only a container of another service carries the label (D4-2, S6-2)', async () => {
     seedRestore();
     addDb('stopped', { [LABEL_CONFIG_PATH]: COMPOSE_PATH });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
-    expect((await h.registry.get(ENV_ID))?.configPath).toBe(COMPOSE_PATH);
+    // Review round 6, S6-2: changed expectation, the label of another service (perhaps of its image) does not count.
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
   });
 
   it.each(['../../etc/devcontainer.json', '/workspaces/api/.devcontainer/devcontainer.json', '.devcontainer/../x/devcontainer.json', '.devcontainer/a/b/devcontainer.json', 'devcontainer.json'])(
     'keeps the default configuration path for the label %j (D4-2)',
     async (value) => {
       seedRestore();
-      addDb('stopped', { [LABEL_CONFIG_PATH]: value });
+      // Review round 6, S6-2: changed setup, the label is on the dev container, the only one whose label counts.
+      h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'stopped', image: IMAGE_1, labels: { ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', [LABEL_CONFIG_PATH]: value } });
       expect(await h.service.reconcileFromVolumes()).toBe(1);
       expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
       expect(h.logger.warnings.some((line) => line.includes('which is no configuration path'))).toBe(true);
@@ -1584,5 +1586,17 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     await withoutRecord();
     useSingle();
     expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+  });
+});
+
+describe('review round 6 of unit 6 (S6-2)', () => {
+  it('restores the default configuration when only a side container carries the label and the dev container is gone (S6-2)', async () => {
+    h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.images.add(DB_IMAGE);
+    const labels = { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db', [LABEL_CONFIG_PATH]: '.devcontainer/other/devcontainer.json' };
+    h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-db-1`, state: 'stopped', image: DB_IMAGE, labels });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    expect(h.logger.warnings.some((line) => line.includes('which is no configuration path'))).toBe(false);
   });
 });

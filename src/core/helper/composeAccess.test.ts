@@ -386,3 +386,16 @@ describe('review round 5 of unit 6 (S5-4)', () => {
     expect(syntax.hostAccess).toEqual(['service db: syntax image evil/frontend:1 (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)']);
   });
 });
+
+describe('review round 6 of unit 6 (P6-1)', () => {
+  const REMOTE = (context: string) => `service db: build context ${context} (a remote build context is not supported yet)`;
+
+  it.each(['github.com/acme/tool', 'github.com/acme/tool.git#main:docker', 'docker-image://devenv-11111111:2', 'oci-layout:///tmp/layout', 'target://base'])(
+    'refuses the build context %s, which Compose leaves as it is, as a remote build context (checks on and off)',
+    (context) => {
+      const services = { ...model().services, db: { build: { context } } };
+      expect(composeAccessReport(input({ model: { ...model(), services } }), true)).toEqual(U(REMOTE(context)));
+      expect(composeAccessReport(input({ model: { ...model(), services } }), false)).toEqual(U(REMOTE(context)));
+    },
+  );
+});

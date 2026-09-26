@@ -226,13 +226,16 @@ function checkRepository(repository: string): { owner: string; name: string } {
   return parts;
 }
 
-/** A configuration path relative to the repository folder, without `..`. */
+/**
+ * A configuration path relative to the repository folder, without `..`. Review round 6 (note of S): a backslash is allowed, as the
+ * discovery and isConfigPathLabelValue allow it; in the workspace helper (Linux) it is a character of a name, no
+ * separator, and the path goes to the scripts as an argument, never through a shell.
+ */
 function checkConfigPath(configPath: string): string {
   const segments = configPath.split('/');
   if (
     configPath === '' ||
     configPath.startsWith('/') ||
-    configPath.includes('\\') ||
     configPath.includes('\0') ||
     segments.some((segment) => segment === '' || segment === '.' || segment === '..')
   ) {

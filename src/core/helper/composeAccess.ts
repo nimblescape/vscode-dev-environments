@@ -148,9 +148,12 @@ function isRepositoryPath(file: string, repositoryFolder: string): boolean {
   return file.startsWith('/') && !file.split('/').includes('..') && isInside(path.posix.normalize(file), repositoryFolder);
 }
 
-/** A remote build context: a URL of Git or HTTP(S). */
+/**
+ * A remote build context: a URL of Git or HTTP(S), and (review round 6, P6-1) every value that Compose's absContextPath
+ * leaves as it is: one that starts with `github.com/`, or holds `://` anywhere (for example `docker-image://…`).
+ */
 function isRemoteContext(context: string): boolean {
-  return /^(https?:\/\/|git@|git:\/\/|ssh:\/\/)/i.test(context);
+  return /^(https?:\/\/|git@|git:\/\/|ssh:\/\/|github\.com\/)/i.test(context) || context.includes('://');
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

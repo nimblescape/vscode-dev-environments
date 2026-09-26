@@ -815,6 +815,18 @@ describe('WorkspaceHelper file and Git queries', () => {
     expect(docker.runs).toHaveLength(0);
   });
 
+  it('readConfigFiles takes a configuration path with a backslash, as the discovery lists it (review round 6, note of S)', async () => {
+    const helper = createHelper();
+    docker.handler = () => ({ stdout: '{"configText":"{}"}\n' });
+    const configPath = '.devcontainer/a\\b/devcontainer.json';
+    expect(await helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath })).toEqual({ configText: '{}' });
+    expect(commandOf(docker.runs[0].args)).toEqual(['node', '-e', READ_FILES_SCRIPT, '/workspaces/api', configPath]);
+    // Still refused: a path outside of the repository, with a backslash too.
+    for (const outside of ['..\\x/../devcontainer.json', '/a\\b/devcontainer.json', '.devcontainer/a\\b/../../../x']) {
+      await expect(helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath: outside })).rejects.toThrow(/Invalid configuration path/);
+    }
+  });
+
   it('listConfigurations returns the list of the script', async () => {
     docker.handler = () => ({ stdout: '[".devcontainer/devcontainer.json",".devcontainer/python/devcontainer.json"]\n' });
     expect(await createHelper().listConfigurations({ volumeName: 'vol', repository: 'acme/api' })).toEqual([

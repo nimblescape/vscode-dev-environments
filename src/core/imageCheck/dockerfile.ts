@@ -28,6 +28,18 @@ const HEREDOC_INSTRUCTIONS = new Set(['RUN', 'COPY', 'ADD']);
 export const SHELL_NAME = /^(?:\p{Nd}+|[@*#?\-$!]|[\p{L}_][\p{L}\p{Nd}_]*)/u;
 /** Review round 5 (S5-1): BuildKit takes any name that is not empty for an ARG (it refuses only a blank one). */
 const isArgName = (name: string): boolean => name !== '';
+/**
+ * Review round 6 (S6-1): the longest image reference (and value of FROM, `--from`, or `from=`) that the check reads; a
+ * longer one is refused as unsupported (the image reference is too long). Docker's own limit for a name is 255.
+ */
+export const MAX_REFERENCE_LENGTH = 1024;
+/** Review round 6 (S6-1): the deepest nesting of `${…}` that the expansion evaluates; deeper is refused as unsupported. */
+export const MAX_NESTING = 32;
+/**
+ * Review round 6 (S6-1): the longest text that one expansion (an ARG or ENV value, a reference) makes; a longer one is
+ * cut and refused as unsupported (for example ARGs that double their value).
+ */
+export const MAX_EXPANDED_LENGTH = 64 * 1024;
 
 interface Instruction {
   keyword: string;
@@ -133,6 +145,16 @@ export interface DockerfileImageReference {
    * it is refused (UncheckedClass).
    */
   unchecked?: UncheckedClass;
+  /**
+   * Review round 6 (S6-1): the reference, or the value of FROM, `--from`, or `from=` that it came from, is longer than
+   * MAX_REFERENCE_LENGTH (the reference is then that value).
+   */
+  tooLong?: true;
+  /**
+   * Review round 6 (P6-2), with the option `withStages`, for a reference with a variable that is not resolved: the stage
+   * names (lower case) that the reference names as a stage instead of an image (for FROM the earlier stages, else all).
+   */
+  stages?: string[];
 }
 
 /**
@@ -147,7 +169,7 @@ export interface DockerfileImageReference {
 export function extractImageReferences(
   dockerfileText: string,
   buildArgs?: Record<string, string>,
-  options: { target?: string } = {},
+  options: { target?: string; withStages?: boolean } = {},
 ): DockerfileImageReference[] {
   const { escape, syntax, instructions } = parseInstructions(dockerfileText);
   const override = (name: string): string | undefined =>
@@ -191,19 +213,28 @@ export function extractImageReferences(
   const seen = new Set<string>();
   // FROM: only the stages before it, as in extractBaseImages (the conservative side for a later name).
   const earlier = new Set<string>();
-  const add = (reference: string, kind: ImageReferenceKind, state?: Expansion): void => {
-    const text = reference.trim();
+  const add = (reference: string, kind: ImageReferenceKind, state?: Expansion, raw?: string): void => {
+    // Review round 6 (S6-1): a value longer than MAX_REFERENCE_LENGTH is kept as it is written, as too long.
+    const tooLong = (raw !== undefined && raw.length > MAX_REFERENCE_LENGTH) || reference.trim().length > MAX_REFERENCE_LENGTH;
+    const text = raw !== undefined && raw.length > MAX_REFERENCE_LENGTH ? raw.trim() : reference.trim();
     const key = text.toLowerCase();
     const isStage = kind === 'FROM' ? earlier.has(key) : stages.has(key);
-    if (text === '' || key === 'scratch' || isStage || (kind !== 'FROM' && /^\d+$/.test(text))) return;
+    if (!tooLong && (text === '' || key === 'scratch' || isStage || (kind !== 'FROM' && /^\d+$/.test(text)))) return;
     const known = result.find((other) => other.kind === kind && other.reference === text);
     if (known) {
       if (state?.unchecked !== undefined && known.unchecked !== 'protected') known.unchecked = state.unchecked;
+      if (tooLong) known.tooLong = true;
       return;
     }
     if (seen.has(`${kind} ${text}`)) return;
     seen.add(`${kind} ${text}`);
-    result.push({ reference: text, kind, ...(state?.unchecked !== undefined ? { unchecked: state.unchecked } : {}) });
+    result.push({
+      reference: text,
+      kind,
+      ...(state?.unchecked !== undefined ? { unchecked: state.unchecked } : {}),
+      ...(tooLong ? { tooLong: true as const } : {}),
+      ...(options.withStages === true && text.includes('$') ? { stages: [...(kind === 'FROM' ? earlier : stages)] } : {}),
+    });
   };
   /** Expands a reference, noting what the expansion met (review round 4, S4-3). */
   const reference = (word: string, lookup: Lookup): { text: string; state: Expansion } => {
@@ -245,7 +276,7 @@ export function extractImageReferences(
       while (words.length > 0 && words[0].startsWith('--')) words.shift();
       if (words.length === 0) continue;
       const from = reference(words[0], globalLookup);
-      add(from.text, 'FROM', from.state);
+      add(from.text, 'FROM', from.state, words[0]);
       const name = words.length >= 3 && words[1].toLowerCase() === 'as' ? words[2].toLowerCase() : undefined;
       if (name !== undefined) earlier.add(name);
       if (target && name === target) targetDone = true;
@@ -279,14 +310,14 @@ export function extractImageReferences(
       if (value === undefined) continue;
       if (instruction.keyword === 'COPY' && flag === '--from') {
         const from = reference(value, stageLookup);
-        add(from.text, 'COPY --from', from.state);
+        add(from.text, 'COPY --from', from.state, value);
       }
       if (instruction.keyword === 'RUN' && flag === '--mount') {
         for (const field of csvFields(value)) {
           const index = field.indexOf('=');
           if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'from') {
             const from = reference(field.slice(index + 1), stageLookup);
-            add(from.text, 'RUN --mount from', from.state);
+            add(from.text, 'RUN --mount from', from.state, field.slice(index + 1));
           }
         }
       }
@@ -559,6 +590,11 @@ function expand(word: string, lookup: Lookup, escape: string, state?: Expansion,
   let inDouble = false;
   let i = 0;
   while (i < word.length) {
+    // Review round 6 (S6-1): a text longer than MAX_EXPANDED_LENGTH is cut and cannot be checked.
+    if (result.length > MAX_EXPANDED_LENGTH) {
+      markUnchecked(state, 'unsupported');
+      return result.slice(0, MAX_EXPANDED_LENGTH + 1);
+    }
     const char = word[i];
     if (char === escape && i + 1 < word.length) {
       result += rawEscapes ? word.slice(i, i + 2) : word[i + 1];
@@ -589,6 +625,10 @@ function expand(word: string, lookup: Lookup, escape: string, state?: Expansion,
     result += char;
     i++;
   }
+  if (result.length > MAX_EXPANDED_LENGTH) {
+    markUnchecked(state, 'unsupported');
+    return result.slice(0, MAX_EXPANDED_LENGTH + 1);
+  }
   return result;
 }
 
@@ -616,12 +656,14 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
   }
 
   let depth = 1;
+  let deepest = 1;
   let j = start + 2;
   while (j < word.length) {
     if (word[j] === escape) {
       j += 2;
     } else if (word[j] === '$' && word[j + 1] === '{') {
       depth++;
+      deepest = Math.max(deepest, depth);
       j += 2;
     } else if (word[j] === '}') {
       depth--;
@@ -635,6 +677,12 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
 
   const raw = word.slice(start, j + 1);
   const end = j + 1;
+  // Review round 6 (S6-1): a nesting deeper than MAX_NESTING is not evaluated (each nested operand expands on its own,
+  // so its nesting is less than this one).
+  if (deepest > MAX_NESTING) {
+    markUnchecked(state, 'unsupported');
+    return { text: raw, end };
+  }
   const inner = word.slice(start + 2, j);
   const name = SHELL_NAME.exec(inner)?.[0];
   if (!name) {

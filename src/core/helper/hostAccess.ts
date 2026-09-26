@@ -14,7 +14,15 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { cutAtSpace, extractImageReferences, SHELL_NAME, type DockerfileImageReference, type ImageReferenceKind } from '../imageCheck/dockerfile';
+import {
+  cutAtSpace,
+  extractImageReferences,
+  MAX_NESTING,
+  MAX_REFERENCE_LENGTH,
+  SHELL_NAME,
+  type DockerfileImageReference,
+  type ImageReferenceKind,
+} from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
   COMPOSE_CLEARED_LABELS,
@@ -561,7 +569,7 @@ export interface NamedImageReference {
  */
 export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
   return dockerfileReferences(text, args)
-    .filter(({ reference, unchecked }) => !reference.includes('$') && unchecked === undefined)
+    .filter(({ reference, unchecked, tooLong }) => !reference.includes('$') && unchecked === undefined && tooLong === undefined)
     .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
 }
 
@@ -571,7 +579,7 @@ export function dockerfileImageReferences(text: string, args: Readonly<Record<st
  * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
  */
 function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImageReference[] {
-  const references = extractImageReferences(text, { ...args });
+  const references = extractImageReferences(text, { ...args }, { withStages: true });
   // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
   const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
   if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
@@ -626,10 +634,15 @@ const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
  */
 export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
   const findings: HostAccessFinding[] = [];
-  for (const { reference, kind, unchecked } of dockerfileReferences(text, args)) {
+  for (const { reference, kind, unchecked, tooLong, stages } of dockerfileReferences(text, args)) {
     const what = DOCKERFILE_IMAGE_WHAT[kind];
     if (unchecked === 'protected') {
-      findings.push({ item: `${what} ${reference} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
+      findings.push({ item: `${what} ${shortReference(reference)} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
+      continue;
+    }
+    // Review round 6 (S6-1): before the variants, whose number grows with the length.
+    if (tooLong === true || reference.length > MAX_REFERENCE_LENGTH) {
+      findings.push(tooLongFinding(reference, what));
       continue;
     }
     if (unchecked === 'unsupported') {
@@ -656,7 +669,11 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
     }
     // Review round 5 (S5-1): the texts that the reference can become when its variables that are not resolved are empty
     // (for example `dev${TARGETVARIANT}env-…`), or give an operand of `:-` or `:+`.
-    const variants = unresolvedVariants(reference);
+    // Review round 6 (P6-2): a variant that names a stage (by its name, or by its index for `COPY --from` and
+    // `RUN --mount from`) is no image, as extractImageReferences leaves out such a resolved text.
+    const stageNames = new Set(stages ?? []);
+    const isImage = (variant: string): boolean => !stageNames.has(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
+    const variants = unresolvedVariants(reference)?.filter(isImage);
     if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
       findings.push({
         item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
@@ -675,13 +692,25 @@ const IMAGE_ID_FORM = /^(?:sha256:)?[0-9a-f]+$/i;
 /** The most texts that unresolvedVariants makes; a reference with more cannot be checked. */
 const MAX_VARIANTS = 256;
 
+/** Review round 6 (S6-1): a reference in an item, cut after 64 characters. */
+function shortReference(reference: string): string {
+  return reference.length > 64 ? `${reference.slice(0, 64)}…` : reference;
+}
+
+/** Review round 6 (S6-1): the finding of a reference longer than MAX_REFERENCE_LENGTH. */
+function tooLongFinding(reference: string, what: string): HostAccessFinding {
+  return { item: `${what} ${shortReference(reference.trim())} (the image reference is too long)`, class: 'unsupported' };
+}
+
 /**
  * The texts that an expanded image reference (extractImageReferences) can become through its variables that are not
  * resolved (review round 5, S5-1): each such variable (`$NAME`, `${NAME…}`, names as SHELL_NAME reads them) is left out,
  * and a `${NAME:-word}`, `${NAME-word}`, `${NAME:+word}`, or `${NAME+word}` also gives its word (with its own variants).
- * A `$` without a name stays. `undefined` for more than MAX_VARIANTS texts.
+ * A `$` without a name stays. `undefined` for more than MAX_VARIANTS texts, or for a nesting of `${…}` deeper than
+ * MAX_NESTING (review round 6, S6-1). The text between two variables is added in one step (review round 6, S6-1).
  */
-export function unresolvedVariants(reference: string): string[] | undefined {
+export function unresolvedVariants(reference: string, level = 0): string[] | undefined {
+  if (level > MAX_NESTING) return undefined;
   let variants: string[] = [''];
   const append = (options: readonly string[]): boolean => {
     const next = new Set<string>();
@@ -693,8 +722,10 @@ export function unresolvedVariants(reference: string): string[] | undefined {
   while (i < reference.length) {
     const char = reference[i];
     if (char !== '$') {
-      if (!append([char])) return undefined;
-      i++;
+      const next = reference.indexOf('$', i);
+      const end = next < 0 ? reference.length : next;
+      if (!append([reference.slice(i, end)])) return undefined;
+      i = end;
       continue;
     }
     if (reference[i + 1] === '{') {
@@ -711,7 +742,7 @@ export function unresolvedVariants(reference: string): string[] | undefined {
       const operator = /^:?[-+]/.exec(inner.slice(name.length))?.[0];
       const options = [''];
       if (operator !== undefined) {
-        const word = unresolvedVariants(inner.slice(name.length + operator.length));
+        const word = unresolvedVariants(inner.slice(name.length + operator.length), level + 1);
         if (word === undefined) return undefined;
         options.push(...word);
       }
@@ -820,6 +851,8 @@ export function localImageRepository(reference: string): string {
  */
 export function imageReferenceFinding(reference: string, what = 'image'): HostAccessFinding | undefined {
   const text = reference.trim();
+  // Review round 6 (S6-1).
+  if (text.length > MAX_REFERENCE_LENGTH) return tooLongFinding(text, what);
   if (IMAGE_ID.test(text)) return { item: imageIdItem(text, what), class: 'unsupported' };
   if (/^devenv-/.test(localImageRepository(text))) return { item: `${what} ${text} of another environment`, class: 'protected' };
   return undefined;

@@ -3607,10 +3607,14 @@ export class EnvironmentService {
         .filter((volume) => labelled.includes(volume.name) && volume.labels[LABEL_SERVICE_DATA] === SERVICE_DATA)
         .map((volume) => volume.name);
       if (serviceVolumes.length > 0) candidate.serviceVolumes = serviceVolumes;
-      // Review round 4 (D4-2): the configuration path of the label devenv.config-path of its containers (the dev container
-      // first), when it is a configuration path of a repository (isConfigPathLabelValue); else the default one.
-      const own = containers.filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id && container.labels[LABEL_CONFIG_PATH] !== undefined);
-      const labelledPath = (own.find((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined) ?? own[0])?.labels[LABEL_CONFIG_PATH];
+      // Review round 4 (D4-2): the configuration path of the label devenv.config-path of its dev container, when it is a
+      // configuration path of a repository (isConfigPathLabelValue); else the default one. Review round 6 (S6-2): only the
+      // dev container (a container without devenv.compose-service) counts; the label of another service can come from its
+      // image.
+      const labelledPath = containers.find(
+        (container) =>
+          container.labels[LABEL_ENVIRONMENT_ID] === candidate.id && container.labels[LABEL_COMPOSE_SERVICE] === undefined && container.labels[LABEL_CONFIG_PATH] !== undefined,
+      )?.labels[LABEL_CONFIG_PATH];
       if (labelledPath !== undefined) {
         if (isConfigPathLabelValue(labelledPath)) candidate.configPath = labelledPath;
         else this.logger.warn(`The containers of the volume ${candidate.volumeName} name the configuration ${JSON.stringify(labelledPath)}, which is no configuration path. The default configuration is used.`);
