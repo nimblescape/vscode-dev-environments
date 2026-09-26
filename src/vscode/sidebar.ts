@@ -27,7 +27,7 @@ import type { SessionCoordinator } from './sessionCoordinator';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import { CoalescingTask, mapLimit } from './tasks';
 import { findRepositoryInfo, ownerTrust, pickerRepositories, repositoriesToLookUp, repositoryKey } from './targets';
-import { buildTreeModel, type EnvironmentRuntime, type OwnerGroup } from './treeModel';
+import { buildTreeModel, type EnvironmentRuntime, type OwnerGroup, type TreeInput } from './treeModel';
 import { REPOSITORIES_VIEW_ID, type RepositoriesTreeProvider } from './treeView';
 
 /** Context key of the welcome views (package.json): a list was loaded, or the first refresh failed. */
@@ -93,9 +93,15 @@ export class Sidebar implements vscode.Disposable {
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
   private readonly discoveryTask = new CoalescingTask(() => this.refreshDiscoveryNow());
   private readonly statesEmitter = new vscode.EventEmitter<void>();
+  private readonly renderEmitter = new vscode.EventEmitter<void>();
+  /** The input of the last render, without the patterns of repositoryGroups (groupingInput). */
+  private lastInput: TreeInput | undefined;
 
   /** Fires after the container states and the branches of running containers were read. */
   readonly onDidRefreshStates: vscode.Event<void> = this.statesEmitter.event;
+
+  /** Fires after each render of the view (for the preview of the repository groups editor). */
+  readonly onDidRender: vscode.Event<void> = this.renderEmitter.event;
 
   constructor(private readonly deps: SidebarDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -114,6 +120,15 @@ export class Sidebar implements vscode.Disposable {
   /** The account whose list and environments the view shows; `undefined` without a sign-in. */
   get currentAccount(): GitHubAccount | undefined {
     return this.account;
+  }
+
+  /**
+   * The input of the last render of the view, without patterns: the repositories already loaded (no GitHub request) and
+   * the environments with their states. The repository groups editor builds its preview with it and buildTreeModel, as
+   * the view does, so the preview is what the view shows with those patterns. `undefined` before the first render.
+   */
+  groupingInput(): TreeInput | undefined {
+    return this.lastInput;
   }
 
   /** The current model of the view (for the switcher). */
@@ -281,6 +296,7 @@ export class Sidebar implements vscode.Disposable {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.statesEmitter.dispose();
+    this.renderEmitter.dispose();
   }
 
   private renderInBackground(): void {
@@ -303,8 +319,7 @@ export class Sidebar implements vscode.Disposable {
     // Only the environments of the signed-in account; hidden ones are not counted or named anywhere (concept 7.5).
     const environments = availableEnvironments(entries, account);
     const repositoryGroups = this.repositoryGroups();
-    const started = this.clock.now();
-    const groups = buildTreeModel({
+    const input: TreeInput = {
       discovery: this.data ?? this.shownPartial(),
       settings: this.deps.settings(),
       environments,
@@ -319,11 +334,14 @@ export class Sidebar implements vscode.Disposable {
       liveBranches: this.liveBranches,
       signedIn: this.signedIn,
       repositoryLookups: this.lookups,
-      repositoryGroups,
       formatTime,
-    });
+    };
+    this.lastInput = input;
+    const started = this.clock.now();
+    const groups = buildTreeModel({ ...input, repositoryGroups });
     this.warnIfGroupingIsSlow(repositoryGroups, this.clock.now() - started);
     this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
+    this.renderEmitter.fire();
   }
 
   /**

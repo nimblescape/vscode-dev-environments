@@ -228,6 +228,7 @@ interface Harness {
   };
   claims: { claim: ReturnType<typeof vi.fn> };
   dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
+  repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -311,6 +312,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     start: vi.fn(async () => {}),
     installWsl: vi.fn(async () => {}),
   };
+  const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -354,6 +356,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     statusBar,
     settings: () => settings,
     dockerSetup,
+    repositoryGroupsEditor,
     viewVisible: () => false,
     clock,
     isAlive: (pid: number) => alive.has(pid),
@@ -404,6 +407,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     auth,
     claims,
     dockerSetup,
+    repositoryGroupsEditor,
     ui,
     discovery,
     sidebar,
@@ -511,7 +515,8 @@ describe('Controller commands', () => {
     // 20 since unit 10: Turn Off Host Access Checks… and Turn On Host Access Checks (the switch per repository).
     // 24 since unit 14 (spec: open in a new window): Start in New Window, Start in Current Window, and the switcher for
     // a new window and for the current window.
-    expect(declared).toHaveLength(24);
+    // 25 since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups….
+    expect(declared).toHaveLength(25);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -1673,6 +1678,11 @@ describe('Connection of this window', () => {
   it('opens the walkthrough with Install Docker…', async () => {
     await run('installDocker');
     expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the editor of the repository groups with Edit Repository Groups…', async () => {
+    await run('editRepositoryGroups');
+    expect(h.repositoryGroupsEditor.open).toHaveBeenCalledTimes(1);
   });
 
   it('runs the buttons of the walkthrough', async () => {
