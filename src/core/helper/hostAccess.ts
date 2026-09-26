@@ -7,12 +7,18 @@
 // container are ports of the computer on the addresses that it listens on). The open pipeline checks the configuration
 // before every build and before every `devcontainer up`, and refuses a configuration that needs more; it never changes
 // one silently: the flags that it removes from `runArgs` (overrideRunArgs) are named in the log (removedRunArgs).
+// The checks can be turned off per repository (setting devEnvLauncher.hostAccessChecksOff, ../hostAccessChecks.ts): the
+// caller passes the switch, and with the checks off only the refusals of access to the computer (HostAccessClass
+// `computer`) are lifted, and published ports keep the address that the configuration gives them. Account separation, the
+// identity of the owner account, the integrity of the extension, and the options that the policy does not support stay
+// refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
   ENVIRONMENT_VOLUME_PATTERN,
   HELPER_CACHE_VOLUME,
+  HOST_ACCESS_UNRESTRICTED_LABEL,
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_VOLUME,
@@ -70,32 +76,60 @@ export interface HostAccessReport {
   unsupported: string[];
 }
 
-/** A problem of the configuration: its text, and whether it needs access to the computer or is not supported. */
-interface Problem {
+/**
+ * The class of a refused item, for the switch of the host access checks (concept section 9 "Host access"):
+ * - `computer`: access to the computer (its files, the Docker socket, privileges, devices, namespaces, ports on other
+ *   addresses than localhost, volumes of other programs). Refused while the checks are on, allowed while they are off.
+ * - `protected`: refused whatever the switch says: account separation (volumes of other environments and accounts, the
+ *   cache volume of the workspace helper), the identity of the owner account (variables of container-only Git and of
+ *   the GitHub CLI), the integrity of the extension (`initializeCommand`, which would run in the workspace helper next to
+ *   the Docker socket), and items whose class is not clear. Reported as access to the computer (Messages.hostAccess).
+ * - `unsupported`: options that the policy does not know or does not support (Messages.unsupportedOptions); refused
+ *   whatever the switch says.
+ */
+export type HostAccessClass = 'computer' | 'protected' | 'unsupported';
+
+/** A refused item with its class (hostAccessClassification). */
+export interface HostAccessFinding {
   item: string;
-  kind: 'hostAccess' | 'unsupported';
+  class: HostAccessClass;
 }
 
-const access = (item: string): Problem => ({ item, kind: 'hostAccess' });
+/** A problem of the configuration: its text and its class. */
+interface Problem {
+  item: string;
+  class: HostAccessClass;
+}
+
+/** Access to the computer: lifted while the host access checks are off. */
+const access = (item: string): Problem => ({ item, class: 'computer' });
 const accessAll = (items: readonly string[]): Problem[] => items.map(access);
-const unsupported = (item: string): Problem => ({ item, kind: 'unsupported' });
+/** Refused as access to the computer whatever the switch says (HostAccessClass `protected`). */
+const guarded = (item: string): Problem => ({ item, class: 'protected' });
+const guardedAll = (items: readonly string[]): Problem[] => items.map(guarded);
+const unsupported = (item: string): Problem => ({ item, class: 'unsupported' });
 
 /** How a flag of `docker run` or `docker build` is treated. */
 type FlagRule =
   | { kind: 'allow'; value: boolean }
   // Allowed, but not passed to Docker (overrideRunArgs); `reason` tells the log why (removedRunArgs).
   | { kind: 'remove'; value: boolean; reason: string }
-  | { kind: 'refuse'; value: boolean; item?: string }
+  // `guarded`: refused whatever the switch of the host access checks says (HostAccessClass `protected`).
+  | { kind: 'refuse'; value: boolean; item?: string; guarded?: boolean }
   | { kind: 'check'; check: (value: string) => Problem[] };
 
 const allowValue: FlagRule = { kind: 'allow', value: true };
 const allowFlag: FlagRule = { kind: 'allow', value: false };
 const refuseValue: FlagRule = { kind: 'refuse', value: true };
-const refuseFlag: FlagRule = { kind: 'refuse', value: false };
 
-/** A check whose items all need access to the computer. */
+/** A check whose items all need access to the computer (HostAccessClass `computer`). */
 function checkAccess(check: (value: string) => string[]): FlagRule {
   return { kind: 'check', check: (value) => accessAll(check(value)) };
+}
+
+/** A check whose items stay refused whatever the switch says (HostAccessClass `protected`). */
+function checkGuarded(check: (value: string) => string[]): FlagRule {
+  return { kind: 'check', check: (value) => guardedAll(check(value)) };
 }
 
 const REMOVED_NAME = 'the container gets the name of the environment';
@@ -135,8 +169,9 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--hostname': allowValue,
   '-h': allowValue,
   // Not a variable of container-only Git (envProblems).
-  '--env': checkAccess(envProblems),
-  '-e': checkAccess(envProblems),
+  // The identity of the owner account: stays refused with the checks off.
+  '--env': checkGuarded(envProblems),
+  '-e': checkGuarded(envProblems),
   // docker run reads the file in the workspace helper: only a file of the workspace volume (envFileProblems).
   '--env-file': { kind: 'check', check: envFileProblems },
   '--shm-size': allowValue,
@@ -202,8 +237,9 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--stop-timeout': { kind: 'check', check: stopTimeoutProblems },
   // Only `no` and `on-failure`: the others start the container together with Docker (restartProblems).
   '--restart': { kind: 'check', check: restartProblems },
-  // Only drivers that keep the log in files of the container, or no log (logDriverProblems).
-  '--log-driver': checkAccess(logDriverProblems),
+  // Only drivers that keep the log in files of the container, or no log (logDriverProblems). Stays refused with the
+  // checks off, like the other options of the log (user decision 2026-09-26).
+  '--log-driver': checkGuarded(logDriverProblems),
   // Only options of the size, the rotation, and the content of the log (logOptionProblems).
   '--log-opt': { kind: 'check', check: logOptionProblems },
   // No effect: the CLI adds its own --entrypoint after the runArgs, and Docker uses the last one.
@@ -247,8 +283,9 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--use-api-socket': { kind: 'refuse', value: false, item: 'the Docker socket (--use-api-socket)' },
   // A control group of the computer.
   '--cgroup-parent': refuseValue,
-  // Without the OOM killer, a container without a memory limit can make the computer hang.
-  '--oom-kill-disable': refuseFlag,
+  // Without the OOM killer, a container without a memory limit can make the computer hang. Not named by the user
+  // decision on the switch, so it stays refused with the checks off (the safer choice for an unclear item).
+  '--oom-kill-disable': { kind: 'refuse', value: false, guarded: true },
   '--pid': refuseValue,
   '--ipc': refuseValue,
   '--uts': refuseValue,
@@ -291,51 +328,78 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `build.options`, and the properties below), the merged configuration (the same, except `containerEnv` and
  * `remoteEnv`), and the image metadata (`mounts`, `privileged`, `capAdd`, `securityOpt`, `hostRequirements.gpu`,
  * `initializeCommand`, `remote.localPortHost` of `customizations.vscode.settings`, `containerEnv`, `remoteEnv`).
- * hostAccessReport splits them.
+ * hostAccessReport splits them. `checksOn`: the switch of the repository (../hostAccessChecks.ts); `false` leaves out
+ * the items of the class `computer` (hostAccessClassification), and the published ports keep their address.
  */
-export function hostAccessProblems(input: HostAccessInput): string[] {
-  return hostAccessFindings(input).map((problem) => problem.item);
+export function hostAccessProblems(input: HostAccessInput, checksOn = true): string[] {
+  return applicable(hostAccessFindings(input, checksOn), checksOn).map((problem) => problem.item);
 }
 
-/** The items of hostAccessProblems, split into settings that need access to the computer and unknown settings. */
-export function hostAccessReport(input: HostAccessInput): HostAccessReport {
+/**
+ * The items of hostAccessProblems, split into settings that need access to the computer (the classes `computer` and
+ * `protected`) and unknown settings (`unsupported`). `checksOn` as in hostAccessProblems.
+ */
+export function hostAccessReport(input: HostAccessInput, checksOn = true): HostAccessReport {
   const report: HostAccessReport = { hostAccess: [], unsupported: [] };
-  for (const problem of hostAccessFindings(input)) report[problem.kind].push(problem.item);
+  for (const problem of applicable(hostAccessFindings(input, checksOn), checksOn)) {
+    report[problem.class === 'unsupported' ? 'unsupported' : 'hostAccess'].push(problem.item);
+  }
   return report;
 }
 
-function hostAccessFindings(input: HostAccessInput): Problem[] {
+/**
+ * Every item that the policy refuses while the checks are on, with its class: which of them the switch lifts
+ * (`computer`) and which stay refused (`protected`, `unsupported`). For the tests and the documentation of the switch.
+ */
+export function hostAccessClassification(input: HostAccessInput): HostAccessFinding[] {
+  return hostAccessFindings(input, true).map((problem) => ({ item: problem.item, class: problem.class }));
+}
+
+/** The problems that the policy refuses with the switch `checksOn`. */
+function applicable(problems: readonly Problem[], checksOn: boolean): Problem[] {
+  return checksOn ? [...problems] : problems.filter((problem) => problem.class !== 'computer');
+}
+
+function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
   const problems: Problem[] = [];
   const add = (found: readonly Problem[]): void => {
-    for (const problem of found) if (!problems.some((known) => known.item === problem.item)) problems.push(problem);
+    for (const problem of found) {
+      const known = problems.find((other) => other.item === problem.item);
+      if (!known) problems.push({ ...problem });
+      // The same text from two rules (for example the options of two mounts of one volume): the one that the switch does
+      // not lift counts.
+      else if (known.class === 'computer' && problem.class !== 'computer') known.class = problem.class;
+    }
   };
   const volumes = volumeContext(input);
   for (const source of configurationSources(input)) {
     // Read as the Dev Container CLI merges them: any true-like `privileged`, and a single value in place of a list.
-    for (const mount of cliList(source.mounts)) add(accessAll(mountProblems(parseMountEntry(mount), volumes)));
+    for (const mount of cliList(source.mounts)) add(mountProblems(parseMountEntry(mount), volumes));
     if (source.privileged) add([access('privileged mode')]);
     add(accessAll(capabilityProblems(cliList(source.capAdd))));
     add(accessAll(securityOptionProblems(cliList(source.securityOpt))));
     const gpu = isRecord(source.hostRequirements) ? source.hostRequirements.gpu : undefined;
     if (gpu !== undefined && gpu !== false && gpu !== null) add([access('GPU access (hostRequirements.gpu)')]);
-    // It would run in the workspace helper, which has the Docker socket.
-    if (hasCommand(source.initializeCommand)) add([access('initializeCommand')]);
+    // It would run in the workspace helper, which has the Docker socket (not on the computer): the integrity of the
+    // extension, so it stays refused with the checks off.
+    if (hasCommand(source.initializeCommand)) add([guarded('initializeCommand')]);
     add(accessAll(portHostProblems(source.customizations)));
   }
   for (const source of [input.config, input.merged]) {
     if (!source) continue;
     if (Array.isArray(source.runArgs)) {
       add(runArgsFindings(source.runArgs, volumes));
-      // What Docker gets: the same list without the removed flags, and with 127.0.0.1 for published ports.
-      add(runArgsFindings(overrideRunArgs(source.runArgs), volumes));
+      // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
+      add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes));
     }
-    if (source.appPort !== undefined) add(accessAll(appPortProblems(source.appPort)));
+    if (source.appPort !== undefined) add(appPortProblems(source.appPort));
     const build = isRecord(source.build) ? source.build : undefined;
     if (build && Array.isArray(build.options)) add(buildOptionFindings(build.options));
   }
   // Not the merged configuration: for an existing container, it holds the values of the override configuration, also of
-  // an earlier version of the extension. The image metadata has none of them (the build runs without it).
-  for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(accessAll(environmentProblems(source)));
+  // an earlier version of the extension. The image metadata has none of them (the build runs without it). The identity
+  // of the owner account: stays refused with the checks off.
+  for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(guardedAll(environmentProblems(source)));
   return problems;
 }
 
@@ -428,6 +492,12 @@ export interface MountSpec {
    * labels by which the extension restores the environments of a lost registry).
    */
   volumeOptions: boolean;
+  /**
+   * Of `volumeOptions`: an option other than `volume-driver` and `volume-opt` (for example `volume-label`). Such a mount
+   * stays refused with the host access checks off: the labels are those by which the extension tells the volumes of the
+   * environments apart.
+   */
+  otherVolumeOptions?: boolean;
   /** The text, when it cannot be read as Docker reads it (csvFields). */
   unreadable?: string;
 }
@@ -478,7 +548,10 @@ export function parseMountString(spec: string): MountSpec {
     const value = index < 0 ? '' : field.slice(index + 1).trim();
     if (key === 'type') mount.type = value.toLowerCase();
     else if (key === 'source' || key === 'src') mount.source = value;
-    else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') mount.volumeOptions = true;
+    else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') {
+      mount.volumeOptions = true;
+      if (key !== 'volume-driver' && key !== 'volume-opt') mount.otherVolumeOptions = true;
+    }
   }
   return mount;
 }
@@ -496,9 +569,9 @@ function parseMountEntry(entry: unknown): MountSpec {
   if (entry.source) parts.push(`src=${String(entry.source)}`);
   parts.push(`dst=${String(entry.target)}`);
   const mount = parseMountString(parts.join(','));
-  if (Object.keys(entry).some((key) => /^volume(-?(driver|opt|options|label|labels))$/i.test(key))) {
-    mount.volumeOptions = true;
-  }
+  const keys = Object.keys(entry).filter((key) => /^volume(-?(driver|opt|options|label|labels))$/i.test(key));
+  if (keys.length > 0) mount.volumeOptions = true;
+  if (keys.some((key) => !/^volume-?(driver|opt)$/i.test(key))) mount.otherVolumeOptions = true;
   return mount;
 }
 
@@ -525,16 +598,27 @@ function mountType(mount: MountSpec): string {
   return mount.type ?? (source !== '' && isPathSource(source) ? 'bind' : 'volume');
 }
 
-/** Only `type=volume` (not a volume of something else, volumeNameProblems) and `type=tmpfs` are allowed. */
-function mountProblems(mount: MountSpec, volumes: VolumeContext): string[] {
-  if (mount.unreadable !== undefined) return [`mount ${JSON.stringify(mount.unreadable)}`];
+/**
+ * Only `type=volume` (not a volume of something else, volumeNameProblems) and `type=tmpfs` are allowed. With the host
+ * access checks off (class `computer`), also bind mounts, the named pipes of the computer (`npipe`), and the volume
+ * options `volume-driver` and `volume-opt`; the name of the volume is still checked for account separation. A mount
+ * that Docker would read otherwise, the types `image`, `cluster`, and unknown types, and other volume options stay
+ * refused: what they reach is not clear.
+ */
+function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
+  if (mount.unreadable !== undefined) return [guarded(`mount ${JSON.stringify(mount.unreadable)}`)];
   const source = mount.source ?? '';
   const type = mountType(mount);
   if (type === 'tmpfs') return [];
-  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [source ? `bind mount ${source}` : 'bind mount'];
-  if (type !== 'volume') return [`mount of the type ${type}`];
-  if (mount.volumeOptions) return [`volume options of the mount ${source || '(anonymous volume)'}`];
-  return volumeNameProblems(source, volumes);
+  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${source}` : 'bind mount')];
+  if (type === 'npipe') return [access(`mount of the type ${type}`)];
+  if (type !== 'volume') return [guarded(`mount of the type ${type}`)];
+  const options: Problem[] = [];
+  if (mount.volumeOptions) {
+    const item = `volume options of the mount ${source || '(anonymous volume)'}`;
+    options.push(mount.otherVolumeOptions ? guarded(item) : access(item));
+  }
+  return [...options, ...volumeNameProblems(source, volumes)];
 }
 
 /** The name of the named volume of a mount; `undefined` for other mounts and anonymous volumes. */
@@ -665,22 +749,28 @@ function mayMountEnvironmentVolume(labels: Readonly<Record<string, string>>, vol
  * the repository (`${localWorkspaceFolderBasename}-node_modules`), are allowed: a volume that does not exist yet is
  * created with the labels of the environment before `up`.
  */
-function volumeNameProblems(name: string, volumes: VolumeContext): string[] {
+function volumeNameProblems(name: string, volumes: VolumeContext): Problem[] {
   if (name === '' || name === volumes.own) return [];
-  if (volumes.foreign.has(name)) return [`volume ${name} of another environment`];
+  // Account separation: the volumes of other environments and the cache volume of the workspace helper, which all
+  // environments share, stay refused with the host access checks off. The volumes of other programs (another container,
+  // the Dev Containers extension, Docker Compose) are access to the computer.
+  if (volumes.foreign.has(name)) return [guarded(`volume ${name} of another environment`)];
   const byName = foreignVolumeName(name);
-  if (byName !== undefined) return [`volume ${name} of ${byName}`];
+  if (byName !== undefined) {
+    const item = `volume ${name} of ${byName}`;
+    return [name === HELPER_CACHE_VOLUME || ENVIRONMENT_VOLUME_PATTERN.test(name) ? guarded(item) : access(item)];
+  }
   const labels = volumes.labels[name];
   // Not known to exist.
   if (labels === undefined) return [];
   if (labels[LABEL_ENVIRONMENT_ID] !== undefined) {
-    return mayMountEnvironmentVolume(labels, volumes) ? [] : [`volume ${name} of another environment`];
+    return mayMountEnvironmentVolume(labels, volumes) ? [] : [guarded(`volume ${name} of another environment`)];
   }
   const owner = volumeLabelOwner(labels);
-  if (owner !== undefined) return [`volume ${name} of ${owner}`];
+  if (owner !== undefined) return [access(`volume ${name} of ${owner}`)];
   // An existing volume named like a clone volume of the Dev Containers extension (isDevContainersCloneVolumeName), which
   // older versions did not label.
-  if (isDevContainersCloneVolumeName(name)) return [`volume ${name} of another program`];
+  if (isDevContainersCloneVolumeName(name)) return [access(`volume ${name} of another program`)];
   return [];
 }
 
@@ -694,10 +784,10 @@ export function volumeFlagSource(spec: string): string | undefined {
   return index > 0 ? spec.slice(0, index) : undefined;
 }
 
-function volumeFlagProblems(value: string, volumes: VolumeContext): string[] {
+function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
   const source = volumeFlagSource(value);
   if (source === undefined) return [];
-  if (isPathSource(source)) return [`bind mount ${source}`];
+  if (isPathSource(source)) return [access(`bind mount ${source}`)];
   return volumeNameProblems(source, volumes);
 }
 
@@ -781,14 +871,15 @@ function portProblems(spec: string): string[] {
   return [`published port ${spec.trim()}`];
 }
 
-function appPortProblems(appPort: unknown): string[] {
+function appPortProblems(appPort: unknown): Problem[] {
   const ports = Array.isArray(appPort) ? appPort : [appPort];
-  const items: string[] = [];
+  const items: Problem[] = [];
   for (const port of ports) {
     // A number is published on 127.0.0.1 by the Dev Container CLI itself.
     if (typeof port === 'number') continue;
-    if (typeof port === 'string') items.push(...portProblems(port));
-    else items.push(`published port ${JSON.stringify(port)}`);
+    if (typeof port === 'string') items.push(...accessAll(portProblems(port)));
+    // Neither a number nor a text: what the Dev Container CLI makes of it is not clear, so it stays refused.
+    else items.push(guarded(`published port ${JSON.stringify(port)}`));
   }
   return items;
 }
@@ -825,8 +916,12 @@ export function loopbackAppPorts(appPort: unknown): string[] | undefined {
 /** Label keys of Dev Environments (`devenv.`) and of the Dev Container CLI and the Dev Containers extension (`devcontainer.`). */
 const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
 
-/** The labels that the override configuration adds to runArgs itself, with their values. */
-const OWN_LABELS: readonly string[] = [CONTAINER_VERSION_LABEL, CONTAINER_CONFIG_UNKNOWN_LABEL];
+/**
+ * The labels that the override configuration adds to runArgs itself, with their values. The merged configuration of an
+ * existing container holds them too, also `devenv.host-access=unrestricted` of a container created while the host
+ * access checks were off, which must not block the open that creates it again once they are on.
+ */
+const OWN_LABELS: readonly string[] = [CONTAINER_VERSION_LABEL, CONTAINER_CONFIG_UNKNOWN_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL];
 
 /**
  * `--label`: no key of RESERVED_LABEL (compared without case and surrounding spaces), except the exact labels that the
@@ -869,7 +964,9 @@ function envFileProblems(value: string): Problem[] {
     !segments.includes('..') &&
     segments.length > root.length &&
     root.every((segment, index) => segments[index] === segment);
-  return inVolume ? [] : [access(`--env-file=${value}`)];
+  // Files of the workspace helper, not of the computer (among them the cache volume that all environments share): stays
+  // refused with the checks off.
+  return inVolume ? [] : [guarded(`--env-file=${value}`)];
 }
 
 /**
@@ -898,7 +995,8 @@ function restartProblems(value: string): Problem[] {
  * computer first when the memory runs out.
  */
 function oomScoreProblems(value: string): Problem[] {
-  return /^\d+$/.test(value) ? [] : [access(`--oom-score-adj=${value}`)];
+  // Not named by the user decision on the switch: stays refused with the checks off (the safer choice).
+  return /^\d+$/.test(value) ? [] : [guarded(`--oom-score-adj=${value}`)];
 }
 
 /**
@@ -1039,8 +1137,9 @@ function flagProblems(flag: ParsedFlag, label: (text: string) => string): Proble
   if (!rule) return [unsupported(label(flag.name.startsWith('--') ? flag.name : flag.raw))];
   if (rule.kind === 'allow' || rule.kind === 'remove') return [];
   if (rule.kind === 'refuse') {
-    if (rule.item) return [access(rule.item)];
-    return [access(label(flag.value !== undefined ? `${flag.name}=${flag.value}` : flag.name))];
+    const refused = rule.guarded ? guarded : access;
+    if (rule.item) return [refused(rule.item)];
+    return [refused(label(flag.value !== undefined ? `${flag.name}=${flag.value}` : flag.name))];
   }
   return rule.check(flag.value ?? '');
 }
@@ -1068,9 +1167,9 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext): P
     if (last && rule !== undefined && (rule.kind === 'allow' || rule.kind === 'check') && takesValue(rule)) {
       problems.push(unsupported(`${flag.raw} without a value`));
     } else if (flag.name === '-v' || flag.name === '--volume') {
-      problems.push(...accessAll(volumeFlagProblems(flag.value ?? '', volumes)));
+      problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
     } else if (flag.name === '--mount') {
-      problems.push(...accessAll(mountProblems(parseMountString(flag.value ?? ''), volumes)));
+      problems.push(...mountProblems(parseMountString(flag.value ?? ''), volumes));
     } else {
       problems.push(...flagProblems(flag, (text) => text));
     }
@@ -1179,13 +1278,15 @@ export function removedRunArgs(runArgs: readonly string[]): RemovedRunArg[] {
 /**
  * The repository part of `runArgs` in the override configuration of `devcontainer up`, the list that Docker gets: the
  * entries that are text (the policy refuses a list with other entries), without the removed flags (removedRunArgs, read
- * with the parser of the policy), and with 127.0.0.1 for published ports without an address (loopbackRunArgs).
+ * with the parser of the policy), and with 127.0.0.1 for published ports without an address (loopbackRunArgs), unless
+ * the host access checks are off (`checksOn` false: the ports keep the address that the configuration gives them).
  * hostAccessProblems checks this list too, and the pipeline checks the complete list of the override configuration
  * again before `up`.
  */
-export function overrideRunArgs(runArgs: unknown): string[] {
+export function overrideRunArgs(runArgs: unknown, checksOn = true): string[] {
   const texts = Array.isArray(runArgs) ? runArgs.filter((arg): arg is string => typeof arg === 'string') : [];
-  return loopbackRunArgs(withoutRemovals(texts, removals(texts)));
+  const kept = withoutRemovals(texts, removals(texts));
+  return checksOn ? loopbackRunArgs(kept) : kept;
 }
 
 /**

@@ -32,6 +32,7 @@ const SETTINGS: ExtensionSettings = {
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 const OCTO: GitHubAccount = { id: '1001', login: 'octo' };

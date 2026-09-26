@@ -34,6 +34,7 @@ const SETTINGS: ExtensionSettings = {
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 const ACCOUNT = { id: '1001', label: 'octo' };

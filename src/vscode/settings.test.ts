@@ -9,7 +9,15 @@ import * as path from 'path';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import type { ExtensionSettings } from '../core/types';
-import { DEFAULT_SETTINGS, MAX_REFRESH_INTERVAL_MINUTES, normalizeSettings, readSettings, SETTINGS_SECTION } from './settings';
+import { Messages } from '../core/messages';
+import {
+  DEFAULT_SETTINGS,
+  MAX_REFRESH_INTERVAL_MINUTES,
+  normalizeSettings,
+  readSettings,
+  SETTINGS_SECTION,
+  warnInvalidHostAccessChecksOff,
+} from './settings';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 describe('settings (concept section 8)', () => {
@@ -26,6 +34,8 @@ describe('settings (concept section 8)', () => {
       includeArchived: false,
       includeForks: true,
       refreshIntervalMinutes: 60,
+      // Unit 10: no repository has its host access checks off by default.
+      hostAccessChecksOff: [],
       // Unit 9 (setting repositoryGroups, concept 8): a new setting with the default [].
       repositoryGroups: [],
     });
@@ -33,7 +43,8 @@ describe('settings (concept section 8)', () => {
 
   it('reads the section devEnvLauncher', () => {
     const values: Partial<Record<keyof ExtensionSettings, unknown>> = { stopOnClose: false, owners: ['acme'] };
-    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: (key: keyof ExtensionSettings) => values[key] });
+    // `inspect`: devEnvLauncher.hostAccessChecksOff is read from the user settings only (unit 10); it has no user value here.
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: (key: keyof ExtensionSettings) => values[key], inspect: () => undefined });
     expect(readSettings()).toEqual({ ...DEFAULT_SETTINGS, stopOnClose: false, owners: ['acme'] });
     expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
     expect(SETTINGS_SECTION).toBe('devEnvLauncher');
@@ -81,5 +92,37 @@ describe('settings (concept section 8)', () => {
     // A timer with a longer delay would fire every millisecond.
     expect(settings({ refreshIntervalMinutes: 1_000_000 }).refreshIntervalMinutes).toBe(MAX_REFRESH_INTERVAL_MINUTES);
     expect(MAX_REFRESH_INTERVAL_MINUTES * 60_000).toBeLessThanOrEqual(2 ** 31 - 1);
+  });
+
+  it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {
+    const get = vi.fn((key: string) => (key === 'hostAccessChecksOff' ? ['from/workspace'] : undefined));
+    const inspect = vi.fn((): { globalValue?: string[]; workspaceValue: string[] } => ({
+      globalValue: [' acme/api ', 'not a name', 'me/web'],
+      workspaceValue: ['evil/repo'],
+    }));
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get, inspect });
+    expect(readSettings().hostAccessChecksOff).toEqual(['acme/api', 'me/web']);
+    expect(inspect).toHaveBeenCalledWith('hostAccessChecksOff');
+    expect(get).not.toHaveBeenCalledWith('hostAccessChecksOff');
+    // Without a user value, every check is on.
+    inspect.mockReturnValue({ globalValue: undefined, workspaceValue: ['evil/repo'] });
+    expect(readSettings().hostAccessChecksOff).toEqual([]);
+    expect(normalizeSettings((key) => (key === 'hostAccessChecksOff' ? 'acme/api' : undefined)).hostAccessChecksOff).toEqual([]);
+  });
+
+  it('warns once about the invalid entries of hostAccessChecksOff, and again only when they change', () => {
+    const inspect = vi.fn((): { globalValue: unknown[] } => ({ globalValue: ['acme/api', 'acme', 3] }));
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: () => undefined, inspect });
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    const warned = warnInvalidHostAccessChecksOff(logger, '');
+    expect(warned).toBe('acme, 3');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.hostAccessChecksOffInvalid('acme, 3'));
+    expect(logger.warn).toHaveBeenCalledWith(Messages.hostAccessChecksOffInvalid('acme, 3'));
+    expect(warnInvalidHostAccessChecksOff(logger, warned)).toBe(warned);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    inspect.mockReturnValue({ globalValue: ['acme/api'] });
+    expect(warnInvalidHostAccessChecksOff(logger, warned)).toBe('');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
   });
 });

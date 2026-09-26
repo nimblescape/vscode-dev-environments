@@ -255,6 +255,16 @@
         "category": "Dev Environments"
       },
       {
+        "command": "devEnvironments.turnOffHostAccessChecks",
+        "title": "Turn Off Host Access Checks…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.turnOnHostAccessChecks",
+        "title": "Turn On Host Access Checks",
+        "category": "Dev Environments"
+      },
+      {
         "command": "devEnvironments.dockerSetup.install",
         "title": "Install Docker",
         "category": "Dev Environments"
@@ -293,6 +303,14 @@
         },
         {
           "command": "devEnvironments.dockerSetup.installWsl",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.turnOffHostAccessChecks",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.turnOnHostAccessChecks",
           "when": "false"
         }
       ],
@@ -373,6 +391,16 @@
           "command": "devEnvironments.showOnGitHub",
           "when": "view == devEnvironments.repositories && viewItem =~ /onGitHub/",
           "group": "2_more@4"
+        },
+        {
+          "command": "devEnvironments.turnOffHostAccessChecks",
+          "when": "view == devEnvironments.repositories && viewItem =~ /hostAccessChecked/",
+          "group": "3_hostAccess@1"
+        },
+        {
+          "command": "devEnvironments.turnOnHostAccessChecks",
+          "when": "view == devEnvironments.repositories && viewItem =~ /hostAccessUnrestricted/",
+          "group": "3_hostAccess@1"
         }
       ],
       "devEnvironments.more": [
@@ -394,6 +422,16 @@
           "command": "devEnvironments.showOnGitHub",
           "when": "viewItem =~ /onGitHub/",
           "group": "1_more@4"
+        },
+        {
+          "command": "devEnvironments.turnOffHostAccessChecks",
+          "when": "viewItem =~ /hostAccessChecked/",
+          "group": "2_hostAccess@1"
+        },
+        {
+          "command": "devEnvironments.turnOnHostAccessChecks",
+          "when": "viewItem =~ /hostAccessUnrestricted/",
+          "group": "2_hostAccess@1"
         }
       ]
     },
@@ -457,6 +495,17 @@
           "minimum": 1,
           "maximum": 35791,
           "description": "Interval in minutes of the background update of the repository list."
+        },
+        "devEnvLauncher.hostAccessChecksOff": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\s*[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+\\s*$",
+            "patternErrorMessage": "A repository name like owner/name."
+          },
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Repositories (`owner/name`) whose host access checks are off. Their configuration, Features, and base image may then use your computer: its files (bind mounts), the Docker socket (full control of Docker and of every other environment), privileged mode, devices and GPUs, published ports on all network addresses, and the volumes of other programs. The checks of account separation, of the GitHub account of the environment, and of options that Dev Environments does not support stay on. Empty: the checks are on for every repository. Only the user settings count. Use **Turn Off Host Access Checks…** in the context menu of a repository."
         },
         "devEnvLauncher.repositoryGroups": {
           "type": "array",

@@ -6,6 +6,7 @@
 // `vscode`, so the rules for rows, states, actions, and sorting are unit-tested; treeView.ts only maps the model to
 // tree items.
 import { filterRepositories } from '../core/discovery/discoveryService';
+import { hostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { formatChanges, Messages, StateTexts } from '../core/messages';
 import { configurationName } from '../core/names';
 import type {
@@ -45,7 +46,8 @@ export interface EnvironmentRuntime {
 export interface TreeInput {
   /** Stored or fresh result of the discovery. `undefined` while no list is loaded. */
   discovery: DiscoveryData | undefined;
-  settings: Pick<ExtensionSettings, 'owners' | 'includeArchived' | 'includeForks'>;
+  /** `hostAccessChecksOff`: the repositories whose host access checks are off (a marker and a warning in the row). */
+  settings: Pick<ExtensionSettings, 'owners' | 'includeArchived' | 'includeForks'> & Partial<Pick<ExtensionSettings, 'hostAccessChecksOff'>>;
   /**
    * The entries of the Environment Registry that the signed-in account may use (concept 7.5, `availableEnvironments`).
    * Environments of another account are never passed, so no row, name, or count reveals them.
@@ -112,6 +114,12 @@ export interface RepositoryRow {
   configurationName?: string;
   /** The row has an environment, and GitHub does not list its repository. */
   notOnGitHub: boolean;
+  /**
+   * The switch of the host access checks of the repository (setting devEnvLauncher.hostAccessChecksOff): `off` shows the
+   * marker `host access unrestricted` and a warning in the tooltip, and offers Turn On Host Access Checks instead of
+   * Turn Off Host Access Checks….
+   */
+  hostAccessChecks: HostAccessChecks;
   actions: RowActions;
   /** Repository name. */
   label: string;
@@ -119,7 +127,10 @@ export interface RepositoryRow {
   description: string;
   /** Includes the time of the last use. */
   tooltip: string;
-  /** `repository;canStart;canStop;canDelete;canRebuild;multiConfig;onGitHub`, only the flags that apply (package.json menus). */
+  /**
+   * `repository;canStart;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked`, only the flags that apply
+   * (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are off.
+   */
   contextValue: string;
 }
 
@@ -287,8 +298,12 @@ export function rowActions(
   };
 }
 
-/** `contextValue` of a repository row; the `when` clauses in package.json match these flags. */
-export function contextValue(actions: RowActions): string {
+/**
+ * `contextValue` of a repository row; the `when` clauses in package.json match these flags. `checks`: the switch of the
+ * host access checks of the repository, the flag `hostAccessChecked` (Turn Off Host Access Checks…) or
+ * `hostAccessUnrestricted` (Turn On Host Access Checks); none without it.
+ */
+export function contextValue(actions: RowActions, checks?: HostAccessChecks): string {
   const flags = ['repository'];
   if (actions.canStart) flags.push('canStart');
   if (actions.canStop) flags.push('canStop');
@@ -296,6 +311,8 @@ export function contextValue(actions: RowActions): string {
   if (actions.canRebuild) flags.push('canRebuild');
   if (actions.multiConfig) flags.push('multiConfig');
   if (actions.onGitHub) flags.push('onGitHub');
+  if (checks === 'on') flags.push('hostAccessChecked');
+  if (checks === 'off') flags.push('hostAccessUnrestricted');
   return flags.join(';');
 }
 
@@ -359,7 +376,7 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
       const id = `repo:${key}`;
       if (usedIds.has(id)) continue;
       usedIds.add(id);
-      const row = repositoryRow(id, info);
+      const row = repositoryRow(id, info, input);
       groupFor(row.owner).others.push(row);
     }
 
@@ -600,8 +617,13 @@ function environmentRow(
   const changes =
     (state === 'stopped' || state === 'noContainer') && environment.gitSummary ? formatChanges(environment.gitSummary) : '';
 
+  // After a rename or transfer on GitHub the row shows the current name, while the pipeline reads the switch under the
+  // registry name: the row shows the state of the switch under that name, as the pipeline applies it (review findings
+  // A1 and R2-1).
+  const checks: HostAccessChecks = hostAccessChecks(environment.repository, input.settings);
+  const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   const left = [branch, configuration !== undefined ? `(${configuration})` : undefined].filter(isText).join(' ');
-  const right = [stateText(state), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined].filter(isText).join(' · ');
+  const right = [stateText(state), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
   const description = [left, right].filter(isText).join('   ');
 
   const formatTime = input.formatTime ?? defaultFormatTime;
@@ -613,6 +635,7 @@ function environmentRow(
     timeValue(environment.lastUsedAt) > 0 ? TreeTexts.lastUsed(formatTime(environment.lastUsedAt)) : undefined,
     notOnGitHub ? TreeTexts.notListedOnGitHub : undefined,
     info?.isArchived ? TreeTexts.archived : undefined,
+    checks === 'off' ? Messages.hostAccessUnrestrictedTooltip : undefined,
   ]
     .filter(isText)
     .join('\n');
@@ -629,11 +652,12 @@ function environmentRow(
     branch,
     configurationName: configuration,
     notOnGitHub,
+    hostAccessChecks: checks,
     actions,
     label: name,
     description,
     tooltip,
-    contextValue: contextValue(actions),
+    contextValue: contextValue(actions, checks),
   };
 }
 
@@ -641,13 +665,15 @@ function environmentRow(
  * The row of a repository without environment of the signed-in account. An environment of another account does not
  * change it: Start creates the account's own environment (concept 7.5, D-3).
  */
-function repositoryRow(id: string, info: RepositoryInfo): RepositoryRow {
+function repositoryRow(id: string, info: RepositoryInfo, input: Pick<TreeInput, 'settings'>): RepositoryRow {
   const actions = rowActions(undefined, info);
+  const checks = hostAccessChecks(info.nameWithOwner, input.settings);
   const tooltip = [
     info.nameWithOwner,
     TreeTexts.noEnvironment,
     info.defaultBranch ? TreeTexts.defaultBranch(info.defaultBranch) : undefined,
     info.isArchived ? TreeTexts.archived : undefined,
+    checks === 'off' ? Messages.hostAccessUnrestrictedTooltip : undefined,
   ]
     .filter(isText)
     .join('\n');
@@ -659,11 +685,12 @@ function repositoryRow(id: string, info: RepositoryInfo): RepositoryRow {
     name: info.name,
     info,
     notOnGitHub: false,
+    hostAccessChecks: checks,
     actions,
     label: info.name,
-    description: '',
+    description: checks === 'off' ? StateTexts.hostAccessUnrestricted : '',
     tooltip,
-    contextValue: contextValue(actions),
+    contextValue: contextValue(actions, checks),
   };
 }
 

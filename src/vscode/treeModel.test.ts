@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Messages, StateTexts } from '../core/messages';
 import type { DiscoveryData, Environment, EnvironmentState, GitSummary, RepositoryInfo } from '../core/types';
 import {
   buildTreeModel,
@@ -309,21 +310,22 @@ describe('buildTreeModel', () => {
       owner: group.owner,
       rows: rows([group]).map((entry) => [entry.label, entry.state, entry.description, entry.contextValue]),
     }));
+    // Unit 10: every repository row has the flag of its host access checks (on by default: hostAccessChecked).
     expect(view).toEqual([
       {
         owner: 'acme-university',
         rows: [
-          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub'],
-          ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub'],
-          ['infra', undefined, '', 'repository;canStart;onGitHub'],
-          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub'],
+          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked'],
+          ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked'],
+          ['infra', undefined, '', 'repository;canStart;onGitHub;hostAccessChecked'],
+          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked'],
         ],
       },
       {
         owner: 'me',
         rows: [
-          ['dotfiles', 'stopped', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;onGitHub'],
-          ['website', undefined, '', 'repository;canStart;onGitHub'],
+          ['dotfiles', 'stopped', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked'],
+          ['website', undefined, '', 'repository;canStart;onGitHub;hostAccessChecked'],
         ],
       },
     ]);
@@ -385,7 +387,8 @@ describe('buildTreeModel', () => {
     const old = row(groups, 'acme/old');
     expect(old.notOnGitHub).toBe(true);
     expect(old.description).toBe('dev   Stopped · 2 uncommitted · not on GitHub');
-    expect(old.contextValue).toBe('repository;canStart;canDelete;canRebuild');
+    // Unit 10: the flag of the host access checks (on by default).
+    expect(old.contextValue).toBe('repository;canStart;canDelete;canRebuild;hostAccessChecked');
     expect(old.tooltip).toContain(TreeTexts.notListedOnGitHub);
     expect(row(groups, 'lost/repo').description).toBe('main   Stopped · not on GitHub');
     expect(groups.map((group) => group.owner)).toEqual(['acme', 'lost']);
@@ -494,8 +497,9 @@ describe('buildTreeModel', () => {
 
   it('shows the environments without "not on GitHub" while no repository list is loaded', () => {
     const groups = buildTreeModel(input({ discovery: undefined, environments: [environment('e1', 'acme/api')] }));
+    // Unit 10: the flag of the host access checks (on by default).
     expect(rows(groups).map((entry) => [entry.repository, entry.description, entry.contextValue])).toEqual([
-      ['acme/api', 'main   Stopped', 'repository;canStart;canDelete;canRebuild'],
+      ['acme/api', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;hostAccessChecked'],
     ]);
   });
 
@@ -823,6 +827,75 @@ describe('hint of an owner of the scan scope that GitHub does not return', () =>
         url: 'https://github.com/Nobody-Here',
       },
     ]);
+  });
+});
+
+describe('the switch of the host access checks in the rows (concept section 9 "Host access", unit 10)', () => {
+  const settings = (hostAccessChecksOff: string[]) => ({ owners: [], includeArchived: false, includeForks: true, hostAccessChecksOff });
+
+  it('marks a repository whose checks are off, with a warning in the tooltip, and offers Turn On', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web'), repo('acme/docs')]),
+        environments: [environment('e1', 'acme/api', { gitSummary: summary({ uncommittedFiles: 2 }) })],
+        runtime: new Map<string, EnvironmentRuntime>([['e1', { container: 'stopped', volume: true }]]),
+        settings: settings([' ACME/API ', 'acme/web']),
+      }),
+    );
+    const api = findRowByRepository(groups, 'acme/api');
+    expect(api?.hostAccessChecks).toBe('off');
+    expect(api?.description).toBe(`main   Stopped · 2 uncommitted · ${StateTexts.hostAccessUnrestricted}`);
+    expect(api?.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
+    expect(api?.contextValue.split(';')).toContain('hostAccessUnrestricted');
+    expect(api?.contextValue.split(';')).not.toContain('hostAccessChecked');
+    // A repository without environment.
+    const web = findRowByRepository(groups, 'acme/web');
+    expect(web?.description).toBe(StateTexts.hostAccessUnrestricted);
+    expect(web?.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
+    expect(web?.contextValue).toBe('repository;canStart;onGitHub;hostAccessUnrestricted');
+    // The checks of other repositories stay on: no marker, and Turn Off.
+    const docs = findRowByRepository(groups, 'acme/docs');
+    expect(docs?.hostAccessChecks).toBe('on');
+    expect(docs?.description).toBe('');
+    expect(docs?.tooltip).not.toContain(Messages.hostAccessUnrestrictedTooltip);
+    expect(docs?.contextValue).toBe('repository;canStart;onGitHub;hostAccessChecked');
+  });
+
+  // Review finding R2-1: the row shows the switch as the pipeline applies it, under the registry name only (it was
+  // "either name" after finding A1, which could show the checks off while the pipeline had them on).
+  it('marks a renamed or transferred repository by its registry name, the name the pipeline reads (A1, R2-1)', () => {
+    // The registry keeps alice/tool (the name the open pipeline reads the switch under); GitHub answers bob/tool.
+    const moved = repo('bob/tool', { configPaths: [] });
+    const build = (listed: string) =>
+      buildTreeModel(
+        input({
+          discovery: discovery([repo('acme/api')]),
+          environments: [environment('e1', 'alice/tool')],
+          repositoryLookups: new Map([['alice/tool', moved]]),
+          settings: settings([listed]),
+        }),
+      );
+    const off = row(build('alice/tool'), 'bob/tool');
+    expect(off.hostAccessChecks).toBe('off');
+    expect(off.description).toBe(`main   Stopped · ${StateTexts.hostAccessUnrestricted}`);
+    expect(off.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
+    expect(flags(off.contextValue)).toContain('hostAccessUnrestricted');
+    expect(flags(off.contextValue)).not.toContain('hostAccessChecked');
+
+    const on = row(build('bob/tool'), 'bob/tool');
+    expect(on.hostAccessChecks).toBe('on');
+    expect(on.description).not.toContain(StateTexts.hostAccessUnrestricted);
+    expect(flags(on.contextValue)).toContain('hostAccessChecked');
+  });
+
+  it('adds no flag of the switch to contextValue without it', () => {
+    const actions = rowActions('stopped', repo('acme/api'));
+    expect(contextValue(actions)).toBe('repository;canStart;canDelete;canRebuild;onGitHub');
+    expect(contextValue(actions, 'on')).toBe('repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked');
+    expect(contextValue(actions, 'off')).toBe('repository;canStart;canDelete;canRebuild;onGitHub;hostAccessUnrestricted');
+    // The when clauses of package.json tell the two flags apart.
+    expect(/hostAccessChecked/.test('hostAccessUnrestricted')).toBe(false);
+    expect(/hostAccessUnrestricted/.test('hostAccessChecked')).toBe(false);
   });
 });
 

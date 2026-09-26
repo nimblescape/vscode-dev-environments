@@ -102,6 +102,12 @@ export interface RefusedUpdate {
   features: Record<string, string>;
   /** What the new image needed, for the message (Messages.updateRefused). */
   items: string;
+  /**
+   * `off` when the host access checks were off for the repository at the refusal (only settings that stay refused then,
+   * for example a variable of the GitHub CLI); absent when they were on. An update refused with one state of the switch
+   * is tried again with the other.
+   */
+  hostAccessChecks?: 'off';
 }
 
 /**
@@ -264,6 +270,11 @@ export interface ExtensionSettings {
   includeArchived: boolean;
   includeForks: boolean;
   refreshIntervalMinutes: number;
+  /**
+   * Repositories (`owner/name`, valid entries only, trimmed) whose host access checks are off (concept section 8 and
+   * section 9 "Host access"; hostAccessChecks in hostAccessChecks.ts). Only the user setting counts.
+   */
+  hostAccessChecksOff: string[];
   /**
    * Raw entries of `repositoryGroups` (concept 6.2, 8): regular expressions that filter and group the repositories of the
    * sidebar. The sidebar checks each entry (src/vscode/repositoryGroups.ts). Missing: the same as an empty list.
