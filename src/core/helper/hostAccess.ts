@@ -1213,6 +1213,21 @@ export function runArgsUser(runArgs: unknown): string | undefined {
   return user === undefined || user.trim() === '' ? undefined : user;
 }
 
+/**
+ * Whether `runArgs` decide the host name of the container themselves, read as Docker reads the arguments (parseFlags):
+ * with `--hostname`/`-h`, or with a network or UTS namespace that Docker refuses a host name with (`--network host`,
+ * `--network container:<name>`, `--uts host`; also as `--net`). The override configuration then adds no `--hostname`.
+ */
+export function runArgsDecideHostname(runArgs: readonly string[]): boolean {
+  return parseFlags(runArgs, RUN_FLAGS).some((flag) => {
+    const value = flag.value?.trim().toLowerCase();
+    if (flag.name === '--hostname' || flag.name === '-h') return true;
+    if (value === undefined) return false;
+    if (flag.name === '--network' || flag.name === '--net') return value === 'host' || value.startsWith('container:');
+    return flag.name === '--uts' && value === 'host';
+  });
+}
+
 /** A flag that overrideRunArgs removes from `runArgs`, for the log. */
 export interface RemovedRunArg {
   /** The entry as the configuration writes it, with the next entry when that is its value (for example `--name x`). */
