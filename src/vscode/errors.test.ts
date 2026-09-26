@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { CommandError, UserFacingError } from '../core/errors';
-import { Actions, DOCKER_DOWNLOAD_URL, Messages } from '../core/messages';
+import { Actions, Messages } from '../core/messages';
 import { abortError, type Logger } from '../core/ports';
 import { RegistryVersionError } from '../core/storage/registry';
 import { isCancellation, OPERATION_FAILED, showError } from './errors';
@@ -41,18 +41,19 @@ describe('showError (concept 6.5)', () => {
     return { severity: error ? 'error' : 'warning', message, actions };
   }
 
-  it('offers the download page when Docker is not installed', async () => {
+  it('offers Install Docker… (the setup walkthrough) when Docker is not installed', async () => {
     const { logger } = recordingLogger();
-    window.showErrorMessage.mockResolvedValue(Actions.openDownloadPage);
+    window.showErrorMessage.mockResolvedValue(Actions.installDocker);
     showError(new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled), { logger, showLog: vi.fn() });
     expect(shown()).toEqual({
       severity: 'error',
       message: 'Docker Desktop is not installed.',
-      actions: ['Open download page'],
+      actions: ['Install Docker…'],
     });
     await flush();
-    expect(fakeVscode.env.openExternal).toHaveBeenCalledTimes(1);
-    expect(String(fakeVscode.env.openExternal.mock.calls[0][0])).toBe(DOCKER_DOWNLOAD_URL);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.installDocker');
+    expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -171,6 +172,7 @@ describe('showError (concept 6.5)', () => {
       'gitSwitchFailed',
       'signInRequired',
       'hostAccess',
+      'unencryptedDockerConnection',
       'otherAccount',
       'environmentUnassigned',
     ] as const;

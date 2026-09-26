@@ -85,6 +85,8 @@ interface Harness {
   sidebar: Sidebar;
   models: OwnerGroup[][];
   signedInFlags: boolean[];
+  dockerMissingFlags: boolean[];
+  dockerMissing: { value: boolean };
   coordinator: { environmentId: string | null; otherActiveWindows: ReturnType<typeof vi.fn<() => Promise<WindowStatus[]>>> };
   service: { inspectStates: ReturnType<typeof vi.fn>; currentBranch: ReturnType<typeof vi.fn> };
   docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn> };
@@ -108,11 +110,14 @@ function createHarness(): Harness {
   const registry = new EnvironmentRegistry(paths, clock);
   const sessionFiles = new SessionFiles(paths, clock);
   const models: OwnerGroup[][] = [];
+  const dockerMissing = { value: false };
   const signedInFlags: boolean[] = [];
+  const dockerMissingFlags: boolean[] = [];
   const tree = {
-    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean }) => {
+    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean; dockerMissing?: boolean }) => {
       models.push(groups);
       signedInFlags.push(options.signedIn ?? true);
+      dockerMissingFlags.push(options.dockerMissing ?? false);
     },
     getModel: () => models[models.length - 1] ?? [],
   };
@@ -153,10 +158,26 @@ function createHarness(): Harness {
     auth,
     tree,
     settings: () => settings,
+    dockerMissing: () => dockerMissing.value,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
-  return { root, registry, sessionFiles, sidebar, models, signedInFlags, coordinator, service, docker, discovery, auth, settings };
+  return {
+    root,
+    registry,
+    sessionFiles,
+    sidebar,
+    models,
+    signedInFlags,
+    dockerMissingFlags,
+    dockerMissing,
+    coordinator,
+    service,
+    docker,
+    discovery,
+    auth,
+    settings,
+  };
 }
 
 let h: Harness;
@@ -189,6 +210,15 @@ function rowOf(repository: string): RepositoryRow {
 }
 
 describe('Sidebar', () => {
+  it('passes the Docker state to the view at each render, without asking Docker', async () => {
+    await h.sidebar.render();
+    h.dockerMissing.value = true;
+    await h.sidebar.render();
+    expect(h.dockerMissingFlags).toEqual([false, true]);
+    expect(h.docker.isRunning).not.toHaveBeenCalled();
+    expect(h.docker.isInstalled).not.toHaveBeenCalled();
+  });
+
   it('shows the stored list at once and marks the view as loaded, then refreshes in the background', async () => {
     h.discovery.loadStored.mockResolvedValue(data([info('acme/web')]));
     await h.sidebar.initialize();

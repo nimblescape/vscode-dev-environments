@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { devContainersSettings } from '../devContainers';
 import { CommandError } from '../errors';
 import {
   DevcontainerCommandError,
@@ -16,7 +17,7 @@ import {
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
-import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 
 describe('argument builders', () => {
   it('read-configuration', () => {
@@ -193,7 +194,7 @@ describe('buildOverrideConfig', () => {
       image: 'devenv-3f2a9c1e:2',
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
-      runArgs: ['--label', 'devenv.container-version=3', '--name', 'devenv-acme-api-3f2a9c1e'],
+      runArgs: ['--label', 'devenv.container-version=4', '--name', 'devenv-acme-api-3f2a9c1e'],
       containerEnv: containerEnvironment(),
       remoteEnv: remoteEnvironment(),
       customizations: { vscode: { settings: devContainersSettings() } },
@@ -262,7 +263,7 @@ describe('buildOverrideConfig', () => {
       '-p',
       '127.0.0.1:8080:80',
       '--label',
-      'devenv.container-version=3',
+      'devenv.container-version=4',
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);
@@ -291,7 +292,7 @@ describe('buildOverrideConfig', () => {
     expect(buildOverrideConfig({ ...base, runArgs: shifting }).runArgs).toEqual([
       ...shifting,
       '--label',
-      'devenv.container-version=3',
+      'devenv.container-version=4',
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);

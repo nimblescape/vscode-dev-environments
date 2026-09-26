@@ -19,6 +19,7 @@ export type UserErrorCode =
   | 'gitSwitchFailed'
   | 'signInRequired'
   | 'hostAccess'
+  | 'unencryptedDockerConnection'
   | 'otherAccount'
   | 'environmentUnassigned'
   | 'cancelled';

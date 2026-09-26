@@ -87,6 +87,11 @@ export interface ContainerAdapterOptions {
   findDocker?: (env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string | undefined;
   /** Default: the system clock. */
   clock?: Clock;
+  /**
+   * Called with the result of each `docker info` (daemonStatus), for the context key of the Docker setup. Docker is not
+   * asked for it: only the checks that run anyway are reported.
+   */
+  onDaemonStatus?: (running: boolean) => void;
 }
 
 type ObjectKind = 'container' | 'volume' | 'image';
@@ -247,6 +252,25 @@ export function registryLoginConfig(login: RegistryLogin): string {
   return JSON.stringify({ auths: { [login.registry]: { auth } } });
 }
 
+/**
+ * True when a Docker call to `host` keeps registry credentials from travelling in clear text: an empty endpoint (the
+ * default of the platform, a Unix socket or a named pipe), `unix://`, `npipe://`, `ssh://`, or `tcp://` with
+ * DOCKER_TLS_VERIFY set to a value other than `0` and DOCKER_CERT_PATH set in `env` (the environment that the Docker
+ * call gets). Every other endpoint is not: `tcp://` without these variables is plain HTTP, and an unknown scheme cannot
+ * be judged. The TLS files of a Docker context are not used: a call with its own config folder (`docker --config`) does
+ * not see the context, and its store is internal to Docker.
+ */
+export function isProtectedDockerEndpoint(host: string | undefined, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  const endpoint = (host ?? '').trim();
+  if (endpoint === '') return true;
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(endpoint)?.[1].toLowerCase();
+  if (scheme === 'unix' || scheme === 'npipe' || scheme === 'ssh') return true;
+  if (scheme !== 'tcp') return false;
+  const verify = (envValue(env, 'DOCKER_TLS_VERIFY', platform) ?? '').trim();
+  const certPath = (envValue(env, 'DOCKER_CERT_PATH', platform) ?? '').trim();
+  return verify !== '' && verify !== '0' && certPath !== '';
+}
+
 /** Removes a variable in every spelling of its name (names are case-insensitive on Windows). */
 function deleteEnv(env: NodeJS.ProcessEnv, name: string): void {
   for (const key of Object.keys(env)) {
@@ -266,6 +290,7 @@ export class ContainerAdapter {
   private readonly rawEnv: NodeJS.ProcessEnv;
   private readonly findDocker: ContainerAdapterOptions['findDocker'];
   private readonly clock: Clock;
+  private readonly onDaemonStatus: ContainerAdapterOptions['onDaemonStatus'];
   private lookedUpAt: number | undefined;
 
   /**
@@ -288,6 +313,7 @@ export class ContainerAdapter {
     this.env = dockerProcessEnv(env, platform, dockerPath);
     this.findDocker = options.findDocker;
     this.clock = options.clock ?? systemClock;
+    this.onDaemonStatus = options.onDaemonStatus;
     // The caller has just looked the CLI up.
     this.lookedUpAt = this.clock.now();
   }
@@ -326,11 +352,20 @@ export class ContainerAdapter {
     }
   }
 
-  /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS. */
-  private lookUpCliIfMissing(): void {
+  /**
+   * True if the Docker CLI was found. With `findDocker`, a missing CLI is looked up again now, without the waiting time
+   * of `isInstalled` (after an installation was started, the CLI is looked up more often).
+   */
+  lookUpCliNow(): boolean {
+    this.lookUpCliIfMissing(true);
+    return this.path !== undefined;
+  }
+
+  /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS unless `force` is set. */
+  private lookUpCliIfMissing(force = false): void {
     if (this.path !== undefined || !this.findDocker) return;
     const now = this.clock.now();
-    if (this.lookedUpAt !== undefined && Math.abs(now - this.lookedUpAt) < DOCKER_CLI_LOOKUP_RETRY_MS) return;
+    if (!force && this.lookedUpAt !== undefined && Math.abs(now - this.lookedUpAt) < DOCKER_CLI_LOOKUP_RETRY_MS) return;
     this.lookedUpAt = now;
     let found: string | undefined;
     try {
@@ -357,6 +392,16 @@ export class ContainerAdapter {
    * Without a CLI, the engine counts as not running.
    */
   async daemonStatus(signal?: AbortSignal, timeoutMs: number = DOCKER_INFO_TIMEOUT_MS): Promise<DaemonStatus> {
+    const status = await this.queryDaemonStatus(signal, timeoutMs);
+    try {
+      this.onDaemonStatus?.(status.running);
+    } catch (error) {
+      this.logger.warn(`The Docker state could not be reported: ${errorMessage(error)}`);
+    }
+    return status;
+  }
+
+  private async queryDaemonStatus(signal: AbortSignal | undefined, timeoutMs: number): Promise<DaemonStatus> {
     if (!this.isInstalled()) return { running: false, detail: 'The Docker CLI was not found.' };
     let result: RunResult;
     try {
@@ -585,6 +630,8 @@ export class ContainerAdapter {
    * With `credentials`, the pull uses them instead of the credentials that Docker has stored, for this pull only: the
    * CLI gets its own config folder with only these credentials (`docker --config`), created with mode 0700 and removed
    * afterwards. The daemon stays the one of the current Docker context (DOCKER_HOST). The secret is never logged.
+   * The credentials are sent only over a local or encrypted connection (isProtectedDockerEndpoint); otherwise the call
+   * throws UserFacingError('unencryptedDockerConnection') before anything is written or sent.
    */
   async pullImage(
     reference: string,
@@ -599,6 +646,14 @@ export class ContainerAdapter {
     }
     this.logger.info(`Pulling image ${reference} with the credentials for ${login.registry}.`);
     const env = await this.envForOwnConfig(options.signal);
+    const host = envValue(env, 'DOCKER_HOST', this.platform);
+    if (!isProtectedDockerEndpoint(host, env, this.platform)) {
+      throw new UserFacingError(
+        'unencryptedDockerConnection',
+        Messages.unencryptedDockerConnection,
+        `The credentials for ${login.registry} are not sent to the Docker endpoint ${host ?? ''}: it is not local, and TLS is not set up with DOCKER_TLS_VERIFY and DOCKER_CERT_PATH.`,
+      );
+    }
     const configDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'devenv-pull-'));
     try {
       await fs.promises.chmod(configDir, 0o700);

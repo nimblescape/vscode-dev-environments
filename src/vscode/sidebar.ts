@@ -52,6 +52,8 @@ export interface SidebarDeps {
   claims: EnvironmentClaims;
   tree: RepositoriesTreeProvider;
   settings: () => ExtensionSettings;
+  /** True while no Docker CLI is found: the view shows the Docker row (concept 6.1 step 2). Default: false. */
+  dockerMissing?: () => boolean;
   clock?: Clock;
   isAlive?: (pid: number) => boolean;
 }
@@ -310,7 +312,7 @@ export class Sidebar implements vscode.Disposable {
       repositoryLookups: this.lookups,
       formatTime,
     });
-    this.deps.tree.setModel(groups, { signedIn: this.signedIn });
+    this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
   }
 
   private async refreshStatesNow(): Promise<void> {

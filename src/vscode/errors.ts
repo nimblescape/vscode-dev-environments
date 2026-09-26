@@ -6,7 +6,7 @@
 // The complete error goes to the log (NFR-02).
 import * as vscode from 'vscode';
 import { isUserFacingError, type UserErrorCode } from '../core/errors';
-import { Actions, DOCKER_DOWNLOAD_URL } from '../core/messages';
+import { Actions } from '../core/messages';
 import { isAbortError, type Logger } from '../core/ports';
 import { RegistryVersionError } from '../core/storage/registry';
 
@@ -16,6 +16,8 @@ export const OPERATION_FAILED = 'The operation failed.';
 
 /** Command of the welcome view and of the action "Sign in" (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
+/** Command of the action "Install Docker…" (package.json): the walkthrough "Set up Docker for Dev Environments". */
+const INSTALL_DOCKER_COMMAND = 'devEnvironments.installDocker';
 
 export interface ShowErrorOptions {
   logger: Logger;
@@ -25,7 +27,7 @@ export interface ShowErrorOptions {
   retry?: () => unknown;
 }
 
-type ErrorAction = 'openDownloadPage' | 'showDetails' | 'tryAgain' | 'signIn';
+type ErrorAction = 'installDocker' | 'showDetails' | 'tryAgain' | 'signIn';
 
 interface Presentation {
   message: string;
@@ -82,7 +84,7 @@ function present(error: unknown, canRetry: boolean): Presentation {
 // Concept 6.5 table: at most one action besides Show details.
 // 'retry': Show details, plus Try again when the caller can retry. 'retryOnly': Try again (Show details without retry).
 const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
-  dockerNotInstalled: ['openDownloadPage'],
+  dockerNotInstalled: ['installDocker'],
   dockerStartFailed: 'retry',
   buildFailed: 'retry',
   startFailed: 'retry',
@@ -96,6 +98,7 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   filesMissing: ['showDetails'],
   signInRequired: ['signIn'],
   hostAccess: ['showDetails'],
+  unencryptedDockerConnection: ['showDetails'],
   otherAccount: [],
   // An entry of an older version that the claim did not assign yet (concept 7.5): a later try can assign it.
   environmentUnassigned: 'retry',
@@ -109,6 +112,7 @@ const WARNINGS = new Set<UserErrorCode>([
   'gitSwitchFailed',
   'signInRequired',
   'hostAccess',
+  'unencryptedDockerConnection',
   'otherAccount',
   'environmentUnassigned',
 ]);
@@ -116,10 +120,10 @@ const WARNINGS = new Set<UserErrorCode>([
 function runAction(action: ErrorAction, options: ShowErrorOptions): void {
   try {
     switch (action) {
-      case 'openDownloadPage':
-        vscode.env
-          .openExternal(vscode.Uri.parse(DOCKER_DOWNLOAD_URL))
-          .then(undefined, (error: unknown) => options.logger.error('Could not open the download page.', error));
+      case 'installDocker':
+        vscode.commands
+          .executeCommand(INSTALL_DOCKER_COMMAND)
+          .then(undefined, (error: unknown) => options.logger.error('Could not open the Docker setup.', error));
         return;
       case 'showDetails':
         options.showLog();

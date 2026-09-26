@@ -24,6 +24,9 @@ export const Messages = {
   registryUnreachable:
     'No connection to the image registry. The update check was skipped. The environment uses the local image.',
   firstOpenOffline: 'This repository cannot be opened without internet access.',
+  /** The pull of an image needs the GitHub sign-in, and the connection to the Docker engine is neither local nor encrypted. */
+  unencryptedDockerConnection:
+    'The image of this environment can only be downloaded with your GitHub sign-in. The connection to Docker is not encrypted, so Dev Environments does not send the sign-in. Use a local Docker, or connect to Docker over SSH or TLS.',
   registrySignIn: (registry: string) => `The registry ${registry} requires a sign-in.`,
   organizationNotAuthorized: (organization: string) =>
     `Access to the organization ${organization} is not authorized.`,
@@ -111,7 +114,8 @@ export const Messages = {
 } as const;
 
 export const Actions = {
-  openDownloadPage: 'Open download page',
+  /** Opens the walkthrough "Set up Docker for Dev Environments" (command devEnvironments.installDocker). */
+  installDocker: 'Install Docker…',
   showDetails: 'Show details',
   tryAgain: 'Try again',
   signIn: 'Sign in',
@@ -142,8 +146,6 @@ export const StateTexts = {
   filesMissing: 'Files missing',
   notOnGitHub: 'not on GitHub',
 } as const;
-
-export const DOCKER_DOWNLOAD_URL = 'https://www.docker.com/products/docker-desktop/';
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */
 export function formatChanges(summary: { uncommittedFiles: number; unpushedCommits: number; stashes?: number }): string {

@@ -6,11 +6,13 @@
 // configuration in the workspace volume (CONFIG_FOLDER) and the token of the owner account, never the configuration or
 // the credentials that the Dev Containers extension forwards from the computer. The global Dev Containers settings stay
 // unchanged, so other dev containers of the user keep working. The forwarding is switched off per environment, only
-// through the documented settings of the Dev Containers extension (devContainersSettings) and the documented variables of
-// Git and Docker (containerEnvironment). The variables of the Dev Containers extension and of the VS Code server
-// (REMOTE_CONTAINERS_*, SSH_AUTH_SOCK, BROWSER, VSCODE_*) are never set or changed: they expect their own values (user
-// decision 2026-09-25). Pure values and scripts, no I/O.
-import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GIT_CONFIG_FILE, GITHUB_TOKEN_FILE } from '../names';
+// through settings of the Dev Containers extension (devContainersSettings in ../devContainers.ts: the settings are
+// documented, but that the extension reads them per container from the label devcontainer.metadata is not) and the
+// documented variables of Git, Docker, and the GitHub CLI (containerEnvironment). The variables of the Dev Containers
+// extension and of the VS Code server (REMOTE_CONTAINERS_*, SSH_AUTH_SOCK, BROWSER, VSCODE_*) are never set or changed:
+// they expect their own values (user decision 2026-09-25). Pure values and scripts, no I/O.
+import { forwardingHelperReachesGit } from '../devContainers';
+import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GH_CONFIG_FOLDER, GIT_CONFIG_FILE, GITHUB_TOKEN_FILE } from '../names';
 
 /**
  * Git credential helper of the dev container (a shell snippet that Git runs with `sh`, see gitcredentials(7)). It
@@ -45,7 +47,7 @@ export const GIT_CREDENTIALS_CONFIG_CONTENT = [
 /**
  * The Git settings of the command line level of the container (GIT_CONFIG_COUNT), in this order: remove every credential
  * helper of the configuration files (among them a forwarding helper that the Dev Containers extension writes with
- * `git config --system` and `--global` when devContainersSettings do not apply), add the helpers of the user
+ * `git config --system` and `--global` when devContainersSettings do not apply, ../devContainers.ts), add the helpers of the user
  * (GIT_CREDENTIALS_CONFIG_FILE, an absolute path: Git refuses a relative include on the command line), and for
  * https://github.com remove them again and add the helper of the container. An empty helper removes the helpers before it
  * since Git 2.9.
@@ -71,7 +73,9 @@ function commandLineGitConfig(): Array<[key: string, value: string]> {
  * - DOCKER_CONFIG: the Docker CLI reads its configuration from the volume, not a credential store that the Dev
  *   Containers extension may write into ~/.docker/config.json.
  * - GIT_SSH_COMMAND: Git over SSH does not use the SSH agent (`IdentityAgent=none`, ssh_config(5)).
- * The token is never an environment variable (no GH_TOKEN).
+ * - GH_CONFIG_DIR: the GitHub CLI (gh) reads its configuration from the volume (GH_CONFIG_FOLDER), where GIT_FILES_SCRIPT
+ *   signs it in with the account that owns the environment (its hosts.yml), not from ~/.config/gh of the image.
+ * The token is never an environment variable (no GH_TOKEN, no GITHUB_TOKEN).
  * Assumption (V-8): Git of the Source Control view and of the integrated terminal runs with these variables (the VS Code
  * server gets containerEnv and remoteEnv), so `git push` uses the credential helper of the container.
  */
@@ -84,6 +88,7 @@ export function containerEnvironment(): Record<string, string> {
   });
   env.DOCKER_CONFIG = DOCKER_CONFIG_FOLDER;
   env.GIT_SSH_COMMAND = 'ssh -o IdentityAgent=none';
+  env.GH_CONFIG_DIR = GH_CONFIG_FOLDER;
   return env;
 }
 
@@ -101,7 +106,8 @@ export function remoteEnvironment(): Record<string, string> {
 
 /**
  * True for the name of an environment variable that a configuration may not set (host access policy, concept section 9
- * "Host access"): each variable of containerEnvironment, and every other variable of the configuration of Git
+ * "Host access"): each variable of containerEnvironment (among them GH_CONFIG_DIR, so that no configuration moves the
+ * GitHub CLI away from the sign-in of the owner account), and every other variable of the configuration of Git
  * (`GIT_CONFIG` and `GIT_CONFIG_*`, for example GIT_CONFIG_PARAMETERS, which Git applies after GIT_CONFIG_COUNT). In
  * `docker run`, a `-e` of runArgs comes after the containerEnv of the override configuration and replaces its value (a
  * `-e NAME` without a value removes it) for the main process of the container and `docker exec`. Compared without case
@@ -113,38 +119,46 @@ export function isContainerGitVariable(name: string): boolean {
 }
 
 /**
- * Settings of the Dev Containers extension for this container (`customizations.vscode.settings` of the override
- * configuration), its documented settings `copyGitConfig`, `gitCredentialHelperConfigLocation`, `dockerCredentialHelper`,
- * and `githubCLILoginWithToken`: it copies no Git configuration of the computer, configures no forwarding credential
- * helper for Git (`git config --system` and `--global`) or Docker (`credsStore` and
- * `/usr/local/bin/docker-credential-dev-containers-*`), and signs in no GitHub CLI with the token of the computer. This is
- * the only way the extension switches features of the Dev Containers extension off. The global settings of the user stay
- * unchanged. Flat keys, as the extension reads them (remote-containers 0.470.0, extension.js, class kv, kept literally):
- * `getConfiguration(t){return this.settings[ms(t)]||this.settings[wl(t)]}getNewConfiguration(t){return this.settings[ms(t)]}`
- * with `ms(e)` = `dev.containers.${e}` and `wl(e)` = `remote.containers.${e}`. So `copyGitConfig` needs both keys: a
- * false under the new key alone falls through to the old key (for example a `true` of the repository);
- * `dockerCredentialHelper` and `githubCLILoginWithToken` are read only under the new key. The values of the override
- * configuration win over those of the repository, the Features, and the image, because its entry of the label
- * devcontainer.metadata is the last one.
- * Assumption (V-8): at the first attach of a new container, the Dev Containers extension writes these settings into
- * ~/.vscode-server/data/Machine/settings.json of the container and reads them from there at each attach (verified in its
- * code, not documented). A process in the container can change that file; the variables of containerEnvironment keep
- * Git and Docker on the configuration of the volume also then.
+ * The variables of the GitHub CLI that choose its account or host (gh help environment): gh uses a token in GH_TOKEN,
+ * GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, or GITHUB_ENTERPRISE_TOKEN instead of the sign-in in GH_CONFIG_DIR, and GH_HOST
+ * makes it use another host than github.com.
  */
-export function devContainersSettings(): Record<string, boolean | string> {
-  return {
-    'dev.containers.copyGitConfig': false,
-    'remote.containers.copyGitConfig': false,
-    'dev.containers.gitCredentialHelperConfigLocation': 'none',
-    'dev.containers.dockerCredentialHelper': false,
-    'dev.containers.githubCLILoginWithToken': false,
-  };
+export const GITHUB_CLI_ACCOUNT_VARIABLES: readonly string[] = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GH_ENTERPRISE_TOKEN',
+  'GITHUB_ENTERPRISE_TOKEN',
+  'GH_HOST',
+];
+
+/** Plain-language reason of the refusal of a variable of GITHUB_CLI_ACCOUNT_VARIABLES. */
+export const GITHUB_CLI_ACCOUNT_REASON = 'the GitHub CLI would use it instead of the sign-in of the account that owns the environment';
+
+/**
+ * True for the name of a variable of GITHUB_CLI_ACCOUNT_VARIABLES, which a configuration may not set either (host access
+ * policy, concept section 9 "Host access"; like isContainerGitVariable in containerEnv, remoteEnv, and `-e`/`--env` of
+ * runArgs): the GitHub CLI in the container is signed in only as the account that owns the environment (GH_CONFIG_DIR),
+ * and nothing else decides who is signed in (user decision 2026-09-26). Compared without case and surrounding spaces. A
+ * variable that the Dockerfile of the image sets with ENV is not part of any configuration and is not refused.
+ */
+export function isGitHubCliAccountVariable(name: string): boolean {
+  return GITHUB_CLI_ACCOUNT_VARIABLES.includes(name.trim().toUpperCase());
 }
 
 /** user.name and user.email of the Git configuration of the container. */
 export interface GitIdentity {
   name: string;
   email: string;
+}
+
+/**
+ * True for a GitHub login, the user of the sign-in of the GitHub CLI (GIT_FILES_SCRIPT checks the same): 1 to 39
+ * letters, digits, hyphens, and underscores, starting with a letter or a digit (this also accepts old logins with two
+ * hyphens in a row or one at the end, and the logins of Enterprise Managed Users, `<handle>_<shortcode>`). Such a value
+ * is safe in the double quotes of hosts.yml.
+ */
+export function isGitHubLogin(login: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$/.test(login);
 }
 
 /** The account as the GitHub API names it: `viewer { databaseId login name }`. */
@@ -218,19 +232,6 @@ export function homeGitConfigCommand(user: string): string[] {
   return ['sh', '-c', HOME_GIT_CONFIG_SCRIPT, 'sh', user];
 }
 
-/**
- * Command for `docker exec -u root`: the owner of CONFIG_FOLDER as `uid:gid` (GNU and BusyBox `stat`). This user may
- * remove the token file when root may not: in a container that the configuration took rights away from (for example
- * `--cap-drop ALL`, concept section 9 "Host access"), root is bound to the permissions of the files like any user.
- */
-export const CONFIG_FOLDER_OWNER_COMMAND: readonly string[] = ['stat', '-c', '%u:%g', CONFIG_FOLDER];
-
-/** `uid:gid` from the output of CONFIG_FOLDER_OWNER_COMMAND, for `docker exec -u`; `undefined` for any other output. */
-export function parseOwnerIds(output: string): string | undefined {
-  const ids = output.trim();
-  return /^\d+:\d+$/.test(ids) ? ids : undefined;
-}
-
 /** Version of Git from the output of `git --version`, for example `git version 2.39.3 (Apple Git-146)`. */
 export function parseGitVersion(output: string): [major: number, minor: number, patch: number] | undefined {
   const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/m.exec(output.trim());
@@ -247,14 +248,14 @@ export function parseGitVersion(output: string): [major: number, minor: number, 
  *   ~/.gitconfig with content.
  * - 'unsafe': before Git 2.9, an empty credential.helper does not remove the helpers before it, so a forwarding helper
  *   of the Dev Containers extension (when its settings of the container do not apply) answers requests of Git: with the
- *   credentials of the computer.
+ *   credentials of the computer (forwardingHelperReachesGit, ../devContainers.ts).
  */
 export function containerGitSupport(versionOutput: string): 'full' | 'noGlobalVariable' | 'unsafe' | undefined {
   const version = parseGitVersion(versionOutput);
   if (!version) return undefined;
   const [major, minor] = version;
   const atLeast = (m: number, n: number): boolean => major > m || (major === m && minor >= n);
-  if (!atLeast(2, 9)) return 'unsafe';
+  if (forwardingHelperReachesGit(major, minor)) return 'unsafe';
   if (!atLeast(2, 32)) return 'noGlobalVariable';
   return 'full';
 }

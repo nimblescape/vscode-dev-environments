@@ -193,6 +193,9 @@ describe('the filter icon of the view title bar', () => {
     expect(title[0].when).toBe(`view == devEnvironments.repositories && !${OWNERS_FILTERED_CONTEXT_KEY}`);
     expect(title[1].when).toBe(`view == devEnvironments.repositories && ${OWNERS_FILTERED_CONTEXT_KEY}`);
     // The twin with the filled icon is not a second entry of the Command Palette.
-    expect(manifest.contributes.menus.commandPalette).toEqual([{ command: Commands.selectOwnersFiltered, when: 'false' }]);
+    // (The Docker setup adds hidden commands of its own to the same list.)
+    const palette = manifest.contributes.menus.commandPalette as Array<{ command: string; when: string }>;
+    expect(palette.filter((entry) => entry.command === Commands.selectOwnersFiltered)).toEqual([{ command: Commands.selectOwnersFiltered, when: 'false' }]);
+    expect(palette.some((entry) => entry.command === Commands.selectOwners)).toBe(false);
   });
 });

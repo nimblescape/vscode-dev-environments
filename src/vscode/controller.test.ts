@@ -10,10 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import type { ContainerInfo } from '../core/docker/containerAdapter';
-import { UserFacingError } from '../core/errors';
-import { CONFIG_FOLDER_OWNER_COMMAND } from '../core/helper/containerGit';
+import { DockerContextKeys } from '../core/docker/dockerSetup';
+import { CommandError, UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
-import { CONTAINER_VERSION, GITHUB_TOKEN_FILE, LABEL_CONTAINER_VERSION } from '../core/names';
+import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
@@ -189,7 +189,9 @@ interface Harness {
     containerState: ReturnType<typeof vi.fn>;
     findContainer: ReturnType<typeof vi.fn>;
     exec: ReturnType<typeof vi.fn>;
+    volumeExists: ReturnType<typeof vi.fn>;
   };
+  helper: { removeGitToken: ReturnType<typeof vi.fn<(p: { volumeName: string; timeoutMs?: number }) => Promise<void>>> };
   service: {
     open: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
     openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
@@ -201,6 +203,7 @@ interface Harness {
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
+    removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
@@ -222,6 +225,7 @@ interface Harness {
     updateContextKey: ReturnType<typeof vi.fn>;
   };
   claims: { claim: ReturnType<typeof vi.fn> };
+  dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
@@ -257,7 +261,9 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     // A container of the current setup (concept section 9), unless a test gives another label.
     findContainer: vi.fn(async (_id: string) => containerInfo(String(CONTAINER_VERSION))),
     exec: vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false })),
+    volumeExists: vi.fn(async (_name: string) => true),
   };
+  const helper: Harness['helper'] = { removeGitToken: vi.fn(async () => {}) };
   const service: Harness['service'] = {
     open: vi.fn(async () => openResult(environment())),
     openEnvironment: vi.fn(async (id: string) => openResult((await registry.get(id)) ?? environment())),
@@ -269,6 +275,8 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     listConfigurations: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
     reconcileFromVolumes: vi.fn(async () => 0),
+    // By default, Delete could remove every recorded volume (their labels make them the environment's own).
+    removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
@@ -294,6 +302,12 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     updateContextKey: vi.fn(async () => true),
   };
   const claims = { claim: vi.fn(async (): Promise<string[]> => []) };
+  const dockerSetup = {
+    openWizard: vi.fn(async () => {}),
+    install: vi.fn(async () => {}),
+    start: vi.fn(async () => {}),
+    installWsl: vi.fn(async () => {}),
+  };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
@@ -325,6 +339,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     sessionFiles,
     disconnectRequests,
     docker,
+    helper,
     service,
     discovery,
     auth,
@@ -335,6 +350,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     sidebar,
     statusBar,
     settings: () => settings,
+    dockerSetup,
     viewVisible: () => false,
     clock,
     isAlive: (pid: number) => alive.has(pid),
@@ -378,11 +394,13 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     controller,
     commands,
     docker,
+    helper,
     service,
     connection,
     coordinator,
     auth,
     claims,
+    dockerSetup,
     ui,
     discovery,
     sidebar,
@@ -487,7 +505,7 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    expect(declared).toHaveLength(14);
+    expect(declared).toHaveLength(18);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -506,7 +524,7 @@ describe('Controller commands', () => {
     expect(defaults).toEqual({ ...DEFAULT_SETTINGS });
     const keys = new Set(manifest.contributes.viewsWelcome.flatMap((view) => view.when.match(/devEnvironments\.\w+/g) ?? []));
     // Exactly the keys that the extension sets.
-    expect([...keys].sort()).toEqual([LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort());
+    expect([...keys].sort()).toEqual([DockerContextKeys.missing, LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY].sort());
   });
 
   it('shows "could not be loaded", not "no repository was found", after a failed first load (package.json)', () => {
@@ -534,6 +552,36 @@ describe('Controller commands', () => {
     expect(shown({ [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
     ]);
+    // Without Docker: the Docker entry first, and the sign-in entry below it.
+    expect(shown({ [DockerContextKeys.missing]: true })).toEqual([
+      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
+      'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
+    ]);
+    expect(shown({ ...signedIn, [DockerContextKeys.missing]: true })).toEqual([
+      'Dev Environments runs your environments in Docker, which is not installed on this computer.',
+      'Loading your repositories…',
+    ]);
+  });
+
+  it('shows the Docker entry first with the exact text and the command Install Docker…', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        commands: Array<{ command: string; title: string; category: string }>;
+        viewsWelcome: Array<{ view: string; contents: string; when: string }>;
+      };
+    };
+    expect(manifest.contributes.viewsWelcome[0]).toEqual({
+      view: 'devEnvironments.repositories',
+      contents:
+        'Dev Environments runs your environments in Docker, which is not installed on this computer.\n[Install Docker…](command:devEnvironments.installDocker)',
+      when: 'devEnvironments.dockerMissing',
+    });
+    expect(manifest.contributes.viewsWelcome[1].when).toBe('!devEnvironments.signedIn');
+    expect(manifest.contributes.commands.find((command) => command.command === Commands.installDocker)).toEqual({
+      command: 'devEnvironments.installDocker',
+      title: 'Install Docker…',
+      category: 'Dev Environments',
+    });
   });
 
   it('shows the log', async () => {
@@ -818,6 +866,24 @@ describe('Delete', () => {
       Actions.deleteAnyway,
     ]);
     expect(calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+  });
+
+  it('offers only the additional volumes that Delete would remove, and asks nothing when there are none', async () => {
+    await h.registry.add(environment({ additionalVolumes: ['api-db', 'legacy-cache'] }));
+    h.service.removableAdditionalVolumes.mockResolvedValueOnce(['api-db']);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete).mockResolvedValueOnce(Actions.remove);
+    await run('delete', row('acme/api', environment()));
+    expect(h.service.removableAdditionalVolumes).toHaveBeenCalledWith(ENV_ID);
+    expect(fakeVscode.window.showWarningMessage.mock.calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+
+    fakeVscode.window.showWarningMessage.mockReset();
+    h.service.delete.mockClear();
+    h.service.removableAdditionalVolumes.mockResolvedValueOnce([]);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
@@ -1569,7 +1635,41 @@ describe('Connection of this window', () => {
     h.controller.onViewVisible();
     h.controller.onViewVisible();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.openDownloadPage);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.installDocker);
+  });
+
+  it('opens the Docker setup with the action Install Docker…', async () => {
+    h.docker.isInstalled.mockReturnValue(false);
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.installDocker);
+    h.controller.onViewVisible();
+    await settle(() => fakeVscode.commands.executeCommand.mock.calls.length > 0, 'the command');
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(Commands.installDocker);
+    expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('says nothing when the view shows and Docker is installed', () => {
+    h.controller.onViewVisible();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('opens the walkthrough with Install Docker…', async () => {
+    await run('installDocker');
+    expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the buttons of the walkthrough', async () => {
+    await run('dockerSetupInstall');
+    await run('dockerSetupStart');
+    await run('dockerSetupInstallWsl');
+    expect(h.dockerSetup.install).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.start).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.installWsl).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows an error of a walkthrough button (concept 6.5)', async () => {
+    h.dockerSetup.start.mockRejectedValue(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
+    await run('dockerSetupStart');
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerStartFailed, Actions.showDetails);
   });
 });
 
@@ -1864,8 +1964,8 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
-    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal of the token');
+    expect(h.helper.removeGitToken).toHaveBeenCalledWith(expect.objectContaining({ volumeName: CONTAINER }));
   });
 
   it('role A: a restored window leaves when its open pipeline refuses the environment after an account change', async () => {
@@ -1878,8 +1978,8 @@ describe('Accounts (concept 7.5)', () => {
     });
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
-    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal of the token');
+    expect(h.helper.removeGitToken).toHaveBeenCalledWith(expect.objectContaining({ volumeName: CONTAINER }));
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
   });
 
@@ -1901,8 +2001,8 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.reconcileIfRegistryLost();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
-    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal of the token');
+    expect(h.helper.removeGitToken).toHaveBeenCalledWith(expect.objectContaining({ volumeName: CONTAINER }));
   });
 
   it('role A: without a sign-in, the window closes its connection', async () => {
@@ -1980,81 +2080,76 @@ describe('Accounts (concept 7.5)', () => {
     expect(warningMessages()).not.toContain(Messages.otherAccountConnection('acme/api'));
   });
 
-  it('takes the token of the owner out of the running container when the account changes, not on a hand-off', async () => {
+  it('takes the token of the owner out of the volume when the account changes, not on a hand-off', async () => {
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);
     await run('stop', row('acme/api', env));
     expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
-    expect(h.docker.exec).not.toHaveBeenCalled();
+    expect(h.helper.removeGitToken).not.toHaveBeenCalled();
 
     recreateHarness({});
     await h.registry.add(env);
     await connectHere(env);
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     await h.controller.onSessionChanged();
-    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal of the token');
+    expect(h.helper.removeGitToken).toHaveBeenCalledWith(expect.objectContaining({ volumeName: CONTAINER }));
   });
 
-  describe('the token of a container where root may not remove it (a configuration with --cap-drop)', () => {
-    const DENIED = "rm: cannot remove '/workspaces/.devenv+/github-token': Permission denied";
-    type ExecResult = { exitCode: number; stdout?: string; stderr?: string };
-
-    /** docker exec: `rm` as root is denied; `stat` of the folder of the token gives `owner`; any other user may remove it. */
-    function rootMayNotRemove(owner: ExecResult): void {
-      h.docker.exec.mockImplementation(async (_container: string, command: string[], options: { user?: string }) => {
-        let result: ExecResult = { exitCode: 0 };
-        if (command[0] === 'rm' && options.user === 'root') result = { exitCode: 1, stderr: DENIED };
-        else if (command[0] === 'stat') result = owner;
-        return { stdout: '', stderr: '', timedOut: false, ...result };
-      });
-    }
+  describe('the removal of the token in the workspace helper (concept 7.5)', () => {
+    const VOLUME = 'devenv-acme-api-volume';
 
     async function takeTokenOut(): Promise<void> {
-      const env = environment({ owner: OTHER_ACCOUNT });
+      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME });
       await h.registry.add(env);
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-      const logged = () => [...h.logger.info.mock.calls, ...h.logger.warn.mock.calls].some((call) => String(call[0]).includes('The GitHub token'));
+      const logged = () =>
+        [...h.logger.info.mock.calls, ...h.logger.warn.mock.calls].some((call) => /GitHub token|holds no GitHub token/.test(String(call[0])));
       await settle(logged, 'the removal of the token');
     }
 
-    const calls = () => h.docker.exec.mock.calls.map((call) => ({ command: call[1] as string[], user: (call[2] as { user?: string }).user }));
-
-    it('removes it as the owner of its folder', async () => {
-      rootMayNotRemove({ exitCode: 0, stdout: '1000:1000\n' });
+    it('removes it from the volume of the environment with a time limit, and runs nothing in the dev container', async () => {
       await takeTokenOut();
-      expect(calls()).toEqual([
-        { command: ['rm', '-f', GITHUB_TOKEN_FILE], user: 'root' },
-        { command: [...CONFIG_FOLDER_OWNER_COMMAND], user: 'root' },
-        { command: ['rm', '-f', GITHUB_TOKEN_FILE], user: '1000:1000' },
-      ]);
-      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
+      expect(h.docker.volumeExists).toHaveBeenCalledWith(VOLUME);
+      expect(h.helper.removeGitToken).toHaveBeenCalledTimes(1);
+      expect(h.helper.removeGitToken).toHaveBeenCalledWith({ volumeName: VOLUME, timeoutMs: 30_000 });
+      expect(h.docker.exec).not.toHaveBeenCalled();
+      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the volume ${VOLUME} of the container ${CONTAINER}.`);
       expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
     });
 
-    it('warns when the owner of its folder is not known', async () => {
-      rootMayNotRemove({ exitCode: 1, stderr: "stat: can't stat" });
+    it('removes it also when the container is stopped (its volume still holds the token)', async () => {
+      h.docker.containerState.mockResolvedValue('stopped');
       await takeTokenOut();
-      expect(calls().map((call) => call.user)).toEqual(['root', 'root']);
-      expect(h.logger.warn).toHaveBeenCalledWith(`The GitHub token could not be removed from the container ${CONTAINER}: ${DENIED}`);
+      expect(h.helper.removeGitToken).toHaveBeenCalledWith({ volumeName: VOLUME, timeoutMs: 30_000 });
+      expect(h.docker.exec).not.toHaveBeenCalled();
     });
-  });
 
-  it('role A: takes the token out of a running container of another account, and asks nothing of a stopped one', async () => {
-    const env = environment({ owner: OTHER_ACCOUNT });
-    await h.registry.add(env);
-    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    await settle(() => h.docker.exec.mock.calls.length > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith(CONTAINER, ['rm', '-f', GITHUB_TOKEN_FILE], expect.objectContaining({ user: 'root' }));
+    it('warns when the helper cannot remove it', async () => {
+      h.helper.removeGitToken.mockRejectedValue(
+        new CommandError('remove the GitHub token', 1, '', '/workspaces/.devenv+/github-token could not be removed.'),
+      );
+      await takeTokenOut();
+      expect(h.logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(`^The GitHub token could not be removed from the volume ${VOLUME} of the container ${CONTAINER}: .*github-token could not be removed`)),
+      );
+      expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('The GitHub token was removed'));
+    });
 
-    recreateHarness({});
-    await h.registry.add(env);
-    h.docker.containerState.mockResolvedValue('stopped');
-    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
-    await pause(20);
-    expect(h.docker.exec).not.toHaveBeenCalled();
+    it('runs no helper for a volume that does not exist (the helper would create an empty one)', async () => {
+      h.docker.volumeExists.mockResolvedValue(false);
+      await takeTokenOut();
+      expect(h.helper.removeGitToken).not.toHaveBeenCalled();
+      expect(h.logger.info).toHaveBeenCalledWith(`The volume ${VOLUME} of the container ${CONTAINER} does not exist: it holds no GitHub token.`);
+    });
+
+    it('warns when Docker cannot say whether the volume exists', async () => {
+      h.docker.volumeExists.mockRejectedValue(new Error('Cannot connect to the Docker daemon'));
+      await takeTokenOut();
+      expect(h.helper.removeGitToken).not.toHaveBeenCalled();
+      expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Cannot connect to the Docker daemon'));
+    });
   });
 
   it('closes the connection again when the window kept it after an account change (Cancel on unsaved files)', async () => {
@@ -2069,7 +2164,7 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length >= 2, 'the second close');
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.stillConnected('acme/api'), { modal: true });
     // The token is taken out again with each close.
-    await settle(() => h.docker.exec.mock.calls.length >= 2, 'the second removal of the token');
+    await settle(() => h.helper.removeGitToken.mock.calls.length >= 2, 'the second removal of the token');
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -2252,8 +2347,9 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.claims.claim.mock.calls.length === 1, 'the command again');
     expect(h.claims.claim).toHaveBeenCalledWith(OTHER_ACCOUNT, 'gho_other', expect.objectContaining({ environmentIds: [ENV_ID] }));
     expect(h.claims.claim).toHaveBeenCalledTimes(1);
-    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
+    // The pipeline starts after the claim finished (its registry write included).
     await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    expect((await h.registry.get(ENV_ID))?.owner).toEqual(OTHER_ACCOUNT);
     expect(warningMessages()).toEqual([ControllerTexts.accountChangedDuringClaim('acme/api')]);
   });
 

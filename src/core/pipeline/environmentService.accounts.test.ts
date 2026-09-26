@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, resourceName } from '../names';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
 import { EnvironmentClaims, availableEnvironments } from '../ownership';
 import { silentLogger } from '../ports';
 import type { Environment, GitHubAccount, RepositoryInfo } from '../types';
@@ -20,6 +20,7 @@ import {
   OTHER_ID,
   REPO,
   TOKEN,
+  additionalVolumeLabels,
   createHarness,
   seedEnvironment,
   type Harness,
@@ -133,6 +134,8 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
       [first.volumeName, TOKEN, '1001+octo@users.noreply.github.com'],
       [second.volumeName, OTHER_TOKEN, '2002+someone@users.noreply.github.com'],
     ]);
+    // Concept section 9: the GitHub CLI of each environment is signed in as the account that owns it, with its token.
+    expect(h.helper.gitPreparations.map((call) => call.login)).toEqual(['octo', 'someone']);
     expect(h.docker.containersOf(first.id)).toHaveLength(1);
     expect(h.docker.containersOf(second.id)).toHaveLength(1);
     expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);
@@ -272,13 +275,39 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     expect(h.docker.volumes.has(DATA)).toBe(true);
   });
 
-  it('lets a new environment of the same account use the volume again', async () => {
+  it('lets a new environment of the same account use the volume again, without taking it for its own', async () => {
     await otherAccountDeletesAndKeeps();
     signIn(OTHER_ACCOUNT, OTHER_TOKEN);
     h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
     const result = await h.service.open(TARGET, options());
     expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
-    expect(result.environment.additionalVolumes).toContain(DATA);
+    expect(h.helper.ups).toHaveLength(1);
+    // Its labels name no environment (a version before the labels created it): never recorded, never removed.
+    expect(result.environment.additionalVolumes).toBeUndefined();
+  });
+
+  it('lets a new environment of the same account mount a labeled volume that its Delete kept, and refuses it to another account', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { additionalVolumes: [DATA] } });
+    h.docker.volumes.set(DATA, additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    // Without the record of the Delete, the labels alone decide.
+    await h.registry.forgetKeptVolumes([DATA]);
+    signIn(ACCOUNT, TOKEN);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess(`volume ${DATA} of another environment`));
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
+    // The labels name the deleted environment: the new one records it only to protect it (an additional volume of the
+    // same owner, concept section 9), does not take it for its own or relabel it, and its Delete keeps it.
+    expect(result.environment.additionalVolumes).toEqual([DATA]);
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
+    expect(await h.service.removableAdditionalVolumes(result.environment.id)).toEqual([]);
+    await h.service.delete(result.environment.id, { progress: h.progress, additionalVolumesToRemove: [DATA] });
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
+    expect(h.docker.log.filter((line) => line === `volume rm ${DATA}`)).toEqual([]);
   });
 
   it('records the volumes that the Delete after missing files keeps without asking', async () => {
@@ -307,17 +336,26 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     // docker volume prune; then an environment of ACCOUNT creates a new volume of that name.
     h.docker.volumes.delete(DATA);
     h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
-    await h.service.open(TARGET, options());
+    const first = await h.service.open(TARGET, options());
     expect(await h.registry.keptVolumes()).toEqual([]);
-    h.docker.volumes.set(DATA, {});
-    // The Delete of ACCOUNT keeps it; its next environment may use it, and a later Delete may remove it.
-    await h.service.delete((await h.registry.list())[0].id, { progress: h.progress, additionalVolumesToRemove: [] });
+    // The new volume of that name carries the labels of the environment of ACCOUNT, which created it before `up`.
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(first.environment.id, ACCOUNT));
+    expect(first.environment.additionalVolumes).toEqual([DATA]);
+    // The Delete of ACCOUNT keeps it; its next environment may use it, but only the Delete of the environment that
+    // created it removes it: the next one keeps it, with a line in the log.
+    await h.service.delete(first.environment.id, { progress: h.progress, additionalVolumesToRemove: [] });
     expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[DATA, ACCOUNT.id]]);
     const result = await h.service.open(TARGET, options());
-    expect(result.environment.additionalVolumes).toContain(DATA);
+    expect(h.helper.ups.length).toBeGreaterThan(1);
+    // Recorded only to protect it (an additional volume of the same owner); its labels still name the first environment.
+    expect(result.environment.additionalVolumes).toEqual([DATA]);
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(first.environment.id, ACCOUNT));
+    await h.registry.updateEnvironment(result.environment.id, (entry) => {
+      entry.additionalVolumes = [DATA];
+    });
     await h.service.delete(result.environment.id, { progress: h.progress, additionalVolumesToRemove: [DATA] });
-    expect(h.docker.volumes.has(DATA)).toBe(false);
-    expect(await h.registry.keptVolumes()).toEqual([]);
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+    expect(h.logger.infos.some((line) => line.startsWith(`The volume ${DATA} is kept, because another environment created it`))).toBe(true);
   });
 
   it('records no kept volume that does not exist at the Delete', async () => {
@@ -353,7 +391,7 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     await otherAccountDeletesAndKeeps();
     // An entry of one person from before the separation by account recorded the same volume.
     await seedEnvironment(h, { id: OTHER_ID, container: null, extra: { additionalVolumes: [DATA, 'web-cache'] } });
-    h.docker.volumes.set('web-cache', {});
+    h.docker.volumes.set('web-cache', additionalVolumeLabels(OTHER_ID));
     await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [DATA, 'web-cache'] });
     expect(h.docker.volumes.has(DATA)).toBe(true);
     expect(h.docker.volumes.has('web-cache')).toBe(false);
@@ -367,6 +405,56 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
     signIn(OTHER_ACCOUNT, OTHER_TOKEN);
     expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+  });
+});
+
+describe('a lost registry: the named volumes without labels that the container of an environment mounts (concept 7.5, section 9)', () => {
+  const PGDATA = 'pgdata';
+  const WORKSPACE = resourceName(REPO, OTHER_ID);
+
+  /** The registry is lost; the volume and the container of OTHER_ACCOUNT's environment are still there. */
+  function lostRegistry(mounted: string[]): void {
+    h.docker.volumes.set(WORKSPACE, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name: WORKSPACE, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    h.docker.containers.set(container.id, { ...container, volumes: [WORKSPACE, ...mounted] });
+  }
+
+  it('records the unlabelled volume again, so that the environment of another account is refused it', async () => {
+    h.docker.volumes.set(PGDATA, {});
+    lostRegistry([PGDATA]);
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual([PGDATA]);
+    // ACCOUNT's first open of the repository mounts the volume of OTHER_ACCOUNT's environment.
+    h.helper.config = { image: BASE_IMAGE, mounts: [`source=${PGDATA},target=/var/lib/postgresql/data,type=volume`] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`volume ${PGDATA} of another environment`));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.volumes.get(PGDATA)).toEqual({});
+  });
+
+  it('keeps the unlabelled volume at the Delete of the restored environment: not offered, not removed, kept for its account', async () => {
+    h.docker.volumes.set(PGDATA, {});
+    lostRegistry([PGDATA]);
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    expect(await h.service.removableAdditionalVolumes(OTHER_ID)).toEqual([]);
+    // Even a confirmation of the name does not remove it: its labels do not make it the environment's own.
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [PGDATA] });
+    expect(await h.registry.get(OTHER_ID)).toBeUndefined();
+    expect(h.docker.volumes.get(PGDATA)).toEqual({});
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[PGDATA, OTHER_ACCOUNT.id]]);
+  });
+
+  it('records no anonymous volume, no volume of Docker Compose or of another environment, and no volume that does not exist', async () => {
+    const anonymous = 'ef'.repeat(32);
+    h.docker.volumes.set(anonymous, { 'com.docker.volume.anonymous': '' });
+    h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' });
+    h.docker.volumes.set('web-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001', ACCOUNT));
+    h.docker.volumes.set('devenv-acme-web-f0000001', { [LABEL_ENVIRONMENT_ID]: 'f0000001-0000-4000-8000-000000000001', [LABEL_REPOSITORY]: 'acme/web' });
+    lostRegistry([anonymous, 'shop_db', 'web-cache', 'devenv-acme-web-f0000001', 'gone']);
+    expect(await h.service.reconcileFromVolumes()).toBeGreaterThanOrEqual(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
   });
 });
 
@@ -557,5 +645,90 @@ describe('the ID of a new environment (implementation notes 5)', () => {
     expect(ids.mock.calls.length).toBeLessThanOrEqual(10);
     expect((await h.registry.list()).map((entry) => entry.repository)).toEqual(['acme/web']);
     expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
+  });
+});
+
+describe('a named volume that the environments of one account share (concept section 9 "Host access")', () => {
+  // A fork and its upstream repository both mount `${localWorkspaceFolderBasename}-node_modules`.
+  const SHARED = 'web-node_modules';
+  const MOUNT = `source=${SHARED},target=/workspaces/web/node_modules,type=volume`;
+  const FORK = 'alice/web';
+  const UPSTREAM: RepositoryTarget = { ...TARGET, repository: 'acme/web' };
+  const FORK_LABELS = additionalVolumeLabels(OTHER_ID, ACCOUNT, FORK);
+
+  /**
+   * Environment A (OTHER_ID, the fork) created and recorded SHARED; then environment B of the same account (the upstream
+   * repository) opens with the same mount. Returns B and what B recorded when `up` started.
+   */
+  async function openBoth(): Promise<{ b: Environment; recordedAtUp: readonly string[] | undefined }> {
+    await seedEnvironment(h, { id: OTHER_ID, repository: FORK, container: null, extra: { additionalVolumes: [SHARED] } });
+    h.docker.volumes.set(SHARED, { ...FORK_LABELS });
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    let recordedAtUp: readonly string[] | undefined;
+    const up = h.helper.up.bind(h.helper);
+    h.helper.up = async (p) => {
+      const entry = (await h.registry.list()).find((environment) => environment.repository === UPSTREAM.repository);
+      recordedAtUp = entry?.additionalVolumes;
+      return up(p);
+    };
+    const result = await h.service.open(UPSTREAM, options());
+    return { b: result.environment, recordedAtUp };
+  }
+
+  const kept = (reason: string) => `The volume ${SHARED} is kept, because ${reason}.`;
+  const removals = () => h.docker.log.filter((line) => line === `volume rm ${SHARED}`);
+
+  it('opens the second environment, which records the volume before `up` and neither creates nor relabels it', async () => {
+    const { b, recordedAtUp } = await openBoth();
+    expect(h.helper.ups).toHaveLength(1);
+    expect(recordedAtUp).toEqual([SHARED]);
+    expect(b.additionalVolumes).toEqual([SHARED]);
+    expect(h.docker.log.filter((line) => line === `volume create ${SHARED}`)).toEqual([]);
+    expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
+  });
+
+  it('keeps the volume at the Delete of the first environment while the second records it, and does not offer it', async () => {
+    await openBoth();
+    expect(await h.service.removableAdditionalVolumes(OTHER_ID)).toEqual([]);
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
+    expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
+    expect(h.logger.infos).toContain(kept('another environment uses it too'));
+    expect(removals()).toEqual([]);
+  });
+
+  it('keeps the volume at the Delete of the second environment: it is not its own', async () => {
+    const { b } = await openBoth();
+    expect(await h.service.removableAdditionalVolumes(b.id)).toEqual([]);
+    await h.service.delete(b.id, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
+    expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
+    expect(h.logger.infos).toContain(kept('another environment uses it too'));
+    expect(removals()).toEqual([]);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual([SHARED]);
+  });
+
+  it('keeps the volume at the Delete of the second environment after the Delete of the first kept it', async () => {
+    const { b } = await openBoth();
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
+    expect(await h.service.removableAdditionalVolumes(b.id)).toEqual([]);
+    await h.service.delete(b.id, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
+    expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
+    expect(h.logger.infos).toContain(kept('another environment created it'));
+    expect(removals()).toEqual([]);
+  });
+
+  it('refuses the volume to an environment of another account while either environment exists', async () => {
+    await openBoth();
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    const other: RepositoryTarget = { ...TARGET, repository: 'someone/web' };
+    const first = await rejection(h.service.open(other, options()));
+    expect(first.code).toBe('hostAccess');
+    expect(first.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+    signIn(ACCOUNT, TOKEN);
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    const second = await rejection(h.service.open(other, options()));
+    expect(second.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
   });
 });

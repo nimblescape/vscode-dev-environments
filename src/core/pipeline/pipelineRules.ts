@@ -6,6 +6,7 @@
 import * as crypto from 'crypto';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
+import { runArgsUser } from '../helper/hostAccess';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import { CONTAINER_CONFIG_UNKNOWN, CONTAINER_VERSION, LABEL_CONTAINER_CONFIG, LABEL_CONTAINER_VERSION } from '../names';
 import type { DevcontainerResult, RefusedUpdate } from '../types';
@@ -284,11 +285,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * The user that `devcontainer up` gives a container of an environment image, by the rule of the Dev Container CLI:
- * the last `remoteUser` of the label devcontainer.metadata, else its last `containerUser`, else the user of the image,
- * else root. `imageConfig` is `Config` of `docker image inspect`.
+ * The user part of `user[:group]`, as the Dev Container CLI 0.89.0 reads the user of a container
+ * (`/([^:]*)(:(.*))?/`), with `0` as `root`. An empty user part (`:1000`) counts as root here: the CLI would ask the
+ * container (`id -un`), and root only skips the ownership fix.
  */
-export function imageRemoteUser(imageConfig: unknown): string {
+export function containerUserName(user: string): string {
+  const name = /^([^:]*)/.exec(user)?.[1] ?? '';
+  return name === '' || name === '0' ? 'root' : name;
+}
+
+/**
+ * The user that `devcontainer up` gives a container of an environment image, by the rule of the Dev Container CLI
+ * 0.89.0 (image metadata merged last-wins; `docker run -u <containerUser> …runArgs`; then the user of the container):
+ * the container runs as the last `--user`/`-u` of `runArgs` (Docker takes the last one, and the CLI puts the runArgs
+ * after its own `-u <containerUser>`), else the last `containerUser` of the label devcontainer.metadata, else the user
+ * of the image. The remote user is the last `remoteUser` of the metadata, else that container user, else root; of
+ * `user:group` only the user part counts, and `0` is root (containerUserName). `imageConfig` is `Config` of `docker
+ * image inspect`; `runArgs` are those that `up` passes to Docker (the override configuration).
+ */
+export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown[]): string {
   const config = isRecord(imageConfig) ? imageConfig : {};
   const labels = isRecord(config.Labels) ? config.Labels : {};
   let remoteUser: string | undefined;
@@ -307,8 +322,19 @@ export function imageRemoteUser(imageConfig: unknown): string {
       containerUser = nonEmptyString(entry.containerUser) ?? containerUser;
     }
   }
-  const imageUser = typeof config.User === 'string' ? nonEmptyString(config.User.split(':')[0]) : undefined;
-  return remoteUser ?? containerUser ?? imageUser ?? 'root';
+  const imageUser = typeof config.User === 'string' ? nonEmptyString(config.User) : undefined;
+  const runUser = runArgsUser(runArgs) ?? containerUser ?? imageUser;
+  return containerUserName(remoteUser ?? runUser ?? 'root');
+}
+
+/**
+ * The remote user by the configuration alone, when neither `up` nor the image named it: its `remoteUser`, else the last
+ * `--user`/`-u` of `runArgs`, else its `containerUser` (the order of imageRemoteUser, without the image). `undefined`
+ * when the configuration names none.
+ */
+export function configRemoteUser(config: { remoteUser?: unknown; containerUser?: unknown } | undefined, runArgs?: readonly unknown[]): string | undefined {
+  const user = nonEmptyString(config?.remoteUser) ?? runArgsUser(runArgs) ?? nonEmptyString(config?.containerUser);
+  return user === undefined ? undefined : containerUserName(user);
 }
 
 /** `owner/name`, as the registry accepts it. */

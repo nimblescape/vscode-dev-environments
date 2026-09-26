@@ -3,15 +3,16 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The folder URI format of the Dev Containers extension for attached containers (concept 7.8, implementation notes 11).
-// This module is the only place that knows the format (NFR-06, RK-1). It does not import `vscode`, so it is unit-tested.
+// This module is the only place that knows the encoding of the authority (NFR-06, RK-1); the literal ATTACHED_CONTAINER
+// comes from src/core/devContainers.ts, the module of all other internal details of the Dev Containers extension. It
+// does not import `vscode`, so it is unit-tested.
 //
 // Assumption (V-2): Dev Containers 0.470.0 builds the authority as `attached-container+` followed by the hexadecimal
 // encoding of the UTF-8 text of JSON.stringify({ containerName: '/<name>' }) (fields that are undefined are left out),
 // optionally followed by `@<authority of a parent remote>`. It attaches to a container of this name, and the path of the
 // URI is the folder inside the container.
+import { ATTACHED_CONTAINER } from '../../core/devContainers';
 
-/** Remote name of attached containers: `vscode.env.remoteName`, and the part of the authority before `+`. */
-export const ATTACHED_CONTAINER = 'attached-container';
 /** URI scheme of remote folders. */
 export const REMOTE_SCHEME = 'vscode-remote';
 

@@ -3,8 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { ATTACHED_CONTAINER } from '../../core/devContainers';
 import {
-  ATTACHED_CONTAINER,
   containerNameOfUri,
   decodeAuthority,
   encodeAuthority,

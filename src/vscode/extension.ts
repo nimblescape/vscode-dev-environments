@@ -34,6 +34,7 @@ import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
+import { DockerSetup } from './dockerSetup';
 import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
@@ -86,8 +87,13 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   const runner = new NodeProcessRunner();
   const dockerPath = findDockerCli(env, platform);
   logger.info(dockerPath ? `Docker CLI: ${dockerPath}` : 'The Docker CLI was not found.');
+  // Set below; the adapter reports each `docker info` to it (context key devEnvironments.dockerReady).
+  let dockerSetup: DockerSetup | undefined;
   // Docker Desktop installed or updated while VS Code runs is found without a reload.
-  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, { findDocker: findDockerCli });
+  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, {
+    findDocker: findDockerCli,
+    onDaemonStatus: (running) => dockerSetup?.reportDaemonStatus(running),
+  });
   const registry = new EnvironmentRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
@@ -186,6 +192,20 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   });
   const statusBar = new EnvironmentStatusBar();
   context.subscriptions.push(tree, view, statusBar);
+  // Concept 6.1 step 2: the welcome view and the row "Install Docker…" while no Docker CLI is found.
+  const setup = new DockerSetup({
+    docker,
+    runner,
+    logger,
+    showLog: () => logger.show(),
+    platform,
+    env,
+    onDidChangeInstalled: () => {
+      sidebar.render().catch((error: unknown) => logger.error('Could not update the sidebar.', error));
+    },
+  });
+  dockerSetup = setup;
+  context.subscriptions.push(setup);
   const sidebar = new Sidebar({
     logger,
     registry,
@@ -198,7 +218,9 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     claims,
     tree,
     settings: getSettings,
+    dockerMissing: () => setup.dockerMissing,
   });
+  setup.initialize();
   const controller = new Controller({
     logger,
     registry,
@@ -206,6 +228,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     sessionFiles,
     disconnectRequests,
     docker,
+    helper,
     service,
     discovery,
     auth,
@@ -216,6 +239,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     sidebar,
     statusBar,
     settings: getSettings,
+    dockerSetup: setup,
     viewVisible: () => view.visible,
   });
   context.subscriptions.push(
@@ -294,7 +318,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
 
   if (currentEnvironment && containerName) {
     // Role A: the open pipeline runs before VS Code connects this window (awaited).
-    // Assumption (V-2): VS Code waits for activate() before it resolves the attached-container authority.
+    // Assumption (V-2, ATTACHED_CONTAINER_ACTIVATION_EVENT): VS Code waits for activate() before it resolves the authority.
     const pending = await started;
     await controller.openAttachedWindow(currentEnvironment, containerName, pending);
     return;

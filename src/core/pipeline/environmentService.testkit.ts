@@ -18,6 +18,8 @@ import {
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  LABEL_VOLUME,
+  VOLUME_KIND_ADDITIONAL,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -256,6 +258,20 @@ export class FakeDocker implements EnvironmentDocker {
 }
 
 /**
+ * Labels of an additional volume that the pipeline created for the environment `id` (additionalVolumeLabels): only
+ * these make a volume the environment's own. `owner` null: an entry of an older version without owner.
+ */
+export function additionalVolumeLabels(
+  id: string = ENV_ID,
+  owner: GitHubAccount | null = ACCOUNT,
+  repository: string = REPO,
+): Record<string, string> {
+  const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL };
+  if (owner) labels[LABEL_OWNER_ID] = owner.id;
+  return labels;
+}
+
+/**
  * `Config` of an environment image whose metadata label names `remoteUser` (the base image entry comes first), with more
  * entries (for example of Features) before the configuration.
  */
@@ -323,7 +339,13 @@ export class FakeHelper implements EnvironmentHelper {
   readonly builds: Array<{ imageName: string; configPath: string }> = [];
   readonly ups: Array<{ image: string; removeExistingContainer: boolean; override: Record<string, unknown> }> = [];
   /** Each write of the token and the Git configuration into the volume. */
-  readonly gitPreparations: Array<{ volumeName: string; repository: string; token: string; identity: { name: string; email: string } }> = [];
+  readonly gitPreparations: Array<{
+    volumeName: string;
+    repository: string;
+    token: string;
+    identity: { name: string; email: string };
+    login: string;
+  }> = [];
   /** Volumes that a helper run created silently (the real helper does this for a missing volume). Must stay empty. */
   readonly silentlyCreatedVolumes: string[] = [];
 
@@ -371,10 +393,16 @@ export class FakeHelper implements EnvironmentHelper {
     return this.merged === undefined ? { config } : { config, merged: { ...config, ...this.merged } };
   }
 
-  async prepareGit(p: { volumeName: string; repository: string; token: string; identity: { name: string; email: string } }): Promise<void> {
+  async prepareGit(p: {
+    volumeName: string;
+    repository: string;
+    token: string;
+    identity: { name: string; email: string };
+    login: string;
+  }): Promise<void> {
     this.mount(p.volumeName);
     this.calls.push('prepareGit');
-    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity } });
+    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity }, login: p.login });
     if (this.prepareGitError) throw this.prepareGitError;
   }
 

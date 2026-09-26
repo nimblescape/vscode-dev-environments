@@ -14,9 +14,19 @@ import {
   ENVIRONMENT_VOLUME_PATTERN,
   HELPER_CACHE_VOLUME,
   LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
+  LABEL_VOLUME,
+  VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
 } from '../names';
-import { isContainerGitVariable } from './containerGit';
+import {
+  DEV_CONTAINERS_VOLUMES,
+  exposingLocalPortHostValues,
+  hasDevContainersVolumeLabel,
+  isDevContainersCloneVolumeName,
+  LOCAL_PORT_HOST_SETTING,
+} from '../devContainers';
+import { GITHUB_CLI_ACCOUNT_REASON, isContainerGitVariable, isGitHubCliAccountVariable } from './containerGit';
 
 export interface HostAccessInput {
   /** The repository configuration, as `devcontainer read-configuration` resolved it (`configuration`). */
@@ -40,6 +50,12 @@ export interface HostAccessInput {
    * a volume that another program created (volumeLabelOwner).
    */
   volumeLabels?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /**
+   * The environment that is checked (its ID and the GitHub user ID of its owner): an existing volume whose devenv labels
+   * name it is its own (isOwnVolume) and may be mounted, and so may an additional volume of another environment of the
+   * same owner (isSameOwnerAdditionalVolume). Without it, every volume with devenv.environment-id is refused.
+   */
+  environment?: { id: string; ownerId?: string };
 }
 
 /**
@@ -161,7 +177,24 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--read-only': allowFlag,
   // Docker accepts only settings of the namespaces of the container (not `net.*` with --network host).
   '--sysctl': allowValue,
-  // The health check runs inside the container (and `--health-*`, see RUN_FLAG_PREFIXES).
+  // The name servers and search domains of the container: network only. `--dns-opt` is Docker's hidden older name of
+  // `--dns-option`.
+  '--dns': allowValue,
+  '--dns-option': allowValue,
+  '--dns-opt': allowValue,
+  '--dns-search': allowValue,
+  // Memory limits of the container: resources only.
+  '--memory': allowValue,
+  '--memory-reservation': allowValue,
+  '--memory-swap': allowValue,
+  '--memory-swappiness': allowValue,
+  // The health check runs inside the container.
+  '--health-cmd': allowValue,
+  '--health-interval': allowValue,
+  '--health-retries': allowValue,
+  '--health-start-period': allowValue,
+  '--health-start-interval': allowValue,
+  '--health-timeout': allowValue,
   '--no-healthcheck': allowFlag,
   // The signal that `docker stop` sends to the container.
   '--stop-signal': allowValue,
@@ -229,9 +262,6 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--volume': allowValue,
   '--mount': allowValue,
 };
-
-/** `--dns*`, `--memory*`, and `--health-*`: all of these flags take a value and are allowed. */
-const RUN_FLAG_PREFIXES: readonly string[] = ['--dns', '--memory', '--health-'];
 
 const BUILD_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--network': allowValue,
@@ -319,7 +349,12 @@ function configurationSources(input: HostAccessInput): Record<string, unknown>[]
 }
 
 function volumeContext(input: HostAccessInput): VolumeContext {
-  return { own: input.ownVolume, foreign: new Set(input.foreignVolumes ?? []), labels: input.volumeLabels ?? {} };
+  return {
+    own: input.ownVolume,
+    foreign: new Set(input.foreignVolumes ?? []),
+    labels: input.volumeLabels ?? {},
+    environment: input.environment,
+  };
 }
 
 /**
@@ -340,40 +375,43 @@ function hasCommand(value: unknown): boolean {
 }
 
 /**
- * The variables of container-only Git in `containerEnv` and `remoteEnv` of the configuration or of an entry of the image
- * metadata (isContainerGitVariable): the override configuration would replace those that it sets without a word,
- * because its values win, and the others (for example GIT_CONFIG_PARAMETERS) would change the configuration of Git in
- * the container.
+ * The item of a variable that a configuration may not set, or `undefined` when it may: a variable of container-only Git
+ * (isContainerGitVariable), named alone, or a variable that chooses the account of the GitHub CLI
+ * (isGitHubCliAccountVariable), with the reason. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
+ */
+function refusedVariableItem(name: string, where: string): string | undefined {
+  if (isContainerGitVariable(name)) return `variable ${name} in ${where}`;
+  if (isGitHubCliAccountVariable(name)) return `variable ${name} in ${where} (${GITHUB_CLI_ACCOUNT_REASON})`;
+  return undefined;
+}
+
+/**
+ * The variables of container-only Git and of the account of the GitHub CLI in `containerEnv` and `remoteEnv` of the
+ * configuration or of an entry of the image metadata (refusedVariableItem): the override configuration would replace
+ * those that it sets without a word, because its values win, the others (for example GIT_CONFIG_PARAMETERS) would
+ * change the configuration of Git in the container, and a token or host of the GitHub CLI would win over the sign-in of
+ * the owner account.
  */
 function environmentProblems(config: Record<string, unknown>): string[] {
   const items: string[] = [];
   for (const property of ['containerEnv', 'remoteEnv']) {
     const env = config[property];
     if (!isRecord(env)) continue;
-    for (const name of Object.keys(env)) if (isContainerGitVariable(name)) items.push(`variable ${name.trim()} in ${property}`);
+    for (const name of Object.keys(env)) {
+      const item = refusedVariableItem(name.trim(), property);
+      if (item !== undefined) items.push(item);
+    }
   }
   return items;
 }
 
 /**
- * `remote.localPortHost` in the VS Code settings of a configuration (`customizations.vscode.settings`: one object per
- * entry, a list of them in the merged configuration; flat or nested keys). The Dev Containers extension writes these
- * settings into the settings of the container, and the window applies them: with any value other than `localhost`, VS
- * Code forwards the ports of the container on all addresses of the computer (VS Code 1.139, tunnel service:
- * `!e||e==="localhost"?"127.0.0.1":"0.0.0.0"`), not only on localhost. The setting of the user stays the user's choice.
+ * `remote.localPortHost` other than `localhost` in the VS Code settings of a configuration (exposingLocalPortHostValues,
+ * ../devContainers.ts: the window applies the settings of the container, and forwards ports on all addresses of the
+ * computer for such a value).
  */
 function portHostProblems(customizations: unknown): string[] {
-  const vscode = isRecord(customizations) ? customizations.vscode : undefined;
-  const items: string[] = [];
-  for (const entry of Array.isArray(vscode) ? vscode : [vscode]) {
-    const settings = isRecord(entry) && isRecord(entry.settings) ? entry.settings : undefined;
-    if (!settings) continue;
-    const nested = isRecord(settings.remote) ? settings.remote.localPortHost : undefined;
-    for (const value of [settings['remote.localPortHost'], nested]) {
-      if (value && value !== 'localhost') items.push(`setting remote.localPortHost ${JSON.stringify(value)}`);
-    }
-  }
-  return items;
+  return exposingLocalPortHostValues(customizations).map((value) => `setting ${LOCAL_PORT_HOST_SETTING} ${JSON.stringify(value)}`);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -477,6 +515,8 @@ interface VolumeContext {
   foreign: ReadonlySet<string>;
   /** HostAccessInput.volumeLabels. */
   labels: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /** HostAccessInput.environment. */
+  environment: { id: string; ownerId?: string } | undefined;
 }
 
 /** The type of a mount: without a type, a path is a bind mount and a name a volume (Docker's default of --mount). */
@@ -523,7 +563,7 @@ export function mountedVolumeNames(input: HostAccessInput): string[] {
   }
   for (const source of [input.config, input.merged]) {
     if (!source || !Array.isArray(source.runArgs)) continue;
-    for (const flag of parseFlags(source.runArgs, RUN_FLAGS, RUN_FLAG_PREFIXES)) {
+    for (const flag of parseFlags(source.runArgs, RUN_FLAGS)) {
       if (flag.value === undefined) continue;
       if (flag.name === '-v' || flag.name === '--volume') {
         const name = volumeFlagSource(flag.value);
@@ -536,39 +576,41 @@ export function mountedVolumeNames(input: HostAccessInput): string[] {
   return [...names];
 }
 
-/**
- * The volumes of the Dev Containers extension (remote-containers 0.470.0, extension.js): `vscode`, its cache of VS Code
- * Server for the dev containers that it creates, and the volumes of "Clone Repository in Container Volume": its proposal
- * `vsc-remote-containers` for a named volume, and names that end in a hexadecimal MD5 or SHA-256 hash
- * (`vsc-<repository>-<md5>`, `<repository>-<md5>`, `<repository>-<sha256>`). A container with such a volume could
- * change the VS Code Server or the repositories of the other dev containers of the user.
- */
-function isDevContainersVolume(name: string): boolean {
-  return name === 'vscode' || name === 'vsc-remote-containers' || /-([0-9a-f]{32}|[0-9a-f]{64})$/.test(name);
-}
-
 /** Docker's name of an anonymous volume: 64 hexadecimal characters. */
 const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
 
 /**
  * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
- * the Dev Containers extension. The restore of a lost registry and Delete use the same rule, so that no such volume
- * becomes an additional volume of an environment.
+ * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume
+ * is an environment's own is decided by its labels (isOwnVolume).
  */
 export function foreignVolumeName(name: string): string | undefined {
   if (name === HELPER_CACHE_VOLUME) return 'the workspace helper';
   if (ENVIRONMENT_VOLUME_PATTERN.test(name)) return 'another environment';
   if (ANONYMOUS_VOLUME_NAME.test(name)) return 'another container';
-  if (isDevContainersVolume(name)) return 'the Dev Containers extension';
+  if (DEV_CONTAINERS_VOLUMES.includes(name)) return 'the Dev Containers extension';
   return undefined;
+}
+
+/**
+ * True when the labels of a volume make it the own volume of the environment `environmentId`: devenv.environment-id is
+ * that ID, and devenv.owner-id, when both the volume and the environment have an owner, is the owner of the
+ * environment. The only rule by which the pipeline records an additional volume and Delete removes one: a volume
+ * without these labels (for example one that a version before the labels created, one named with `${devcontainerId}`,
+ * which Docker creates at `up`, or one of another program) is never the environment's.
+ */
+export function isOwnVolume(labels: Readonly<Record<string, string>>, environmentId: string, ownerId: string | undefined): boolean {
+  if (labels[LABEL_ENVIRONMENT_ID] !== environmentId) return false;
+  const volumeOwner = labels[LABEL_OWNER_ID];
+  return volumeOwner === undefined || ownerId === undefined || volumeOwner === ownerId;
 }
 
 /**
  * The program that created an existing volume, by its labels, for a volume that a repository did not create by its
  * mounts (Docker gives such a volume no labels): Docker Compose (the volume of a project, for example the data of a
- * database), the Dev Containers extension (`vsch.*`: its clones of repositories; `dev.container.volume`), Docker itself
- * (an anonymous volume of another container), or Dev Environments (the workspace volume of another environment).
+ * database), the Dev Containers extension (hasDevContainersVolumeLabel), Docker itself
+ * (an anonymous volume of another container), or Dev Environments (a volume of an environment, devenv.environment-id).
  * `undefined` for a volume without such labels.
  */
 export function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
@@ -577,25 +619,69 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
     const project = labels['com.docker.compose.project'];
     return project ? `the Docker Compose project ${project}` : 'Docker Compose';
   }
-  if (keys.some((key) => key.startsWith('vsch.') || key === 'dev.container.volume')) return 'the Dev Containers extension';
+  if (hasDevContainersVolumeLabel(labels)) return 'the Dev Containers extension';
   if (keys.includes('com.docker.volume.anonymous')) return 'another container';
   if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   return undefined;
 }
 
 /**
+ * True when the labels of a volume make it an additional volume (devenv.volume=additional) of an environment of the
+ * GitHub user `ownerId`: devenv.environment-id is set, and devenv.owner-id is set and is that user. The environments of one account share such a volume,
+ * for example `${localWorkspaceFolderBasename}-node_modules` of a fork and its upstream repository, or a fixed cache
+ * name: each may mount it (mayMountEnvironmentVolume) and records it, so that the Delete of one keeps it while another
+ * records it. A volume without the owner label, a workspace volume (no devenv.volume), and every volume when the
+ * environment has no owner are not.
+ */
+export function isSameOwnerAdditionalVolume(labels: Readonly<Record<string, string>>, ownerId: string | undefined): boolean {
+  const volumeOwner = labels[LABEL_OWNER_ID];
+  return (
+    labels[LABEL_ENVIRONMENT_ID] !== undefined &&
+    labels[LABEL_VOLUME] === VOLUME_KIND_ADDITIONAL &&
+    volumeOwner !== undefined &&
+    ownerId !== undefined &&
+    volumeOwner === ownerId
+  );
+}
+
+/**
+ * An existing volume with devenv labels that the environment may mount: its own (isOwnVolume), or an additional volume
+ * of another environment of the same owner (isSameOwnerAdditionalVolume), whether that environment still exists or its
+ * Delete kept the volume. A volume of another account, a volume without an owner label, a workspace volume, and every
+ * such volume for an environment without owner are refused.
+ */
+function mayMountEnvironmentVolume(labels: Readonly<Record<string, string>>, volumes: VolumeContext): boolean {
+  const environment = volumes.environment;
+  if (!environment) return false;
+  return isOwnVolume(labels, environment.id, environment.ownerId) || isSameOwnerAdditionalVolume(labels, environment.ownerId);
+}
+
+/**
  * A named volume that belongs to something else: the workspace helper, another environment (named like a workspace
- * volume, or used by an environment of another account), the Dev Containers extension, or another program that created
- * the volume (its labels, volumeLabelOwner). Other named volumes, for example of the repository
- * (`${localWorkspaceFolderBasename}-node_modules`), are allowed.
+ * volume, used by an environment of another account, or labeled with the ID of another environment that is not an
+ * additional volume of the same owner, mayMountEnvironmentVolume), the Dev
+ * Containers extension (by name, or an existing volume whose name ends in a hash and that is not the environment's
+ * own), or another program that created the volume (its labels, volumeLabelOwner). Other named volumes, for example of
+ * the repository (`${localWorkspaceFolderBasename}-node_modules`), are allowed: a volume that does not exist yet is
+ * created with the labels of the environment before `up`.
  */
 function volumeNameProblems(name: string, volumes: VolumeContext): string[] {
   if (name === '' || name === volumes.own) return [];
   if (volumes.foreign.has(name)) return [`volume ${name} of another environment`];
   const byName = foreignVolumeName(name);
   if (byName !== undefined) return [`volume ${name} of ${byName}`];
-  const owner = volumeLabelOwner(volumes.labels[name] ?? {});
-  return owner === undefined ? [] : [`volume ${name} of ${owner}`];
+  const labels = volumes.labels[name];
+  // Not known to exist.
+  if (labels === undefined) return [];
+  if (labels[LABEL_ENVIRONMENT_ID] !== undefined) {
+    return mayMountEnvironmentVolume(labels, volumes) ? [] : [`volume ${name} of another environment`];
+  }
+  const owner = volumeLabelOwner(labels);
+  if (owner !== undefined) return [`volume ${name} of ${owner}`];
+  // An existing volume named like a clone volume of the Dev Containers extension (isDevContainersCloneVolumeName), which
+  // older versions did not label.
+  if (isDevContainersCloneVolumeName(name)) return [`volume ${name} of another program`];
+  return [];
 }
 
 /**
@@ -756,13 +842,16 @@ function labelProblems(value: string): Problem[] {
 }
 
 /**
- * `-e`/`--env`: no variable of container-only Git (isContainerGitVariable), with or without a value. `docker run` gets
- * the runArgs after the containerEnv of the override configuration, so the value of the runArgs would win.
+ * `-e`/`--env`: no variable of container-only Git and no variable of the account of the GitHub CLI
+ * (refusedVariableItem), with or without a value. `docker run` gets the runArgs after the containerEnv of the override
+ * configuration, so the value of the runArgs would win; a `-e NAME` without a value takes the value of the workspace
+ * helper, or removes the variable.
  */
 function envProblems(value: string): string[] {
   const index = value.indexOf('=');
   const name = (index < 0 ? value : value.slice(0, index)).trim();
-  return isContainerGitVariable(name) ? [`variable ${name} in runArgs`] : [];
+  const item = refusedVariableItem(name, 'runArgs');
+  return item === undefined ? [] : [item];
 }
 
 /**
@@ -864,9 +953,12 @@ interface ParsedFlag {
   raw: string;
 }
 
-function ruleOf(name: string, rules: Readonly<Record<string, FlagRule>>, prefixes: readonly string[]): FlagRule | undefined {
-  if (Object.prototype.hasOwnProperty.call(rules, name)) return rules[name];
-  return prefixes.some((prefix) => name.startsWith(prefix)) ? allowValue : undefined;
+/**
+ * The rule of a flag, by its exact name only: a flag that is not in `rules` is unknown, also one that starts like a
+ * known flag (for example `--dns-foo`), because the policy cannot tell whether it takes a value.
+ */
+function ruleOf(name: string, rules: Readonly<Record<string, FlagRule>>): FlagRule | undefined {
+  return Object.prototype.hasOwnProperty.call(rules, name) ? rules[name] : undefined;
 }
 
 function takesValue(rule: FlagRule): boolean {
@@ -878,11 +970,7 @@ function takesValue(rule: FlagRule): boolean {
  * them: a flag that takes a value takes the next argument, also one that starts with `-`. An entry that is no text is
  * never a flag or a value (the Dev Container CLI would not pass it on as one): it is an argument of its own.
  */
-function parseFlags(
-  args: readonly unknown[],
-  rules: Readonly<Record<string, FlagRule>>,
-  prefixes: readonly string[] = [],
-): ParsedFlag[] {
+function parseFlags(args: readonly unknown[], rules: Readonly<Record<string, FlagRule>>): ParsedFlag[] {
   const flags: ParsedFlag[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -906,7 +994,7 @@ function parseFlags(
       name = raw.slice(0, 2);
       inline = raw.length > 2 ? raw.slice(2).replace(/^=/, '') : undefined;
     }
-    const rule = ruleOf(name, rules, prefixes);
+    const rule = ruleOf(name, rules);
     if (!rule) {
       // An unknown long flag without `=` probably takes the next argument as its value.
       const skipsNext = raw.startsWith('--') && inline === undefined && typeof next === 'string' && !next.startsWith('-');
@@ -919,7 +1007,7 @@ function parseFlags(
         // A group of short flags (`-it`): Docker reads each letter as a flag. Each gets its own entry with the index of
         // the group when all of them are flags without a value; otherwise the group is not known here.
         const group = [...raw.slice(1)].map((letter) => `-${letter}`);
-        const groupRules = group.map((member) => ruleOf(member, rules, prefixes));
+        const groupRules = group.map((member) => ruleOf(member, rules));
         if (groupRules.every((memberRule) => memberRule !== undefined && !takesValue(memberRule))) {
           group.forEach((member, n) => {
             flags.push({ index: i, name: member, rule: groupRules[n], value: undefined, form: 'none', raw });
@@ -973,7 +1061,7 @@ export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, 
 
 function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext): Problem[] {
   const problems: Problem[] = [];
-  for (const flag of parseFlags(runArgs, RUN_FLAGS, RUN_FLAG_PREFIXES)) {
+  for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     const rule = flag.rule;
     // At the end, without its value, the flag would take the next argument that the extension or the CLI adds.
     const last = flag.index === runArgs.length - 1 && flag.value === undefined;
@@ -1012,6 +1100,20 @@ function buildContextProblems(value: string): string[] {
   return [`build option --build-context=${value}`];
 }
 
+/**
+ * The user that `--user`/`-u` of `runArgs` gives the container, read as Docker reads the arguments (parseFlags, so a
+ * `--user` that is the value of another flag does not count): the last one wins, as in `docker run`. `undefined`
+ * without one, or when the last one is empty (Docker then uses the user of the image).
+ */
+export function runArgsUser(runArgs: unknown): string | undefined {
+  if (!Array.isArray(runArgs)) return undefined;
+  let user: string | undefined;
+  for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
+    if ((flag.name === '--user' || flag.name === '-u') && flag.value !== undefined) user = flag.value;
+  }
+  return user === undefined || user.trim() === '' ? undefined : user;
+}
+
 /** A flag that overrideRunArgs removes from `runArgs`, for the log. */
 export interface RemovedRunArg {
   /** The entry as the configuration writes it, with the next entry when that is its value (for example `--name x`). */
@@ -1028,7 +1130,7 @@ export interface RemovedRunArg {
  */
 function removals(runArgs: readonly string[], names?: readonly string[]): Map<number, ParsedFlag[]> {
   const entries = new Map<number, ParsedFlag[]>();
-  for (const flag of parseFlags(runArgs, RUN_FLAGS, RUN_FLAG_PREFIXES)) {
+  for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     entries.set(flag.index, [...(entries.get(flag.index) ?? []), flag]);
   }
   const removes = (flag: ParsedFlag): boolean =>
@@ -1093,7 +1195,7 @@ export function overrideRunArgs(runArgs: unknown): string[] {
  */
 export function loopbackRunArgs(runArgs: readonly string[]): string[] {
   const result = [...runArgs];
-  for (const flag of parseFlags(runArgs, RUN_FLAGS, RUN_FLAG_PREFIXES)) {
+  for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     if ((flag.name !== '-p' && flag.name !== '--publish') || flag.value === undefined) continue;
     const value = withLoopbackAddress(flag.value);
     if (flag.form === 'next') result[flag.index + 1] = value;
