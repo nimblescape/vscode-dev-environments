@@ -14,7 +14,7 @@ import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { CommandError, UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
-import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
+import type { ConfigurationKindChange, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -200,7 +200,7 @@ interface Harness {
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     switchBranch: ReturnType<typeof vi.fn<(id: string, branch: string, options: OperationOptions) => Promise<void>>>;
-    configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean>>>;
+    configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean | ConfigurationKindChange>>>;
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
@@ -231,7 +231,7 @@ interface Harness {
   claims: { claim: ReturnType<typeof vi.fn> };
   dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
-  ui: { configurationChanged: ReturnType<typeof vi.fn> };
+  ui: { configurationChanged: ReturnType<typeof vi.fn>; configurationKindChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
     infos: Map<string, RepositoryInfo>;
@@ -319,7 +319,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     installWsl: vi.fn(async () => {}),
   };
   const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
-  const ui = { configurationChanged: vi.fn(async () => 'later') };
+  const ui = { configurationChanged: vi.fn(async () => 'later'), configurationKindChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
   const sidebar = {
@@ -1304,6 +1304,30 @@ describe('Switch branch…', () => {
     expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
     expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', 'feature-x');
   });
+
+  it.each(['rebuildNow', 'later'] as const)(
+    'asks about a switch between Docker Compose and a single container as the pipeline asks, and hands off the rebuild on Rebuild now (review round 5, D5-3, %s)',
+    async (answer) => {
+      const env = environment();
+      await h.registry.add(env);
+      await connectHere(env);
+      h.service.configurationChanged.mockResolvedValue({ question: 'the kind question' });
+      h.ui.configurationKindChanged.mockResolvedValue(answer);
+      const command = run('switchBranch', row('acme/api', env));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+      expect(h.ui.configurationKindChanged).toHaveBeenCalledWith('acme/api', 'the kind question');
+      expect(h.ui.configurationChanged).not.toHaveBeenCalled();
+      if (answer === 'rebuildNow') {
+        expect(await h.sessionFiles.readOperations()).toEqual([expect.objectContaining({ operation: 'rebuild', reason: 'configChanged' })]);
+        expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
+      } else {
+        expect(await h.sessionFiles.readOperations()).toEqual([]);
+        expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it('creates the environment on a typed branch when the repository has none', async () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));

@@ -11,6 +11,7 @@ import {
   COMPOSE_CLEARED_LABELS,
   CONTAINER_VERSION_LABEL,
   configPathLabel,
+  isConfigPathLabelValue,
   containerHostname,
   HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
   HOST_ACCESS_UNRESTRICTED_LABEL,
@@ -207,7 +208,9 @@ export function buildOverrideConfig(p: {
 }): Record<string, unknown> {
   const checksOn = p.hostAccessChecks !== 'off';
   const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
-  if (p.configPath !== undefined) labels.push('--label', configPathLabel(p.configPath));
+  // Review round 5 (D5-2): only a configuration path that reconcileFromVolumes takes; without the label, it takes the
+  // default configuration.
+  if (p.configPath !== undefined && isConfigPathLabelValue(p.configPath)) labels.push('--label', configPathLabel(p.configPath));
   // Review round 2 (D2-1): the labels of Docker Compose empty, whatever the image inherited.
   for (const label of COMPOSE_CLEARED_LABELS) labels.push('--label', label);
   const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);

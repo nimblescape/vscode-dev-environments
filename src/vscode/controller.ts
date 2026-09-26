@@ -16,7 +16,7 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks,
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
-import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
+import { PipelineTexts, type ConfigurationKindChange, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
 import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
@@ -1197,7 +1197,7 @@ export class Controller implements vscode.Disposable {
   private async switchEnvironmentBranch(target: Target, environment: Environment, branch: string): Promise<void> {
     const repository = this.displayName(target);
     const connectedHere = this.isConnectedHere(environment);
-    let configurationChanged = false;
+    let configurationChanged: boolean | ConfigurationKindChange = false;
     const switched = await this.operation(
       repository,
       'Switch branch',
@@ -1220,8 +1220,16 @@ export class Controller implements vscode.Disposable {
         this.current.branch = branch;
         this.updateStatusBar();
       }
-      // Concept 7.12: a changed configuration offers Rebuild now; Later keeps the window connected.
-      if (configurationChanged && (await this.deps.ui.configurationChanged(repository)) === 'rebuildNow') {
+      // Concept 7.12: a changed configuration offers Rebuild now; Later keeps the window connected. Review round 5 (D5-3):
+      // a switch between Docker Compose and a single container asks as the pipeline asks (configurationKindChanged).
+      const changed = configurationChanged as boolean | ConfigurationKindChange;
+      const answer =
+        typeof changed === 'object'
+          ? await this.deps.ui.configurationKindChanged(repository, changed.question)
+          : changed
+            ? await this.deps.ui.configurationChanged(repository)
+            : 'later';
+      if (answer === 'rebuildNow') {
         await this.handOff(target, environment, { operation: 'rebuild', reason: 'configChanged' }, 'rebuild');
       }
       return;

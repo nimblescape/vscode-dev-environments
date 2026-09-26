@@ -20,8 +20,14 @@ const PLATFORM_ARGS = new Set([
 
 const KNOWN_DIRECTIVES = new Set(['syntax', 'escape', 'check']);
 const HEREDOC_INSTRUCTIONS = new Set(['RUN', 'COPY', 'ADD']);
-const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*/;
-const ARG_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Review round 5 (S5-1): a variable name as `processName` of BuildKit's shell lexer reads it: a run of digits (a
+ * positional parameter, `$1`), one special parameter of `@*#?-$!0`, or Unicode letters, digits, and `_` (not starting
+ * with a digit). A name that is not set expands to the empty text.
+ */
+export const SHELL_NAME = /^(?:\p{Nd}+|[@*#?\-$!]|[\p{L}_][\p{L}\p{Nd}_]*)/u;
+/** Review round 5 (S5-1): BuildKit takes any name that is not empty for an ARG (it refuses only a blank one). */
+const isArgName = (name: string): boolean => name !== '';
 
 interface Instruction {
   keyword: string;
@@ -86,7 +92,7 @@ export function extractBaseImages(
       for (const word of splitWords(instruction.args, escape)) {
         const equals = word.indexOf('=');
         const name = equals < 0 ? word : word.slice(0, equals);
-        if (!ARG_NAME.test(name)) continue;
+        if (!isArgName(name)) continue;
         const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), lookup, escape, { keepPatterns: true });
         const override = buildArgs && Object.prototype.hasOwnProperty.call(buildArgs, name) ? buildArgs[name] : undefined;
         globals.set(name, override !== undefined ? override : defaultValue);
@@ -214,7 +220,7 @@ export function extractImageReferences(
       for (const word of splitWords(instruction.args, escape)) {
         const equals = word.indexOf('=');
         const name = equals < 0 ? word : word.slice(0, equals);
-        if (!ARG_NAME.test(name)) continue;
+        if (!isArgName(name)) continue;
         const state: Expansion = {};
         if (!fromSeen) {
           const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), globalLookup, escape, state);
@@ -390,20 +396,62 @@ function csvFields(value: string): string[] {
   return fields;
 }
 
+/** A parser directive `# name=value` (more lenient than BuildKit: white space before the `#`). */
+const DIRECTIVE = /^\s*#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+/** A directive in the C form `// name=value` (DetectSyntax). */
+const SLASH_DIRECTIVE = /^\s*\/\/\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+
+/**
+ * The frontend of a Dockerfile as `DetectSyntax` of BuildKit's Dockerfile parser finds it (review round 5, S5-3): after a
+ * BOM, a first line that starts with `#!` is left out; then the directive `# syntax=…` at the top (with the directives
+ * `escape` and `check` before it), else the directive `// syntax=…`, else the whole text as a JSON object with a text
+ * `syntax`. BuildKit takes the value up to its first space (review round 5, P5-2: `# syntax=docker/dockerfile:1 # x`),
+ * the check cuts the JSON value there too. `undefined` without one.
+ */
+export function detectSyntax(text: string): string | undefined {
+  let source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const newline = source.indexOf('\n');
+  if ((newline < 0 ? source : source.slice(0, newline)).startsWith('#!')) source = newline < 0 ? '' : source.slice(newline + 1);
+  const lines = source.split(/\r\n|\r|\n/);
+  for (const pattern of [DIRECTIVE, SLASH_DIRECTIVE]) {
+    for (const line of lines) {
+      const match = pattern.exec(line);
+      if (!match || !KNOWN_DIRECTIVES.has(match[1].toLowerCase())) break;
+      if (match[1].toLowerCase() === 'syntax') return cutAtSpace(match[2]);
+    }
+  }
+  try {
+    const json: unknown = JSON.parse(source);
+    if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
+      const value = (json as Record<string, unknown>).syntax;
+      if (typeof value === 'string') return cutAtSpace(value);
+    }
+  } catch {
+    // No JSON document.
+  }
+  return undefined;
+}
+
+/** The text up to its first ASCII space, as BuildKit's `strings.Cut(value, " ")` (review round 5, P5-2). */
+export function cutAtSpace(value: string): string {
+  const space = value.indexOf(' ');
+  return space < 0 ? value : value.slice(0, space);
+}
+
 /** Splits the text into instructions: directives, comments, continuation lines, and heredoc bodies are handled here. */
 function parseInstructions(text: string): { escape: string; syntax?: string; instructions: Instruction[] } {
   const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const lines = source.split(/\r\n|\r|\n/);
   let escape = '\\';
-  let syntax: string | undefined;
+  // Review round 5 (S5-3): the frontend as BuildKit's DetectSyntax finds it.
+  const syntax = detectSyntax(text);
   let index = 0;
 
   // Parser directives are only recognized at the very top of the file.
   for (; index < lines.length; index++) {
-    const match = /^\s*#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/.exec(lines[index]);
+    const match = DIRECTIVE.exec(lines[index]);
     if (!match || !KNOWN_DIRECTIVES.has(match[1].toLowerCase())) break;
     if (match[1].toLowerCase() === 'escape' && (match[2] === '`' || match[2] === '\\')) escape = match[2];
-    if (match[1].toLowerCase() === 'syntax' && syntax === undefined) syntax = match[2];
   }
 
   const continuation = new RegExp(`${escapeRegExp(escape)}[ \\t]*$`);
@@ -552,13 +600,16 @@ function expand(word: string, lookup: Lookup, escape: string, state?: Expansion,
  */
 function expandVariable(word: string, start: number, lookup: Lookup, escape: string, state?: Expansion): { text: string; end: number } {
   if (word[start + 1] !== '{') {
-    const name = VARIABLE_NAME.exec(word.slice(start + 1))?.[0];
+    const name = SHELL_NAME.exec(word.slice(start + 1))?.[0];
     if (!name) return { text: '$', end: start + 1 };
     const end = start + 1 + name.length;
     const found = lookup(name);
     if (found === 'unresolved') {
       if (state) state.unresolved = true;
-      return { text: word.slice(start, end), end };
+      // Review round 5 (S5-1): in braces when an escape or a quote comes next, whose character could otherwise read as a
+      // part of the name (`dev$TARGETVARIANT\env` gives `dev${TARGETVARIANT}env`, see unresolvedVariants).
+      const next = word[end];
+      return { text: next === escape || next === '"' || next === "'" ? `\${${name}}` : word.slice(start, end), end };
     }
     markUnchecked(state, found.unchecked);
     return { text: found.value ?? '', end };
@@ -585,9 +636,10 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
   const raw = word.slice(start, j + 1);
   const end = j + 1;
   const inner = word.slice(start + 2, j);
-  const name = VARIABLE_NAME.exec(inner)?.[0];
+  const name = SHELL_NAME.exec(inner)?.[0];
   if (!name) {
-    // `${}`, `${1}`, `${@}`: BuildKit refuses them; the check cannot read them either (review round 4, S4-3).
+    // `${}`, `${:x}`, `${.x}`: BuildKit refuses them; the check cannot read them either (review round 4, S4-3). Review
+    // round 5 (S5-1): `${1}` and `${@}` are names (SHELL_NAME).
     markUnchecked(state, 'protected');
     return { text: raw, end };
   }

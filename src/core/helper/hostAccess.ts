@@ -14,7 +14,7 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { extractImageReferences, type DockerfileImageReference, type ImageReferenceKind } from '../imageCheck/dockerfile';
+import { cutAtSpace, extractImageReferences, SHELL_NAME, type DockerfileImageReference, type ImageReferenceKind } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
   COMPOSE_CLEARED_LABELS,
@@ -502,6 +502,12 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
     const finding = imageReferenceFinding(config.image);
     if (finding) problems.push(finding);
   }
+  // Review round 5 (S5-2): the CLI passes an object as `[object Object]`; the check refuses it.
+  if (isRecord(build.args)) {
+    for (const [name, value] of Object.entries(build.args)) {
+      if (isRecord(value)) problems.push(unsupported(`build.args ${name} (an object; the value of a build argument is a text)`));
+    }
+  }
   if (input.dockerfileText !== undefined) {
     const { args, target } = singleBuildArguments(build);
     problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
@@ -517,12 +523,14 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
  * `build.options`, and the last value of an argument or of the target wins. `--build-arg NAME` without a value takes the
  * value of the variable NAME of the workspace helper, or (buildx drops it when the helper has no such variable) the
  * earlier value or the default of the ARG: it stays `${NAME}` here, and buildArgOptionProblems refuses it (review round
- * 4, S4-1).
+ * 4, S4-1). Review round 5 (S5-2): each value of `build.args` as the CLI's template literal `${k}=${v}` makes it a
+ * text (`String(value)`: an array gives its items with commas, `null` gives `null`); singleBuildProblems refuses an
+ * object.
  */
 export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
   const args: Record<string, string> = {};
   if (isRecord(build.args)) {
-    for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
+    for (const [name, value] of Object.entries(build.args)) args[name] = String(value);
   }
   let target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
   if (Array.isArray(build.options)) {
@@ -564,7 +572,8 @@ export function dockerfileImageReferences(text: string, args: Readonly<Record<st
  */
 function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImageReference[] {
   const references = extractImageReferences(text, { ...args });
-  const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? args.BUILDKIT_SYNTAX.trim() : '';
+  // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
+  const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
   if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
     references.unshift({ reference: syntax, kind: 'syntax' });
   }
@@ -643,9 +652,82 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
     const prefix = reference.slice(0, dollar).trim();
     if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
       findings.push({ item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' });
+      continue;
+    }
+    // Review round 5 (S5-1): the texts that the reference can become when its variables that are not resolved are empty
+    // (for example `dev${TARGETVARIANT}env-…`), or give an operand of `:-` or `:+`.
+    const variants = unresolvedVariants(reference);
+    if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
+      findings.push({
+        item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
+        class: 'protected',
+      });
     }
   }
   return findings;
+}
+
+/**
+ * Review round 5 (S5-1): the form of an image ID or of a prefix of one (`sha256:<hex>`, hexadecimal characters), for a
+ * text that a reference with a variable that is not resolved can become. Docker takes a prefix of an ID too.
+ */
+const IMAGE_ID_FORM = /^(?:sha256:)?[0-9a-f]+$/i;
+/** The most texts that unresolvedVariants makes; a reference with more cannot be checked. */
+const MAX_VARIANTS = 256;
+
+/**
+ * The texts that an expanded image reference (extractImageReferences) can become through its variables that are not
+ * resolved (review round 5, S5-1): each such variable (`$NAME`, `${NAME…}`, names as SHELL_NAME reads them) is left out,
+ * and a `${NAME:-word}`, `${NAME-word}`, `${NAME:+word}`, or `${NAME+word}` also gives its word (with its own variants).
+ * A `$` without a name stays. `undefined` for more than MAX_VARIANTS texts.
+ */
+export function unresolvedVariants(reference: string): string[] | undefined {
+  let variants: string[] = [''];
+  const append = (options: readonly string[]): boolean => {
+    const next = new Set<string>();
+    for (const variant of variants) for (const option of options) next.add(variant + option);
+    variants = [...next];
+    return variants.length <= MAX_VARIANTS;
+  };
+  let i = 0;
+  while (i < reference.length) {
+    const char = reference[i];
+    if (char !== '$') {
+      if (!append([char])) return undefined;
+      i++;
+      continue;
+    }
+    if (reference[i + 1] === '{') {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < reference.length && depth > 0; j++) {
+        if (reference[j] === '$' && reference[j + 1] === '{') {
+          depth++;
+          j++;
+        } else if (reference[j] === '}') depth--;
+      }
+      const inner = reference.slice(i + 2, depth === 0 ? j - 1 : reference.length);
+      const name = SHELL_NAME.exec(inner)?.[0] ?? '';
+      const operator = /^:?[-+]/.exec(inner.slice(name.length))?.[0];
+      const options = [''];
+      if (operator !== undefined) {
+        const word = unresolvedVariants(inner.slice(name.length + operator.length));
+        if (word === undefined) return undefined;
+        options.push(...word);
+      }
+      if (!append(options)) return undefined;
+      i = j;
+      continue;
+    }
+    const name = SHELL_NAME.exec(reference.slice(i + 1))?.[0];
+    if (name === undefined) {
+      if (!append(['$'])) return undefined;
+      i++;
+      continue;
+    }
+    i += 1 + name.length;
+  }
+  return variants;
 }
 
 /** The registries of Docker Hub, whose images Docker keeps under their short names (`devenv-…` is local then). */

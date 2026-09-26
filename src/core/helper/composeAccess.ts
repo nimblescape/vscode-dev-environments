@@ -450,8 +450,8 @@ const BUILD_ALLOWED = new Set([
 ]);
 
 /**
- * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it)
- * or a remote context; the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
+ * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it);
+ * a remote context is not supported yet (review round 5, S5-4); the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
  * access to the computer; tags and exported caches could overwrite images or write files.
  */
 function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
@@ -465,6 +465,9 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   const contextProblems =
     context === undefined ? [access(`build context ${String(value.context)}`)] : remote || contextMissing ? [] : localPathProblems(`build context ${context}`, context, ctx);
   problems.push(...contextProblems);
+  // Review round 5 (S5-4): the Dockerfile of a remote context is not read, so its images cannot be checked (until each
+  // build has a builder of its own).
+  if (remote) problems.push(unsupported(`build context ${context} (a remote build context is not supported yet)`));
   if (!remote && !contextMissing && context !== undefined && isUnset(value.dockerfile_inline) && !isMissing(dockerfilePath(context, value), ctx)) {
     const dockerfile = typeof value.dockerfile === 'string' ? value.dockerfile : undefined;
     const file = dockerfilePath(context, value);
@@ -483,9 +486,10 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
       problems.push(unsupported(`Dockerfile ${file} (it could not be read, so its images cannot be checked)`));
     }
   }
-  // The images that the build uses (FROM and the others of the Dockerfile or of `dockerfile_inline`).
+  // The images that the build uses (FROM and the others of the Dockerfile or of `dockerfile_inline`). Review round 5
+  // (S5-4): `dockerfile_inline` whatever the context.
   const text = ctx.input.dockerfiles?.[ctx.name];
-  if (text !== undefined && !remote) {
+  if (text !== undefined) {
     const args: Record<string, string> = {};
     if (isRecord(value.args)) {
       for (const [arg, setting] of Object.entries(value.args)) {

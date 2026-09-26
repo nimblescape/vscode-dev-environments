@@ -310,6 +310,15 @@ export interface RepositoryTarget {
   trusted: boolean;
 }
 
+/**
+ * Review round 5 (D5-3): configurationChanged of an environment without a build record whose containers are of another
+ * kind than the configuration that the pipeline would use: `question` asks about the switch as the pipeline asks
+ * (Messages.configurationKindChanged, or configurationKindChangedDevContainerMissing).
+ */
+export interface ConfigurationKindChange {
+  question: string;
+}
+
 export interface OperationOptions {
   progress: ProgressReporter;
   signal?: AbortSignal;
@@ -1178,19 +1187,15 @@ export class EnvironmentService {
     // than the configuration: the environment switches only when the user says so (a rebuild), never by the build of a
     // first open. Review round 4 (D4-2): also when the dev container of Docker Compose is gone but containers of its other
     // services exist; (D4-3) with a question of its own that names the switch and what it removes.
-    const containersCompose =
-      loaded && record === undefined && !ctx.forced
-        ? container !== undefined
-          ? ctx.composeContainer === true
-          : (await this.environmentContainers(ctx.env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined)
-            ? true
-            : undefined
-        : undefined;
+    const containersCompose = loaded && record === undefined && !ctx.forced ? await this.containersUseCompose(ctx.env, container) : undefined;
     if (loaded && containersCompose !== undefined && containersCompose !== (loaded.compose !== undefined)) {
       this.logger.info(
         `The containers of ${ctx.env.repository} are of another kind than the configuration ${loaded.configPath} (${loaded.compose ? 'Docker Compose' : 'a single container'}), and the environment has no build record.`,
       );
-      const answer = await this.deps.ui.configurationKindChanged(ctx.env.repository, Messages.configurationKindChanged(containersCompose, loaded.configPath));
+      // Review round 5 (P5-4): without the dev container, Later starts nothing, and the question says so.
+      const question =
+        container === undefined ? Messages.configurationKindChangedDevContainerMissing(loaded.configPath) : Messages.configurationKindChanged(containersCompose, loaded.configPath);
+      const answer = await this.deps.ui.configurationKindChanged(ctx.env.repository, question);
       this.throwIfCancelled(ctx.signal);
       if (answer === 'rebuildNow') ctx.forced = true;
       else {
@@ -3344,13 +3349,15 @@ export class EnvironmentService {
 
   /**
    * True if the configuration in the volume differs from the build record (path or configHash, concept 7.12). An
-   * environment without a build record counts as changed; a missing volume or environment as unchanged.
+   * environment without a build record counts as changed; a missing volume or environment as unchanged. Review round 5
+   * (D5-3): for an environment without a build record whose containers are of another kind than the configuration (as
+   * the pipeline tells them, containersUseCompose), a ConfigurationKindChange with the question about the switch.
    */
-  async configurationChanged(environmentId: string, options: OperationOptions): Promise<boolean> {
+  async configurationChanged(environmentId: string, options: OperationOptions): Promise<boolean | ConfigurationKindChange> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return false;
     const record = env.buildRecord;
-    if (!record) return true;
+    if (!record) return this.configurationKindChange(env, options);
     const steps = new StepReporter(options.progress, this.logger);
     try {
       await this.requireOwnAccount(env, true);
@@ -3370,6 +3377,47 @@ export class EnvironmentService {
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }
+  }
+
+  /**
+   * Review round 5 (D5-3): configurationChanged of an environment without a build record: a ConfigurationKindChange when
+   * its containers are of another kind than the configuration that the pipeline would use, else true (changed).
+   */
+  private async configurationKindChange(env: Environment, options: OperationOptions): Promise<true | ConfigurationKindChange> {
+    const steps = new StepReporter(options.progress, this.logger);
+    try {
+      await this.requireOwnAccount(env, true);
+      await this.startDocker(steps, options.signal);
+      if (!(await this.deps.docker.volumeExists(env.volumeName))) return true;
+      const container = await this.deps.docker.findContainer(env.id, env.containerName);
+      const containersCompose = await this.containersUseCompose(env, container);
+      if (containersCompose === undefined) return true;
+      const resolved = await this.resolveConfigFiles(env, env.configPath, options.signal);
+      if (!resolved) return true;
+      const configurationCompose = checkConfiguration(resolved.files.configText).compose;
+      if (containersCompose === configurationCompose) return true;
+      this.logger.info(
+        `The containers of ${env.repository} are of another kind than the configuration ${resolved.configPath}, and the environment has no build record.`,
+      );
+      return {
+        question:
+          container === undefined
+            ? Messages.configurationKindChangedDevContainerMissing(resolved.configPath)
+            : Messages.configurationKindChanged(containersCompose, resolved.configPath),
+      };
+    } catch (error) {
+      throw this.toUserError(error, options.signal);
+    }
+  }
+
+  /**
+   * Whether the containers of an environment use Docker Compose, as the pipeline tells them before a switch of the kind
+   * (review round 3, D3-2; round 4, D4-2): its dev container `container`, or else a container of another service of
+   * Docker Compose (true); `undefined` without either.
+   */
+  private async containersUseCompose(env: Environment, container: ContainerInfo | undefined): Promise<boolean | undefined> {
+    if (container !== undefined) return isComposeContainer(container.labels, composeProjectName(env.id));
+    return (await this.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
   }
 
   /**

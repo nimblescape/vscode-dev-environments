@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { extractBaseImages, extractBuilderFlags, extractImageReferences } from './dockerfile';
+import { cutAtSpace, detectSyntax, extractBaseImages, extractBuilderFlags, extractImageReferences, SHELL_NAME } from './dockerfile';
 
 describe('extractBaseImages', () => {
   it('returns the image of a single FROM', () => {
@@ -312,5 +312,71 @@ describe('pattern operators of variables (review round 4, S4-3)', () => {
 
   it('leaves the pattern operators unevaluated for extractBaseImages', () => {
     expect(extractBaseImages('ARG A=a.b\nFROM x:${A%.*}\nFROM y')).toEqual(['y']);
+  });
+});
+
+describe('review round 5 of unit 6 (S5-1, S5-3, P5-2)', () => {
+  it.each([
+    ['1env', '1'],
+    ['12x', '12'],
+    ['٣٤x', '٣٤'],
+    ['@env', '@'],
+    ['*x', '*'],
+    ['#x', '#'],
+    ['?x', '?'],
+    ['-x', '-'],
+    ['$x', '$'],
+    ['!x', '!'],
+    ['0x', '0'],
+    ['éenv-1', 'éenv'],
+    ['_a1é-x', '_a1é'],
+    ['Aé٣_b.c', 'Aé٣_b'],
+  ])('reads the name at the start of %j as BuildKit processName does (S5-1)', (text, name) => {
+    expect(SHELL_NAME.exec(text)?.[0]).toBe(name);
+  });
+
+  it('reads no name at the start of a text that starts with another character (S5-1)', () => {
+    for (const text of ['.x', '/x', '{x', '}', ':x', '%x', '']) expect(SHELL_NAME.exec(text)).toBeNull();
+  });
+
+  it('expands positional and special parameters and names of Unicode letters that are not set to the empty text (S5-1)', () => {
+    expect(extractImageReferences('FROM dev$1env$@-${2}x$$y$éa$é\\z\n').map((r) => r.reference)).toEqual(['devenv-xyz']);
+    expect(extractImageReferences('ARG é=alp\nARG 1=ine\nFROM $é${1}\n').map((r) => r.reference)).toEqual(['alpine']);
+    expect(extractBaseImages('ARG é=alpine\nFROM $é\n')).toEqual(['alpine']);
+  });
+
+  it.each([
+    ['# syntax=a/b:1\nFROM x', 'a/b:1'],
+    ['﻿# syntax=a/b:1\nFROM x', 'a/b:1'],
+    ['#!/bin/sh\n# syntax=a/b:1\nFROM x', 'a/b:1'],
+    ['#!/bin/sh\r\n# syntax=a/b:1\r\nFROM x', 'a/b:1'],
+    ['# escape=`\n# check=skip=all\n# syntax=a/b:1\nFROM x', 'a/b:1'],
+    ['// syntax=a/b:1\nFROM x', 'a/b:1'],
+    ['#!/bin/sh\n//escape=`\n//syntax = a/b:1\nFROM x', 'a/b:1'],
+    ['{"syntax": "a/b:1"}', 'a/b:1'],
+    ['#!/bin/sh\n{"x": 1, "syntax": "a/b:1 c"}\n', 'a/b:1'],
+    ['# syntax=a/b:1 # comment\nFROM x', 'a/b:1'],
+    ['# syntax=a/b:1\t# comment\nFROM x', 'a/b:1\t#'],
+  ])('finds the frontend of %j as BuildKit DetectSyntax does (S5-3, P5-2)', (text, syntax) => {
+    expect(detectSyntax(text)).toBe(syntax);
+  });
+
+  it.each([
+    'FROM x\n# syntax=a/b:1',
+    '# hello\n# syntax=a/b:1\nFROM x',
+    '#!/bin/sh\n#!/bin/sh\n# syntax=a/b:1\nFROM x',
+    '{"syntax": 1}',
+    '["syntax"]',
+    '{"syntax": "a/b:1"} x',
+    // Each form of directives starts at the first line.
+    '# escape=`\n// syntax=a/b:1\nFROM x',
+  ])('finds no frontend in %j (S5-3)', (text) => {
+    expect(detectSyntax(text)).toBeUndefined();
+  });
+
+  it('cuts a value at its first ASCII space only (P5-2)', () => {
+    expect(cutAtSpace('a b c')).toBe('a');
+    expect(cutAtSpace('a\tb')).toBe('a\tb');
+    expect(cutAtSpace('a')).toBe('a');
   });
 });

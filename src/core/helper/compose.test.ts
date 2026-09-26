@@ -610,3 +610,32 @@ describe('review round 1 of unit 6', () => {
     expect(composeInputsHash('{}', 'x', { app: 'FROM b' })).not.toBe(a);
   });
 });
+
+describe('review round 5 of unit 6 (D5-1, D5-2)', () => {
+  const up = (configPath: string | undefined) => composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7', configPath }).model;
+
+  it('labels only the dev service with the configuration path, so the other services stay the same for another configuration (D5-1)', () => {
+    const first = up('.devcontainer/devcontainer.json');
+    const second = up('.devcontainer/other/devcontainer.json');
+    expect(first.services.app.labels).toMatchObject({ 'devenv.config-path': '.devcontainer/devcontainer.json' });
+    expect(second.services.app.labels).toMatchObject({ 'devenv.config-path': '.devcontainer/other/devcontainer.json' });
+    const others = Object.keys(first.services).filter((name) => name !== 'app');
+    expect(others.length).toBeGreaterThan(0);
+    for (const name of others) {
+      expect(first.services[name].labels).not.toHaveProperty(['devenv.config-path']);
+      expect(second.services[name]).toEqual(first.services[name]);
+    }
+  });
+
+  it('labels the dev service with a folder that has a backslash or a space (D5-2)', () => {
+    for (const configPath of ['.devcontainer/a\\b/devcontainer.json', '.devcontainer/ /devcontainer.json']) {
+      expect(up(configPath).services.app.labels).toMatchObject({ 'devenv.config-path': configPath });
+    }
+  });
+
+  it('adds no label for a path that is no configuration path of the discovery (D5-2)', () => {
+    for (const configPath of ['.devcontainer/a/b/devcontainer.json', '../x/devcontainer.json', '.devcontainer/../devcontainer.json']) {
+      expect(up(configPath).services.app.labels).not.toHaveProperty(['devenv.config-path']);
+    }
+  });
+});

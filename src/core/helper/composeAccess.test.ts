@@ -86,8 +86,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['the image of another environment on Docker Hub', 'db', { image: 'docker.io/library/devenv-11111111-app' }, A('service db: image docker.io/library/devenv-11111111-app of another environment')],
     // build
     ['a build context in the repository', 'db', { build: { context: REPO, dockerfile: 'docker/Dockerfile', args: { A: '1' }, target: 'dev', network: 'host', pull: true, no_cache: true, shm_size: '1g', extra_hosts: ['a:1.2.3.4'], platforms: ['linux/amd64'], ulimits: {}, isolation: 'default' } }, NONE],
-    ['a remote build context', 'db', { build: { context: 'https://github.com/acme/tool.git#main', dockerfile: 'Dockerfile' } }, NONE],
-    ['a build context of git@', 'db', { build: { context: 'git@github.com:acme/tool.git' } }, NONE],
+    // Review round 5, S5-4: changed expectation, a remote build context is not supported yet.
+    ['a remote build context', 'db', { build: { context: 'https://github.com/acme/tool.git#main', dockerfile: 'Dockerfile' } }, U('service db: build context https://github.com/acme/tool.git#main (a remote build context is not supported yet)')],
+    // Review round 5, S5-4: changed expectation, a remote build context is not supported yet.
+    ['a build context of git@', 'db', { build: { context: 'git@github.com:acme/tool.git' } }, U('service db: build context git@github.com:acme/tool.git (a remote build context is not supported yet)')],
     ['a build context of the parent of the repository', 'db', { build: { context: '/workspaces' } }, A('service db: build context /workspaces')],
     ['a build context outside the repository', 'db', { build: { context: '/etc' } }, A('service db: build context /etc')],
     ['a build context with ..', 'db', { build: { context: `${REPO}/../other` } }, A(`service db: build context ${REPO}/../other`)],
@@ -361,5 +363,26 @@ describe('durationSeconds', () => {
     [undefined, undefined],
   ])('%j → %s', (value, seconds) => {
     expect(durationSeconds(value)).toBe(seconds);
+  });
+});
+
+describe('review round 5 of unit 6 (S5-4)', () => {
+  const REMOTE = (context: string) => `service db: build context ${context} (a remote build context is not supported yet)`;
+
+  it.each(['https://github.com/acme/tool.git#main', 'http://example.com/ctx.tar.gz', 'git@github.com:acme/tool.git', 'git://github.com/acme/tool.git', 'ssh://git@github.com/acme/tool.git', 'HTTPS://github.com/acme/tool.git'])(
+    'refuses the remote build context %s as not supported yet',
+    (context) => {
+      expect(serviceReport('db', { build: { context, dockerfile: 'Dockerfile' } })).toEqual(U(REMOTE(context)));
+      expect(composeAccessReport(input({ model: { ...model(), services: { ...model().services, db: { build: { context } } } } }), false)).toEqual(U(REMOTE(context)));
+    },
+  );
+
+  it('checks dockerfile_inline of a remote build context', () => {
+    const context = 'https://github.com/acme/tool.git';
+    const report = serviceReport('db', { build: { context, dockerfile_inline: 'FROM devenv-11111111:2' } }, { dockerfiles: { app: 'FROM alpine', db: 'FROM devenv-11111111:2' } });
+    expect(report.unsupported).toEqual([REMOTE(context)]);
+    expect(report.hostAccess).toEqual(['service db: FROM image devenv-11111111:2 of another environment']);
+    const syntax = serviceReport('db', { build: { context, dockerfile_inline: '# syntax=evil/frontend:1\nFROM alpine' } }, { dockerfiles: { app: 'FROM alpine', db: '# syntax=evil/frontend:1\nFROM alpine' } });
+    expect(syntax.hostAccess).toEqual(['service db: syntax image evil/frontend:1 (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)']);
   });
 });

@@ -44,6 +44,12 @@ export const Messages = {
       ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
       : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
   /**
+   * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts
+   * nothing then (composeDevContainerMissing).
+   */
+  configurationKindChangedDevContainerMissing: (configPath: string) =>
+    `The dev container of this Docker Compose environment is missing, and the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later starts nothing and keeps the containers of the other services. To switch later, choose Rebuild; to use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`,
+  /**
    * Review round 4 (D4-2): Later for an environment whose Docker Compose dev container is missing: nothing can start
    * without the switch, so nothing is removed and nothing starts.
    */

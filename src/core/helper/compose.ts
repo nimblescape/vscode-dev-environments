@@ -25,6 +25,7 @@ import {
   LABEL_HOST_ACCESS,
   WORKSPACES_ROOT,
   containerHostname,
+  isConfigPathLabelValue,
 } from '../names';
 import {
   isDockerNetworkMode,
@@ -621,8 +622,9 @@ export interface ComposeRewriteParams {
    */
   hostAccessChecks?: HostAccessChecks;
   /**
-   * Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path of every service
-   * (LABEL_CONFIG_PATH). Only the up model gets it.
+   * Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path (LABEL_CONFIG_PATH)
+   * of the dev service (review round 5, D5-1: not of the other services), when isConfigPathLabelValue takes it (D5-2).
+   * Only the up model gets it.
    */
   configPath?: string;
 }
@@ -712,7 +714,10 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     // every service either way (review round 2, D2-2), so that a label of an image that Compose builds or pulls during
     // `up` (not checked before) cannot make a container look unrestricted, or restricted.
     labels[LABEL_HOST_ACCESS] = checksOn ? HOST_ACCESS_CHECKED : HOST_ACCESS_UNRESTRICTED;
-    if (p.configPath !== undefined) labels[LABEL_CONFIG_PATH] = p.configPath;
+    // Review round 5: only on the dev service (D5-1: a label of the other services would change their configuration hash
+    // with each switch of the selected configuration, and Compose would create them again), and only with a path that
+    // reconcileFromVolumes takes (D5-2).
+    if (isDev && p.configPath !== undefined && isConfigPathLabelValue(p.configPath)) labels[LABEL_CONFIG_PATH] = p.configPath;
     service.labels = labels;
     // Names: the dev container has the name of the environment; the others the default names of Compose (a fixed name
     // would collide between two environments of one repository).

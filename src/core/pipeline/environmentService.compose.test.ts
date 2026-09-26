@@ -1364,13 +1364,15 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
     expect(error.detail).toContain(`The containers of Docker Compose that existed before this start were kept: the container ${PROJECT}-db-1 of the service db.`);
   });
 
-  it('labels every container that up creates with the configuration path (D4-2)', async () => {
+  it('labels the dev container that up creates with the configuration path (D4-2, D5-1)', async () => {
     // Docker Compose: the dev service and the other services.
     await h.service.open(TARGET, options());
     expect(upModel().services.app.labels).toMatchObject({ [LABEL_CONFIG_PATH]: DEFAULT_CONFIG_PATH });
-    expect(upModel().services.db.labels).toMatchObject({ [LABEL_CONFIG_PATH]: DEFAULT_CONFIG_PATH });
+    // Review round 5, D5-1: changed expectation, only the dev service carries the label.
+    expect(upModel().services.db.labels).not.toHaveProperty(LABEL_CONFIG_PATH);
     expect(devContainer()?.labels[LABEL_CONFIG_PATH]).toBe(DEFAULT_CONFIG_PATH);
-    expect(dbContainer()?.labels[LABEL_CONFIG_PATH]).toBe(DEFAULT_CONFIG_PATH);
+    // Review round 5, D5-1: changed expectation, only the dev service carries the label.
+    expect(dbContainer()?.labels[LABEL_CONFIG_PATH]).toBeUndefined();
     // A single container.
     const other = createHarness({ newEnvironmentId: () => ENV_ID });
     try {
@@ -1424,7 +1426,8 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
     useSingle();
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
-    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // Review round 5, P5-4: changed expectation, the question of its own for a missing dev container.
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChangedDevContainerMissing(DEFAULT_CONFIG_PATH)]);
     // "Later": nothing can start without the switch, and nothing is removed.
     expect(error.code).toBe('startFailed');
     expect(error.detail).toBe(Messages.composeDevContainerMissing(DEFAULT_CONFIG_PATH));
@@ -1480,4 +1483,106 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
       expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
     },
   );
+});
+
+describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
+  const OTHER_PATH = '.devcontainer/other/devcontainer.json';
+
+  it('keeps the other services as they are when the selected configuration changes between two that share the compose file (D5-1)', async () => {
+    h.helper.files = {
+      [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT },
+      [OTHER_PATH]: { configText: CONFIG_TEXT.replace('["compose.yml"]', '["../compose.yml"]') },
+    };
+    await h.service.open(TARGET, options());
+    const first = upModel();
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: OTHER_PATH });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(OTHER_PATH);
+    expect(h.helper.ups).toHaveLength(2);
+    const second = upModel();
+    expect(first.services.app.labels).toMatchObject({ [LABEL_CONFIG_PATH]: DEFAULT_CONFIG_PATH });
+    expect(second.services.app.labels).toMatchObject({ [LABEL_CONFIG_PATH]: OTHER_PATH });
+    // The labels of the db service decide its configuration hash in Docker Compose: the same, so its container stays.
+    expect(second.services.db).toEqual(first.services.db);
+    expect(second.services.db.labels).not.toHaveProperty([LABEL_CONFIG_PATH]);
+  });
+
+  it.each(['.devcontainer/a\\b/devcontainer.json', '.devcontainer/my config/devcontainer.json'])(
+    'starts a single container of the configuration %j, with the label devenv.config-path (D5-2)',
+    async (configPath) => {
+      const other = createHarness({ newEnvironmentId: () => ENV_ID });
+      try {
+        other.helper.files = { [configPath]: { configText: DEFAULT_CONFIG_TEXT } };
+        other.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+        const result = await other.service.open({ ...TARGET, configPaths: [configPath] }, { progress: other.progress });
+        expect(result.containerName).toBe(NAME);
+        expect(other.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['--label', `${LABEL_CONFIG_PATH}=${configPath}`]));
+        expect(other.docker.containersOf(ENV_ID)[0].labels[LABEL_CONFIG_PATH]).toBe(configPath);
+      } finally {
+        other.cleanup();
+      }
+    },
+  );
+
+  it('restores the configuration path of a folder with a backslash from the label (D5-2)', async () => {
+    h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'stopped', image: IMAGE_1, labels: { [LABEL_CONFIG_PATH]: '.devcontainer/a\\b/devcontainer.json' } });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe('.devcontainer/a\\b/devcontainer.json');
+  });
+
+  async function withoutRecord(): Promise<void> {
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+  }
+
+  it('reports a switch from Docker Compose to a single container in configurationChanged, with the question of the pipeline (D5-3)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await withoutRecord();
+    useSingle();
+    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH) });
+    // The pipeline asks the same question.
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+  });
+
+  it('reports a switch from a single container to Docker Compose in configurationChanged (D5-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    await withoutRecord();
+    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(false, DEFAULT_CONFIG_PATH) });
+  });
+
+  it('reports a switch when the dev container of Docker Compose is gone, with the question for it (D5-3, P5-4)', async () => {
+    await seedCompose({ dev: null, db: 'stopped' });
+    await withoutRecord();
+    useSingle();
+    const question = Messages.configurationKindChangedDevContainerMissing(DEFAULT_CONFIG_PATH);
+    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question });
+    expect(question).toContain('Later starts nothing');
+    expect(question).toContain('choose Rebuild');
+    expect(question).toContain('Select configuration…');
+    expect(question).not.toContain('Later keeps');
+    // The pipeline asks the same question; Later starts nothing.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(h.ui.kindQuestions).toEqual([question]);
+    expect(error.detail).toBe(Messages.composeDevContainerMissing(DEFAULT_CONFIG_PATH));
+  });
+
+  it('reports a change without a switch as true, as before (D5-3)', async () => {
+    // Containers of Docker Compose and a Docker Compose configuration.
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await withoutRecord();
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    // No containers: nothing to switch.
+    for (const container of h.docker.containersOf(ENV_ID)) await h.docker.removeContainer(container.id);
+    useSingle();
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+  });
+
+  it('reports a single container with a single-container configuration as changed (D5-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    await withoutRecord();
+    useSingle();
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+  });
 });
