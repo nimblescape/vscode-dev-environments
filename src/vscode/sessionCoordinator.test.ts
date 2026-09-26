@@ -11,6 +11,7 @@ import type { Logger } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, WindowStatus } from '../core/types';
+import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -220,6 +221,8 @@ describe('SessionCoordinator', () => {
   it('does not start a monitor while monitor.lock holds a live and fresh process ID', async () => {
     fs.mkdirSync(h.root, { recursive: true });
     fs.writeFileSync(h.paths.monitorLock, `${OTHER_PID}\n`);
+    // A monitor of the current version (review finding F2 of PR #26: an older one is asked to exit, see below).
+    fs.writeFileSync(path.join(h.root, 'monitor.version'), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION }));
     await h.coordinator.start(null);
     expect(h.spawns).toEqual([]);
 
@@ -227,6 +230,74 @@ describe('SessionCoordinator', () => {
     h.alive.delete(OTHER_PID);
     await h.coordinator.ensureMonitorRunning();
     expect(h.spawns).toHaveLength(1);
+  });
+
+  // Review finding F2 of PR #26: a Session Monitor of an older version (without keepRunning) keeps running as long as a
+  // window is alive, and stops kept environments. A window asks it to exit and starts the current monitor, which waits
+  // for it (monitor protocol version, monitor.version next to monitor.lock).
+  describe('a monitor of an older version', () => {
+    const signals: Array<[number, string]> = [];
+    const versionFile = (): string => path.join(h.root, 'monitor.version');
+    const exitFile = (): string => path.join(h.root, 'monitor.exit');
+    const writeLock = (ageMs: number): void => {
+      fs.mkdirSync(h.root, { recursive: true });
+      fs.writeFileSync(h.paths.monitorLock, `${OTHER_PID}\n`);
+      const time = new Date(Date.now() - ageMs);
+      fs.utimesSync(h.paths.monitorLock, time, time);
+    };
+    const exitRequestPid = (): number | undefined => {
+      try {
+        return (JSON.parse(fs.readFileSync(exitFile(), 'utf8')) as { pid: number }).pid;
+      } catch {
+        return undefined;
+      }
+    };
+    beforeEach(() => {
+      signals.length = 0;
+      h.coordinator.dispose();
+      h.coordinator = h.create({ signalProcess: (pid: number, signal: NodeJS.Signals) => void signals.push([pid, signal]) });
+    });
+
+    it('asks a monitor without a version (it knows no control file) to exit with SIGTERM, and starts the current one', async () => {
+      writeLock(3_000);
+      await h.coordinator.start(null);
+      expect(signals).toEqual([[OTHER_PID, 'SIGTERM']]);
+      expect(exitRequestPid()).toBe(OTHER_PID);
+      expect(h.spawns).toHaveLength(1);
+      expect(h.logger.lines.join('\n')).toContain(`Asked the Session Monitor (process ${OTHER_PID}) to exit`);
+    });
+
+    it('asks a monitor of an older version through the control file only, and starts the current one', async () => {
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION - 1 }));
+      await h.coordinator.start(null);
+      expect(signals).toEqual([]);
+      expect(exitRequestPid()).toBe(OTHER_PID);
+      expect(h.spawns).toHaveLength(1);
+    });
+
+    it('leaves a monitor of the current version alone', async () => {
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION }));
+      await h.coordinator.start(null);
+      expect(signals).toEqual([]);
+      expect(exitRequestPid()).toBeUndefined();
+      expect(h.spawns).toEqual([]);
+    });
+
+    it('does not count the version of another process ID, and waits for a monitor that has just taken the lock', async () => {
+      // Taken this moment: the new monitor writes its version right after the lock.
+      writeLock(0);
+      await h.coordinator.start(null);
+      expect(signals).toEqual([]);
+      expect(h.spawns).toEqual([]);
+      // The version file of an earlier monitor (another process ID) does not make this one current.
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID + 1, version: MONITOR_PROTOCOL_VERSION }));
+      await h.coordinator.ensureMonitorRunning();
+      expect(signals).toEqual([[OTHER_PID, 'SIGTERM']]);
+      expect(h.spawns).toHaveLength(1);
+    });
   });
 
   it('does not start a second monitor while the first one is still starting', async () => {

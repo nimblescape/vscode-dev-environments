@@ -12,13 +12,28 @@ import { NodeProcessRunner } from '../core/process';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import { acquireMonitorLock, refreshMonitorLock, releaseMonitorLock } from './lock';
+import {
+  acquireMonitorLock,
+  clearMonitorExitRequest,
+  readMonitorExitRequest,
+  refreshMonitorLock,
+  releaseMonitorLock,
+  waitForRetiringMonitor,
+  writeMonitorVersion,
+  MONITOR_PROTOCOL_VERSION,
+} from './lock';
 import { MonitorDockerClient } from './monitorDocker';
 import { FileLogger } from './monitorLog';
 import { MonitorLoop } from './monitorLoop';
 
 /** After SIGTERM or SIGINT, the current step gets this long before the process ends anyway. */
 const SIGNAL_GRACE_MS = 3_000;
+/**
+ * A new monitor waits this long for an older monitor that a window asked to exit (monitor.exit, review finding F2 of
+ * PR #26). The older one may be in a `docker stop` (up to 10 seconds) after a `git status` in the container. After this
+ * time the new monitor tries the lock once and ends if it is still held; the window starts another one later.
+ */
+const RETIRING_MONITOR_WAIT_MS = 60_000;
 
 /**
  * Runs the Session Monitor for the storage folder `argv[2]`. Resolves with the exit code: 0 when it ended normally or
@@ -33,6 +48,10 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
 
   const paths = new StoragePaths(root);
   const logger = new FileLogger(paths.monitorLog);
+  // A window asked an older monitor to exit and started this one: it finishes its current step first.
+  if (!(await waitForRetiringMonitor(paths.monitorLock, paths.monitorExit, { timeoutMs: RETIRING_MONITOR_WAIT_MS }))) {
+    logger.info('The older Session Monitor did not end in time.');
+  }
   let acquired: boolean;
   try {
     acquired = acquireMonitorLock(paths.monitorLock);
@@ -41,17 +60,41 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
     return 1;
   }
   if (!acquired) return 0;
+  try {
+    // Right after the lock: a window that finds the lock without the version of its process ID asks it to exit.
+    writeMonitorVersion(paths.monitorVersion);
+  } catch (error) {
+    logger.error('The version file of the Session Monitor could not be written.', error);
+    releaseMonitorLock(paths.monitorLock);
+    return 1;
+  }
+  // The request named the older monitor, which has ended.
+  clearMonitorExitRequest(paths.monitorExit);
 
   const release = (): void => releaseMonitorLock(paths.monitorLock);
   process.once('exit', release);
-  logger.info(`Session Monitor started (Node.js ${process.version}, ${process.platform}).`);
+  logger.info(
+    `Session Monitor started (protocol version ${MONITOR_PROTOCOL_VERSION}, Node.js ${process.version}, ${process.platform}).`,
+  );
 
-  const loop = new MonitorLoop({
+  let exitRequested = false;
+  // Checked in every tick (refreshLock): a window of a newer version asks this monitor to exit. It ends after its
+  // current step, so a `docker stop` that has started is finished; it keeps the lock until then.
+  const checkExitRequest = (): void => {
+    if (exitRequested || readMonitorExitRequest(paths.monitorExit) !== process.pid) return;
+    exitRequested = true;
+    logger.info('A window of a newer version asked this Session Monitor to exit.');
+    loop.stop();
+  };
+  const loop: MonitorLoop = new MonitorLoop({
     registry: new EnvironmentRegistry(paths, undefined, { logger }),
     sessionFiles: new SessionFiles(paths),
     docker: new MonitorDockerClient({ runner: new NodeProcessRunner(), env: process.env, platform: process.platform, logger }),
     logger,
-    refreshLock: () => refreshMonitorLock(paths.monitorLock),
+    refreshLock: () => {
+      checkExitRequest();
+      return refreshMonitorLock(paths.monitorLock);
+    },
   });
 
   const onSignal = (signal: NodeJS.Signals): void => {

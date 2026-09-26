@@ -183,8 +183,8 @@ export const StateTexts = {
   /** The marker of a repository whose host access checks are off (concept section 9 "Host access"). */
   hostAccessUnrestricted: 'host access unrestricted',
   /**
-   * The suffix of the state text of a kept environment whose container runs, for example `Running · kept` (Keep Running
-   * When Closed; user decision 2026-09-26, "go with the proposal for closing").
+   * The suffix of the state text of a kept environment whose container runs or is stopped, for example `Running · kept`
+   * or `Stopped · kept` (Keep Running When Closed; user decision 2026-09-26, "go with the proposal for closing").
    */
   kept: 'kept',
 } as const;

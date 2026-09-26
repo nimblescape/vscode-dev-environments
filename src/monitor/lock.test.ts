@@ -9,12 +9,20 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acquireMonitorLock,
+  clearMonitorExitRequest,
   isMonitorRunning,
   isProcessAlive,
   MONITOR_LOCK_STALE_MS,
+  MONITOR_PROTOCOL_VERSION,
+  readMonitorExitRequest,
   readMonitorLockPid,
+  readMonitorVersion,
   refreshMonitorLock,
   releaseMonitorLock,
+  requestMonitorExit,
+  runningMonitor,
+  waitForRetiringMonitor,
+  writeMonitorVersion,
 } from './lock';
 
 const alive = () => true;
@@ -187,5 +195,94 @@ describe('monitor lock', () => {
     setAge(lockFile, MONITOR_LOCK_STALE_MS + 10_000);
     expect(isMonitorRunning(lockFile, alive)).toBe(false);
     expect(isMonitorRunning(lockFile, alive, { staleMs: MONITOR_LOCK_STALE_MS * 2 })).toBe(true);
+  });
+});
+
+// Review finding F2 of PR #26: a monitor of an older version is asked to exit, and the current one takes over.
+describe('monitor protocol version and exit request', () => {
+  let dir: string;
+  let lockFile: string;
+  let versionFile: string;
+  let exitFile: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
+    lockFile = path.join(dir, 'monitor.lock');
+    versionFile = path.join(dir, 'monitor.version');
+    exitFile = path.join(dir, 'monitor.exit');
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is version 2 since Keep Running When Closed (version 1 wrote no version file)', () => {
+    expect(MONITOR_PROTOCOL_VERSION).toBe(2);
+  });
+
+  it('writes and reads the version of a process ID, atomically and next to the lock', () => {
+    writeMonitorVersion(versionFile, 1111);
+    expect(JSON.parse(fs.readFileSync(versionFile, 'utf8'))).toEqual({ pid: 1111, version: MONITOR_PROTOCOL_VERSION });
+    expect(readMonitorVersion(versionFile, 1111)).toBe(MONITOR_PROTOCOL_VERSION);
+    // The version of another process (an earlier monitor) is not the version of this one.
+    expect(readMonitorVersion(versionFile, 2222)).toBeUndefined();
+    writeMonitorVersion(versionFile, 2222, 7);
+    expect(readMonitorVersion(versionFile, 2222)).toBe(7);
+    expect(fs.readdirSync(dir)).toEqual(['monitor.version']);
+  });
+
+  it('reads no version for a missing or invalid file', () => {
+    expect(readMonitorVersion(versionFile, 1111)).toBeUndefined();
+    for (const text of ['', '2', 'null', '[]', '{"pid":1111}', '{"pid":1111,"version":"2"}', '{"pid":1111,"version":0}']) {
+      fs.writeFileSync(versionFile, text);
+      expect(readMonitorVersion(versionFile, 1111)).toBeUndefined();
+    }
+  });
+
+  it('writes, reads, and clears an exit request; a monitor keeps the request that names itself', () => {
+    expect(readMonitorExitRequest(exitFile)).toBeUndefined();
+    requestMonitorExit(exitFile, 1111, new Date('2026-09-26T10:00:00.000Z'));
+    expect(JSON.parse(fs.readFileSync(exitFile, 'utf8'))).toEqual({ pid: 1111, requestedAt: '2026-09-26T10:00:00.000Z' });
+    expect(readMonitorExitRequest(exitFile)).toBe(1111);
+    clearMonitorExitRequest(exitFile, 1111);
+    expect(readMonitorExitRequest(exitFile)).toBe(1111);
+    clearMonitorExitRequest(exitFile, 2222);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    fs.writeFileSync(exitFile, '{"pid":-1}');
+    expect(readMonitorExitRequest(exitFile)).toBeUndefined();
+  });
+
+  it('gives the running monitor with its process ID and the age of its lock', () => {
+    expect(runningMonitor(lockFile, alive)).toBeUndefined();
+    expect(acquireMonitorLock(lockFile, 1111, alive)).toBe(true);
+    setAge(lockFile, 3_000);
+    const monitor = runningMonitor(lockFile, alive);
+    expect(monitor?.pid).toBe(1111);
+    expect(monitor?.lockAgeMs).toBeGreaterThanOrEqual(2_900);
+    expect(runningMonitor(lockFile, dead)).toBeUndefined();
+    // A lock without a valid process ID yet is not a running monitor with a process ID.
+    fs.writeFileSync(lockFile, '');
+    expect(runningMonitor(lockFile, alive)).toBeUndefined();
+  });
+
+  it('waits for a monitor that was asked to exit, until it has released the lock', async () => {
+    expect(acquireMonitorLock(lockFile, 1111, alive)).toBe(true);
+    requestMonitorExit(exitFile, 1111);
+    const waiting = waitForRetiringMonitor(lockFile, exitFile, { timeoutMs: 5_000, pollMs: 10, isAlive: alive });
+    let done = false;
+    void waiting.then(() => (done = true));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(done).toBe(false);
+    releaseMonitorLock(lockFile, 1111);
+    expect(await waiting).toBe(true);
+  });
+
+  it('does not wait for a monitor that nobody asked to exit, and gives up after the timeout', async () => {
+    expect(acquireMonitorLock(lockFile, 1111, alive)).toBe(true);
+    expect(await waitForRetiringMonitor(lockFile, exitFile, { timeoutMs: 5_000, pollMs: 10, isAlive: alive })).toBe(true);
+    requestMonitorExit(exitFile, 2222);
+    expect(await waitForRetiringMonitor(lockFile, exitFile, { timeoutMs: 5_000, pollMs: 10, isAlive: alive })).toBe(true);
+    requestMonitorExit(exitFile, 1111);
+    expect(await waitForRetiringMonitor(lockFile, exitFile, { timeoutMs: 50, pollMs: 10, isAlive: alive })).toBe(false);
   });
 });

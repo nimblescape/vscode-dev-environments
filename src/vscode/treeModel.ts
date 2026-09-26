@@ -238,11 +238,12 @@ export function stateText(state: EnvironmentState): string {
 /**
  * State text of a row: the text of the state, with the suffix ` · kept` for a kept environment (Keep Running When
  * Closed) while its container runs, for example `Running · kept` or `Connected · kept` (user decision 2026-09-26, "go
- * with the proposal for closing"). A tree item has one icon only, so the icon stays the one of the state, and the text
- * marks the kept environment.
+ * with the proposal for closing"), and while it is stopped, `Stopped · kept` (review finding F4 of PR #26: the user
+ * sees that the next start keeps it running). A tree item has one icon only, so the icon stays the one of the state,
+ * and the text marks the kept environment.
  */
 export function rowStateText(state: EnvironmentState, kept: boolean): string {
-  return kept && containerRuns(state) ? `${stateText(state)} · ${StateTexts.kept}` : stateText(state);
+  return kept && (containerRuns(state) || state === 'stopped') ? `${stateText(state)} · ${StateTexts.kept}` : stateText(state);
 }
 
 type StateInput = Pick<TreeInput, 'runtime' | 'currentEnvironmentId' | 'otherWindowEnvironmentIds' | 'busyEnvironmentIds'>;

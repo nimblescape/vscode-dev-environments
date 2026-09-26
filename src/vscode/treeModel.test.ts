@@ -1313,12 +1313,36 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(rowStateText('running', true)).toBe('Running · kept');
     expect(rowStateText('connected', true)).toBe('Connected · kept');
     expect(rowStateText('connectedOtherWindow', true)).toBe('Connected · other window · kept');
-    for (const state of ['stopped', 'updating', 'noContainer', 'filesMissing'] as EnvironmentState[]) {
+    // Review finding F4 of PR #26: also "Stopped · kept" (below); the other states without a container that runs show
+    // no suffix.
+    for (const state of ['updating', 'noContainer', 'filesMissing'] as EnvironmentState[]) {
       expect(rowStateText(state, true)).toBe(stateText(state));
     }
     for (const state of ['running', 'connected', 'connectedOtherWindow', 'stopped'] as EnvironmentState[]) {
       expect(rowStateText(state, false)).toBe(stateText(state));
     }
+  });
+
+  // Review finding F4 of PR #26: concept 6.2 says the row shows `kept` also while the environment is stopped; the state
+  // text says so, clearer than the tooltip alone.
+  it('shows "Stopped · kept" for a stopped kept environment, with the grey stopped icon', () => {
+    expect(rowStateText('stopped', true)).toBe('Stopped · kept');
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web')]),
+        environments: [environment('e1', 'acme/api', { keepRunning: true }), environment('e2', 'acme/web')],
+        runtime: new Map<string, EnvironmentRuntime>([
+          ['e1', { container: 'stopped', volume: true }],
+          ['e2', { container: 'stopped', volume: true }],
+        ]),
+      }),
+    );
+    const api = row(groups, 'acme/api');
+    expect(api.state).toBe('stopped');
+    expect(api.description).toBe('main   Stopped · kept');
+    expect(api.tooltip.split('\n')).toEqual(expect.arrayContaining(['Stopped · kept', TreeTexts.kept]));
+    expect(stateIcon(api.state!)).toEqual(stateIcon('stopped'));
+    expect(row(groups, 'acme/web').description).toBe('main   Stopped');
   });
 
   it('shows "Running · kept", keeps the running icon, and offers Stop When Closed instead of Keep Running When Closed', () => {
@@ -1347,7 +1371,7 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(flags(web.contextValue)).not.toContain('kept');
   });
 
-  it('shows "Connected · kept" in this window, and a stopped kept environment as "Stopped" with the tooltip line', () => {
+  it('shows "Connected · kept" in this window, and a stopped kept environment as "Stopped · kept" with the tooltip line', () => {
     const groups = buildTreeModel(
       input({
         discovery: discovery([repo('acme/api'), repo('acme/web')]),
@@ -1361,8 +1385,9 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     );
     expect(row(groups, 'acme/api').description).toBe('main   Connected · kept');
     const web = row(groups, 'acme/web');
-    // Stop keeps the flag: the row still offers Stop When Closed.
-    expect(web.description).toBe('main   Stopped');
+    // Stop keeps the flag: the row still offers Stop When Closed. Since review finding F4 of PR #26 the state text shows
+    // it too ("Stopped · kept", as concept 6.2 says), not only the tooltip.
+    expect(web.description).toBe('main   Stopped · kept');
     expect(web.tooltip.split('\n')).toContain(TreeTexts.kept);
     expect(flags(web.contextValue)).toContain('kept');
   });

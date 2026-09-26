@@ -246,6 +246,8 @@ interface Harness {
   progressTitles: string[];
   alive: Set<number>;
   settings: ExtensionSettings;
+  /** The clock of the controller, the registry and the session files; a test may replace `now`. */
+  clock: { now: () => number };
 }
 
 function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number; disconnectAnswerMs?: number } = {}): Harness {
@@ -418,6 +420,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     progressTitles,
     alive,
     settings,
+    clock,
   };
 }
 
@@ -1684,6 +1687,41 @@ describe('Window roles', () => {
     await h.controller.runEmptyWindowTasks();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 6_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+  });
+
+  // Review finding F1: the age of the reopen record is measured at activation, not after the awaits (ready, the stale
+  // claims, the operations, the GitHub account) and the pause of REOPEN_CHECK_DELAY_MS. Otherwise a Close Remote
+  // Connection whose empty window activates 3 seconds later is checked at about 6 seconds and reconnects.
+  it('role B: measures the age of the reopen record at activation, not after the awaits and the pause', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    let now = NOW;
+    h.clock.now = () => now;
+    const advancing = (): void => {
+      // The status file (ready), the GitHub account, and the pause before the check each take time.
+      h.controller.setReady(Promise.resolve().then(() => (now += 500)));
+      h.auth.getAccount.mockImplementationOnce(async () => {
+        now += 1_000;
+        return ACCOUNT;
+      });
+      h.coordinator.otherActiveWindows.mockImplementationOnce(async () => {
+        now += 1_500;
+        return [];
+      });
+    };
+
+    // 3 seconds old at activation (Close Remote Connection), 6 seconds old at the check: no reopen.
+    advancing();
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 3_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(now - Date.parse((await h.sessionFiles.readReopen())!.closedAt)).toBe(6_000);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+
+    // 6 seconds old at activation: a reopen.
+    advancing();
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 6_000) });
     await h.controller.runEmptyWindowTasks();
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });

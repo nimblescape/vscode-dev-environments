@@ -454,8 +454,14 @@ export class Controller implements vscode.Disposable {
   /**
    * Role B: an empty window. First the pending operations that a window left when it closed its remote connection
    * (concept 7.14), oldest first; then the reopen rule (concept 7.10 #2, decision D-5 option a).
+   *
+   * `activatedAt`: the time at which the window's activation began (`activate()` passes it), taken before any await.
+   * The age of the reopen record is measured at this time, not at the check: the awaits (the window status, the stale
+   * claims, the operations, the GitHub account) and the pause of REOPEN_CHECK_DELAY_MS take several seconds, and a Close
+   * Remote Connection whose empty window activates 2 to 3 seconds later must still count as younger than
+   * REOPEN_MIN_AGE_MS (review finding F1 of PR #26).
    */
-  async runEmptyWindowTasks(): Promise<void> {
+  async runEmptyWindowTasks(activatedAt: number = this.clock.now()): Promise<void> {
     await this.ready;
     const { sessionFiles, coordinator, registry, connection } = this.deps;
     await sessionFiles
@@ -505,7 +511,8 @@ export class Controller implements vscode.Disposable {
       record,
       // Concept 7.5: only an environment of the signed-in account is opened again.
       environmentIds: new Set(availableEnvironments(environments, account).map((environment) => environment.id)),
-      now: this.clock.now(),
+      // The age of the record at activation (see `activatedAt`), not after the awaits and the pause.
+      now: activatedAt,
       development: this.deps.development,
     });
     if (!decision.reopen) {
