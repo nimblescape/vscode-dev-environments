@@ -6,6 +6,7 @@
 import * as crypto from 'crypto';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
+import { composeMountVolumeName } from '../helper/compose';
 import { runArgsUser } from '../helper/hostAccess';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessChecks } from '../hostAccessChecks';
@@ -13,11 +14,12 @@ import {
   CONTAINER_CONFIG_UNKNOWN,
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
+  LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_CONFIG,
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
 } from '../names';
-import type { DevcontainerResult, RefusedUpdate } from '../types';
+import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, RefusedUpdate } from '../types';
 
 export type { RefusedUpdate };
 
@@ -387,4 +389,93 @@ export function stringList(value: unknown): string[] | undefined {
 /** A non-empty string, otherwise `undefined`. */
 export function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Docker Compose (implementation notes, section "Docker Compose")
+
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+
+/** BuildRecord.compose, when it is valid: the build record of a Docker Compose configuration. */
+export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRecord | undefined {
+  const value: unknown = record?.compose;
+  if (!isRecord(value) || typeof value.service !== 'string' || value.service === '') return undefined;
+  if (!Array.isArray(value.images) || !value.images.every((image) => typeof image === 'string')) return undefined;
+  const serviceImages = Array.isArray(value.serviceImages) && value.serviceImages.every((image) => typeof image === 'string') ? [...value.serviceImages] : undefined;
+  return {
+    service: value.service,
+    images: [...value.images],
+    ...(serviceImages !== undefined ? { serviceImages } : {}),
+    ...(typeof value.version === 'string' ? { version: value.version } : {}),
+    ...(typeof value.inputsHash === 'string' ? { inputsHash: value.inputsHash } : {}),
+  };
+}
+
+/**
+ * Whether the Docker Compose configuration changed since the build of `record` (review round 1, P-4), from the model
+ * hash (composeConfigHash, `configHash`), the hash of the files as written (composeInputsHash), and the version of the
+ * Compose plugin that printed the model:
+ * - `changed`: the files differ, or they are equal and the same Compose version printed another model (for example a
+ *   value of the environment of the helper that the model uses);
+ * - `rebaseline`: only the Compose version and with it the printed model differ: no change for the user; the record
+ *   takes the new model hash and version;
+ * - `unchanged`: otherwise.
+ * A record without the hash of the files or the version (written before) compares the model hash alone.
+ */
+export function composeConfigurationChange(
+  record: Pick<BuildRecord, 'configHash' | 'compose'>,
+  current: { configHash: string; inputsHash: string; version: string },
+): 'changed' | 'unchanged' | 'rebaseline' {
+  const compose = composeRecordOf(record as BuildRecord);
+  if (compose?.inputsHash === undefined || compose.version === undefined) return record.configHash === current.configHash ? 'unchanged' : 'changed';
+  if (compose.inputsHash !== current.inputsHash) return 'changed';
+  if (record.configHash === current.configHash) return compose.version === current.version ? 'unchanged' : 'rebaseline';
+  return compose.version === current.version ? 'changed' : 'rebaseline';
+}
+
+/**
+ * A container that Docker Compose created for the project `project` (the dev container or another service): the label
+ * of the project together with a label that Compose puts only on containers, never on images (the number of the
+ * container, or the hash of its configuration). Review round 2 (D2-4): the label of the project alone can come from the
+ * image (a single container created from an image that Compose built for the project).
+ */
+export function isComposeContainer(labels: Readonly<Record<string, string>>, project: string): boolean {
+  return labels[COMPOSE_PROJECT_LABEL] === project && (labels[COMPOSE_CONTAINER_NUMBER_LABEL] !== undefined || labels[COMPOSE_CONFIG_HASH_LABEL] !== undefined);
+}
+
+/** Labels that Docker Compose puts on the containers that it creates (not on images): isComposeContainer. */
+export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-number';
+export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
+
+/**
+ * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the
+ * other services (label devenv.compose-service) first and the dev container last, so that a database runs before the
+ * lifecycle commands of the dev container need it; `stop` the reverse (the dev container first, D-20).
+ */
+export function composeContainerOrder<T extends { labels: Readonly<Record<string, string>> }>(containers: readonly T[], order: 'start' | 'stop'): T[] {
+  const services = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
+  const dev = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
+  return order === 'start' ? [...services, ...dev] : [...dev, ...services];
+}
+
+/**
+ * The named volumes of the `mounts` of devcontainer.json, of the merged configuration, and of the image metadata in a
+ * Docker Compose configuration (each argument is one `mounts` value: a list, or a single mount). The Dev Container CLI
+ * puts them into the project (`<project>_<source>`, composeMountVolumeName), unless the mount says `external`:
+ * - `names`: their Docker names, which the pipeline creates before `up` with the labels of the environment;
+ * - `sources`: the sources of the project volumes, which our model declares as external volumes (mountVolumeSources).
+ */
+export function composeMountVolumes(project: string, mounts: readonly unknown[]): { names: string[]; sources: string[] } {
+  const names = new Set<string>();
+  const sources = new Set<string>();
+  for (const value of mounts) {
+    for (const mount of Array.isArray(value) ? value : value === undefined || value === null ? [] : [value]) {
+      const name = composeMountVolumeName(project, mount);
+      if (name === undefined) continue;
+      names.add(name);
+      if (name.startsWith(`${project}_`) && !(isRecord(mount) && mount.external === true)) sources.add(name.slice(project.length + 1));
+    }
+  }
+  return { names: [...names], sources: [...sources] };
 }

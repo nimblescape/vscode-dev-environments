@@ -14,7 +14,7 @@ import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { CommandError, UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
-import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
+import type { ConfigurationKindChange, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -201,11 +201,13 @@ interface Harness {
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     switchBranch: ReturnType<typeof vi.fn<(id: string, branch: string, options: OperationOptions) => Promise<void>>>;
-    configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean>>>;
+    configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean | ConfigurationKindChange>>>;
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
+    removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
+    possibleServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
@@ -230,7 +232,7 @@ interface Harness {
   claims: { claim: ReturnType<typeof vi.fn> };
   dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
-  ui: { configurationChanged: ReturnType<typeof vi.fn> };
+  ui: { configurationChanged: ReturnType<typeof vi.fn>; configurationKindChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
     infos: Map<string, RepositoryInfo>;
@@ -283,6 +285,10 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     reconcileFromVolumes: vi.fn(async () => 0),
     // By default, Delete could remove every recorded volume (their labels make them the environment's own).
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
+    // No volumes of a Docker Compose project, unless a test gives them (D-19).
+    removableServiceDataVolumes: vi.fn(async () => []),
+    // Review round 3 (P3-4): none of an environment whose services are not known, unless a test gives them.
+    possibleServiceDataVolumes: vi.fn(async () => []),
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
@@ -316,7 +322,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     installWsl: vi.fn(async () => {}),
   };
   const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
-  const ui = { configurationChanged: vi.fn(async () => 'later') };
+  const ui = { configurationChanged: vi.fn(async () => 'later'), configurationKindChanged: vi.fn(async () => 'later') };
   const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
   const infos = new Map<string, RepositoryInfo>();
   const sidebar = {
@@ -1077,6 +1083,69 @@ describe('Delete', () => {
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
+  // Unit 6, D-19: the volumes of a Docker Compose project (the data of its services) are asked about apart, none ticked.
+  describe('the data of the services of a Docker Compose environment', () => {
+    const DATA = ['devenv-3f2a9c1e_pgdata', 'devenv-3f2a9c1e_cache'];
+
+    async function deleteWithServiceData(pick: (items: Array<{ label: string; picked?: boolean }>) => unknown): Promise<void> {
+      await h.registry.add(environment({ additionalVolumes: ['api-db', ...DATA] }));
+      h.service.removableAdditionalVolumes.mockResolvedValueOnce(['api-db']);
+      h.service.removableServiceDataVolumes.mockResolvedValueOnce([...DATA]);
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete).mockResolvedValueOnce(Actions.remove);
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; picked?: boolean }>) => pick(items));
+      await run('delete', row('acme/api', environment()));
+    }
+
+    it('lists them with nothing ticked and keeps them when none is ticked', async () => {
+      await deleteWithServiceData((items) => {
+        expect(items.map((item) => item.label)).toEqual(DATA);
+        expect(items.every((item) => item.picked === false)).toBe(true);
+        return [];
+      });
+      expect(fakeVscode.window.showQuickPick).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ canPickMany: true, title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder }),
+      );
+      expect(h.service.removableServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    });
+
+    it('names the volumes of an environment whose services are not known as possible data (review round 3, P3-4)', async () => {
+      h.service.possibleServiceDataVolumes.mockResolvedValueOnce([DATA[1]]);
+      await deleteWithServiceData((items) => {
+        expect(items).toEqual([
+          { label: DATA[0], description: Messages.deleteServiceDataItem, picked: false },
+          { label: DATA[1], description: Messages.deleteServiceDataPossibleItem, picked: false },
+        ]);
+        return [];
+      });
+      expect(fakeVscode.window.showQuickPick).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ placeHolder: Messages.deleteServiceDataPossiblePlaceholder }),
+      );
+      expect(h.service.possibleServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    });
+
+    it('removes the ticked ones', async () => {
+      await deleteWithServiceData((items) => [items[0]]);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db', DATA[0]] }));
+    });
+
+    it('cancels the Delete on Escape', async () => {
+      await deleteWithServiceData(() => undefined);
+      expect(h.service.delete).not.toHaveBeenCalled();
+    });
+
+    it('asks nothing when the environment has none', async () => {
+      await h.registry.add(environment());
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+      await run('delete', row('acme/api', environment()));
+      expect(fakeVscode.window.showQuickPick).not.toHaveBeenCalled();
+      expect(h.service.delete).toHaveBeenCalled();
+    });
+  });
+
   it('opens the environment instead when the user selects Open environment', async () => {
     await h.registry.add(environment());
     h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) });
@@ -1336,6 +1405,30 @@ describe('Switch branch…', () => {
     expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', 'feature-x');
   });
 
+  it.each(['rebuildNow', 'later'] as const)(
+    'asks about a switch between Docker Compose and a single container as the pipeline asks, and hands off the rebuild on Rebuild now (review round 5, D5-3, %s)',
+    async (answer) => {
+      const env = environment();
+      await h.registry.add(env);
+      await connectHere(env);
+      h.service.configurationChanged.mockResolvedValue({ question: 'the kind question' });
+      h.ui.configurationKindChanged.mockResolvedValue(answer);
+      const command = run('switchBranch', row('acme/api', env));
+      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+      h.quickPicks[0].pick('feature-x');
+      await command;
+      expect(h.ui.configurationKindChanged).toHaveBeenCalledWith('acme/api', 'the kind question');
+      expect(h.ui.configurationChanged).not.toHaveBeenCalled();
+      if (answer === 'rebuildNow') {
+        expect(await h.sessionFiles.readOperations()).toEqual([expect.objectContaining({ operation: 'rebuild', reason: 'configChanged' })]);
+        expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
+      } else {
+        expect(await h.sessionFiles.readOperations()).toEqual([]);
+        expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it('creates the environment on a typed branch when the repository has none', async () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
     const command = run('switchBranch', row('acme/api'));
@@ -1524,7 +1617,8 @@ describe('Window roles', () => {
       h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError(code, message));
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
       await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
-      expect(h.docker.findContainer).toHaveBeenCalledWith(ENV_ID);
+      // Review round 1 (D2): the lookup gets the name of the environment too.
+      expect(h.docker.findContainer).toHaveBeenCalledWith(ENV_ID, env.containerName);
       expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
       expect(h.statusBar.showNotConnected).toHaveBeenCalled();
       expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();

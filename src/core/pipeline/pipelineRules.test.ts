@@ -7,6 +7,10 @@ import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
 import {
   baseImageKey,
+  composeContainerOrder,
+  composeMountVolumes,
+  composeConfigurationChange,
+  composeRecordOf,
   configHash,
   containerIsCurrent,
   digestReference,
@@ -15,6 +19,7 @@ import {
   containerUserName,
   imageRemoteUser,
   imagesToPull,
+  isComposeContainer,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -444,5 +449,72 @@ describe('isGitHubTokenRejected', () => {
     "error: pathspec 'feature' did not match any file(s) known to git",
   ])('not a rejected token: %s', (text) => {
     expect(isGitHubTokenRejected(text)).toBe(false);
+  });
+});
+
+describe('Docker Compose rules (unit 6)', () => {
+  const record = { builtAt: '', environmentImage: 'devenv-3f2a9c1e:1', buildNumber: 1, configPath: 'c', configHash: 'h', images: {}, features: {} };
+
+  it.each([
+    ['no compose part', undefined, undefined],
+    ['a valid part', { service: 'app', images: ['devenv-3f2a9c1e-app'] }, { service: 'app', images: ['devenv-3f2a9c1e-app'] }],
+    ['an empty service', { service: '', images: [] }, undefined],
+    ['images that are no list of texts', { service: 'app', images: [1] }, undefined],
+    ['no object', 'app', undefined],
+  ])('composeRecordOf: %s', (_name, compose, expected) => {
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(expected);
+  });
+
+  it('composeRecordOf keeps the service images, the Compose version, and the hash of the files (review round 1, D5, P-4)', () => {
+    const compose = { service: 'app', images: [], serviceImages: ['postgres:16'], version: '2.40.3', inputsHash: 'sha256:x' };
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(compose);
+    expect(composeRecordOf({ ...record, compose: { ...compose, serviceImages: [1], version: 2 } } as never)).toEqual({ service: 'app', images: [], inputsHash: 'sha256:x' });
+  });
+
+  it.each<[string, Record<string, unknown> | undefined, { configHash: string; inputsHash: string; version: string }, string]>([
+    ['the same model, files, and version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.40' }, 'unchanged'],
+    ['other files', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'g', version: '2.40' }, 'changed'],
+    ['other files and another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'g', version: '2.41' }, 'changed'],
+    ['the same files, another model of the same version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.40' }, 'changed'],
+    ['the same files, another model of another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['the same files and model, another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['an older record: the model hash alone', {}, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+    ['an older record with the same model', {}, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'unchanged'],
+    ['no compose part', undefined, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+  ])('composeConfigurationChange: %s (review round 1, P-4)', (_name, compose, current, expected) => {
+    const withCompose = compose === undefined ? record : { ...record, compose: { service: 'app', images: [], ...compose } };
+    expect(composeConfigurationChange(withCompose as never, current)).toBe(expected);
+  });
+
+  it('isComposeContainer: only a container of the project of the environment', () => {
+    // Review round 2 (D2-4): changed input, a container of Compose also has a label that only containers have.
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.config-hash': 'x' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'api_devcontainer', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(false);
+    expect(isComposeContainer({}, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('isComposeContainer: not by the labels that an image of the project gave a single container (review round 2, D2-4)', () => {
+    const fromImage = { 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(isComposeContainer(fromImage, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('composeContainerOrder: the services start first and stop last', () => {
+    const dev = { id: 'dev', labels: {} };
+    const db = { id: 'db', labels: { 'devenv.compose-service': 'db' } };
+    const cache = { id: 'cache', labels: { 'devenv.compose-service': 'cache' } };
+    expect(composeContainerOrder([dev, db, cache], 'start').map((c) => c.id)).toEqual(['db', 'cache', 'dev']);
+    expect(composeContainerOrder([db, dev, cache], 'stop').map((c) => c.id)).toEqual(['dev', 'db', 'cache']);
+  });
+
+  it('composeMountVolumes: named volumes of mounts become volumes of the project, unless external', () => {
+    expect(
+      composeMountVolumes('devenv-3f2a9c1e', [
+        ['source=cache,target=/cache,type=volume', 'source=/tmp,target=/tmp,type=bind', 'type=tmpfs,target=/run'],
+        { source: 'shared', target: '/shared', type: 'volume', external: true },
+        undefined,
+        [{ source: 'cache', target: '/other', type: 'volume' }],
+      ]),
+    ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'] });
   });
 });

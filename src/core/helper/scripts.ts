@@ -23,8 +23,18 @@ export { GIT_SUMMARY_SCRIPT };
 export const SECRETS_FOLDER = '/run/devenv-secrets';
 /** File of the token in SECRETS_FOLDER. */
 export const TOKEN_FILE = `${SECRETS_FOLDER}/github-token`;
-/** Path of the override configuration of `devcontainer up` inside the helper (each helper run is a new container). */
-export const OVERRIDE_CONFIG_PATH = '/tmp/devenv-override/devcontainer.json';
+/**
+ * Folder of the files that the extension writes into a helper run for the Dev Container CLI (the override configuration,
+ * and for Docker Compose our model): only in the helper, never in the repository (each helper run is a new container).
+ */
+export const OVERRIDE_FOLDER = '/tmp/devenv-override';
+/**
+ * Age after which WRITE_AND_RUN_SCRIPT removes a compose file that the Dev Container CLI generated in the cache volume
+ * (30 days, limit L-5 of the implementation notes, section "Docker Compose").
+ */
+export const COMPOSE_FILES_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Path of the override configuration of `devcontainer up` inside the helper. */
+export const OVERRIDE_CONFIG_PATH = `${OVERRIDE_FOLDER}/devcontainer.json`;
 
 /**
  * Git credential helper (a shell function, run by Git with `sh -c`). It answers only `get` requests for
@@ -380,11 +390,75 @@ process.stdout.write(JSON.stringify(found) + '\n');
 `;
 
 /**
- * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it.
+ * The function `missingInRepository(file)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they define `fs`, `path`,
+ * `root`, `inside`, and `realPath`): whether a path of the repository does not exist, as a plain error of the
+ * configuration (review round 3, P3-1). Review round 4 (P4-1): a link that leads nowhere counts too when its chain stays
+ * in the repository: each link is read with readlink and its target resolved against the real folder of the link, at
+ * most 32 links; every step must stay in the repository (so never a folder of the workspace helper), and the last path
+ * must not exist while the nearest folder above it that exists is in the repository after links. A link out of the
+ * repository, a chain in a circle or longer than the limit, and a path that exists for the system (stat) are no missing
+ * path: the check refuses them.
+ */
+const MISSING_IN_REPOSITORY = String.raw`const missingInRepository = (file) => {
+  if (!inside(file)) return false;
+  const rootReal = realPath(root);
+  if (rootReal === null) return false;
+  const inRepository = (candidate) => inside(candidate) || candidate === rootReal || candidate.startsWith(rootReal + '/');
+  const absent = (candidate) => {
+    try {
+      fs.lstatSync(candidate);
+      return false;
+    } catch (error) {
+      return Boolean(error) && ['ENOENT', 'ENOTDIR'].includes(error.code);
+    }
+  };
+  // The system follows the links physically: a path that exists for it is not missing, whatever its chain says.
+  try {
+    fs.statSync(file);
+    return false;
+  } catch (error) {
+    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+  }
+  let current = file;
+  const seen = new Set();
+  for (let hop = 0; hop <= 32; hop++) {
+    if (!inRepository(current) || seen.has(current)) return false;
+    seen.add(current);
+    if (absent(current)) {
+      for (let folder = path.posix.dirname(current); inRepository(folder); folder = path.posix.dirname(folder)) {
+        if (absent(folder)) continue;
+        const real = realPath(folder);
+        return real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
+      }
+      return false;
+    }
+    let stat;
+    let target;
+    try {
+      stat = fs.lstatSync(current);
+      if (!stat.isSymbolicLink()) return false;
+      target = fs.readlinkSync(current);
+    } catch {
+      return false;
+    }
+    const folder = realPath(path.posix.dirname(current));
+    if (folder === null || !(folder === rootReal || folder.startsWith(rootReal + '/'))) return false;
+    current = path.posix.resolve(folder, target);
+  }
+  return false;
+};
+`;
+
+/**
+ * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it, `argv[3]`
+ * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
+ * round 2, S2-01), in place of `build.dockerfile` of the text.
  * Prints one JSON line: `null` if the configuration file does not exist, otherwise
- * `{ configText, dockerfilePath?, dockerfileText? }`. `build.dockerfile` (or the old `dockerFile`) is resolved
- * relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
- * Paths outside of the repository folder are not read.
+ * `{ configText, dockerfilePath?, dockerfileText?, dockerfileMissing? }`. `build.dockerfile` (or the old `dockerFile`) is
+ * resolved relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
+ * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved, nor a file whose
+ * link leads out of the repository (review round 3, P3-1). `dockerfileMissing: true`: the Dockerfile does not exist in
+ * the repository, and no link leads to or through its path (a missing file, not a link out).
  */
 export const READ_FILES_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -399,7 +473,14 @@ const read = (file) => {
     throw error;
   }
 };
-const stripJsonc = (text) => {
+const realPath = (file) => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+};
+${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
   let result = '';
   let i = 0;
   const skipComment = (j) => {
@@ -460,16 +541,294 @@ const main = () => {
   }
   if (!config || typeof config !== 'object') return result;
   const build = config.build && typeof config.build === 'object' ? config.build : {};
-  const dockerfile = typeof build.dockerfile === 'string' ? build.dockerfile : config.dockerFile;
+  const dockerfile = process.argv[3] ? process.argv[3] : typeof build.dockerfile === 'string' ? build.dockerfile : config.dockerFile;
   if (typeof dockerfile !== 'string' || dockerfile === '' || dockerfile.includes('$' + '{')) return result;
   const dockerfileFile = path.posix.resolve(path.posix.dirname(configFile), dockerfile);
   if (!inside(dockerfileFile) || dockerfileFile === root) return result;
   result.dockerfilePath = path.posix.relative(root, dockerfileFile);
+  if (missingInRepository(dockerfileFile)) {
+    result.dockerfileMissing = true;
+    return result;
+  }
+  // Review round 3 (P3-1): a link out of the repository is not read (the check refuses the Dockerfile).
+  const real = realPath(dockerfileFile);
+  const rootReal = realPath(root);
+  if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
   const dockerfileText = read(dockerfileFile);
   if (dockerfileText !== undefined) result.dockerfileText = dockerfileText;
   return result;
 };
 process.stdout.write(JSON.stringify(main()) + '\n');
+`;
+
+/**
+ * `node -e` script for the runs of the Dev Container CLI with files of the extension (Docker Compose: the override
+ * configuration and our model, and the Dockerfile of a synthesized build). `argv[1]` = the folder for the files
+ * (OVERRIDE_FOLDER), `argv[2]` = path of the repository's devcontainer.json for the lockfile rule of BUILD_SCRIPT (`''`:
+ * none), `argv[3]` = path of our copy of the configuration that `--config` names (`''`: none), then the arguments of
+ * `devcontainer`. Standard input: JSON `{ "files": { "<absolute path>": "<text>" } }`. Each path must be below the
+ * folder, absolute and without `.`/`..` segments; the files get mode 0600, and the folder `context/` (the empty build
+ * context of a synthesized build) is created. Lockfile: when the repository has one next to its configuration, it is
+ * copied next to our copy (so the CLI uses it; a change that the CLI writes stays in the helper); without one,
+ * `--no-lockfile` is added, so that a build never adds a file to the repository. Before `devcontainer up`, the compose
+ * files that the Dev Container CLI generated in `<--user-data-folder>/docker-compose` (the shared cache volume) and that
+ * are older than COMPOSE_FILES_MAX_AGE_MS are removed (limit L-5: nothing else removes them; the CLI writes a missing one
+ * again without a build). Then `devcontainer` runs with the output of this process; its exit code is the exit code
+ * (128 + the signal number after a signal), and a stop signal is passed on to it.
+ */
+export const WRITE_AND_RUN_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const folder = process.argv[1];
+const repositoryConfig = process.argv[2];
+const ownConfig = process.argv[3];
+const args = process.argv.slice(4);
+const lockfileOf = (config) =>
+  path.posix.join(path.posix.dirname(config), path.posix.basename(config).startsWith('.') ? '.devcontainer-lock.json' : 'devcontainer-lock.json');
+const prepare = () => {
+  if (!folder || path.posix.resolve(folder) !== folder || folder === '/') throw new Error('Invalid folder: ' + folder);
+  const input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+  const files = input && typeof input.files === 'object' && input.files !== null ? input.files : {};
+  fs.mkdirSync(path.posix.join(folder, 'context'), { recursive: true, mode: 0o700 });
+  for (const [file, text] of Object.entries(files)) {
+    if (typeof file !== 'string' || path.posix.resolve(file) !== file || !file.startsWith(folder + '/') || typeof text !== 'string') {
+      throw new Error('Invalid file: ' + file);
+    }
+    fs.mkdirSync(path.posix.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, text, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  }
+  if (ownConfig && (path.posix.resolve(ownConfig) !== ownConfig || !ownConfig.startsWith(folder + '/'))) {
+    throw new Error('Invalid configuration path: ' + ownConfig);
+  }
+  if (repositoryConfig) {
+    const lockfile = lockfileOf(repositoryConfig);
+    if (!fs.existsSync(lockfile)) {
+      args.push('--no-lockfile');
+    } else if (ownConfig) {
+      const copy = lockfileOf(ownConfig);
+      fs.mkdirSync(path.posix.dirname(copy), { recursive: true, mode: 0o700 });
+      fs.copyFileSync(lockfile, copy);
+      fs.chmodSync(copy, 0o600);
+    }
+  }
+};
+const composeFile = /^docker-compose\.devcontainer\.(build|containerFeatures)-\d+(-[0-9A-Fa-f-]+)?\.yml$/;
+const removeOldComposeFiles = () => {
+  if (args[0] !== 'up') return;
+  const index = args.indexOf('--user-data-folder');
+  const data = index >= 0 ? args[index + 1] : undefined;
+  if (!data || path.posix.resolve(data) !== data || data === '/') return;
+  const dir = path.posix.join(data, 'docker-compose');
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const limit = Date.now() - ${COMPOSE_FILES_MAX_AGE_MS};
+  for (const name of names) {
+    if (!composeFile.test(name)) continue;
+    const file = path.posix.join(dir, name);
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && stat.mtimeMs < limit) fs.unlinkSync(file);
+    } catch {
+      // Removed by another run, or not ours to remove.
+    }
+  }
+};
+try {
+  prepare();
+} catch (error) {
+  process.stderr.write(String(error && error.message ? error.message : error) + '\n');
+  process.exitCode = 2;
+}
+if (process.exitCode === undefined) {
+  removeOldComposeFiles();
+  const child = spawn('devcontainer', args, { stdio: ['ignore', 'inherit', 'inherit'] });
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+  child.on('error', (error) => {
+    process.stderr.write('devcontainer could not be started: ' + error.message + '\n');
+    process.exitCode = 127;
+  });
+  child.on('exit', (code, signal) => {
+    process.exitCode = code !== null ? code : 128 + (os.constants.signals[signal] || 1);
+  });
+}
+`;
+
+/**
+ * `node -e` script of the model run of a Docker Compose configuration. `argv[1]` = repository folder (absolute), then
+ * the compose files (absolute, resolveComposeFiles). The project name comes from COMPOSE_PROJECT_NAME. The run has no
+ * Docker socket and no network (the Compose plugin needs no engine for `config`), and the configuration folder of the
+ * volume is hidden (WorkspaceHelper.composeModel). Prints one JSON line (ComposeModelOutput of compose.ts):
+ * - `version`: `docker compose version --short`;
+ * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
+ * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles);
+ * - `dockerfiles`: the Dockerfile of each service with a local build (`build.dockerfile_inline`, or the file: when it
+ *   is in the repository folder, also after links, or when it is outside of it and no path of the workspace helper
+ *   (isHelperPath of hostAccess.ts, the same paths here), also after links);
+ * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
+ *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
+ *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
+ * - `missing` (review round 3, P3-1): of the local build contexts and Dockerfiles, those in the repository folder that
+ *   do not exist, without a link that leads to or through them (a missing file of the repository, not a link out);
+ * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
+ *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
+ *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
+ *   Only the hash leaves the run, not the texts.
+ * On an error of Docker Compose: `{ "error": "<its message>" }`, exit code 0.
+ */
+export const COMPOSE_MODEL_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const crypto = require('crypto');
+const root = path.posix.resolve(process.argv[1]);
+const files = process.argv.slice(2);
+const inside = (file) => file === root || file.startsWith(root + '/');
+const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+const compose = (args, options) =>
+  spawnSync('docker', ['compose', ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
+const failure = (result, what) => {
+  const text = ((result.stderr || '') + (result.error ? ' ' + result.error.message : '')).trim();
+  return { error: text || what + ' failed with exit code ' + result.status + '.' };
+};
+const realPath = (file) => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+};
+// The paths of isHelperPath (hostAccess.ts): the root, the cache volume, the folder with the token, the folders of the
+// kernel (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one
+// of them. (The Docker socket of isHelperPath is not mounted in this run; the check refuses a Dockerfile there anyway.)
+const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
+const isHelperPath = (file) => {
+  const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
+  if (normal === '/') return true;
+  if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
+  return !inside(normal) && overlaps(normal, '/workspaces');
+};
+// The folder of a local additional context (localContextPath of hostAccess.ts): the path, or the path of an OCI layout.
+const localFolder = (source) => {
+  const text = String(source).trim();
+  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
+  if (oci) {
+    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
+    const colon = folder.indexOf(':', folder.lastIndexOf('/') + 1);
+    return colon >= 0 ? folder.slice(0, colon) : folder;
+  }
+  return /^[a-z][a-z0-9+.-]*:/i.test(text) ? undefined : text;
+};
+// The key files of build.ssh: 'id=path[,path]', { id, path }, or a map.
+const sshFiles = (ssh) => {
+  const values = isObject(ssh) ? Object.values(ssh) : (Array.isArray(ssh) ? ssh : []).map((entry) => {
+    if (isObject(entry)) return entry.path;
+    const text = String(entry);
+    return text.includes('=') ? text.slice(text.indexOf('=') + 1) : undefined;
+  });
+  return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
+};
+${MISSING_IN_REPOSITORY}const readDockerfile = (file) => {
+  const real = realPath(file);
+  if (real === null) return undefined;
+  const allowed = inside(file) ? inside(real) : !isHelperPath(file) && !isHelperPath(real);
+  if (!allowed) return undefined;
+  try {
+    return fs.readFileSync(real, 'utf8');
+  } catch {
+    return undefined;
+  }
+};
+const main = () => {
+  const version = compose(['version', '--short']);
+  if (version.status !== 0) return failure(version, 'docker compose version');
+  const probeFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-compose-probe-'));
+  const probe = compose(['--project-directory', probeFolder, '-p', 'devenv-probe', '-f', '-', 'config', '--format', 'json'], {
+    cwd: probeFolder,
+    input: 'services:\n  probe:\n    image: probe\n    environment:\n      V: "a$$b"\n',
+  });
+  fs.rmSync(probeFolder, { recursive: true, force: true });
+  if (probe.status !== 0) return failure(probe, 'docker compose config');
+  const value = JSON.parse(probe.stdout).services.probe.environment.V;
+  if (value !== 'a$$b' && value !== 'a$b') return { error: 'docker compose config printed an unknown form of $: ' + JSON.stringify(value) };
+  const args = [];
+  for (const file of files) args.push('-f', file);
+  const result = compose([...args, '--profile', '*', 'config', '--format', 'json'], { cwd: root });
+  if (result.status !== 0) return failure(result, 'docker compose config');
+  const model = JSON.parse(result.stdout);
+  const dockerfiles = {};
+  const realPaths = {};
+  const missing = [];
+  for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
+    if (!isObject(service)) continue;
+    const build = service.build;
+    if (isObject(build)) {
+      const local = typeof build.context === 'string' && build.context.startsWith('/');
+      if (local) realPaths[build.context] = realPath(build.context);
+      if (local && missingInRepository(build.context) && !missing.includes(build.context)) missing.push(build.context);
+      // Review round 2 (S2-03): the other files and folders that the build client reads in the helper.
+      for (const source of Object.values(isObject(build.additional_contexts) ? build.additional_contexts : {})) {
+        const folder = localFolder(source);
+        if (folder !== undefined && folder.startsWith('/')) realPaths[folder] = realPath(folder);
+      }
+      for (const file of sshFiles(build.ssh)) if (file.startsWith('/')) realPaths[file] = realPath(file);
+      for (const entry of Array.isArray(build.secrets) ? build.secrets : []) {
+        const secretName = typeof entry === 'string' ? entry : isObject(entry) ? entry.source : undefined;
+        const secret = isObject(model.secrets) && typeof secretName === 'string' ? model.secrets[secretName] : undefined;
+        if (isObject(secret) && typeof secret.file === 'string' && secret.file.startsWith('/')) realPaths[secret.file] = realPath(secret.file);
+      }
+      if (typeof build.dockerfile_inline === 'string') {
+        dockerfiles[name] = build.dockerfile_inline;
+      } else if (local) {
+        const file = path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile');
+        realPaths[file] = realPath(file);
+        if (missingInRepository(file) && !missing.includes(file)) missing.push(file);
+        const text = readDockerfile(file);
+        if (text !== undefined) dockerfiles[name] = text;
+      }
+    }
+    for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
+      if (isObject(volume) && volume.type === 'bind' && typeof volume.source === 'string') realPaths[volume.source] = realPath(volume.source);
+    }
+    for (const entry of Array.isArray(service.env_file) ? service.env_file : []) {
+      const file = typeof entry === 'string' ? entry : isObject(entry) ? entry.path : undefined;
+      if (typeof file === 'string') realPaths[file] = realPath(file);
+    }
+  }
+  const inputs = new Map();
+  const readInput = (file) => {
+    if (inputs.has(file)) return;
+    try {
+      inputs.set(file, fs.readFileSync(file, 'utf8'));
+    } catch {
+      inputs.set(file, null);
+    }
+  };
+  for (const file of files) readInput(file);
+  if (files.length > 0) readInput(path.posix.join(path.posix.dirname(files[0]), '.env'));
+  for (const service of Object.values(isObject(model.services) ? model.services : {})) {
+    for (const entry of isObject(service) && Array.isArray(service.env_file) ? service.env_file : []) {
+      const file = typeof entry === 'string' ? entry : isObject(entry) ? entry.path : undefined;
+      if (typeof file === 'string') readInput(file);
+    }
+  }
+  const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, missing, inputsHash };
+};
+let output;
+try {
+  output = main();
+} catch (error) {
+  output = { error: String(error && error.message ? error.message : error) };
+}
+process.stdout.write(JSON.stringify(output) + '\n');
 `;
 
 /** `sh -c` command that clones the repository into the volume. Token on stdin, secrets mount required. */
@@ -504,13 +863,29 @@ export function listConfigsCommand(repoFolder: string): string[] {
   return ['node', '-e', LIST_CONFIGS_SCRIPT, repoFolder];
 }
 
-export function readFilesCommand(repoFolder: string, configPath: string): string[] {
-  return ['node', '-e', READ_FILES_SCRIPT, repoFolder, configPath];
+/** `dockerfile`: the Dockerfile that the resolved configuration names (READ_FILES_SCRIPT, `argv[3]`). */
+export function readFilesCommand(repoFolder: string, configPath: string, dockerfile?: string): string[] {
+  return ['node', '-e', READ_FILES_SCRIPT, repoFolder, configPath, ...(dockerfile !== undefined && dockerfile !== '' ? [dockerfile] : [])];
 }
 
 /** `sh -c` command for `devcontainer up`: the override configuration is expected on stdin. */
 export function upCommand(overrideConfigPath: string, args: readonly string[]): string[] {
   return ['sh', '-c', UP_SCRIPT, 'sh', overrideConfigPath, ...args];
+}
+
+/**
+ * `node -e` command of WRITE_AND_RUN_SCRIPT: writes the files of its standard input below OVERRIDE_FOLDER, then runs
+ * `devcontainer <args…>`. For `build`: `repositoryConfig` (absolute path of the repository's devcontainer.json in the
+ * helper) with the lockfile rule of BUILD_SCRIPT, and `config`, our copy of the configuration below OVERRIDE_FOLDER that
+ * `--config` names, which gets the repository's lockfile.
+ */
+export function writeAndRunCommand(p: { repositoryConfig?: string; config?: string }, args: readonly string[]): string[] {
+  return ['node', '-e', WRITE_AND_RUN_SCRIPT, OVERRIDE_FOLDER, p.repositoryConfig ?? '', p.config ?? '', ...args];
+}
+
+/** `node -e` command of COMPOSE_MODEL_SCRIPT for the compose files (absolute paths) of a configuration. */
+export function composeModelCommand(repoFolder: string, files: readonly string[]): string[] {
+  return ['node', '-e', COMPOSE_MODEL_SCRIPT, repoFolder, ...files];
 }
 
 /** `sh -c` command for `devcontainer build`. `configFile` is the absolute path of devcontainer.json in the helper. */

@@ -175,6 +175,47 @@ describe('environmentState', () => {
   });
 });
 
+describe('review round 7 of unit 6, P7-2: running side services of Docker Compose', () => {
+  const env = environment('e1', 'acme-university/api');
+  const info = repo('acme-university/api');
+  const rowWith = (entry: EnvironmentRuntime, overrides: Partial<TreeInput> = {}) =>
+    row(buildTreeModel(input({ environments: [env], runtime: runtime({ e1: entry }), ...overrides })), 'acme-university/api');
+
+  it('shows the state of the dev container, offers Start, and keeps Stop while a side service runs', () => {
+    const stopped = rowWith({ container: 'stopped', volume: true, servicesRunning: true });
+    expect(stopped.state).toBe('stopped');
+    expect(stopped.actions.canStart).toBe(true);
+    expect(stopped.actions.canStop).toBe(true);
+    expect(stopped.description).toContain(`${StateTexts.stopped} · ${StateTexts.servicesRunning}`);
+    expect(stopped.tooltip).toContain(TreeTexts.servicesRunning);
+    const missing = rowWith({ container: 'missing', volume: true, servicesRunning: true });
+    expect(missing.state).toBe('noContainer');
+    expect(missing.actions.canStop).toBe(true);
+  });
+
+  it('is not connected while only a side service runs', () => {
+    expect(rowWith({ container: 'stopped', volume: true, servicesRunning: true }, { currentEnvironmentId: 'e1' }).state).toBe('stopped');
+    expect(rowWith({ container: 'stopped', volume: true, servicesRunning: true }, { otherWindowEnvironmentIds: new Set(['e1']) }).state).toBe('stopped');
+  });
+
+  it('adds nothing without running side services, or while the dev container runs', () => {
+    const stopped = rowWith({ container: 'stopped', volume: true });
+    expect(stopped.actions.canStop).toBe(false);
+    expect(stopped.description).not.toContain(StateTexts.servicesRunning);
+    const running = rowWith({ container: 'running', volume: true, servicesRunning: true });
+    expect(running.state).toBe('running');
+    expect(running.description).not.toContain(StateTexts.servicesRunning);
+    expect(running.tooltip).not.toContain(TreeTexts.servicesRunning);
+  });
+
+  it('offers Stop for running side services, but not while the environment is updating', () => {
+    expect(rowActions('stopped', info, undefined, true).canStop).toBe(true);
+    expect(rowActions('noContainer', info, undefined, true).canStop).toBe(true);
+    expect(rowActions('updating', info, 'rebuild', true).canStop).toBe(false);
+    expect(rowActions('stopped', info, undefined, false).canStop).toBe(false);
+  });
+});
+
 describe('row actions and contextValue', () => {
   const info = repo('acme-university/api');
   const multi = repo('acme-university/api', {

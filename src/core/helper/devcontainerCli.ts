@@ -7,7 +7,16 @@ import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
 import type { HostAccessChecks } from '../hostAccessChecks';
-import { CONTAINER_VERSION_LABEL, containerHostname, HOST_ACCESS_UNRESTRICTED_LABEL, WORKSPACES_ROOT } from '../names';
+import {
+  COMPOSE_CLEARED_LABELS,
+  CONTAINER_VERSION_LABEL,
+  configPathLabel,
+  isConfigPathLabelValue,
+  containerHostname,
+  HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
+  HOST_ACCESS_UNRESTRICTED_LABEL,
+  WORKSPACES_ROOT,
+} from '../names';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { loopbackAppPorts, overrideRunArgs, runArgsDecideHostname, withoutNameArgs } from './hostAccess';
 
@@ -16,7 +25,7 @@ import { loopbackAppPorts, overrideRunArgs, runArgsDecideHostname, withoutNameAr
  * Assumption (V-10): the CLI keeps data there that is useful across helper runs. CLI 0.89.0 downloads Features into a
  * new folder below os.tmpdir() for each build, so the Features themselves are not cached there.
  */
-export const HELPER_CACHE_FOLDER = '/devenv-cache';
+export const HELPER_CACHE_FOLDER = NAMES_HELPER_CACHE_FOLDER;
 
 /**
  * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:
@@ -24,12 +33,25 @@ export const HELPER_CACHE_FOLDER = '/devenv-cache';
  * the host access policy checks (concept section 9). Without a container, the CLI reads the base image and the Features
  * for it (from the registries, if they are not local).
  */
-export function readConfigurationArgs(p: { workspaceFolder: string; configPath: string; idLabel: string; merged?: boolean }): string[] {
+export function readConfigurationArgs(p: {
+  workspaceFolder: string;
+  configPath: string;
+  idLabel: string;
+  merged?: boolean;
+  /** `--override-config` (Docker Compose: composeConfigOverride, which names our model). */
+  overrideConfigPath?: string;
+}): string[] {
   const args = ['read-configuration', '--workspace-folder', p.workspaceFolder, '--config', p.configPath, '--id-label', p.idLabel];
+  if (p.overrideConfigPath !== undefined) args.push('--override-config', p.overrideConfigPath);
   if (p.merged !== false) args.push('--include-merged-configuration');
   return args;
 }
 
+/**
+ * Arguments of `devcontainer build`. `build` has no `--override-config` (CLI 0.89.0, devContainersSpecCLI.js, the
+ * handler of `build`: `configFile:v,overrideConfigFile:J` with `J=void 0`), so a Docker Compose configuration is built
+ * with `--config` naming our copy of the configuration (composeConfigOverride) in the helper.
+ */
 export function buildArgs(p: { workspaceFolder: string; configPath: string; imageName: string }): string[] {
   return [
     'build',
@@ -162,7 +184,8 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
 /**
  * Override configuration for `up` (implementation notes 8, concept 7.6): only image, workspaceMount, workspaceFolder,
  * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
- * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>` and
+ * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>`, the labels
+ * `com.docker.compose.project` and `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and
  * `--name <container name>`, and `--hostname <repository name>` (containerHostname) unless the runArgs decide the host
  * name themselves, runArgsDecideHostname), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
  * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
@@ -180,9 +203,16 @@ export function buildOverrideConfig(p: {
   runArgs?: string[];
   appPort?: DevcontainerConfig['appPort'];
   hostAccessChecks?: HostAccessChecks;
+  /** Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path. */
+  configPath?: string;
 }): Record<string, unknown> {
   const checksOn = p.hostAccessChecks !== 'off';
   const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
+  // Review round 5 (D5-2): only a configuration path that reconcileFromVolumes takes; without the label, it takes the
+  // default configuration.
+  if (p.configPath !== undefined && isConfigPathLabelValue(p.configPath)) labels.push('--label', configPathLabel(p.configPath));
+  // Review round 2 (D2-1): the labels of Docker Compose empty, whatever the image inherited.
+  for (const label of COMPOSE_CLEARED_LABELS) labels.push('--label', label);
   const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);
   // Without it, Docker names the host after the container ID, and the shell prompt shows that ID.
   const hostname = runArgsDecideHostname(repositoryRunArgs) ? [] : ['--hostname', containerHostname(p.repositoryName)];
@@ -197,6 +227,48 @@ export function buildOverrideConfig(p: {
   if (appPort !== undefined && appPort !== null) override.appPort = appPort;
   // Merged over the containerEnv, remoteEnv, and settings of the image metadata; these values win. The settings only add
   // to the customizations of the image metadata (its extensions and other settings stay).
+  override.containerEnv = containerEnvironment();
+  override.remoteEnv = remoteEnvironment();
+  override.customizations = { vscode: { settings: devContainersSettings() } };
+  override.shutdownAction = ATTACHED_SHUTDOWN_ACTION;
+  return override;
+}
+
+/**
+ * The configuration of a Docker Compose configuration for `read-configuration` (`--override-config`) and `build`
+ * (`--config`, buildArgs): the repository configuration as written (`raw`, parsed devcontainer.json; the CLI resolves
+ * its variables as usual), with `dockerComposeFile` naming only our model (an absolute path: the CLI resolves the paths
+ * against the folder of `--config`, CLI 0.89.0 function `sg`), and without `initializeCommand`, which the host access
+ * policy refuses anyway (it would run in the helper, which has the Docker socket).
+ */
+export function composeConfigOverride(raw: Readonly<Record<string, unknown>>, modelPath: string): Record<string, unknown> {
+  const config: Record<string, unknown> = { ...raw, dockerComposeFile: [modelPath] };
+  delete config.initializeCommand;
+  return config;
+}
+
+/**
+ * Override configuration of `devcontainer up` for a Docker Compose configuration (the counterpart of buildOverrideConfig):
+ * `dockerComposeFile` names only our model (composeUpModel, an absolute path), `service`, `runServices` (when the
+ * repository names them), `workspaceFolder`, and, as in buildOverrideConfig, containerEnv, remoteEnv, the settings of
+ * the Dev Containers extension, and shutdownAction 'none'. No image, runArgs, appPort, or workspaceMount: the CLI
+ * ignores them for Compose (CLI 0.89.0: `if("dockerComposeFile"in t)return{workspaceFolder:pp(t),workspaceMount:void 0,…}`;
+ * runArgs and appPort are read only for a single container); the model carries the image, the name, the labels, the
+ * ports, and the workspace volume. The CLI writes containerEnv as `environment` of the dev service into its last compose
+ * file, so these values win. `initializeCommand` is never passed.
+ */
+export function buildComposeOverrideConfig(p: {
+  modelPath: string;
+  service: string;
+  runServices?: readonly string[];
+  repositoryName: string;
+}): Record<string, unknown> {
+  const override: Record<string, unknown> = {
+    dockerComposeFile: [p.modelPath],
+    service: p.service,
+  };
+  if (p.runServices !== undefined) override.runServices = [...p.runServices];
+  override.workspaceFolder = `${WORKSPACES_ROOT}/${p.repositoryName}`;
   override.containerEnv = containerEnvironment();
   override.remoteEnv = remoteEnvironment();
   override.customizations = { vscode: { settings: devContainersSettings() } };

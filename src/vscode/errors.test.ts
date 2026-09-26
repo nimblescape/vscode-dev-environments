@@ -93,7 +93,9 @@ describe('showError (concept 6.5)', () => {
   });
 
   it.each([
-    ['composeNotSupported', Messages.composeNotSupported],
+    // Spec u6: Docker Compose configurations are supported, so composeNotSupported is gone. Its row is replaced by the
+    // refusal of a Compose setting that the policy does not support, which is shown the same way.
+    ['hostAccess', Messages.unsupportedOptions('service db: restart always')],
     ['noConfiguration', Messages.noConfiguration('acme/api')],
     ['gitSwitchFailed', Messages.gitSwitchFailed('dev', 'error: Your local changes would be overwritten.')],
   ] as const)('shows %s as a warning with Show details', (code, message) => {
@@ -164,7 +166,7 @@ describe('showError (concept 6.5)', () => {
       'helperFailed',
       'cloneFailed',
       'firstOpenOffline',
-      'composeNotSupported',
+      // Spec u6: composeNotSupported no longer exists (Docker Compose configurations are supported).
       'noConfiguration',
       'buildFailed',
       'startFailed',

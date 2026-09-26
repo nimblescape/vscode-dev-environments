@@ -131,6 +131,11 @@ export interface PipelineUi {
   confirmUntrustedRepository(repository: string): Promise<boolean>;
   /** Concept 7.12: the devcontainer.json changed since the last build. */
   configurationChanged(repository: string): Promise<'rebuildNow' | 'later'>;
+  /**
+   * Review round 4 (D4-3): the containers of an environment without a build record are of another kind (Docker Compose or
+   * a single container) than its configuration. `message`: Messages.configurationKindChanged. `later` keeps the kind.
+   */
+  configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'>;
   /** Concept 7.12: the workspace volume is missing. `undefined` means cancel. */
   filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined>;
   /** Non-blocking information message. */

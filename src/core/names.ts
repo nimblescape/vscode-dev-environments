@@ -16,6 +16,26 @@ export const LABEL_OWNER_ID = 'devenv.owner-id';
  */
 export const LABEL_VOLUME = 'devenv.volume';
 export const VOLUME_KIND_ADDITIONAL = 'additional';
+/**
+ * devenv.volume of a named volume of the Compose project of an environment (`devenv-<short id>_<key>`, the data of its
+ * services, for example of a database): created by the extension before `up` with the labels of the environment, never
+ * shared with another environment, and removed by Delete only when the user asks for it.
+ */
+export const VOLUME_KIND_COMPOSE = 'compose';
+/**
+ * Volume label (review round 2, D2-3), with the value SERVICE_DATA: a volume that the extension created before `up` for
+ * a service of Docker Compose other than the dev service (it holds the data of that service, for example of a
+ * database), whatever its devenv.volume. Delete lists such a volume in the question about the data of the services,
+ * none ticked, also after a lost registry (reconcileFromVolumes restores Environment.serviceVolumes from it).
+ */
+export const LABEL_SERVICE_DATA = 'devenv.service-data';
+export const SERVICE_DATA = 'true';
+/**
+ * Container label of the containers of a Compose environment other than the dev container: the name of their service.
+ * They carry devenv.environment-id too, so Stop, the Session Monitor, and Delete find them; the lookup of the dev
+ * container skips them.
+ */
+export const LABEL_COMPOSE_SERVICE = 'devenv.compose-service';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
 export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
 /**
@@ -34,6 +54,29 @@ export const CONTAINER_VERSION = 4;
  */
 export const LABEL_CONTAINER_CONFIG = 'devenv.container-config';
 export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
+/**
+ * Container label (review round 4, D4-2): the path of the configuration of the repository that the container was
+ * created for (Environment.configPath, for example `.devcontainer/python/devcontainer.json`), on the dev container that
+ * `up` creates (a single container, or the dev service of Docker Compose; review round 5, D5-1: not the other services),
+ * when isConfigPathLabelValue takes the path (D5-2). reconcileFromVolumes restores the configuration path of an entry
+ * from it after a lost registry; without it, the entry gets the default configuration.
+ */
+export const LABEL_CONFIG_PATH = 'devenv.config-path';
+/** `--label` value of the override configuration of a single container: LABEL_CONFIG_PATH with its value. */
+export function configPathLabel(configPath: string): string {
+  return `${LABEL_CONFIG_PATH}=${configPath}`;
+}
+/**
+ * Whether a value of LABEL_CONFIG_PATH is a configuration path of a repository as the discovery finds them: relative,
+ * `.devcontainer/devcontainer.json`, `.devcontainer/<folder>/devcontainer.json`, or `.devcontainer.json`. Review round 5
+ * (D5-2): the folder as the discovery takes it (isValidFolderName of detect.ts): not empty, not `.` or `..`, without
+ * `/`; a backslash and white space are allowed.
+ */
+export function isConfigPathLabelValue(value: string): boolean {
+  if (value === '.devcontainer.json' || value === '.devcontainer/devcontainer.json') return true;
+  const match = /^\.devcontainer\/([^/]+)\/devcontainer\.json$/.exec(value);
+  return match !== null && match[1] !== '.' && match[1] !== '..';
+}
 /** `--label` value of the override configuration: the version of the container setup. */
 export const CONTAINER_VERSION_LABEL = `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`;
 /** `--label` value of the override configuration of a container created without the configuration of the repository. */
@@ -47,9 +90,26 @@ export const LABEL_HOST_ACCESS = 'devenv.host-access';
 export const HOST_ACCESS_UNRESTRICTED = 'unrestricted';
 /** `--label` value of the override configuration of a container created while the host access checks were off. */
 export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCESS_UNRESTRICTED}`;
+/**
+ * devenv.host-access of a container of Docker Compose that was created while the host access checks were on (review
+ * round 2, D2-2): the model sets the label on every service explicitly, so that a label of the image (for example of a
+ * side service that Compose builds during `up`) cannot decide it.
+ */
+export const HOST_ACCESS_CHECKED = 'checked';
+/**
+ * `--label` values of the override configuration of a single container (review round 2, D2-1): the labels by which Docker
+ * Compose finds the containers of a project, with empty values, so that labels that the image inherited (for example of
+ * an image that Compose built for another project) cannot make `docker compose -p <project> down` of the user remove the
+ * dev container.
+ */
+export const COMPOSE_CLEARED_LABELS: readonly string[] = ['com.docker.compose.project=', 'com.docker.compose.service='];
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
+/** Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI). */
+export const HELPER_CACHE_FOLDER = '/devenv-cache';
+/** Path of the Docker socket inside the workspace helper. */
+export const HELPER_DOCKER_SOCKET = '/var/run/docker.sock';
 /** Mount point of the workspace volume, in the helper and in the dev container. */
 export const WORKSPACES_ROOT = '/workspaces';
 /**
@@ -118,6 +178,15 @@ export const ENVIRONMENT_VOLUME_PATTERN = /^devenv-[a-z0-9_.-]*-[0-9a-f]{8}$/i;
 /** Repository part of the environment image name: `devenv-<short id>`. */
 export function environmentImageRepository(environmentId: string): string {
   return `devenv-${sanitize(shortId(environmentId))}`;
+}
+
+/**
+ * Compose project of an environment: `devenv-<short id>`, the same as environmentImageRepository. Stable for the life of
+ * the environment (the Dev Container CLI finds the dev container again only by the project and the service) and unique
+ * among the environments (short IDs are unique among the entries and the volumes).
+ */
+export function composeProjectName(environmentId: string): string {
+  return environmentImageRepository(environmentId);
 }
 
 /** Environment image: `devenv-<short id>:<build number>`. */

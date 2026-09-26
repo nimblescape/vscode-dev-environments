@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID } from '../names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
   isAbortError,
   systemClock,
@@ -42,6 +42,16 @@ export interface ContainerInfo {
 export interface VolumeInfo {
   name: string;
   labels: Record<string, string>;
+}
+
+/** A network of `docker network inspect`. */
+export interface NetworkInfo {
+  name: string;
+  /** The full ID of the network (review round 2, S2-04: a configuration may name a network by its ID or a prefix). */
+  id: string;
+  labels: Record<string, string>;
+  /** The IDs of the containers attached to it. */
+  containers: string[];
 }
 
 /** A local image of `docker image ls`. */
@@ -94,13 +104,17 @@ export interface ContainerAdapterOptions {
   onDaemonStatus?: (running: boolean) => void;
 }
 
-type ObjectKind = 'container' | 'volume' | 'image';
+type ObjectKind = 'container' | 'volume' | 'image' | 'network';
 
 const MISSING_PATTERNS: Record<ObjectKind, RegExp> = {
   container: /no such (container|object)/i,
   volume: /no such (volume|object)/i,
   image: /no such (image|object)/i,
+  network: /no such (network|object)|network \S+ not found/i,
 };
+
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 
 /** Docker refuses to remove an image that a container or another image uses. */
 const IMAGE_IN_USE_PATTERN = /conflict|in use|being used|is using|dependent child images/i;
@@ -208,6 +222,20 @@ function mountedVolumes(mounts: unknown): string[] {
 function toVolumeInfo(value: unknown): VolumeInfo | undefined {
   if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
   return { name: value.Name, labels: toLabels(value.Labels) };
+}
+
+function toNetworkInfo(value: unknown): NetworkInfo | undefined {
+  if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
+  const containers = isRecord(value.Containers) ? Object.keys(value.Containers) : [];
+  return { name: value.Name, id: typeof value.Id === 'string' ? value.Id : '', labels: toLabels(value.Labels), containers };
+}
+
+/**
+ * Whether a container of an environment is its dev container (findContainer): without the label devenv.compose-service
+ * of the other services of Docker Compose, or with the name of the environment.
+ */
+export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>, containerName: string): boolean {
+  return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
@@ -429,9 +457,16 @@ export class ContainerAdapter {
     return (await this.daemonStatus(signal)).running;
   }
 
-  /** The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. */
-  async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
-    const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+  /**
+   * The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. The
+   * other services of a Docker Compose environment carry the label too, with devenv.compose-service: they are skipped,
+   * so this is always the dev container. A container with the name of the environment (`containerName`, the name of
+   * the dev container) is never skipped, whatever labels its image gave it (review round 1, D2: an image with the label
+   * devenv.compose-service would hide a single container, which then kept running after the checks were turned on).
+   */
+  async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
+    const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+    const containers = all.filter((container) => isDevContainer(container, containerName));
     if (containers.length === 0) return undefined;
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
@@ -439,10 +474,84 @@ export class ContainerAdapter {
     return publicInfo([...containers].sort(preferred)[0]);
   }
 
+  /**
+   * The API version of the Docker Engine (`docker version --format '{{.Server.APIVersion}}'`, for example `1.48`), or
+   * `undefined` when the engine does not tell it. Docker Compose configurations need it for `volume.subpath`
+   * (supportsVolumeSubpath). Rejects only with an AbortError.
+   */
+  async engineApiVersion(signal?: AbortSignal): Promise<string | undefined> {
+    let result: RunResult;
+    try {
+      result = await this.run(['version', '--format', '{{.Server.APIVersion}}'], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.logger.warn(`The API version of the Docker Engine could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+    const version = result.stdout.trim();
+    if (result.exitCode === 0 && /^\d+\.\d+$/.test(version)) return version;
+    this.logger.warn(`The API version of the Docker Engine could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
+    return undefined;
+  }
+
   /** All containers with the label devenv.environment-id, running or not. */
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));
     return containers.map(publicInfo);
+  }
+
+  /**
+   * All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not, also
+   * those without the label devenv.environment-id (for example one-off containers of `docker compose run`).
+   */
+  async listProjectContainers(project: string): Promise<ContainerInfo[]> {
+    const containers = await this.inspectContainers(await this.containerIds(`label=${COMPOSE_PROJECT_LABEL}=${project}`));
+    return containers.map(publicInfo);
+  }
+
+  /** The names of the networks of the Docker Compose project `project` (label com.docker.compose.project). */
+  async listProjectNetworks(project: string): Promise<string[]> {
+    const args = ['network', 'ls', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${project}`, '--format', '{{json .Name}}'];
+    const names = parseJsonLines(await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS }));
+    return [...new Set(names.filter((name): name is string => typeof name === 'string' && name !== ''))];
+  }
+
+  /** `docker network rm`. A missing network is not an error; a network in use is (CommandError). */
+  async removeNetwork(name: string): Promise<void> {
+    this.logger.info(`Removing network ${name}.`);
+    const args = ['network', 'rm', name];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode === 0 || (!result.timedOut && /not found|no such network/i.test(result.stderr))) return;
+    throw this.commandError(args, result);
+  }
+
+  /**
+   * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
+   * devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
+   */
+  async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
+    const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
+    const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    const images = new Set<string>();
+    for (const item of parseJsonLines(stdout)) {
+      if (!isRecord(item) || typeof item.Repository !== 'string' || typeof item.Tag !== 'string') continue;
+      if (!item.Repository.startsWith(`${project}-`) || !item.Tag || item.Tag === '<none>') continue;
+      images.add(`${item.Repository}:${item.Tag}`);
+    }
+    const sorted = [...images].sort();
+    if (environmentId === undefined || sorted.length === 0) return sorted;
+    const foreign = new Set<string>();
+    for (const batch of chunks(sorted, INSPECT_BATCH_SIZE)) {
+      const items = await this.inspectBatch(['image', 'inspect', ...batch], 'image');
+      items.forEach((item) => {
+        const config = isRecord(item) ? item.Config : undefined;
+        const owner = toLabels(isRecord(config) ? config.Labels : undefined)[LABEL_ENVIRONMENT_ID];
+        const tags = isRecord(item) && Array.isArray(item.RepoTags) ? item.RepoTags.filter((tag): tag is string => typeof tag === 'string') : [];
+        if (owner !== undefined && owner !== environmentId) for (const tag of tags) foreign.add(tag);
+      });
+    }
+    return sorted.filter((image) => !foreign.has(image));
   }
 
   /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */
@@ -542,6 +651,21 @@ export class ContainerAdapter {
     return volumes;
   }
 
+  /**
+   * The networks of `names` that exist, with their labels and the IDs of the containers attached to them
+   * (`docker network inspect`); missing ones are left out. Throws CommandError.
+   */
+  async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
+    const networks: NetworkInfo[] = [];
+    for (const batch of chunks([...new Set(names)], INSPECT_BATCH_SIZE)) {
+      for (const item of await this.inspectBatch(['network', 'inspect', ...batch], 'network')) {
+        const network = toNetworkInfo(item);
+        if (network) networks.push(network);
+      }
+    }
+    return networks;
+  }
+
   /** True if the image exists locally. Throws CommandError for other errors (for example an invalid reference). */
   async imageExists(reference: string): Promise<boolean> {
     const args = ['image', 'inspect', '--format', '{{json .Id}}', reference];
@@ -562,6 +686,24 @@ export class ContainerAdapter {
     const id = parseJsonOutput(result.stdout);
     if (typeof id !== 'string' || id === '') throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
     return id;
+  }
+
+  /**
+   * The names of the local image that `reference` names (`RepoTags` and `RepoDigests` of `docker image inspect`), or
+   * `undefined` if it does not exist (review round 2, S2-05: whether Docker took the reference for an image ID,
+   * resolvedByImageId). Throws CommandError for other errors.
+   */
+  async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
+    const args = ['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', reference];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) {
+      if (this.isMissing(result, 'image')) return undefined;
+      throw this.commandError(args, result);
+    }
+    const value = parseJsonOutput(result.stdout);
+    if (!isRecord(value)) throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
+    const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
+    return { repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) };
   }
 
   /**

@@ -35,7 +35,33 @@ export const Messages = {
   newerImage: 'A newer image is available. The environment is updated. Your files are kept.',
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',
-  composeNotSupported: 'Docker Compose configurations are not supported yet.',
+  /**
+   * Review round 4 (D4-3): an environment without a build record (restored after a lost registry) whose containers are of
+   * another kind than its configuration. Rebuild now switches the kind; Later keeps it (the non-destructive answer).
+   */
+  configurationKindChanged: (containersUseCompose: boolean, configPath: string) =>
+    containersUseCompose
+      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
+      : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
+  /**
+   * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts
+   * nothing then (composeDevContainerMissing).
+   */
+  configurationKindChangedDevContainerMissing: (configPath: string) =>
+    `The dev container of this Docker Compose environment is missing, and the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later starts nothing and keeps the containers of the other services. To switch later, choose Rebuild; to use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`,
+  /**
+   * Review round 4 (D4-2): Later for an environment whose Docker Compose dev container is missing: nothing can start
+   * without the switch, so nothing is removed and nothing starts.
+   */
+  composeDevContainerMissing: (configPath: string) =>
+    `The dev container of this Docker Compose environment is missing, and the configuration ${configPath} uses a single container. The containers of the other services are kept. Rebuild the environment to switch it to a single container, or choose Select configuration… for its Docker Compose configuration.`,
+  /** Docker Compose could not read the compose files of a configuration (the details have its message). */
+  /**
+   * Review round 3 (P3-1): the configuration builds from a Dockerfile or a build context that does not exist in the
+   * repository. Not a refusal: the existing environment still starts.
+   */
+  buildFileMissing: (what: string) => `The configuration names ${what}, which does not exist in the repository. Nothing was built.`,
+  composeConfigurationFailed: 'The Docker Compose files of this configuration could not be read. The details show why.',
   noConfiguration: (repository: string) => `The repository ${repository} has no Dev Container configuration.`,
   configurationNotFound: (configPath: string, configurationName: string) =>
     `The configuration ${configPath} does not exist on this branch. The configuration ${configurationName} is used.`,
@@ -67,6 +93,17 @@ export const Messages = {
    */
   containerHostAccessChecksOn:
     'The host access checks are on again for this repository, so the container is set up again with them. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * The configuration of an environment of a Docker Compose configuration no longer uses Docker Compose: its container
+   * is created again as a single container, and the containers of its other services are removed (their volumes stay).
+   */
+  // Review round 1 (P-1): the containers of the other services go; their named volumes stay, and the data in their
+  // volumes without a name is no longer used (Docker keeps those volumes as unused volumes).
+  containerComposeReplaced:
+    'The configuration of the environment no longer uses Docker Compose, so the container is set up again, and the containers of the other services are removed. Your files in the repository and the data that the services keep in named volumes are kept. Data that the services keep in volumes without a name is no longer used; Docker keeps those volumes as unused volumes. Files in other folders of the container, for example in the home folder, are removed.',
+  /** Review round 1 (P-1): a single container is replaced by the containers of a Docker Compose configuration. */
+  containerComposeCreated:
+    'The configuration of the environment now uses Docker Compose, so the container is set up again with the containers of its services. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
   /**
    * The modal question of Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26), with
    * what the configuration of the repository can then use (hostAccessChecksOffDetail).
@@ -141,6 +178,24 @@ export const Messages = {
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   deleteAdditionalVolumes: (volumes: string) =>
     `The environment also used these volumes: ${volumes}. Remove them too?`,
+  /**
+   * D-19: the title of the question of Delete about the volumes of the Docker Compose project (the data of its services),
+   * a list in which the user ticks the volumes to remove; none is ticked, and nothing ticked keeps them all.
+   */
+  deleteServiceDataTitle: 'Remove the data of the services too?',
+  /** D-19: the hint of that list. */
+  deleteServiceDataPlaceholder:
+    'These volumes hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
+  /** D-19: the description of each volume in that list. */
+  deleteServiceDataItem: 'data of the services',
+  /**
+   * Review round 3 (P3-4): the description of a volume in that list of an environment whose services are not known (for
+   * example one restored from its volumes): it may hold data of a service, or be another additional volume.
+   */
+  deleteServiceDataPossibleItem: 'additional volume (possibly data of services)',
+  /** Review round 3 (P3-4): the hint of that list when it holds such a volume. */
+  deleteServiceDataPossiblePlaceholder:
+    'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
@@ -187,6 +242,11 @@ export const StateTexts = {
    * or `Stopped · kept` (Keep Running When Closed; user decision 2026-09-26, "go with the proposal for closing").
    */
   kept: 'kept',
+  /**
+   * Review round 7, P7-2: the suffix of the state text of an environment whose dev container does not run while another
+   * service of Docker Compose runs, for example `Stopped · services running` (Stop stays offered).
+   */
+  servicesRunning: 'services running',
 } as const;
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */

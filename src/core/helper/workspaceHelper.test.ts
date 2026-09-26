@@ -17,6 +17,7 @@ import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
+  COMPOSE_MODEL_SCRIPT,
   GIT_FILES_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
@@ -24,8 +25,11 @@ import {
   REMOVE_GIT_TOKEN_SCRIPT,
   SWITCH_BRANCH_SCRIPT,
   UP_SCRIPT,
+  WRITE_AND_RUN_SCRIPT,
 } from './scripts';
+import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
+  COMPOSE_MODEL_TIMEOUT_MS,
   DOCKER_SOCKET,
   HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
@@ -258,6 +262,40 @@ describe('helperRunArgs', () => {
       'git',
       'status',
     ]);
+  });
+
+  it('hides the configuration folder of the volume with an empty tmpfs when asked, and only then', () => {
+    const spec = {
+      tag: 'devenv-helper:abc',
+      volumeName: 'vol',
+      socketPath: '/var/run/docker.sock',
+      containerName: 'n',
+      env: {},
+      secrets: false,
+      docker: false,
+      network: false,
+      command: ['node'],
+    };
+    expect(helperRunArgs({ ...spec, hideConfigFolder: true })).toEqual([
+      'run',
+      '--rm',
+      '-i',
+      '--pull',
+      'never',
+      '--name',
+      'n',
+      '--label',
+      'devenv.helper-run=true',
+      '--mount',
+      'type=volume,source=vol,target=/workspaces',
+      '--mount',
+      'type=tmpfs,destination=/workspaces/.devenv+',
+      '--network',
+      'none',
+      'devenv-helper:abc',
+      'node',
+    ]);
+    expect(helperRunArgs(spec).join(' ')).not.toContain('tmpfs');
   });
 
   it('quotes a mount field with a comma', () => {
@@ -777,6 +815,18 @@ describe('WorkspaceHelper file and Git queries', () => {
     expect(docker.runs).toHaveLength(0);
   });
 
+  it('readConfigFiles takes a configuration path with a backslash, as the discovery lists it (review round 6, note of S)', async () => {
+    const helper = createHelper();
+    docker.handler = () => ({ stdout: '{"configText":"{}"}\n' });
+    const configPath = '.devcontainer/a\\b/devcontainer.json';
+    expect(await helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath })).toEqual({ configText: '{}' });
+    expect(commandOf(docker.runs[0].args)).toEqual(['node', '-e', READ_FILES_SCRIPT, '/workspaces/api', configPath]);
+    // Still refused: a path outside of the repository, with a backslash too.
+    for (const outside of ['..\\x/../devcontainer.json', '/a\\b/devcontainer.json', '.devcontainer/a\\b/../../../x']) {
+      await expect(helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath: outside })).rejects.toThrow(/Invalid configuration path/);
+    }
+  });
+
   it('listConfigurations returns the list of the script', async () => {
     docker.handler = () => ({ stdout: '[".devcontainer/devcontainer.json",".devcontainer/python/devcontainer.json"]\n' });
     expect(await createHelper().listConfigurations({ volumeName: 'vol', repository: 'acme/api' })).toEqual([
@@ -1091,6 +1141,156 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
         removeExistingContainer: false,
         }),
     ).rejects.toMatchObject({ name: 'DevcontainerCommandError', exitCode: 1 });
+  });
+});
+
+describe('WorkspaceHelper Docker Compose runs', () => {
+  const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: 'devenv-3f2a9c1e', services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {}, inputsHash: 'abc' };
+
+  it('composeModel runs the model script without the Docker socket, network, and the configuration folder, with the project name', async () => {
+    docker.handler = () => ({ stdout: `${JSON.stringify(MODEL_OUTPUT)}\n` });
+    const files = ['/workspaces/api/.devcontainer/compose.yml'];
+    const result = await createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: 'devenv-3f2a9c1e' });
+    expect(result).toEqual(MODEL_OUTPUT);
+    const run = docker.runs[0];
+    expect(hasDockerAccess(run.args)).toBe(false);
+    expect(hasNoNetwork(run.args)).toBe(true);
+    expect(run.args).toContain('type=tmpfs,destination=/workspaces/.devenv+');
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT, '/workspaces/api', ...files]);
+    expect(COMPOSE_MODEL_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it('composeModel returns the message of Docker Compose, and throws when the helper fails', async () => {
+    docker.handler = () => ({ stdout: '{"error":"yaml: bad"}\n' });
+    const p = { volumeName: 'vol', repository: 'acme/api', files: ['/workspaces/api/compose.yml'], project: 'devenv-3f2a9c1e' };
+    expect(await createHelper().composeModel(p)).toEqual({ error: 'yaml: bad' });
+    docker.handler = () => ({ exitCode: 1, stderr: 'boom' });
+    await expect(createHelper().composeModel(p)).rejects.toBeInstanceOf(CommandError);
+  });
+
+  it.each<[string, string[]]>([
+    ['no file', []],
+    ['a file outside the repository', ['/workspaces/other/compose.yml']],
+    ['a file with ..', ['/workspaces/api/../other/compose.yml']],
+    ['the configuration folder', ['/workspaces/.devenv+/compose.yml']],
+  ])('composeModel refuses %s before any Docker call', async (_name, files) => {
+    await expect(createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: 'p' })).rejects.toThrow(/Invalid compose files/);
+    expect(docker.calls).toHaveLength(0);
+  });
+
+  it('readConfiguration with an override writes it and the files into the helper, and passes the project name', async () => {
+    docker.handler = () => ({ stdout: '{"configuration":{"service":"app"}}\n' });
+    const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app' };
+    const result = await createHelper().readConfiguration({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      configPath: '.devcontainer/devcontainer.json',
+      environmentId: '3f2a9c1e-5b7d',
+      merged: false,
+      override,
+      files: { [COMPOSE_MODEL_PATH]: '{"services":{}}' },
+      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+    });
+    expect(result).toEqual({ config: { service: 'app' } });
+    const run = docker.runs[0];
+    expect(hasDockerAccess(run.args)).toBe(true);
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(commandOf(run.args)).toEqual([
+      'node',
+      '-e',
+      WRITE_AND_RUN_SCRIPT,
+      '/tmp/devenv-override',
+      '',
+      '',
+      'read-configuration',
+      '--workspace-folder',
+      '/workspaces/api',
+      '--config',
+      '/workspaces/api/.devcontainer/devcontainer.json',
+      '--id-label',
+      'devenv.environment-id=3f2a9c1e-5b7d',
+      '--override-config',
+      OVERRIDE_CONFIG_PATH,
+    ]);
+    expect(JSON.parse(run.options.input ?? '')).toEqual({
+      files: { [COMPOSE_MODEL_PATH]: '{"services":{}}', [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
+    });
+  });
+
+  it('build with our copy of the configuration names it with --config and keeps the repository configuration for the lockfile', async () => {
+    docker.handler = () => ({ stdout: '{"outcome":"success","imageName":["devenv-3f2a9c1e:2"]}\n' });
+    const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app' };
+    await createHelper().build({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      configPath: '.devcontainer/devcontainer.json',
+      imageName: 'devenv-3f2a9c1e:2',
+      override,
+      files: { [COMPOSE_MODEL_PATH]: '{}', [COMPOSE_DEV_DOCKERFILE]: 'FROM x\n' },
+      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+    });
+    const run = docker.runs[0];
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(commandOf(run.args)).toEqual([
+      'node',
+      '-e',
+      WRITE_AND_RUN_SCRIPT,
+      '/tmp/devenv-override',
+      '/workspaces/api/.devcontainer/devcontainer.json',
+      OVERRIDE_CONFIG_PATH,
+      'build',
+      '--workspace-folder',
+      '/workspaces/api',
+      '--config',
+      OVERRIDE_CONFIG_PATH,
+      '--image-name',
+      'devenv-3f2a9c1e:2',
+      '--user-data-folder',
+      '/devenv-cache',
+    ]);
+    expect(Object.keys(JSON.parse(run.options.input ?? '').files)).toEqual([COMPOSE_MODEL_PATH, COMPOSE_DEV_DOCKERFILE, OVERRIDE_CONFIG_PATH]);
+  });
+
+  it('up with files writes them with the override configuration and passes the project name', async () => {
+    docker.handler = () => ({ stdout: '{"outcome":"success","containerId":"c1","composeProjectName":"devenv-3f2a9c1e"}\n' });
+    const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app', shutdownAction: 'none' };
+    const result = await createHelper().up({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      override,
+      environmentId: '3f2a9c1e-5b7d',
+      removeExistingContainer: false,
+      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
+      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+    });
+    expect(result).toMatchObject({ outcome: 'success', containerId: 'c1' });
+    const run = docker.runs[0];
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    const command = commandOf(run.args);
+    expect(command.slice(0, 7)).toEqual(['node', '-e', WRITE_AND_RUN_SCRIPT, '/tmp/devenv-override', '', '', 'up']);
+    expect(command).toContain('--override-config');
+    expect(JSON.parse(run.options.input ?? '')).toEqual({
+      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}', [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
+    });
+  });
+
+  it.each<[string, string]>([
+    ['a file outside the override folder', '/tmp/other/compose.json'],
+    ['a file with ..', '/tmp/devenv-override/../x.json'],
+    ['a file with an empty segment', '/tmp/devenv-override//x.json'],
+  ])('refuses %s before any Docker call', async (_name, file) => {
+    await expect(
+      createHelper().up({
+        volumeName: 'vol',
+        repository: 'acme/api',
+        override: {},
+        environmentId: 'e',
+        removeExistingContainer: false,
+        files: { [file]: '{}' },
+      }),
+    ).rejects.toThrow(/Invalid helper file/);
+    expect(docker.runs).toHaveLength(0);
   });
 });
 

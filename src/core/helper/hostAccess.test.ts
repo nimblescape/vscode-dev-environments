@@ -17,18 +17,28 @@ import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_STOP_TIMEOUT_SECONDS,
   buildOptionProblems,
+  foreignNetworkItem,
   hostAccessProblems,
   hostAccessReport,
+  imageLabelItems,
+  imageReferenceFinding,
+  resolveNetworkReference,
+  resolvedByImageId,
+  isHelperPath,
   isLoopbackAddress,
   isOwnVolume,
   isSameOwnerAdditionalVolume,
+  localImageRepository,
   loopbackAppPorts,
   loopbackRunArgs,
   mountedVolumeNames,
   overrideRunArgs,
   removedRunArgs,
+  runArgsNetworks,
   runArgsProblems,
   splitPortAddress,
+  volumeLabelOwner,
+  volumeNameItems,
   withLoopbackAddress,
   withoutNameArgs,
   type HostAccessReport,
@@ -341,7 +351,8 @@ describe('host access policy: settings that need access to the computer, and set
     expect(
       report({ runArgs: ['-v', '/Users/x:/x', '-P', '--gpus', 'all'], build: { options: ['--secret', 'id=a'] }, initializeCommand: 'x' }),
     ).toEqual({
-      hostAccess: ['initializeCommand', 'bind mount /Users/x', 'publishing all ports (-P)', '--gpus=all', 'build option --secret'],
+      // Review round 3, S3-6: changed expectation, the secret `id=a` without a source is the file `a` (a relative path).
+      hostAccess: ['initializeCommand', 'bind mount /Users/x', 'publishing all ports (-P)', '--gpus=all', 'build option --secret', 'build option --secret id=a (a relative path)'],
       unsupported: [],
     });
   });
@@ -375,7 +386,8 @@ describe('host access policy: the runArgs that Docker gets', () => {
       .runArgs as string[];
     // The host name is left out where the repository decides it (runArgsDecideHostname).
     const added = all.at(-2) === '--hostname' ? ['--hostname', 'api'] : [];
-    const tail = ['--label', 'devenv.container-version=4', '--name', OWN, ...added];
+    // Review round 2 (D2-1): changed expectation, the override configuration also sets the labels of Docker Compose empty.
+    const tail = ['--label', 'devenv.container-version=4', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service=', '--name', OWN, ...added];
     expect(all.slice(-tail.length)).toEqual(tail);
     return all.slice(0, -tail.length);
   }
@@ -451,8 +463,26 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       containerName: OWN,
       runArgs: ['--platform', 'linux/amd64', '--rm', '-it', '--cap-drop', 'ALL', '-d', '--label', '--rm'],
     });
-    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', OWN, '--hostname', 'api']);
-    expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual([]);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    expect(override.runArgs).toEqual([
+      '--platform',
+      'linux/amd64',
+      '--cap-drop',
+      'ALL',
+      '--label',
+      '--rm',
+      '--label',
+      'devenv.container-version=4',
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
+      '--name',
+      OWN,
+      '--hostname',
+      'api',
+    ]);
+    expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
   });
 });
 
@@ -501,7 +531,8 @@ describe('host access policy: build options', () => {
     ['entitlements', ['--allow', 'network.host'], ['build option --allow']],
     ['a build context of a folder', ['--build-context', 'src=/Users/x/src'], ['build option --build-context=src=/Users/x/src']],
     ['a build context of an OCI layout (a folder)', ['--build-context=x=oci-layout:///Users/x'], ['build option --build-context=x=oci-layout:///Users/x']],
-    ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o']],
+    // Review round 3, S3-6: changed expectation, `-o out` writes to a relative path.
+    ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o', 'build option -o out (a relative path)']],
     ['an unknown option', ['--progress=plain'], ['build option --progress']],
   ])('%s', (_name, options, expected) => {
     expect(buildOptionProblems(options)).toEqual(expected);
@@ -577,8 +608,30 @@ describe('host access policy: properties of the configuration, the merged config
     for (const runArgs of [['--init', '-p', '3000'], ['--label', CONTAINER_CONFIG_UNKNOWN_LABEL]]) {
       const override = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs });
       expect(override.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
-      expect(hostAccessReport({ config: { runArgs: override.runArgs }, merged: override, ownVolume: OWN })).toEqual({ hostAccess: [], unsupported: [] });
+      // Review round 2 (D2-1): changed input, the final check says that `config` is the override configuration (its
+      // labels of Docker Compose with empty values).
+      expect(hostAccessReport({ config: { runArgs: override.runArgs }, merged: override, ownVolume: OWN, overrideConfiguration: true })).toEqual({
+        hostAccess: [],
+        unsupported: [],
+      });
     }
+  });
+
+  it('allows the empty labels of Docker Compose only as the override configuration adds them (review round 2, D2-1)', () => {
+    const runArgs = ['--init', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
+    // The repository may not write them, nor any other value of a label of Docker Compose.
+    expect(hostAccessReport({ config: { runArgs }, ownVolume: OWN }).unsupported).toEqual(['label com.docker.compose.project', 'label com.docker.compose.service']);
+    expect(hostAccessReport({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual({ hostAccess: [], unsupported: [] });
+    // The merged configuration of an existing container holds the override configuration.
+    expect(hostAccessReport({ config: {}, merged: { runArgs }, ownVolume: OWN })).toEqual({ hostAccess: [], unsupported: [] });
+    // Exactly these: another value, or another label of Docker Compose, stays refused also in the override configuration.
+    const other = ['--label', 'com.docker.compose.project=shop', '--label', 'com.docker.compose.oneoff=', '-l', 'com.docker.compose.project= '];
+    expect(hostAccessReport({ config: { runArgs: other }, ownVolume: OWN, overrideConfiguration: true }).unsupported).toEqual([
+      'label com.docker.compose.project',
+      'label com.docker.compose.oneoff',
+    ]);
+    const override = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: [] });
+    expect(override.runArgs).toEqual(expect.arrayContaining(['com.docker.compose.project=', 'com.docker.compose.service=']));
   });
 
   it('checks the merged configuration (Features and the base image) and the image metadata too', () => {
@@ -834,6 +887,30 @@ describe('volumes of other programs, by their labels (restrictions summary, find
   });
 });
 
+describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, composeAccess.ts)', () => {
+  it.each<[string, Record<string, string>, string | undefined]>([
+    ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop' }, 'the Docker Compose project shop'],
+    // The volumes of the Compose project of an environment carry both: the environment label decides (spec u6).
+    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': 'devenv-11111111', 'devenv.environment-id': 'x' }, 'another environment'],
+    ['a volume of an environment', { 'devenv.environment-id': 'x' }, 'another environment'],
+    ['no labels', {}, undefined],
+  ])('volumeLabelOwner: %s', (_name, labels, expected) => {
+    expect(volumeLabelOwner(labels)).toBe(expected);
+  });
+
+  it('volumeNameItems applies the rules of the named volumes of mounts', () => {
+    const environment = { id: 'e1', ownerId: '1' };
+    expect(volumeNameItems(OWN, { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('cache', { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('devenv-helper-cache', { ownVolume: OWN })).toEqual(['volume devenv-helper-cache of the workspace helper']);
+    expect(volumeNameItems('cache', { ownVolume: OWN, foreignVolumes: ['cache'] })).toEqual(['volume cache of another environment']);
+    const own = { 'devenv.environment-id': 'e1', 'devenv.owner-id': '1', 'devenv.volume': 'compose' };
+    expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: own } })).toEqual([]);
+    const other = { ...own, 'devenv.environment-id': 'e2' };
+    expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: other } })).toEqual(['volume data of another environment']);
+  });
+});
+
 describe('ports on localhost', () => {
   it.each<[string, string | undefined, string]>([
     ['80', undefined, '80'],
@@ -973,5 +1050,212 @@ describe('variables of the account of the GitHub CLI (user decision 2026-09-26, 
       hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
       unsupported: [],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 1 of unit 6 (S1, S2, S3, S4, D2)
+
+describe('isHelperPath', () => {
+  const REPO = '/workspaces/api';
+  it.each([
+    ['/', true],
+    ['/devenv-cache', true],
+    ['/devenv-cache/docker-compose', true],
+    ['/workspaces', true],
+    ['/workspaces/.devenv+', true],
+    ['/workspaces/.devenv+/github-token', true],
+    ['/workspaces/other', true],
+    ['/workspaces/api-other', true],
+    ['/var/run/docker.sock', true],
+    ['/var/run', true],
+    ['/var', true],
+    ['/workspaces/api/../.devenv+', true],
+    // Review round 3 (S3-1): the folders of the kernel, whose links lead anywhere.
+    ['/proc/self/root/devenv-cache', true],
+    ['/proc', true],
+    ['/sys/fs/cgroup', true],
+    ['/dev/fd/3', true],
+    ['/device', false],
+    ['/workspaces/api', false],
+    ['/workspaces/api/.devcontainer', false],
+    ['/opt/tools', false],
+    ['/tmp/devenv-override/context', false],
+    ['/etc', false],
+  ])('%s → %s', (file, expected) => {
+    expect(isHelperPath(file, REPO)).toBe(expected);
+  });
+});
+
+describe('imageReferenceFinding and localImageRepository', () => {
+  it.each([
+    ['devenv-11111111:2', 'devenv-11111111'],
+    ['docker.io/devenv-11111111:2', 'devenv-11111111'],
+    ['docker.io/library/devenv-11111111', 'devenv-11111111'],
+    ['index.docker.io/library/devenv-11111111:2', 'devenv-11111111'],
+    ['registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64), 'devenv-11111111-db'],
+    ['ghcr.io/acme/devenv-tools:1', 'ghcr.io/acme/devenv-tools'],
+    ['localhost:5000/devenv-x', 'localhost:5000/devenv-x'],
+    ['postgres:16', 'postgres'],
+  ])('%s → %s', (reference, repository) => {
+    expect(localImageRepository(reference)).toBe(repository);
+  });
+
+  it.each([
+    ['devenv-11111111:2', { item: 'image devenv-11111111:2 of another environment', class: 'protected' }],
+    ['Docker.io/Library/devenv-1', { item: 'image Docker.io/Library/devenv-1 of another environment', class: 'protected' }],
+    [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    // Review round 2 (S2-05): changed expectation, 12 hexadecimal characters may be a name; the pipeline asks Docker
+    // (resolvedByImageId).
+    ['dddddddddddd', undefined],
+    ['ghcr.io/acme/devenv-tools:1', undefined],
+    ['postgres:16', undefined],
+  ])('%s', (reference, expected) => {
+    expect(imageReferenceFinding(reference)).toEqual(expected);
+  });
+});
+
+describe('foreignNetworkItem and runArgsNetworks', () => {
+  const ID = 'e0000001-0000-4000-8000-000000000001';
+  it.each([
+    ['named like the project of another environment', 'devenv-11111111_default', undefined, true],
+    ['named like the own project', 'devenv-e0000001_default', undefined, false],
+    ['labelled for another environment', 'backend', { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] }, true],
+    ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ID] }, false],
+    ['labelled for a project of another program', 'backend', { labels: { 'com.docker.compose.project': 'shop' }, environments: [] }, false],
+    ['with a container of another environment', 'shared', { labels: {}, environments: [ID, 'e0000002-0000-4000-8000-000000000002'] }, true],
+    ['without anything of another environment', 'shared', { labels: {}, environments: [] }, false],
+  ])('%s', (_name, network, state, foreign) => {
+    expect(foreignNetworkItem(network, state, ID) !== undefined).toBe(foreign);
+  });
+
+  it('names the networks of runArgs, not the modes of Docker', () => {
+    expect(runArgsNetworks(['--network', 'host', '--net=backend', '--network', 'name=shared,alias=x', '--network', 'container:x', '-e', 'A=--network'])).toEqual([
+      'backend',
+      'shared',
+    ]);
+    expect(runArgsNetworks(undefined)).toEqual([]);
+  });
+});
+
+describe('the Dockerfile of a single container (review round 2, S2-01)', () => {
+  it('refuses a configured Dockerfile that could not be read as not supported', () => {
+    expect(hostAccessReport({ config: { build: { dockerfile: 'x' } }, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' })).toEqual({
+      hostAccess: [],
+      unsupported: ['Dockerfile ${localEnv:X}/Dockerfile (it could not be read, so its images cannot be checked)'],
+    });
+    // The text, when it was read, is checked instead.
+    expect(hostAccessReport({ config: {}, ownVolume: OWN, dockerfileText: 'FROM devenv-11111111:1', dockerfileUnreadable: 'x' }).hostAccess).toEqual([
+      'FROM image devenv-11111111:1 of another environment',
+    ]);
+  });
+});
+
+describe('the images that the Dockerfile of a single container names (review round 2, S2-02)', () => {
+  it('refuses the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
+    const dockerfileText = [
+      '# syntax=docker.io/library/devenv-11111111:9',
+      'FROM alpine AS base',
+      'FROM devenv-22222222${TARGETVARIANT}',
+      'COPY --from=base /a /a',
+      'COPY --from=devenv-33333333:1 /b /b',
+      'RUN --mount=type=cache,from=devenv-44444444,target=/c true',
+      'COPY --from=$IMAGE /d /d',
+    ].join('\n');
+    const expected = [
+      'syntax image docker.io/library/devenv-11111111:9 of another environment',
+      'FROM image devenv-22222222${TARGETVARIANT} of another environment (a variable that is not resolved)',
+      'COPY --from image devenv-33333333:1 of another environment',
+      'RUN --mount image devenv-44444444 of another environment',
+    ];
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config: { build: { dockerfile: 'Dockerfile' } }, ownVolume: OWN, dockerfileText }, checksOn)).toEqual({ hostAccess: expected, unsupported: [] });
+    }
+  });
+});
+
+describe('resolvedByImageId (review round 2, S2-05)', () => {
+  const digest = `sha256:${'e'.repeat(64)}`;
+  it.each<[string, string, string[], string[], boolean]>([
+    ['a name of the image', 'postgres:16', ['postgres:16'], [], false],
+    ['Docker Hub written in full', 'docker.io/library/postgres', ['postgres:latest'], [], false],
+    ['the short form of a full name', 'postgres', ['docker.io/library/postgres:latest'], [], false],
+    ['an ID prefix', 'a1b2c3d4', ['postgres:16'], [], true],
+    ['a short ID prefix', 'a1b', ['postgres:16'], [], true],
+    ['an image that is named like hexadecimal characters', 'a1b2c3d4', ['a1b2c3d4:latest'], [], false],
+    ['another tag of the same repository', 'postgres:15', ['postgres:16'], [], true],
+    ['a digest of the image', `postgres@${digest}`, [], [`postgres@${digest}`], false],
+    ['a tag and a digest of the image', `postgres:16@${digest}`, [], [`docker.io/library/postgres@${digest}`], false],
+    ['a digest that the image does not have', `postgres@${digest}`, ['postgres:16'], [], true],
+    ['a dangling image', 'a1b2c3d4', [], [], true],
+    ['no image name', 'Not/Valid:', [], [], false],
+  ])('%s', (_name, reference, tags, digests, expected) => {
+    expect(resolvedByImageId(reference, tags, digests)).toBe(expected);
+  });
+});
+
+describe('resolveNetworkReference (review round 2, S2-04)', () => {
+  const networks = [
+    { name: 'backend', id: 'aaaa1111' },
+    { name: 'aaaa', id: 'bbbb2222' },
+    { name: 'front', id: 'aaaa3333' },
+  ];
+  it('resolves as Docker does: full ID, name, then a unique ID prefix', () => {
+    expect(resolveNetworkReference('bbbb2222', networks)?.name).toBe('aaaa');
+    expect(resolveNetworkReference('backend', networks)?.name).toBe('backend');
+    expect(resolveNetworkReference('aaaa', networks)?.name).toBe('aaaa');
+    expect(resolveNetworkReference('aaaa3', networks)?.name).toBe('front');
+    expect(resolveNetworkReference('aaa', networks)).toBeUndefined();
+    expect(resolveNetworkReference('', networks)).toBeUndefined();
+    expect(resolveNetworkReference('zzzz', networks)).toBeUndefined();
+  });
+});
+
+describe('foreignNetworkItem (review round 2, S2-04 and P2-2)', () => {
+  const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+  it('checks the name of the network that a reference resolves to', () => {
+    expect(foreignNetworkItem('f00dbabe', { name: 'devenv-11111111_default', labels: {}, environments: [] }, ID)).toBe('network f00dbabe of another environment');
+    expect(foreignNetworkItem('f00dbabe', { name: 'devenv-3f2a9c1e_default', labels: {}, environments: [] }, ID)).toBeUndefined();
+  });
+
+  it('allows a container of an environment of the same owner, and no other', () => {
+    const other = '11111111-0000-4000-8000-000000000000';
+    expect(foreignNetworkItem('devnet', { labels: {}, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBeUndefined();
+    expect(foreignNetworkItem('devnet', { labels: {}, environments: [other, 'x'], sameOwnerEnvironments: [other] }, ID)).toBe('network devnet of another environment');
+    expect(foreignNetworkItem('devnet', { labels: {}, environments: [other] }, ID)).toBe('network devnet of another environment');
+    // The project network of another environment stays refused, also of the same owner.
+    expect(foreignNetworkItem('devenv-11111111_default', { labels: {}, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
+      'network devenv-11111111_default of another environment',
+    );
+    expect(foreignNetworkItem('backend', { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
+      'network backend of another environment',
+    );
+  });
+});
+
+describe('imageLabelItems', () => {
+  it('names the labels by which the extension and the CLI find containers, except devcontainer.metadata', () => {
+    // Review round 2 (D2-1): changed expectation, the label com.docker.compose.project of an image is no longer refused.
+    expect(
+      imageLabelItems('devenv-e0000001:2', {
+        'devcontainer.metadata': '[]',
+        'org.opencontainers.image.title': 'x',
+        'devenv.compose-service': 'x',
+        'devcontainer.local_folder': '/x',
+        'com.docker.compose.project': 'devenv-11111111',
+      }),
+    ).toEqual(['label devenv.compose-service of the image devenv-e0000001:2', 'label devcontainer.local_folder of the image devenv-e0000001:2']);
+  });
+
+  it('allows the labels of Docker Compose of any project (review round 2, D2-1)', () => {
+    // Changed expectation (D2-1): an image that Compose built for another project (inherited through FROM) is usable; a
+    // single container gets the labels empty in its override configuration, and Compose sets its own on its containers.
+    const built = { 'com.docker.compose.project': 'devenv-e0000001', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(imageLabelItems('devenv-e0000001-app', built)).toEqual([]);
+    expect(imageLabelItems('x', { 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'shop' })).toEqual([]);
+    expect(imageLabelItems('x', { 'devenv.host-access': 'unrestricted', 'com.docker.compose.project': 'shop' })).toEqual([
+      'label devenv.host-access of the image x',
+    ]);
   });
 });
