@@ -48,6 +48,9 @@ describe('the host name of the container in the override configuration', () => {
     ['--network host', ['--network', 'host']],
     ['--net=host', ['--net=host']],
     ['--network container:', ['--network', 'container:db']],
+    ['--network name=container:', ['--network', 'name=container:db']],
+    ['--net=name=container:,alias=', ['--net=name=container:db,alias=x']],
+    ['--network "name=container:"', ['--network', '"name=container:db"']],
     ['--uts host', ['--uts', 'host']],
   ])('adds none where the repository decides it: %s', (_label, runArgs) => {
     expect(runArgsDecideHostname(runArgs)).toBe(true);
@@ -60,6 +63,7 @@ describe('the host name of the container in the override configuration', () => {
     ['-e HOSTNAME', ['-e', 'HOSTNAME=x']],
     ['--network bridge', ['--network', 'bridge']],
     ['--network none', ['--network', 'none']],
+    ['--network name=bridge,alias=', ['--network', 'name=bridge,alias=app']],
   ])('adds it where the repository does not decide it: %s', (_label, runArgs) => {
     expect(runArgsDecideHostname(runArgs)).toBe(false);
     expect(hostnameOf(runArgs)).toBe('module-oop');
