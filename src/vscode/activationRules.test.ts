@@ -7,6 +7,7 @@ import type { PendingOperation } from '../core/types';
 import {
   PENDING_OPERATION_MAX_AGE_MS,
   REOPEN_MIN_AGE_MS,
+  REOPEN_TOO_RECENT_REASON,
   decideReopen,
   pipelineJustRan,
   sortPendingOperations,
@@ -84,7 +85,8 @@ describe('decideReopen', () => {
     ['an operation is pending', { pendingOperations: 1 }],
     ['no reopen record exists', { record: undefined }],
     ['the environment was deleted', { environmentIds: new Set(['e2']) }],
-    ['the record is younger than 30 seconds (Close Remote Connection)', { record: { environmentId: 'e1', closedAt: iso(NOW - REOPEN_MIN_AGE_MS) } }],
+    // The guard is 5 seconds since the user decision 2026-09-26, "go with the proposal for closing" (it was 30 seconds).
+    ['the record is not older than 5 seconds (Close Remote Connection)', { record: { environmentId: 'e1', closedAt: iso(NOW - REOPEN_MIN_AGE_MS) } }],
     ['the record time is in the future', { record: { environmentId: 'e1', closedAt: iso(NOW + 60_000) } }],
     ['the record time is invalid', { record: { environmentId: 'e1', closedAt: 'yesterday' } }],
   ])('does not reopen when %s', (_name, overrides) => {
@@ -93,8 +95,28 @@ describe('decideReopen', () => {
     if (!decision.reopen) expect(decision.reason).not.toBe('');
   });
 
-  it('reopens a record just older than 30 seconds', () => {
+  // User decision 2026-09-26, "go with the proposal for closing": the guard is 5 seconds, not 30. The log showed a real
+  // reopen from the macOS Dock that the 30-second rule blocked; Close Remote Connection brings up the empty window within
+  // 1 to 3 seconds, which the guard still covers.
+  it('reopens a record just older than 5 seconds', () => {
+    expect(REOPEN_MIN_AGE_MS).toBe(5_000);
     expect(decideReopen({ ...base, record: { environmentId: 'e1', closedAt: iso(NOW - REOPEN_MIN_AGE_MS - 1) } }).reopen).toBe(true);
+  });
+
+  it('guards 5 seconds: no reopen after 1, 3, and 4 seconds, a reopen after 6 seconds and after 30 seconds', () => {
+    const after = (ms: number) => decideReopen({ ...base, record: { environmentId: 'e1', closedAt: iso(NOW - ms) } });
+    for (const ms of [1_000, 3_000, 4_000, 5_000]) {
+      expect(after(ms)).toEqual({ reopen: false, reason: REOPEN_TOO_RECENT_REASON });
+    }
+    expect(after(6_000)).toEqual({ reopen: true, environmentId: 'e1' });
+    // A reopen from the macOS Dock 10 to 30 seconds after the quit, which the 30-second rule blocked.
+    expect(after(10_000)).toEqual({ reopen: true, environmentId: 'e1' });
+    expect(after(30_000)).toEqual({ reopen: true, environmentId: 'e1' });
+  });
+
+  it('derives the reason text from the constant', () => {
+    expect(REOPEN_TOO_RECENT_REASON).toBe('the last environment was closed less than 5 seconds ago');
+    expect(REOPEN_TOO_RECENT_REASON).not.toContain('30');
   });
 
   describe('in an Extension Development Host (a debug run)', () => {

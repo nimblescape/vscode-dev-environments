@@ -455,6 +455,7 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['lastBuildNumber', isCount],
   ['owner', isOwner],
   ['refusedUpdate', isRefusedUpdate],
+  ['keepRunning', (value) => typeof value === 'boolean'],
 ];
 
 /**

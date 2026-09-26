@@ -88,8 +88,8 @@ describe('RepositoriesTreeProvider', () => {
       label: 'api',
       id: 'repo:acme/api',
       description: 'main   Connected',
-      // Unit 10: the flag of the host access checks (on by default).
-      contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked',
+      // Unit 10: the flag of the host access checks (on by default). Unit 26: Keep Running When Closed (off by default).
+      contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning',
     });
     expect((apiItem.iconPath as ThemeIcon).id).toBe('circle-filled');
     // A repository without environment has no state symbol.

@@ -178,6 +178,37 @@ describe('EnvironmentRegistry reading', () => {
     await expect(new EnvironmentRegistry(paths).get(ID_A)).resolves.toMatchObject({ busy });
   });
 
+  // User decision 2026-09-26, "go with the proposal for closing": the switch Keep Running When Closed is stored with the
+  // environment. Entries of earlier versions have no field, which means false.
+  it('reads keepRunning with and without the field, drops an invalid value, and writes it under the lock', async () => {
+    writeRaw({
+      version: 1,
+      environments: [
+        environment(ID_A, 'o/a', { keepRunning: true }),
+        environment(ID_B, 'o/b', { keepRunning: false }),
+        environment(ID_C, 'o/c'),
+        { ...environment(ID_D, 'o/d'), keepRunning: 'yes' },
+      ],
+    });
+    const registry = new EnvironmentRegistry(paths);
+    const list = await registry.list();
+    expect(list.map((entry) => entry.keepRunning)).toEqual([true, false, undefined, undefined]);
+    expect(list[2]).toEqual(environment(ID_C, 'o/c'));
+    expect('keepRunning' in list[3]).toBe(false);
+
+    await registry.updateEnvironment(ID_C, (entry) => {
+      entry.keepRunning = true;
+    });
+    await registry.updateEnvironment(ID_A, (entry) => {
+      delete entry.keepRunning;
+    });
+    const written = readRaw().environments as Array<Record<string, unknown>>;
+    expect(written.find((entry) => entry.id === ID_C)?.keepRunning).toBe(true);
+    expect(written.find((entry) => entry.id === ID_A)).not.toHaveProperty('keepRunning');
+    // The lock folder is gone after the write.
+    expect(fs.existsSync(paths.registryLock)).toBe(false);
+  });
+
   it('finds the environment of a repository and account, ignoring the case of the repository', async () => {
     writeRaw({
       version: 1,

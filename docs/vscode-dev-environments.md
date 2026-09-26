@@ -62,7 +62,7 @@ Main behavior:
 | Environment image | The image that the extension builds for an environment from its configuration: the base image plus the Dev Container Features. Containers are created from this image, also without internet access. |
 | Build record | The name of the current environment image, and the digests of the images and Features that it was built from |
 | Stop | Stop a container with `docker stop`. Its processes end, and it frees its memory. The container and the workspace volume stay, so the next start takes only seconds. |
-| Waiting time | The time between "no window uses the environment" and "the extension stops the container". Default: 30 seconds. |
+| Waiting time | The time between "no window uses the environment" and "the extension stops the container". Default: 30 seconds (setting `devEnvLauncher.waitingTimeSeconds`). An environment with **Keep Running When Closed** has no waiting time: the extension does not stop it (see [7.9](#79-stop-on-close-and-crash-handling)). |
 | Session Monitor | A small helper process of this extension. It stops containers when no window uses them anymore. |
 | Open pipeline | The fixed sequence of steps that the extension runs to open, reopen, update, or reconnect an environment |
 
@@ -85,7 +85,7 @@ This extension offers the same one-action experience with local containers. It u
 | FR-03 | The user can select a branch. If a repository has several configurations, the user can select one. Both selections apply to the one environment of the repository of the signed-in account (see [D-3](#13-decisions)). |
 | FR-04 | No flow requires the user to use commands, views, or prompts of the Dev Containers extension. |
 | FR-05 | While connected to an environment, the user can switch to another environment. |
-| FR-06 | When a window closes, or when VS Code quits, the extension stops the container of that window. No process of the environment keeps running in the background, and the container uses no memory. |
+| FR-06 | When a window closes, or when VS Code quits, the extension stops the container of that window after the waiting time. No process of the environment keeps running in the background, and the container uses no memory. Opt-out per environment: **Keep Running When Closed** keeps the container of that environment running until the user stops or deletes it; **Stop When Closed** switches back. The setting `stopOnClose = false` keeps all environments running (see [7.9](#79-stop-on-close-and-crash-handling)). User decision 2026-09-26: "go with the proposal for closing". |
 | FR-07 | When VS Code starts, it reopens and connects the last used environment automatically. |
 | FR-08 | Reconnection is automatic: the extension starts Docker if needed (FR-14), starts stopped containers, and creates missing containers again. |
 | FR-09 | The user can rebuild and delete an environment. Before delete, the extension warns about uncommitted or unpushed changes. |
@@ -102,7 +102,7 @@ This extension offers the same one-action experience with local containers. It u
 | NFR-01 | Ease of use: a new user reaches a running environment in three steps: sign in, select a repository, wait. |
 | NFR-02 | Messages use plain language. Technical logs are shown only on request. |
 | NFR-03 | The extension stores no secrets in its settings or global storage. GitHub access uses the built-in GitHub sign-in of VS Code. The token of the account that owns an environment is written into the workspace volume of that environment, as in a codespace. Docker keeps the volume on the disk of the computer (see [section 9](#9-security-and-privacy)). |
-| NFR-04 | No container keeps running after a VS Code crash. A window reload and computer sleep do not stop a container that a window uses. |
+| NFR-04 | No container keeps running after a VS Code crash, except the environments that the user keeps running (FR-06). A window reload and computer sleep do not stop a container that a window uses. |
 | NFR-05 | Primary platform: macOS with Docker Desktop. Linux with Docker Engine is supported. Windows is supported with Docker Desktop and the WSL 2 back end. |
 | NFR-06 | Internal details of the Dev Containers extension are used in one component only: the module `src/core/devContainers.ts` (the Connection Adapter encodes the folder URI with the literal of this module). A change in the Dev Containers extension affects only this component. |
 | NFR-07 | Data safety: only the action **Delete** removes a workspace volume. An update never removes a working container before its replacement is ready. |
@@ -232,6 +232,8 @@ Green always means that the container runs; the shape tells which window uses it
 | ◌ | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
 | ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
 
+**Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (green while the container runs, the grey ring while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
+
 **Actions in a row:**
 
 | Action | Shown when | Effect |
@@ -240,10 +242,12 @@ Green always means that the container runs; the shape tells which window uses it
 | **Start in New Window** (context menu and **⋯**; while `openInNewWindow` is on: **Start in Current Window**) | Like **Start** | The same as **Start**, but a new window connects. The current window keeps its environment, also from an empty window (the user asked for a new window). **Start in Current Window** connects the current window. |
 | **Stop** | The container runs | The container stops at once. If a window is connected, the extension closes the connection first. The workspace volume is kept. |
 | **Delete** | The repository has an environment | Safety check, then the extension removes the container and the workspace volume (see [7.14](#714-rebuild-and-delete)). The repository stays in the list if GitHub lists it. |
+| **Keep Running When Closed** (context menu and **⋯**) | The repository has an environment that is not kept | The switch `keepRunning` of the environment is set in the registry, and the row shows `kept`. The Session Monitor no longer stops the environment when no window uses it (see [7.9](#79-stop-on-close-and-crash-handling)). Nothing starts or stops at once. |
+| **Stop When Closed** (context menu and **⋯**) | The environment is kept | The switch is removed. The container stops after the waiting time once no window uses it. |
 
 **Which window connects.** By default, **Start** connects the current window, which leaves its previous environment. **Start in New Window** opens a new window for the environment, and the current window stays as it is: its own environment stays connected and in use. This allows several windows at the same time, each with its own environment. An environment is never open in two windows: if another window is connected to it, **Start** and **Start in New Window** show that window (VS Code brings the window that has the folder open to the front instead of opening a second one, see [7.11](#711-switching)). If VS Code did not find that window, **Start in New Window** would open a new one and never replace the current window. A **Start** of the environment of the current window only shows a message; **Reconnect** of a lost connection always uses the current window.
 
-**⋯** (menu of a row): Start in New Window (or Start in Current Window), Switch branch…, Select configuration… (only if the repository has several configurations), Rebuild, Show on GitHub, and Turn Off Host Access Checks… or, while they are off, Turn On Host Access Checks (see [section 9](#9-security-and-privacy), "Host access"). The row of a repository whose host access checks are off shows `host access unrestricted` in its description and a warning in its tooltip.
+**⋯** (menu of a row): Start in New Window (or Start in Current Window), Switch branch…, Select configuration… (only if the repository has several configurations), Rebuild, Show on GitHub, Keep Running When Closed or, for a kept environment, Stop When Closed (only for a repository with an environment; the `contextValue` of the row has the flag `canKeepRunning` or `kept`, and the `when` clause of each command matches one of them, so exactly one shows), and Turn Off Host Access Checks… or, while they are off, Turn On Host Access Checks (see [section 9](#9-security-and-privacy), "Host access"). The row of a repository whose host access checks are off shows `host access unrestricted` in its description and a warning in its tooltip.
 
 - **Switch branch…** switches the branch in the environment and connects the current window (see [7.5](#75-environment-model-and-workspace-volume)). If the repository has no environment, the extension creates it on the selected branch.
 - **Select configuration…** changes the configuration of the environment and rebuilds its container (see [7.5](#75-environment-model-and-workspace-volume)).
@@ -306,8 +310,9 @@ Messages name the situation and offer at most one action:
 | Start in a new window | Select **Start in New Window** on a repository | A new window connects to the environment. The current window keeps its environment. |
 | Update | None (automatic at each connection) | If a newer image exists, the container is rebuilt with it before the window connects. The workspace volume is kept. |
 | Start without internet access | Select **Start** on a repository that has an environment | The update step is skipped. The environment starts with the local image. |
-| Switch | Select another environment in the switcher | The same window connects to the other environment. The previous environment stops. |
-| Close | Close the window, or quit VS Code | The environment stops after the waiting time (default: 30 seconds). |
+| Switch | Select another environment in the switcher | The same window connects to the other environment. The previous environment stops after the waiting time, unless it keeps running when closed. |
+| Close | Close the window, or quit VS Code | The environment stops after the waiting time (default: 30 seconds), unless it keeps running when closed. |
+| Keep running | Select **Keep Running When Closed** in the menu of a repository | The environment keeps running when no window uses it, until **Stop** or **Delete**. |
 | Reopen | Start VS Code | The last environment starts and connects. |
 | Stop | Select **Stop** on a repository | The container stops at once. The workspace volume is kept. |
 | Rebuild | Select **Rebuild** in the menu of a repository | The container is created again. The workspace volume is kept. |
@@ -741,7 +746,7 @@ Results for typical situations:
 | Situation | What the Session Monitor sees | Result |
 |---|---|---|
 | Window closed, or VS Code quit | State `closing`, process ended | Stop after the waiting time |
-| Switch to another environment in the same window | The old environment is no longer referenced. The new environment has a pending connection file. | The old environment stops after the waiting time. |
+| Switch to another environment in the same window | The old environment is no longer referenced. The new environment has a pending connection file. | The old environment stops after the waiting time, unless it is kept. |
 | Start in a new window | The current window still references its environment. The new environment has a pending connection file until the new window writes its status file. | No stop of either environment |
 | Window reload | For some seconds, no window references the environment. Then the reloaded window writes a new status file. | No stop, if the reload takes less than the waiting time |
 | VS Code crash or forced termination | Process ended, no `closing` state | Stop after the waiting time |
@@ -749,6 +754,7 @@ Results for typical situations:
 | Computer sleep | After wake, all `updatedAt` values are old. | No stop. After a gap in its own checks, the Session Monitor ignores the age of `updatedAt` for 60 seconds, so that the windows can update their files. |
 | Computer shutdown or Docker restart | Docker stops all containers. | The next connection starts them. |
 | Update, rebuild, or delete in progress | Environment marked as `busy` | No stop |
+| Environment with **Keep Running When Closed** | `keepRunning: true` in the registry | No stop: not after close or quit, not after computer sleep, not for a window that does not respond, and not as the retry of a failed stop. Docker is not asked for its container. |
 
 Further rules:
 
@@ -758,6 +764,18 @@ Further rules:
 - It deletes the status files of ended processes after the waiting time.
 - It ends itself when no VS Code window is alive and no waiting time is running.
 - When the extension activates, it starts the Session Monitor if none runs. So a container that kept running without a window after an earlier failure stops at the next start of VS Code.
+
+**Keep running when closed.** User decision 2026-09-26: "go with the proposal for closing". The default stays: when no window uses an environment any more (window closed, VS Code quit, **Close Remote Connection**), its container stops after the waiting time. The opt-out is a switch per environment:
+
+- **Keep Running When Closed** in the context menu of a repository row (and in its **⋯** menu, and in the Command Palette with a list of the environments) sets `keepRunning: true` in the registry entry of the environment; **Stop When Closed** removes it. The switch is written under the registry lock like every change, so it survives restarts of VS Code and of the computer. Entries without the field (of earlier versions) are not kept.
+- The Session Monitor never stops a kept environment: it gets no waiting time, a running waiting time ends when the switch is set, and the monitor checks the switch again right before a stop (the user may set it while the Git state is recorded). This holds when the window closes, when VS Code quits, after computer sleep, and for a failed stop that would be tried again. The monitor also ends while a kept container runs.
+- Only the user stops a kept environment: **Stop** stops it at once, and the switch stays set, so the next **Start** runs it as kept again. **Delete** removes it with its entry.
+- The global setting `devEnvLauncher.stopOnClose = false` keeps all environments running, as before. The switch adds kept environments only while `stopOnClose` is `true`.
+- The switch cannot take effect on a stop that has already begun. The monitor checks it right before `docker stop`; when the user sets it after that point, the `docker stop` that runs (up to 10 seconds, see **Why `docker stop`** below) is finished, and the container is stopped. The switch stays set, so the next **Start** runs the environment as kept.
+- A Session Monitor of an older version of the extension does not know the switch and would stop a kept environment. The monitor therefore has a protocol version (see [implementation notes, section 12](implementation-notes.md#12-session-monitor)). A window that finds a running monitor of a known, older version asks it to exit and starts the current one, which takes over when the older one has ended. The window only asks and never sends a signal: the monitor finishes its current step first, including a `docker stop` that has started. A restart of VS Code alone does not reliably retire a monitor of such a version: it ends only when no VS Code window is alive, no pending connection file is fresh (2 minutes), and no waiting time runs (30 seconds by default, `devEnvLauncher.waitingTimeSeconds`). Before it ends, it stops kept environments one last time, because it does not know the switch. After updating from a version without monitor versions: (1) quit VS Code (all windows); (2) wait at least the waiting time (up to 2 minutes plus the waiting time when a connection was just being opened), or until the Session Monitor log `<global storage>/monitor.log` (the global storage folder of the extension, for example `~/.config/Code/User/globalStorage/nimblescape.vscode-dev-environments/monitor.log` on Linux, `~/Library/Application Support/Code/User/globalStorage/nimblescape.vscode-dev-environments/monitor.log` on macOS, `%APPDATA%\Code\User\globalStorage\nimblescape.vscode-dev-environments\monitor.log` on Windows) shows `Session Monitor ends`; (3) then reopen VS Code, and start kept environments again that the old monitor stopped.
+- The sidebar shows the state text with ` · kept` in every state, also while the environment is stopped (`Stopped · kept`, see [6.2](#62-sidebar-view)).
+- Remote Docker hosts (unit 7) use the same switch when they come.
+- After a lost registry, an entry that is restored from the volume labels (see [7.5](#75-environment-model-and-workspace-volume)) is not kept: the labels do not hold the switch.
 
 **Why `docker stop`.** A stopped container has no running processes and uses no memory. The container itself is kept, so the next start takes only seconds and needs no rebuild. Docker first sends a stop signal (default `SIGTERM`) to the main process of the container, and after 10 seconds `SIGKILL`, so programs in the container can end cleanly. At the next start, `postStartCommand` runs again, for example to start a development server. When no container runs, the Resource Saver mode of Docker Desktop stops the Docker engine after 5 minutes (default). This also reduces the memory use of Docker Desktop itself. The alternative `docker pause` keeps the processes and their memory (see [D-4](#13-decisions)).
 
@@ -773,9 +791,9 @@ Two mechanisms work together:
    - The window is empty (no folder is open).
    - No other VS Code window is alive (no other status file with an existing process).
    - No operation is pending, for example a rebuild (see [7.14](#714-rebuild-and-delete)).
-   - A reopen record exists, and it is older than 30 seconds.
+   - A reopen record exists, and it was older than 5 seconds when the window began to activate.
 
-   In an Extension Development Host (a debug run of the extension, `ExtensionMode.Development`), the 30 seconds do not apply, and only other windows that are connected to an environment count: a new debug run starts within seconds after the previous one closed its window, and the window with the source code stays open. Cost: **Close Remote Connection** in a debug run connects the window again once (Cancel on the progress notification keeps it empty); VS Code gives no way to tell that reload from a new debug run.
+   In an Extension Development Host (a debug run of the extension, `ExtensionMode.Development`), the 5 seconds do not apply, and only other windows that are connected to an environment count: a new debug run starts within seconds after the previous one closed its window, and the window with the source code stays open. Cost: **Close Remote Connection** in a debug run connects the window again once (Cancel on the progress notification keeps it empty); VS Code gives no way to tell that reload from a new debug run.
 
    A notification "Opening acme-university/api… [Cancel]" lets the user stay in the empty window.
 
@@ -787,14 +805,14 @@ Two mechanisms work together:
 
 With several windows (see **Start in New Window** in [6.2](#62-sidebar-view)), each window writes the record of its own environment, so the record names the environment of the window that closed last.
 
-The age condition has a reason. The VS Code command **Close Remote Connection** also changes a window to an empty window. The extension then activates again within a few seconds, and the reopen record is younger than 30 seconds. So the extension does not reconnect a window that the user disconnected on purpose. The reopen rule is decision [D-5](#13-decisions).
+The age condition has a reason. The VS Code command **Close Remote Connection** also changes a window to an empty window. The extension then activates again within 1 to 3 seconds, and the reopen record is younger than 5 seconds (`REOPEN_MIN_AGE_MS` in `src/vscode/activationRules.ts`; the reason in the log is derived from it). So the extension does not reconnect a window that the user disconnected on purpose. The age is measured at the start of the activation, before anything else runs: the checks before the reopen decision (the window status, the pending operations, the GitHub account, and a pause of 3 seconds for windows that VS Code restores at the same time) take several seconds, and measured at the decision, the record of a **Close Remote Connection** would be older than 5 seconds. The limit was 30 seconds until the user decision of 2026-09-26 ("go with the proposal for closing"): the log showed a real reopen from the macOS Dock that the 30-second rule blocked. For a kept environment (see [7.9](#79-stop-on-close-and-crash-handling)), **Close Remote Connection** stops nothing, and the same reopen rules apply. The reopen rule is decision [D-5](#13-decisions).
 
 ### 7.11 Switching
 
 1. The user selects another environment in the status bar, the switcher, or the sidebar.
 2. The extension runs the open pipeline for the target environment until the container runs, including the image check. The current window stays connected during this time and shows the progress.
 3. The extension replaces the folder of the current window with the folder URI of the target environment (`vscode.openFolder` with `forceNewWindow: false`), or, for **Start in New Window** and with the setting `devEnvLauncher.openInNewWindow` (except from an empty window), opens it in a new window (`forceNewWindow: true`). VS Code asks about unsaved files in the usual way. **Switch branch…** and **Select configuration…** always use the current window.
-4. The Session Monitor stops the previous environment after the waiting time (see [7.9](#79-stop-on-close-and-crash-handling)).
+4. The Session Monitor stops the previous environment after the waiting time (see [7.9](#79-stop-on-close-and-crash-handling)), unless it is kept (**Keep Running When Closed**): a kept environment keeps running until the user stops it.
 
 If the target environment is open in another window already, VS Code shows that window instead of opening it a second time (to verify in [V-2](#11-verification-before-implementation)). The main process of VS Code looks for a window with the same folder URI before it opens a window, also with `forceNewWindow: true`, so this holds for **Start in New Window** too.
 
@@ -888,7 +906,7 @@ The prefix `devEnvLauncher` is a working name (see [D-1](#13-decisions)).
 |---|---|---|
 | `devEnvLauncher.reopenLastOnStartup` | `true` | Open the last used environment when VS Code starts (see [7.10](#710-reopen-last-environment)) |
 | `devEnvLauncher.openInNewWindow` | `false` | If `true`, **Start** and **Switch Environment…** open the environment in a new window, and the current window keeps its environment; the row menu then offers **Start in Current Window**, and the Command Palette **Switch Environment in Current Window…**. From an empty window, **Start** uses that window; **Start in New Window** always opens a new one. If `false`, **Start** connects the current window, and the row menu offers **Start in New Window** (see [6.2](#62-sidebar-view)). Scope `application`: only the user settings count. |
-| `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it (see [7.9](#79-stop-on-close-and-crash-handling)). If `false`, the container keeps running. |
+| `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it, after the waiting time (see [7.9](#79-stop-on-close-and-crash-handling)). If `false`, all environments keep running. To keep only some environments running, use **Keep Running When Closed** on their rows (stored per environment in the registry). |
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time before a stop. It prevents a stop during a window reload. [V-4](#11-verification-before-implementation) measures the reload time to confirm the value. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection (see [7.7](#77-image-update-check)) |
 | `devEnvLauncher.respectShutdownActionNone` | `false` | If `true`, a repository with `"shutdownAction": "none"` keeps its container running after close |

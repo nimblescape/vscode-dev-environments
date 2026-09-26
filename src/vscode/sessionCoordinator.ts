@@ -18,7 +18,14 @@ import { isoTime, systemClock, type Clock, type Logger } from '../core/ports';
 import { retryTransient, retryTransientSync, type StoragePaths } from '../core/storage/paths';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
-import { isMonitorRunning, isProcessAlive } from '../monitor/lock';
+import {
+  isMonitorRunning,
+  isProcessAlive,
+  MONITOR_PROTOCOL_VERSION,
+  readMonitorVersion,
+  requestMonitorExit,
+  runningMonitor,
+} from '../monitor/lock';
 import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../monitor/rules';
 
 /** Interval of the window status file updates (concept 7.9). */
@@ -359,20 +366,49 @@ export class SessionCoordinator implements vscode.Disposable {
     };
   }
 
-  /** Synchronous, for deactivateSync(). Returns true if a monitor process was started. */
+  /**
+   * Synchronous, for deactivateSync(). Returns true if a monitor process was started. A live monitor of a known, older
+   * protocol version (MONITOR_PROTOCOL_VERSION) is asked to exit, and the current monitor is started; it waits until the
+   * older one has ended. A monitor whose version is unknown (no version file, or it cannot be read) is left alone this
+   * time: a failed read is never taken for an older version.
+   */
   private ensureMonitorRunningSync(): boolean {
     try {
-      if (isMonitorRunning(this.paths.monitorLock, this.isAlive)) return false;
+      let older: { pid: number; version: number } | undefined;
+      if (isMonitorRunning(this.paths.monitorLock, this.isAlive)) {
+        const monitor = runningMonitor(this.paths.monitorLock, this.isAlive);
+        // A lock without a valid process ID yet: its creator is still writing it.
+        if (!monitor) return false;
+        const version = readMonitorVersion(this.paths.monitorVersion, monitor.pid);
+        if (version === undefined || version >= MONITOR_PROTOCOL_VERSION) return false;
+        older = { pid: monitor.pid, version };
+      }
       const now = this.clock.now();
       if (this.monitorStartedAt !== undefined && Math.abs(now - this.monitorStartedAt) < MONITOR_START_GRACE_MS) {
         return false;
       }
       this.monitorStartedAt = now;
+      if (older) this.retireMonitor(older.pid, older.version);
       this.startMonitor();
       return true;
     } catch (error) {
       this.logger.error('The Session Monitor could not be started.', error);
       return false;
+    }
+  }
+
+  /**
+   * Asks an older monitor to exit, never forces it and sends it no signal: monitor.exit names it, and the monitor ends
+   * after its current step (a `docker stop` that has started is finished).
+   */
+  private retireMonitor(pid: number, version: number): void {
+    this.logger.info(
+      `Asked the Session Monitor (process ${pid}) to exit: it has protocol version ${version}, older than ${MONITOR_PROTOCOL_VERSION}.`,
+    );
+    try {
+      requestMonitorExit(this.paths.monitorExit, pid);
+    } catch (error) {
+      this.logger.warn(`The exit request for the Session Monitor could not be written. ${errorMessage(error)}`);
     }
   }
 

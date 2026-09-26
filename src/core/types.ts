@@ -86,6 +86,12 @@ export interface Environment {
    * again until a digest or the configuration changes.
    */
   refusedUpdate?: RefusedUpdate;
+  /**
+   * Keep Running When Closed (concept 7.9; user decision 2026-09-26, "go with the proposal for closing"): the Session
+   * Monitor never stops this environment when no window uses it; only the user's Stop or Delete does. Missing (entries of
+   * earlier versions) or false: the container stops after the waiting time, as the setting stopOnClose says.
+   */
+  keepRunning?: boolean;
 }
 
 /**

@@ -32,6 +32,10 @@ export const Commands = {
   // The switch of the host access checks of a repository (row context menu only, hidden in the Command Palette).
   turnOffHostAccessChecks: 'devEnvironments.turnOffHostAccessChecks',
   turnOnHostAccessChecks: 'devEnvironments.turnOnHostAccessChecks',
+  // The switch Keep Running When Closed of an environment (user decision 2026-09-26, "go with the proposal for closing").
+  // The row context menu shows one of the two; the Command Palette offers both with a picker of the environments, as Stop.
+  keepRunning: 'devEnvironments.keepRunning',
+  stopWhenClosed: 'devEnvironments.stopWhenClosed',
   // The buttons of the walkthrough "Set up Docker for Dev Environments" (hidden in the Command Palette).
   dockerSetupInstall: 'devEnvironments.dockerSetup.install',
   dockerSetupStart: 'devEnvironments.dockerSetup.start',

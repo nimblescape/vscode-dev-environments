@@ -10,9 +10,14 @@ import { PENDING_MAX_AGE_MS } from '../monitor/rules';
 export const PENDING_OPERATION_MAX_AGE_MS = 10 * 60_000;
 /**
  * Concept 7.10: the reopen record must be older than this. "Close Remote Connection" makes an empty window that
- * activates within a few seconds; it must not reconnect the window that the user disconnected on purpose.
+ * activates within 1 to 3 seconds; it must not reconnect the window that the user disconnected on purpose.
+ * 5 seconds, not 30 (user decision 2026-09-26, "go with the proposal for closing"): the log showed a real reopen from the
+ * macOS Dock that the 30-second rule blocked. A kept environment (Keep Running When Closed) follows the same rule.
  */
-export const REOPEN_MIN_AGE_MS = 30_000;
+export const REOPEN_MIN_AGE_MS = 5_000;
+
+/** The reason of `decideReopen` for a record younger than REOPEN_MIN_AGE_MS, derived from the constant. */
+export const REOPEN_TOO_RECENT_REASON = `the last environment was closed less than ${formatSeconds(REOPEN_MIN_AGE_MS)} ago`;
 
 /**
  * Role A (concept 7.10 #1): true if the open pipeline has just run for this window, which our own `vscode.openFolder`
@@ -60,7 +65,7 @@ export interface ReopenInput {
   /**
    * The window is an Extension Development Host (a debug run of this extension, ExtensionMode.Development). A new debug
    * run follows the end of the previous one within seconds, and the window with the source code stays open: the
-   * 30-second rule does not apply there, and only other windows that are connected to an environment count. Cost: a
+   * age rule of REOPEN_MIN_AGE_MS does not apply there, and only other windows that are connected to an environment count. Cost: a
    * "Close Remote Connection" in a debug run connects the window again once (Cancel on the progress stops it); VS Code
    * gives no way to tell that reload from a new debug run. A window that is still connecting has no environment in
    * its status yet and does not count either; the busy mark of the environment keeps a second pipeline waiting.
@@ -86,9 +91,14 @@ export function decideReopen(input: ReopenInput): ReopenDecision {
   // A time in the future (clock change) does not count as old.
   const minAge = input.development ? 0 : REOPEN_MIN_AGE_MS;
   if (!Number.isFinite(closedAt) || closedAt > input.now || input.now - closedAt <= minAge) {
-    return { reopen: false, reason: 'the last environment was closed less than 30 seconds ago' };
+    return { reopen: false, reason: REOPEN_TOO_RECENT_REASON };
   }
   return { reopen: true, environmentId: record.environmentId };
+}
+
+function formatSeconds(ms: number): string {
+  const seconds = ms / 1000;
+  return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
 }
 
 function compare(a: string, b: string): number {
