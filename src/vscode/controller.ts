@@ -481,6 +481,7 @@ export class Controller implements vscode.Disposable {
       settings: this.deps.settings(),
       emptyWindow: connection.isEmptyWindow(),
       otherActiveWindows: others.length,
+      otherConnectedWindows: others.filter((status) => status.environmentId !== null).length,
       pendingOperations: operations.length,
       record,
       // Concept 7.5: only an environment of the signed-in account is opened again.

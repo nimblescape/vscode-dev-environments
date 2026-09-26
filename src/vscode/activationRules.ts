@@ -49,6 +49,8 @@ export interface ReopenInput {
   emptyWindow: boolean;
   /** Number of other live, active windows (SessionCoordinator.otherActiveWindows). */
   otherActiveWindows: number;
+  /** How many of them are connected to an environment (in development, only these count). Default: all of them. */
+  otherConnectedWindows?: number;
   /** Number of pending operations that were found (whether this window ran them or not). */
   pendingOperations: number;
   record: ReopenRecord | undefined;
@@ -58,7 +60,9 @@ export interface ReopenInput {
   /**
    * The window is an Extension Development Host (a debug run of this extension, ExtensionMode.Development). A new debug
    * run follows the end of the previous one within seconds, and the window with the source code stays open: the
-   * 30-second rule and the other windows do not apply there.
+   * 30-second rule does not apply there, and only other windows that are connected to an environment count. Cost: a
+   * "Close Remote Connection" in a debug run connects the window again once (Cancel on the progress stops it); VS Code
+   * gives no way to tell that reload from a new debug run.
    */
   development?: boolean;
 }
@@ -69,7 +73,8 @@ export type ReopenDecision = { reopen: true; environmentId: string } | { reopen:
 export function decideReopen(input: ReopenInput): ReopenDecision {
   if (!input.settings.reopenLastOnStartup) return { reopen: false, reason: 'the setting reopenLastOnStartup is off' };
   if (!input.emptyWindow) return { reopen: false, reason: 'the window is not empty' };
-  if (input.otherActiveWindows > 0 && !input.development) return { reopen: false, reason: 'another window is open' };
+  const others = input.development ? (input.otherConnectedWindows ?? input.otherActiveWindows) : input.otherActiveWindows;
+  if (others > 0) return { reopen: false, reason: 'another window is open' };
   if (input.pendingOperations > 0) return { reopen: false, reason: 'an operation is pending' };
   const record = input.record;
   if (!record) return { reopen: false, reason: 'no environment was open before' };
@@ -78,7 +83,8 @@ export function decideReopen(input: ReopenInput): ReopenDecision {
   }
   const closedAt = Date.parse(record.closedAt);
   // A time in the future (clock change) does not count as old.
-  if (!Number.isFinite(closedAt) || (input.now - closedAt <= REOPEN_MIN_AGE_MS && !input.development)) {
+  const minAge = input.development ? 0 : REOPEN_MIN_AGE_MS;
+  if (!Number.isFinite(closedAt) || closedAt > input.now || input.now - closedAt <= minAge) {
     return { reopen: false, reason: 'the last environment was closed less than 30 seconds ago' };
   }
   return { reopen: true, environmentId: record.environmentId };
