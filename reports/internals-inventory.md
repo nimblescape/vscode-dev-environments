@@ -10,6 +10,25 @@ Repository: `vscode-dev-environments`, branch `main`, commit `33ae64d`. No repos
 - **VS Code.** Checked only against `@types/vscode` 1.90 and the documented built-in commands.
 - **GitHub and Docker Desktop.** Neither was reachable here. Their rows are not checkable here.
 
+## Status (update 2026-09-26)
+
+The problems of section 6 and the NFR-06 finding were fixed on `main` in commit `133154c` ("Protect the GitHub token, sign in the GitHub CLI as the owner, label our volumes, and keep Dev Containers internals in one module", unit 5), after three review rounds and green CI:
+
+| Section | Problem | Fix on main (`133154c`) |
+|---|---|---|
+| 1 | NFR-06 did not hold | All Dev Containers internals are in `src/core/devContainers.ts`; the authority encoding in `src/vscode/connection/authority.ts` imports the literal from it; a test pins the activation event in `package.json` |
+| 6.1 | Credentialed pull dropped the context's TLS settings | The GitHub session is sent only over the default endpoint, `unix://`, `npipe://`, `ssh://`, or `tcp://` with `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH`; otherwise a plain `docker pull` with Docker's own credentials |
+| 6.2 | `gh` token push had no second layer | `gh` is signed in as the owner through `GH_CONFIG_DIR` in the volume (`gh/hosts.yml`, written with the owner's token); the configuration may not set `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`; logins with `_` (Enterprise Managed Users) accepted |
+| 6.3 | Token removal needed tools of the user's image | A workspace helper run removes the token file and `gh/hosts.yml` from the volume, whether the container runs or not |
+| 6.4 | Compose and anonymous-volume labels decided ownership | Volumes that a configuration mounts are created with `devenv.environment-id`, `devenv.owner-id`, `devenv.repository`, `devenv.volume=additional`; recording and Delete use only these labels; environments of one account share such a volume, another account is refused; a restored registry protects the unlabeled volumes that a container mounts |
+| 6.5 | `runArgs` prefix rules always took a value | `--dns*`, `--memory*`, `--health-*` flags are allowed only by their exact names |
+| 6.6 | Remote-user rule ignored `runArgs --user` and `user:group` | Resolved as Dev Container CLI 0.89.0 does it |
+| 6.7 | Volume hash rule too broad | A hash-suffixed name is refused only when the volume exists and is not the environment's own |
+| 6.8 | The documented Features cache did not exist | Docs corrected: Features are downloaded at each build |
+| 6.9 | Doc comments | Corrected (`containerGit.ts` header, docs) |
+
+Container version 4: existing containers are created again once (files in the volume are kept). Section 7 ("what breaks first") still applies to future Dev Containers and CLI updates. The tables below describe the state before the fix; locations in them refer to commit `33ae64d`.
+
 ## 1. Summary
 
 The extension depends on **20 internal details of the Dev Containers extension** (Table A). It also relies on **5 public Dev Containers features** for behavior that the documentation does not promise (Table B).
