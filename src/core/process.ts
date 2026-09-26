@@ -26,16 +26,23 @@ export class NodeProcessRunner implements ProcessRunner {
       let aborted = false;
       let settled = false;
 
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      child.stdout.on('data', (text: string) => {
+      // The output is decoded with TextDecoder (streaming, so a character split between two chunks stays whole), not
+      // with Readable.setEncoding: that uses Node's string_decoder module, which fails in the extension host of VS Code
+      // 1.139 (Electron 43) with "StringDecoder is not a constructor", so that no program could be started at all.
+      const stdoutDecoder = new TextDecoder('utf-8');
+      const stderrDecoder = new TextDecoder('utf-8');
+      const onStdout = (text: string) => {
+        if (text === '') return;
         stdout += text;
         options.onStdout?.(text);
-      });
-      child.stderr.on('data', (text: string) => {
+      };
+      const onStderr = (text: string) => {
+        if (text === '') return;
         stderr += text;
         options.onStderr?.(text);
-      });
+      };
+      child.stdout.on('data', (chunk: Buffer) => onStdout(stdoutDecoder.decode(chunk, { stream: true })));
+      child.stderr.on('data', (chunk: Buffer) => onStderr(stderrDecoder.decode(chunk, { stream: true })));
 
       const timer =
         options.timeoutMs !== undefined
@@ -65,6 +72,9 @@ export class NodeProcessRunner implements ProcessRunner {
         if (settled) return;
         settled = true;
         finish();
+        // The rest of an incomplete character at the end of the output.
+        onStdout(stdoutDecoder.decode());
+        onStderr(stderrDecoder.decode());
         if (aborted) {
           reject(abortError());
           return;
