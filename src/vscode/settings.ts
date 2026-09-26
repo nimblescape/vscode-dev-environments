@@ -25,6 +25,7 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   refreshIntervalMinutes: 60,
   hostAccessChecksOff: [],
   repositoryGroups: [],
+  openInNewWindow: false,
 });
 
 /**
@@ -37,7 +38,8 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
  * Current settings. Values of a wrong type fall back to the default; waitingTimeSeconds ≥ 0,
  * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES. hostAccessChecksOff is read from the user settings only
  * (hostAccessChecksOffValue). `repositoryGroups` has the scope `application` in
- * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions.
+ * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions. The same
+ * for `openInNewWindow`: a workspace does not decide which window a Start uses.
  */
 export function readSettings(): ExtensionSettings {
   const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);
@@ -116,5 +118,6 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     hostAccessChecksOff: parseHostAccessChecksOff(get('hostAccessChecksOff')).repositories,
     // The entries are checked where they are used (repositoryGroups.ts), so that each problem can be named.
     repositoryGroups: Array.isArray(repositoryGroups) ? [...(repositoryGroups as unknown[])] : [],
+    openInNewWindow: bool('openInNewWindow', DEFAULT_SETTINGS.openInNewWindow ?? false),
   };
 }

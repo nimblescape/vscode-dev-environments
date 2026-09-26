@@ -114,6 +114,13 @@ describe('switcher (concept 6.4)', () => {
     expect(titles).toEqual(['Open repository…', undefined]);
   });
 
+  it('names a new window in both lists when the switcher opens in a new window (unit 14)', async () => {
+    showQuickPick.mockImplementationOnce(async (items: Item[]) => items[items.length - 1]);
+    await showSwitcher({ groups, environments, repositories, newWindow: true });
+    const placeholders = showQuickPick.mock.calls.map((call: unknown[]) => (call[1] as { placeHolder?: string }).placeHolder);
+    expect(placeholders).toEqual(['Select an environment to open in a new window', 'Search a repository to open in a new window']);
+  });
+
   it('opens the repository list at once when no environment exists', async () => {
     showQuickPick.mockImplementationOnce(async (items: Item[]) => items[0]);
     const choice = await showSwitcher({ groups: [], environments: [], repositories: [repositories[0]] });

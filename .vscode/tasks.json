@@ -54,6 +54,17 @@
       "problemMatcher": []
     },
     {
+      // Opens an Extension Development Host window with the extension from dist/, without a debugger (see "Run Extension
+      // (no debugger)" in launch.json). To find out whether a crash of the extension host comes from the debugger.
+      "label": "open extension development host (no debugger)",
+      "type": "shell",
+      "command": "code",
+      "args": ["--new-window", "--extensionDevelopmentPath=${workspaceFolder}"],
+      "dependsOn": "build",
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    },
+    {
       // The same in a VS Code profile of your choice (the Dev Containers extension must be installed in it).
       "label": "open extension development host (profile)",
       "type": "shell",

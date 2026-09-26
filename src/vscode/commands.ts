@@ -6,6 +6,9 @@
 
 export const Commands = {
   start: 'devEnvironments.start',
+  // Start in a new window, or (while the setting openInNewWindow is on) in the current window (concept 6.2, 8).
+  startInNewWindow: 'devEnvironments.startInNewWindow',
+  startInCurrentWindow: 'devEnvironments.startInCurrentWindow',
   stop: 'devEnvironments.stop',
   delete: 'devEnvironments.delete',
   switchBranch: 'devEnvironments.switchBranch',
@@ -13,6 +16,9 @@ export const Commands = {
   rebuild: 'devEnvironments.rebuild',
   showOnGitHub: 'devEnvironments.showOnGitHub',
   switchEnvironment: 'devEnvironments.switchEnvironment',
+  // The switcher for a new window, or (while the setting openInNewWindow is on) for the current window (concept 6.4).
+  switchEnvironmentInNewWindow: 'devEnvironments.switchEnvironmentInNewWindow',
+  switchEnvironmentInCurrentWindow: 'devEnvironments.switchEnvironmentInCurrentWindow',
   refresh: 'devEnvironments.refresh',
   search: 'devEnvironments.search',
   showLog: 'devEnvironments.showLog',

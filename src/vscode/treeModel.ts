@@ -222,9 +222,10 @@ export interface StateIcon {
 }
 
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
+  // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
   connected: { id: 'circle-filled', color: 'charts.green' },
-  connectedOtherWindow: { id: 'circle-filled', color: 'charts.green' },
-  running: { id: 'color-mode' },
+  connectedOtherWindow: { id: 'window', color: 'charts.green' },
+  running: { id: 'vm-running', color: 'charts.green' },
   stopped: { id: 'circle-outline' },
   updating: { id: 'sync~spin' },
   // A dashed circle (◌) is not available as a codicon.
@@ -232,7 +233,11 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   filesMissing: { id: 'warning', color: 'list.warningForeground' },
 };
 
-/** Icon of a state: ● connected, ◐ running, ○ stopped, ↻ updating, ◌ no container, ⚠ files missing. */
+/**
+ * Icon of a state: green ● connected (this window), green window icon connected in another window, green running machine
+ * without a window, grey ○ stopped, ↻ updating, ◌ no container, ⚠ files missing. Green always means that the container
+ * runs.
+ */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
 }

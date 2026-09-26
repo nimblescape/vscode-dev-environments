@@ -314,6 +314,11 @@ export interface ExtensionSettings {
    * sidebar. The sidebar checks each entry (src/vscode/repositoryGroups.ts). Missing: the same as an empty list.
    */
   repositoryGroups?: unknown[];
+  /**
+   * `openInNewWindow` (concept 6.2, 8): Start opens the environment in a new window, and the current window keeps its
+   * environment. Only the user setting counts (scope `application`). Missing: false (Start uses the current window).
+   */
+  openInNewWindow?: boolean;
 }
 
 /** State of a container as Docker reports it, simplified. */

@@ -20,6 +20,19 @@
       "preLaunchTask": "open extension development host"
     },
     {
+      // Opens an Extension Development Host window with the extension from dist/, without a debugger (task "open
+      // extension development host (no debugger)"): no breakpoints, but also nothing of the Node inspector in the
+      // extension host. This session only runs the task and ends at once; the window stays open. Logs: Developer: Open
+      // Logs Folder in that window.
+      "name": "Run Extension (no debugger)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["-e", "0"],
+      "console": "internalConsole",
+      "preLaunchTask": "open extension development host (no debugger)"
+    },
+    {
       // The same in a VS Code profile of your choice (it asks for the name; the Dev Containers extension must be
       // installed in that profile).
       "name": "Run Extension (profile)",
