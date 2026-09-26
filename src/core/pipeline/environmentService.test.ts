@@ -2133,6 +2133,34 @@ describe('reconcileFromVolumes', () => {
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules', 'api-history']);
   });
 
+  it('restores an additional volume of another environment of the same owner that its container mounts, so that the Delete of that environment keeps it', async () => {
+    // A (the fork) created web-node_modules; B (the upstream repository, same owner) mounts it too; C of another account
+    // has a container that mounts it (for example from before the separation by account): C does not record it.
+    const A = 'a0000001-0000-4000-8000-000000000001';
+    const B = 'a0000002-0000-4000-8000-000000000002';
+    const C = 'a0000003-0000-4000-8000-000000000003';
+    const restored = (id: string, repository: string, owner: GitHubAccount): string => {
+      const name = resourceName(repository, id);
+      h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: owner.id });
+      const container = h.docker.addContainer({ environmentId: id, name, state: 'stopped', image: environmentImageName(id, 1) });
+      h.docker.containers.set(container.id, { ...container, volumes: [name, 'web-node_modules'] });
+      return name;
+    };
+    restored(A, 'alice/web', ACCOUNT);
+    restored(B, 'acme/web', ACCOUNT);
+    restored(C, 'someone/web', OTHER_ACCOUNT);
+    h.docker.volumes.set('web-node_modules', additionalVolumeLabels(A, ACCOUNT, 'alice/web'));
+    expect(await h.service.reconcileFromVolumes()).toBe(3);
+    expect((await h.registry.get(A))?.additionalVolumes).toEqual(['web-node_modules']);
+    expect((await h.registry.get(B))?.additionalVolumes).toEqual(['web-node_modules']);
+    expect((await h.registry.get(C))?.additionalVolumes).toBeUndefined();
+    // The Delete of A keeps it while B records it, and the question does not offer it.
+    expect(await h.service.removableAdditionalVolumes(A)).toEqual([]);
+    await h.service.delete(A, options({ additionalVolumesToRemove: ['web-node_modules'] }));
+    expect(h.docker.volumes.has('web-node_modules')).toBe(true);
+    expect(h.logger.infos).toContain('The volume web-node_modules is kept, because another environment uses it too.');
+  });
+
   it('lets a declined claim of a restored entry with only anonymous volumes create an environment of the account', async () => {
     const name = resourceName(REPO, OTHER_ID);
     const anonymous = 'cd'.repeat(32);

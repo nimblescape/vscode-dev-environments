@@ -18,6 +18,7 @@ import {
   foreignVolumeName,
   hostAccessReport,
   isOwnVolume,
+  isSameOwnerAdditionalVolume,
   mountedVolumeNames,
   removedRunArgs,
   volumeLabelOwner,
@@ -1100,8 +1101,9 @@ export class EnvironmentService {
    * is stored.
    */
   private async saveConfiguration(ctx: PipelineContext, loaded: LoadedConfiguration, record: BuildRecord | undefined): Promise<void> {
-    // Only the volumes whose labels make them the environment's own (ownVolumes); the others are never recorded.
-    const additionalVolumes = await this.ownVolumes(loaded.mountedVolumes, ctx.env);
+    // Only the volumes whose labels make them the environment's own or an additional volume of the same owner
+    // (recordedVolumes); the others are never recorded.
+    const additionalVolumes = await this.recordedVolumes(loaded.mountedVolumes, ctx.env);
     const configPath = loaded.fallback && record !== undefined ? ctx.configPath : loaded.configPath;
     await this.updateEntry(ctx, (entry) => {
       entry.configPath = configPath;
@@ -1609,32 +1611,41 @@ export class EnvironmentService {
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image, dockerRunArgs);
   }
 
-  /** The named volumes that the container of the environment mounts join its additional volumes (ownVolumes). */
+  /** The named volumes that the container of the environment mounts join its additional volumes (recordedVolumes). */
   private async recordContainerVolumes(ctx: PipelineContext): Promise<void> {
     const container = await this.deps.docker.findContainer(ctx.env.id);
-    const volumes = await this.ownVolumes(container?.volumes ?? [], ctx.env);
+    const volumes = await this.recordedVolumes(container?.volumes ?? [], ctx.env);
     await this.recordAdditionalVolumes(ctx, volumes);
   }
 
   /**
    * The volumes of `names` that the pipeline records as additional volumes of `env`: existing volumes, other than the
    * workspace volume, whose labels make them its own (isOwnVolume: devenv.environment-id, and devenv.owner-id when both
-   * are set). Any other volume (an anonymous volume, a volume of another program or environment, a volume that a version
-   * before the labels or Docker at `up` created) is never recorded, so Delete never removes it.
+   * are set), and existing additional volumes of other environments of the same owner (isSameOwnerAdditionalVolume),
+   * which the environments of one account share (for example `${localWorkspaceFolderBasename}-node_modules` of a fork
+   * and its upstream repository). Such a record only protects the shared volume: the Delete of the other environment
+   * keeps a volume that another entry records, and the Delete of this one never removes it (removableVolumes: not its
+   * own). Any other volume (an anonymous volume, a volume of another program or account, a volume that a version before
+   * the labels or Docker at `up` created) is never recorded, so Delete never removes it.
    */
-  private async ownVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
+  private async recordedVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
     const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
     if (candidates.length === 0) return [];
     const volumes = await this.deps.docker.inspectVolumes(candidates);
-    const own = new Set(volumes.filter((volume) => isOwnVolume(volume.labels, env.id, env.owner?.id)).map((volume) => volume.name));
-    return candidates.filter((name) => own.has(name));
+    const recorded = new Set(
+      volumes
+        .filter((volume) => isOwnVolume(volume.labels, env.id, env.owner?.id) || isSameOwnerAdditionalVolume(volume.labels, env.owner?.id))
+        .map((volume) => volume.name),
+    );
+    return candidates.filter((name) => recorded.has(name));
   }
 
   /**
    * Before `up` creates a container: each named volume that it mounts (the configuration, the `runArgs` that Docker
    * gets, and the image metadata) and that does not exist yet is created with the labels of the environment
-   * (additionalVolumeLabels), so that it is the environment's own; then the own volumes are recorded. An existing volume
-   * keeps its labels (Docker does not change them). A name with `${devcontainerId}` is not among them: the Dev Container
+   * (additionalVolumeLabels), so that it is the environment's own; then the own volumes and the existing additional
+   * volumes of other environments of the same owner are recorded (recordedVolumes). An existing volume keeps its labels
+   * (Docker does not change them). A name with `${devcontainerId}` is not among them: the Dev Container
    * CLI 0.89.0 resolves it only at `up` (read-configuration substitutes it only for an existing container), so Docker
    * creates that volume without labels, and it is never the environment's. A volume that cannot be created is logged:
    * Docker creates it at `up` without the labels, and Delete keeps it.
@@ -1653,7 +1664,7 @@ export class EnvironmentService {
         this.logger.warn(`The volume ${name} could not be created with the labels of the environment. Docker creates it at the start without them, and Delete keeps it: ${errorMessage(error)}`);
       }
     }
-    await this.recordAdditionalVolumes(ctx, await this.ownVolumes(candidates, env));
+    await this.recordAdditionalVolumes(ctx, await this.recordedVolumes(candidates, env));
   }
 
   /**
@@ -1744,7 +1755,7 @@ export class EnvironmentService {
       (name) => !own.has(name),
     );
     const environment = { id: env.id, ...(env.owner ? { ownerId: env.owner.id } : {}) };
-    return { ...checked, foreignVolumes, volumeLabels, environment, environmentIds: file.environments.map((other) => other.id) };
+    return { ...checked, foreignVolumes, volumeLabels, environment };
   }
 
   /**
@@ -1775,8 +1786,8 @@ export class EnvironmentService {
   }
 
   /**
-   * Own volumes (ownVolumes) join the additional volumes of the entry: Delete offers to remove them, and the policy
-   * refuses them to the environments of other accounts too.
+   * Recorded volumes (recordedVolumes) join the additional volumes of the entry: Delete offers to remove the own ones
+   * that no other entry records, and the policy refuses them to the environments of other accounts too.
    */
   private async recordAdditionalVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
     const added = names.filter((name) => name !== ctx.env.volumeName && !(ctx.env.additionalVolumes ?? []).includes(name));
@@ -2284,9 +2295,10 @@ export class EnvironmentService {
    * Registry lost (concept 7.5): adds an entry for each volume with the label devenv.environment-id that the registry
    * lacks, with the owner of its label devenv.owner-id. A volume of a repository of which the owner account (or, without
    * the label, an entry of an older version) has an environment already is not added: one environment per repository and
-   * account (concept D-3). The additional volumes of an entry are its own labelled volumes (devenv.volume, isOwnVolume)
-   * and the volumes without devenv labels that its surviving container mounts (protectedMountedVolumes), which protect
-   * them from other accounts; Delete removes only the own ones. The entries have no build record, so the next
+   * account (concept D-3). The additional volumes of an entry are its own labelled volumes (devenv.volume, isOwnVolume),
+   * the additional volumes of other environments of the same owner that its surviving container mounts
+   * (isSameOwnerAdditionalVolume), and the volumes without devenv labels that it mounts (protectedMountedVolumes), which
+   * protect them from other accounts and from the Delete of the other environments; Delete removes only the own ones. The entries have no build record, so the next
    * connection with internet access rebuilds the container. Returns the number of added entries. Does not start Docker.
    */
   async reconcileFromVolumes(): Promise<number> {
@@ -2340,7 +2352,13 @@ export class EnvironmentService {
       const mounted = containers
         .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
         .flatMap((container) => container.volumes ?? []);
-      const volumes = [...new Set([...labelled, ...(await this.protectedMountedVolumes(mounted, candidate.volumeName))])];
+      // An additional volume of another environment of the same owner that the container mounts: recorded again, so that
+      // the Delete of that environment keeps it, as the pipeline records it (recordedVolumes).
+      const shared = additional
+        .filter((volume) => mounted.includes(volume.name) && isSameOwnerAdditionalVolume(volume.labels, candidate.owner?.id))
+        .map((volume) => volume.name)
+        .filter((name) => name !== candidate.volumeName);
+      const volumes = [...new Set([...labelled, ...shared, ...(await this.protectedMountedVolumes(mounted, candidate.volumeName))])];
       if (volumes.length > 0) candidate.additionalVolumes = volumes;
     }
     const skipped: string[] = [];

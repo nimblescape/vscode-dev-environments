@@ -21,6 +21,7 @@ import {
   hostAccessReport,
   isLoopbackAddress,
   isOwnVolume,
+  isSameOwnerAdditionalVolume,
   loopbackAppPorts,
   loopbackRunArgs,
   mountedVolumeNames,
@@ -703,18 +704,30 @@ describe('volumes with the labels of Dev Environments', () => {
     ...(kind === null ? {} : { 'devenv.volume': kind }),
   });
 
-  it.each<[string, Record<string, string>, readonly string[], string[]]>([
-    ['its own volume', labels(ENVIRONMENT.id, '1001'), [ENVIRONMENT.id], []],
-    ['its own volume without an owner label (an entry of an older version)', labels(ENVIRONMENT.id), [ENVIRONMENT.id], []],
-    ['its own ID with the owner label of another account', labels(ENVIRONMENT.id, '2002'), [ENVIRONMENT.id], ['volume data of another environment']],
-    ['a volume of another environment in the registry, also of the same owner', labels(FORMER, '1001'), [ENVIRONMENT.id, FORMER], ['volume data of another environment']],
-    ['a volume that the Delete of an environment of the same owner kept', labels(FORMER, '1001'), [ENVIRONMENT.id], []],
-    ['a volume that the Delete of an environment of another owner kept', labels(FORMER, '2002'), [ENVIRONMENT.id], ['volume data of another environment']],
-    ['a volume of a deleted environment without an owner label', labels(FORMER), [ENVIRONMENT.id], ['volume data of another environment']],
-    ['a volume of a deleted environment that is no additional volume', labels(FORMER, '1001', null), [ENVIRONMENT.id], ['volume data of another environment']],
-  ])('%s', (_name, volumeLabels, environmentIds, expected) => {
+  it.each<[string, Record<string, string>, { id: string; ownerId?: string }, string[]]>([
+    ['its own volume', labels(ENVIRONMENT.id, '1001'), ENVIRONMENT, []],
+    ['its own volume without an owner label (an entry of an older version)', labels(ENVIRONMENT.id), ENVIRONMENT, []],
+    ['its own ID with the owner label of another account', labels(ENVIRONMENT.id, '2002'), ENVIRONMENT, ['volume data of another environment']],
+    // The environments of one account share an additional volume, as on main and as the docs promise (for example
+    // web-node_modules of a fork and its upstream repository): the other environment may still exist.
+    ['a volume of another environment in the registry, also of the same owner', labels(FORMER, '1001'), ENVIRONMENT, []],
+    ['a volume that the Delete of an environment of the same owner kept', labels(FORMER, '1001'), ENVIRONMENT, []],
+    ['a volume of another environment of another owner', labels(FORMER, '2002'), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment without an owner label', labels(FORMER), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment of the same owner, for an environment without owner', labels(FORMER, '1001'), { id: ENVIRONMENT.id }, ['volume data of another environment']],
+    ['a volume of another environment without an owner label, for an environment without owner', labels(FORMER), { id: ENVIRONMENT.id }, ['volume data of another environment']],
+    ['a volume of another environment of the same owner without devenv.volume (a workspace volume)', labels(FORMER, '1001', null), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment of the same owner of another kind', labels(FORMER, '1001', 'workspace'), ENVIRONMENT, ['volume data of another environment']],
+  ])('%s', (_name, volumeLabels, environment, expected) => {
     const config = { mounts: ['source=data,target=/data,type=volume'] };
-    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: volumeLabels }, environment: ENVIRONMENT, environmentIds })).toEqual(expected);
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: volumeLabels }, environment })).toEqual(expected);
+  });
+
+  it('refuses an additional volume of the same owner that an environment of another account records', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(
+      hostAccessProblems({ config, ownVolume: OWN, foreignVolumes: ['data'], volumeLabels: { data: labels(FORMER, '1001') }, environment: ENVIRONMENT }),
+    ).toEqual(['volume data of another environment']);
   });
 
   it('refuses every volume with devenv.environment-id when the environment is not known', () => {
@@ -732,6 +745,19 @@ describe('volumes with the labels of Dev Environments', () => {
     ['labels of another program', { 'com.docker.compose.project': 'a' }, '1', false],
   ])('isOwnVolume: %s', (_name, volumeLabels, ownerId, expected) => {
     expect(isOwnVolume(volumeLabels, 'a', ownerId)).toBe(expected);
+  });
+
+  it.each<[string, Record<string, string>, string | undefined, boolean]>([
+    ['an additional volume of the owner', labels(FORMER, '1001'), '1001', true],
+    ['an additional volume of another owner', labels(FORMER, '2002'), '1001', false],
+    ['an additional volume without an owner label', labels(FORMER), '1001', false],
+    ['an additional volume, for an environment without owner', labels(FORMER, '1001'), undefined, false],
+    ['a workspace volume of the owner (no devenv.volume)', labels(FORMER, '1001', null), '1001', false],
+    ['a volume of the owner of another kind', labels(FORMER, '1001', 'workspace'), '1001', false],
+    ['the owner and kind labels without an environment ID', { 'devenv.owner-id': '1001', 'devenv.volume': 'additional' }, '1001', false],
+    ['no labels', {}, '1001', false],
+  ])('isSameOwnerAdditionalVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isSameOwnerAdditionalVolume(volumeLabels, ownerId)).toBe(expected);
   });
 });
 
