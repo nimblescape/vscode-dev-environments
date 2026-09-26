@@ -313,6 +313,19 @@ describe('monitor protocol version and exit request', () => {
     expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(false);
   });
 
+  it('treats a lock with its own process ID as left by a dead monitor: removes the request and does not wait (round-4 review of PR #26)', async () => {
+    // A monitor that was asked to exit crashed with a fresh lock, and the new monitor got its reused process ID 1111.
+    fs.writeFileSync(lockFile, '1111\n');
+    requestMonitorExit(exitFile, 1111);
+    const started = Date.now();
+    expect(
+      await waitForRetiringMonitor(lockFile, exitFile, { timeoutMs: 5_000, pollMs: 10, isAlive: alive, ownPid: 1111 }),
+    ).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    removeLeftoverExitRequest(lockFile, exitFile, alive, 1111);
+    expect(fs.existsSync(exitFile)).toBe(false);
+  });
+
   it('removes an exit request at the start of a monitor only when it is known to be left over', () => {
     const request = (): void => requestMonitorExit(exitFile, 1111);
     // No request: nothing to do.

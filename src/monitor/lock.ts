@@ -233,6 +233,7 @@ export function removeLeftoverExitRequest(
   lockFile: string,
   exitFile: string,
   isAlive: (pid: number) => boolean = isProcessAlive,
+  ownPid: number = process.pid,
 ): void {
   let text: string | undefined;
   let lock: LockInfo | undefined;
@@ -247,7 +248,9 @@ export function removeLeftoverExitRequest(
   const request = parseMonitorExitRequest(text);
   if (request && lock) {
     if (lock.pid === undefined) return;
-    if (lock.pid === request.pid && isAlive(lock.pid)) return;
+    // A lock with this monitor's own process ID was left by a dead monitor whose ID was reused (round-4 review): that
+    // request is left over, not one to wait for.
+    if (lock.pid === request.pid && lock.pid !== ownPid && isAlive(lock.pid)) return;
   }
   try {
     retryTransientSync(() => fs.rmSync(exitFile, { force: true }));
@@ -264,12 +267,14 @@ export function removeLeftoverExitRequest(
 export async function waitForRetiringMonitor(
   lockFile: string,
   exitFile: string,
-  options: { timeoutMs: number; pollMs?: number; isAlive?: (pid: number) => boolean; staleMs?: number },
+  options: { timeoutMs: number; pollMs?: number; isAlive?: (pid: number) => boolean; staleMs?: number; ownPid?: number },
 ): Promise<boolean> {
+  const ownPid = options.ownPid ?? process.pid;
   const until = Date.now() + options.timeoutMs;
   for (;;) {
     const monitor = runningMonitor(lockFile, options.isAlive ?? isProcessAlive, { staleMs: options.staleMs });
-    if (!monitor || readMonitorExitRequest(exitFile)?.pid !== monitor.pid) return true;
+    // A lock with this monitor's own process ID belongs to a dead predecessor: never wait for oneself.
+    if (!monitor || monitor.pid === ownPid || readMonitorExitRequest(exitFile)?.pid !== monitor.pid) return true;
     if (Date.now() >= until) return false;
     await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 250));
   }
