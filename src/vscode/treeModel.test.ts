@@ -756,7 +756,8 @@ describe('state texts and icons', () => {
     expect(stateIcon('connected')).toEqual({ id: 'circle-filled', color: 'charts.green' });
     // Green always means that the container runs; the shape tells which window uses it (user decision 2026-09-26).
     expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'window', color: 'charts.green' });
-    expect(stateIcon('running')).toEqual({ id: 'vm-running', color: 'charts.green' });
+    // A play symbol, not the monitor of vm-running, which looked like a connected window (user, 2026-09-26).
+    expect(stateIcon('running')).toEqual({ id: 'play-circle', color: 'charts.green' });
     expect(stateIcon('stopped')).toEqual({ id: 'circle-outline' });
     expect(stateIcon('updating').id).toBe('sync~spin');
     expect(stateIcon('noContainer').id).toBe('circle-large-outline');
