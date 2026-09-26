@@ -1133,7 +1133,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
 });
 
 describe('WorkspaceHelper Docker Compose runs', () => {
-  const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: 'devenv-3f2a9c1e', services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {} };
+  const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: 'devenv-3f2a9c1e', services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {}, inputsHash: 'abc' };
 
   it('composeModel runs the model script without the Docker socket, network, and the configuration folder, with the project name', async () => {
     docker.handler = () => ({ stdout: `${JSON.stringify(MODEL_OUTPUT)}\n` });

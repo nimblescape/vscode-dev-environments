@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { ContainerInfo, VolumeInfo } from '../docker/containerAdapter';
+import { isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
 import { COMPOSE_MODEL_PATH, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -129,13 +129,29 @@ export class FakeDocker implements EnvironmentDocker {
     return [...this.networks.entries()].filter(([, labels]) => labels['com.docker.compose.project'] === project).map(([name]) => name);
   }
 
+  /** The IDs of the containers attached to each network of `networks` (inspectNetworks). */
+  readonly networkContainers = new Map<string, string[]>();
+  /** The names of each `docker network inspect` (inspectNetworks). */
+  readonly networkInspections: string[][] = [];
+
+  async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
+    this.networkInspections.push([...names]);
+    return [...new Set(names)]
+      .filter((name) => this.networks.has(name))
+      .map((name) => ({ name, labels: { ...this.networks.get(name) }, containers: [...(this.networkContainers.get(name) ?? [])] }));
+  }
+
   async removeNetwork(name: string): Promise<void> {
     this.log.push(`network rm ${name}`);
     this.networks.delete(name);
   }
 
-  async listProjectImages(project: string): Promise<string[]> {
-    return [...this.images].filter((image) => image.startsWith(`${project}-`)).sort();
+  async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
+    const owner = (image: string): string | undefined => this.imageConfigs.get(image)?.Labels?.[LABEL_ENVIRONMENT_ID];
+    return [...this.images]
+      .filter((image) => image.startsWith(`${project}-`))
+      .filter((image) => environmentId === undefined || owner(image) === undefined || owner(image) === environmentId)
+      .sort();
   }
 
   async engineApiVersion(): Promise<string | undefined> {
@@ -172,9 +188,9 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   /** Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped. */
-  async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
+  async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const matching = [...this.containers.values()].filter(
-      (c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId && c.labels[LABEL_COMPOSE_SERVICE] === undefined,
+      (c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId && isDevContainer(c, containerName),
     );
     const found = matching.find((c) => c.state === 'running') ?? matching[matching.length - 1];
     return found && { ...found, labels: { ...found.labels } };

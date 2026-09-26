@@ -1373,7 +1373,8 @@ describe('Window roles', () => {
       h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError(code, message));
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
       await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
-      expect(h.docker.findContainer).toHaveBeenCalledWith(ENV_ID);
+      // Review round 1 (D2): the lookup gets the name of the environment too.
+      expect(h.docker.findContainer).toHaveBeenCalledWith(ENV_ID, env.containerName);
       expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
       expect(h.statusBar.showNotConnected).toHaveBeenCalled();
       expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();

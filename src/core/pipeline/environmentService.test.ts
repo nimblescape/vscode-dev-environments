@@ -16,7 +16,11 @@ import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../he
 import type { EnsureImageOptions } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import {
+  CONTAINER_VERSION,
+  HOST_ACCESS_UNRESTRICTED,
+  LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
+  LABEL_HOST_ACCESS,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   environmentImageName,
@@ -2708,6 +2712,77 @@ describe('the Git version of a new container (concept section 9 "Git inside the 
     await h.service.openEnvironment(ENV_ID, options());
     expect(versionChecks()).toEqual([]);
     expect(h.ui.warnings).toEqual([]);
+  });
+});
+
+describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () => {
+  it.each<[string, 'on' | 'off']>([
+    ['on', 'on'],
+    ['off', 'off'],
+  ])('refuses the cache volume of the workspace helper as build context with the checks %s (S1)', async (_name, checks) => {
+    if (checks === 'off') h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '/devenv-cache' } };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('build context /devenv-cache (a folder of the workspace helper)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses the folder with the token as build context, resolved against the folder of the configuration (S1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '../../.devenv+' } };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('build context ../../.devenv+ (a folder of the workspace helper)'));
+  });
+
+  it('allows the parent folder of the configuration as build context (S1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '..' } };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses the image of another environment, also with the registry of Docker Hub, and FROM it (S4)', async () => {
+    h.helper.config = { image: 'docker.io/library/devenv-7c1d2e3f:2' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 of another environment'));
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.files[DEFAULT_CONFIG_PATH] = {
+      configText: '{ "build": { "dockerfile": "Dockerfile" } }',
+      dockerfilePath: '.devcontainer/Dockerfile',
+      dockerfileText: 'FROM devenv-7c1d2e3f:2\n',
+    };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses the Compose network of another environment in runArgs, by its name and by its labels (S3)', async () => {
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
+    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=backend'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a label of Docker Compose in runArgs (D3)', async () => {
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--label', `com.docker.compose.project=devenv-7c1d2e3f`] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('label com.docker.compose.project'));
+  });
+
+  it('refuses an environment image with a label of the extension before the container is created (D2)', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'devenv.compose-service': 'x', 'devcontainer.metadata': '[]' } });
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${IMAGE_1}`));
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('finds a container whose image gave it the label of a Compose service, and creates it again once the checks are on (D2)', async () => {
+    await seedEnvironment(h, {
+      container: 'running',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED, 'devenv.compose-service': 'x' },
+    });
+    const old = h.docker.containersOf(ENV_ID)[0].id;
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+    expect(h.docker.containerByRef(old)?.labels[LABEL_HOST_ACCESS]).toBeUndefined();
   });
 });
 

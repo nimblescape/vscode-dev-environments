@@ -14,6 +14,7 @@ import { Messages } from '../messages';
 import {
   CONFIG_FOLDER,
   HELPER_CACHE_VOLUME,
+  HELPER_DOCKER_SOCKET,
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
   WORKSPACES_ROOT,
@@ -108,7 +109,7 @@ export interface EnsureImageOptions {
 export const HELPER_IMAGE_RECHECK_MS = 60 * 60 * 1000;
 
 /** Path of the Docker socket inside the helper, and the default source of the socket mount. */
-export const DOCKER_SOCKET = '/var/run/docker.sock';
+export const DOCKER_SOCKET = HELPER_DOCKER_SOCKET;
 
 /**
  * Time limit of the helper run that reads the merged configuration (readConfiguration). Without a container, the CLI

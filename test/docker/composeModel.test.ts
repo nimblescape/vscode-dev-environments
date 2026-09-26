@@ -119,6 +119,51 @@ describe('model run of a Docker Compose configuration', () => {
     expect(report).toEqual({ hostAccess: [], unsupported: subpath ? [] : [`service db: bind mount ${REPO}/init.sql → /init.sql (needs Docker Engine 26 or newer)`] });
   });
 
+  it('records the real path of a build context that links out of the repository, and the policy refuses it (review round 1, S1)', async () => {
+    const files = { [`${REPO}/.devcontainer/linked.yml`]: 'services:\n  linked:\n    build:\n      context: ../ctx\n    command: sleep infinity\n' };
+    const written = await helper.run(volumeName, ['node', '-e', WRITE_FILES_SCRIPT], { input: JSON.stringify(files), docker: false, network: false });
+    expect(written.exitCode, written.stderr).toBe(0);
+    const linked = await helper.run(volumeName, ['sh', '-c', `ln -sfn /workspaces/.devenv+ ${REPO}/ctx`], { docker: false, network: false });
+    expect(linked.exitCode, linked.stderr).toBe(0);
+    const output = await model(['compose.yml', 'linked.yml']);
+    if ('error' in output) throw new Error(output.error);
+    expect(output.realPaths[`${REPO}/ctx`]).toBe('/workspaces/.devenv+');
+    // The Dockerfile behind the link is not read (the folder with the token is hidden in the model run anyway).
+    expect(output.dockerfiles.linked).toBeUndefined();
+    expect(output.inputsHash).toMatch(/^[0-9a-f]{64}$/);
+    const input = {
+      model: output.model,
+      devService: 'app',
+      project: PROJECT,
+      repositoryFolder: REPO,
+      ownVolume: volumeName,
+      engineApiVersion: '1.45',
+      realPaths: output.realPaths,
+      dockerfiles: output.dockerfiles,
+      environment: { id: ENVIRONMENT_ID },
+    };
+    const item = `service linked: build context ${REPO}/ctx (a link to /workspaces/.devenv+, outside of the repository)`;
+    expect(composeAccessReport(input).hostAccess).toContain(item);
+    // Whatever the switch says.
+    expect(composeAccessReport(input, false).hostAccess).toContain(item);
+  });
+
+  it('reads the labels and the containers of a network, and leaves out a missing one (review round 1, S2)', async () => {
+    const network = `devenv-test-backend-${run.runId}`;
+    cli.ok(['network', 'create', '--label', 'com.docker.compose.project=devenv-11111111', '--label', `${TEST_RUN_LABEL}=${run.runId}`, network]);
+    const container = cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', 'devenv.environment-id=other', '--network', network, TEST_BASE_IMAGE, 'true']);
+    try {
+      const networks = await docker.inspectNetworks([network, `devenv-test-missing-${run.runId}`]);
+      expect(networks).toHaveLength(1);
+      expect(networks[0]).toMatchObject({ name: network, labels: expect.objectContaining({ 'com.docker.compose.project': 'devenv-11111111' }) });
+      // A created container is attached only once it runs; the labels decide here.
+      log.info(`Containers of ${network}: ${JSON.stringify(networks[0].containers)}`);
+    } finally {
+      cli.run(['rm', '-f', container]);
+      cli.run(['network', 'rm', network]);
+    }
+  });
+
   it('hides the configuration folder with the token from the files of the repository', async () => {
     const output = await model(['compose.yml', 'token.yml']);
     expect('error' in output).toBe(true);

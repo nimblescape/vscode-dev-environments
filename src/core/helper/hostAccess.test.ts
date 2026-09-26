@@ -17,16 +17,22 @@ import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_STOP_TIMEOUT_SECONDS,
   buildOptionProblems,
+  foreignNetworkItem,
   hostAccessProblems,
   hostAccessReport,
+  imageLabelItems,
+  imageReferenceFinding,
+  isHelperPath,
   isLoopbackAddress,
   isOwnVolume,
   isSameOwnerAdditionalVolume,
+  localImageRepository,
   loopbackAppPorts,
   loopbackRunArgs,
   mountedVolumeNames,
   overrideRunArgs,
   removedRunArgs,
+  runArgsNetworks,
   runArgsProblems,
   splitPortAddress,
   volumeLabelOwner,
@@ -999,5 +1005,101 @@ describe('variables of the account of the GitHub CLI (user decision 2026-09-26, 
       hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
       unsupported: [],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 1 of unit 6 (S1, S2, S3, S4, D2)
+
+describe('isHelperPath', () => {
+  const REPO = '/workspaces/api';
+  it.each([
+    ['/', true],
+    ['/devenv-cache', true],
+    ['/devenv-cache/docker-compose', true],
+    ['/workspaces', true],
+    ['/workspaces/.devenv+', true],
+    ['/workspaces/.devenv+/github-token', true],
+    ['/workspaces/other', true],
+    ['/workspaces/api-other', true],
+    ['/var/run/docker.sock', true],
+    ['/var/run', true],
+    ['/var', true],
+    ['/workspaces/api/../.devenv+', true],
+    ['/workspaces/api', false],
+    ['/workspaces/api/.devcontainer', false],
+    ['/opt/tools', false],
+    ['/tmp/devenv-override/context', false],
+    ['/etc', false],
+  ])('%s → %s', (file, expected) => {
+    expect(isHelperPath(file, REPO)).toBe(expected);
+  });
+});
+
+describe('imageReferenceFinding and localImageRepository', () => {
+  it.each([
+    ['devenv-11111111:2', 'devenv-11111111'],
+    ['docker.io/devenv-11111111:2', 'devenv-11111111'],
+    ['docker.io/library/devenv-11111111', 'devenv-11111111'],
+    ['index.docker.io/library/devenv-11111111:2', 'devenv-11111111'],
+    ['registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64), 'devenv-11111111-db'],
+    ['ghcr.io/acme/devenv-tools:1', 'ghcr.io/acme/devenv-tools'],
+    ['localhost:5000/devenv-x', 'localhost:5000/devenv-x'],
+    ['postgres:16', 'postgres'],
+  ])('%s → %s', (reference, repository) => {
+    expect(localImageRepository(reference)).toBe(repository);
+  });
+
+  it.each([
+    ['devenv-11111111:2', { item: 'image devenv-11111111:2 of another environment', class: 'protected' }],
+    ['Docker.io/Library/devenv-1', { item: 'image Docker.io/Library/devenv-1 of another environment', class: 'protected' }],
+    [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    ['dddddddddddd', { item: 'image dddddddddddd (an image ID; name the image)', class: 'unsupported' }],
+    ['ghcr.io/acme/devenv-tools:1', undefined],
+    ['postgres:16', undefined],
+  ])('%s', (reference, expected) => {
+    expect(imageReferenceFinding(reference)).toEqual(expected);
+  });
+});
+
+describe('foreignNetworkItem and runArgsNetworks', () => {
+  const ID = 'e0000001-0000-4000-8000-000000000001';
+  it.each([
+    ['named like the project of another environment', 'devenv-11111111_default', undefined, true],
+    ['named like the own project', 'devenv-e0000001_default', undefined, false],
+    ['labelled for another environment', 'backend', { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] }, true],
+    ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ID] }, false],
+    ['labelled for a project of another program', 'backend', { labels: { 'com.docker.compose.project': 'shop' }, environments: [] }, false],
+    ['with a container of another environment', 'shared', { labels: {}, environments: [ID, 'e0000002-0000-4000-8000-000000000002'] }, true],
+    ['without anything of another environment', 'shared', { labels: {}, environments: [] }, false],
+  ])('%s', (_name, network, state, foreign) => {
+    expect(foreignNetworkItem(network, state, ID) !== undefined).toBe(foreign);
+  });
+
+  it('names the networks of runArgs, not the modes of Docker', () => {
+    expect(runArgsNetworks(['--network', 'host', '--net=backend', '--network', 'name=shared,alias=x', '--network', 'container:x', '-e', 'A=--network'])).toEqual([
+      'backend',
+      'shared',
+    ]);
+    expect(runArgsNetworks(undefined)).toEqual([]);
+  });
+});
+
+describe('imageLabelItems', () => {
+  it('names the labels by which the extension, the CLI, and Compose find containers, except devcontainer.metadata', () => {
+    expect(
+      imageLabelItems('devenv-e0000001:2', {
+        'devcontainer.metadata': '[]',
+        'org.opencontainers.image.title': 'x',
+        'devenv.compose-service': 'x',
+        'devcontainer.local_folder': '/x',
+        'com.docker.compose.project': 'devenv-11111111',
+      }),
+    ).toEqual([
+      'label devenv.compose-service of the image devenv-e0000001:2',
+      'label devcontainer.local_folder of the image devenv-e0000001:2',
+      'label com.docker.compose.project of the image devenv-e0000001:2',
+    ]);
   });
 });

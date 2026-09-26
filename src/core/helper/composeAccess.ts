@@ -12,8 +12,10 @@
 // setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
 // Pure functions, no I/O.
 import * as path from 'path';
+import { extractBaseImages } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
 import {
+  composeNetworkNames,
   composeVolumeNames,
   decideServiceMount,
   decideServicePort,
@@ -26,9 +28,13 @@ import {
   LOG_DRIVERS,
   LOG_OPTIONS,
   MAX_STOP_TIMEOUT_SECONDS,
+  RESERVED_COMPOSE_LABEL,
   RESERVED_LABEL,
   RESTART_POLICY,
   capabilityProblems,
+  foreignNetworkItem,
+  imageReferenceFinding,
+  isHelperPath,
   refusedVariableItem,
   securityOptionProblems,
   volumeNameFindings,
@@ -51,8 +57,17 @@ export interface ComposeAccessInput extends VolumeInput {
   repositoryFolder: string;
   /** The Docker Engine API version, for the bind mounts of repository files (supportsVolumeSubpath). */
   engineApiVersion?: string;
-  /** ComposeModelOutput.realPaths: bind mount sources and `env_file`s whose links lead out of the repository are refused. */
+  /**
+   * ComposeModelOutput.realPaths: bind mount sources, `env_file`s, build contexts, and Dockerfiles whose links lead out
+   * of the repository are refused.
+   */
   realPaths?: Readonly<Record<string, string | null>>;
+  /**
+   * ComposeModelOutput.dockerfiles: the FROM images of each local build are checked (no image of another environment),
+   * and a local build whose Dockerfile could not be read is refused (its images would escape the image check).
+   * Without it, neither is checked.
+   */
+  dockerfiles?: Readonly<Record<string, string>>;
 }
 
 interface Problem {
@@ -87,9 +102,6 @@ function isUnset(value: unknown): boolean {
 /** Extension fields (`x-…`): no effect in Compose. */
 const isExtension = (key: string): boolean => key.startsWith('x-');
 
-/** Label keys that the extension, the Dev Container CLI, and Compose use to find and set up the containers. */
-const RESERVED_COMPOSE_LABEL = /^com\.docker\.compose\./i;
-
 function labelKeys(labels: unknown): string[] {
   if (isRecord(labels)) return Object.keys(labels);
   if (Array.isArray(labels)) return labels.map((entry) => String(entry).split('=')[0]);
@@ -103,9 +115,10 @@ function labelProblems(labels: unknown, where: string): Problem[] {
     .map((key) => unsupported(`${where}label ${key}`));
 }
 
-/** An image of the namespace of Dev Environments (`devenv-…`): the image of another environment, perhaps of another account. */
-function isEnvironmentImage(image: string): boolean {
-  return /^(docker\.io\/)?(library\/)?devenv-/i.test(image.trim());
+/** imageReferenceFinding of hostAccess.ts as a problem: the image of another environment (D-17), or an image ID. */
+function imageProblems(reference: string, what: string): Problem[] {
+  const finding = imageReferenceFinding(reference, what);
+  return finding ? [finding] : [];
 }
 
 /** A Go duration (`20s`, `1m30s`, `500ms`) in seconds; `undefined` when it is none. */
@@ -176,7 +189,7 @@ function listOf(value: unknown): unknown[] {
 const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   // The image of another environment is refused (D-17): account separation. The images of built services are renamed
   // (rewrite).
-  image: (value) => (typeof value === 'string' && isEnvironmentImage(value) ? [guarded(`image ${value} of another environment`)] : []),
+  image: (value) => (typeof value === 'string' ? imageProblems(value, 'image') : []),
   build: buildProblems,
   // Rewritten: the dev container gets the name of the environment, the others none (D-12).
   container_name: allow,
@@ -339,8 +352,9 @@ function networkModeProblems(value: unknown, ctx: ServiceContext): Problem[] {
     const target = mode.slice('service:'.length);
     return ctx.services.has(target) && target !== ctx.name ? [] : [access(`network of another container (${mode})`)];
   }
-  if (isOtherEnvironmentProjectName(mode, ctx.input.project)) return [guarded(`network ${mode} of another environment`)];
-  return [];
+  // The network of another environment (by its name, its labels, or its containers): account separation.
+  const foreign = isOtherEnvironmentProjectName(mode, ctx.input.project) || foreignNetworkItem(mode, ctx.input.networks?.[mode], ctx.input.environment?.id) !== undefined;
+  return foreign ? [guarded(`network ${mode} of another environment`)] : [];
 }
 
 /** `blkio_config`: the weight only; the limits of devices name devices of the computer. */
@@ -435,14 +449,40 @@ const BUILD_ALLOWED = new Set([
 function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   if (isUnset(value)) return [];
   if (!isRecord(value)) return [unsupported(`build ${JSON.stringify(value)}`)];
-  const repository = ctx.input.repositoryFolder;
   const problems: Problem[] = [];
   const context = typeof value.context === 'string' ? value.context : undefined;
   const remote = context !== undefined && isRemoteContext(context);
-  if (context === undefined || (!remote && !isRepositoryPath(context, repository))) problems.push(access(`build context ${String(value.context)}`));
-  if (typeof value.dockerfile === 'string' && !remote && context !== undefined && value.dockerfile_inline === undefined) {
-    const file = path.posix.resolve(context, value.dockerfile);
-    if (!isRepositoryPath(file, repository)) problems.push(access(`Dockerfile ${value.dockerfile}`));
+  const contextProblems = context === undefined ? [access(`build context ${String(value.context)}`)] : remote ? [] : localPathProblems(`build context ${context}`, context, ctx);
+  problems.push(...contextProblems);
+  if (!remote && context !== undefined && isUnset(value.dockerfile_inline)) {
+    const dockerfile = typeof value.dockerfile === 'string' ? value.dockerfile : undefined;
+    const file = path.posix.resolve(context, dockerfile ?? 'Dockerfile');
+    // The default Dockerfile of a context outside the repository is outside with it: named only when it is worse than
+    // the context (a link of it to a path of the workspace helper, while the switch lifts the context).
+    const contextGuarded = contextProblems.some((problem) => problem.class !== 'computer');
+    const fileProblems = localPathProblems(`Dockerfile ${dockerfile ?? 'Dockerfile'}`, file, ctx).filter(
+      (problem) => dockerfile !== undefined || contextProblems.length === 0 || (!contextGuarded && problem.class !== 'computer'),
+    );
+    problems.push(...fileProblems);
+    // A Dockerfile that the model run could not read: its FROM images would escape the image check and the rule on the
+    // images of other environments (a refusal that the switch lifts does not excuse it).
+    const dockerfiles = ctx.input.dockerfiles;
+    const refused = [...contextProblems, ...fileProblems].some((problem) => problem.class !== 'computer');
+    if (dockerfiles !== undefined && !refused && !Object.prototype.hasOwnProperty.call(dockerfiles, ctx.name)) {
+      problems.push(unsupported(`Dockerfile ${file} (it could not be read, so its images cannot be checked)`));
+    }
+  }
+  // The images that the build starts from (FROM of the Dockerfile or of `dockerfile_inline`).
+  const text = ctx.input.dockerfiles?.[ctx.name];
+  if (text !== undefined && !remote) {
+    const args: Record<string, string> = {};
+    if (isRecord(value.args)) {
+      for (const [arg, setting] of Object.entries(value.args)) {
+        if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
+      }
+    }
+    const target = typeof value.target === 'string' && value.target !== '' ? value.target : undefined;
+    for (const image of extractBaseImages(text, args, { target })) problems.push(...imageProblems(image, 'FROM image'));
   }
   problems.push(...labelProblems(value.labels, 'build '));
   for (const [key, setting] of Object.entries(value)) {
@@ -456,12 +496,38 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   }
   if (isRecord(value.additional_contexts)) {
     for (const [name, source] of Object.entries(value.additional_contexts)) {
-      if (!/^(docker-image|https?):\/\//i.test(String(source))) problems.push(access(`build additional_contexts ${name}=${String(source)}`));
+      const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
+      if (image) problems.push(...imageProblems(image[1], `build additional_contexts ${name} image`));
+      else if (!/^https?:\/\//i.test(String(source))) problems.push(access(`build additional_contexts ${name}=${String(source)}`));
     }
   } else if (!isUnset(value.additional_contexts)) {
     problems.push(unsupported('build additional_contexts'));
   }
   return problems;
+}
+
+/**
+ * A local path of a build (its context or its Dockerfile, absolute as `docker compose config` prints it), which the
+ * builder reads in the workspace helper, where the cache volume, the folder with the token, and the Docker socket are
+ * mounted (S1):
+ * - in the repository folder (lexically): allowed, unless its real path (ComposeModelOutput.realPaths) does not exist or
+ *   is outside the repository (a link out): refused whatever the switch says, because BuildKit follows the link;
+ * - outside the repository: a path of the workspace helper (isHelperPath, also after links) stays refused whatever the
+ *   switch says; any other one is access to the computer (lifted while the checks are off).
+ */
+function localPathProblems(item: string, file: string, ctx: ServiceContext): Problem[] {
+  const repository = ctx.input.repositoryFolder;
+  const realPaths = ctx.input.realPaths;
+  const known = realPaths !== undefined && Object.prototype.hasOwnProperty.call(realPaths, file);
+  const real = known ? realPaths[file] : undefined;
+  if (isRepositoryPath(file, repository)) {
+    if (known && real === null) return [guarded(`${item} (the path does not exist in the repository)`)];
+    if (typeof real === 'string' && !isInside(real, repository)) return [guarded(`${item} (a link to ${real}, outside of the repository)`)];
+    return [];
+  }
+  if (!file.startsWith('/')) return [access(item)];
+  if (isHelperPath(file, repository) || (typeof real === 'string' && isHelperPath(real, repository))) return [guarded(item)];
+  return [access(item)];
 }
 
 function serviceProblems(service: unknown, ctx: ServiceContext): Problem[] {
@@ -512,11 +578,15 @@ const NETWORK_ALLOWED = new Set(['name', 'external', 'driver', 'driver_opts', 'i
 function topLevelNetworkProblems(input: ComposeAccessInput): Problem[] {
   const problems: Problem[] = [];
   const networks = isRecord(input.model.networks) ? input.model.networks : {};
+  const names = new Map(composeNetworkNames(input.model, input.project).map((network) => [network.key, network.name]));
   for (const [key, network] of Object.entries(networks)) {
     if (!isRecord(network)) continue;
     const at = `network ${key}: `;
-    const name = typeof network.name === 'string' ? network.name : key;
-    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(guarded(`network ${name} of another environment`));
+    const name = names.get(key) ?? key;
+    // A network of another environment (by its name, its labels, or its containers): account separation.
+    if (isOtherEnvironmentProjectName(name, input.project) || foreignNetworkItem(name, input.networks?.[name], input.environment?.id) !== undefined) {
+      problems.push(guarded(`network ${name} of another environment`));
+    }
     if (!isUnset(network.driver) && String(network.driver) !== 'bridge') problems.push(access(`${at}driver ${String(network.driver)}`));
     if (!isUnset(network.driver_opts)) problems.push(access(`${at}driver options`));
     problems.push(...labelProblems(network.labels, at));

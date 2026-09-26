@@ -589,9 +589,15 @@ if (process.exitCode === undefined) {
  * - `version`: `docker compose version --short`;
  * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
  * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles);
- * - `dockerfiles`: the Dockerfile of each service with a local build (`build.dockerfile_inline`, or the file, only when
- *   it is in the repository folder, also after links);
- * - `realPaths`: the real path of each bind mount source and `env_file` of the model (`null` when it does not exist).
+ * - `dockerfiles`: the Dockerfile of each service with a local build (`build.dockerfile_inline`, or the file: when it
+ *   is in the repository folder, also after links, or when it is outside of it and no path of the workspace helper
+ *   (isHelperPath of hostAccess.ts, the same paths here), also after links);
+ * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
+ *   build of the model (`null` when it does not exist);
+ * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
+ *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
+ *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
+ *   Only the hash leaves the run, not the texts.
  * On an error of Docker Compose: `{ "error": "<its message>" }`, exit code 0.
  */
 export const COMPOSE_MODEL_SCRIPT = String.raw`'use strict';
@@ -599,6 +605,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const crypto = require('crypto');
 const root = path.posix.resolve(process.argv[1]);
 const files = process.argv.slice(2);
 const inside = (file) => file === root || file.startsWith(root + '/');
@@ -616,9 +623,21 @@ const realPath = (file) => {
     return null;
   }
 };
-const readInside = (file) => {
+// The paths of isHelperPath (hostAccess.ts): the root, the cache volume, the folder with the token, and every path below
+// /workspaces outside the repository, or a folder that contains one of them. (The Docker socket of isHelperPath is not
+// mounted in this run; the check refuses a Dockerfile there anyway.)
+const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
+const isHelperPath = (file) => {
+  const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
+  if (normal === '/') return true;
+  if (['/devenv-cache', '/workspaces/.devenv+'].some((helperPath) => overlaps(normal, helperPath))) return true;
+  return !inside(normal) && overlaps(normal, '/workspaces');
+};
+const readDockerfile = (file) => {
   const real = realPath(file);
-  if (!inside(file) || real === null || !inside(real)) return undefined;
+  if (real === null) return undefined;
+  const allowed = inside(file) ? inside(real) : !isHelperPath(file) && !isHelperPath(real);
+  if (!allowed) return undefined;
   try {
     return fs.readFileSync(real, 'utf8');
   } catch {
@@ -648,10 +667,14 @@ const main = () => {
     if (!isObject(service)) continue;
     const build = service.build;
     if (isObject(build)) {
+      const local = typeof build.context === 'string' && build.context.startsWith('/');
+      if (local) realPaths[build.context] = realPath(build.context);
       if (typeof build.dockerfile_inline === 'string') {
         dockerfiles[name] = build.dockerfile_inline;
-      } else if (typeof build.context === 'string' && build.context.startsWith('/')) {
-        const text = readInside(path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile'));
+      } else if (local) {
+        const file = path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile');
+        realPaths[file] = realPath(file);
+        const text = readDockerfile(file);
         if (text !== undefined) dockerfiles[name] = text;
       }
     }
@@ -663,7 +686,25 @@ const main = () => {
       if (typeof file === 'string') realPaths[file] = realPath(file);
     }
   }
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths };
+  const inputs = new Map();
+  const readInput = (file) => {
+    if (inputs.has(file)) return;
+    try {
+      inputs.set(file, fs.readFileSync(file, 'utf8'));
+    } catch {
+      inputs.set(file, null);
+    }
+  };
+  for (const file of files) readInput(file);
+  if (files.length > 0) readInput(path.posix.join(path.posix.dirname(files[0]), '.env'));
+  for (const service of Object.values(isObject(model.services) ? model.services : {})) {
+    for (const entry of isObject(service) && Array.isArray(service.env_file) ? service.env_file : []) {
+      const file = typeof entry === 'string' ? entry : isObject(entry) ? entry.path : undefined;
+      if (typeof file === 'string') readInput(file);
+    }
+  }
+  const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, inputsHash };
 };
 let output;
 try {

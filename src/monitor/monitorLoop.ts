@@ -319,8 +319,11 @@ export class MonitorLoop {
     if (!idle) return 'skipped';
     const { environment, label } = idle;
     const containers = devContainerFirst(running, environment.containerName);
-    // The Git summary comes from the dev container; the other services of a Docker Compose environment have no repository.
-    const target = containers.find((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
+    // The Git summary comes from the dev container (its name, whatever labels its image gave it); the other services of a
+    // Docker Compose environment have no repository.
+    const target = containers.find(
+      (container) => container.name === environment.containerName || container.labels[LABEL_COMPOSE_SERVICE] === undefined,
+    );
 
     const summary = target ? await this.readGitSummary(environment, label, target) : undefined;
     if (this.stopRequested) return 'skipped';
@@ -357,6 +360,9 @@ export class MonitorLoop {
     let failed = false;
     for (const [index, container] of containers.entries()) {
       if (index > 0 && !this.deps.refreshLock()) return 'lockLost';
+      // Review round 1 (D4): each stop can take up to the time limit of a Docker call, and a window can start a session
+      // meanwhile; the containers that still run then stay running (the window starts a stopped one again).
+      if (index > 0 && (this.stopRequested || !(await this.idleEnvironment(id)))) return 'skipped';
       try {
         logger.info(`Stopping the container ${container.name} of ${label}: no window uses it.`);
         await this.deps.docker.stopContainer(container.id);

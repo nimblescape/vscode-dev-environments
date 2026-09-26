@@ -62,6 +62,10 @@ export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCES
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
+/** Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI). */
+export const HELPER_CACHE_FOLDER = '/devenv-cache';
+/** Path of the Docker socket inside the workspace helper. */
+export const HELPER_DOCKER_SOCKET = '/var/run/docker.sock';
 /** Mount point of the workspace volume, in the helper and in the dev container. */
 export const WORKSPACES_ROOT = '/workspaces';
 /**

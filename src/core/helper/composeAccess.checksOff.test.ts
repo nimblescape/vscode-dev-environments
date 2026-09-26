@@ -102,6 +102,33 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['a log driver', input(service('db', { logging: { driver: 'syslog' } })), 'service db: log driver syslog', 'protected'],
   ['oom_kill_disable', input(service('db', { oom_kill_disable: true })), 'service db: oom_kill_disable', 'protected'],
   ['a negative oom_score_adj', input(service('db', { oom_score_adj: -500 })), 'service db: oom_score_adj -500', 'protected'],
+  // Review round 1, S1: the paths of the build, which BuildKit reads in the workspace helper (with the cache volume, the
+  // folder with the token, and the Docker socket), also through a link.
+  ['a build context that links to the cache volume', input(service('db', { build: { context: `${REPO}/ctx` } }), { realPaths: { [`${REPO}/ctx`]: '/devenv-cache', [`${REPO}/ctx/Dockerfile`]: '/devenv-cache/Dockerfile' } }), `service db: build context ${REPO}/ctx (a link to /devenv-cache, outside of the repository)`, 'protected'],
+  ['a build context that links to the folder with the token', input(service('db', { build: { context: `${REPO}/.devcontainer/ctx` } }), { realPaths: { [`${REPO}/.devcontainer/ctx`]: '/workspaces/.devenv+' } }), `service db: build context ${REPO}/.devcontainer/ctx (a link to /workspaces/.devenv+, outside of the repository)`, 'protected'],
+  ['a build context that does not exist', input(service('db', { build: { context: `${REPO}/gone` } }), { realPaths: { [`${REPO}/gone`]: null } }), `service db: build context ${REPO}/gone (the path does not exist in the repository)`, 'protected'],
+  ['a Dockerfile that links out of the repository', input(service('db', { build: { context: REPO, dockerfile: 'x.Dockerfile' } }), { realPaths: { [REPO]: REPO, [`${REPO}/x.Dockerfile`]: '/root/Dockerfile' } }), 'service db: Dockerfile x.Dockerfile (a link to /root/Dockerfile, outside of the repository)', 'protected'],
+  ['the cache volume as build context', input(service('db', { build: { context: '/devenv-cache' } })), 'service db: build context /devenv-cache', 'protected'],
+  ['the folder with the token as build context', input(service('db', { build: { context: '/workspaces/.devenv+' } })), 'service db: build context /workspaces/.devenv+', 'protected'],
+  ['the parent of the repository as build context', input(service('db', { build: { context: '/workspaces' } })), 'service db: build context /workspaces', 'protected'],
+  ['the root as build context', input(service('db', { build: { context: '/' } })), 'service db: build context /', 'protected'],
+  ['the folder of the Docker socket as build context', input(service('db', { build: { context: '/var/run' } })), 'service db: build context /var/run', 'protected'],
+  ['a context outside that links to the cache volume', input(service('db', { build: { context: '/opt/ctx' } }), { realPaths: { '/opt/ctx': '/devenv-cache/x' } }), 'service db: build context /opt/ctx', 'protected'],
+  ['a Dockerfile in the cache volume', input(service('db', { build: { context: REPO, dockerfile: '/devenv-cache/Dockerfile' } })), 'service db: Dockerfile /devenv-cache/Dockerfile', 'protected'],
+  ['a local build whose Dockerfile could not be read', input(service('db', { build: { context: REPO } }), { dockerfiles: {} }), `service db: Dockerfile ${REPO}/Dockerfile (it could not be read, so its images cannot be checked)`, 'unsupported'],
+  // Review round 1, S4: images of other environments, however they are written, and image IDs.
+  ['the image of another environment with index.docker.io', input(service('db', { image: 'index.docker.io/library/devenv-11111111:3' })), 'service db: image index.docker.io/library/devenv-11111111:3 of another environment', 'protected'],
+  ['the image of another environment with registry-1.docker.io', input(service('db', { image: 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64) })), `service db: image registry-1.docker.io/devenv-11111111-db@sha256:${'a'.repeat(64)} of another environment`, 'protected'],
+  ['an image ID', input(service('db', { image: `sha256:${'b'.repeat(64)}` })), `service db: image sha256:${'b'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
+  ['a short image ID', input(service('db', { image: 'bbbbbbbbbbbb' })), 'service db: image bbbbbbbbbbbb (an image ID; name the image)', 'unsupported'],
+  ['FROM the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM docker.io/devenv-11111111:2 AS base\nFROM base\n' } }), 'service db: FROM image docker.io/devenv-11111111:2 of another environment', 'protected'],
+  ['FROM the image of another environment through a build argument', input(service('db', { build: { context: REPO, args: { BASE: 'devenv-11111111:2' } } }), { dockerfiles: { db: 'ARG BASE=alpine\nFROM $BASE\n' } }), 'service db: FROM image devenv-11111111:2 of another environment', 'protected'],
+  ['FROM the image of another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'FROM devenv-11111111:2' } }), { dockerfiles: { db: 'FROM devenv-11111111:2' } }), 'service db: FROM image devenv-11111111:2 of another environment', 'protected'],
+  ['an additional context of the image of another environment', input(service('db', { build: { context: REPO, additional_contexts: { base: 'docker-image://devenv-11111111:2' } } })), 'service db: build additional_contexts base image devenv-11111111:2 of another environment', 'protected'],
+  // Review round 1, S2: a network of another environment under a name of its own, found by its labels or containers.
+  ['a named network of another project', input((m) => (m.networks = { backend: { name: 'backend' } }), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'network backend of another environment', 'protected'],
+  ['an external network with a container of another environment', input((m) => (m.networks = { shared: { name: 'shared', external: true } }), { networks: { shared: { labels: {}, environments: ['11111111-0000-4000-8000-000000000000'] } } }), 'network shared of another environment', 'protected'],
+  ['network_mode of a network of another project', input(service('db', { network_mode: 'backend' }), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'service db: network backend of another environment', 'protected'],
   // Not supported, whatever the switch says.
   ['restart always', input(service('db', { restart: 'always' })), 'service db: restart always', 'unsupported'],
   ['an unknown key', input(service('db', { future: 1 })), 'service db: future', 'unsupported'],
@@ -128,6 +155,30 @@ describe('composeAccessClassification', () => {
     // The same volume name in two keys: one of another program (computer), the same text never gets weaker.
     const checked = input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`], volumeLabels: { [`${PROJECT}_pgdata`]: { 'devenv.environment-id': 'x' } } });
     expect(composeAccessReport(checked, false).hostAccess).toEqual([`volume ${PROJECT}_pgdata of another environment`]);
+  });
+
+  it('allows the build paths and networks of the environment itself (review round 1, S1, S2)', () => {
+    const checked = input(
+      (m) => {
+        m.services.db = { build: { context: `${REPO}/db`, dockerfile: 'Dockerfile', additional_contexts: { base: 'docker-image://postgres:16' } } };
+        m.networks = { default: { name: `${PROJECT}_default` }, backend: { name: 'backend' } };
+      },
+      {
+        realPaths: { [`${REPO}/db`]: `${REPO}/db`, [`${REPO}/db/Dockerfile`]: `${REPO}/db/Dockerfile` },
+        dockerfiles: { db: 'FROM postgres:16\n' },
+        networks: {
+          [`${PROJECT}_default`]: { labels: { 'com.docker.compose.project': PROJECT }, environments: [ID] },
+          backend: { labels: {}, environments: [] },
+        },
+      },
+    );
+    expect(composeAccessReport(checked)).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  it('lifts a build context outside the repository that is no path of the workspace helper (review round 1, S1)', () => {
+    const checked = input(service('db', { build: { context: '/opt/tool' } }), { realPaths: { '/opt/tool': '/opt/tool' }, dockerfiles: { db: 'FROM alpine:3.22\n' } });
+    expect(composeAccessClassification(checked)).toEqual([{ item: 'service db: build context /opt/tool', class: 'computer' }]);
+    expect(composeAccessReport(checked, false)).toEqual({ hostAccess: [], unsupported: [] });
   });
 
   it('allows the template model with the checks off as with them on', () => {

@@ -402,7 +402,36 @@ export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRe
   const value: unknown = record?.compose;
   if (!isRecord(value) || typeof value.service !== 'string' || value.service === '') return undefined;
   if (!Array.isArray(value.images) || !value.images.every((image) => typeof image === 'string')) return undefined;
-  return { service: value.service, images: [...value.images] };
+  const serviceImages = Array.isArray(value.serviceImages) && value.serviceImages.every((image) => typeof image === 'string') ? [...value.serviceImages] : undefined;
+  return {
+    service: value.service,
+    images: [...value.images],
+    ...(serviceImages !== undefined ? { serviceImages } : {}),
+    ...(typeof value.version === 'string' ? { version: value.version } : {}),
+    ...(typeof value.inputsHash === 'string' ? { inputsHash: value.inputsHash } : {}),
+  };
+}
+
+/**
+ * Whether the Docker Compose configuration changed since the build of `record` (review round 1, P-4), from the model
+ * hash (composeConfigHash, `configHash`), the hash of the files as written (composeInputsHash), and the version of the
+ * Compose plugin that printed the model:
+ * - `changed`: the files differ, or they are equal and the same Compose version printed another model (for example a
+ *   value of the environment of the helper that the model uses);
+ * - `rebaseline`: only the Compose version and with it the printed model differ: no change for the user; the record
+ *   takes the new model hash and version;
+ * - `unchanged`: otherwise.
+ * A record without the hash of the files or the version (written before) compares the model hash alone.
+ */
+export function composeConfigurationChange(
+  record: Pick<BuildRecord, 'configHash' | 'compose'>,
+  current: { configHash: string; inputsHash: string; version: string },
+): 'changed' | 'unchanged' | 'rebaseline' {
+  const compose = composeRecordOf(record as BuildRecord);
+  if (compose?.inputsHash === undefined || compose.version === undefined) return record.configHash === current.configHash ? 'unchanged' : 'changed';
+  if (compose.inputsHash !== current.inputsHash) return 'changed';
+  if (record.configHash === current.configHash) return compose.version === current.version ? 'unchanged' : 'rebaseline';
+  return compose.version === current.version ? 'changed' : 'rebaseline';
 }
 
 /** A container that Docker Compose created for the project `project` (the dev container or another service). */

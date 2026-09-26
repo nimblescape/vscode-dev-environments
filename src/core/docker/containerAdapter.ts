@@ -44,6 +44,14 @@ export interface VolumeInfo {
   labels: Record<string, string>;
 }
 
+/** A network of `docker network inspect`. */
+export interface NetworkInfo {
+  name: string;
+  labels: Record<string, string>;
+  /** The IDs of the containers attached to it. */
+  containers: string[];
+}
+
 /** A local image of `docker image ls`. */
 export interface ImageInfo {
   /** Full image ID, for example `sha256:7a83…`. */
@@ -94,12 +102,13 @@ export interface ContainerAdapterOptions {
   onDaemonStatus?: (running: boolean) => void;
 }
 
-type ObjectKind = 'container' | 'volume' | 'image';
+type ObjectKind = 'container' | 'volume' | 'image' | 'network';
 
 const MISSING_PATTERNS: Record<ObjectKind, RegExp> = {
   container: /no such (container|object)/i,
   volume: /no such (volume|object)/i,
   image: /no such (image|object)/i,
+  network: /no such (network|object)|network \S+ not found/i,
 };
 
 /** Label that Docker Compose gives each container, network, and volume of a project. */
@@ -211,6 +220,20 @@ function mountedVolumes(mounts: unknown): string[] {
 function toVolumeInfo(value: unknown): VolumeInfo | undefined {
   if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
   return { name: value.Name, labels: toLabels(value.Labels) };
+}
+
+function toNetworkInfo(value: unknown): NetworkInfo | undefined {
+  if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
+  const containers = isRecord(value.Containers) ? Object.keys(value.Containers) : [];
+  return { name: value.Name, labels: toLabels(value.Labels), containers };
+}
+
+/**
+ * Whether a container of an environment is its dev container (findContainer): without the label devenv.compose-service
+ * of the other services of Docker Compose, or with the name of the environment.
+ */
+export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>, containerName: string): boolean {
+  return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
@@ -435,11 +458,13 @@ export class ContainerAdapter {
   /**
    * The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. The
    * other services of a Docker Compose environment carry the label too, with devenv.compose-service: they are skipped,
-   * so this is always the dev container.
+   * so this is always the dev container. A container with the name of the environment (`containerName`, the name of
+   * the dev container) is never skipped, whatever labels its image gave it (review round 1, D2: an image with the label
+   * devenv.compose-service would hide a single container, which then kept running after the checks were turned on).
    */
-  async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
+  async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
-    const containers = all.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
+    const containers = all.filter((container) => isDevContainer(container, containerName));
     if (containers.length === 0) return undefined;
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
@@ -500,9 +525,10 @@ export class ContainerAdapter {
 
   /**
    * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
-   * `repository:tag` (`docker image ls --filter reference=<project>-*`). Throws CommandError.
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
+   * devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
    */
-  async listProjectImages(project: string): Promise<string[]> {
+  async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
     const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     const images = new Set<string>();
@@ -511,7 +537,19 @@ export class ContainerAdapter {
       if (!item.Repository.startsWith(`${project}-`) || !item.Tag || item.Tag === '<none>') continue;
       images.add(`${item.Repository}:${item.Tag}`);
     }
-    return [...images].sort();
+    const sorted = [...images].sort();
+    if (environmentId === undefined || sorted.length === 0) return sorted;
+    const foreign = new Set<string>();
+    for (const batch of chunks(sorted, INSPECT_BATCH_SIZE)) {
+      const items = await this.inspectBatch(['image', 'inspect', ...batch], 'image');
+      items.forEach((item) => {
+        const config = isRecord(item) ? item.Config : undefined;
+        const owner = toLabels(isRecord(config) ? config.Labels : undefined)[LABEL_ENVIRONMENT_ID];
+        const tags = isRecord(item) && Array.isArray(item.RepoTags) ? item.RepoTags.filter((tag): tag is string => typeof tag === 'string') : [];
+        if (owner !== undefined && owner !== environmentId) for (const tag of tags) foreign.add(tag);
+      });
+    }
+    return sorted.filter((image) => !foreign.has(image));
   }
 
   /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */
@@ -609,6 +647,21 @@ export class ContainerAdapter {
       }
     }
     return volumes;
+  }
+
+  /**
+   * The networks of `names` that exist, with their labels and the IDs of the containers attached to them
+   * (`docker network inspect`); missing ones are left out. Throws CommandError.
+   */
+  async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
+    const networks: NetworkInfo[] = [];
+    for (const batch of chunks([...new Set(names)], INSPECT_BATCH_SIZE)) {
+      for (const item of await this.inspectBatch(['network', 'inspect', ...batch], 'network')) {
+        const network = toNetworkInfo(item);
+        if (network) networks.push(network);
+      }
+    }
+    return networks;
   }
 
   /** True if the image exists locally. Throws CommandError for other errors (for example an invalid reference). */

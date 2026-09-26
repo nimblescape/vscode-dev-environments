@@ -434,15 +434,55 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.version).toBe('2.29.1');
     expect(output.dollarEscaped).toBe(true);
     expect(output.model).toEqual(JSON.parse(env.FAKE_MODEL!));
-    // Not the Dockerfile outside the repository, also not through a link, and none of a remote context.
-    expect(output.dockerfiles).toEqual({ app: 'FROM node:24\n', inline: 'FROM alpine:3.22' });
+    // Not a Dockerfile in the repository whose link leads out of it, and none of a remote context. Review round 1 (S1):
+    // a Dockerfile outside the repository that is no path of the workspace helper is read now (with the checks off it
+    // may be built, and its FROM images must be checked); before, it was left out.
+    expect(output.dockerfiles).toEqual({ app: 'FROM node:24\n', inline: 'FROM alpine:3.22', outside: 'FROM secret\n' });
+    // Review round 1 (S1): the real paths of the build contexts and the Dockerfiles too.
     expect(output.realPaths).toEqual({
       [repo]: fs.realpathSync(repo),
+      [`${repo}/.devcontainer`]: fs.realpathSync(path.join(repo, '.devcontainer')),
+      [`${repo}/.devcontainer/Dockerfile`]: fs.realpathSync(path.join(repo, '.devcontainer', 'Dockerfile')),
+      [path.join(dir, 'outside', 'Dockerfile')]: fs.realpathSync(path.join(dir, 'outside', 'Dockerfile')),
+      [`${repo}/linked.Dockerfile`]: fs.realpathSync(path.join(dir, 'outside', 'Dockerfile')),
       [`${repo}/link-out`]: fs.realpathSync(path.join(dir, 'secret.txt')),
       [`${repo}/missing`]: null,
       [`${repo}/db.env`]: fs.realpathSync(path.join(repo, 'db.env')),
       [`${repo}/missing.env`]: null,
     });
+  });
+
+  it('records the real path of a build context that links out of the repository, and does not read its Dockerfile', () => {
+    // Review round 1 (S1): without the real path of the context, a link to a folder of the workspace helper passed.
+    const { dir, repo, env } = setup();
+    fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'ctx'));
+    const model = { name: 'devenv-3f2a9c1e', services: { app: { build: { context: `${repo}/ctx` } } } };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
+    expect(output.realPaths).toEqual({
+      [`${repo}/ctx`]: fs.realpathSync(path.join(dir, 'outside')),
+      [`${repo}/ctx/Dockerfile`]: fs.realpathSync(path.join(dir, 'outside', 'Dockerfile')),
+    });
+    expect(output.dockerfiles).toEqual({});
+  });
+
+  it('prints the hash of the files that Compose read, which follows their texts (review round 1, P-4)', () => {
+    const { repo, env } = setup();
+    const files = [path.join(repo, 'compose.yml')];
+    write(files[0], 'services: {}\n');
+    const first = (runModel(repo, files, env) as Record<string, unknown>).inputsHash;
+    expect(first).toMatch(/^[0-9a-f]{64}$/);
+    expect((runModel(repo, files, env) as Record<string, unknown>).inputsHash).toBe(first);
+    // The .env of the project folder (the folder of the first compose file).
+    write(path.join(repo, '.env'), 'A=1\n');
+    const withEnv = (runModel(repo, files, env) as Record<string, unknown>).inputsHash;
+    expect(withEnv).not.toBe(first);
+    // An env_file of the model.
+    write(path.join(repo, 'db.env'), 'A=2\n');
+    const withEnvFile = (runModel(repo, files, env) as Record<string, unknown>).inputsHash;
+    expect(withEnvFile).not.toBe(withEnv);
+    // A compose file.
+    write(files[0], 'services: { a: {} }\n');
+    expect((runModel(repo, files, env) as Record<string, unknown>).inputsHash).not.toBe(withEnvFile);
   });
 
   it('reports a $ that the output does not escape', () => {

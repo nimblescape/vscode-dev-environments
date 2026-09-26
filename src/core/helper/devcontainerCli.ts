@@ -7,7 +7,13 @@ import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
 import type { HostAccessChecks } from '../hostAccessChecks';
-import { CONTAINER_VERSION_LABEL, containerHostname, HOST_ACCESS_UNRESTRICTED_LABEL, WORKSPACES_ROOT } from '../names';
+import {
+  CONTAINER_VERSION_LABEL,
+  containerHostname,
+  HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
+  HOST_ACCESS_UNRESTRICTED_LABEL,
+  WORKSPACES_ROOT,
+} from '../names';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { loopbackAppPorts, overrideRunArgs, runArgsDecideHostname, withoutNameArgs } from './hostAccess';
 
@@ -16,7 +22,7 @@ import { loopbackAppPorts, overrideRunArgs, runArgsDecideHostname, withoutNameAr
  * Assumption (V-10): the CLI keeps data there that is useful across helper runs. CLI 0.89.0 downloads Features into a
  * new folder below os.tmpdir() for each build, so the Features themselves are not cached there.
  */
-export const HELPER_CACHE_FOLDER = '/devenv-cache';
+export const HELPER_CACHE_FOLDER = NAMES_HELPER_CACHE_FOLDER;
 
 /**
  * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:

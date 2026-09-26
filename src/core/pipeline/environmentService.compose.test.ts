@@ -13,6 +13,7 @@ import {
   COMPOSE_MODEL_PATH,
   WORKSPACE_VOLUME_KEY,
   composeConfigHash,
+  composeInputsHash,
   type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
@@ -112,6 +113,7 @@ function output(changes: (m: ComposeModel) => void = () => undefined): ComposeMo
     model: m,
     dockerfiles: {},
     realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql` },
+    inputsHash: 'inputs-1',
   };
 }
 
@@ -281,7 +283,7 @@ describe('first open of a Docker Compose configuration', () => {
     // Both containers carry the environment ID; the lookup finds the dev container.
     expect(devContainer()).toMatchObject({ name: NAME, state: 'running', image: IMAGE_1 });
     expect(dbContainer()).toMatchObject({ state: 'running', labels: expect.objectContaining({ [LABEL_ENVIRONMENT_ID]: ENV_ID }) });
-    expect((await h.docker.findContainer(ENV_ID))?.name).toBe(NAME);
+    expect((await h.docker.findContainer(ENV_ID, NAME))?.name).toBe(NAME);
     expect(result).toMatchObject({ containerName: NAME, remoteWorkspaceFolder: FOLDER });
 
     const entry = await h.registry.get(ENV_ID);
@@ -375,6 +377,68 @@ describe('first open of a Docker Compose configuration', () => {
     );
   });
 
+  it('names an engine whose version could not be read as unknown, not as old (review round 1, P-5)', async () => {
+    h.docker.apiVersion = undefined;
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(
+      Messages.unsupportedOptions(
+        `service db: bind mount ${FOLDER}/init.sql → /docker-entrypoint-initdb.d/init.sql (needs Docker Engine 26 or newer; the version of the Docker Engine could not be read)`,
+      ),
+    );
+  });
+
+  it('refuses a network of another environment under a name of its own, found by its labels, before any build (review round 1, S2)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.networks = { ...m.networks, backend: { name: 'backend' } };
+        m.services.db.networks = { default: null, backend: null };
+      }),
+    );
+    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('network backend of another environment'));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.networkInspections[0]).toEqual(expect.arrayContaining([`${PROJECT}_default`, 'backend']));
+  });
+
+  it('refuses an external network that a container of another environment uses (review round 1, S2)', async () => {
+    useCompose(h, output((m) => (m.networks = { ...m.networks, shared: { name: 'shared', external: true } })));
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    h.docker.networks.set('shared', {});
+    h.docker.networkContainers.set('shared', [other.id]);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('network shared of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a local build whose Dockerfile links out of the repository, before any build (review round 1, S1)', async () => {
+    useCompose(h, {
+      ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
+      realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/db`]: '/devenv-cache', [`${FOLDER}/db/Dockerfile`]: '/devenv-cache/Dockerfile' },
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain(`service db: build context ${FOLDER}/db (a link to /devenv-cache, outside of the repository)`);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a side service built FROM the image of another environment (review round 1, S4)', async () => {
+    useCompose(h, {
+      ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
+      dockerfiles: { db: 'FROM index.docker.io/library/devenv-7c1d2e3f:3\n' },
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment'));
+  });
+
+  it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'devenv.compose-service': 'x' } });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${DB_IMAGE}`));
+    expect(h.helper.ups).toEqual([]);
+  });
+
   it('reports a compose file that Docker Compose cannot read, with its message in the details', async () => {
     h.helper.composeOutput = { error: 'yaml: line 3: mapping values are not allowed in this context' };
     const error = await rejection(h.service.open(TARGET, options()));
@@ -436,8 +500,32 @@ describe('existing Docker Compose environment', () => {
     expect(devContainer()).toMatchObject({ id: dev, state: 'running' });
     expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
     expect(h.ui.prompts).toEqual([]);
-    // The existing container passed the checks when it was created: no new volumes are created without a new container.
-    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
+    // The existing container passed the checks when it was created: the model and the image are not checked again
+    // (no image inspect). Review round 1 (P-2): the volumes of the model that are missing are created all the same
+    // (before, none was created without a new container, and `up` failed on an external volume that did not exist).
+    expect(h.docker.log.filter((line) => line.startsWith('image inspect'))).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume create')).sort()).toEqual([`volume create ${PROJECT}_cache`, `volume create ${PROJECT}_pgdata`]);
+  });
+
+  it('creates only the missing volumes when up adds the container of a new service (review round 1, P-2)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    h.docker.volumes.set(`${PROJECT}_pgdata`, volumeLabelsOf(VOLUME_KIND_COMPOSE));
+    h.docker.volumes.set(`${PROJECT}_cache`, volumeLabelsOf(VOLUME_KIND_COMPOSE));
+    // The model gained a service with a volume; "Rebuild later" starts the environment without a build.
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: DB_IMAGE, volumes: [{ type: 'volume', source: 'cachedata', target: '/data' }] };
+        m.volumes = { ...m.volumes, cachedata: { name: `${PROJECT}_cachedata` } };
+      }),
+    );
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([`volume create ${PROJECT}_cachedata`]);
+    expect(h.docker.volumes.get(`${PROJECT}_cachedata`)?.[LABEL_VOLUME]).toBe(VOLUME_KIND_COMPOSE);
+    expect(h.docker.log.indexOf(`volume create ${PROJECT}_cachedata`)).toBeGreaterThanOrEqual(0);
+    expect(upModel().volumes).toMatchObject({ cachedata: { name: `${PROJECT}_cachedata`, external: true } });
   });
 
   it('starts a stopped side service when the dev container runs (D-22)', async () => {
@@ -461,6 +549,33 @@ describe('existing Docker Compose environment', () => {
     const entry = await h.registry.get(ENV_ID);
     expect(entry?.buildRecord).toMatchObject({ environmentImage: IMAGE_2, images: { [DB_IMAGE]: DB_DIGEST_NEW } });
     expect(h.docker.images.has(IMAGE_1)).toBe(false);
+  });
+
+  it('removes the old base image of the dev service after an update, but not the old image of a side service (review round 1, D5)', async () => {
+    await seedCompose({
+      record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST }, compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE] } },
+    });
+    const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
+    const oldDb = `docker.io/library/postgres@${DB_DIGEST}`;
+    h.docker.images.add(oldBase);
+    h.docker.images.add(oldDb);
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect(h.docker.log).toContain(`rmi ${oldBase}`);
+    // The image of the database is the user's (for example also used outside Dev Environments).
+    expect(h.docker.log).not.toContain(`rmi ${oldDb}`);
+    expect(h.docker.images.has(oldDb)).toBe(true);
+  });
+
+  it('removes no base image of a Docker Compose build record without the list of service images (review round 1, D5)', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
+    const oldDb = `docker.io/library/postgres@${DB_DIGEST}`;
+    h.docker.images.add(oldDb);
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect(h.docker.log.filter((line) => line.startsWith('rmi') && line.includes('@'))).toEqual([]);
   });
 
   it('keeps the environment when the newer dev service image needs access to the computer (refused update)', async () => {
@@ -493,6 +608,31 @@ describe('existing Docker Compose environment', () => {
     expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(composeConfigHash(CONFIG_TEXT, changed, {}));
   });
 
+  it('takes over a new Compose version that prints the unchanged files as another model, without a question (review round 1, P-4)', async () => {
+    await seedCompose({ record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.39.0', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } } });
+    // The same files, printed by the newer plugin with a key more.
+    useCompose(h, { ...output((m) => (m.services.db.stop_signal = 'SIGTERM')), version: '2.40.3' });
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.prompts).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+    const record = (await h.registry.get(ENV_ID))?.buildRecord;
+    expect(record?.configHash).toBe(composeConfigHash(CONFIG_TEXT, (h.helper.composeOutput as ComposeModelOutput).model, {}));
+    expect(record?.compose?.version).toBe('2.40.3');
+  });
+
+  it('asks when the files changed, and when the same Compose version prints another model (review round 1, P-4)', async () => {
+    const record = { compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.40.3', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } };
+    await seedCompose({ record });
+    useCompose(h, { ...output(), version: '2.41.0', inputsHash: 'inputs-2' });
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    useCompose(h, output((m) => (m.services.db.stop_signal = 'SIGTERM')));
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
+  });
+
   it('counts an unchanged model as unchanged, and a model that cannot be read as changed', async () => {
     await seedCompose();
     expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
@@ -509,6 +649,13 @@ describe('existing Docker Compose environment', () => {
     expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
   });
 
+  it('starts all containers with docker start when up fails because the workspace helper failed (review round 1, P-3)', async () => {
+    await seedCompose();
+    h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+  });
+
   it('starts all containers with docker start when the workspace helper is not available', async () => {
     await seedCompose();
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
@@ -521,14 +668,33 @@ describe('existing Docker Compose environment', () => {
     // Compose pulls a missing image of a side service itself (pull_policy missing).
     h.docker.images.add(DB_IMAGE);
     const single = h.docker.containersOf(ENV_ID)[0].id;
-    h.ui.configurationChangedAnswer = 'later';
+    // Review round 1 (P-1): the kind switches only with a build (before: also with "Rebuild later").
+    h.ui.configurationChangedAnswer = 'rebuildNow';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.docker.log).toContain(`rm ${single}`);
-    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     expect(devContainer()).toMatchObject({ name: NAME, state: 'running' });
     expect(dbContainer()?.state).toBe('running');
     // The containers of the configuration are new: the volumes are created with the labels before `up`.
     expect(h.docker.volumes.get(`${PROJECT}_pgdata`)?.[LABEL_VOLUME]).toBe(VOLUME_KIND_COMPOSE);
+    // Review round 1 (P-1): the user learns that the files outside the repository are removed.
+    expect(h.progress.details).toContain(Messages.containerComposeCreated);
+  });
+
+  it('starts the single container as it is on "Rebuild later" when the configuration became a Compose configuration (review round 1, P-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0].id;
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.log).not.toContain(`rm ${single}`);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    // A single container: the override configuration of a single container, no model.
+    expect(h.helper.ups[0].override).toHaveProperty('runArgs');
+    expect(h.helper.ups[0].files).toBeUndefined();
+    expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
+    expect(h.docker.containersOf(ENV_ID)[0]).toMatchObject({ id: single, state: 'running' });
+    expect(h.progress.details).not.toContain(Messages.containerComposeCreated);
   });
 });
 
@@ -684,6 +850,28 @@ describe('Delete of a Docker Compose environment', () => {
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['shared-tools']);
   });
 
+  it('lists a volume with a name of its own that a side service mounts as data of the services (review round 1, D1)', async () => {
+    // The database keeps its data in a volume that the model names itself (label `additional`), recorded at the open.
+    useCompose(
+      h,
+      output((m) => {
+        m.volumes = { pgdata: { name: 'myapp-db' } };
+      }),
+    );
+    await h.service.open(TARGET, options());
+    expect(h.docker.volumes.get('myapp-db')?.[LABEL_VOLUME]).toBe(VOLUME_KIND_ADDITIONAL);
+    expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
+    // Also without the record: the container of the service mounts it.
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      delete entry.serviceVolumes;
+    });
+    dbContainer()!.volumes = ['myapp-db'];
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
+  });
+
   it('removes all containers, the networks, and the images of the project, and keeps the data of the services by default', async () => {
     const { oneOff } = await seedForDelete();
     await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
@@ -702,6 +890,19 @@ describe('Delete of a Docker Compose environment', () => {
     expect(await h.registry.list()).toEqual([]);
     // The containers go before the networks, which Docker removes only when no container uses them.
     expect(h.docker.log.indexOf(`network rm ${PROJECT}_default`)).toBeGreaterThan(h.docker.log.indexOf(`rm ${oneOff}`));
+  });
+
+  it('keeps a container of another environment that has the label of the project (review round 1, D3)', async () => {
+    await seedForDelete();
+    // For example a single container of another environment whose image has the label of this project.
+    const foreign = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x', labels: { ...COMPOSE_LABELS } });
+    h.docker.images.add(`${PROJECT}-tool`);
+    h.docker.imageConfigs.set(`${PROJECT}-tool`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.containerByRef(foreign.id)).toBeDefined();
+    expect(h.docker.log).not.toContain(`rm ${foreign.id}`);
+    expect(h.docker.images.has(`${PROJECT}-tool`)).toBe(true);
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(false);
   });
 
   it('removes the volumes of the project that the user ticked', async () => {
@@ -748,10 +949,11 @@ describe('a Docker Compose environment whose configuration became a single conta
 
   it('removes the other services, then creates the container again as a single container', async () => {
     const db = dbContainer()?.id;
-    h.ui.configurationChangedAnswer = 'later';
+    // Review round 1 (P-1): the kind switches only with a build (before: also with "Rebuild later").
+    h.ui.configurationChangedAnswer = 'rebuildNow';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.docker.log).toContain(`rm ${db}`);
-    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     // `up` got a single container, and the containers of Compose are gone.
     expect(h.helper.ups[0].override).toHaveProperty('runArgs');
     const containers = h.docker.containersOf(ENV_ID);
@@ -763,6 +965,27 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.progress.details).toContain(Messages.containerComposeReplaced);
     // The merged configuration of the container of Compose is not checked (the CLI could read another service).
     expect(h.logger.infos.some((line) => line.includes('was created for a Docker Compose configuration. Its merged configuration is not checked'))).toBe(true);
+  });
+
+  it('starts the containers of Docker Compose with docker start on "Rebuild later" (review round 1, P-1)', async () => {
+    const db = dbContainer()?.id;
+    const dev = devContainer()?.id;
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log).not.toContain(`rm ${db}`);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db}`, `start ${dev}`]);
+    expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
+    expect(h.progress.details).not.toContain(Messages.containerComposeReplaced);
+  });
+
+  it('refuses to start on "Rebuild later" when the Docker Compose environment has no dev container (review round 1, P-1)', async () => {
+    for (const container of h.docker.containersOf(ENV_ID)) h.docker.containers.delete(container.id);
+    h.ui.configurationChangedAnswer = 'later';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(h.helper.ups).toEqual([]);
   });
 
   it('removes the images that Compose built for the project after the rebuild', async () => {
@@ -806,6 +1029,14 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     expect(h.helper.ups[0].env).toEqual({ COMPOSE_PROJECT_NAME: PROJECT });
     expect(dbContainer()?.state).toBe('running');
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose).toEqual({ service: 'app', images: [`${PROJECT}-app`] });
+    // Review round 1 (D5): the record names the pulled images of the other services, which are no base images.
+    // Review round 1 (P-4): the version of Compose and the hash of the files as written, too.
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose).toEqual({
+      service: 'app',
+      images: [`${PROJECT}-app`],
+      serviceImages: [DB_IMAGE],
+      version: '2.40.3',
+      inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}),
+    });
   });
 });

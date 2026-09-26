@@ -1739,7 +1739,7 @@ export class Controller implements vscode.Disposable {
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;
     try {
-      const container = await this.deps.docker.findContainer(environment.id);
+      const container = await this.deps.docker.findContainer(environment.id, environment.containerName);
       if (container === undefined) return undefined;
       const checks = hostAccessChecks(environment.repository, this.deps.settings());
       if (containerIsCurrent(container.labels, true, checks)) return undefined;

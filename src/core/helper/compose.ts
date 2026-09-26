@@ -24,7 +24,15 @@ import {
   WORKSPACES_ROOT,
   containerHostname,
 } from '../names';
-import { isLoopbackAddress, isPathSource, parseMountString, splitPortAddress, withLoopbackAddress } from './hostAccess';
+import {
+  isDockerNetworkMode,
+  isLoopbackAddress,
+  isOtherEnvironmentProjectName,
+  isPathSource,
+  parseMountString,
+  splitPortAddress,
+  withLoopbackAddress,
+} from './hostAccess';
 import { OVERRIDE_FOLDER } from './scripts';
 
 /** A service of the merged model (`services.<name>`), as `docker compose config --format json` prints it. */
@@ -148,6 +156,11 @@ export interface ComposeModelOutput {
    * for a path that does not exist.
    */
   realPaths: Record<string, string | null>;
+  /**
+   * sha256 of the texts of the files that Compose read for the model (the compose files, the `.env` of the project
+   * folder, the `env_file`s), computed in the helper (review round 1, P-4); `''` when the output has none.
+   */
+  inputsHash: string;
 }
 
 /**
@@ -183,6 +196,7 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     model: value.model as unknown as ComposeModel,
     dockerfiles: value.dockerfiles as Record<string, string>,
     realPaths: value.realPaths as Record<string, string | null>,
+    inputsHash: typeof value.inputsHash === 'string' ? value.inputsHash : '',
   };
 }
 
@@ -199,10 +213,7 @@ export function composeServiceImage(project: string, service: string): string {
   return `${project}-${name || 'service'}`;
 }
 
-/** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
-export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
-  return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);
-}
+export { isOtherEnvironmentProjectName };
 
 /** A named volume of the top-level `volumes` of a model. */
 export interface ComposeVolumeName {
@@ -233,6 +244,51 @@ export function composeVolumeNames(model: ComposeModel, project: string): Compos
     const external = isRecord(volume) && Boolean(volume.external);
     return { key, name, project: !external && name === `${project}_${key}` };
   });
+}
+
+/** A network of the top-level `networks` of a model, with its Docker name. */
+export interface ComposeNetworkName {
+  key: string;
+  name: string;
+}
+
+/** The Docker names of the top-level networks of the model: `name`, the key of an external network, or `<project>_<key>`. */
+export function composeNetworkNames(model: ComposeModel, project: string): ComposeNetworkName[] {
+  const networks = isRecord(model.networks) ? model.networks : {};
+  return Object.entries(networks).map(([key, network]) => ({ key, name: volumeNameOf(key, network, project) }));
+}
+
+/**
+ * The networks of the model that may exist before `up` and whose labels and containers the check reads (S2): the
+ * top-level networks (composeNetworkNames) and each network that a `network_mode` names (not a mode of Docker such as
+ * `host`, `none`, `service:…`).
+ */
+export function composeNetworkReferences(model: ComposeModel, project: string): string[] {
+  const names = new Set(composeNetworkNames(model, project).map((network) => network.name));
+  for (const service of Object.values(isRecord(model.services) ? model.services : {})) {
+    const mode = isRecord(service) && typeof service.network_mode === 'string' ? service.network_mode.trim() : '';
+    if (mode !== '' && !isDockerNetworkMode(mode)) names.add(mode);
+  }
+  return [...names];
+}
+
+/**
+ * The Docker names of the named volumes that services other than the dev service mount (review round 1, D1): they hold
+ * the data of the services (for example of a database), whatever their key or `name:`. Delete lists them apart, none
+ * ticked (removableServiceDataVolumes of the pipeline).
+ */
+export function composeServiceVolumeNames(model: ComposeModel, project: string, devService: string): string[] {
+  const names = new Map(composeVolumeNames(model, project).map((volume) => [volume.key, volume.name]));
+  const used = new Set<string>();
+  for (const [service, value] of Object.entries(isRecord(model.services) ? model.services : {})) {
+    if (service === devService || !isRecord(value) || !Array.isArray(value.volumes)) continue;
+    for (const entry of value.volumes) {
+      if (!isRecord(entry) || (entry.type !== undefined && entry.type !== 'volume') || typeof entry.source !== 'string') continue;
+      const name = names.get(entry.source);
+      if (name !== undefined) used.add(name);
+    }
+  }
+  return [...used].sort();
 }
 
 /**
@@ -292,6 +348,20 @@ export function composeReferences(model: ComposeModel, dockerfiles: Readonly<Rec
   return { images: unique(images), features: unique(featureKeys) };
 }
 
+/**
+ * The `image` of each service other than the dev service that has no `build` (review round 1, D5): images that Compose
+ * runs as they are (for example `postgres:16`), which the image check checks and the pipeline pulls, but which are no
+ * base image of the environment image. Trimmed, as composeReferences names them.
+ */
+export function composeServiceImageReferences(model: ComposeModel, devService: string): string[] {
+  const images = new Set<string>();
+  for (const [name, service] of Object.entries(model.services)) {
+    if (name === devService || !isRecord(service) || isRecord(service.build)) continue;
+    if (typeof service.image === 'string' && service.image.trim() !== '') images.add(service.image.trim());
+  }
+  return [...images].sort();
+}
+
 /** JSON with the keys of every object sorted, so that the same model always gives the same text. */
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -316,6 +386,20 @@ export function composeConfigHash(configText: string, model: ComposeModel, docke
     .join(',');
   const text = `${configText}\n${stableJson(model)}\n${files}`;
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+}
+
+/**
+ * The hash of the files of a Compose configuration as written (review round 1, P-4): the devcontainer.json text, the
+ * files that Compose read (ComposeModelOutput.inputsHash: compose files, `.env`, `env_file`s), and the Dockerfiles of
+ * the built services. Unlike composeConfigHash, it does not depend on the version of the Compose plugin, which prints
+ * the same files as a different model now and then.
+ */
+export function composeInputsHash(configText: string, inputsHash: string, dockerfiles: Readonly<Record<string, string>>): string {
+  const files = Object.keys(dockerfiles)
+    .sort()
+    .map((name) => `${JSON.stringify(name)}:${JSON.stringify(dockerfiles[name])}`)
+    .join(',');
+  return `sha256:${crypto.createHash('sha256').update(`${configText}\n${inputsHash}\n${files}`).digest('hex')}`;
 }
 
 /**
@@ -446,6 +530,14 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
       // A subpath of the workspace volume that a link leads out of the repository, for example to the GitHub token: not clear.
       return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${real}, outside of the repository)`, guarded: true };
     }
+  }
+  if (ctx.engineApiVersion === undefined) {
+    // Review round 1 (P-5): an engine that did not tell its version is not an old engine.
+    return {
+      action: 'refuse',
+      kind: 'unsupported',
+      item: `bind mount ${describe} (needs ${MIN_SUBPATH_ENGINE} or newer; the version of the Docker Engine could not be read)`,
+    };
   }
   if (!supportsVolumeSubpath(ctx.engineApiVersion)) {
     return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (needs ${MIN_SUBPATH_ENGINE} or newer)` };

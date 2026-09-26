@@ -263,6 +263,10 @@ describe('Docker Compose in the CLI bundle (implementation notes, section "Docke
     ['the top-level volumes of mounts', 'c=u.filter(b=>b.type==="volume"&&b.source)'],
     // `build` has no override configuration.
     ['build without --override-config', 'configFile:v,overrideConfigFile:J'],
+    // Review round 1 (D2, imageLabelItems): the only label that the CLI puts on the images that it builds; the other
+    // `devcontainer.` labels of the CLI are labels of containers.
+    ['the metadata label of images', 'var EI="devcontainer.metadata"'],
+    ['the labels of containers', 'var hg="devcontainer.local_folder",lI="devcontainer.config_file"'],
   ])('%s', (_name, text) => {
     expect(bundle.split(text).length - 1, text).toBe(1);
   });

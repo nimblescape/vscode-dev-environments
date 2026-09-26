@@ -774,6 +774,30 @@ describe('MonitorLoop.tick', () => {
       expect(h.lock.refreshes).toBe(refreshes[0] + 1);
     });
 
+    it('stops no further container when a window starts a session after the dev container stopped (review round 1, D4)', async () => {
+      const env = await closedWindowScenario(h);
+      const db = serviceOf(env, 'db');
+      h.docker.containers = [db, containerOf(env)];
+      let first = true;
+      h.docker.stopHook = async () => {
+        // A window opens the environment while the dev container stops.
+        if (first) await writeWindow(h, 'w2', ID_A, { pid: LIVE_PID_2 });
+        first = false;
+      };
+      const results = await runUntil(h, T0 + WAITING_MS + 1);
+      expect(results.flatMap((result) => result.stopped)).toEqual([]);
+      expect(h.docker.calls.filter((call) => call.startsWith('stop'))).toEqual([`stop id-${env.containerName}`]);
+      expect(h.docker.containers.find((container) => container.id === db.id)?.state).toBe('running');
+    });
+
+    it('reads Git in the container with the name of the environment even when its image labels it as a service (review round 1, D2)', async () => {
+      const env = await closedWindowScenario(h);
+      const dev = containerOf(env);
+      h.docker.containers = [{ ...dev, labels: { ...dev.labels, [LABEL_COMPOSE_SERVICE]: 'x' } }];
+      await runUntil(h, T0 + WAITING_MS + 1);
+      expect(h.docker.execCalls.map((call) => call.container)).toEqual([`id-${env.containerName}`]);
+    });
+
     it('reads no Git state when only other services run', async () => {
       const env = await closedWindowScenario(h);
       const db = serviceOf(env, 'db');

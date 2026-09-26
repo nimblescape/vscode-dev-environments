@@ -28,6 +28,9 @@ function input(config: Record<string, unknown>, more: Partial<HostAccessInput> =
   return { config, ownVolume: OWN, environment: ENVIRONMENT, ...more };
 }
 
+/** The folders of a single container's configuration `.devcontainer/devcontainer.json` in the repository `api`. */
+const HELPER_PATHS: Partial<HostAccessInput> = { configFolder: '/workspaces/api/.devcontainer', repositoryFolder: '/workspaces/api' };
+
 const mount = (spec: unknown): Record<string, unknown> => ({ mounts: [spec] });
 const run = (...runArgs: string[]): Record<string, unknown> => ({ runArgs });
 const build = (...options: string[]): Record<string, unknown> => ({ build: { options } });
@@ -140,6 +143,26 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['a storage option other than size', input(run('--storage-opt', 'dm.basesize=20G')), '--storage-opt=dm.basesize=20G', 'unsupported'],
   ['a network that Docker would read otherwise', input(run('--network', 'name="a,alias=b')), 'network "name=\\"a,alias=b"', 'unsupported'],
   ['an unknown build option', input(build('--progress=plain')), 'build option --progress', 'unsupported'],
+
+  // Review round 1 (S1 addendum): the build of a single container runs in the workspace helper; its paths there.
+  ['the cache volume as build context', input({ build: { dockerfile: 'Dockerfile', context: '/devenv-cache' } }, HELPER_PATHS), 'build context /devenv-cache (a folder of the workspace helper)', 'protected'],
+  ['the folder with the token as build context', input({ build: { dockerfile: 'Dockerfile', context: '../../.devenv+' } }, HELPER_PATHS), 'build context ../../.devenv+ (a folder of the workspace helper)', 'protected'],
+  ['the root as build context', input({ build: { dockerfile: 'Dockerfile', context: '/' } }, HELPER_PATHS), 'build context / (a folder of the workspace helper)', 'protected'],
+  ['the older property context', input({ dockerFile: 'Dockerfile', context: '/workspaces' }, HELPER_PATHS), 'build context /workspaces (a folder of the workspace helper)', 'protected'],
+  ['a Dockerfile in the cache volume', input({ build: { dockerfile: '/devenv-cache/Dockerfile' } }, HELPER_PATHS), 'Dockerfile /devenv-cache/Dockerfile (a folder of the workspace helper)', 'protected'],
+  // Review round 1 (S4): images of other environments, however they are written, and image IDs.
+  ['the image of another environment', input({ image: 'devenv-11111111:2' }), 'image devenv-11111111:2 of another environment', 'protected'],
+  ['the image of another environment on Docker Hub', input({ image: 'index.docker.io/library/devenv-11111111:2' }), 'image index.docker.io/library/devenv-11111111:2 of another environment', 'protected'],
+  ['an image ID', input({ image: `sha256:${'c'.repeat(64)}` }), `image sha256:${'c'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
+  ['FROM the image of another environment', input({ build: { dockerfile: 'Dockerfile', args: { B: 'devenv-11111111:2' } } }, { dockerfileText: 'ARG B\nFROM ${B}\n' }), 'FROM image devenv-11111111:2 of another environment', 'protected'],
+  ['a build context of the image of another environment', input(build('--build-context', 'base=docker-image://docker.io/devenv-11111111:2')), 'build option --build-context image docker.io/devenv-11111111:2 of another environment', 'protected'],
+  // Review round 1 (S3): the Compose network of another environment, by its name (also the long form) or its labels.
+  ['the Compose network of another environment', input(run('--network', 'devenv-11111111_default')), 'network devenv-11111111_default of another environment', 'protected'],
+  ['the long form of the network of another environment', input(run('--network=name=devenv-11111111_default,alias=x')), 'network devenv-11111111_default of another environment', 'protected'],
+  ['a network labelled for another environment', input(run('--net', 'backend'), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'network backend of another environment', 'protected'],
+  ['a network with a container of another environment', input(run('--network', 'shared'), { networks: { shared: { labels: {}, environments: ['e0000002-0000-4000-8000-000000000002'] } } }), 'network shared of another environment', 'protected'],
+  // Review round 1 (D3): Docker Compose finds and removes containers by these labels.
+  ['a label of Docker Compose', input(run('--label', 'com.docker.compose.project=devenv-e0000001')), 'label com.docker.compose.project', 'unsupported'],
 ];
 
 describe('the switch of the host access checks: the class of every refused item', () => {
@@ -188,6 +211,24 @@ describe('the switch of the host access checks: the class of every refused item'
     const checked = input({ mounts: ['type=volume,source=v,target=/a,volume-driver=local', 'type=volume,source=v,target=/b,volume-label=a=b'] });
     expect(hostAccessClassification(checked)).toEqual([{ item: 'volume options of the mount v', class: 'protected' }]);
     expect(hostAccessProblems(checked, false)).toEqual(['volume options of the mount v']);
+  });
+});
+
+describe('review round 1: what stays allowed', () => {
+  it('allows a build context and a Dockerfile in the repository, and the networks of the environment itself', () => {
+    const checked = input(
+      { build: { dockerfile: 'Dockerfile', context: '..' }, runArgs: ['--network', 'devenv-e0000001_default', '--network', 'mine'] },
+      {
+        ...HELPER_PATHS,
+        dockerfileText: 'FROM mcr.microsoft.com/devcontainers/base:ubuntu\nFROM alpine:3.22\n',
+        networks: { mine: { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ENVIRONMENT.id] } },
+      },
+    );
+    expect(hostAccessReport(checked)).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  it('lifts a build context outside of the repository that is no path of the workspace helper, as before', () => {
+    expect(hostAccessReport(input({ build: { dockerfile: 'Dockerfile', context: '/opt/tools' } }, HELPER_PATHS))).toEqual({ hostAccess: [], unsupported: [] });
   });
 });
 

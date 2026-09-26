@@ -6,8 +6,9 @@
 // It works without VS Code and never connects a window; the VS Code layer connects the window with the result of
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the
 // pipeline can run again at any time.
+import * as path from 'path';
 import { isBusyMarkLive } from '../busy';
-import { ContainerAdapter, type ContainerInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
@@ -17,7 +18,11 @@ import {
   builtServiceImages,
   composeBuildModel,
   composeConfigHash,
+  composeInputsHash,
+  composeNetworkReferences,
   composeReferences,
+  composeServiceImageReferences,
+  composeServiceVolumeNames,
   composeUpModel,
   composeUserArgs,
   composeVolumeNames,
@@ -33,13 +38,16 @@ import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConf
 import {
   foreignVolumeName,
   hostAccessReport,
+  imageLabelItems,
   isOwnVolume,
   isSameOwnerAdditionalVolume,
   mountedVolumeNames,
   removedRunArgs,
+  runArgsNetworks,
   volumeLabelOwner,
   type HostAccessInput,
   type HostAccessReport,
+  type NetworkState,
 } from '../helper/hostAccess';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import { hostAccessChecks, type HostAccessChecks } from '../hostAccessChecks';
@@ -68,6 +76,7 @@ import {
   VOLUME_KIND_COMPOSE,
   WORKSPACES_ROOT,
   composeProjectName,
+  configurationFolder,
   configurationName,
   environmentImageName,
   environmentImageRepository,
@@ -110,6 +119,7 @@ import type {
 import {
   DEFAULT_CONFIG_PATH,
   baseImageKey,
+  composeConfigurationChange,
   composeContainerOrder,
   composeMountVolumes,
   composeRecordOf,
@@ -177,6 +187,7 @@ export type EnvironmentDocker = Pick<
   | 'listProjectNetworks'
   | 'removeNetwork'
   | 'listProjectImages'
+  | 'inspectNetworks'
 > & {
   /**
    * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
@@ -382,6 +393,8 @@ interface LoadedCompose {
   mounts: unknown[];
   /** The switch of the host access checks with which the model was checked (PipelineContext.hostAccessChecks). */
   hostAccessChecks: HostAccessChecks;
+  /** composeInputsHash of the files as written (review round 1, P-4). */
+  inputsHash: string;
 }
 
 /** State of one pipeline run. */
@@ -419,6 +432,11 @@ interface PipelineContext {
   hostAccessChecks: HostAccessChecks;
   /** The configuration of this run is a Docker Compose configuration (loadComposeConfiguration read it). */
   compose?: boolean;
+  /**
+   * The configuration is of the other kind (Docker Compose or a single container) than the environment, and no build
+   * applies it: the environment starts as it is (configurationOfKind).
+   */
+  kindKept?: boolean;
   /**
    * The container of the environment at the start of this run was created by Docker Compose (the project of the
    * environment), so the environment may still have containers of other services.
@@ -1066,7 +1084,7 @@ export class EnvironmentService {
   private async runPipeline(ctx: PipelineContext): Promise<OpenResult> {
     const { docker } = this.deps;
     this.throwIfCancelled(ctx.signal);
-    const container = await docker.findContainer(ctx.env.id);
+    const container = await docker.findContainer(ctx.env.id, ctx.env.containerName);
     ctx.composeContainer = container !== undefined && isComposeContainer(container.labels, composeProjectName(ctx.env.id));
     const record = ctx.env.buildRecord;
     const imagePresent = record !== undefined && (await docker.imageExists(record.environmentImage));
@@ -1098,8 +1116,33 @@ export class EnvironmentService {
       const plan = await this.planUpdate(ctx, loaded, record, imagePresent, currentContainer);
       if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
     }
-    outcome ??= await this.startContainer(ctx, container, record, imagePresent, loaded);
+    outcome ??= await this.startContainer(ctx, container, record, imagePresent, this.configurationOfKind(ctx, loaded, container, record));
     return this.finish(ctx, outcome, loaded);
+  }
+
+  /**
+   * Review round 1 (P-1): the environment switches between Docker Compose and a single container only with a build (as
+   * the configuration changes otherwise apply only with a rebuild). Without a build ("Rebuild later", a failed or refused
+   * update), the configuration of the other kind is not used to start the environment: `undefined`, so a Docker Compose
+   * environment starts its containers with `docker start` (D-15), and a single container starts as a container whose
+   * configuration is not known. The kind of the environment: its dev container, or else its build record.
+   */
+  private configurationOfKind(
+    ctx: PipelineContext,
+    loaded: LoadedConfiguration | undefined,
+    container: ContainerInfo | undefined,
+    record: BuildRecord | undefined,
+  ): LoadedConfiguration | undefined {
+    if (loaded === undefined || (container === undefined && record === undefined)) return loaded;
+    const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
+    if (existingCompose === (loaded.compose !== undefined)) return loaded;
+    this.logger.info(
+      existingCompose
+        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose are started as they are.`
+        : `The configuration ${loaded.configPath} of ${ctx.env.repository} now uses Docker Compose. It applies with the next rebuild; until then, the existing container is started as it is.`,
+    );
+    ctx.kindKept = true;
+    return undefined;
   }
 
   /**
@@ -1163,8 +1206,16 @@ export class EnvironmentService {
       );
       merged = undefined;
     }
-    // Concept section 9 "Host access": checked before any build or container start.
-    const checked = await this.hostAccessInput(env, { config, merged });
+    // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
+    // CLI resolves the build context and the Dockerfile, and the Dockerfile (review round 1, S1 and S4).
+    const repository = repositoryFolder(env.repository);
+    const checked = await this.hostAccessInput(env, {
+      config,
+      merged,
+      configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
+      repositoryFolder: repository,
+      ...(files.dockerfileText !== undefined ? { dockerfileText: files.dockerfileText } : {}),
+    });
     const report = hostAccessReport(checked, ctx.hostAccessChecks === 'on');
     if (isRefused(report)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
@@ -1269,6 +1320,7 @@ export class EnvironmentService {
       raw: parseJsonc<Record<string, unknown>>(files.configText),
       mounts: [config.mounts],
       hostAccessChecks: ctx.hostAccessChecks,
+      inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),
     };
     const composeReport = await this.composeReport(env, compose, config);
     if (isRefused(composeReport)) {
@@ -1326,12 +1378,14 @@ export class EnvironmentService {
    */
   private async composeReport(env: Environment, compose: LoadedCompose, config: DevcontainerConfig): Promise<HostAccessReport> {
     const names = composeVolumeNames(compose.output.model, compose.project).map((volume) => volume.name);
-    const volumes = await this.hostAccessInput(env, {}, names);
+    const volumes = await this.hostAccessInput(env, {}, names, composeNetworkReferences(compose.output.model, compose.project));
     const model = composeAccessReport({
       ownVolume: volumes.ownVolume,
       foreignVolumes: volumes.foreignVolumes,
       volumeLabels: volumes.volumeLabels,
       environment: volumes.environment,
+      ...(volumes.networks !== undefined ? { networks: volumes.networks } : {}),
+      dockerfiles: compose.output.dockerfiles,
       model: compose.output.model,
       devService: compose.service,
       runServices: config.runServices,
@@ -1406,12 +1460,41 @@ export class EnvironmentService {
       const recorded = entry.additionalVolumes ?? [];
       const added = additionalVolumes.filter((name) => !recorded.includes(name));
       if (added.length > 0) entry.additionalVolumes = [...recorded, ...added];
+      // Review round 1 (D1): the volumes of the other services of Docker Compose, for the question of Delete (kept once
+      // recorded: a volume that a service used holds its data).
+      if (loaded.compose) {
+        const services = entry.serviceVolumes ?? [];
+        const used = composeServiceVolumeNames(loaded.compose.output.model, loaded.compose.project, loaded.compose.service).filter((name) => !services.includes(name));
+        if (used.length > 0) entry.serviceVolumes = [...services, ...used];
+      }
       // A refused update of another configuration is not tried again anyway.
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
         delete entry.refusedUpdate;
       }
     });
+  }
+
+  /**
+   * Whether the configuration hash differs from the build record. Docker Compose (review round 1, P-4): with
+   * composeConfigurationChange; when only the version of the Compose plugin (and with it the printed model) changed,
+   * the record takes the new model hash and version without a question.
+   */
+  private async configHashChanged(ctx: PipelineContext, record: BuildRecord, loaded: LoadedConfiguration): Promise<boolean> {
+    if (!loaded.compose) return record.configHash !== loaded.configHash;
+    const current = { configHash: loaded.configHash, inputsHash: loaded.compose.inputsHash, version: loaded.compose.output.version };
+    const change = composeConfigurationChange(record, current);
+    if (change !== 'rebaseline') return change === 'changed';
+    this.logger.info(
+      `The Docker Compose plugin of the workspace helper is now ${current.version} and prints the unchanged files of ${ctx.env.repository} as another model. That is no change of the configuration.`,
+    );
+    await this.updateEntry(ctx, (entry) => {
+      const compose = composeRecordOf(entry.buildRecord);
+      if (!entry.buildRecord || !compose || entry.buildRecord.environmentImage !== record.environmentImage) return;
+      entry.buildRecord.configHash = current.configHash;
+      entry.buildRecord.compose = { ...compose, version: current.version };
+    });
+    return false;
   }
 
   /** Steps 6 and 7: configuration change, image check, and the decision to build. */
@@ -1424,7 +1507,7 @@ export class EnvironmentService {
   ): Promise<UpdatePlan> {
     let forced = ctx.forced;
     let skipUpdate = false;
-    const changed = record !== undefined && (record.configHash !== loaded.configHash || record.configPath !== loaded.configPath);
+    const changed = record !== undefined && (record.configPath !== loaded.configPath || (await this.configHashChanged(ctx, record, loaded)));
     if (changed && !forced) {
       this.logger.info(`The configuration of ${ctx.env.repository} changed since the last build.`);
       const answer = await this.deps.ui.configurationChanged(ctx.env.repository);
@@ -1622,7 +1705,7 @@ export class EnvironmentService {
       if (!previousImage) throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
       this.deps.ui.warn(Messages.buildFailed);
       // The old container is started when it still exists; a missing or half-created one is replaced.
-      const survivor = await this.deps.docker.findContainer(env.id).catch(() => undefined);
+      const survivor = await this.deps.docker.findContainer(env.id, env.containerName).catch(() => undefined);
       const keep =
         survivor !== undefined && survivor.image === previousImage && containerIsCurrent(survivor.labels, true, ctx.hostAccessChecks);
       this.logger.info(
@@ -1655,6 +1738,9 @@ export class EnvironmentService {
             compose: {
               service: loaded.compose.service,
               images: builtServiceImages(loaded.compose.output.model, loaded.compose.project, loaded.compose.service),
+              serviceImages: composeServiceImageReferences(loaded.compose.output.model, loaded.compose.service),
+              version: loaded.compose.output.version,
+              inputsHash: loaded.compose.inputsHash,
             },
           }
         : {}),
@@ -1815,15 +1901,9 @@ export class EnvironmentService {
         };
       }
     }
-    if (container !== undefined && !outdated && loaded !== undefined && loaded.compose === undefined && ctx.composeContainer === true) {
-      // The configuration is no Docker Compose configuration any more: the container of Docker Compose is created again
-      // as a single container (runUp removes the containers of the other services first).
-      outdated = true;
-      recreation = {
-        log: `The container ${container.name} was created for a Docker Compose configuration. It is created again for the configuration ${loaded.configPath}, and the containers of the other services are removed; the files in the volumes are kept.`,
-        detail: Messages.containerComposeReplaced,
-      };
-    }
+    // A configuration that is no Docker Compose configuration any more for a container of Docker Compose (or the other way
+    // round) does not get here: without a build, the environment keeps its kind (configurationOfKind, review round 1,
+    // P-1); buildAndReplace switches it (runUp, runComposeUp).
     if (container?.state === 'running' && !outdated) {
       this.logger.info(`The container ${container.name} runs already.`);
       // D-22: the Dev Container CLI does not call Compose for a running dev container, so a stopped service stays stopped.
@@ -1841,15 +1921,16 @@ export class EnvironmentService {
       // D-15: without the configuration there is no model, so no `up`: the containers that exist are started, unless they
       // must be created again (containerIsCurrent, for example after the host access checks were turned on again).
       if (container && !outdated) {
-        this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} cannot be read. Its containers are started as they are.`);
+        if (!ctx.kindKept) this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} cannot be read. Its containers are started as they are.`);
         return this.startWithDocker(ctx, container, true);
       }
+      const reason = ctx.kindKept ? 'The configuration no longer uses Docker Compose, which applies with a rebuild' : 'The Docker Compose configuration cannot be read';
       throw new UserFacingError(
         'startFailed',
         PipelineTexts.startFailed,
         container
-          ? `The Docker Compose configuration cannot be read, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
-          : 'The Docker Compose configuration cannot be read, and the environment has no container.',
+          ? `${reason}, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
+          : `${reason}, and the environment has no container.`,
       );
     }
     // Assumption (V-10): `up` finds an existing container by --id-label and starts it without using the image of the
@@ -1882,7 +1963,8 @@ export class EnvironmentService {
       return { result, created: container === undefined || outdated, container: outdated ? undefined : container };
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
-      if (container && !outdated && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container);
+      // Review round 1 (P-3): every container of a Docker Compose environment, not only the dev container.
+      if (container && !outdated && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container, compose);
       this.logger.error(`The container of ${ctx.env.repository} could not be started.`, error);
       throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
     }
@@ -2054,7 +2136,14 @@ export class EnvironmentService {
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
     // of the other services have too, so they go first.
     const leftovers = createsContainer && (ctx.composeContainer === true || composeRecordOf(env.buildRecord) !== undefined);
-    if (leftovers) await this.removeComposeServices(ctx);
+    if (leftovers) {
+      this.logger.info(
+        `The environment ${env.repository} was a Docker Compose environment. The container is created again for the configuration, and the containers of the other services are removed; the files in the volumes are kept.`,
+      );
+      // Review round 1 (P-1): named volumes of the services stay; their volumes without a name are no longer used.
+      ctx.steps.detail(Messages.containerComposeReplaced);
+      await this.removeComposeServices(ctx);
+    }
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
       result = await this.deps.helper.up({
@@ -2111,13 +2200,14 @@ export class EnvironmentService {
     await this.requireVolume(env);
     // A container of the environment that Compose did not create (the configuration was no Docker Compose configuration
     // before) has the name of the dev container: it goes after the checks, and `up` creates the containers.
-    const found = await docker.findContainer(env.id);
+    const found = await docker.findContainer(env.id, env.containerName);
     const replaced = found !== undefined && !isComposeContainer(found.labels, compose.project) ? found : undefined;
     const creates = createsContainer || replaced !== undefined;
     // The `mounts` of the image metadata (Features) become volumes of the project too.
     let metadata: unknown[] = [];
+    let labels: Record<string, string> = {};
     try {
-      metadata = await this.imageMetadata(image, ctx.signal);
+      ({ metadata, labels } = await this.imageMetadataAndLabels(image, ctx.signal));
     } catch (error) {
       if (creates || this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The metadata of ${image} could not be read: ${errorMessage(error)}`);
@@ -2129,9 +2219,12 @@ export class EnvironmentService {
         this.logger.warn(`The Docker Compose configuration of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
         throw new HostAccessError(report);
       }
-      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks === 'on');
-      await this.createComposeVolumes(ctx, compose, mounts);
+      const serviceLabels = await this.serviceImageLabelItems(ctx, compose);
+      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks === 'on', labels, serviceLabels);
     }
+    // Review round 1 (P-2): also when `up` only adds containers (a service that the model gained, after a "Rebuild
+    // later"): Compose would refuse an external volume that does not exist. Only the missing ones are created.
+    await this.createComposeVolumes(ctx, compose, mounts);
     const { model, rewrites } = composeUpModel(compose.output.model, { ...this.composeParams(env, compose, mounts.sources), image });
     if (rewrites.length > 0) {
       this.logger.info(`Changed in the Docker Compose model of ${env.repository}: ${rewrites.map((rewrite) => `${rewrite.item} (${rewrite.reason})`).join(', ')}.`);
@@ -2142,6 +2235,8 @@ export class EnvironmentService {
       this.logger.info(
         `The container ${replaced.name} of ${env.repository} was not created by Docker Compose. It is replaced by the containers of the Docker Compose configuration; the files in the volume are kept.`,
       );
+      // Review round 1 (P-1): as for the other recreations, the user learns that the files outside the repository go.
+      ctx.steps.detail(Messages.containerComposeCreated);
       await docker.removeContainer(replaced.id);
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
@@ -2183,6 +2278,26 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 1 (D2): the labels of the images of the other services that exist (the images that Compose pulls or
+   * that the pipeline pulled, not those that Compose builds during `up`), as imageLabelItems names them.
+   */
+  private async serviceImageLabelItems(ctx: PipelineContext, compose: LoadedCompose): Promise<string[]> {
+    const items: string[] = [];
+    for (const reference of composeServiceImageReferences(compose.output.model, compose.service)) {
+      let labels: Record<string, string>;
+      try {
+        labels = (await this.imageMetadataAndLabels(reference, ctx.signal)).labels;
+      } catch (error) {
+        if (this.isCancellation(error, ctx.signal)) throw error;
+        // Not here yet: Compose pulls it in the workspace helper (a limit, implementation notes section 15).
+        continue;
+      }
+      items.push(...imageLabelItems(reference, labels));
+    }
+    return items;
+  }
+
+  /**
    * Before `up` creates the containers of a Docker Compose configuration (D-7): the named volumes of the model and the
    * volumes of the `mounts` (composeMountVolumes) that do not exist are created with the labels of the environment, so
    * that they are its own and our model can declare them external: devenv.volume=compose for a volume of the project
@@ -2209,7 +2324,7 @@ export class EnvironmentService {
    * `all`: the volumes of every container of the environment (the services of a Docker Compose configuration).
    */
   private async recordContainerVolumes(ctx: PipelineContext, all = false): Promise<void> {
-    const containers = all ? await this.environmentContainers(ctx.env.id) : [await this.deps.docker.findContainer(ctx.env.id)];
+    const containers = all ? await this.environmentContainers(ctx.env.id) : [await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName)];
     const volumes = await this.recordedVolumes(
       containers.flatMap((container) => container?.volumes ?? []),
       ctx.env,
@@ -2278,7 +2393,7 @@ export class EnvironmentService {
     if (this.isCancellation(error, ctx.signal) || !(error instanceof DevcontainerCommandError) || !error.result) return undefined;
     const containerId = nonEmptyString(error.result.containerId);
     if (containerId === undefined || lifecycleHookFailure(error.result) === undefined) return undefined;
-    const container = await this.deps.docker.findContainer(ctx.env.id).catch(() => undefined);
+    const container = await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName).catch(() => undefined);
     if (container?.state !== 'running' || !sameContainerId(container.id, containerId)) return undefined;
     this.logger.error(`A lifecycle command failed in the container ${container.name} of ${ctx.env.repository}. It runs and is kept.`, error);
     return { outcome: 'success', containerId, lifecycleCommandFailure: String(error.result.description) };
@@ -2338,6 +2453,7 @@ export class EnvironmentService {
     env: Environment,
     input: Omit<HostAccessInput, 'ownVolume'>,
     moreVolumes: readonly string[] = [],
+    moreNetworks: readonly string[] = [],
   ): Promise<HostAccessInput> {
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
     const file = await this.deps.registry.read();
@@ -2359,7 +2475,33 @@ export class EnvironmentService {
       (name) => !own.has(name),
     );
     const environment = { id: env.id, ...(env.owner ? { ownerId: env.owner.id } : {}) };
-    return { ...checked, foreignVolumes, volumeLabels, environment };
+    // Review round 1 (S2, S3): the networks that the configuration names, with their labels and containers, so that the
+    // network of another environment is refused also under a name of its own.
+    const networkNames = [...new Set([...runArgsNetworks(input.config?.runArgs), ...runArgsNetworks(input.merged?.runArgs), ...moreNetworks])];
+    const networks = await this.networkStates(networkNames);
+    return { ...checked, foreignVolumes, volumeLabels, environment, networks };
+  }
+
+  /**
+   * The networks of `names` that exist (`docker network inspect`), with their labels and the environments of the
+   * containers attached to them (label devenv.environment-id), for foreignNetworkItem.
+   */
+  private async networkStates(names: readonly string[]): Promise<Record<string, NetworkState>> {
+    const states: Record<string, NetworkState> = {};
+    if (names.length === 0) return states;
+    const networks: NetworkInfo[] = await this.deps.docker.inspectNetworks(names);
+    const environments = new Map<string, string>();
+    if (networks.some((network) => network.containers.length > 0)) {
+      for (const container of await this.deps.docker.listEnvironmentContainers()) {
+        const id = container.labels[LABEL_ENVIRONMENT_ID];
+        if (id !== undefined) environments.set(container.id, id);
+      }
+    }
+    for (const network of networks) {
+      const ids = network.containers.map((id) => environments.get(id)).filter((id): id is string => id !== undefined);
+      states[network.name] = { labels: network.labels, environments: [...new Set(ids)] };
+    }
+    return states;
   }
 
   /**
@@ -2370,15 +2512,22 @@ export class EnvironmentService {
    * mounts.
    */
   private async checkImageHostAccess(ctx: PipelineContext, image: string): Promise<string[]> {
-    const metadata = await this.imageMetadata(image, ctx.signal);
+    const { metadata, labels } = await this.imageMetadataAndLabels(image, ctx.signal);
     // The same switch as the check of the configuration (read at the start of this open).
-    return this.checkMetadataHostAccess(ctx, image, metadata, ctx.hostAccessChecks === 'on');
+    return this.checkMetadataHostAccess(ctx, image, metadata, ctx.hostAccessChecks === 'on', labels);
   }
 
   /** The entries of the label devcontainer.metadata of `image` (none when it has no valid label). */
   private async imageMetadata(image: string, signal: AbortSignal | undefined): Promise<unknown[]> {
+    return (await this.imageMetadataAndLabels(image, signal)).metadata;
+  }
+
+  /** imageMetadata, and all labels of `image`. */
+  private async imageMetadataAndLabels(image: string, signal: AbortSignal | undefined): Promise<{ metadata: unknown[]; labels: Record<string, string> }> {
     const config = await this.imageConfig(image, signal);
     const labels = isRecord(config) && isRecord(config.Labels) ? config.Labels : {};
+    const stringLabels: Record<string, string> = {};
+    for (const [key, value] of Object.entries(labels)) if (typeof value === 'string') stringLabels[key] = value;
     const text = labels['devcontainer.metadata'];
     let metadata: unknown[] = [];
     if (typeof text === 'string') {
@@ -2389,13 +2538,25 @@ export class EnvironmentService {
         this.logger.warn(`The label devcontainer.metadata of ${image} is not valid JSON.`);
       }
     }
-    return metadata;
+    return { metadata, labels: stringLabels };
   }
 
-  /** checkImageHostAccess for the metadata of `image` that was read already. */
-  private async checkMetadataHostAccess(ctx: PipelineContext, image: string, metadata: readonly unknown[], checksOn: boolean): Promise<string[]> {
+  /**
+   * checkImageHostAccess for the metadata of `image` that was read already. `labels`: the labels of the image; those by
+   * which the extension, the CLI, and Compose find containers stay refused whatever the switch says (imageLabelItems,
+   * review round 1, D2), and so do `moreItems` (the labels of the images of the other services of Docker Compose).
+   */
+  private async checkMetadataHostAccess(
+    ctx: PipelineContext,
+    image: string,
+    metadata: readonly unknown[],
+    checksOn: boolean,
+    labels: Readonly<Record<string, string>> = {},
+    moreItems: readonly string[] = [],
+  ): Promise<string[]> {
     const checked = await this.hostAccessInput(ctx.env, { metadata });
     const report = hostAccessReport(checked, checksOn);
+    for (const item of [...imageLabelItems(image, labels), ...moreItems]) if (!report.hostAccess.includes(item)) report.hostAccess.push(item);
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);
@@ -2683,7 +2844,7 @@ export class EnvironmentService {
       // An update, rebuild, or delete in another window replaces or removes the container: no stop in between (concept
       // 7.9 rule 1 applies to the Session Monitor; a Stop from a sidebar that is not up to date must respect it too).
       const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
-      const container = await this.deps.docker.findContainer(env.id);
+      const container = await this.deps.docker.findContainer(env.id, env.containerName);
       if (!container || container.state !== 'running') {
         this.logger.info(`The container of ${env.repository} does not run.`);
         await this.stopServices(env);
@@ -2899,7 +3060,9 @@ export class EnvironmentService {
       const { files } = resolved;
       if (record.configPath !== resolved.configPath) return true;
       if (checkConfiguration(files.configText).compose) {
-        return record.configHash !== (await this.composeConfigurationHash(env, resolved.configPath, files, options.signal));
+        const current = await this.composeConfigurationHash(env, resolved.configPath, files, options.signal);
+        // Review round 1 (P-4): a new version of the Compose plugin alone is no change (the next open takes it over).
+        return current === undefined || composeConfigurationChange(record, current) === 'changed';
       }
       return record.configHash !== configHash(files.configText, files.dockerfileText);
     } catch (error) {
@@ -2908,10 +3071,16 @@ export class EnvironmentService {
   }
 
   /**
-   * composeConfigHash of the Docker Compose configuration `configPath` (the model run, as in loadComposeConfiguration),
-   * or `undefined` when its compose files cannot be read: then it counts as changed.
+   * composeConfigHash, composeInputsHash, and the Compose version of the Docker Compose configuration `configPath` (the
+   * model run, as in loadComposeConfiguration), or `undefined` when its compose files cannot be read: then it counts as
+   * changed.
    */
-  private async composeConfigurationHash(env: Environment, configPath: string, files: ConfigFiles, signal: AbortSignal | undefined): Promise<string | undefined> {
+  private async composeConfigurationHash(
+    env: Environment,
+    configPath: string,
+    files: ConfigFiles,
+    signal: AbortSignal | undefined,
+  ): Promise<{ configHash: string; inputsHash: string; version: string } | undefined> {
     const { helper } = this.deps;
     await this.requireVolume(env);
     const { config } = await helper.readConfiguration({
@@ -2933,7 +3102,12 @@ export class EnvironmentService {
       project: composeProjectName(env.id),
       signal,
     });
-    return 'error' in output ? undefined : composeConfigHash(files.configText, output.model, output.dockerfiles);
+    if ('error' in output) return undefined;
+    return {
+      configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
+      inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),
+      version: output.version,
+    };
   }
 
   /** Configuration paths in the volume (current branch), in the order of precedence. */
@@ -3279,8 +3453,14 @@ export class EnvironmentService {
       if (other.id === excludeEnvironmentId) continue;
       for (const [reference, digest] of Object.entries(other.buildRecord?.images ?? {})) inUse.add(baseImageKey(reference, digest));
     }
+    // Review round 1 (D5): the images of the other services of Docker Compose that are not built (for example
+    // `postgres:16`) are images of the user, not base images of the environment image (concept 7.7 "Disk space" removes
+    // only base images). A Docker Compose record without the list removes none.
+    const compose = composeRecordOf(oldRecord);
+    if (compose !== undefined && compose.serviceImages === undefined) return;
+    const serviceImages = new Set(compose?.serviceImages ?? []);
     for (const [reference, digest] of Object.entries(oldRecord.images)) {
-      if (inUse.has(baseImageKey(reference, digest))) continue;
+      if (inUse.has(baseImageKey(reference, digest)) || serviceImages.has(reference)) continue;
       const image = digestReference(reference, digest);
       if (!image) continue;
       await this.quietly(`remove the base image ${image}`, () => this.removeBaseImage(image, reference));
@@ -3321,13 +3501,24 @@ export class EnvironmentService {
     return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.kind === VOLUME_KIND_COMPOSE).map((volume) => volume.name);
   }
 
-  /** removableVolumes of the additional volumes of `environmentId`, each with its label devenv.volume. */
+  /**
+   * removableVolumes of the additional volumes of `environmentId`, each with its kind: VOLUME_KIND_COMPOSE for a volume
+   * that holds data of the services of Docker Compose (review round 1, D1: classified by use, whatever its label
+   * devenv.volume; a volume with `name:` in the model has the label `additional`): the label `compose`, a volume that the
+   * open recorded as mounted by another service (Environment.serviceVolumes), or a volume that a container of another
+   * service mounts now. Otherwise its label devenv.volume.
+   */
   private async removableVolumesByKind(environmentId: string): Promise<Array<{ name: string; kind: string | undefined }>> {
     const env = await this.deps.registry.get(environmentId);
     if (!env || (env.additionalVolumes ?? []).length === 0) return [];
     try {
       const { removable, labels } = await this.removableVolumes(env, env.additionalVolumes ?? []);
-      return removable.map((name) => ({ name, kind: labels.get(name)?.[LABEL_VOLUME] }));
+      const services = new Set(env.serviceVolumes ?? []);
+      const containers = await this.environmentContainers(env.id);
+      for (const container of containers) {
+        if (!isDevContainer(container, env.containerName)) for (const name of container.volumes ?? []) services.add(name);
+      }
+      return removable.map((name) => ({ name, kind: services.has(name) ? VOLUME_KIND_COMPOSE : labels.get(name)?.[LABEL_VOLUME] }));
     } catch (error) {
       this.logger.warn(`The additional volumes of ${env.repository} could not be read: ${errorMessage(error)}`);
       return [];
@@ -3438,11 +3629,20 @@ export class EnvironmentService {
     const project = composeProjectName(env.id);
     const run = (what: string, fn: () => Promise<unknown>): Promise<unknown> => (quiet ? this.quietly(what, fn) : fn());
     await run('remove the containers of the Docker Compose project', async () => {
-      for (const container of await docker.listProjectContainers(project)) await docker.removeContainer(container.id);
+      for (const container of await docker.listProjectContainers(project)) {
+        // Review round 1 (D3): the label of the project can come from an image (a container of another environment, for
+        // example a single container whose image has the label): never a container of another environment.
+        const owner = container.labels[LABEL_ENVIRONMENT_ID];
+        if (owner !== undefined && owner !== env.id) {
+          this.logger.warn(`The container ${container.name} has the label of the Docker Compose project ${project} but belongs to another environment. It is not removed.`);
+          continue;
+        }
+        await docker.removeContainer(container.id);
+      }
     });
     await this.quietly('remove the networks of the Docker Compose project', () => this.removeComposeNetworks(env));
     await this.quietly('remove the images of the Docker Compose project', async () => {
-      const images = new Set([...(composeRecordOf(env.buildRecord)?.images ?? []), ...(await docker.listProjectImages(project))]);
+      const images = new Set([...(composeRecordOf(env.buildRecord)?.images ?? []), ...(await docker.listProjectImages(project, env.id))]);
       for (const image of images) await this.quietly(`remove the image ${image}`, () => docker.removeImage(image));
     });
   }

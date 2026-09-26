@@ -259,7 +259,7 @@ describe('containers', () => {
         ]),
       );
     });
-    const info = await docker.findContainer('env-1');
+    const info = await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e');
     expect(runner.calls[0].args).toEqual([
       'ps',
       '-a',
@@ -282,7 +282,7 @@ describe('containers', () => {
 
   it('returns undefined without a container and does not call inspect', async () => {
     const { docker, runner } = adapter(() => ok(''));
-    expect(await docker.findContainer('env-1')).toBeUndefined();
+    expect(await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')).toBeUndefined();
     expect(runner.calls).toHaveLength(1);
   });
 
@@ -297,7 +297,7 @@ describe('containers', () => {
         ]),
       );
     });
-    expect((await docker.findContainer('env-1'))?.id).toBe('run');
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('run');
   });
 
   it('skips the other services of a Docker Compose environment: the dev container is found (unit 6, D-4)', async () => {
@@ -311,7 +311,19 @@ describe('containers', () => {
         ]),
       );
     });
-    expect((await docker.findContainer('env-1'))?.id).toBe('dev');
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
+  });
+
+  it('finds the container with the name of the environment even when its image gave it the label of a service (review round 1, D2)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['dev']));
+      return ok(
+        inspectOutput([
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'x' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
   });
 
   it('finds no container when only other services of a Docker Compose environment exist', async () => {
@@ -319,7 +331,7 @@ describe('containers', () => {
       if (call.args[0] === 'ps') return ok(idLines(['db']));
       return ok(inspectOutput([containerJson({ id: 'db', name: 'db', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } })]));
     });
-    expect(await docker.findContainer('env-1')).toBeUndefined();
+    expect(await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')).toBeUndefined();
   });
 
   it('skips a container that was removed between list and inspect', async () => {
@@ -531,6 +543,24 @@ describe('volumes', () => {
       { name: 'cache', labels: {} },
     ]);
     expect(runner.calls.map((call) => call.args)).toEqual([['volume', 'inspect', 'db', 'cache', 'gone']]);
+  });
+
+  it('inspects the networks of a list that exist, with their labels and containers (review round 1, S2)', async () => {
+    const { docker, runner } = adapter(() =>
+      fail(
+        'Error response from daemon: network gone not found',
+        1,
+        inspectOutput([
+          { Name: 'backend', Labels: { 'com.docker.compose.project': 'devenv-11111111' }, Containers: { c1: { Name: 'x' }, c2: { Name: 'y' } } },
+          { Name: 'shared', Labels: null, Containers: {} },
+        ]),
+      ),
+    );
+    expect(await docker.inspectNetworks(['backend', 'shared', 'gone', 'backend'])).toEqual([
+      { name: 'backend', labels: { 'com.docker.compose.project': 'devenv-11111111' }, containers: ['c1', 'c2'] },
+      { name: 'shared', labels: {}, containers: [] },
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['network', 'inspect', 'backend', 'shared', 'gone']]);
   });
 
   it('inspects nothing for an empty list, and throws for errors other than a missing volume', async () => {
@@ -1042,5 +1072,25 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
     const { docker, runner } = adapter(() => ok(`${lines.join('\n')}\n`));
     expect(await docker.listProjectImages('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-worker:latest']);
     expect(runner.calls[0].args).toEqual(['image', 'ls', '--filter', 'reference=devenv-3f2a9c1e-*', '--format', '{{json .}}']);
+  });
+
+  it('leaves out the images whose label names another environment (review round 1, D3)', async () => {
+    const lines = [
+      { Repository: 'devenv-3f2a9c1e-app', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-db', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-tool', Tag: 'latest' },
+    ].map((line) => JSON.stringify(line));
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'ls') return ok(`${lines.join('\n')}\n`);
+      return ok(
+        inspectOutput([
+          { RepoTags: ['devenv-3f2a9c1e-app:latest'], Config: { Labels: { 'devenv.environment-id': 'env-1' } } },
+          { RepoTags: ['devenv-3f2a9c1e-db:latest'], Config: { Labels: { 'devenv.environment-id': 'env-2' } } },
+          { RepoTags: ['devenv-3f2a9c1e-tool:latest'], Config: { Labels: null } },
+        ]),
+      );
+    });
+    expect(await docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-tool:latest']);
+    expect(runner.calls[1].args).toEqual(['image', 'inspect', 'devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-db:latest', 'devenv-3f2a9c1e-tool:latest']);
   });
 });

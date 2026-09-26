@@ -12,9 +12,14 @@ import {
   builtServiceImages,
   composeBuildModel,
   composeConfigHash,
+  composeInputsHash,
   composeMountVolumeName,
+  composeNetworkNames,
+  composeNetworkReferences,
   composeReferences,
   composeServiceImage,
+  composeServiceImageReferences,
+  composeServiceVolumeNames,
   composeUpModel,
   composeUserArgs,
   composeVolumeNames,
@@ -164,7 +169,9 @@ describe('parseComposeModelOutput', () => {
   const output = { version: '2.29.1', dollarEscaped: true, model: templateModel(), dockerfiles: { app: 'FROM x\n' }, realPaths: { '/workspaces': '/workspaces', '/x': null } };
 
   it('reads the last line', () => {
-    expect(parseComposeModelOutput(`warning\n${JSON.stringify(output)}\n\n`)).toEqual(output);
+    // Review round 1 (P-4): the hash of the input files; `''` when the output has none.
+    expect(parseComposeModelOutput(`warning\n${JSON.stringify(output)}\n\n`)).toEqual({ ...output, inputsHash: '' });
+    expect(parseComposeModelOutput(JSON.stringify({ ...output, inputsHash: 'abc' }))).toEqual({ ...output, inputsHash: 'abc' });
   });
 
   it('returns the message of Docker Compose', () => {
@@ -347,7 +354,8 @@ describe('decideServiceMount (D-6, D-11)', () => {
     ['a folder of the repository in the dev service', { type: 'bind', source: `${REPO}/data`, target: '/data' }, dev, subpath('api/data', '/data')],
     ['a folder of the repository at /workspaces in the dev service', { type: 'bind', source: `${REPO}/data`, target: '/workspaces' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
     ['repository files with an old engine', { type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }, { engineApiVersion: '1.44' }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/init.sql → /i.sql (needs Docker Engine 26 or newer)` }],
-    ['repository files with an unknown engine', { type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }, { engineApiVersion: undefined }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/init.sql → /i.sql (needs Docker Engine 26 or newer)` }],
+    // Review round 1 (P-5): an unknown version is named as unknown, not as an old engine.
+    ['repository files with an unknown engine', { type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }, { engineApiVersion: undefined }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/init.sql → /i.sql (needs Docker Engine 26 or newer; the version of the Docker Engine could not be read)` }],
     ['a link out of the repository', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: '/workspaces/.devenv+' } }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${REPO}/data → /d (a link to /workspaces/.devenv+, outside of the repository)`, guarded: true }],
     ['a link in the repository', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: `${REPO}/real` } }, subpath('api/data', '/d')],
     ['a path that does not exist', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: null } }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/data → /d (the path does not exist in the repository)` }],
@@ -557,5 +565,46 @@ describe('composeBuildModel', () => {
 describe('escapeComposeDollars', () => {
   it('escapes texts, not keys, at every depth', () => {
     expect(escapeComposeDollars({ $k: ['a$', { b: '$$' }, 1, null, true] })).toEqual({ $k: ['a$$', { b: '$$$$' }, 1, null, true] });
+  });
+});
+
+describe('review round 1 of unit 6', () => {
+  const P = 'devenv-3f2a9c1e';
+  const m: ComposeModel = {
+    name: P,
+    services: {
+      app: { image: 'mcr.microsoft.com/devcontainers/base:ubuntu', volumes: [{ type: 'volume', source: 'cache', target: '/c' }], network_mode: 'service:db' },
+      db: { image: ' postgres:16 ', volumes: [{ type: 'volume', source: 'pgdata', target: '/d' }, { type: 'volume', target: '/anon' }, { type: 'tmpfs', target: '/t' }] },
+      worker: { build: { context: '/workspaces/api' }, image: 'x', volumes: [{ type: 'volume', source: 'shared', target: '/s' }], network_mode: 'backend' },
+      tool: { image: 'alpine:3.22', network_mode: 'host' },
+    },
+    volumes: { pgdata: { name: 'myapp-db' }, cache: { name: `${P}_cache` }, shared: { name: 'shared', external: true } },
+    networks: { default: { name: `${P}_default` }, other: { external: true }, named: { name: 'backend' } },
+  };
+
+  it('composeServiceVolumeNames: the named volumes that the other services mount (D1)', () => {
+    expect(composeServiceVolumeNames(m, P, 'app')).toEqual(['myapp-db', 'shared']);
+  });
+
+  it('composeServiceImageReferences: the images of the other services that are not built (D5)', () => {
+    expect(composeServiceImageReferences(m, 'app')).toEqual(['alpine:3.22', 'postgres:16']);
+  });
+
+  it('composeNetworkNames and composeNetworkReferences: the Docker names of the networks, and the networks of network_mode (S2)', () => {
+    expect(composeNetworkNames(m, P)).toEqual([
+      { key: 'default', name: `${P}_default` },
+      { key: 'other', name: 'other' },
+      { key: 'named', name: 'backend' },
+    ]);
+    expect(composeNetworkReferences(m, P)).toEqual([`${P}_default`, 'other', 'backend']);
+  });
+
+  it('composeInputsHash: depends on the files, not on the model (P-4)', () => {
+    const a = composeInputsHash('{}', 'x', { app: 'FROM a' });
+    expect(a).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(composeInputsHash('{}', 'x', { app: 'FROM a' })).toBe(a);
+    expect(composeInputsHash('{}', 'y', { app: 'FROM a' })).not.toBe(a);
+    expect(composeInputsHash('{ }', 'x', { app: 'FROM a' })).not.toBe(a);
+    expect(composeInputsHash('{}', 'x', { app: 'FROM b' })).not.toBe(a);
   });
 });

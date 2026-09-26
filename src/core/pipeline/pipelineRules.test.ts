@@ -9,6 +9,7 @@ import {
   baseImageKey,
   composeContainerOrder,
   composeMountVolumes,
+  composeConfigurationChange,
   composeRecordOf,
   configHash,
   containerIsCurrent,
@@ -462,6 +463,27 @@ describe('Docker Compose rules (unit 6)', () => {
     ['no object', 'app', undefined],
   ])('composeRecordOf: %s', (_name, compose, expected) => {
     expect(composeRecordOf({ ...record, compose } as never)).toEqual(expected);
+  });
+
+  it('composeRecordOf keeps the service images, the Compose version, and the hash of the files (review round 1, D5, P-4)', () => {
+    const compose = { service: 'app', images: [], serviceImages: ['postgres:16'], version: '2.40.3', inputsHash: 'sha256:x' };
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(compose);
+    expect(composeRecordOf({ ...record, compose: { ...compose, serviceImages: [1], version: 2 } } as never)).toEqual({ service: 'app', images: [], inputsHash: 'sha256:x' });
+  });
+
+  it.each<[string, Record<string, unknown> | undefined, { configHash: string; inputsHash: string; version: string }, string]>([
+    ['the same model, files, and version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.40' }, 'unchanged'],
+    ['other files', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'g', version: '2.40' }, 'changed'],
+    ['other files and another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'g', version: '2.41' }, 'changed'],
+    ['the same files, another model of the same version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.40' }, 'changed'],
+    ['the same files, another model of another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['the same files and model, another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['an older record: the model hash alone', {}, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+    ['an older record with the same model', {}, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'unchanged'],
+    ['no compose part', undefined, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+  ])('composeConfigurationChange: %s (review round 1, P-4)', (_name, compose, current, expected) => {
+    const withCompose = compose === undefined ? record : { ...record, compose: { service: 'app', images: [], ...compose } };
+    expect(composeConfigurationChange(withCompose as never, current)).toBe(expected);
   });
 
   it('isComposeContainer: only a container of the project of the environment', () => {

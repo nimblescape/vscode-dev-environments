@@ -43,6 +43,20 @@ export interface ComposeBuildRecord {
   service: string;
   /** `devenv-<short id>-<service>` of each service that Compose builds. */
   images: string[];
+  /**
+   * The `image` references of the other services that are not built (for example `postgres:16`), as the image check
+   * names them in `images` of the build record (review round 1, D5). They are images of the user, pulled for the
+   * services, not base images of the environment image: removeUnusedBaseImages never removes them. A record without it
+   * (written before) removes no base images.
+   */
+  serviceImages?: string[];
+  /**
+   * Review round 1 (P-4): the version of the Compose plugin that printed the model of `configHash`, and composeInputsHash
+   * of the files as written. A new Compose version can print the same files as another model: with equal files, a
+   * different model counts as a change only with the same version (composeConfigurationChange).
+   */
+  version?: string;
+  inputsHash?: string;
 }
 
 export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';
@@ -87,6 +101,12 @@ export interface Environment {
   shutdownActionNone?: boolean;
   /** Named volumes of the configuration (`mounts` with `type=volume`), without the workspace volume. */
   additionalVolumes?: string[];
+  /**
+   * Docker Compose (review round 1, D1): the named volumes that services other than the dev service mounted, recorded at
+   * each open from the checked model (composeServiceVolumeNames) and kept once recorded. Delete lists these volumes as
+   * data of the services (none ticked), whatever their label devenv.volume, also when the configuration cannot be read.
+   */
+  serviceVolumes?: string[];
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
   /**

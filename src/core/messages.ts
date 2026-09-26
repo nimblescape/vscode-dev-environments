@@ -72,8 +72,13 @@ export const Messages = {
    * The configuration of an environment of a Docker Compose configuration no longer uses Docker Compose: its container
    * is created again as a single container, and the containers of its other services are removed (their volumes stay).
    */
+  // Review round 1 (P-1): the containers of the other services go; their named volumes stay, and the data in their
+  // volumes without a name is no longer used (Docker keeps those volumes as unused volumes).
   containerComposeReplaced:
-    'The configuration of the environment no longer uses Docker Compose, so the container is set up again, and the containers of the other services are removed. Your files in the repository and the data of the services are kept. Files in other folders of the container, for example in the home folder, are removed.',
+    'The configuration of the environment no longer uses Docker Compose, so the container is set up again, and the containers of the other services are removed. Your files in the repository and the data that the services keep in named volumes are kept. Data that the services keep in volumes without a name is no longer used; Docker keeps those volumes as unused volumes. Files in other folders of the container, for example in the home folder, are removed.',
+  /** Review round 1 (P-1): a single container is replaced by the containers of a Docker Compose configuration. */
+  containerComposeCreated:
+    'The configuration of the environment now uses Docker Compose, so the container is set up again with the containers of its services. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
   /**
    * The modal question of Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26), with
    * what the configuration of the repository can then use (hostAccessChecksOffDetail).
