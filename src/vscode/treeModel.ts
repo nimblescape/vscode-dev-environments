@@ -209,7 +209,8 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
   connected: { id: 'circle-filled', color: 'charts.green' },
   connectedOtherWindow: { id: 'window', color: 'charts.green' },
-  running: { id: 'vm-running', color: 'charts.green' },
+  // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
+  running: { id: 'play-circle', color: 'charts.green' },
   stopped: { id: 'circle-outline' },
   updating: { id: 'sync~spin' },
   // A dashed circle (◌) is not available as a codicon.
