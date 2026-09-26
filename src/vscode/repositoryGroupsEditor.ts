@@ -95,8 +95,16 @@ interface EditorSession {
   /**
    * Text for the status line (for example the result of Save). Every state repeats it until the draft changes (an edit
    * or a load), so a state computed afterwards (a change of settings.json, a render of the sidebar) does not hide it.
+   * A newer fact ends it (review round 9 of PR #21): a change of settings.json after it was set, a run of the preview
+   * that failed or was too slow, and for "too slow, nothing was saved" a later run that is fast enough.
    */
   status?: string;
+  /** settings.json differed from the base when `status` was set (for example Cancel of the question of Save). */
+  statusChangedOutside: boolean;
+  /** A state with `status` was sent: a run that starts afterwards is later than the run that `status` reports. */
+  statusPosted: boolean;
+  /** Counts the settings of `status`, so a run knows whether the status it started with is still the same. */
+  statusVersion: number;
 }
 
 export class RepositoryGroupsEditor implements vscode.Disposable {
@@ -137,6 +145,9 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       ignoredDuringSave: false,
       computing: false,
       again: false,
+      statusChangedOutside: false,
+      statusPosted: false,
+      statusVersion: 0,
     };
     this.session = session;
     const webview = panel.webview;
@@ -235,10 +246,22 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     }
   }
 
-  /** The entries of an update or Save become the draft; an edit ends the status of before (for example "Saved"). */
+  /**
+   * The entries of an update or Save become the draft; an edit ends the status of before (for example "Saved"). Equal
+   * entries (an update of the test field) keep the array, so a run of the preview for it is still current.
+   */
   private takeDraft(session: EditorSession, entries: EditorEntry[]): void {
-    if (!sameEntries(entries, session.entries)) session.status = undefined;
+    if (sameEntries(entries, session.entries)) return;
+    this.setStatus(session, undefined);
     session.entries = entries;
+  }
+
+  /** Sets the kept status, and notes what was true when it was set. */
+  private setStatus(session: EditorSession, status: string | undefined): void {
+    session.status = status;
+    session.statusChangedOutside = !sameSettingValue(readSettingValue(), session.base);
+    session.statusPosted = false;
+    session.statusVersion += 1;
   }
 
   /** Load settings.json: the stored value replaces the draft; updates and Saves of earlier loads stay dropped. */
@@ -294,9 +317,14 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         const unchanged = !notAList && sameSettingValue(current, session.base);
         if (unchanged || (confirmed && sameSettingValue(confirmed.theirs, current))) {
           // Nothing awaits between the read above and this write, so it replaces exactly the value that was checked.
-          if (!sameSettingValue(value, current)) {
-            await vscode.workspace.getConfiguration(SETTINGS_SECTION).update(REPOSITORY_GROUPS_KEY, value, vscode.ConfigurationTarget.Global);
+          if (sameSettingValue(value, current)) {
+            // settings.json already holds the draft (for example an edit that was undone): nothing is written.
+            this.deps.logger.info('The setting devEnvLauncher.repositoryGroups already held the entries of the editor.');
+            reload = { value: current };
+            status = GroupsEditorTexts.alreadySaved;
+            return;
           }
+          await vscode.workspace.getConfiguration(SETTINGS_SECTION).update(REPOSITORY_GROUPS_KEY, value, vscode.ConfigurationTarget.Global);
           this.deps.logger.info(`The setting devEnvLauncher.repositoryGroups was saved with ${mine.length} entries.`);
           reload = { value };
           status = unchanged ? GroupsEditorTexts.saved : GroupsEditorTexts.savedReplaced;
@@ -342,8 +370,10 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     } finally {
       session.saving = false;
       // A message of another page was answered during Save but not taken over: this state answers it too (its `seq` is
-      // at least that of the message), so it must not say "Saved".
-      if (session.ignoredDuringSave) status = GroupsEditorTexts.notTakenDuringSave;
+      // at least that of the message), so it must not say only "Saved": the note follows the result of Save.
+      if (session.ignoredDuringSave) {
+        status = status !== undefined ? `${status} ${GroupsEditorTexts.notTakenDuringSave}` : GroupsEditorTexts.notTakenDuringSave;
+      }
       session.ignoredDuringSave = false;
       const queued = session.reloadQueued;
       session.reloadQueued = false;
@@ -368,7 +398,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     session.entries = entries;
     session.notices = notices;
     // The draft is replaced: the status of before ends with it.
-    session.status = status;
+    this.setStatus(session, status);
     this.postLoad(session);
     this.refresh(session);
   }
@@ -391,7 +421,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
    * request during one computes again afterwards with the draft of then.
    */
   private refresh(session: EditorSession, status?: string): void {
-    if (status !== undefined) session.status = status;
+    if (status !== undefined) this.setStatus(session, status);
     if (session.computing) {
       session.again = true;
       return;
@@ -411,12 +441,16 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   }
 
   /**
-   * One state, from one snapshot of the session (seq, generation, entries, status). When the seq, the generation, or the
-   * entries changed during the run, the result is dropped: the change asked for a new computation, which sends the state.
+   * One state, from one snapshot of the session (generation, entries, test name). A result that the page can still use is
+   * sent although updates arrived meanwhile: the generation is the same and the entries equal the draft (only the test
+   * name changed), so it is sent with the current seq, and the run that the update asked for follows. When the generation
+   * or the entries changed, the result is dropped: the change asked for a new computation, which sends the state.
    */
   private async computeState(session: EditorSession): Promise<void> {
     if (this.session !== session) return;
-    const { seq, generation, entries, loaded, status: kept } = session;
+    const { generation, entries } = session;
+    /** A state with the kept status was sent before this run started: this run is later than the one it reports. */
+    const { statusPosted, statusVersion } = session;
     const run = await this.deps.previewRunner.run({
       entries,
       testName: session.testName,
@@ -424,18 +458,35 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     });
     // The panel was closed meanwhile: the runner was disposed, so the run failed on purpose, and nobody sees the state.
     if (this.session !== session) return;
-    if (session.seq !== seq || session.generation !== generation || session.entries !== entries) return;
+    if (session.generation !== generation || !sameEntries(session.entries, entries)) return;
     if (run.failed) this.deps.logger.warn('The preview of the repository groups could not be made in its worker thread.');
-    const status = kept ?? (run.previewTooSlow ? GroupsEditorTexts.previewTooSlow : run.failed ? GroupsEditorTexts.previewFailed : undefined);
+    const changedOutside = !sameSettingValue(readSettingValue(), session.base);
+    const tooSlow = run.previewTooSlow === true;
+    // A newer fact ends the kept status: a change of settings.json after it was set, a failed or too slow run (which
+    // the status line shows instead; "too slow, nothing was saved" says that already), or a fast run after "too slow".
+    const kept = session.status;
+    const laterRun = statusPosted && statusVersion === session.statusVersion;
+    const keptTooSlow = kept?.startsWith(GroupsEditorTexts.tooSlowNotSaved) === true;
+    if (
+      kept !== undefined &&
+      ((changedOutside && !session.statusChangedOutside) ||
+        run.failed ||
+        (tooSlow && !keptTooSlow) ||
+        (!tooSlow && laterRun && keptTooSlow))
+    ) {
+      session.status = undefined;
+    }
+    const status = session.status ?? (tooSlow ? GroupsEditorTexts.previewTooSlow : run.failed ? GroupsEditorTexts.previewFailed : undefined);
     const message: EditorStateMessage = editorState({
-      seq,
-      entries,
-      loaded,
+      seq: session.seq,
+      entries: session.entries,
+      loaded: session.loaded,
       run,
-      changedOutside: !sameSettingValue(readSettingValue(), session.base),
+      changedOutside,
       saving: session.saving,
       ...(status !== undefined ? { status } : {}),
     });
+    if (session.status !== undefined) session.statusPosted = true;
     this.post(session, message);
   }
 

@@ -406,10 +406,12 @@ describe('RepositoryGroupsEditor', () => {
       expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
       // The webview still gets an answer, for the draft of settings.json.
       expect(lastState(panel)).toMatchObject({ seq: 3, dirty: false, changedOutside: false });
-      // Save of the current generation writes the draft of settings.json.
+      // Save of the current generation takes the draft of settings.json; settings.json already holds it, so nothing is
+      // written (review round 9 of PR #21, finding 2), and the status says so.
       panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries: loaded(panel).entries, testName: '' });
       await flush();
-      expect(lastState(panel)).toMatchObject({ seq: 4, status: GroupsEditorTexts.saved });
+      expect(update).not.toHaveBeenCalled();
+      expect(lastState(panel)).toMatchObject({ seq: 4, status: GroupsEditorTexts.alreadySaved });
     });
 
     // Nit of the review of PR #21: settings.json already holds the draft.
@@ -785,7 +787,8 @@ describe('RepositoryGroupsEditor', () => {
     // The first Save wrote its draft; the state that unlocks the second page does not say that its Save was done.
     expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE], fakeVscode.ConfigurationTarget.Global);
     expect(loaded(panel)).toMatchObject({ saving: false });
-    expect(lastState(panel)).toMatchObject({ seq: 2, saving: false, status: GroupsEditorTexts.notTakenDuringSave });
+    // Review round 9 of PR #21, finding 3: the note follows the result of the Save that ran.
+    expect(lastState(panel)).toMatchObject({ seq: 2, saving: false, status: `${GroupsEditorTexts.saved} ${GroupsEditorTexts.notTakenDuringSave}` });
     for (const state of panel.posted.filter((message) => message.type === 'state' && (message.seq as number) >= 2)) {
       expect(state.status).not.toBe(GroupsEditorTexts.saved);
     }
@@ -863,6 +866,171 @@ describe('RepositoryGroupsEditor', () => {
     expect(lastState(panel)).toMatchObject({ seq: 2, dirty: false });
     expect(lastState(panel)?.status).not.toBe(GroupsEditorTexts.staleKept);
     expect(update).not.toHaveBeenCalled();
+  });
+
+  // Review round 9 of PR #21, finding 1, scenario A: a change of settings.json after Save ends the status "Saved"; the
+  // banner is the newer fact.
+  it('drops the status of Save when settings.json changes afterwards', async () => {
+    const { panel } = await openEditor();
+    update.mockImplementation(async (_key: string, value: unknown) => changeStored(value));
+    const entries = loaded(panel).entries;
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 1, changedOutside: false, status: GroupsEditorTexts.saved });
+    changeStored(['^other$']);
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 1, changedOutside: true });
+    expect(lastState(panel)?.status).toBeUndefined();
+    // It stays dropped when settings.json holds the saved value again.
+    changeStored([EXAMPLE]);
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 1, changedOutside: false });
+    expect(lastState(panel)?.status).toBeUndefined();
+  });
+
+  // Review round 9 of PR #21, finding 1, scenario B: a run of the preview that fails or is too slow after Save shows that,
+  // not "Saved"; the status of Save does not come back with the next run.
+  it('shows a failed or too slow run of the preview after Save instead of the status of Save', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries, testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    runner.next = { failed: true };
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries, testName: 'web-shop' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 2, canSave: false, status: GroupsEditorTexts.previewFailed });
+    panel.receive({ type: 'update', seq: 3, generation: gen(panel), entries, testName: 'web-api' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 3 });
+    expect(lastState(panel)?.status).toBeUndefined();
+
+    panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries, testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)?.status).toBeDefined();
+    runner.next = { previewTooSlow: true, slowEntry: 0 };
+    panel.receive({ type: 'update', seq: 5, generation: gen(panel), entries, testName: 'web-shop' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 5, canSave: false, status: GroupsEditorTexts.previewTooSlow });
+  });
+
+  // Review round 9 of PR #21, finding 1: "too slow, nothing was saved" ends once a later run is fast enough.
+  it('drops the status that a too slow Save left once a later run is fast enough', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    runner.next = { previewTooSlow: true, slowEntry: 0 };
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries, testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(update).not.toHaveBeenCalled();
+    expect(lastState(panel)).toMatchObject({ seq: 1, status: GroupsEditorTexts.tooSlowNotSaved });
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries, testName: 'web-shop' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 2, canSave: true });
+    expect(lastState(panel)?.status).toBeUndefined();
+  });
+
+  // Review round 9 of PR #21, finding 2: an edit undone before Save writes nothing, and the status says so.
+  it('says that nothing had to be written when Save gets the stored entries back', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    await flush();
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries, testName: '' });
+    await flush();
+    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries, testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(update).not.toHaveBeenCalled();
+    expect(lastState(panel)).toMatchObject({ seq: 3, dirty: false, status: GroupsEditorTexts.alreadySaved });
+  });
+
+  // Review round 9 of PR #21, finding 3: a message ignored during Save adds its note to the result of Save.
+  it('adds the note on an ignored message to a successful write', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    await flush();
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries, testName: '' });
+    await flush();
+    release({});
+    for (let i = 0; i < 4; i++) await flush();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(lastState(panel)).toMatchObject({
+      seq: 2,
+      saving: false,
+      status: `${GroupsEditorTexts.saved} ${GroupsEditorTexts.notTakenDuringSave}`,
+    });
+  });
+
+  it('adds the note on an ignored message to Load settings.json of the question of Save', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    changeStored(['^theirs']);
+    await flush();
+    let answer: (value: unknown) => void = () => {};
+    fakeVscode.window.showWarningMessage.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)) as never);
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries, testName: '' });
+    await flush();
+    answer(GroupsEditorTexts.loadTheirs);
+    for (let i = 0; i < 4; i++) await flush();
+    expect(update).not.toHaveBeenCalled();
+    expect(loaded(panel).entries).toEqual([{ name: '', pattern: '^theirs', flags: '' }]);
+    expect(lastState(panel)).toMatchObject({
+      seq: 2,
+      saving: false,
+      dirty: false,
+      status: `${GroupsEditorTexts.loadedTheirs} ${GroupsEditorTexts.notTakenDuringSave}`,
+    });
+  });
+
+  // Review round 9 of PR #21, finding 4: updates of the test field that keep arriving do not hold back every state: a
+  // finished run for the same entries is sent with the current seq, and the run for the newest test name follows.
+  it('sends states while updates of the test name keep arriving', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    const releases: Array<() => void> = [];
+    const inner = runner.run.getMockImplementation()!;
+    runner.run.mockImplementation(
+      (job: never) => new Promise<PreviewRun>((resolve) => releases.push(() => resolve(inner(job) as never))),
+    );
+    const states = () => panel.posted.filter((message) => message.type === 'state').length;
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: entries.map((entry) => ({ ...entry })), testName: 'w' });
+    await flush();
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries: entries.map((entry) => ({ ...entry })), testName: 'we' });
+    await flush();
+    const before = states();
+    expect(releases).toHaveLength(1);
+    releases[0]();
+    for (let i = 0; i < 4; i++) await flush();
+    // The run of seq 1 is sent (the entries did not change), marked with seq 2; the run for seq 2 follows.
+    expect(states()).toBe(before + 1);
+    expect(lastState(panel)).toMatchObject({ seq: 2, dirty: false });
+    expect(releases).toHaveLength(2);
+    panel.receive({ type: 'update', seq: 3, generation: gen(panel), entries, testName: 'web' });
+    await flush();
+    releases[1]();
+    for (let i = 0; i < 4; i++) await flush();
+    expect(states()).toBe(before + 2);
+    expect(lastState(panel)).toMatchObject({ seq: 3 });
+    releases[2]();
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 3, test: { matched: false } });
+    // An edit of the entries during a run still drops its result.
+    runner.run.mockImplementation((job: never) => new Promise<PreviewRun>((resolve) => releases.push(() => resolve(inner(job) as never))));
+    panel.receive({ type: 'update', seq: 4, generation: gen(panel), entries: [entries[0]], testName: 'web' });
+    await flush();
+    panel.receive({ type: 'update', seq: 5, generation: gen(panel), entries, testName: 'web' });
+    await flush();
+    const beforeEdit = states();
+    releases[3]();
+    for (let i = 0; i < 4; i++) await flush();
+    expect(states()).toBe(beforeEdit);
+    releases[4]();
+    for (let i = 0; i < 4; i++) await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 5, checks: [{}, {}] });
   });
 
   // Review round 2 of PR #21, W6: the worker of the preview stops with the panel.
