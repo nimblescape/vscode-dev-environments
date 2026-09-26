@@ -211,16 +211,15 @@ function stableJson(value: unknown): string {
 export type EditorRequest =
   | { type: 'ready' }
   | { type: 'update'; seq: number; generation: number; entries: EditorEntry[]; testName: string }
-  | { type: 'save'; seq: number; generation: number; entries: EditorEntry[] }
-  | { type: 'reload' }
+  | { type: 'save'; seq: number; generation: number; entries: EditorEntry[]; testName: string }
+  /** Load settings.json; `testName` is the text of the test field, which the load keeps. */
+  | { type: 'reload'; testName: string }
   | { type: 'cancel' }
-  /** The webview showed the value of the `external` message with this generation (it had no unsent edits). */
-  | { type: 'accept'; generation: number }
   /**
    * An update or Save for entries of an earlier load (edited from another value): nothing is written, and the editor
-   * keeps these entries with a status (unless Load settings.json replaced that load). `testName` only for an update.
+   * keeps these entries with a status (unless Load settings.json replaced that load).
    */
-  | { type: 'stale'; seq: number; generation: number; entries: EditorEntry[]; testName?: string };
+  | { type: 'stale'; seq: number; generation: number; entries: EditorEntry[]; testName: string };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
@@ -231,24 +230,20 @@ export function parseEditorRequest(raw: unknown, context: { generation: number }
   if (!isPlainObject(raw)) return undefined;
   switch (raw.type) {
     case 'ready':
-    case 'reload':
     case 'cancel':
       return hasOnlyKeys(raw, ['type']) ? { type: raw.type } : undefined;
-    case 'accept':
-      return hasOnlyKeys(raw, ['type', 'generation']) && isSeq(raw.generation) ? { type: 'accept', generation: raw.generation } : undefined;
+    case 'reload':
+      return hasOnlyKeys(raw, ['type', 'testName']) && isText(raw.testName, EditorLimits.testName)
+        ? { type: 'reload', testName: raw.testName }
+        : undefined;
     case 'update':
     case 'save': {
-      const keys = raw.type === 'update' ? ['type', 'seq', 'generation', 'entries', 'testName'] : ['type', 'seq', 'generation', 'entries'];
-      if (!hasOnlyKeys(raw, keys) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
+      if (!hasOnlyKeys(raw, ['type', 'seq', 'generation', 'entries', 'testName']) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
       const entries = parseEntries(raw.entries);
-      if (!entries) return undefined;
-      if (raw.type === 'update' && !isText(raw.testName, EditorLimits.testName)) return undefined;
-      const testName = raw.type === 'update' ? (raw.testName as string) : undefined;
-      if (raw.generation !== context.generation) {
-        return { type: 'stale', seq: raw.seq, generation: raw.generation, entries, ...(testName !== undefined ? { testName } : {}) };
-      }
-      if (testName === undefined) return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
-      return { type: 'update', seq: raw.seq, generation: raw.generation, entries, testName };
+      if (!entries || !isText(raw.testName, EditorLimits.testName)) return undefined;
+      const message = { seq: raw.seq, generation: raw.generation, entries, testName: raw.testName };
+      if (raw.generation !== context.generation) return { type: 'stale', ...message };
+      return { type: raw.type, ...message };
     }
     default:
       return undefined;
@@ -570,21 +565,8 @@ export interface EditorLoadMessage {
   seq: number;
   entries: EditorEntry[];
   notices: string[];
-  /** The text of the test field, so a restored webview shows the text of its result. */
+  /** The text of the test field, so a page that starts again shows the text of its result (a running page keeps its own). */
   testName: string;
-}
-
-/**
- * Message to the webview: settings.json changed the setting, and the draft of the extension has no edits. The webview
- * shows `entries` and answers `accept` with `generation` only when it has no edits that the extension has not answered
- * yet (a keystroke that waits for its delay, or an update without its state); otherwise it keeps its draft, shows the
- * banner, and sends the draft. The extension keeps its base until the answer.
- */
-export interface EditorExternalMessage {
-  type: 'external';
-  generation: number;
-  entries: EditorEntry[];
-  notices: string[];
 }
 
 /** Message to the webview: everything the extension computes for the entries of the webview. */
@@ -596,7 +578,11 @@ export interface EditorStateMessage {
   canSave: boolean;
   /** The entries differ from those that were loaded. */
   dirty: boolean;
-  /** The setting was changed outside the editor since it was loaded. */
+  /**
+   * The setting was changed outside the editor since it was loaded (or last saved): the page shows the banner
+   * "settings.json changed this setting." with Load settings.json. The draft is never replaced without that button or
+   * the question of Save.
+   */
   changedOutside: boolean;
   /** A Save runs: the webview stays read-only until a state with the `seq` of its Save and `saving: false`. */
   saving: boolean;

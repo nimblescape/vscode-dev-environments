@@ -73,7 +73,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - Type a repository name in **Test a Repository Name** to see which entry matches it and where its row goes.
 - The preview and the test stop after 1 second: a regular expression that takes longer for your repository names is marked as too slow and cannot be saved, because the view would become slow with it. If the check fails, Save is not possible either.
 - **Save** writes only this one setting in your user `settings.json`: it replaces the value of `devEnvLauncher.repositoryGroups` with the entries of the editor, and your other settings and comments stay as they are.
-- If this setting changes in `settings.json` while the editor is open, the editor says so: "settings.json changed this setting." with **Load settings.json**. Your unsaved edits stay until you choose. If you have not changed anything in the editor, it simply shows the new value.
+- If this setting changes in `settings.json` while the editor is open, the editor says so: "settings.json changed this setting." with **Load settings.json**. The entries in the editor stay until you choose; the editor never replaces them on its own.
 - If you save after such a change, the editor shows the current list of `settings.json` and asks: **Load settings.json** shows that list and drops your unsaved edits; **Save Mine** replaces that one value with your entries; **Cancel** changes nothing and keeps your edits. Entries are never merged one by one. If `settings.json` changes again while this question is open, it asks again. If the value in `settings.json` is not a list, Save asks the same way before it replaces it.
 - **Cancel**, or closing the tab, discards your changes; a Save that is still waiting then writes nothing.
 

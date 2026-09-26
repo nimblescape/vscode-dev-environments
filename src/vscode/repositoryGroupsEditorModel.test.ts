@@ -313,7 +313,7 @@ describe('messages of the webview', () => {
 
   it('accepts exactly the messages of the editor', () => {
     expect(parseEditorRequest({ type: 'ready' }, context)).toEqual({ type: 'ready' });
-    expect(parseEditorRequest({ type: 'reload' }, context)).toEqual({ type: 'reload' });
+    expect(parseEditorRequest({ type: 'reload', testName: 'x' }, context)).toEqual({ type: 'reload', testName: 'x' });
     expect(parseEditorRequest({ type: 'cancel' }, context)).toEqual({ type: 'cancel' });
     expect(parseEditorRequest({ type: 'update', seq: 3, generation: 5, entries: [valid, valid], testName: 'x' }, context)).toEqual({
       type: 'update',
@@ -322,13 +322,20 @@ describe('messages of the webview', () => {
       entries: [valid, valid],
       testName: 'x',
     });
-    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [] }, context)).toEqual({ type: 'save', seq: 0, generation: 5, entries: [] });
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [], testName: '' }, context)).toEqual({
+      type: 'save',
+      seq: 0,
+      generation: 5,
+      entries: [],
+      testName: '',
+    });
     // An update of an earlier load: its entries were edited from another value.
-    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid] }, context)).toEqual({
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid], testName: 'y' }, context)).toEqual({
       type: 'stale',
       seq: 0,
       generation: 4,
       entries: [valid],
+      testName: 'y',
     });
     expect(parseEditorRequest({ type: 'update', seq: 2, generation: 6, entries: [valid], testName: 'x' }, context)).toEqual({
       type: 'stale',
@@ -337,7 +344,6 @@ describe('messages of the webview', () => {
       entries: [valid],
       testName: 'x',
     });
-    expect(parseEditorRequest({ type: 'accept', generation: 7 }, context)).toEqual({ type: 'accept', generation: 7 });
   });
 
   it('reads the seq of a refused message only when it is a valid one', () => {
@@ -348,7 +354,8 @@ describe('messages of the webview', () => {
   });
 
   it('checks a stale update or Save as strictly as a current one', () => {
-    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [{ ...valid, flags: 'g' }] }, context)).toBeUndefined();
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [{ ...valid, flags: 'g' }], testName: '' }, context)).toBeUndefined();
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }, context)).toBeUndefined();
     expect(parseEditorRequest({ type: 'update', seq: 0, generation: 4, entries: [], testName: 1 }, context)).toBeUndefined();
   });
 
@@ -359,24 +366,30 @@ describe('messages of the webview', () => {
     ['an unknown type', { type: 'write' }],
     ['an extra property', { type: 'ready', extra: 1 }],
     ['a missing property', { type: 'update', seq: 1, generation: 5, entries: [] }],
-    ['an accept without a generation', { type: 'accept' }],
-    ['an accept with an extra property', { type: 'accept', generation: 1, entries: [] }],
-    ['a missing generation', { type: 'save', seq: 1, entries: [] }],
-    ['a generation that is no number', { type: 'save', seq: 1, generation: '5', entries: [] }],
-    ['a sequence that is no whole number', { type: 'save', seq: 1.5, generation: 5, entries: [] }],
-    ['a negative sequence', { type: 'save', seq: -1, generation: 5, entries: [] }],
-    ['entries that are no list', { type: 'save', seq: 1, generation: 5, entries: {} }],
-    ['an entry that is a string', { type: 'save', seq: 1, generation: 5, entries: ['^a'] }],
-    ['an entry with an extra property', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, regex: '^a' }] }],
-    ['an entry without flags', { type: 'save', seq: 1, generation: 5, entries: [{ name: '', pattern: '^a' }] }],
-    ['a pattern that is no text', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 1 }] }],
-    ['the flag g', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'g' }] }],
-    ['a repeated flag', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'ii' }] }],
+    // Round 7 of PR #21: the offer of settings.json and its answer are gone (no automatic reload, orchestrator decision).
+    ['an accept (removed in review round 7)', { type: 'accept', generation: 7 }],
+    // Round 7 of PR #21, F2: Save and Load settings.json carry the test name, checked like that of an update.
+    ['a Save without a test name', { type: 'save', seq: 1, generation: 5, entries: [] }],
+    ['a Load settings.json without a test name', { type: 'reload' }],
+    ['a test name of Save over the limit', { type: 'save', seq: 1, generation: 5, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a test name of Load settings.json over the limit', { type: 'reload', testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a test name of Load settings.json that is no text', { type: 'reload', testName: 1 }],
+    ['a missing generation', { type: 'save', seq: 1, entries: [], testName: '' }],
+    ['a generation that is no number', { type: 'save', seq: 1, generation: '5', entries: [], testName: '' }],
+    ['a sequence that is no whole number', { type: 'save', seq: 1.5, generation: 5, entries: [], testName: '' }],
+    ['a negative sequence', { type: 'save', seq: -1, generation: 5, entries: [], testName: '' }],
+    ['entries that are no list', { type: 'save', seq: 1, generation: 5, entries: {}, testName: '' }],
+    ['an entry that is a string', { type: 'save', seq: 1, generation: 5, entries: ['^a'], testName: '' }],
+    ['an entry with an extra property', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, regex: '^a' }], testName: '' }],
+    ['an entry without flags', { type: 'save', seq: 1, generation: 5, entries: [{ name: '', pattern: '^a' }], testName: '' }],
+    ['a pattern that is no text', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 1 }], testName: '' }],
+    ['the flag g', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'g' }], testName: '' }],
+    ['a repeated flag', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'ii' }], testName: '' }],
     // The merge that used an origin is gone (user decision A, 2026-09-26): an entry has no other property.
-    ['an entry with an origin', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: 0 }] }],
-    ['a pattern over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }] }],
-    ['a name over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }] }],
-    ['too many entries', { type: 'save', seq: 1, generation: 5, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid) }],
+    ['an entry with an origin', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: 0 }], testName: '' }],
+    ['a pattern over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }], testName: '' }],
+    ['a name over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }], testName: '' }],
+    ['too many entries', { type: 'save', seq: 1, generation: 5, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid), testName: '' }],
     ['a test name over the limit', { type: 'update', seq: 1, generation: 5, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
     ['an object with another prototype', Object.assign(Object.create({ polluted: true }) as object, { type: 'ready' })],
   ])('refuses %s', (_case, raw) => {
@@ -384,8 +397,8 @@ describe('messages of the webview', () => {
   });
 
   it('sorts the flags of an entry', () => {
-    const request = parseEditorRequest({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'si' }] }, context);
-    expect(request).toEqual({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'is' }] });
+    const request = parseEditorRequest({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'si' }], testName: '' }, context);
+    expect(request).toEqual({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'is' }], testName: '' });
   });
 });
 
