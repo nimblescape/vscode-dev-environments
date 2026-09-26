@@ -5,8 +5,9 @@
 // Arguments and results of the Dev Container CLI in the workspace helper (implementation notes 8). Pure functions.
 import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
+import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
 import { CONTAINER_VERSION_LABEL, WORKSPACES_ROOT } from '../names';
-import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { loopbackAppPorts, overrideRunArgs, withoutNameArgs } from './hostAccess';
 
 /**
@@ -67,8 +68,7 @@ export function upArgs(p: {
     HELPER_CACHE_FOLDER,
     '--update-remote-user-uid-default',
     'never',
-    // Assumption (V-1): the Dev Containers extension runs postAttachCommand when it attaches.
-    '--skip-post-attach',
+    SKIP_POST_ATTACH_ARG,
   ];
   if (p.removeExistingContainer) args.push('--remove-existing-container');
   return args;
@@ -163,7 +163,8 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
  * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
  * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>` and
  * `--name <container name>`), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
- * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'.
+ * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
+ * (ATTACHED_SHUTDOWN_ACTION, ../devContainers.ts).
  * `initializeCommand` is never passed: the host access policy refuses a configuration with one.
  */
 export function buildOverrideConfig(p: {
@@ -187,8 +188,6 @@ export function buildOverrideConfig(p: {
   override.containerEnv = containerEnvironment();
   override.remoteEnv = remoteEnvironment();
   override.customizations = { vscode: { settings: devContainersSettings() } };
-  // Assumption (V-4): this value replaces shutdownAction of the image metadata, so the Dev Containers extension never
-  // stops the container.
-  override.shutdownAction = 'none';
+  override.shutdownAction = ATTACHED_SHUTDOWN_ACTION;
   return override;
 }

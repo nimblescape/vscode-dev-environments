@@ -11,9 +11,10 @@
 // variable of a container, or in .git/config. It arrives on standard input and is written to a file in a tmpfs mount
 // (SECRETS_FOLDER). For the clone and the branch switch, a Git credential helper that exists only for one command
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
-// The only copy in the volume is the token file of the dev container (GIT_FILES_SCRIPT, mode 0600).
+// The only copies in the volume are the token file of the dev container and the sign-in of the GitHub CLI there
+// (GIT_FILES_SCRIPT, both mode 0600); REMOVE_GIT_TOKEN_SCRIPT removes both.
 import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
-import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../names';
+import { CONFIG_FOLDER, GH_CONFIG_FOLDER, GH_HOSTS_FILE, GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
 import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
 export { GIT_SUMMARY_SCRIPT };
@@ -170,10 +171,20 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
 
 /**
  * `$1` = folder name of the repository in /workspaces, `$2` = user.name, `$3` = user.email, `$4` = the credential helper
- * of the dev container (CONTAINER_CREDENTIAL_HELPER). Token on stdin. Prepares the configuration folder of the dev
- * container (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and folders get with the
- * owner (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
+ * of the dev container (CONTAINER_CREDENTIAL_HELPER), `$5` = the GitHub login of the account that owns the environment
+ * (isGitHubLogin; empty when it is not known). Token on stdin. Prepares the configuration folder of the dev container
+ * (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and folders get with the owner
+ * (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
  * - github-token: the token, mode 0600, written again at each run (a new sign-in gives a new token);
+ * - gh/hosts.yml (GH_HOSTS_FILE, the sign-in of the GitHub CLI, GH_CONFIG_DIR): written again at each run, mode 0600 in
+ *   the folder gh/ (0700), with the same token as github-token and the login `$5` for github.com, so gh in the container
+ *   works as the account that owns the environment, and nobody signs in there. Both forms of the file that gh reads: the
+ *   keys `oauth_token`, `user`, and `git_protocol` of the host (gh before 2.40, and the active account of gh 2.40 and
+ *   newer), and `users.<login>.oauth_token` (the accounts of gh 2.40 and newer). The other files of gh/ (for example
+ *   config.yml, which gh writes itself) stay as they are. A token with characters that YAML would need to escape (no
+ *   token of GitHub has them) signs gh in nowhere: the file is removed; so does a `$5` that is empty or no GitHub login
+ *   (the same rule as isGitHubLogin), which never goes into the file, while the token and the Git configuration are
+ *   still written (Git in the container works, gh is not signed in);
  * - gitconfig: created when missing, with user.name and user.email; of an existing file, only the section
  *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours);
  * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
@@ -187,17 +198,25 @@ folder="$1"
 name="$2"
 email="$3"
 credential_helper="$4"
+login="$5"
 case "$folder" in
   '' | . | .. | -* | */*) fail 2 "Invalid folder name: $folder" ;;
 esac
+case "$login" in
+  '' | [!A-Za-z0-9]* | *[!A-Za-z0-9_-]*) login='' ;;
+esac
+if [ "\${#login}" -gt 39 ]; then
+  login=''
+fi
 repo='${WORKSPACES_ROOT}'/"$folder"
 dir='${CONFIG_FOLDER}'
+gh='${GH_CONFIG_FOLDER}'
 if [ ! -d "$repo" ]; then
   fail 4 "The folder $repo does not exist."
 fi
 owner=$(stat -c '%u:%g' "$repo")
 read_token
-for path in "$dir" "$dir/docker"; do
+for path in "$dir" "$dir/docker" "$gh"; do
   if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
     rm -f "$path"
   fi
@@ -206,13 +225,36 @@ for path in "$dir" "$dir/docker"; do
   fi
 done
 chmod 0755 "$dir"
-chmod 0700 "$dir/docker"
+chmod 0700 "$dir/docker" "$gh"
 work=$(mktemp -d "$dir/.work.XXXXXX")
 cp "$token_file" "$work/github-token"
 rm -f "$token_file"
 chmod 0600 "$work/github-token"
 chown "$owner" "$work/github-token"
+token=$(cat "$work/github-token")
 mv -fT "$work/github-token" "$dir/github-token"
+hosts='${GH_HOSTS_FILE}'
+if [ -L "$hosts" ] || { [ -e "$hosts" ] && [ ! -f "$hosts" ]; }; then
+  rm -rf "$hosts"
+fi
+if [ -z "$login" ]; then
+  rm -f "$hosts"
+  echo 'The GitHub CLI in the container is not signed in: the GitHub login of the account is not known. Git works.'
+else
+  case "$token" in
+    *[!A-Za-z0-9_.-]*)
+      rm -f "$hosts"
+      echo 'The GitHub CLI in the container is not signed in: the token has characters that its configuration cannot hold.'
+      ;;
+    *)
+      (umask 077 && printf 'github.com:\n    users:\n        "%s":\n            oauth_token: "%s"\n    git_protocol: https\n    oauth_token: "%s"\n    user: "%s"\n' "$login" "$token" "$token" "$login" > "$work/hosts.yml")
+      chmod 0600 "$work/hosts.yml"
+      chown "$owner" "$work/hosts.yml"
+      mv -fT "$work/hosts.yml" "$hosts"
+      ;;
+  esac
+fi
+token=''
 cfg="$dir/gitconfig"
 if [ -L "$cfg" ]; then
   rm -f "$cfg"
@@ -241,8 +283,28 @@ if [ ! -e "$credentials" ]; then
   chmod 0644 "$work/credentials.gitconfig"
   mv -fT "$work/credentials.gitconfig" "$credentials"
 fi
-chown -h "$owner" "$dir" "$dir/docker" "$cfg" "$credentials"
+chown -h "$owner" "$dir" "$dir/docker" "$cfg" "$credentials" "$gh"
 echo "The Git configuration of the environment is in $dir."
+`;
+
+/**
+ * No arguments. Removes the token of the owner account from the configuration folder of the dev container: the token
+ * file (GITHUB_TOKEN_FILE) and the sign-in of the GitHub CLI (GH_HOSTS_FILE), concept 7.5. It runs in the workspace
+ * helper (our image, as root with the rights of a normal container), which mounts the workspace volume, so it needs no
+ * tool of the image of the dev container, and works whether the dev container runs or not. The other files stay.
+ * Exit code 1 when a file is still there.
+ */
+export const REMOVE_GIT_TOKEN_SCRIPT = `set -u
+status=0
+for path in '${GITHUB_TOKEN_FILE}' '${GH_HOSTS_FILE}'; do
+  rm -rf -- "$path" || true
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    printf '%s could not be removed.\n' "$path" >&2
+    status=1
+  fi
+done
+if [ "$status" -eq 0 ]; then echo 'The GitHub token was removed from the volume.'; fi
+exit "$status"
 `;
 
 /**
@@ -415,9 +477,22 @@ export function cloneCommand(repository: string, folderName: string, branch?: st
   return ['sh', '-c', CLONE_SCRIPT, 'sh', repository, folderName, branch ?? ''];
 }
 
-/** `sh -c` command that writes the token and the Git configuration of the dev container. Token on stdin, secrets mount required. */
-export function gitFilesCommand(folderName: string, identity: { name: string; email: string }, credentialHelper: string): string[] {
-  return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper];
+/**
+ * `sh -c` command that writes the token, the sign-in of the GitHub CLI as `login`, and the Git configuration of the dev
+ * container. Token on stdin, secrets mount required.
+ */
+export function gitFilesCommand(
+  folderName: string,
+  identity: { name: string; email: string },
+  credentialHelper: string,
+  login: string,
+): string[] {
+  return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper, login];
+}
+
+/** `sh -c` command that removes the token of the owner account from the volume (REMOVE_GIT_TOKEN_SCRIPT). */
+export function removeGitTokenCommand(): string[] {
+  return ['sh', '-c', REMOVE_GIT_TOKEN_SCRIPT, 'sh'];
 }
 
 /** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */

@@ -172,6 +172,7 @@ describe('showError (concept 6.5)', () => {
       'gitSwitchFailed',
       'signInRequired',
       'hostAccess',
+      'unencryptedDockerConnection',
       'otherAccount',
       'environmentUnassigned',
     ] as const;

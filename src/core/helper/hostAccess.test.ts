@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { devContainersSettings } from '../devContainers';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -11,7 +12,7 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../names';
-import { containerEnvironment, devContainersSettings, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_STOP_TIMEOUT_SECONDS,
@@ -19,6 +20,8 @@ import {
   hostAccessProblems,
   hostAccessReport,
   isLoopbackAddress,
+  isOwnVolume,
+  isSameOwnerAdditionalVolume,
   loopbackAppPorts,
   loopbackRunArgs,
   mountedVolumeNames,
@@ -64,8 +67,9 @@ describe('host access policy: mounts (concept section 9 "Host access")', () => {
     // volumes named with a hash.
     ['the cache volume of the Dev Containers extension', 'source=vscode,target=/vscode,type=volume', ['volume vscode of the Dev Containers extension']],
     ['the cache volume of the Dev Containers extension as an object', { type: 'volume', source: 'vscode', target: '/v' }, ['volume vscode of the Dev Containers extension']],
-    ['a clone volume of the Dev Containers extension (SHA-256)', `source=api-${'5e'.repeat(32)},target=/x,type=volume`, [`volume api-${'5e'.repeat(32)} of the Dev Containers extension`]],
-    ['a clone volume of the Dev Containers extension (MD5)', `source=vsc-api-${'0f'.repeat(16)},target=/x`, [`volume vsc-api-${'0f'.repeat(16)} of the Dev Containers extension`]],
+    // A name that ends in a hash is decided by the volume, when it exists (see "volumes named like a clone volume").
+    ['a name like a clone volume of the Dev Containers extension (SHA-256) that does not exist', `source=api-${'5e'.repeat(32)},target=/x,type=volume`, []],
+    ['a name like a clone volume of the Dev Containers extension (MD5) that does not exist', `source=vsc-api-${'0f'.repeat(16)},target=/x`, []],
     ['the proposed name of a named clone volume of the Dev Containers extension', 'source=vsc-remote-containers,target=/x,type=volume', ['volume vsc-remote-containers of the Dev Containers extension']],
     ['volumes whose names only look similar', 'source=vscode-extensions,target=/x,type=volume', []],
     ['a hash of another length (SHA-1)', `source=api-${'a'.repeat(40)},target=/x,type=volume`, []],
@@ -108,6 +112,23 @@ describe('host access policy: runArgs', () => {
     ],
     ['--mount with a line break', ['--mount', 'type=bind,src=/,dst=/host\n,type=volume,src=v'], ['mount "type=bind,src=/,dst=/host\\n,type=volume,src=v"']],
     ['DNS and hosts', ['--add-host', 'host.docker.internal:host-gateway', '--dns=1.1.1.1', '--dns-search', 'corp', '--dns-option=ndots:1'], []],
+    [
+      'each known DNS, memory, and health check flag, with its value next or after =',
+      [
+        '--dns', '1.1.1.1', '--dns=8.8.8.8', '--dns-option', 'ndots:2', '--dns-option=timeout:1', '--dns-opt', 'rotate', '--dns-opt=attempts:2',
+        '--dns-search', 'corp', '--dns-search=example.com',
+        '--memory', '4g', '--memory=2g', '--memory-reservation', '1g', '--memory-reservation=512m', '--memory-swap', '5g', '--memory-swap=-1',
+        '--memory-swappiness', '10', '--memory-swappiness=0',
+        '--health-cmd', 'true', '--health-cmd=true', '--health-interval', '30s', '--health-interval=10s', '--health-retries', '3', '--health-retries=5',
+        '--health-start-period', '5s', '--health-start-period=1s', '--health-start-interval', '1s', '--health-start-interval=2s',
+        '--health-timeout', '2s', '--health-timeout=3s', '--no-healthcheck',
+      ],
+      [],
+    ],
+    // An unknown flag that starts like a known one does not take the next argument as its value: `--privileged` is seen.
+    ['an unknown flag that starts like --dns', ['--dns-foo', '--privileged'], ['--dns-foo', 'privileged mode']],
+    ['unknown flags that start like --memory and --health-', ['--memory-foo', '-v', '/:/host', '--health-foo=1', '--healthcheck'], ['--memory-foo', 'bind mount /', '--health-foo', '--healthcheck']],
+    ['a value of a known flag that looks like a flag stays its value', ['--dns-search', '--privileged'], []],
     ['init, labels, hostname, name', ['--init', '--label', 'a=b', '-l', 'c=d', '--hostname', 'h', '-h', 'h2', '--name', 'x'], []],
     ['environment variables', ['--env', 'A=1', '-e', 'B=2', '-eC=3', '-e=D=4', '--env-file', '/workspaces/api/.env'], []],
     ['limits', ['--shm-size=1g', '--ulimit', 'nofile=1024', '--memory', '4g', '-m', '2g', '--memory-swap=5g', '--cpus', '2'], []],
@@ -352,7 +373,7 @@ describe('host access policy: the runArgs that Docker gets', () => {
   function dockerRunArgs(runArgs: string[]): string[] {
     const all = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
       .runArgs as string[];
-    expect(all.slice(-4)).toEqual(['--label', 'devenv.container-version=3', '--name', OWN]);
+    expect(all.slice(-4)).toEqual(['--label', 'devenv.container-version=4', '--name', OWN]);
     return all.slice(0, -4);
   }
 
@@ -427,7 +448,7 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       containerName: OWN,
       runArgs: ['--platform', 'linux/amd64', '--rm', '-it', '--cap-drop', 'ALL', '-d', '--label', '--rm'],
     });
-    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=3', '--name', OWN]);
+    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', OWN]);
     expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual([]);
   });
 });
@@ -655,6 +676,91 @@ describe('volumes of environments of other accounts (restrictions summary, findi
   });
 });
 
+describe('volumes named like a clone volume of the Dev Containers extension (a name that ends in a hash)', () => {
+  const SHA = `api-${'5e'.repeat(32)}`;
+  const MD5 = `vsc-api-${'0f'.repeat(16)}`;
+  const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const OWN_LABELS = { 'devenv.environment-id': ENVIRONMENT.id, 'devenv.owner-id': '1001', 'devenv.repository': 'acme/api', 'devenv.volume': 'additional' };
+
+  it.each<[string, Record<string, Record<string, string>>, string[]]>([
+    ['they do not exist yet (the pipeline creates them with its labels)', {}, []],
+    ['they exist without labels (older versions of the Dev Containers extension)', { [SHA]: {}, [MD5]: {} }, [`volume ${SHA} of another program`, `volume ${MD5} of another program`]],
+    ['they exist with the labels of the Dev Containers extension', { [SHA]: { 'vsch.local.repository': 'x' }, [MD5]: { 'dev.container.volume': 'true' } }, [`volume ${SHA} of the Dev Containers extension`, `volume ${MD5} of the Dev Containers extension`]],
+    ['they exist with other labels', { [SHA]: { 'com.example': 'x' } }, [`volume ${SHA} of another program`]],
+    ['they are the own volumes of the environment', { [SHA]: OWN_LABELS, [MD5]: OWN_LABELS }, []],
+  ])('%s', (_name, volumeLabels, expected) => {
+    const config = { mounts: [`source=${SHA},target=/s,type=volume`], runArgs: ['-v', `${MD5}:/m`] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels, environment: ENVIRONMENT })).toEqual(expected);
+  });
+});
+
+describe('volumes with the labels of Dev Environments', () => {
+  const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const FORMER = 'e0000009-0000-4000-8000-000000000009';
+  const labels = (id: string, owner?: string, kind: string | null = 'additional'): Record<string, string> => ({
+    'devenv.environment-id': id,
+    'devenv.repository': 'acme/api',
+    ...(owner === undefined ? {} : { 'devenv.owner-id': owner }),
+    ...(kind === null ? {} : { 'devenv.volume': kind }),
+  });
+
+  it.each<[string, Record<string, string>, { id: string; ownerId?: string }, string[]]>([
+    ['its own volume', labels(ENVIRONMENT.id, '1001'), ENVIRONMENT, []],
+    ['its own volume without an owner label (an entry of an older version)', labels(ENVIRONMENT.id), ENVIRONMENT, []],
+    ['its own ID with the owner label of another account', labels(ENVIRONMENT.id, '2002'), ENVIRONMENT, ['volume data of another environment']],
+    // The environments of one account share an additional volume, as on main and as the docs promise (for example
+    // web-node_modules of a fork and its upstream repository): the other environment may still exist.
+    ['a volume of another environment in the registry, also of the same owner', labels(FORMER, '1001'), ENVIRONMENT, []],
+    ['a volume that the Delete of an environment of the same owner kept', labels(FORMER, '1001'), ENVIRONMENT, []],
+    ['a volume of another environment of another owner', labels(FORMER, '2002'), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment without an owner label', labels(FORMER), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment of the same owner, for an environment without owner', labels(FORMER, '1001'), { id: ENVIRONMENT.id }, ['volume data of another environment']],
+    ['a volume of another environment without an owner label, for an environment without owner', labels(FORMER), { id: ENVIRONMENT.id }, ['volume data of another environment']],
+    ['a volume of another environment of the same owner without devenv.volume (a workspace volume)', labels(FORMER, '1001', null), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment of the same owner of another kind', labels(FORMER, '1001', 'workspace'), ENVIRONMENT, ['volume data of another environment']],
+  ])('%s', (_name, volumeLabels, environment, expected) => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: volumeLabels }, environment })).toEqual(expected);
+  });
+
+  it('refuses an additional volume of the same owner that an environment of another account records', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(
+      hostAccessProblems({ config, ownVolume: OWN, foreignVolumes: ['data'], volumeLabels: { data: labels(FORMER, '1001') }, environment: ENVIRONMENT }),
+    ).toEqual(['volume data of another environment']);
+  });
+
+  it('refuses every volume with devenv.environment-id when the environment is not known', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: labels(ENVIRONMENT.id, '1001') } })).toEqual(['volume data of another environment']);
+  });
+
+  it.each<[string, Record<string, string>, string | undefined, boolean]>([
+    ['the ID and the owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '1' }, '1', true],
+    ['the ID without an owner label', { 'devenv.environment-id': 'a' }, '1', true],
+    ['the ID of an environment without owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '1' }, undefined, true],
+    ['another owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '2' }, '1', false],
+    ['another ID', { 'devenv.environment-id': 'b', 'devenv.owner-id': '1' }, '1', false],
+    ['no labels', {}, '1', false],
+    ['labels of another program', { 'com.docker.compose.project': 'a' }, '1', false],
+  ])('isOwnVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isOwnVolume(volumeLabels, 'a', ownerId)).toBe(expected);
+  });
+
+  it.each<[string, Record<string, string>, string | undefined, boolean]>([
+    ['an additional volume of the owner', labels(FORMER, '1001'), '1001', true],
+    ['an additional volume of another owner', labels(FORMER, '2002'), '1001', false],
+    ['an additional volume without an owner label', labels(FORMER), '1001', false],
+    ['an additional volume, for an environment without owner', labels(FORMER, '1001'), undefined, false],
+    ['a workspace volume of the owner (no devenv.volume)', labels(FORMER, '1001', null), '1001', false],
+    ['a volume of the owner of another kind', labels(FORMER, '1001', 'workspace'), '1001', false],
+    ['the owner and kind labels without an environment ID', { 'devenv.owner-id': '1001', 'devenv.volume': 'additional' }, '1001', false],
+    ['no labels', {}, '1001', false],
+  ])('isSameOwnerAdditionalVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isSameOwnerAdditionalVolume(volumeLabels, ownerId)).toBe(expected);
+  });
+});
+
 describe('volumes of other programs, by their labels (restrictions summary, finding 4)', () => {
   it.each<[string, Record<string, string>, string[]]>([
     ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' }, ['volume data of the Docker Compose project shop']],
@@ -788,5 +894,81 @@ describe('ports on localhost', () => {
   it('keeps --network host as it is (Docker ignores -p there, concept section 9 "Host access", exception)', () => {
     expect(loopbackRunArgs(['--network', 'host', '-p', '3000:3000'])).toEqual(['--network', 'host', '-p', '127.0.0.1:3000:3000']);
     expect(hostAccessProblems({ config: { runArgs: ['--network', 'host', '-p', '3000:3000'] }, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account (concept section 9)', () => {
+  it.each<[string, Record<string, unknown>, string[]]>([
+    ['in containerEnv', { containerEnv: { GH_CONFIG_DIR: '/home/node/.config/gh' } }, ['variable GH_CONFIG_DIR in containerEnv']],
+    ['in remoteEnv', { remoteEnv: { gh_config_dir: '/tmp/gh' } }, ['variable gh_config_dir in remoteEnv']],
+    ['in runArgs with -e', { runArgs: ['-e', 'GH_CONFIG_DIR=/tmp/gh'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with --env=', { runArgs: ['--env=GH_CONFIG_DIR=/x'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with -e and the value attached', { runArgs: ['-eGH_CONFIG_DIR=/y'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    // Without a value, Docker removes the variable of the override configuration.
+    ['in runArgs without a value', { runArgs: ['--env', 'GH_CONFIG_DIR'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['other variables of the GitHub CLI', { containerEnv: { GH_PAGER: 'cat' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] }, []],
+  ])('%s', (_name, config, expected) => {
+    expect(configProblems(config)).toEqual(expected);
+  });
+
+  it('refuses it in the image metadata, and accepts the value of the override configuration in the merged configuration', () => {
+    expect(hostAccessProblems({ metadata: [{ id: 'feature', containerEnv: { GH_CONFIG_DIR: '/g' } }], ownVolume: OWN })).toEqual([
+      'variable GH_CONFIG_DIR in containerEnv',
+    ]);
+    const merged = { containerEnv: containerEnvironment(), remoteEnv: remoteEnvironment() };
+    expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
+    expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('variables of the account of the GitHub CLI (user decision 2026-09-26, concept section 9)', () => {
+  const NAMES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST'];
+  const REASON = 'the GitHub CLI would use it instead of the sign-in of the account that owns the environment';
+  const FORMS: Array<[form: string, runArgs: (name: string) => string[]]> = [
+    ['-e NAME=value', (name) => ['-e', `${name}=x`]],
+    ['-e NAME', (name) => ['-e', name]],
+    ['--env NAME=value', (name) => ['--env', `${name}=x`]],
+    ['--env NAME', (name) => ['--env', name]],
+    ['--env=NAME=value', (name) => [`--env=${name}=x`]],
+    ['--env=NAME', (name) => [`--env=${name}`]],
+    ['-eNAME=value', (name) => [`-e${name}=x`]],
+    ['-eNAME', (name) => [`-e${name}`]],
+  ];
+
+  it.each(NAMES.flatMap((name) => FORMS.map(([form, runArgs]) => [name, form, runArgs(name)] as const)))(
+    '%s in runArgs as %s',
+    (name, _form, runArgs) => {
+      expect(configProblems({ runArgs: [...runArgs] })).toEqual([`variable ${name} in runArgs (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of the repository configuration',
+    (name, property) => {
+      expect(configProblems({ [property]: { [name]: 'ghp_x' } })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of an entry of the image metadata',
+    (name, property) => {
+      const metadata = [{ id: 'base' }, { id: 'feature', [property]: { [name]: 'x' } }];
+      expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it('compares without case and surrounding spaces, and allows other variables of the GitHub CLI', () => {
+    expect(configProblems({ containerEnv: { ' gh_token ': 'x' }, runArgs: ['-e', 'github_token'] })).toEqual([
+      `variable github_token in runArgs (${REASON})`,
+      `variable gh_token in containerEnv (${REASON})`,
+    ]);
+    expect(configProblems({ containerEnv: { GH_PAGER: 'cat', GITHUB_TOKEN_FILE: '/x' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] })).toEqual([]);
+  });
+
+  it('is a refusal of access, not an unsupported option', () => {
+    expect(hostAccessReport({ config: { containerEnv: { GH_TOKEN: 'x' } }, ownVolume: OWN })).toEqual({
+      hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
+      unsupported: [],
+    });
   });
 });

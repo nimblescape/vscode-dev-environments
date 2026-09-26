@@ -27,10 +27,13 @@ import {
   HOME_GIT_CONFIG_CONTENT,
   containerEnvironment,
   containerGitSupport,
-  devContainersSettings,
 } from '../../src/core/helper/containerGit';
+import { devContainersSettings } from '../../src/core/devContainers';
 import { Messages } from '../../src/core/messages';
 import {
+  CONTAINER_VERSION,
+  GH_CONFIG_FOLDER,
+  GH_HOSTS_FILE,
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
   LABEL_OWNER_ID,
@@ -401,12 +404,13 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
-    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe('3');
+    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
     const env = containerEnv();
     expect(env).toMatchObject({
       GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',
       DOCKER_CONFIG: '/workspaces/.devenv+/docker',
       GIT_SSH_COMMAND: 'ssh -o IdentityAgent=none',
+      GH_CONFIG_DIR: GH_CONFIG_FOLDER,
       // Remove every credential helper, include the helpers of the user, and for github.com only the one of the container.
       GIT_CONFIG_COUNT: '4',
       GIT_CONFIG_KEY_0: 'credential.helper',
@@ -431,13 +435,21 @@ describe('open pipeline on a seeded environment', () => {
     expect(last?.remoteEnv).toEqual(containerEnvironment());
     expect(last?.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
 
-    // The token file: mode 600, owned by the remote user, readable by it, and the only file with the token.
+    // The token file: mode 600, owned by the remote user, readable by it. Only it and the sign-in of the GitHub CLI
+    // (hosts.yml, the same token, the owner account) hold the token.
     expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/github-token')).toBe(`600 ${REMOTE_USER}`);
     expect(execIn(REMOTE_USER, 'cat /workspaces/.devenv+/github-token')).toBe(DUMMY_TOKEN);
-    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('/workspaces/.devenv+/github-token');
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`).split('\n').sort()).toEqual(
+      ['/workspaces/.devenv+/github-token', GH_HOSTS_FILE].sort(),
+    );
     expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/docker')).toBe(`700 ${REMOTE_USER}`);
+    expect(execIn('root', `stat -c "%a %U" ${GH_CONFIG_FOLDER}`)).toBe(`700 ${REMOTE_USER}`);
+    expect(execIn('root', `stat -c "%a %U" ${GH_HOSTS_FILE}`)).toBe(`600 ${REMOTE_USER}`);
+    const hosts = execIn(REMOTE_USER, `cat ${GH_HOSTS_FILE}`);
+    expect(hosts).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
+    expect(hosts).toContain(`user: "${TEST_ACCOUNT.login}"`);
     // No GnuPG folder of the extension: GnuPG works where the image sets it up.
-    expect(execIn('root', 'ls -A /workspaces/.devenv+').split('\n').sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token']);
+    expect(execIn('root', 'ls -A /workspaces/.devenv+').split('\n').sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig', 'github-token']);
 
     // Git reads only the configuration of the container; the ~/.gitconfig of the extension includes it for Git without
     // the variables. No ~/.config/git/config of the extension.
@@ -581,7 +593,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Id).not.toBe(oldId);
     expect(container?.State.Running).toBe(true);
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
-    expect(container?.Config.Labels?.['devenv.container-version']).toBe('3');
+    expect(container?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
     expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     expect(containersOfEnvironment()).toHaveLength(1);
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();

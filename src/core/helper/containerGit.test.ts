@@ -9,21 +9,22 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CONFIG_FOLDER, GIT_CONFIG_FILE } from '../names';
 import {
-  CONFIG_FOLDER_OWNER_COMMAND,
   CONTAINER_CREDENTIAL_HELPER,
   GIT_CREDENTIALS_CONFIG_FILE,
   HOME_GIT_CONFIG_CONTENT,
   HOME_GIT_CONFIG_SCRIPT,
   containerEnvironment,
   containerGitSupport,
-  devContainersSettings,
   gitIdentity,
   homeGitConfigCommand,
   isContainerGitVariable,
+  isGitHubCliAccountVariable,
+  GITHUB_CLI_ACCOUNT_VARIABLES,
+  isGitHubLogin,
   parseGitVersion,
-  parseOwnerIds,
   remoteEnvironment,
 } from './containerGit';
+import { hostAccessProblems } from './hostAccess';
 
 const hasGit = !spawnSync('git', ['--version'], { stdio: 'ignore' }).error;
 /** Optional: the path of an old Git (for example 2.30.2) that the credential tests run with too. */
@@ -58,17 +59,19 @@ describe('environment of the dev container (concept section 9 "Git inside the co
     expect(env.GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     expect(env.DOCKER_CONFIG).toBe('/workspaces/.devenv+/docker');
     expect(env.GIT_SSH_COMMAND).toBe('ssh -o IdentityAgent=none');
+    // The GitHub CLI reads its sign-in (hosts.yml of the owner account) from the volume, not from ~/.config/gh.
+    expect(env.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
     expect(Object.keys(env).some((name) => /TOKEN/.test(name))).toBe(false);
     expect(remoteEnvironment()).toEqual(env);
   });
 
-  it('sets only documented variables of Git and Docker, never one of the Dev Containers extension or the VS Code server', () => {
-    const documented = /^(GIT_CONFIG_GLOBAL|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_SSH_COMMAND|DOCKER_CONFIG)$/;
+  it('sets only documented variables of Git, Docker, and the GitHub CLI, never one of the Dev Containers extension or the VS Code server', () => {
+    const documented = /^(GIT_CONFIG_GLOBAL|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_SSH_COMMAND|DOCKER_CONFIG|GH_CONFIG_DIR)$/;
     for (const env of [containerEnvironment(), remoteEnvironment()]) {
       for (const name of Object.keys(env)) expect(name).toMatch(documented);
       // User decision (2026-09-25): these keep the values of their owners, so the browser, the agents, and the
       // channels of the Dev Containers extension work as the Dev Containers extension and VS Code expect.
-      for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'GIT_CONFIG_PARAMETERS', 'GNUPGHOME']) {
+      for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'GIT_CONFIG_PARAMETERS', 'GNUPGHOME', 'GH_TOKEN', 'GITHUB_TOKEN']) {
         expect(env).not.toHaveProperty(name);
       }
     }
@@ -105,109 +108,79 @@ describe('environment of the dev container (concept section 9 "Git inside the co
   });
 });
 
-describe('settings of the Dev Containers extension for the container (concept section 9 "Git inside the container")', () => {
-  it.each<[string, boolean | string]>([
-    ['dev.containers.copyGitConfig', false],
-    ['remote.containers.copyGitConfig', false],
-    ['dev.containers.gitCredentialHelperConfigLocation', 'none'],
-    ['dev.containers.dockerCredentialHelper', false],
-    ['dev.containers.githubCLILoginWithToken', false],
-  ])('%s is %s', (key, value) => {
-    expect(devContainersSettings()[key]).toBe(value);
-  });
-
-  it('has only these flat keys, as the extension reads them', () => {
-    const settings = devContainersSettings();
-    expect(Object.keys(settings)).toHaveLength(5);
-    for (const value of Object.values(settings)) expect(typeof value === 'boolean' || typeof value === 'string').toBe(true);
-  });
-
-  /**
-   * What the Dev Containers extension reads for the container (remote-containers 0.470.0, extension.js): the settings of
-   * all entries of the label merged with Object.assign in their order (function Coe; the override configuration is the
-   * last entry), read by class kv (`getConfiguration`: new key || old key; `getNewConfiguration`: new key), with the
-   * user setting only for `undefined` and `null` (`??`). The user of these tests switched every forwarding on.
-   */
-  function effective(entries: Array<Record<string, unknown>>): Record<string, unknown> {
-    const settings: Record<string, unknown> = Object.assign({}, ...entries);
-    const user = { copyGitConfig: true, gitCredentialHelperConfigLocation: 'global', dockerCredentialHelper: true, githubCLILoginWithToken: true };
-    const getConfiguration = (name: string) => settings[`dev.containers.${name}`] || settings[`remote.containers.${name}`];
-    const getNewConfiguration = (name: string) => settings[`dev.containers.${name}`];
-    return {
-      copyGitConfig: getConfiguration('copyGitConfig') ?? user.copyGitConfig,
-      gitCredentialHelperConfigLocation: getConfiguration('gitCredentialHelperConfigLocation') ?? user.gitCredentialHelperConfigLocation,
-      dockerCredentialHelper: getNewConfiguration('dockerCredentialHelper') ?? user.dockerCredentialHelper,
-      githubCLILoginWithToken: getNewConfiguration('githubCLILoginWithToken') ?? user.githubCLILoginWithToken,
-    };
-  }
-
-  const NOTHING_FORWARDED = { copyGitConfig: false, gitCredentialHelperConfigLocation: 'none', dockerCredentialHelper: false, githubCLILoginWithToken: false };
-
-  it.each<[string, Record<string, unknown>]>([
-    ['no settings', {}],
-    [
-      'a repository that switches everything on with the new keys',
-      {
-        'dev.containers.copyGitConfig': true,
-        'dev.containers.gitCredentialHelperConfigLocation': 'global',
-        'dev.containers.dockerCredentialHelper': true,
-        'dev.containers.githubCLILoginWithToken': true,
-      },
-    ],
-    [
-      'a repository that switches everything on with the old keys',
-      {
-        'remote.containers.copyGitConfig': true,
-        'remote.containers.gitCredentialHelperConfigLocation': 'system',
-        'remote.containers.dockerCredentialHelper': true,
-        'remote.containers.githubCLILoginWithToken': true,
-      },
-    ],
-  ])('forwards nothing of the computer for a container with %s', (_name, repository) => {
-    expect(effective([repository, devContainersSettings()])).toEqual(NOTHING_FORWARDED);
-  });
-
-  it('needs both keys of copyGitConfig: a false under the new key alone falls through to the old key', () => {
-    const repository = { 'remote.containers.copyGitConfig': true };
-    expect(effective([repository, { 'dev.containers.copyGitConfig': false }]).copyGitConfig).toBe(true);
-    expect(effective([repository, devContainersSettings()]).copyGitConfig).toBe(false);
-  });
-});
-
 describe('variables of container-only Git, which a configuration may not set (concept section 9 "Host access")', () => {
-  it.each<[string, boolean]>([
-    ['GIT_CONFIG_GLOBAL', true],
-    ['GIT_CONFIG_PARAMETERS', true],
-    ['GIT_CONFIG_COUNT', true],
-    ['GIT_CONFIG_KEY_0', true],
-    ['GIT_CONFIG_VALUE_3', true],
-    ['GIT_CONFIG_KEY_4', true],
-    ['GIT_CONFIG_SYSTEM', true],
-    ['GIT_CONFIG_NOSYSTEM', true],
-    ['GIT_CONFIG', true],
-    ['GIT_CONFIG_PARAMETERS', true],
-    ['DOCKER_CONFIG', true],
-    ['GIT_SSH_COMMAND', true],
-    ['git_config_global', true],
-    [' GIT_SSH_COMMAND ', true],
+  it.each<[string, boolean, boolean]>([
+    ['GIT_CONFIG_GLOBAL', true, true],
+    ['GIT_CONFIG_PARAMETERS', true, true],
+    ['GIT_CONFIG_COUNT', true, true],
+    ['GIT_CONFIG_KEY_0', true, true],
+    ['GIT_CONFIG_VALUE_3', true, true],
+    ['GIT_CONFIG_KEY_4', true, true],
+    ['GIT_CONFIG_SYSTEM', true, true],
+    ['GIT_CONFIG_NOSYSTEM', true, true],
+    ['GIT_CONFIG', true, true],
+    ['GIT_CONFIG_PARAMETERS', true, true],
+    ['DOCKER_CONFIG', true, true],
+    ['GIT_SSH_COMMAND', true, true],
+    ['GH_CONFIG_DIR', true, true],
+    ['gh_config_dir', true, true],
+    [' GH_CONFIG_DIR', true, true],
+    ['git_config_global', true, true],
+    [' GIT_SSH_COMMAND ', true, true],
     // Variables of the Dev Containers extension, the VS Code server, and GnuPG: the extension does not set them.
-    ['SSH_AUTH_SOCK', false],
-    ['REMOTE_CONTAINERS_IPC', false],
-    ['GNUPGHOME', false],
-    ['GIT_CONFIGURATION', false],
-    ['GIT_AUTHOR_NAME', false],
-    ['GIT_SSH', false],
-    ['SSH_AUTH_SOCKET', false],
-    ['DOCKER_HOST', false],
-    ['BROWSER', false],
-    ['GITHUB_TOKEN', false],
-    ['', false],
-  ])('%j: %s', (name, expected) => {
+    ['SSH_AUTH_SOCK', false, false],
+    ['REMOTE_CONTAINERS_IPC', false, false],
+    ['GNUPGHOME', false, false],
+    ['GIT_CONFIGURATION', false, false],
+    ['GIT_AUTHOR_NAME', false, false],
+    ['GIT_SSH', false, false],
+    ['SSH_AUTH_SOCKET', false, false],
+    ['DOCKER_HOST', false, false],
+    ['BROWSER', false, false],
+    // Deliberate behavior change (user decision 2026-09-26, "nothing else decides who is logged into github"): the
+    // variables of the account of the GitHub CLI were allowed before; they are no variables of container-only Git, but
+    // the host access policy refuses them (isGitHubCliAccountVariable).
+    ['GITHUB_TOKEN', false, true],
+    ['GH_CONFIG', false, false],
+    ['GH_HOST', false, true],
+    ['', false, false],
+  ])('%j: container-only Git %s, refused by the policy %s', (name, expected, refused) => {
     expect(isContainerGitVariable(name)).toBe(expected);
+    expect(hostAccessProblems({ config: { containerEnv: { [name]: 'x' } }, ownVolume: 'devenv-acme-api-3f2a9c1e' })).toHaveLength(refused ? 1 : 0);
   });
 
   it('covers every variable that the override configuration sets', () => {
     for (const name of Object.keys({ ...containerEnvironment(), ...remoteEnvironment() })) expect(isContainerGitVariable(name)).toBe(true);
+  });
+});
+
+describe('variables of the account of the GitHub CLI, which a configuration may not set (user decision 2026-09-26)', () => {
+  it.each<[string, boolean]>([
+    ['GH_TOKEN', true],
+    ['GITHUB_TOKEN', true],
+    ['GH_ENTERPRISE_TOKEN', true],
+    ['GITHUB_ENTERPRISE_TOKEN', true],
+    ['GH_HOST', true],
+    ['gh_token', true],
+    [' GH_HOST ', true],
+    ['GH_CONFIG_DIR', false],
+    ['GH_PAGER', false],
+    ['GH_NO_UPDATE_NOTIFIER', false],
+    ['GITHUB_TOKEN_FILE', false],
+    ['GH_TOKENS', false],
+    ['', false],
+  ])('%j: %s', (name, expected) => {
+    expect(isGitHubCliAccountVariable(name)).toBe(expected);
+  });
+
+  it('lists exactly the token and host variables of gh', () => {
+    expect([...GITHUB_CLI_ACCOUNT_VARIABLES].sort()).toEqual(['GH_ENTERPRISE_TOKEN', 'GH_HOST', 'GH_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GITHUB_TOKEN']);
+  });
+
+  it('never sets one of them in the container itself', () => {
+    for (const name of GITHUB_CLI_ACCOUNT_VARIABLES) {
+      expect(Object.keys({ ...containerEnvironment(), ...remoteEnvironment() })).not.toContain(name);
+    }
   });
 });
 
@@ -510,21 +483,29 @@ describe('Git version of the container', () => {
   });
 });
 
-describe('the owner of the configuration folder, who may remove the token when root may not (--cap-drop)', () => {
-  it('asks stat for the numeric owner and group of the configuration folder', () => {
-    expect(CONFIG_FOLDER_OWNER_COMMAND).toEqual(['stat', '-c', '%u:%g', CONFIG_FOLDER]);
-  });
-
-  it.each<[string, string | undefined]>([
-    ['1000:1000\n', '1000:1000'],
-    ['  501:20  ', '501:20'],
-    ['0:0', '0:0'],
-    ['', undefined],
-    ['vscode:vscode', undefined],
-    ['1000', undefined],
-    ["stat: can't stat '/workspaces/.devenv+': No such file or directory", undefined],
-    ['1000:1000\n1001:1001', undefined],
-  ])('%j', (output, ids) => {
-    expect(parseOwnerIds(output)).toBe(ids);
+describe('GitHub login of the sign-in of the GitHub CLI (hosts.yml)', () => {
+  it.each<[string, boolean]>([
+    ['scalarion', true],
+    ['octo-cat', true],
+    ['a', true],
+    ['1234', true],
+    ['null', true],
+    ['old--login', true],
+    ['old-login-', true],
+    ['x'.repeat(39), true],
+    ['x'.repeat(40), false],
+    ['', false],
+    ['-octo', false],
+    // Enterprise Managed Users have logins `<handle>_<shortcode>`; an earlier expectation (false) had the rule wrong.
+    ['octo_cat', true],
+    ['dev_acme', true],
+    ['_x', false],
+    ['octo cat', false],
+    ['octo"cat', false],
+    ['octo:cat', false],
+    ['octo\ncat', false],
+    ['${localEnv:USER}', false],
+  ])('%j: %s', (login, expected) => {
+    expect(isGitHubLogin(login)).toBe(expected);
   });
 });

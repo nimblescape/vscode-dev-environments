@@ -37,7 +37,7 @@ import {
   type BaseDigestLookup,
   type HelperBuildKind,
 } from './helperImage';
-import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
+import { CONTAINER_CREDENTIAL_HELPER, isGitHubLogin, type GitIdentity } from './containerGit';
 import {
   OVERRIDE_CONFIG_PATH,
   SECRETS_FOLDER,
@@ -46,6 +46,7 @@ import {
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
+  removeGitTokenCommand,
   switchBranchCommand,
   upCommand,
 } from './scripts';
@@ -534,7 +535,7 @@ export class WorkspaceHelper {
 
   /**
    * devcontainer up with the override configuration. The override configuration is passed on stdin and written to a
-   * temporary file inside the helper. --skip-post-attach (V-1). Throws DevcontainerCommandError.
+   * temporary file inside the helper. SKIP_POST_ATTACH_ARG (V-1). Throws DevcontainerCommandError.
    * A failed lifecycle command (isLifecycleCommandFailure) does not throw when its container runs: like the Dev
    * Containers extension, which connects and reports the failed command, the container is kept (concept 7.6, 7.7).
    * The result then has outcome 'success', the container ID, and `lifecycleCommandFailure`.
@@ -574,24 +575,34 @@ export class WorkspaceHelper {
   }
 
   /**
-   * Writes the token of the owner account and the Git and Docker configuration of the dev container into the volume
-   * (GIT_FILES_SCRIPT, concept section 9 "Git inside the container"), without the Docker socket, the cache volume, and
-   * network. The token goes to the helper on stdin only; it is never on a command line, in a variable, or in the output.
-   * Throws CommandError (with the token removed from the output).
+   * Writes the token of the owner account, the sign-in of the GitHub CLI as that account (`login`), and the Git and
+   * Docker configuration of the dev container into the volume (GIT_FILES_SCRIPT, concept section 9 "Git inside the
+   * container"), without the Docker socket, the cache volume, and network. The token goes to the helper on stdin only; it
+   * is never on a command line, in a variable, or in the output. Throws CommandError (with the token removed from the
+   * output). A `login` that is no GitHub login (isGitHubLogin) does not stop the Git setup: the helper gets no login,
+   * writes the token and the Git configuration, and signs the GitHub CLI in nowhere (no hosts.yml), with a warning.
    */
   async prepareGit(p: {
     volumeName: string;
     repository: string;
     token: string;
     identity: GitIdentity;
+    /** The GitHub login of the account that owns the environment (the account of the session). */
+    login: string;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
     checkToken(p.token);
     const { name } = checkRepository(p.repository);
+    let login = p.login;
+    if (!isGitHubLogin(login)) {
+      // Never put an invalid value into hosts.yml, but keep Git in the container working with the token.
+      this.deps.logger.warn(`The GitHub login ${JSON.stringify(login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
+      login = '';
+    }
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Writing the Git configuration and the GitHub token of ${p.repository} into the volume ${p.volumeName}.`);
-    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER, login), {
       input: p.token,
       secrets: true,
       docker: false,
@@ -603,6 +614,23 @@ export class WorkspaceHelper {
     if (result.exitCode !== 0) {
       throw new CommandError('prepare Git', result.exitCode, redact(result.stdout, p.token), redact(result.stderr, p.token));
     }
+  }
+
+  /**
+   * Removes the token of the owner account from the volume (REMOVE_GIT_TOKEN_SCRIPT: the token file and the sign-in of
+   * the GitHub CLI), concept 7.5, without the Docker socket, the cache volume, and network. Works whether the dev
+   * container runs or not; it needs no tool of its image. `timeoutMs` limits the helper container (not a build of the
+   * helper image before it). Throws CommandError when a file is still there.
+   */
+  async removeGitToken(p: { volumeName: string; timeoutMs?: number; signal?: AbortSignal }): Promise<void> {
+    const result = await this.runStreams(p.volumeName, removeGitTokenCommand(), {
+      docker: false,
+      network: false,
+      timeoutMs: p.timeoutMs,
+      signal: p.signal,
+      onStderr: this.logOutput,
+    });
+    if (result.exitCode !== 0) throw new CommandError('remove the GitHub token', result.exitCode, result.stdout, result.stderr);
   }
 
   /**

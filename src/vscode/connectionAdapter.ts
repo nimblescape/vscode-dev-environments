@@ -3,11 +3,12 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Connection Adapter (concept 7.2, 7.8; implementation notes 11): connects the window to a running container through the
-// Dev Containers extension, and finds out which container the window uses. The URI format lives in connection/authority.ts;
-// the command IDs of VS Code for this live here. No other module uses either (NFR-06).
+// Dev Containers extension, and finds out which container the window uses. The URI format lives in connection/authority.ts
+// (the literal ATTACHED_CONTAINER in core/devContainers.ts, NFR-06); the command IDs of VS Code for this live here.
 import * as vscode from 'vscode';
+import { ATTACHED_CONTAINER } from '../core/devContainers';
 import { silentLogger, type Logger } from '../core/ports';
-import { ATTACHED_CONTAINER, containerNameOfUri, folderUriParts, REMOTE_SCHEME } from './connection/authority';
+import { containerNameOfUri, folderUriParts, REMOTE_SCHEME } from './connection/authority';
 
 /** Opens a folder or workspace URI (built-in command of VS Code). */
 export const OPEN_FOLDER_COMMAND = 'vscode.openFolder';
