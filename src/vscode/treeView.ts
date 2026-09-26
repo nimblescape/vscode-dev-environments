@@ -9,6 +9,7 @@ import type { Logger } from '../core/ports';
 import {
   rootNodes,
   stateIcon,
+  type GroupNode,
   type HintRow,
   type InstallDockerRow,
   type OwnerGroup,
@@ -19,7 +20,7 @@ import {
 export const REPOSITORIES_VIEW_ID = 'devEnvironments.repositories';
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
-export type TreeNode = OwnerGroup | RepositoryRow | HintRow | SignInRow | InstallDockerRow;
+export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | InstallDockerRow;
 
 /** Command of the sign-in row (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
@@ -30,7 +31,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
   private groups: OwnerGroup[] = [];
   private roots: TreeNode[] = [];
-  private readonly parents = new Map<string, OwnerGroup>();
+  private readonly parents = new Map<string, OwnerGroup | GroupNode>();
 
   readonly onDidChangeTreeData: vscode.Event<TreeNode | undefined> = this.changeEmitter.event;
 
@@ -44,9 +45,14 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
     this.groups = groups;
     this.roots = rootNodes(groups, options.signedIn ?? true, options.dockerMissing ?? false);
     this.parents.clear();
-    for (const group of groups) {
-      for (const child of group.children) this.parents.set(child.id, group);
-    }
+    // The nodes of the setting repositoryGroups nest the rows: every parent is recorded, so reveal finds each row.
+    const record = (parent: OwnerGroup | GroupNode): void => {
+      for (const child of parent.children) {
+        this.parents.set(child.id, parent);
+        if (child.kind === 'group') record(child);
+      }
+    };
+    for (const group of groups) record(group);
     this.changeEmitter.fire(undefined);
   }
 
@@ -60,6 +66,8 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
       switch (node.kind) {
         case 'owner':
           return ownerItem(node);
+        case 'group':
+          return groupItem(node);
         case 'repository':
           return repositoryItem(node);
         case 'hint':
@@ -77,7 +85,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
 
   getChildren(node?: TreeNode): TreeNode[] {
     if (!node) return this.roots;
-    return node.kind === 'owner' ? node.children : [];
+    return node.kind === 'owner' || node.kind === 'group' ? node.children : [];
   }
 
   getParent(node: TreeNode): TreeNode | undefined {
@@ -93,6 +101,18 @@ function ownerItem(group: OwnerGroup): vscode.TreeItem {
   const item = new vscode.TreeItem(group.owner, vscode.TreeItemCollapsibleState.Expanded);
   item.id = group.id;
   item.contextValue = 'owner';
+  return item;
+}
+
+/** Node of the setting repositoryGroups. Its contextValue does not start with `repository`, so no row action applies. */
+function groupItem(node: GroupNode): vscode.TreeItem {
+  const item = new vscode.TreeItem(
+    node.label,
+    node.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed,
+  );
+  item.id = node.id;
+  item.contextValue = 'group';
+  if (node.tooltip !== undefined) item.tooltip = node.tooltip;
   return item;
 }
 

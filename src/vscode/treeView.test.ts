@@ -2,6 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
@@ -9,7 +11,8 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 import { silentLogger } from '../core/ports';
 import type { Environment, RepositoryInfo } from '../core/types';
 import { resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
-import { buildTreeModel, type HintRow, type OwnerGroup, type RepositoryRow } from './treeModel';
+import { parseRepositoryGroups } from './repositoryGroups';
+import { buildTreeModel, type GroupNode, type HintRow, type OwnerGroup, type RepositoryRow } from './treeModel';
 import { RepositoriesTreeProvider } from './treeView';
 
 function repo(nameWithOwner: string): RepositoryInfo {
@@ -144,6 +147,81 @@ describe('RepositoriesTreeProvider', () => {
     expect(provider.getChildren()).toEqual([]);
     provider.setModel(model(), { signedIn: true });
     expect((provider.getChildren() as OwnerGroup[]).every((node) => node.kind === 'owner')).toBe(true);
+    provider.dispose();
+  });
+});
+
+describe('nodes of the setting repositoryGroups', () => {
+  beforeEach(() => resetFakeVscode());
+
+  function groupedModel(): OwnerGroup[] {
+    const names = ['2026-3cWI-SWP-module-oop-EnesHA81', '2026-3cWI-SWP-module-oop-felix-he021', '2025-3bWI-SWP-module-oop-hailo'];
+    return buildTreeModel({
+      discovery: {
+        version: 1,
+        fetchedAt: '',
+        viewerLogin: 'me',
+        organizations: ['school'],
+        repositories: names.map((name) => repo(`school/${name}`)),
+        hints: [],
+      },
+      settings: { owners: [], includeArchived: false, includeForks: true },
+      environments: [{ ...env, repository: 'school/2026-3cWI-SWP-module-oop-EnesHA81' }],
+      runtime: new Map([['e1', { container: 'running', volume: true }]]),
+      currentEnvironmentId: 'e1',
+      otherWindowEnvironmentIds: new Set(),
+      busyEnvironmentIds: new Set(),
+      liveBranches: new Map(),
+      signedIn: true,
+      repositoryGroups: parseRepositoryGroups([{ name: 'Courses', pattern: String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$` }])
+        .patterns,
+    });
+  }
+
+  it('maps the nested nodes to tree items, with parents, children, and the initial collapsible state', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(groupedModel());
+    const [owner] = provider.getChildren() as OwnerGroup[];
+    const [root] = provider.getChildren(owner) as GroupNode[];
+    expect(provider.getTreeItem(root)).toMatchObject({
+      label: 'Courses',
+      id: 'group:school:0:',
+      contextValue: 'group',
+      collapsibleState: 2,
+      tooltip: String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`,
+    });
+    const [y2025, y2026] = provider.getChildren(root) as GroupNode[];
+    // Collapsed, except the node that holds the row of the environment of this window.
+    expect(provider.getTreeItem(y2025)).toMatchObject({ label: '2025-3bWI-SWP', collapsibleState: 1 });
+    expect(provider.getTreeItem(y2026)).toMatchObject({ label: '2026-3cWI-SWP', collapsibleState: 2 });
+    const [module] = provider.getChildren(y2026) as GroupNode[];
+    const [enes, felix] = provider.getChildren(module) as RepositoryRow[];
+    const item = provider.getTreeItem(enes) as unknown as TreeItem;
+    expect(item).toMatchObject({ label: 'EnesHA81', id: 'repo:school/2026-3cwi-swp-module-oop-enesha81', collapsibleState: 0 });
+    expect(item.tooltip).toContain('school/2026-3cWI-SWP-module-oop-EnesHA81');
+    expect((item.accessibilityInformation as { label: string }).label).toContain('school/2026-3cWI-SWP-module-oop-EnesHA81');
+    expect((provider.getTreeItem(felix) as unknown as TreeItem).label).toBe('felix-he021');
+    // Reveal walks up from any row to the owner group.
+    expect(provider.getParent(enes)).toBe(module);
+    expect(provider.getParent(module)).toBe(y2026);
+    expect(provider.getParent(y2026)).toBe(root);
+    expect(provider.getParent(root)).toBe(owner);
+    expect(provider.getParent(owner)).toBeUndefined();
+    provider.dispose();
+  });
+
+  it('gives group nodes a contextValue that no row action of package.json matches', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { menus: Record<string, Array<{ when?: string }>> };
+    };
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const [owner] = groupedModel();
+    const value = (provider.getTreeItem(owner.children[0]) as unknown as TreeItem).contextValue ?? '';
+    for (const menu of ['view/item/context', 'devEnvironments.more']) {
+      for (const { when } of manifest.contributes.menus[menu]) {
+        for (const regex of (when ?? '').matchAll(/viewItem =~ \/(.+?)\//g)) expect(new RegExp(regex[1]).test(value)).toBe(false);
+      }
+    }
     provider.dispose();
   });
 });

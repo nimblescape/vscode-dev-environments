@@ -171,6 +171,30 @@ DEV ENVIRONMENTS         [Select Organizations] [Search] [Refresh] [Collapse All
 
 The list groups the repositories by owner. In each group, the repositories are in alphabetical order; a repository with an environment keeps its place.
 
+**Repository groups.** The setting `repositoryGroups` (see [section 8](#8-settings)) holds regular expressions (JavaScript syntax) that filter and group the repositories of each owner. Each one is matched against the repository name without the owner. An entry is the regular expression itself, or an object with `pattern`, an optional `name`, and optional `flags` (only `i`, `u`, and `s`; other flags are ignored with a warning).
+
+- **Filter, per owner.** The regular expressions apply to each owner on its own. In an owner where at least one repository matches one of them, the view groups the repositories of that owner and hides those that match none. A repository with an environment is always shown: if it matches none, it is listed directly under its owner, after the group nodes. In an owner where no repository matches, nothing changes: the owner shows its plain list, as without the setting. No owner is hidden because of the setting, and the organization hints stay first in each owner.
+- **Levels.** The capturing groups of the regular expression are the levels of the tree, in their order (named groups count in their numeric position). The first group is the top level, directly under the owner; each further group is one level down; the last group is the label of the repository row. Without capturing groups, the regular expression only filters, and the rows keep their name. A group that did not take part in the match, or is empty, is skipped: the row moves up one level. If the last group is empty, the row shows the repository name.
+- **Nodes.** A repository goes under the first regular expression that matches it. Nodes with the same labels under the same parent are one node, also when different regular expressions make them. An entry with a `name` gets its own node with that name in each owner where a repository matches it; it holds the levels of that entry and is never merged with the nodes of other entries. These named nodes come first, in the order of the setting.
+- **Order.** At every level, the group nodes come first in alphabetical order, then the rows in alphabetical order of their label.
+- **Expanded nodes.** A named node is expanded. The group levels are collapsed, except the nodes that hold the row of the environment of this window. VS Code remembers what the user expands or collapses.
+- **Invalid entries.** An entry of the wrong type, with an empty pattern, or with a regular expression that is not valid is ignored. The view shows a warning that names the entry and the error, once per window, and writes it to the log. With no valid entry, the view is the same as without the setting.
+
+Example: the setting `["^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$"]` shows the repositories `2025-3bWI-SWP-module-oop-hailo`, `2026-3cWI-SWP-module-oop-EnesHA81`, and `2026-3cWI-SWP-module-oop-felix-he021` of the owner `school` as:
+
+```text
+  ▾ school
+    ▸ 2025-3bWI-SWP
+        ▸ module-oop
+            hailo
+    ▸ 2026-3cWI-SWP
+        ▸ module-oop
+            EnesHA81
+            felix-he021
+```
+
+The tooltip of a row names the full `owner/name`.
+
 **Title bar.** **Select Organizations…** opens a list with the signed-in account (marked "your account"), every organization where the account is a member, and the owners of the setting `owners` that are in neither list, so that they can be removed. The current setting is selected. **OK** writes the selection to the setting `owners` (user settings), and the list loads again with the new scan scope (see [7.4](#74-repository-discovery)); no selection means all repositories. The icon is an empty filter while the setting is empty, and a filled filter while it limits the list. Without a sign-in, the command asks to sign in first.
 
 **Row.** A row shows:
@@ -844,6 +868,7 @@ The prefix `devEnvLauncher` is a working name (see [D-1](#13-decisions)).
 | `devEnvLauncher.includeArchived` | `false` | Show archived repositories |
 | `devEnvLauncher.includeForks` | `true` | Show forked repositories |
 | `devEnvLauncher.refreshIntervalMinutes` | `60` | Interval of the background update of the repository list |
+| `devEnvLauncher.repositoryGroups` | `[]` | Regular expressions that group the repositories of the sidebar in levels by their capturing groups, and hide the repositories that match none in each owner where at least one repository matches (see [6.2](#62-sidebar-view)). An entry is the regular expression, or `{ "name", "pattern", "flags" }`. Only the user settings can set it (scope `application`): a workspace cannot bring regular expressions that make the view slow. |
 
 The Docker start (FR-14) has no setting, because it is a fixed requirement.
 

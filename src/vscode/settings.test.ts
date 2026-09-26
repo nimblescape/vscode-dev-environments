@@ -3,6 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
@@ -24,6 +26,8 @@ describe('settings (concept section 8)', () => {
       includeArchived: false,
       includeForks: true,
       refreshIntervalMinutes: 60,
+      // Unit 9 (setting repositoryGroups, concept 8): a new setting with the default [].
+      repositoryGroups: [],
     });
   });
 
@@ -50,6 +54,22 @@ describe('settings (concept section 8)', () => {
     expect(settings.owners).toEqual(['acme', 'me']);
     expect(settings.includeForks).toBe(true);
     expect(normalizeSettings((key) => (key === 'owners' ? 'acme' : undefined)).owners).toEqual([]);
+  });
+
+  it('reads the entries of repositoryGroups as they are, and replaces a value that is not a list with []', () => {
+    const entries = ['^a', { name: 'B', pattern: '^b', flags: 'i' }, 3];
+    expect(normalizeSettings((key) => (key === 'repositoryGroups' ? entries : undefined)).repositoryGroups).toEqual(entries);
+    for (const value of ['^a', null, 3, { pattern: '^a' }]) {
+      expect(normalizeSettings((key) => (key === 'repositoryGroups' ? value : undefined)).repositoryGroups).toEqual([]);
+    }
+  });
+
+  it('declares repositoryGroups with the scope application, so a workspace cannot set regular expressions', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { scope?: string; default?: unknown }> } };
+    };
+    const setting = manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.repositoryGroups`];
+    expect(setting).toMatchObject({ scope: 'application', default: [] });
   });
 
   it('clamps the waiting time and the refresh interval', () => {

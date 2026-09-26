@@ -19,6 +19,7 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  repositoryGroups: [],
 });
 
 /**
@@ -29,7 +30,8 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
 
 /**
  * Current settings. Values of a wrong type fall back to the default; waitingTimeSeconds ≥ 0,
- * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES.
+ * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES. `repositoryGroups` has the scope `application` in
+ * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions.
  */
 export function readSettings(): ExtensionSettings {
   const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);
@@ -52,6 +54,7 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     return typeof value === 'number' && Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, value)) : fallback;
   };
   const owners = get('owners');
+  const repositoryGroups = get('repositoryGroups');
   return {
     reopenLastOnStartup: bool('reopenLastOnStartup', DEFAULT_SETTINGS.reopenLastOnStartup),
     stopOnClose: bool('stopOnClose', DEFAULT_SETTINGS.stopOnClose),
@@ -72,5 +75,7 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
       1,
       MAX_REFRESH_INTERVAL_MINUTES,
     ),
+    // The entries are checked where they are used (repositoryGroups.ts), so that each problem can be named.
+    repositoryGroups: Array.isArray(repositoryGroups) ? [...(repositoryGroups as unknown[])] : [],
   };
 }

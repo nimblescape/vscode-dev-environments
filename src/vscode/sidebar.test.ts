@@ -100,6 +100,7 @@ interface Harness {
   };
   /** The settings that the sidebar reads; a test can change them. */
   settings: ExtensionSettings;
+  logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
 }
 
 function createHarness(): Harness {
@@ -177,6 +178,7 @@ function createHarness(): Harness {
     discovery,
     auth,
     settings,
+    logger,
   };
 }
 
@@ -636,6 +638,32 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     h.sidebar.onPartialResult(part([info('acme/late')]));
     await h.sidebar.render();
     expect(rows()).toEqual([]);
+  });
+
+  it('groups the rows with the setting repositoryGroups, and warns once per session about each invalid entry', async () => {
+    h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop'), info('acme/api')]));
+    h.settings.repositoryGroups = ['(', { pattern: '^(web)-(.+)$', flags: 'g' }];
+    await signedIn();
+    await h.sidebar.render();
+    const [group] = h.models[h.models.length - 1];
+    expect(group.children.map((child) => [child.kind, child.label])).toEqual([['group', 'web']]);
+    expect(rows().map((row) => [row.repository, row.label])).toEqual([['acme/web-shop', 'shop']]);
+
+    const warnings = fakeVscode.window.showWarningMessage.mock.calls.map((call: unknown[]) => call[0] as string);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain('The repository group "(" in the setting devEnvLauncher.repositoryGroups is ignored');
+    expect(warnings[1]).toContain('uses the flags "g", which are ignored');
+    for (const warning of warnings) expect(h.logger.warn).toHaveBeenCalledWith(warning);
+
+    // Each render compiles the patterns again, but a problem is shown only once.
+    await h.sidebar.render();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
+    // Another invalid entry is a new problem.
+    h.settings.repositoryGroups = ['(', '['];
+    await h.sidebar.render();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(3);
+    // Without valid entries, the view lists the repositories as without the setting.
+    expect(rows().map((row) => row.label)).toEqual(['api', 'web-shop']);
   });
 
   it('shows no part of a first load that failed', async () => {

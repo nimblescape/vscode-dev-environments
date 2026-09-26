@@ -22,6 +22,7 @@ import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { isProcessAlive } from '../monitor/lock';
 import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
+import { parseRepositoryGroups, type RepositoryGroupPattern } from './repositoryGroups';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import { CoalescingTask, mapLimit } from './tasks';
@@ -82,6 +83,8 @@ export class Sidebar implements vscode.Disposable {
   /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
   private accountChanges = 0;
   private disposed = false;
+  /** Problems of the setting repositoryGroups that were shown: each distinct one once per window session. */
+  private readonly shownGroupProblems = new Set<string>();
   private readonly renderTask = new CoalescingTask(() => this.renderNow());
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
   private readonly discoveryTask = new CoalescingTask(() => this.refreshDiscoveryNow());
@@ -310,9 +313,27 @@ export class Sidebar implements vscode.Disposable {
       liveBranches: this.liveBranches,
       signedIn: this.signedIn,
       repositoryLookups: this.lookups,
+      repositoryGroups: this.repositoryGroups(),
       formatTime,
     });
     this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
+  }
+
+  /**
+   * The valid entries of the setting repositoryGroups, compiled once for this model. An entry that is not valid is left
+   * out; its problem is logged and shown once per window session.
+   */
+  private repositoryGroups(): RepositoryGroupPattern[] {
+    const { patterns, problems } = parseRepositoryGroups(this.deps.settings().repositoryGroups);
+    for (const { message } of problems) {
+      if (this.shownGroupProblems.has(message)) continue;
+      this.shownGroupProblems.add(message);
+      this.deps.logger.warn(message);
+      vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => {
+        this.deps.logger.warn(`A warning could not be shown: ${errorMessage(error)}`);
+      });
+    }
+    return patterns;
   }
 
   private async refreshStatesNow(): Promise<void> {
