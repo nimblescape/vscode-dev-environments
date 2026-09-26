@@ -701,6 +701,29 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     expect(preview.owners[0].hidden).toEqual(['website']);
   });
 
+  // Review round 2 of PR #21, W1: an entry that throws while it is matched does not break the view, and is logged once.
+  it('renders when an entry of repositoryGroups throws while it is matched, and logs that once', async () => {
+    h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop'), info('acme/aaaa')]));
+    h.settings.repositoryGroups = ['(?:(?:a?){10000}){3000}', '^(web)-(.+)$'];
+    await signedIn();
+    // The stack overflow of that pattern, without the time it takes.
+    const original = RegExp.prototype.exec;
+    const exec = vi.spyOn(RegExp.prototype, 'exec').mockImplementation(function (this: RegExp, text: string) {
+      if (this.source.startsWith('(?:(?:a?)')) throw new RangeError('Maximum call stack size exceeded');
+      return original.call(this, text);
+    });
+    try {
+      await h.sidebar.render();
+      await h.sidebar.render();
+    } finally {
+      exec.mockRestore();
+    }
+    expect(rows().map((row) => [row.repository, row.label])).toEqual([['acme/web-shop', 'shop']]);
+    const failed = h.logger.warn.mock.calls.filter((call: unknown[]) => String(call[0]).includes('failed while it was matched'));
+    expect(failed).toHaveLength(1);
+    expect(String(failed[0][0])).toContain('Maximum call stack size exceeded');
+  });
+
   it('names the setting repositoryGroups once when grouping is slow, and never without patterns', async () => {
     h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop')]));
     await signedIn();

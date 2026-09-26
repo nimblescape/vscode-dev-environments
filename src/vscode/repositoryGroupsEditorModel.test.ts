@@ -10,6 +10,7 @@ import {
   GroupsEditorTexts,
   buildGroupsPreview,
   canSave,
+  capturingGroups,
   checkEntries,
   editorHtml,
   editorState,
@@ -161,6 +162,25 @@ describe('checks of the entries', () => {
     ]);
     expect(canSave(checks)).toBe(true);
     expect(GroupsEditorTexts.levels(3)).toBe('3 capturing groups: 2 levels, then the label of the row.');
+  });
+
+  // Review round 2 of PR #21, W2: the capturing groups are counted in the source; no regular expression of the draft
+  // runs in the extension host.
+  it('counts the capturing groups without running the regular expression', () => {
+    const count = (pattern: string) => capturingGroups(pattern);
+    expect(count('^a')).toBe(0);
+    expect(count('^(a)(?:b)(?<name>c)(?=d)(?!e)(?<=f)(?<!g)$')).toBe(2);
+    expect(count(String.raw`\(a\)[(](b)[\](]`)).toBe(1);
+    expect(count(String.raw`[\]()](x)`)).toBe(1);
+    expect(count(EXAMPLE)).toBe(3);
+    // This one takes seconds when it runs on the empty text.
+    const started = Date.now();
+    expect(checkEntries([entry(String.raw`(?:(|)\1){26}x`)])).toEqual([{ note: GroupsEditorTexts.oneCapturingGroup }]);
+    expect(Date.now() - started).toBeLessThan(500);
+    // The count equals the one of the regular expression.
+    for (const pattern of ['^(a)|(b)$', String.raw`(\()(?<n>[)(])`, EXAMPLE, '(?:x)', '((a)(b))']) {
+      expect(count(pattern)).toBe((new RegExp(`${pattern}|`).exec('')?.length ?? 1) - 1);
+    }
   });
 
   it('refuses a name or a pattern over the limits', () => {
@@ -373,6 +393,15 @@ describe('state and HTML of the webview', () => {
     expect(slowTest.canSave).toBe(true);
   });
 
+  // Review round 2 of PR #21, W1: a failed run of the worker keeps Save off, as a stopped one does.
+  it('keeps Save off when the worker failed', () => {
+    const entries = [entry('^a-(.+)$')];
+    expect(editorState({ seq: 1, entries, loaded: [], run: { failed: true }, changedOutside: false }).canSave).toBe(false);
+    expect(editorState({ seq: 1, entries, loaded: [], run: { preview: buildGroupsPreview(undefined, entries) }, changedOutside: false }).canSave).toBe(
+      true,
+    );
+  });
+
   it('has a strict Content Security Policy: nothing by default, the script only with the nonce, no remote content', () => {
     const html = editorHtml({
       cspSource: 'vscode-webview://abc',
@@ -548,6 +577,58 @@ describe('merge at Save (3-way)', () => {
     const base = [3, '^a'];
     const ours = entriesFromSetting(base).entries;
     expect(mergeRepositoryGroups(base, ours, [3, '^a'])).toEqual(merged(['^a']));
+  });
+
+  // Review round 2 of PR #21, M2: equal entries are matched in order first, so an addition or removal in settings.json
+  // next to an equal entry is no move.
+  describe('matches equal entries in order first', () => {
+    const load = (base: unknown[]) => entriesFromSetting(base).entries;
+
+    it('does not take a copy that settings.json added before an entry for that entry', () => {
+      const base = ['a', 'b'];
+      const [a, b] = load(base);
+      expect(mergeRepositoryGroups(base, [a, { ...b, pattern: 'b2' }], ['b', 'a', 'b'])).toEqual(merged(['b', 'a', 'b2']));
+    });
+
+    it('asks nothing about the order when settings.json only added a copy', () => {
+      const base = ['a', 'b', 'c'];
+      const [a, b, c] = load(base);
+      expect(mergeRepositoryGroups(base, [b, a, c], ['c', 'a', 'b', 'c'])).toMatchObject({ status: 'merged', orderConflict: false });
+    });
+
+    it('asks nothing about the order when settings.json only removed the first of two equal entries', () => {
+      const base = ['a', 'b', 'a', 'c'];
+      const [a1, b, a2, c] = load(base);
+      expect(mergeRepositoryGroups(base, [c, a1, b, a2], ['b', 'a', 'c'])).toEqual(merged(['c', 'b', 'a']));
+    });
+
+    it('keeps an edit of the last of two equal entries when settings.json removed the first', () => {
+      const base = ['a', 'b', 'a'];
+      const [a1, b, a2] = load(base);
+      expect(mergeRepositoryGroups(base, [a1, b, { ...a2, pattern: 'a2' }], ['b', 'a'])).toEqual(merged(['b', 'a2']));
+    });
+  });
+
+  // Review round 2 of PR #21, M3: a move is decided on the entries that both sides kept.
+  it('asks nothing about the order when the only move of one side is of an entry that the other side removed', () => {
+    const base4 = ['a', 'b', 'c', 'd'];
+    const [a, b, c] = entriesFromSetting(base4).entries;
+    expect(mergeRepositoryGroups(base4, [b, c, a], ['d', 'a', 'b', 'c'])).toEqual(merged(['b', 'c', 'a']));
+    const base3 = ['a', 'b', 'c'];
+    const [a3, b3, c3] = entriesFromSetting(base3).entries;
+    expect(mergeRepositoryGroups(base3, [c3, a3, b3], ['b', 'a'])).toEqual(merged(['b', 'a']));
+  });
+
+  // Review round 2 of PR #21, M5: a stored value that is not a list is never overwritten without a question.
+  it('does not merge with a stored value that is not a list, and replaces it only when asked to', () => {
+    const [a] = loaded();
+    const ours = [a, entry('^new')];
+    for (const theirs of [{ pattern: '^x' }, '^x', 42, true]) {
+      expect(merge(ours, theirs)).toEqual({ status: 'notAList', theirs });
+      expect(merge(ours, theirs, { replaceNotAList: true })).toEqual(merged(['^a', '^new']));
+    }
+    // A missing value is the empty list.
+    expect(merge(ours, null)).toMatchObject({ status: 'merged' });
   });
 });
 

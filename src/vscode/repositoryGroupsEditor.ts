@@ -124,6 +124,8 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       // Close or Cancel without Save: the draft is discarded.
       for (const listener of listeners) listener.dispose();
       if (this.session === session) this.session = undefined;
+      // The worker of the preview is not needed until the editor opens again (the next run starts a new one).
+      this.deps.previewRunner.dispose();
     });
   }
 
@@ -173,11 +175,14 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   }
 
   /**
-   * Save: checks the entries again (the webview is not trusted), also against the time limit on the names of the view,
-   * then merges the changes of the editor into the value stored now (mergeRepositoryGroups), asks only about entries
-   * changed differently on both sides (and once about the order when both sides moved entries differently), and writes
-   * the key in the user settings. `update` of one key changes only that key in settings.json; the other settings and the
-   * comments stay. Afterwards the editor shows the written value (the new base).
+   * Save: checks the entries again (the webview is not trusted), also against the time limit on the names of the view
+   * (a run of the worker that failed or was stopped saves nothing), then merges the changes of the editor into the value
+   * stored now (mergeRepositoryGroups), asks only about entries changed differently on both sides (and once about the
+   * order when both sides moved entries differently, and before it replaces a stored value that is not a list), and
+   * writes the key in the user settings. Each question re-reads the stored value: an answer counts only while the value
+   * it was given for is unchanged. `update` of one key changes only that key in settings.json; the other settings and the
+   * comments stay. Afterwards the editor shows the written value (the new base). After Cancel or a closed panel, nothing
+   * is written.
    */
   private async save(session: EditorSession): Promise<void> {
     if (!canSave(checkEntries(session.entries))) {
@@ -187,32 +192,66 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     session.saving = true;
     let status: string | undefined;
     let written: { value: unknown } | undefined;
+    const closed = () => this.session !== session;
     try {
       const run = await this.deps.previewRunner.run({
         entries: session.entries,
         testName: '',
         input: cloneableInput(this.deps.groupingInput()),
       });
+      if (closed()) return;
       if (run.previewTooSlow) {
         status = GroupsEditorTexts.tooSlowNotSaved;
         return;
       }
-      const entries = new Map<number, ConflictChoice>();
-      let order: ConflictChoice | undefined;
+      if (run.failed) {
+        status = GroupsEditorTexts.previewFailed;
+        return;
+      }
+      // The answers, each with the stored element (or value) that it was given for.
+      const entries = new Map<number, { choice: ConflictChoice; theirs: unknown }>();
+      let order: { choice: ConflictChoice; theirs: unknown } | undefined;
+      let replace: { theirs: unknown } | undefined;
       for (;;) {
         const current = readSettingValue();
-        const outcome = mergeRepositoryGroups(session.base, session.entries, current, { entries, ...(order ? { order } : {}) });
+        // An answer counts only while settings.json holds what the question showed; otherwise it is asked again.
+        const open = mergeRepositoryGroups(session.base, session.entries, current);
+        for (const [index, answer] of entries) {
+          const conflict = open.status === 'conflicts' ? open.conflicts.find((item) => item.baseIndex === index) : undefined;
+          if (!conflict || !sameEntry(conflict.theirs, answer.theirs)) entries.delete(index);
+        }
+        if (order && !sameSettingValue(order.theirs, current)) order = undefined;
+        if (replace && !sameSettingValue(replace.theirs, current)) replace = undefined;
+        const outcome = mergeRepositoryGroups(session.base, session.entries, current, {
+          entries: new Map([...entries].map(([index, answer]) => [index, answer.choice])),
+          ...(order ? { order: order.choice } : {}),
+          ...(replace ? { replaceNotAList: true } : {}),
+        });
+        if (outcome.status === 'notAList') {
+          const answer = await vscode.window.showWarningMessage(
+            GroupsEditorTexts.notAListConflict,
+            { modal: true, detail: GroupsEditorTexts.notAListDetail(describeSettingEntry(outcome.theirs)) },
+            GroupsEditorTexts.replaceWithMine,
+          );
+          if (closed()) return;
+          if (answer !== GroupsEditorTexts.replaceWithMine) {
+            status = GroupsEditorTexts.saveCancelled;
+            return;
+          }
+          replace = { theirs: current };
+          continue;
+        }
         if (outcome.status === 'conflicts') {
-          const [open] = outcome.conflicts;
-          const answer = open
+          const [conflict] = outcome.conflicts;
+          const answer = conflict
             ? await vscode.window.showWarningMessage(
-                GroupsEditorTexts.conflict(open.baseIndex + 1),
+                GroupsEditorTexts.conflict(conflict.baseIndex + 1),
                 {
                   modal: true,
                   detail: GroupsEditorTexts.conflictDetail(
-                    describeSettingEntry(open.base),
-                    describeSettingEntry(open.mine),
-                    describeSettingEntry(open.theirs),
+                    describeSettingEntry(conflict.base),
+                    describeSettingEntry(conflict.mine),
+                    describeSettingEntry(conflict.theirs),
                   ),
                 },
                 GroupsEditorTexts.keepMine,
@@ -224,13 +263,14 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
                 GroupsEditorTexts.keepMine,
                 GroupsEditorTexts.keepTheirs,
               );
+          if (closed()) return;
           if (answer === undefined) {
             status = GroupsEditorTexts.saveCancelled;
             return;
           }
           const choice: ConflictChoice = answer === GroupsEditorTexts.keepMine ? 'mine' : 'theirs';
-          if (open) entries.set(open.baseIndex, choice);
-          else order = choice;
+          if (conflict) entries.set(conflict.baseIndex, { choice, theirs: conflict.theirs });
+          else order = { choice, theirs: current };
           continue;
         }
         const merged = outcome.value;
@@ -311,7 +351,9 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       input: cloneableInput(this.deps.groupingInput()),
     });
     if (run.failed) this.deps.logger.warn('The preview of the repository groups could not be made in its worker thread.');
-    const status = session.status ?? (run.previewTooSlow ? GroupsEditorTexts.previewTooSlow : undefined);
+    const status =
+      session.status ??
+      (run.previewTooSlow ? GroupsEditorTexts.previewTooSlow : run.failed ? GroupsEditorTexts.previewFailed : undefined);
     session.status = undefined;
     const message: EditorStateMessage = editorState({
       seq,
@@ -330,6 +372,11 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       this.deps.logger.warn(`The repository groups editor could not be updated: ${errorMessage(error)}`);
     });
   }
+}
+
+/** The same element of the setting (`undefined`: removed). */
+function sameEntry(a: unknown, b: unknown): boolean {
+  return a === undefined || b === undefined ? a === b : sameSettingValue(a, b);
 }
 
 /** The value in the user settings (scope `application`: no other value counts). */

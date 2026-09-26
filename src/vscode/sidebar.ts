@@ -340,6 +340,7 @@ export class Sidebar implements vscode.Disposable {
     const started = this.clock.now();
     const groups = buildTreeModel({ ...input, repositoryGroups });
     this.warnIfGroupingIsSlow(repositoryGroups, this.clock.now() - started);
+    this.logGroupFailures(repositoryGroups);
     this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
     this.renderEmitter.fire();
   }
@@ -359,6 +360,17 @@ export class Sidebar implements vscode.Disposable {
       });
     }
     return patterns;
+  }
+
+  /** Logs once per window session each entry that threw while it was matched (matchRepositoryGroup skipped it). */
+  private logGroupFailures(patterns: readonly RepositoryGroupPattern[]): void {
+    for (const pattern of patterns) {
+      if (pattern.failure === undefined) continue;
+      const message = RepositoryGroupTexts.failed(pattern.source, pattern.failure);
+      if (this.shownGroupProblems.has(message)) continue;
+      this.shownGroupProblems.add(message);
+      this.deps.logger.warn(message);
+    }
   }
 
   /**

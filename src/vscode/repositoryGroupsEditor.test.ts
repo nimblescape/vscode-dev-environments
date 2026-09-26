@@ -320,4 +320,105 @@ describe('RepositoryGroupsEditor', () => {
     const states = panel.posted.filter((message) => message.type === 'state');
     expect(states[states.length - 1]).toMatchObject({ status: GroupsEditorTexts.tooSlowNotSaved });
   });
+  // Review round 2 of PR #21, W1: Save needs a run of the worker that checked the entries.
+  it('does not save when the worker could not check the regular expressions', async () => {
+    const { panel } = await openEditor();
+    const [example] = loaded(panel).entries;
+    runner.next = { failed: true };
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example, { name: '', pattern: '(?:(?:a?){10000}){3000}', flags: '' }] });
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+    const states = panel.posted.filter((message) => message.type === 'state');
+    expect(states[states.length - 1]).toMatchObject({ status: GroupsEditorTexts.previewFailed });
+    // The state of a failed run keeps Save off and says why.
+    runner.next = { failed: true };
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries: [example], testName: '' });
+    await flush();
+    const last = panel.posted.filter((message) => message.type === 'state').pop();
+    expect(last).toMatchObject({ seq: 2, canSave: false, status: GroupsEditorTexts.previewFailed });
+  });
+
+  // Review round 2 of PR #21, M5: a stored value that is not a list is replaced only after a question.
+  it('asks before it replaces a stored value that is not a list, and saves nothing without the answer', async () => {
+    const { panel } = await openEditor();
+    const [example] = loaded(panel).entries;
+    hoisted.stored.value = { pattern: '^typed-by-hand' };
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example] });
+    await flush();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
+      GroupsEditorTexts.notAListConflict,
+      { modal: true, detail: GroupsEditorTexts.notAListDetail('{"pattern":"^typed-by-hand"}') },
+      GroupsEditorTexts.replaceWithMine,
+    );
+    expect(update).not.toHaveBeenCalled();
+    expect(hoisted.stored.value).toEqual({ pattern: '^typed-by-hand' });
+
+    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.replaceWithMine);
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [example] });
+    await flush();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE], fakeVscode.ConfigurationTarget.Global);
+  });
+
+  // Review round 2 of PR #21, M6: an answer counts only for the value of settings.json that the question showed.
+  it('asks again about an entry that settings.json changed after the question about it', async () => {
+    hoisted.stored.value = ['^a', '^b'];
+    const { panel } = await openEditor();
+    const [a, b] = loaded(panel).entries;
+    hoisted.stored.value = ['^a-theirs', '^b-theirs'];
+    const details: string[] = [];
+    fakeVscode.window.showWarningMessage.mockImplementation(async (_message: string, options: { detail: string }) => {
+      details.push(options.detail);
+      // While the second question is open, settings.json changes entry 1 again.
+      if (details.length === 2) hoisted.stored.value = ['^a-theirs-2', '^b-theirs'];
+      return GroupsEditorTexts.keepMine;
+    });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ ...a, pattern: '^a-mine' }, { ...b, pattern: '^b-mine' }] });
+    await flush();
+    await flush();
+    expect(details).toEqual([
+      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', '"^a-theirs"'),
+      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', '"^b-theirs"'),
+      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', '"^a-theirs-2"'),
+    ]);
+    expect(update).toHaveBeenCalledWith('repositoryGroups', ['^a-mine', '^b-mine'], fakeVscode.ConfigurationTarget.Global);
+  });
+
+  // Review round 2 of PR #21, W7: after Cancel or a closed panel, a Save in progress writes nothing.
+  it('writes nothing when the panel is closed while Save waits for the worker or for an answer', async () => {
+    const { panel } = await openEditor();
+    const [example, web] = loaded(panel).entries;
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example, { ...web, pattern: '^cancelled-(.+)$' }] });
+    await flush();
+    panel.receive({ type: 'cancel' });
+    await flush();
+    expect(panel.disposed).toBe(true);
+    release({});
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+
+    const second = await openEditor();
+    const [example2, web2] = loaded(second.panel).entries;
+    hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
+    let answer: (value: unknown) => void = () => {};
+    fakeVscode.window.showWarningMessage.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    second.panel.receive({ type: 'save', seq: 1, generation: gen(second.panel), entries: [example2, { ...web2, pattern: '^www-(.+)$' }] });
+    await flush();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    second.panel.dispose();
+    answer(GroupsEditorTexts.keepMine);
+    await flush();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  // Review round 2 of PR #21, W6: the worker of the preview stops with the panel.
+  it('stops the worker of the preview when the panel is closed', async () => {
+    const { panel } = await openEditor();
+    expect(runner.dispose).not.toHaveBeenCalled();
+    panel.dispose();
+    expect(runner.dispose).toHaveBeenCalledTimes(1);
+  });
 });

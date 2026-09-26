@@ -46,7 +46,7 @@ export const GroupsEditorTexts = {
     `Entry ${position} of the setting is neither a regular expression nor an object with "pattern" and optional "name" and "flags" texts. The editor does not show it, and Save removes it.`,
   ignoredFlagsLeftOut: (position: number, flags: string) =>
     `Entry ${position} of the setting uses the flags "${flags}", which are ignored (only i, u, and s are allowed). Save removes them.`,
-  notAList: 'The setting is not a list. The editor starts with no entries, and Save replaces the value.',
+  notAList: 'The setting is not a list. The editor starts with no entries, and Save asks before it replaces the value.',
   emptyPattern: 'Enter a regular expression.',
   invalidPattern: (error: string) => `This regular expression is not valid: ${error}`,
   patternTooLong: `The regular expression is longer than ${EditorLimits.pattern} characters.`,
@@ -73,6 +73,11 @@ export const GroupsEditorTexts = {
   previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
   testTooSlow: 'The test was stopped: the regular expressions took more than 1 second for this name.',
   tooSlowNotSaved: 'A regular expression takes too long for the repository names of the view. Nothing was saved.',
+  previewFailed: 'The preview could not check these regular expressions; Save is not possible.',
+  notAListConflict: 'settings.json holds a value for devEnvLauncher.repositoryGroups that is not a list.',
+  notAListDetail: (theirs: string) =>
+    `settings.json now: ${theirs}\nReplace with Mine writes the entries of this editor instead of that value. Cancel saves nothing.`,
+  replaceWithMine: 'Replace with Mine',
   orderConflict:
     'The entries of devEnvLauncher.repositoryGroups were moved both in this editor and in settings.json. Which order do you want to keep?',
   orderConflictDetail: 'The other changes of both sides are kept either way.',
@@ -149,7 +154,7 @@ export function checkEntries(entries: readonly EditorEntry[]): EntryCheck[] {
       if (problem?.kind === 'empty') return { error: GroupsEditorTexts.emptyPattern };
       return { error: GroupsEditorTexts.invalidPattern(problem?.detail ?? problem?.message ?? '') };
     }
-    const groups = capturingGroups(pattern.regex);
+    const groups = capturingGroups(pattern.source);
     const note =
       groups === 0 ? GroupsEditorTexts.noCapturingGroup : groups === 1 ? GroupsEditorTexts.oneCapturingGroup : GroupsEditorTexts.levels(groups);
     return { note };
@@ -161,13 +166,29 @@ export function canSave(checks: readonly EntryCheck[]): boolean {
   return checks.every((check) => check.error === undefined);
 }
 
-/** Number of capturing groups of a regular expression (the empty alternative always matches). */
-function capturingGroups(regex: RegExp): number {
-  try {
-    return (new RegExp(`${regex.source}|`, regex.flags).exec('')?.length ?? 1) - 1;
-  } catch {
-    return 0;
+/**
+ * Number of capturing groups of a regular expression, counted in its source without running it (no regular expression
+ * of the draft runs in the extension host): each `(` that is not escaped, not in a character class, and not followed by
+ * `?`, except a named group `(?<name>`. The source is valid (checkRepositoryGroupEntry compiled it); the flags are i, u,
+ * and s only, so a character class does not nest.
+ */
+export function capturingGroups(source: string): number {
+  let count = 0;
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+    if (char === '\\') {
+      i += 1;
+    } else if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') {
+      inClass = true;
+    } else if (char === '(') {
+      if (source[i + 1] !== '?') count += 1;
+      else if (source[i + 2] === '<' && source[i + 3] !== '=' && source[i + 3] !== '!') count += 1;
+    }
   }
+  return count;
 }
 
 /** Two values of the setting are the same (a missing value is the empty list; key order does not count). */
@@ -288,12 +309,16 @@ export type ConflictChoice = 'mine' | 'theirs';
 export interface MergeChoices {
   entries?: ReadonlyMap<number, ConflictChoice>;
   order?: ConflictChoice;
+  /** The value stored now is not a list, and the user chose to replace it with the entries of the editor. */
+  replaceNotAList?: boolean;
 }
 
 export type MergeOutcome =
   | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[]; orderConflict: boolean }
   /** Questions without an answer in the choices: the entries, and whether both sides moved entries differently. */
-  | { status: 'conflicts'; conflicts: MergeConflict[]; orderConflict: boolean };
+  | { status: 'conflicts'; conflicts: MergeConflict[]; orderConflict: boolean }
+  /** The value stored now is not a list (nor missing): Save must ask before it replaces it (`choices.replaceNotAList`). */
+  | { status: 'notAList'; theirs: unknown };
 
 type SideState = { kind: 'unchanged' } | { kind: 'removed' } | { kind: 'edited'; value: unknown };
 
@@ -303,13 +328,15 @@ type Token = { kind: 'base'; index: number } | { kind: 'new'; value: unknown };
  * Save never overwrites a change made in settings.json meanwhile: a 3-way merge of the setting value by the identity of
  * the entries. `base` is the value that the editor loaded (when it opened, or was last saved or loaded), `ours` the
  * entries of the editor (each with the `origin` it was loaded from, none when added), and `theirs` the value stored
- * now. The elements of `theirs` are matched to the base over the whole list (alignToBase), so an entry that
- * settings.json only moved keeps its identity. Per identity: the change of the one side that changed it wins; the same
+ * now. The elements of `theirs` are matched to the base first in order, then over the whole list (alignToBase), so an
+ * entry that settings.json only moved keeps its identity. Per identity: the change of the one side that changed it wins; the same
  * change on both sides is no conflict; different changes (also removed on one side and edited on the other) are a
  * conflict, answered in `choices.entries` by base index. Additions of both sides stay, with their multiplicity (an entry
  * that both sides added once is written once). The order: the order of the side that moved entries; when both moved
  * entries differently, a question (`orderConflict`, answered in `choices.order`); otherwise the order of settings.json.
- * The entries that only the other side has are placed after their predecessor on that side.
+ * Whether a side moved entries is decided on the entries that both sides kept. The entries that only the other side
+ * has are placed after their predecessor on that side. A stored value that is not a list is never merged: the outcome
+ * `notAList` asks first, and `choices.replaceNotAList` writes the entries of the editor instead.
  */
 export function mergeRepositoryGroups(
   baseValue: unknown,
@@ -318,6 +345,11 @@ export function mergeRepositoryGroups(
   choices: MergeChoices = {},
 ): MergeOutcome {
   const base = Array.isArray(baseValue) ? (baseValue as unknown[]) : [];
+  if (theirsValue !== undefined && theirsValue !== null && !Array.isArray(theirsValue)) {
+    // Not a list: nothing to merge with, and never overwritten without a question.
+    if (!choices.replaceNotAList) return { status: 'notAList', theirs: theirsValue };
+    return { status: 'merged', value: toSettingValue(ours), conflicts: [], orderConflict: false };
+  }
   const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
   const baseKeys = base.map(entryKey);
 
@@ -380,17 +412,21 @@ export function mergeRepositoryGroups(
     return decided.set(index, choice === 'mine' ? valueOf(mine, oursByOrigin) : valueOf(other, theirsByOrigin));
   });
 
-  // The order: of the side that moved entries; a question when both moved them differently.
-  const oursMoved = isReordered(oursTokens);
-  const theirsMoved = isReordered(theirsTokens);
+  // The order: of the side that moved entries; a question when both moved them differently. Whether a side moved
+  // entries is decided on the entries that both sides kept, against their order in the base: an entry that one side
+  // removed does not make a move of the other side (review round 2 of PR #21, M3).
+  const inOurs = new Set(oursByOrigin.keys());
+  const inTheirs = new Set(theirsByOrigin.keys());
+  const common = (tokens: Token[], other: Set<number>) =>
+    tokens.flatMap((token) => (token.kind === 'base' && other.has(token.index) ? [token.index] : []));
+  const oursCommon = common(oursTokens, inTheirs);
+  const theirsCommon = common(theirsTokens, inOurs);
+  const oursMoved = isReordered(oursCommon);
+  const theirsMoved = isReordered(theirsCommon);
   let orderConflict = false;
   let skeletonSide: ConflictChoice = oursMoved ? 'mine' : 'theirs';
   if (oursMoved && theirsMoved) {
-    const inOurs = new Set(oursByOrigin.keys());
-    const inTheirs = new Set(theirsByOrigin.keys());
-    const common = (tokens: Token[], other: Set<number>) =>
-      tokens.flatMap((token) => (token.kind === 'base' && other.has(token.index) ? [token.index] : []));
-    orderConflict = common(oursTokens, inTheirs).join(',') !== common(theirsTokens, inOurs).join(',');
+    orderConflict = oursCommon.join(',') !== theirsCommon.join(',');
     if (orderConflict) skeletonSide = choices.order ?? 'mine';
   }
   const orderUnresolved = orderConflict && choices.order === undefined;
@@ -433,23 +469,18 @@ export function mergeRepositoryGroups(
   return { status: 'merged', value, conflicts, orderConflict };
 }
 
-/** The base indices of the tokens that come from the base are not in increasing order: the entries were moved. */
-function isReordered(tokens: readonly Token[]): boolean {
-  let previous = -1;
-  for (const token of tokens) {
-    if (token.kind !== 'base') continue;
-    if (token.index < previous) return true;
-    previous = token.index;
-  }
-  return false;
+/** The base indices are not in increasing order: the entries were moved. */
+function isReordered(indices: readonly number[]): boolean {
+  return indices.some((index, position) => position > 0 && index < indices[position - 1]);
 }
 
 /**
- * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition. The
- * matching looks at the whole list, so a moved entry keeps its identity: first equal entries (each base entry once, so
- * duplicates keep their multiplicity), then entries with the same pattern, then with the same name; last, the
- * remaining entries after the same matched neighbor, in order (an entry whose pattern and name both changed, also next
- * to an addition).
+ * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition. First the
+ * equal entries in order (a longest common subsequence of both lists), so an entry that settings.json added or removed
+ * next to an equal one does not look like a move (review round 2 of PR #21, M2). Then the rest over the whole list, so a
+ * moved entry keeps its identity: equal entries (each base entry once, so duplicates keep their multiplicity), then
+ * entries with the same pattern, then with the same name; last, the remaining entries after the same matched neighbor,
+ * in order (an entry whose pattern and name both changed, also next to an addition).
  */
 function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Array<number | undefined> {
   const origins = new Array<number | undefined>(theirs.length).fill(undefined);
@@ -467,6 +498,10 @@ function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Arra
   const theirsKeys = theirs.map(entryKey);
   const baseFields = base.map(entryFieldsOf);
   const theirsFields = theirs.map(entryFieldsOf);
+  for (const [i, j] of commonSubsequence(baseKeys, theirsKeys)) {
+    origins[j] = i;
+    used.add(i);
+  }
   pass((i, j) => baseKeys[i] === theirsKeys[j]);
   pass((i, j) => baseFields[i] !== undefined && baseFields[i]?.pattern === theirsFields[j]?.pattern);
   pass((i, j) => baseFields[i]?.name !== undefined && baseFields[i]?.name === theirsFields[j]?.name);
@@ -499,6 +534,34 @@ function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Arra
     baseIndices.slice(0, theirsIndices.length).forEach((i, k) => (origins[theirsIndices[k]] = i));
   }
   return origins;
+}
+
+/** The index pairs of a longest common subsequence of `a` and `b`, in order (the first of equal choices). */
+function commonSubsequence(a: readonly string[], b: readonly string[]): Array<[number, number]> {
+  const width = b.length + 1;
+  // lengths[i * width + j]: the length of a longest common subsequence of a[i..] and b[j..].
+  const lengths = new Uint32Array((a.length + 1) * width);
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lengths[i * width + j] =
+        a[i] === b[j] ? lengths[(i + 1) * width + j + 1] + 1 : Math.max(lengths[(i + 1) * width + j], lengths[i * width + j + 1]);
+    }
+  }
+  const pairs: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      pairs.push([i, j]);
+      i += 1;
+      j += 1;
+    } else if (lengths[(i + 1) * width + j] >= lengths[i * width + j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return pairs;
 }
 
 /** The name (trimmed, if any) and pattern of an element of the setting, or `undefined` for one of the wrong type. */
@@ -810,7 +873,8 @@ export function editorState(options: {
     type: 'state',
     seq: options.seq,
     checks,
-    canSave: canSave(checks) && !run.previewTooSlow,
+    // Save needs a run of the worker that checked these entries: a stopped or failed worker keeps it off.
+    canSave: canSave(checks) && !run.previewTooSlow && !run.failed,
     dirty: !sameSettingValue(toSettingValue(options.entries), toSettingValue(options.loaded)),
     changedOutside: options.changedOutside,
     preview,
