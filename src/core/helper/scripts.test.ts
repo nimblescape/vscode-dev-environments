@@ -496,6 +496,33 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.dockerfiles).toEqual({});
   });
 
+  it('does not read a Dockerfile below the folders of the kernel (review round 3, S3-1)', () => {
+    const { dir, repo, env } = setup();
+    const context = `/proc/self/root${path.join(dir, 'outside')}`;
+    const model = { name: 'devenv-3f2a9c1e', services: { app: { build: { context } } } };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
+    expect(output.dockerfiles).toEqual({});
+  });
+
+  it('lists the build contexts and Dockerfiles that are missing in the repository, not links that lead out or nowhere (review round 3, P3-1)', () => {
+    const { dir, repo, env } = setup();
+    fs.mkdirSync(path.join(repo, 'ctx'));
+    fs.symlinkSync(path.join(dir, 'nowhere'), path.join(repo, 'dangling.Dockerfile'));
+    fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'out'));
+    const model = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        a: { build: { context: `${repo}/ctx`, dockerfile: 'missing.Dockerfile' } },
+        b: { build: { context: `${repo}/gone` } },
+        c: { build: { context: repo, dockerfile: 'dangling.Dockerfile' } },
+        d: { build: { context: `${repo}/out`, dockerfile: 'missing.Dockerfile' } },
+        e: { build: { context: path.join(dir, 'elsewhere') } },
+      },
+    };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
+    expect(output.missing).toEqual([`${repo}/ctx/missing.Dockerfile`, `${repo}/gone`, `${repo}/gone/Dockerfile`]);
+  });
+
   it('prints the hash of the files that Compose read, which follows their texts (review round 1, P-4)', () => {
     const { repo, env } = setup();
     const files = [path.join(repo, 'compose.yml')];
@@ -1103,6 +1130,8 @@ describe('READ_FILES_SCRIPT', () => {
     expect(read(repo, 'c/devcontainer.json')).toEqual({
       configText: '{ "build": { "dockerfile": "Dockerfile" } }',
       dockerfilePath: 'c/Dockerfile',
+      // Review round 3, P3-1: changed expectation, a missing Dockerfile of the repository is told apart.
+      dockerfileMissing: true,
     });
   });
 
@@ -1132,6 +1161,29 @@ describe('READ_FILES_SCRIPT', () => {
     // Still only in the repository.
     expect(run('../../secret')).not.toHaveProperty('dockerfileText');
     expect(readFilesCommand(repo, 'x', '')).toHaveLength(5);
+  });
+
+  it('tells a missing Dockerfile apart from a link out, a link that leads nowhere, and a variable (review round 3, P3-1)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    write(path.join(root, 'secret'), 'FROM secret\n');
+    const config = (dockerfile: string) => `{ "build": { "dockerfile": "${dockerfile}" } }`;
+    write(path.join(repo, 'a', 'devcontainer.json'), config('Dockerfile'));
+    write(path.join(repo, 'b', 'devcontainer.json'), config('link.Dockerfile'));
+    fs.symlinkSync(path.join(root, 'secret'), path.join(repo, 'b', 'link.Dockerfile'));
+    write(path.join(repo, 'c', 'devcontainer.json'), config('dangling.Dockerfile'));
+    fs.symlinkSync(path.join(root, 'nowhere'), path.join(repo, 'c', 'dangling.Dockerfile'));
+    write(path.join(repo, 'd', 'devcontainer.json'), config('sub/Dockerfile'));
+    fs.symlinkSync(root, path.join(repo, 'd', 'sub'));
+    write(path.join(repo, 'e', 'devcontainer.json'), config('${localEnv:X}/Dockerfile'));
+    write(path.join(repo, 'f', 'devcontainer.json'), config('../../elsewhere/Dockerfile'));
+    expect(read(repo, 'a/devcontainer.json')).toMatchObject({ dockerfilePath: 'a/Dockerfile', dockerfileMissing: true });
+    // A link out of the repository is not read (before: its text was returned).
+    expect(read(repo, 'b/devcontainer.json')).toEqual({ configText: config('link.Dockerfile'), dockerfilePath: 'b/link.Dockerfile' });
+    expect(read(repo, 'c/devcontainer.json')).toEqual({ configText: config('dangling.Dockerfile'), dockerfilePath: 'c/dangling.Dockerfile' });
+    expect(read(repo, 'd/devcontainer.json')).toEqual({ configText: config('sub/Dockerfile'), dockerfilePath: 'd/sub/Dockerfile' });
+    expect(read(repo, 'e/devcontainer.json')).toEqual({ configText: config('${localEnv:X}/Dockerfile') });
+    expect(read(repo, 'f/devcontainer.json')).toEqual({ configText: config('../../elsewhere/Dockerfile') });
   });
 
   it('fails for a configuration path outside of the repository', () => {

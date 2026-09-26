@@ -263,6 +263,9 @@ ${extra}volumes:
       'com.docker.compose.service': 'app',
     });
     expect(dev?.Config.Labels?.[LABEL_COMPOSE_SERVICE]).toBeUndefined();
+    // Review round 3 (D3-2): with `--id-label`, the CLI sets no devcontainer.config_file, so a restored entry cannot read
+    // its configuration path from its containers.
+    expect(dev?.Config.Labels?.['devcontainer.config_file']).toBeUndefined();
     expect(dev?.Mounts.find((mount) => mount.Destination === '/workspaces')).toMatchObject({ Type: 'volume', Name: app.name });
     // The host name of the dev container is the repository name, as for a single container; db keeps the one of Docker.
     expect(dev?.Config.Hostname).toBe('tiny-compose');

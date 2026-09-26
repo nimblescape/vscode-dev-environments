@@ -9,7 +9,7 @@
 // clear) and `unsupported` stay refused whatever the switch says.
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import { composeAccessClassification, composeAccessReport, type ComposeAccessInput } from './composeAccess';
+import { composeAccessClassification, composeAccessReport, composeMissingBuildPaths, type ComposeAccessInput } from './composeAccess';
 import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
 import type { HostAccessClass } from './hostAccess';
 
@@ -204,5 +204,45 @@ describe('composeAccessClassification', () => {
     const checked = input(() => undefined);
     expect(composeAccessReport(checked, false)).toEqual({ hostAccess: [], unsupported: [] });
     expect(composeAccessClassification(checked)).toEqual([]);
+  });
+});
+
+describe('review round 3 of unit 6 (S3-1, P3-1)', () => {
+  const classes = (checked: ComposeAccessInput) => composeAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
+  const built = (context: string, more: Record<string, unknown> = {}) => service('db', { image: undefined, build: { context, dockerfile_inline: 'FROM alpine', ...more } });
+
+  it('refuses the folders of the kernel whatever the switch says (S3-1)', () => {
+    expect(classes(input(built('/proc/self/root/devenv-cache')))).toEqual(['protected: service db: build context /proc/self/root/devenv-cache']);
+    expect(classes(input(built(REPO, { additional_contexts: { x: '/proc/self/root/devenv-cache' } })))).toEqual([
+      'protected: service db: build additional_contexts x=/proc/self/root/devenv-cache',
+    ]);
+  });
+
+  it('refuses a path outside of the repository whose real path is not known whatever the switch says (S3-1)', () => {
+    const checked = input(built('/opt/ctx'), { realPaths: { '/opt/ctx': null } });
+    expect(classes(checked)).toEqual(['protected: service db: build context /opt/ctx (the path does not exist)']);
+    expect(composeAccessReport(checked, false).hostAccess).toEqual(['service db: build context /opt/ctx (the path does not exist)']);
+    // With a real path, as before: access to the computer.
+    expect(classes(input(built('/opt/ctx'), { realPaths: { '/opt/ctx': '/opt/ctx' } }))).toEqual(['computer: service db: build context /opt/ctx']);
+  });
+
+  it('leaves a missing build context or Dockerfile of the repository to composeMissingBuildPaths, not to the policy (P3-1)', () => {
+    const context = `${REPO}/db`;
+    const missingContext = input(service('db', { image: undefined, build: { context } }), { realPaths: { [context]: null, [`${context}/Dockerfile`]: null }, missing: [context, `${context}/Dockerfile`], dockerfiles: {} });
+    expect(composeAccessReport(missingContext)).toEqual({ hostAccess: [], unsupported: [] });
+    expect(composeMissingBuildPaths(missingContext)).toEqual([`service db: build context ${context}`]);
+    const missingDockerfile = input(service('db', { image: undefined, build: { context: REPO, dockerfile: 'db.Dockerfile' } }), {
+      realPaths: { [REPO]: REPO, [`${REPO}/db.Dockerfile`]: null },
+      missing: [`${REPO}/db.Dockerfile`],
+      dockerfiles: {},
+    });
+    expect(composeAccessReport(missingDockerfile)).toEqual({ hostAccess: [], unsupported: [] });
+    expect(composeMissingBuildPaths(missingDockerfile)).toEqual([`service db: Dockerfile ${REPO}/db.Dockerfile`]);
+    // A link that leads nowhere (not in `missing`) stays refused.
+    const dangling = { ...missingDockerfile, missing: [] };
+    expect(classes(dangling)).toEqual(['protected: service db: Dockerfile db.Dockerfile (the path does not exist in the repository)']);
+    expect(composeMissingBuildPaths(dangling)).toEqual([]);
+    // A path outside of the repository never counts as missing.
+    expect(composeMissingBuildPaths(input(built('/opt/ctx'), { missing: ['/opt/ctx'] }))).toEqual([]);
   });
 });

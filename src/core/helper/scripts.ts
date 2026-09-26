@@ -394,9 +394,11 @@ process.stdout.write(JSON.stringify(found) + '\n');
  * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
  * round 2, S2-01), in place of `build.dockerfile` of the text.
  * Prints one JSON line: `null` if the configuration file does not exist, otherwise
- * `{ configText, dockerfilePath?, dockerfileText? }`. `build.dockerfile` (or the old `dockerFile`) is resolved
- * relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
- * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved.
+ * `{ configText, dockerfilePath?, dockerfileText?, dockerfileMissing? }`. `build.dockerfile` (or the old `dockerFile`) is
+ * resolved relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
+ * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved, nor a file whose
+ * link leads out of the repository (review round 3, P3-1). `dockerfileMissing: true`: the Dockerfile does not exist in
+ * the repository, and no link leads to or through its path (a missing file, not a link out).
  */
 export const READ_FILES_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -410,6 +412,33 @@ const read = (file) => {
     if (error && ['ENOENT', 'ENOTDIR', 'EISDIR'].includes(error.code)) return undefined;
     throw error;
   }
+};
+const realPath = (file) => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+};
+// Review round 3 (P3-1): as missingInRepository of COMPOSE_MODEL_SCRIPT.
+const missingInRepository = (file) => {
+  try {
+    fs.lstatSync(file);
+    return false;
+  } catch (error) {
+    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+  }
+  const rootReal = realPath(root);
+  for (let folder = path.posix.dirname(file); inside(folder); folder = path.posix.dirname(folder)) {
+    try {
+      fs.lstatSync(folder);
+    } catch {
+      continue;
+    }
+    const real = realPath(folder);
+    return rootReal !== null && real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
+  }
+  return false;
 };
 const stripJsonc = (text) => {
   let result = '';
@@ -477,6 +506,14 @@ const main = () => {
   const dockerfileFile = path.posix.resolve(path.posix.dirname(configFile), dockerfile);
   if (!inside(dockerfileFile) || dockerfileFile === root) return result;
   result.dockerfilePath = path.posix.relative(root, dockerfileFile);
+  if (missingInRepository(dockerfileFile)) {
+    result.dockerfileMissing = true;
+    return result;
+  }
+  // Review round 3 (P3-1): a link out of the repository is not read (the check refuses the Dockerfile).
+  const real = realPath(dockerfileFile);
+  const rootReal = realPath(root);
+  if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
   const dockerfileText = read(dockerfileFile);
   if (dockerfileText !== undefined) result.dockerfileText = dockerfileText;
   return result;
@@ -597,6 +634,8 @@ if (process.exitCode === undefined) {
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
  *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
  *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
+ * - `missing` (review round 3, P3-1): of the local build contexts and Dockerfiles, those in the repository folder that
+ *   do not exist, without a link that leads to or through them (a missing file of the repository, not a link out);
  * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
  *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
  *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
@@ -626,14 +665,14 @@ const realPath = (file) => {
     return null;
   }
 };
-// The paths of isHelperPath (hostAccess.ts): the root, the cache volume, the folder with the token, and every path below
-// /workspaces outside the repository, or a folder that contains one of them. (The Docker socket of isHelperPath is not
-// mounted in this run; the check refuses a Dockerfile there anyway.)
+// The paths of isHelperPath (hostAccess.ts): the root, the cache volume, the folder with the token, the folders of the
+// kernel (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one
+// of them. (The Docker socket of isHelperPath is not mounted in this run; the check refuses a Dockerfile there anyway.)
 const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
 const isHelperPath = (file) => {
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
   if (normal === '/') return true;
-  if (['/devenv-cache', '/workspaces/.devenv+'].some((helperPath) => overlaps(normal, helperPath))) return true;
+  if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
 // The folder of a local additional context (localContextPath of hostAccess.ts): the path, or the path of an OCI layout.
@@ -655,6 +694,29 @@ const sshFiles = (ssh) => {
     return text.includes('=') ? text.slice(text.indexOf('=') + 1) : undefined;
   });
   return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
+};
+// Review round 3 (P3-1): a path in the repository that does not exist, and that no link leads to or through: the path
+// itself is no link (a link that leads nowhere exists for lstat), and the nearest folder above it that exists is in the
+// repository after links.
+const missingInRepository = (file) => {
+  if (!inside(file)) return false;
+  try {
+    fs.lstatSync(file);
+    return false;
+  } catch (error) {
+    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+  }
+  const rootReal = realPath(root);
+  for (let folder = path.posix.dirname(file); inside(folder); folder = path.posix.dirname(folder)) {
+    try {
+      fs.lstatSync(folder);
+    } catch {
+      continue;
+    }
+    const real = realPath(folder);
+    return rootReal !== null && real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
+  }
+  return false;
 };
 const readDockerfile = (file) => {
   const real = realPath(file);
@@ -686,12 +748,14 @@ const main = () => {
   const model = JSON.parse(result.stdout);
   const dockerfiles = {};
   const realPaths = {};
+  const missing = [];
   for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
     if (!isObject(service)) continue;
     const build = service.build;
     if (isObject(build)) {
       const local = typeof build.context === 'string' && build.context.startsWith('/');
       if (local) realPaths[build.context] = realPath(build.context);
+      if (local && missingInRepository(build.context) && !missing.includes(build.context)) missing.push(build.context);
       // Review round 2 (S2-03): the other files and folders that the build client reads in the helper.
       for (const source of Object.values(isObject(build.additional_contexts) ? build.additional_contexts : {})) {
         const folder = localFolder(source);
@@ -708,6 +772,7 @@ const main = () => {
       } else if (local) {
         const file = path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile');
         realPaths[file] = realPath(file);
+        if (missingInRepository(file) && !missing.includes(file)) missing.push(file);
         const text = readDockerfile(file);
         if (text !== undefined) dockerfiles[name] = text;
       }
@@ -738,7 +803,7 @@ const main = () => {
     }
   }
   const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, inputsHash };
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, missing, inputsHash };
 };
 let output;
 try {

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { extractBaseImages, extractImageReferences } from './dockerfile';
+import { extractBaseImages, extractBuilderFlags, extractImageReferences } from './dockerfile';
 
 describe('extractBaseImages', () => {
   it('returns the image of a single FROM', () => {
@@ -255,5 +255,26 @@ describe('extractImageReferences (review round 2, S2-02)', () => {
   it('stops after the target stage, as extractBaseImages', () => {
     const text = ['FROM alpine AS one', 'COPY --from=devenv-1 /a /a', 'FROM debian AS two', 'COPY --from=devenv-2 /b /b'].join('\n');
     expect(refs(text, undefined, 'one')).toEqual(['FROM alpine', 'COPY --from devenv-1']);
+  });
+});
+
+describe('extractBuilderFlags (review round 3, S3-5)', () => {
+  it.each<[string, string[]]>([
+    ['--from=a /x /y', ['--from=a']],
+    ['--mount="from=a,target=/x" ls', ['--mount=from=a,target=/x']],
+    ['--mount=type=bind,"from=a" ls', ['--mount=type=bind,from=a']],
+    ["--mount='type=bind, from=a b' ls", ['--mount=type=bind, from=a b']],
+    ['--mount=type=bind,\\"from=a\\" ls', ['--mount=type=bind,"from=a"']],
+    ['--network=none --mount=from=a ls', ['--network=none', '--mount=from=a']],
+    ['--mount type=cache,from=b true', ['--mount', 'type=cache,from=b']],
+    ['-- --from=a', []],
+    ['ls --from=a', []],
+  ])('%j → %j', (line, words) => {
+    expect(extractBuilderFlags(line)).toEqual(words);
+  });
+
+  it('finds the images of quoted --mount fields', () => {
+    const text = 'FROM alpine\nRUN --mount=type=bind,\\"from=devenv-1\\",target=/x --mount="from=devenv-2, target=/y" ls\n';
+    expect(extractImageReferences(text).map((ref) => `${ref.kind} ${ref.reference}`)).toEqual(['FROM alpine', 'RUN --mount from devenv-1', 'RUN --mount from devenv-2']);
   });
 });

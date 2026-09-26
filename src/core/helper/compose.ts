@@ -158,6 +158,11 @@ export interface ComposeModelOutput {
    */
   realPaths: Record<string, string | null>;
   /**
+   * Review round 3 (P3-1): the local build contexts and Dockerfiles in the repository that do not exist, without a link
+   * that leads to or through them (a missing file of the repository, not a link out). Missing in older outputs.
+   */
+  missing?: string[];
+  /**
    * sha256 of the texts of the files that Compose read for the model (the compose files, the `.env` of the project
    * folder, the `env_file`s), computed in the helper (review round 1, P-4); `''` when the output has none.
    */
@@ -197,6 +202,7 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     model: value.model as unknown as ComposeModel,
     dockerfiles: value.dockerfiles as Record<string, string>,
     realPaths: value.realPaths as Record<string, string | null>,
+    ...(Array.isArray(value.missing) ? { missing: value.missing.filter((file): file is string => typeof file === 'string') } : {}),
     inputsHash: typeof value.inputsHash === 'string' ? value.inputsHash : '',
   };
 }

@@ -626,9 +626,16 @@ export class Controller implements vscode.Disposable {
         // listed apart, none ticked: only the ticked ones are removed, and Escape cancels the Delete.
         const serviceData = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableServiceDataVolumes(confirmed.id) : [];
         if (serviceData.length > 0) {
+          // Review round 3 (P3-4): an environment whose services are not known lists its additional volumes as possible data.
+          const possibly = await this.deps.service.possibleServiceDataVolumes(confirmed.id);
+          const placeHolder = possibly.length > 0 ? Messages.deleteServiceDataPossiblePlaceholder : Messages.deleteServiceDataPlaceholder;
           const picked = await vscode.window.showQuickPick(
-            serviceData.map((name) => ({ label: name, description: Messages.deleteServiceDataItem, picked: false })),
-            { title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder, canPickMany: true, ignoreFocusOut: true },
+            serviceData.map((name) => ({
+              label: name,
+              description: possibly.includes(name) ? Messages.deleteServiceDataPossibleItem : Messages.deleteServiceDataItem,
+              picked: false,
+            })),
+            { title: Messages.deleteServiceDataTitle, placeHolder, canPickMany: true, ignoreFocusOut: true },
           );
           if (picked === undefined) return;
           additionalVolumesToRemove = [...additionalVolumesToRemove, ...picked.map((item) => item.label)];

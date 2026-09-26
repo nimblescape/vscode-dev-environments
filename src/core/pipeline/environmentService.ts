@@ -31,7 +31,7 @@ import {
   type ComposeModelOutput,
   type ComposeRewriteParams,
 } from '../helper/compose';
-import { composeAccessReport, composeConfigurationReport, composeIgnoredProperties, composeImageReferences } from '../helper/composeAccess';
+import { composeAccessReport, composeConfigurationReport, composeIgnoredProperties, composeImageReferences, composeMissingBuildPaths } from '../helper/composeAccess';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
@@ -535,6 +535,22 @@ function sameContainerId(a: string, b: string): boolean {
   return a !== '' && b !== '' && (a.startsWith(b) || b.startsWith(a));
 }
 
+/**
+ * Whether the text of a configuration names a Dockerfile (`build.dockerfile` or the older `dockerFile`), also one that
+ * the text names with a variable. A text that is no valid JSONC names none.
+ */
+function namesDockerfile(configText: string): boolean {
+  let config: unknown;
+  try {
+    config = parseJsonc(configText);
+  } catch {
+    return false;
+  }
+  if (!isRecord(config)) return false;
+  const build = isRecord(config.build) ? config.build : {};
+  return typeof build.dockerfile === 'string' || typeof config.dockerFile === 'string';
+}
+
 function isFilesMissing(error: unknown): boolean {
   return isUserFacingError(error) && error.code === 'filesMissing';
 }
@@ -558,17 +574,19 @@ function volumeLabels(environment: Environment): Record<string, string> {
 
 /**
  * The detail of a failed `up` after a build that switched the kind of the environment (review round 2, D2-4): the
- * environment is not started with its previous kind, and what the switch removed before (`removed`, nothing else) is
- * named; the volumes are kept.
+ * environment is not started with its previous kind, and what the switch removed before (`removed`) is named; the
+ * volumes are kept. Review round 3 (P3-3): towards Docker Compose, `created` names the containers that the failed `up`
+ * created and that were removed again (removeFailedComposeContainers).
  */
-export function kindSwitchFailure(toCompose: boolean, removed: readonly string[], cause: string): string {
+export function kindSwitchFailure(toCompose: boolean, removed: readonly string[], cause: string, created: readonly string[] = []): string {
   const what = toCompose
-    ? 'The configuration now uses Docker Compose, and its containers could not be created.'
+    ? 'The configuration now uses Docker Compose, and its containers could not all be created and started.'
     : 'The configuration no longer uses Docker Compose, and its container could not be created.';
   const gone = removed.length > 0 ? `The change removed ${removed.join(', ')}.` : 'The change removed no container of the other kind.';
+  const again = created.length > 0 ? ` The containers that Docker Compose had created were removed again: ${created.join(', ')}.` : '';
   // `up --remove-existing-container` of a single container removes the dev container that it finds by the ID label.
   const cli = toCompose ? '' : ' The Dev Container CLI may have removed the previous dev container before it failed.';
-  return `${what} The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. ${gone}${cli} Nothing else was removed, and the files in the volumes are kept. ${cause}`;
+  return `${what} The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. ${gone}${again}${cli} Nothing else was removed, and the files in the volumes are kept. ${cause}`;
 }
 
 /**
@@ -1138,6 +1156,24 @@ export class EnvironmentService {
     }
 
     let outcome: ContainerOutcome | undefined;
+    // Review round 3 (D3-2): an entry without a build record (restored from its volumes, with the default configuration
+    // path) whose containers are of the other kind than the configuration: the environment switches only when the user
+    // says so (a rebuild), never by the build of a first open. The containers of Docker Compose do not name the
+    // configuration that created them (with `--id-label`, the CLI 0.89.0 sets no devcontainer.config_file).
+    if (loaded && record === undefined && container !== undefined && !ctx.forced && (ctx.composeContainer === true) !== (loaded.compose !== undefined)) {
+      this.logger.info(
+        `The containers of ${ctx.env.repository} are of another kind than the configuration ${loaded.configPath} (${loaded.compose ? 'Docker Compose' : 'a single container'}), and the environment has no build record.`,
+      );
+      const answer = await this.deps.ui.configurationChanged(ctx.env.repository);
+      this.throwIfCancelled(ctx.signal);
+      if (answer === 'rebuildNow') ctx.forced = true;
+      else {
+        this.logger.info('Rebuild later: the existing containers are started as they are.');
+        await this.saveConfiguration(ctx, loaded, record);
+        outcome = await this.startContainer(ctx, container, record, imagePresent, this.configurationOfKind(ctx, loaded, container, record));
+        return this.finish(ctx, outcome, loaded);
+      }
+    }
     if (loaded) {
       await this.saveConfiguration(ctx, loaded, record);
       // A container of an older setup is created again (concept section 9); it does not count as a working container.
@@ -1239,7 +1275,7 @@ export class EnvironmentService {
     // CLI resolves the build context and the Dockerfile, and the Dockerfile (review round 1, S1 and S4) at the path that
     // the resolved configuration names (review round 2, S2-01).
     const repository = repositoryFolder(env.repository);
-    const dockerfile = await this.resolvedDockerfile(ctx, configPath, config, files);
+    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
     const checked = await this.hostAccessInput(env, {
       config,
       merged,
@@ -1257,6 +1293,12 @@ export class EnvironmentService {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
       throw new HostAccessError(report);
     }
+    // Review round 3 (P3-1): a Dockerfile that does not exist in the repository is an error of the configuration, not a
+    // refusal: the existing environment still starts (runPipeline), and nothing is built from a file that is not checked.
+    if (dockerfile.missing !== undefined) {
+      this.logger.warn(`The Dockerfile ${dockerfile.missing} of the configuration ${configPath} of ${env.repository} does not exist.`);
+      throw new UserFacingError('buildFailed', Messages.buildFileMissing(`the Dockerfile ${dockerfile.missing}`));
+    }
     if (merged === undefined) {
       this.logger.info('The merged configuration is not known: the image metadata is checked before the container starts.');
     }
@@ -1264,7 +1306,8 @@ export class EnvironmentService {
     return {
       configPath,
       fallback,
-      configHash: configHash(files.configText, files.dockerfileText),
+      // Review round 3 (P3-2): the Dockerfile at the resolved path, as configurationChanged hashes it.
+      configHash: configHash(files.configText, dockerfile.text),
       config,
       dockerfileText: dockerfile.text,
       references: collectReferences(config, dockerfile.text),
@@ -1277,30 +1320,37 @@ export class EnvironmentService {
    * its variables (review round 2, S2-01: the text of the configuration may name it with a variable, for example
    * `${localEnv:NAME:Dockerfile}`, which READ_FILES_SCRIPT does not read): the text that readConfigFiles read when it is
    * that file, or else the file at the resolved path. `unreadable`: the configuration names a Dockerfile that could not be
-   * read (missing, outside of the repository): the check refuses it, because its images would escape the checks.
+   * read (outside of the repository, a link out of it, or a path with a variable that is not resolved): the check refuses
+   * it, because its images would escape the checks. `missing` (review round 3, P3-1): the Dockerfile does not exist in the
+   * repository (an error of the configuration, not a refusal).
    */
   private async resolvedDockerfile(
-    ctx: PipelineContext,
+    env: Environment,
     configPath: string,
     config: DevcontainerConfig,
     files: ConfigFiles,
-  ): Promise<{ text?: string; unreadable?: string }> {
+    signal: AbortSignal | undefined,
+  ): Promise<{ text?: string; unreadable?: string; missing?: string }> {
     const build: Record<string, unknown> = isRecord(config.build) ? config.build : {};
     const raw: Record<string, unknown> = config as Record<string, unknown>;
     const named = typeof build.dockerfile === 'string' ? build.dockerfile : typeof raw.dockerFile === 'string' ? raw.dockerFile : undefined;
     if (named === undefined || named.trim() === '') return files.dockerfileText !== undefined ? { text: files.dockerfileText } : {};
-    const repository = repositoryFolder(ctx.env.repository);
+    const repository = repositoryFolder(env.repository);
     const relative = path.posix.relative(repository, path.posix.resolve(repository, configurationFolder(configPath), named));
-    if (files.dockerfileText !== undefined && files.dockerfilePath === relative) return { text: files.dockerfileText };
-    await this.requireVolume(ctx.env);
+    if (files.dockerfilePath === relative) {
+      if (files.dockerfileText !== undefined) return { text: files.dockerfileText };
+      if (files.dockerfileMissing === true) return { missing: named };
+    }
+    await this.requireVolume(env);
     const read = await this.deps.helper.readConfigFiles({
-      volumeName: ctx.env.volumeName,
-      repository: ctx.env.repository,
+      volumeName: env.volumeName,
+      repository: env.repository,
       configPath,
       dockerfile: named,
-      signal: ctx.signal,
+      signal,
     });
-    return read?.dockerfileText !== undefined ? { text: read.dockerfileText } : { unreadable: named };
+    if (read?.dockerfileText !== undefined) return { text: read.dockerfileText };
+    return read?.dockerfileMissing === true ? { missing: named } : { unreadable: named };
   }
 
   /** The warnings of a configuration that the pipeline uses: `${localWorkspaceFolder}`, and variables of the computer. */
@@ -1394,6 +1444,13 @@ export class EnvironmentService {
       this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(composeReport)}`);
       throw new HostAccessError(composeReport);
     }
+    // Review round 3 (P3-1): a build context or Dockerfile that does not exist in the repository is an error of the
+    // configuration, not a refusal: the existing environment still starts (runPipeline), and nothing is built.
+    const missing = composeMissingBuildPaths({ model: output.model, missing: output.missing, repositoryFolder: repositoryFolder(env.repository) });
+    if (missing.length > 0) {
+      this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} names paths that do not exist: ${missing.join('; ')}`);
+      throw new UserFacingError('buildFailed', Messages.buildFileMissing(missing.join('; ')));
+    }
     const ignored = composeIgnoredProperties(config);
     if (ignored.length > 0) {
       this.logger.info(`The Dev Container CLI ignores ${ignored.join(', ')} of ${configPath} for Docker Compose. They are not used and not checked.`);
@@ -1460,6 +1517,7 @@ export class EnvironmentService {
       repositoryFolder: repositoryFolder(env.repository),
       engineApiVersion: compose.engineApiVersion,
       realPaths: compose.output.realPaths,
+      ...(compose.output.missing !== undefined ? { missing: compose.output.missing } : {}),
     }, compose.hostAccessChecks === 'on');
     const configuration = composeConfigurationReport(config);
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
@@ -1788,7 +1846,15 @@ export class EnvironmentService {
       const previousCompose = record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
       if ((record !== undefined || container !== undefined) && previousCompose !== (loaded.compose !== undefined)) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
-        throw new UserFacingError('startFailed', PipelineTexts.startFailed, kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error)));
+        // Review round 3 (D3-1, P3-3): the containers that the failed `up` of Docker Compose created (for example of a
+        // database) go, so that no later `up` of a single container takes one of them for its dev container (they carry
+        // the ID label). Each of them is new: the single container was removed before `up`. Their volumes stay.
+        const created = loaded.compose !== undefined ? await this.removeFailedComposeContainers(ctx) : [];
+        throw new UserFacingError(
+          'startFailed',
+          PipelineTexts.startFailed,
+          kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), created),
+        );
       }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
@@ -2230,8 +2296,16 @@ export class EnvironmentService {
     // commands have the token and the Git configuration.
     await this.prepareGit(ctx);
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
-    // of the other services have too, so they go first.
-    const leftovers = createsContainer && (ctx.composeContainer === true || composeRecordOf(env.buildRecord) !== undefined);
+    // of the other services have too, so they go first. Review round 3 (D3-1): also the containers of other services that
+    // exist without a Docker Compose dev container or record (for example after a failed switch to Docker Compose).
+    const services = (await this.environmentContainers(env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
+    if (!createsContainer && services.length > 0) {
+      // `up` without a new container would take one of them for the dev container. The caller reports it as startFailed.
+      throw new Error(
+        `Containers of other Docker Compose services of ${env.repository} exist (${services.map((container) => container.name).join(', ')}), but the configuration uses a single container: rebuild the environment.`,
+      );
+    }
+    const leftovers = createsContainer && (ctx.composeContainer === true || composeRecordOf(env.buildRecord) !== undefined || services.length > 0);
     if (leftovers) {
       this.logger.info(
         `The environment ${env.repository} was a Docker Compose environment. The container is created again for the configuration, and the containers of the other services are removed; the files in the volumes are kept.`,
@@ -2989,6 +3063,34 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 3 (D3-1, P3-3): after a failed `up` that switched a single container to Docker Compose, the containers of
+   * the project that Compose created (isComposeContainer, with the ID label of the environment or without one) are
+   * removed, and the networks of the project; their volumes stay. Never a container of another environment, and never the
+   * previous single container (it is no container of Compose). Returns the removed ones, for kindSwitchFailure; a
+   * failure is logged.
+   */
+  private async removeFailedComposeContainers(ctx: PipelineContext): Promise<string[]> {
+    const env = ctx.env;
+    const project = composeProjectName(env.id);
+    const removed: string[] = [];
+    await this.quietly('remove the containers that the failed up of Docker Compose created', async () => {
+      const containers = [...(await this.environmentContainers(env.id)), ...(await this.deps.docker.listProjectContainers(project))];
+      const seen = new Set<string>();
+      for (const container of containers) {
+        if (seen.has(container.id)) continue;
+        seen.add(container.id);
+        const owner = container.labels[LABEL_ENVIRONMENT_ID];
+        if ((owner !== undefined && owner !== env.id) || !isComposeContainer(container.labels, project)) continue;
+        this.logger.info(`The container ${container.name} that the failed start of Docker Compose created is removed. Its volumes are kept.`);
+        await this.deps.docker.removeContainer(container.id);
+        removed.push(container.labels[LABEL_COMPOSE_SERVICE] !== undefined ? `the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]}` : `the container ${container.name}`);
+      }
+    });
+    await this.quietly('remove the networks of the Docker Compose project', () => this.removeComposeNetworks(env));
+    return removed;
+  }
+
+  /**
    * The networks that Docker Compose created for the project of the environment (label com.docker.compose.project), once
    * no container of the project uses them. A network that cannot be removed is logged.
    */
@@ -3175,10 +3277,31 @@ export class EnvironmentService {
         // Review round 1 (P-4): a new version of the Compose plugin alone is no change (the next open takes it over).
         return current === undefined || composeConfigurationChange(record, current) === 'changed';
       }
-      return record.configHash !== configHash(files.configText, files.dockerfileText);
+      return record.configHash !== (await this.singleConfigurationHash(env, resolved.configPath, files, options.signal));
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }
+  }
+
+  /**
+   * Review round 3 (P3-2): configHash of a single-container configuration as loadConfiguration computes it, with the
+   * Dockerfile at the path that the resolved configuration names (resolvedDockerfile). The CLI resolves the configuration
+   * only when the text names a Dockerfile that READ_FILES_SCRIPT could not locate (for example with a variable).
+   */
+  private async singleConfigurationHash(env: Environment, configPath: string, files: ConfigFiles, signal: AbortSignal | undefined): Promise<string> {
+    if (files.dockerfilePath !== undefined || !namesDockerfile(files.configText)) return configHash(files.configText, files.dockerfileText);
+    await this.requireVolume(env);
+    const { config } = await this.deps.helper.readConfiguration({
+      volumeName: env.volumeName,
+      repository: env.repository,
+      configPath,
+      environmentId: env.id,
+      merged: false,
+      onOutput: this.output,
+      signal,
+    });
+    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, signal);
+    return configHash(files.configText, dockerfile.text);
   }
 
   /**
@@ -3618,13 +3741,22 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 3 (P3-4): of removableServiceDataVolumes, the volumes that are listed there only because the entry
+   * knows neither the volumes of its services nor its build (review round 2, D2-3): additional volumes that may hold data
+   * of services, or not (for example of a single container restored from its volumes). The question names them so.
+   */
+  async possibleServiceDataVolumes(environmentId: string): Promise<string[]> {
+    return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.possibly === true).map((volume) => volume.name);
+  }
+
+  /**
    * removableVolumes of the additional volumes of `environmentId`, each with its kind: VOLUME_KIND_COMPOSE for a volume
    * that holds data of the services of Docker Compose (review round 1, D1: classified by use, whatever its label
    * devenv.volume; a volume with `name:` in the model has the label `additional`): the label `compose`, a volume that the
    * open recorded as mounted by another service (Environment.serviceVolumes), or a volume that a container of another
    * service mounts now. Otherwise its label devenv.volume.
    */
-  private async removableVolumesByKind(environmentId: string): Promise<Array<{ name: string; kind: string | undefined }>> {
+  private async removableVolumesByKind(environmentId: string): Promise<Array<{ name: string; kind: string | undefined; possibly?: boolean }>> {
     const env = await this.deps.registry.get(environmentId);
     if (!env || (env.additionalVolumes ?? []).length === 0) return [];
     try {
@@ -3638,8 +3770,13 @@ export class EnvironmentService {
       // restored from its volumes, whose volumes an older version created without the label devenv.service-data): every
       // volume may hold the data of a service, so each goes to that question, none ticked (the conservative side).
       const unknown = env.serviceVolumes === undefined && env.buildRecord === undefined;
-      const serviceData = (name: string): boolean => unknown || services.has(name) || labels.get(name)?.[LABEL_SERVICE_DATA] === SERVICE_DATA;
-      return removable.map((name) => ({ name, kind: serviceData(name) ? VOLUME_KIND_COMPOSE : labels.get(name)?.[LABEL_VOLUME] }));
+      const known = (name: string): boolean => services.has(name) || labels.get(name)?.[LABEL_SERVICE_DATA] === SERVICE_DATA;
+      return removable.map((name) =>
+        known(name) || !unknown
+          ? { name, kind: known(name) ? VOLUME_KIND_COMPOSE : labels.get(name)?.[LABEL_VOLUME] }
+          : // Review round 3 (P3-4): perhaps data of a service, perhaps not; the question names it so.
+            { name, kind: VOLUME_KIND_COMPOSE, possibly: true },
+      );
     } catch (error) {
       this.logger.warn(`The additional volumes of ${env.repository} could not be read: ${errorMessage(error)}`);
       return [];

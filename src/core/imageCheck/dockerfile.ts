@@ -204,7 +204,8 @@ export function extractImageReferences(
       continue;
     }
     if (instruction.keyword !== 'COPY' && instruction.keyword !== 'RUN') continue;
-    const words = instruction.args.split(/\s+/).filter((word) => word !== '');
+    // Review round 3 (S3-5): the flags as BuildKit reads them, without their quotes (`--mount="from=…,target=/x"`).
+    const words = extractBuilderFlags(instruction.args);
     for (let i = 0; i < words.length && words[i].startsWith('--'); i++) {
       const word = words[i];
       const equals = word.indexOf('=');
@@ -214,7 +215,7 @@ export function extractImageReferences(
       if (value === undefined) continue;
       if (instruction.keyword === 'COPY' && flag === '--from') add(expand(value, stageLookup, escape), 'COPY --from');
       if (instruction.keyword === 'RUN' && flag === '--mount') {
-        for (const field of value.split(',')) {
+        for (const field of csvFields(value)) {
           const index = field.indexOf('=');
           if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'from') add(expand(field.slice(index + 1), stageLookup, escape), 'RUN --mount from');
         }
@@ -222,6 +223,107 @@ export function extractImageReferences(
     }
   }
   return result;
+}
+
+/**
+ * The flag words at the start of the arguments of an instruction, as `extractBuilderFlags` of BuildKit's Dockerfile
+ * parser reads them (review round 3, S3-5): words separated by white space outside quotes, single and double quotes
+ * removed (a quoted part may hold spaces), and a backslash takes the next character as it is. The words end at the first
+ * word that does not start with `--` (except the word after `--from` or `--mount` without `=`), or at `--` alone. The value of a flag is expanded afterwards (as BuildKit does).
+ */
+export function extractBuilderFlags(line: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let phase: 'spaces' | 'word' | 'quote' = 'spaces';
+  let quote = '';
+  let blankOk = false;
+  for (let pos = 0; pos <= line.length; pos++) {
+    const end = pos === line.length;
+    const char = end ? '' : line[pos];
+    if (phase === 'spaces') {
+      if (end) break;
+      if (/\s/.test(char)) continue;
+      // A value after a flag without `=` (for example `--mount type=…`): BuildKit refuses it, the check reads it anyway.
+      const previous = words.length > 0 ? words[words.length - 1].toLowerCase() : '';
+      if ((char !== '-' || line[pos + 1] !== '-') && !(previous === '--from' || previous === '--mount')) break;
+      phase = 'word';
+    }
+    if (end) {
+      if (word !== '--' && (blankOk || word !== '')) words.push(word);
+      break;
+    }
+    if (phase === 'word') {
+      if (/\s/.test(char)) {
+        if (word === '--') break;
+        if (blankOk || word !== '') words.push(word);
+        phase = 'spaces';
+        word = '';
+        blankOk = false;
+        continue;
+      }
+      if (char === "'" || char === '"') {
+        quote = char;
+        blankOk = true;
+        phase = 'quote';
+        continue;
+      }
+      if (char === '\\') {
+        if (pos + 1 === line.length) continue;
+        word += line[++pos];
+        continue;
+      }
+      word += char;
+      continue;
+    }
+    // In quotes.
+    if (char === quote) {
+      phase = 'word';
+      continue;
+    }
+    if (char === '\\') {
+      if (pos + 1 === line.length) {
+        phase = 'word';
+        continue;
+      }
+      word += line[++pos];
+      continue;
+    }
+    word += char;
+  }
+  return words;
+}
+
+/**
+ * The fields of a value that BuildKit reads as a line of CSV (the value of `RUN --mount`): separated by commas, a field
+ * in double quotes may hold commas, and `""` in it is one quote. Review round 3 (S3-5).
+ */
+function csvFields(value: string): string[] {
+  const fields: string[] = [];
+  let field = '';
+  let quoted = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (quoted) {
+      if (char === '"' && value[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        field += char;
+      }
+      continue;
+    }
+    if (char === '"') quoted = true;
+    else if (char === ',') {
+      fields.push(field);
+      field = '';
+    } else {
+      field += char;
+    }
+  }
+  fields.push(field);
+  return fields;
 }
 
 /** Splits the text into instructions: directives, comments, continuation lines, and heredoc bodies are handled here. */

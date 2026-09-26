@@ -351,7 +351,8 @@ describe('host access policy: settings that need access to the computer, and set
     expect(
       report({ runArgs: ['-v', '/Users/x:/x', '-P', '--gpus', 'all'], build: { options: ['--secret', 'id=a'] }, initializeCommand: 'x' }),
     ).toEqual({
-      hostAccess: ['initializeCommand', 'bind mount /Users/x', 'publishing all ports (-P)', '--gpus=all', 'build option --secret'],
+      // Review round 3, S3-6: changed expectation, the secret `id=a` without a source is the file `a` (a relative path).
+      hostAccess: ['initializeCommand', 'bind mount /Users/x', 'publishing all ports (-P)', '--gpus=all', 'build option --secret', 'build option --secret id=a (a relative path)'],
       unsupported: [],
     });
   });
@@ -530,7 +531,8 @@ describe('host access policy: build options', () => {
     ['entitlements', ['--allow', 'network.host'], ['build option --allow']],
     ['a build context of a folder', ['--build-context', 'src=/Users/x/src'], ['build option --build-context=src=/Users/x/src']],
     ['a build context of an OCI layout (a folder)', ['--build-context=x=oci-layout:///Users/x'], ['build option --build-context=x=oci-layout:///Users/x']],
-    ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o']],
+    // Review round 3, S3-6: changed expectation, `-o out` writes to a relative path.
+    ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o', 'build option -o out (a relative path)']],
     ['an unknown option', ['--progress=plain'], ['build option --progress']],
   ])('%s', (_name, options, expected) => {
     expect(buildOptionProblems(options)).toEqual(expected);
@@ -1069,6 +1071,12 @@ describe('isHelperPath', () => {
     ['/var/run', true],
     ['/var', true],
     ['/workspaces/api/../.devenv+', true],
+    // Review round 3 (S3-1): the folders of the kernel, whose links lead anywhere.
+    ['/proc/self/root/devenv-cache', true],
+    ['/proc', true],
+    ['/sys/fs/cgroup', true],
+    ['/dev/fd/3', true],
+    ['/device', false],
     ['/workspaces/api', false],
     ['/workspaces/api/.devcontainer', false],
     ['/opt/tools', false],

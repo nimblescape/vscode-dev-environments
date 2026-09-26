@@ -36,6 +36,11 @@ export const Messages = {
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',
   /** Docker Compose could not read the compose files of a configuration (the details have its message). */
+  /**
+   * Review round 3 (P3-1): the configuration builds from a Dockerfile or a build context that does not exist in the
+   * repository. Not a refusal: the existing environment still starts.
+   */
+  buildFileMissing: (what: string) => `The configuration names ${what}, which does not exist in the repository. Nothing was built.`,
   composeConfigurationFailed: 'The Docker Compose files of this configuration could not be read. The details show why.',
   noConfiguration: (repository: string) => `The repository ${repository} has no Dev Container configuration.`,
   configurationNotFound: (configPath: string, configurationName: string) =>
@@ -163,6 +168,14 @@ export const Messages = {
     'These volumes hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   /** D-19: the description of each volume in that list. */
   deleteServiceDataItem: 'data of the services',
+  /**
+   * Review round 3 (P3-4): the description of a volume in that list of an environment whose services are not known (for
+   * example one restored from its volumes): it may hold data of a service, or be another additional volume.
+   */
+  deleteServiceDataPossibleItem: 'additional volume (possibly data of services)',
+  /** Review round 3 (P3-4): the hint of that list when it holds such a volume. */
+  deleteServiceDataPossiblePlaceholder:
+    'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,

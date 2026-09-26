@@ -267,6 +267,9 @@ describe('Docker Compose in the CLI bundle (implementation notes, section "Docke
     // `devcontainer.` labels of the CLI are labels of containers.
     ['the metadata label of images', 'var EI="devcontainer.metadata"'],
     ['the labels of containers', 'var hg="devcontainer.local_folder",lI="devcontainer.config_file"'],
+    // Review round 3 (D3-2): with `--id-label`, the id labels replace devcontainer.local_folder and
+    // devcontainer.config_file, so the containers of the extension do not name their configuration.
+    ['the id labels replace the labels of the folder and the configuration', 'if(t)return{container:A?await Dr(e,A):await Tr(e,t),idLabels:t}'],
   ])('%s', (_name, text) => {
     expect(bundle.split(text).length - 1, text).toBe(1);
   });

@@ -365,11 +365,12 @@ const BUILD_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--platform': allowValue,
   '--pull': allowFlag,
   '--no-cache': allowFlag,
-  '--secret': refuseValue,
-  '--ssh': refuseValue,
+  // Review round 3 (S3-6): the build client reads their files in the workspace helper (buildFileProblems).
+  '--secret': { kind: 'check', check: (value) => buildSecretOptionProblems(value) },
+  '--ssh': { kind: 'check', check: (value) => buildSshOptionProblems(value) },
   '--allow': refuseValue,
-  '--output': refuseValue,
-  '-o': refuseValue,
+  '--output': { kind: 'check', check: (value) => buildOutputOptionProblems('--output', value) },
+  '-o': { kind: 'check', check: (value) => buildOutputOptionProblems('-o', value) },
   '--build-context': { kind: 'check', check: buildContextProblems },
 };
 
@@ -470,19 +471,26 @@ function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[
  * `build.context` and `build.dockerfile` (and the older `context` and `dockerFile`) of a single container, resolved as
  * the Dev Container CLI resolves them (against the folder of the configuration): a path of the workspace helper
  * (isHelperPath) stays refused whatever the switch says; the CLI builds in the helper, where the cache volume, the
- * folder with the token, and the Docker socket are mounted. `image`, and the FROM images of the Dockerfile: no image of
- * another environment, and no image ID (imageReferenceFinding).
+ * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
+ * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
+ * of the computer), and the check does not resolve its links. `image`, and the images of the Dockerfile: no image of
+ * another environment, and no image ID (imageReferenceFinding), with the build arguments and the target of `build.args`,
+ * `build.target`, and `build.options` as the CLI passes them (singleBuildArguments, review round 3, S3-2).
  */
 function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
   const problems: Problem[] = [];
   const build = isRecord(config.build) ? config.build : {};
   if (input.configFolder !== undefined && input.repositoryFolder !== undefined) {
+    const repository = input.repositoryFolder;
     const context = typeof build.context === 'string' ? build.context : typeof config.context === 'string' ? config.context : undefined;
     const dockerfile = typeof build.dockerfile === 'string' ? build.dockerfile : typeof config.dockerFile === 'string' ? config.dockerFile : undefined;
     for (const [what, value] of [['build context', context], ['Dockerfile', dockerfile]] as const) {
       if (value === undefined || value.trim() === '' || /^[a-z][a-z0-9+.-]*:\/\//i.test(value.trim())) continue;
       const resolved = path.posix.resolve(input.configFolder, value.trim());
-      if (isHelperPath(resolved, input.repositoryFolder)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+      if (isHelperPath(resolved, repository)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+      else if (what === 'build context' && resolved !== repository && !resolved.startsWith(`${repository}/`)) {
+        problems.push(guarded(`${what} ${value} (outside of the repository)`));
+      }
     }
   }
   if (typeof config.image === 'string') {
@@ -490,16 +498,40 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
     if (finding) problems.push(finding);
   }
   if (input.dockerfileText !== undefined) {
-    const args: Record<string, string> = {};
-    if (isRecord(build.args)) {
-      for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
-    }
-    const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+    const { args, target } = singleBuildArguments(build);
     problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
   } else if (input.dockerfileUnreadable !== undefined) {
     problems.push(unsupported(`Dockerfile ${input.dockerfileUnreadable} (it could not be read, so its images cannot be checked)`));
   }
   return problems;
+}
+
+/**
+ * The build arguments and the target of the build of a single container as `docker build` gets them (review round 3,
+ * S3-2): the CLI 0.89.0 passes `--target` of `build.target`, then `--build-arg` of each `build.args`, then
+ * `build.options`, and the last value of an argument or of the target wins. `--build-arg NAME` without a value takes the
+ * value of the variable NAME of the workspace helper: unresolved here, it stays `${NAME}` (a variable that the check does
+ * not resolve).
+ */
+export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
+  const args: Record<string, string> = {};
+  if (isRecord(build.args)) {
+    for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
+  }
+  let target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+  if (Array.isArray(build.options)) {
+    for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
+      if (flag.value === undefined) continue;
+      if (flag.name === '--build-arg') {
+        const equals = flag.value.indexOf('=');
+        if (equals < 0) args[flag.value] = `\${${flag.value}}`;
+        else if (equals > 0) args[flag.value.slice(0, equals)] = flag.value.slice(equals + 1);
+      } else if (flag.name === '--target') {
+        target = flag.value !== '' ? flag.value : undefined;
+      }
+    }
+  }
+  return target !== undefined ? { args, target } : { args };
 }
 
 /** An image reference of a configuration, and how an item names it (for example `FROM image`). */
@@ -511,11 +543,26 @@ export interface NamedImageReference {
 /**
  * The image references that a Dockerfile names without a variable that is not resolved (extractImageReferences), for
  * the question whether Docker takes one of them for an image ID (resolvedByImageId, review round 2, S2-05).
+ * `_target`: not used (review round 3, S3-3, see dockerfileImageFindings).
  */
-export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, target?: string): NamedImageReference[] {
-  return extractImageReferences(text, { ...args }, target !== undefined ? { target } : {})
+export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
+  return dockerfileReferences(text, args)
     .filter(({ reference }) => !reference.includes('$'))
     .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
+}
+
+/**
+ * Every image reference of the Dockerfile (extractImageReferences) of all stages, whatever the target (review round 3,
+ * S3-3: the target stage can use a later stage with `COPY --from`), and the frontend that the build argument
+ * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
+ */
+function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): Array<{ reference: string; kind: ImageReferenceKind }> {
+  const references = extractImageReferences(text, { ...args });
+  const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? args.BUILDKIT_SYNTAX.trim() : '';
+  if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
+    references.unshift({ reference: syntax, kind: 'syntax' });
+  }
+  return references;
 }
 
 /**
@@ -528,9 +575,8 @@ export function singleImageReferences(config: Readonly<Record<string, unknown>>,
   if (typeof config.image === 'string' && config.image.trim() !== '') references.push({ reference: config.image.trim(), what: 'image' });
   const build = isRecord(config.build) ? config.build : {};
   if (dockerfileText !== undefined) {
-    const args: Record<string, string> = {};
-    if (isRecord(build.args)) for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
-    const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+    // Review round 3 (S3-2): with the build arguments of `build.options`.
+    const { args, target } = singleBuildArguments(build);
     references.push(...dockerfileImageReferences(dockerfileText, args, target));
   }
   if (Array.isArray(build.options)) {
@@ -552,14 +598,17 @@ const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
 };
 
 /**
- * The images that a Dockerfile names (extractImageReferences: FROM, `COPY --from`, `RUN --mount=…,from=`, and the
- * directive `# syntax=`) that a configuration may not use (imageReferenceFinding, D-17, review round 2, S2-02). A
+ * The images that a Dockerfile names (extractImageReferences: FROM, `COPY --from`, `RUN --mount=…,from=`, the
+ * directive `# syntax=`, and the build argument BUILDKIT_SYNTAX) that a configuration may not use (imageReferenceFinding,
+ * D-17, review round 2, S2-02). The stages of the whole file count, whatever `_target` says (review round 3, S3-3). A
  * reference whose variable could not be resolved is refused when the text before its first `$` already names an image of
- * the namespace of Dev Environments (for example `devenv-$SUFFIX`); any other one cannot be told apart and is left.
+ * the namespace of Dev Environments (for example `devenv-$SUFFIX`), or when its text holds `devenv` anywhere (review
+ * round 3, S3-4: for example `devenv${TARGETVARIANT}-…`, where the variable is empty on most platforms); any other one
+ * cannot be told apart and is left.
  */
-export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, target?: string): HostAccessFinding[] {
+export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
   const findings: HostAccessFinding[] = [];
-  for (const { reference, kind } of extractImageReferences(text, { ...args }, target !== undefined ? { target } : {})) {
+  for (const { reference, kind } of dockerfileReferences(text, args)) {
     const what = DOCKERFILE_IMAGE_WHAT[kind];
     const dollar = reference.indexOf('$');
     if (dollar < 0) {
@@ -568,7 +617,7 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
       continue;
     }
     const prefix = reference.slice(0, dollar).trim();
-    if (prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) {
+    if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || /devenv/i.test(reference)) {
       findings.push({ item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' });
     }
   }
@@ -584,16 +633,23 @@ function overlaps(file: string, folder: string): boolean {
 }
 
 /**
+ * The folders of the kernel in the workspace helper (review round 3, S3-1): their links lead anywhere, for example
+ * `/proc/self/root/devenv-cache` to the cache volume, and the check does not resolve links of a single container.
+ */
+export const KERNEL_FOLDERS: readonly string[] = ['/proc', '/sys', '/dev'];
+
+/**
  * A path of the workspace helper that no build context, Dockerfile, or bind mount may name, whatever the switch of the
  * host access checks says (HostAccessClass `protected`): the root `/`; the cache volume that all environments share
- * (HELPER_CACHE_FOLDER); the folder with the token (CONFIG_FOLDER); the Docker socket; and every path below
- * WORKSPACES_ROOT that is not in the repository folder (the folder with the token, other folders of the volume). A
- * folder that contains one of them counts too (for example `/var` with the socket). `file` is absolute.
+ * (HELPER_CACHE_FOLDER); the folder with the token (CONFIG_FOLDER); the Docker socket; the folders of the kernel
+ * (KERNEL_FOLDERS, review round 3, S3-1); and every path below WORKSPACES_ROOT that is not in the repository folder (the
+ * folder with the token, other folders of the volume). A folder that contains one of them counts too (for example `/var`
+ * with the socket). `file` is absolute.
  */
 export function isHelperPath(file: string, repositoryFolder: string): boolean {
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
   if (normal === '/') return true;
-  if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET].some((helperPath) => overlaps(normal, helperPath))) return true;
+  if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET, ...KERNEL_FOLDERS].some((helperPath) => overlaps(normal, helperPath))) return true;
   const inRepository = normal === repositoryFolder || normal.startsWith(`${repositoryFolder}/`);
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }
@@ -1618,6 +1674,51 @@ function buildContextProblems(value: string): Problem[] {
   if (!folder.startsWith('/')) return [guarded(item)];
   if (isHelperPath(folder, WORKSPACES_ROOT)) return [guarded(item)];
   return [access(item)];
+}
+
+/**
+ * A file or folder of `build.options` that the build client reads or writes in the workspace helper (review round 3,
+ * S3-6, the rule of the Compose build files, review round 2, S2-03): a path of the workspace helper (isHelperPath) or a
+ * relative path (resolved against the working folder of the build in the helper, which the check does not know) stays
+ * refused whatever the switch says. Otherwise nothing: the rule of the option itself decides (the class `computer`).
+ */
+function buildFileProblems(item: string, file: string): Problem[] {
+  if (!file.startsWith('/')) return [guarded(`${item} (a relative path)`)];
+  if (isHelperPath(file, WORKSPACES_ROOT)) return [guarded(item)];
+  return [];
+}
+
+/** The `key=value` fields of a value of `docker build` (CSV, as buildx reads them), by lower-case key. */
+function optionFields(value: string): Map<string, string> {
+  const fields = new Map<string, string>();
+  for (const field of csvFields(value) ?? value.split(',')) {
+    const equals = field.indexOf('=');
+    if (equals > 0) fields.set(field.slice(0, equals).trim().toLowerCase(), field.slice(equals + 1).trim());
+  }
+  return fields;
+}
+
+/**
+ * `--secret id=…[,src=<file>|,env=<variable>]`: without `src`/`source` and `env` (and not of `type=env`), buildx reads
+ * the variable of the name `id` of the helper, or else the file `id`.
+ */
+function buildSecretOptionProblems(value: string): Problem[] {
+  const fields = optionFields(value);
+  const file = fields.get('src') ?? fields.get('source') ?? (fields.has('env') || fields.get('type') === 'env' ? undefined : fields.get('id'));
+  return [access('build option --secret'), ...(file === undefined || file === '' ? [] : buildFileProblems(`build option --secret ${value}`, file))];
+}
+
+/** `--ssh default|<id>[=<socket>|<key>[,<key>]]`: the files after `=`. */
+function buildSshOptionProblems(value: string): Problem[] {
+  const equals = value.indexOf('=');
+  const files = equals < 0 ? [] : value.slice(equals + 1).split(',').map((file) => file.trim()).filter((file) => file !== '');
+  return [access('build option --ssh'), ...files.flatMap((file) => buildFileProblems(`build option --ssh ${value}`, file))];
+}
+
+/** `--output`/`-o` `type=…,dest=<path>`, or `<path>` alone (a local export); `-` is the standard output. */
+function buildOutputOptionProblems(name: string, value: string): Problem[] {
+  const dest = value.includes('=') ? optionFields(value).get('dest') : value.trim();
+  return [access(`build option ${name}`), ...(dest === undefined || dest === '' || dest === '-' ? [] : buildFileProblems(`build option ${name} ${value}`, dest))];
 }
 
 /**

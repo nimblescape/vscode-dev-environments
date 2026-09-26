@@ -71,6 +71,11 @@ export interface ComposeAccessInput extends VolumeInput {
    * Without it, neither is checked.
    */
   dockerfiles?: Readonly<Record<string, string>>;
+  /**
+   * ComposeModelOutput.missing (review round 3, P3-1): a build context or Dockerfile in the repository that does not
+   * exist is no refusal of the policy: composeMissingBuildPaths names it for a plain error of the configuration.
+   */
+  missing?: readonly string[];
 }
 
 interface Problem {
@@ -455,11 +460,14 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   const problems: Problem[] = [];
   const context = typeof value.context === 'string' ? value.context : undefined;
   const remote = context !== undefined && isRemoteContext(context);
-  const contextProblems = context === undefined ? [access(`build context ${String(value.context)}`)] : remote ? [] : localPathProblems(`build context ${context}`, context, ctx);
+  // Review round 3 (P3-1): a missing context or Dockerfile of the repository is left to composeMissingBuildPaths.
+  const contextMissing = context !== undefined && !remote && isMissing(context, ctx);
+  const contextProblems =
+    context === undefined ? [access(`build context ${String(value.context)}`)] : remote || contextMissing ? [] : localPathProblems(`build context ${context}`, context, ctx);
   problems.push(...contextProblems);
-  if (!remote && context !== undefined && isUnset(value.dockerfile_inline)) {
+  if (!remote && !contextMissing && context !== undefined && isUnset(value.dockerfile_inline) && !isMissing(dockerfilePath(context, value), ctx)) {
     const dockerfile = typeof value.dockerfile === 'string' ? value.dockerfile : undefined;
-    const file = path.posix.resolve(context, dockerfile ?? 'Dockerfile');
+    const file = dockerfilePath(context, value);
     // The default Dockerfile of a context outside the repository is outside with it: named only when it is worse than
     // the context (a link of it to a path of the workspace helper, while the switch lifts the context).
     const contextGuarded = contextProblems.some((problem) => problem.class !== 'computer');
@@ -517,6 +525,37 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   return problems;
 }
 
+/** The Dockerfile of a local build, as the model run resolves it (absolute). */
+function dockerfilePath(context: string, build: Record<string, unknown>): string {
+  return path.posix.resolve(context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile');
+}
+
+/** Whether `file` is a missing path of the repository (ComposeAccessInput.missing, review round 3, P3-1). */
+function isMissing(file: string, ctx: ServiceContext): boolean {
+  return (ctx.input.missing ?? []).includes(file) && isRepositoryPath(file, ctx.input.repositoryFolder);
+}
+
+/**
+ * Review round 3 (P3-1): the local build contexts and Dockerfiles of the model that do not exist in the repository
+ * (ComposeAccessInput.missing), each named with its service. Not a refusal of the policy (composeAccessReport leaves
+ * them out): the pipeline reports them as an error of the configuration, which still starts the existing environment,
+ * and builds nothing. A link that leads out of the repository, or nowhere, is no missing path: the policy refuses it.
+ */
+export function composeMissingBuildPaths(input: Pick<ComposeAccessInput, 'model' | 'missing' | 'repositoryFolder'>): string[] {
+  const missing = input.missing ?? [];
+  const items: string[] = [];
+  if (missing.length === 0) return items;
+  for (const [name, service] of Object.entries(isRecord(input.model.services) ? input.model.services : {})) {
+    const build = isRecord(service) && isRecord(service.build) ? service.build : undefined;
+    const context = build !== undefined && typeof build.context === 'string' ? build.context : undefined;
+    if (build === undefined || context === undefined || isRemoteContext(context)) continue;
+    const inRepository = (file: string): boolean => missing.includes(file) && isRepositoryPath(file, input.repositoryFolder);
+    if (inRepository(context)) items.push(`service ${name}: build context ${context}`);
+    else if (isUnset(build.dockerfile_inline) && inRepository(dockerfilePath(context, build))) items.push(`service ${name}: Dockerfile ${dockerfilePath(context, build)}`);
+  }
+  return items;
+}
+
 /**
  * A file or folder that the build client reads in the workspace helper besides the context and the Dockerfile (review
  * round 2, S2-03: a local additional context, the file of a build secret, an SSH key): refused whatever the switch says
@@ -571,7 +610,9 @@ function buildSecretProblems(value: unknown, ctx: ServiceContext): Problem[] {
  * - in the repository folder (lexically): allowed, unless its real path (ComposeModelOutput.realPaths) does not exist or
  *   is outside the repository (a link out): refused whatever the switch says, because BuildKit follows the link;
  * - outside the repository: a path of the workspace helper (isHelperPath, also after links) stays refused whatever the
- *   switch says; any other one is access to the computer (lifted while the checks are off).
+ *   switch says, and so does a path whose real path is not known because it does not exist or its link leads nowhere
+ *   (review round 3, S3-1: for example a link of /proc); any other one is access to the computer (lifted while the checks
+ *   are off).
  */
 function localPathProblems(item: string, file: string, ctx: ServiceContext): Problem[] {
   const repository = ctx.input.repositoryFolder;
@@ -585,6 +626,7 @@ function localPathProblems(item: string, file: string, ctx: ServiceContext): Pro
   }
   if (!file.startsWith('/')) return [access(item)];
   if (isHelperPath(file, repository) || (typeof real === 'string' && isHelperPath(real, repository))) return [guarded(item)];
+  if (known && real === null) return [guarded(`${item} (the path does not exist)`)];
   return [access(item)];
 }
 

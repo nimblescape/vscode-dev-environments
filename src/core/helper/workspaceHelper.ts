@@ -440,7 +440,8 @@ export class WorkspaceHelper {
   /**
    * devcontainer.json and its Dockerfile (if any) from the volume. `undefined` if the configuration file does not exist.
    * `dockerfile`: the Dockerfile that the configuration names after the Dev Container CLI resolved its variables (review
-   * round 2, S2-01), read in place of the one that the text names.
+   * round 2, S2-01), read in place of the one that the text names. `dockerfileMissing` (review round 3, P3-1): the
+   * Dockerfile does not exist in the repository (READ_FILES_SCRIPT).
    */
   async readConfigFiles(p: {
     volumeName: string;
@@ -448,7 +449,7 @@ export class WorkspaceHelper {
     configPath: string;
     dockerfile?: string;
     signal?: AbortSignal;
-  }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string } | undefined> {
+  }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } | undefined> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
       docker: false,
@@ -462,9 +463,11 @@ export class WorkspaceHelper {
     if (!isRecord(value) || typeof value.configText !== 'string') {
       throw new Error('The workspace helper returned invalid configuration files.');
     }
-    const files: { configText: string; dockerfilePath?: string; dockerfileText?: string } = { configText: value.configText };
+    const files: { configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } = { configText: value.configText };
     if (typeof value.dockerfilePath === 'string') files.dockerfilePath = value.dockerfilePath;
     if (typeof value.dockerfileText === 'string') files.dockerfileText = value.dockerfileText;
+    // Review round 3 (P3-1): the Dockerfile does not exist in the repository (not a link out).
+    if (value.dockerfileMissing === true && files.dockerfileText === undefined) files.dockerfileMissing = true;
     return files;
   }
 

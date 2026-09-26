@@ -206,6 +206,7 @@ interface Harness {
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
+    possibleServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
@@ -283,6 +284,8 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
     // No volumes of a Docker Compose project, unless a test gives them (D-19).
     removableServiceDataVolumes: vi.fn(async () => []),
+    // Review round 3 (P3-4): none of an environment whose services are not known, unless a test gives them.
+    possibleServiceDataVolumes: vi.fn(async () => []),
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
@@ -1004,6 +1007,23 @@ describe('Delete', () => {
         expect.objectContaining({ canPickMany: true, title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder }),
       );
       expect(h.service.removableServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    });
+
+    it('names the volumes of an environment whose services are not known as possible data (review round 3, P3-4)', async () => {
+      h.service.possibleServiceDataVolumes.mockResolvedValueOnce([DATA[1]]);
+      await deleteWithServiceData((items) => {
+        expect(items).toEqual([
+          { label: DATA[0], description: Messages.deleteServiceDataItem, picked: false },
+          { label: DATA[1], description: Messages.deleteServiceDataPossibleItem, picked: false },
+        ]);
+        return [];
+      });
+      expect(fakeVscode.window.showQuickPick).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ placeHolder: Messages.deleteServiceDataPossiblePlaceholder }),
+      );
+      expect(h.service.possibleServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
       expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
     });
 

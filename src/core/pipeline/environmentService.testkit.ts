@@ -371,6 +371,7 @@ export interface FakeFiles {
   configText: string;
   dockerfilePath?: string;
   dockerfileText?: string;
+  dockerfileMissing?: boolean;
 }
 
 type Maybe<T> = T | undefined;
@@ -392,6 +393,11 @@ export class FakeHelper implements EnvironmentHelper {
   readConfigurationError: Maybe<Error>;
   buildError: (imageName: string) => Maybe<Error> = () => undefined;
   upError: (image: string, removeExisting: boolean) => Maybe<Error> = () => undefined;
+  /**
+   * Review round 3 (D3-1): runs when `up` of Docker Compose fails with upError after the removal of the dev container, for
+   * example to add the containers that Compose created before the failure.
+   */
+  beforeUpError: (() => void) | undefined;
   /** upError fails before the CLI removes the existing container (for example an invalid override configuration). */
   upFailsBeforeRemoval = false;
   /**
@@ -487,6 +493,11 @@ export class FakeHelper implements EnvironmentHelper {
   dockerfiles: Record<string, string> | undefined;
   /** Each `dockerfile` of readConfigFiles. */
   readonly dockerfileReads: string[] = [];
+  /**
+   * Review round 3 (P3-1): Dockerfiles (relative to the repository) that exist but cannot be read (for example a link out
+   * of the repository). Any other Dockerfile that `dockerfiles` lacks does not exist (`dockerfileMissing`).
+   */
+  unreadableDockerfiles: string[] = [];
 
   async readConfigFiles(p: { volumeName: string; configPath: string; dockerfile?: string }): Promise<FakeFiles | undefined> {
     this.mount(p.volumeName);
@@ -509,6 +520,7 @@ export class FakeHelper implements EnvironmentHelper {
           .map((entry) => [entry.dockerfilePath as string, entry.dockerfileText as string]),
       );
     if (Object.prototype.hasOwnProperty.call(known, result.dockerfilePath)) result.dockerfileText = known[result.dockerfilePath];
+    else if (!this.unreadableDockerfiles.includes(result.dockerfilePath)) result.dockerfileMissing = true;
     return result;
   }
 
@@ -679,7 +691,10 @@ export class FakeHelper implements EnvironmentHelper {
     const error = this.upError(image, p.removeExistingContainer);
     if (error && this.upFailsBeforeRemoval) throw error;
     if (existing && p.removeExistingContainer) this.docker.containers.delete(existing.id);
-    if (error) throw error;
+    if (error) {
+      this.beforeUpError?.();
+      throw error;
+    }
     // Compose creates the default network of the project.
     this.docker.networks.set(`${project}_default`, { 'com.docker.compose.project': project });
     const volumeNames = (entries: unknown): string[] =>

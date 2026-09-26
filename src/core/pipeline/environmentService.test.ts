@@ -2790,6 +2790,9 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
 
   it('refuses a configured Dockerfile that cannot be read (review round 2, S2-01)', async () => {
     h.helper.config = { build: { dockerfile: 'missing.Dockerfile' } };
+    // Review round 3, P3-1: changed setup, a Dockerfile that exists but cannot be read (for example a link out of the
+    // repository); a missing one is an error of the configuration (the tests of review round 3).
+    h.helper.unreadableDockerfiles = ['.devcontainer/missing.Dockerfile'];
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.unsupportedOptions('Dockerfile missing.Dockerfile (it could not be read, so its images cannot be checked)'));
     expect(h.helper.builds).toEqual([]);
@@ -3389,5 +3392,85 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
       expect(h.helper.ups).toEqual([]);
     });
+  });
+});
+
+describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () => {
+  const MISSING_TEXT = '{ "build": { "dockerfile": "Dockerfile" } }';
+
+  function missingDockerfile(): void {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT, dockerfilePath: '.devcontainer/Dockerfile', dockerfileMissing: true };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = {};
+  }
+
+  it.each(['running', 'stopped'] as const)('starts an existing %s container whose Dockerfile is missing in the repository (P3-1)', async (state) => {
+    await seedEnvironment(h, { container: state, record: { configHash: configHash(MISSING_TEXT) } });
+    missingDockerfile();
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toContain(Messages.buildFileMissing('the Dockerfile Dockerfile'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('ends the first open with a plain error of the configuration, not a refusal, and builds nothing (P3-1)', async () => {
+    missingDockerfile();
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(error.message).toBe(Messages.buildFileMissing('the Dockerfile Dockerfile'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('also for a Dockerfile that the resolved configuration names (P3-1)', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DF:Dockerfile}" } }' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = {};
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
+  });
+
+  it('still refuses a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped', record: { configHash: configHash(MISSING_TEXT) } });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT };
+    for (const [dockerfile, unreadable] of [
+      ['/opt/Dockerfile', []],
+      ['Dockerfile', ['.devcontainer/Dockerfile']],
+    ] as const) {
+      h.helper.config = { build: { dockerfile } };
+      h.helper.dockerfiles = {};
+      h.helper.unreadableDockerfiles = [...unreadable];
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.unsupportedOptions(`Dockerfile ${dockerfile} (it could not be read, so its images cannot be checked)`));
+    }
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('detects a change of the Dockerfile that the configuration names with a variable (P3-2)', async () => {
+    const text = '{ "build": { "dockerfile": "${localEnv:DF:Dockerfile}" } }';
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: text };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\n' };
+    await h.service.open(TARGET, options());
+    const [env] = await h.registry.list();
+    expect(env.buildRecord?.configHash).toBe(configHash(text, 'FROM alpine:3.22\n'));
+    expect(await h.service.configurationChanged(env.id, options())).toBe(false);
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.23\n' };
+    expect(await h.service.configurationChanged(env.id, options())).toBe(true);
+    // The open finds the same change.
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(env.id, options());
+    expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
+  });
+
+  it('checks the images of a Dockerfile with the build arguments and target of build.options (S3-2)', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile' };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'ARG BASE=alpine:3.22\nFROM ${BASE} AS a\nFROM devenv-7c1d2e3f:2 AS b\n' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile', args: { BASE: 'alpine:3.22' }, options: ['--build-arg', 'BASE=devenv-7c1d2e3f:1'] } };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(
+      Messages.hostAccess('FROM image devenv-7c1d2e3f:1 of another environment, FROM image devenv-7c1d2e3f:2 of another environment'),
+    );
+    expect(h.helper.builds).toEqual([]);
   });
 });

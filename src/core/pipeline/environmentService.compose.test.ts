@@ -1105,6 +1105,8 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db']);
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['shared-tools']);
+    // Review round 3 (P3-4): known by its label, so no "possibly".
+    expect(await h.service.possibleServiceDataVolumes(ENV_ID)).toEqual([]);
   });
 
   it('asks about every volume of a restored entry whose volumes have no label of the data of a service (review round 2, D2-3)', async () => {
@@ -1113,6 +1115,8 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
+    // Review round 3 (P3-4): the question names them as additional volumes that may hold data of services.
+    expect(await h.service.possibleServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
     // Once the entry has a build record (its next open), the volumes are known by their use again.
     await h.registry.updateEnvironment(ENV_ID, (entry) => {
       entry.buildRecord = { builtAt: '2026-09-24T15:40:00.000Z', environmentImage: IMAGE_1, buildNumber: 1, configPath: DEFAULT_CONFIG_PATH, configHash: HASH, images: {}, features: {} };
@@ -1162,3 +1166,131 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     });
   });
 });
+
+describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
+  const DB_LABELS = { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db', 'com.docker.compose.config-hash': 'x' };
+
+  function addDb(state: ContainerState = 'running'): ContainerInfo {
+    return h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-db-1`, state, image: DB_IMAGE, labels: { ...DB_LABELS } });
+  }
+
+  it('removes the containers that a failed up of the switch to Docker Compose created, and keeps the volumes (D3-1, P3-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    // Compose created and started the db container before the dev service failed (for example a port in use).
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain(`The containers that Docker Compose had created were removed again: the container ${PROJECT}-db-1 of the service db.`);
+    expect(error.detail).not.toContain('could not be created.');
+    expect(h.docker.log).toContain(`rm ${db?.id}`);
+    expect(dbContainer()).toBeUndefined();
+    expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
+  });
+
+  it('never takes a container of another service for the dev container of a single container (D3-1)', async () => {
+    // As after a failed switch to Docker Compose whose db container could not be removed.
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    await rejection(h.service.openEnvironment(ENV_ID, options()));
+    const db = addDb();
+    h.helper.upError = () => undefined;
+    // "Rebuild later": the single container is created again from its image; the db container goes first.
+    h.ui.configurationChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.log).toContain(`rm ${db.id}`);
+    expect(h.helper.ups.at(-1)?.image).toBe(IMAGE_1);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).not.toContain(db.id);
+    expect(result.containerName).toBe(NAME);
+    expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
+  });
+
+  it('asks for a rebuild instead of an up that would find the container of another service (D3-1)', async () => {
+    // An up-to-date single container, and a container of a service of Docker Compose with the ID label.
+    await seedEnvironment(h, { container: 'stopped' });
+    useSingle();
+    const db = addDb();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('rebuild the environment');
+    expect(h.helper.ups).toEqual([]);
+    // A rebuild removes it and creates the single container.
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+    expect(h.docker.log).toContain(`rm ${db.id}`);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).not.toContain(db.id);
+    expect(h.helper.ups.at(-1)?.removeExistingContainer).toBe(true);
+  });
+
+  it('keeps the kind of a restored environment without build record whose containers are of Docker Compose (D3-2)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${dev?.id}`);
+    expect(dbContainer()?.id).toBe(db?.id);
+    // "Rebuild now" switches, as a rebuild does.
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.log).toContain(`rm ${db?.id}`);
+  });
+
+  it('starts the existing environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    useCompose(h, {
+      ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
+      realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql`, [`${FOLDER}/db`]: `${FOLDER}/db`, [`${FOLDER}/db/Dockerfile`]: null },
+      missing: [`${FOLDER}/db/Dockerfile`],
+    });
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    const text = Messages.buildFileMissing(`service db: Dockerfile ${FOLDER}/db/Dockerfile`);
+    expect(h.ui.warnings).toContain(text);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${devContainer()?.id}`);
+    // A new environment: a plain error of the configuration, no refusal of the policy.
+    const other = createHarness({ newEnvironmentId: () => ENV_ID });
+    try {
+      useCompose(other, h.helper.composeOutput as ComposeModelOutput);
+      const error = await rejection(other.service.open(TARGET, { progress: other.progress }));
+      expect(error.code).toBe('buildFailed');
+      expect(error.message).toBe(text);
+      expect(other.helper.builds).toEqual([]);
+    } finally {
+      other.cleanup();
+    }
+  });
+
+  it('still refuses a build context or Dockerfile of the repository whose link leads nowhere or out (P3-1)', async () => {
+    useCompose(h, {
+      ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
+      realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql`, [`${FOLDER}/db`]: `${FOLDER}/db`, [`${FOLDER}/db/Dockerfile`]: null },
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(`service db: Dockerfile Dockerfile (the path does not exist in the repository)`);
+  });
+});
+
+/** The single-container configuration at the default path. */
+function useSingle(): void {
+  h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
+  h.helper.composeOutput = undefined as never;
+  h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+}
