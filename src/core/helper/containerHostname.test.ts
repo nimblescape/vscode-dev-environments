@@ -45,6 +45,8 @@ describe('the host name of the container in the override configuration', () => {
     ['--hostname of the repository', ['--hostname', 'mine']],
     ['--hostname=', ['--hostname=mine']],
     ['-h', ['-h', 'mine']],
+    ['-h in a group of short flags', ['-Ph', 'mine']],
+    ['-h in a group with its value', ['-Phmine']],
     ['--network host', ['--network', 'host']],
     ['--net=host', ['--net=host']],
     ['--network container:', ['--network', 'container:db']],
@@ -63,6 +65,8 @@ describe('the host name of the container in the override configuration', () => {
     ['-e HOSTNAME', ['-e', 'HOSTNAME=x']],
     ['--network bridge', ['--network', 'bridge']],
     ['--network none', ['--network', 'none']],
+    ['a group of short flags without -h', ['-it']],
+    ['--health-cmd', ['--health-cmd', 'true']],
     ['--network name=bridge,alias=', ['--network', 'name=bridge,alias=app']],
   ])('adds it where the repository does not decide it: %s', (_label, runArgs) => {
     expect(runArgsDecideHostname(runArgs)).toBe(false);

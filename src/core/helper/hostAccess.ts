@@ -1224,7 +1224,7 @@ export function runArgsUser(runArgs: unknown): string | undefined {
 
 /**
  * Whether `runArgs` decide the host name of the container themselves, read as Docker reads the arguments (parseFlags):
- * with `--hostname`/`-h`; with the network of another container (`--network container:<name>`, also as `--net` and in
+ * with `--hostname`/`-h` (also in a group of short flags such as `-Ph`); with the network of another container (`--network container:<name>`, also as `--net` and in
  * the long form `name=container:<name>`, networkNames) or `--uts host`, where Docker refuses a host name; or with
  * `--network host`, where the container keeps the host name of the computer. A network value that Docker would read
  * otherwise counts too (the policy refuses it). The override configuration then adds no `--hostname`.
@@ -1232,6 +1232,9 @@ export function runArgsUser(runArgs: unknown): string | undefined {
 export function runArgsDecideHostname(runArgs: readonly string[]): boolean {
   return parseFlags(runArgs, RUN_FLAGS).some((flag) => {
     if (flag.name === '--hostname' || flag.name === '-h') return true;
+    // A group of short flags that parseFlags does not split (it holds a flag with a value), for example `-Ph mine`:
+    // Docker may read an `-h` in it (the policy refuses such a group while the checks are on).
+    if (flag.rule === undefined && /^-[A-Za-z]*h/.test(flag.raw)) return true;
     if (flag.value === undefined) return false;
     if (flag.name === '--network' || flag.name === '--net') {
       const networks = networkNames(flag.value);
