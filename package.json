@@ -322,6 +322,16 @@
         "category": "Dev Environments"
       },
       {
+        "command": "devEnvironments.keepRunning",
+        "title": "Keep Running When Closed",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.stopWhenClosed",
+        "title": "Stop When Closed",
+        "category": "Dev Environments"
+      },
+      {
         "command": "devEnvironments.dockerSetup.install",
         "title": "Install Docker",
         "category": "Dev Environments"
@@ -461,6 +471,16 @@
           "group": "1_actions@4"
         },
         {
+          "command": "devEnvironments.keepRunning",
+          "when": "view == devEnvironments.repositories && viewItem =~ /;canKeepRunning(;|$)/",
+          "group": "1_actions@5"
+        },
+        {
+          "command": "devEnvironments.stopWhenClosed",
+          "when": "view == devEnvironments.repositories && viewItem =~ /;kept(;|$)/",
+          "group": "1_actions@5"
+        },
+        {
           "command": "devEnvironments.switchBranch",
           "when": "view == devEnvironments.repositories && viewItem =~ /^repository/",
           "group": "2_more@1"
@@ -501,6 +521,16 @@
           "command": "devEnvironments.startInCurrentWindow",
           "when": "viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow",
           "group": "0_start@1"
+        },
+        {
+          "command": "devEnvironments.keepRunning",
+          "when": "viewItem =~ /;canKeepRunning(;|$)/",
+          "group": "1_more@5"
+        },
+        {
+          "command": "devEnvironments.stopWhenClosed",
+          "when": "viewItem =~ /;kept(;|$)/",
+          "group": "1_more@5"
         },
         {
           "command": "devEnvironments.switchBranch",
@@ -557,7 +587,7 @@
         "devEnvLauncher.stopOnClose": {
           "type": "boolean",
           "default": true,
-          "description": "Stop the environment when no window uses it. If false, the container keeps running."
+          "description": "Stop an environment when no window uses it, after the waiting time. If false, all environments keep running. To keep only some environments running, use Keep Running When Closed in the context menu of their rows."
         },
         "devEnvLauncher.waitingTimeSeconds": {
           "type": "number",

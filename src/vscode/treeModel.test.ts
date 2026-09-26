@@ -18,6 +18,7 @@ import {
   repositoryRows,
   rootNodes,
   rowActions,
+  rowStateText,
   stateIcon,
   stateText,
   TreeTexts,
@@ -311,20 +312,21 @@ describe('buildTreeModel', () => {
       rows: rows([group]).map((entry) => [entry.label, entry.state, entry.description, entry.contextValue]),
     }));
     // Unit 10: every repository row has the flag of its host access checks (on by default: hostAccessChecked).
+    // Unit 26: every row with an environment has the flag of Keep Running When Closed (off by default: canKeepRunning).
     expect(view).toEqual([
       {
         owner: 'acme-university',
         rows: [
-          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked'],
-          ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked'],
+          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked;canKeepRunning'],
+          ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning'],
           ['infra', undefined, '', 'repository;canStart;onGitHub;hostAccessChecked'],
-          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked'],
+          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning'],
         ],
       },
       {
         owner: 'me',
         rows: [
-          ['dotfiles', 'stopped', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked'],
+          ['dotfiles', 'stopped', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning'],
           ['website', undefined, '', 'repository;canStart;onGitHub;hostAccessChecked'],
         ],
       },
@@ -388,7 +390,7 @@ describe('buildTreeModel', () => {
     expect(old.notOnGitHub).toBe(true);
     expect(old.description).toBe('dev   Stopped · 2 uncommitted · not on GitHub');
     // Unit 10: the flag of the host access checks (on by default).
-    expect(old.contextValue).toBe('repository;canStart;canDelete;canRebuild;hostAccessChecked');
+    expect(old.contextValue).toBe('repository;canStart;canDelete;canRebuild;hostAccessChecked;canKeepRunning');
     expect(old.tooltip).toContain(TreeTexts.notListedOnGitHub);
     expect(row(groups, 'lost/repo').description).toBe('main   Stopped · not on GitHub');
     expect(groups.map((group) => group.owner)).toEqual(['acme', 'lost']);
@@ -496,7 +498,7 @@ describe('buildTreeModel', () => {
     const groups = buildTreeModel(input({ discovery: undefined, environments: [environment('e1', 'acme/api')] }));
     // Unit 10: the flag of the host access checks (on by default).
     expect(rows(groups).map((entry) => [entry.repository, entry.description, entry.contextValue])).toEqual([
-      ['acme/api', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;hostAccessChecked'],
+      ['acme/api', 'main   Stopped', 'repository;canStart;canDelete;canRebuild;hostAccessChecked;canKeepRunning'],
     ]);
   });
 
@@ -1301,5 +1303,77 @@ describe('setting repositoryGroups (unit 9)', () => {
     expect(Date.now() - started).toBeLessThan(2000);
     expect(rows(groups)).toHaveLength(5000);
     expect(groups[0].children).toHaveLength(7 * 13);
+  });
+});
+
+// User decision 2026-09-26, "go with the proposal for closing": Keep Running When Closed per environment. A kept, running
+// environment shows "Running · kept"; the icon stays the one of the state (a tree item has one icon only).
+describe('Keep Running When Closed in the sidebar (unit 26)', () => {
+  it('adds " · kept" to the state text while the container runs', () => {
+    expect(rowStateText('running', true)).toBe('Running · kept');
+    expect(rowStateText('connected', true)).toBe('Connected · kept');
+    expect(rowStateText('connectedOtherWindow', true)).toBe('Connected · other window · kept');
+    for (const state of ['stopped', 'updating', 'noContainer', 'filesMissing'] as EnvironmentState[]) {
+      expect(rowStateText(state, true)).toBe(stateText(state));
+    }
+    for (const state of ['running', 'connected', 'connectedOtherWindow', 'stopped'] as EnvironmentState[]) {
+      expect(rowStateText(state, false)).toBe(stateText(state));
+    }
+  });
+
+  it('shows "Running · kept", keeps the running icon, and offers Stop When Closed instead of Keep Running When Closed', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web')]),
+        environments: [environment('e1', 'acme/api', { keepRunning: true }), environment('e2', 'acme/web')],
+        runtime: new Map<string, EnvironmentRuntime>([
+          ['e1', { container: 'running', volume: true }],
+          ['e2', { container: 'running', volume: true }],
+        ]),
+      }),
+    );
+    const api = row(groups, 'acme/api');
+    expect(api.state).toBe('running');
+    expect(api.description).toBe('main   Running · kept');
+    expect(api.tooltip.split('\n')).toEqual(expect.arrayContaining(['Running · kept', TreeTexts.kept]));
+    expect(stateIcon(api.state!)).toEqual({ id: 'play-circle', color: 'charts.green' });
+    expect(flags(api.contextValue)).toContain('kept');
+    expect(flags(api.contextValue)).not.toContain('canKeepRunning');
+
+    const web = row(groups, 'acme/web');
+    expect(web.description).toBe('main   Running');
+    expect(web.tooltip).not.toContain(TreeTexts.kept);
+    expect(flags(web.contextValue)).toContain('canKeepRunning');
+    expect(flags(web.contextValue)).not.toContain('kept');
+  });
+
+  it('shows "Connected · kept" in this window, and a stopped kept environment as "Stopped" with the tooltip line', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web')]),
+        environments: [environment('e1', 'acme/api', { keepRunning: true }), environment('e2', 'acme/web', { keepRunning: true })],
+        runtime: new Map<string, EnvironmentRuntime>([
+          ['e1', { container: 'running', volume: true }],
+          ['e2', { container: 'stopped', volume: true }],
+        ]),
+        currentEnvironmentId: 'e1',
+      }),
+    );
+    expect(row(groups, 'acme/api').description).toBe('main   Connected · kept');
+    const web = row(groups, 'acme/web');
+    // Stop keeps the flag: the row still offers Stop When Closed.
+    expect(web.description).toBe('main   Stopped');
+    expect(web.tooltip.split('\n')).toContain(TreeTexts.kept);
+    expect(flags(web.contextValue)).toContain('kept');
+  });
+
+  it('adds the flag only for a row with an environment', () => {
+    const actions = rowActions('running', repo('acme/api'));
+    expect(contextValue(actions, 'on', true)).toBe('repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;kept');
+    expect(contextValue(actions, 'on', false)).toBe('repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning');
+    expect(contextValue(rowActions(undefined, repo('acme/api')), 'on')).toBe('repository;canStart;onGitHub;hostAccessChecked');
+    // The when clauses of package.json tell the two flags apart.
+    expect(/;kept(;|$)/.test('repository;canKeepRunning')).toBe(false);
+    expect(/;canKeepRunning(;|$)/.test('repository;kept')).toBe(false);
   });
 });

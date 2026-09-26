@@ -16,6 +16,11 @@ export const ControllerTexts = {
   waitingForOtherWindow: (repository: string) => `Waiting until another window has finished changing ${repository}…`,
   // Messages.
   alreadyConnected: (repository: string) => `This window is connected to ${repository}.`,
+  // Keep Running When Closed and Stop When Closed (user decision 2026-09-26, "go with the proposal for closing").
+  keptRunning: (repository: string) =>
+    `${repository} keeps running when no window uses it. Stop it yourself when you no longer need it.`,
+  stopsWhenClosed: (repository: string) => `${repository} stops when no window uses it.`,
+  keepAllRunning: 'The setting "Stop On Close" is off, so all environments keep running when no window uses them.',
   // Stop, Rebuild, and Delete of an environment that another window uses: that window closes its connection first
   // (concept 6.2 Stop, 7.14).
   otherWindowClosesConnection: (repository: string) =>
@@ -60,6 +65,8 @@ export const ControllerTexts = {
   // Quick Picks.
   selectRepositoryToStart: 'Select a repository to open in this window',
   selectEnvironmentToStop: 'Select an environment to stop',
+  selectEnvironmentToKeepRunning: 'Select an environment to keep running when closed',
+  selectEnvironmentToStopWhenClosed: 'Select an environment to stop when closed',
   selectEnvironmentToDelete: 'Select an environment to delete',
   selectEnvironmentToRebuild: 'Select an environment to rebuild',
   selectRepositoryForBranch: 'Select a repository to switch its branch',

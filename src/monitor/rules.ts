@@ -59,6 +59,12 @@ export interface MonitorEnvironment {
   busy: boolean;
   /** The repository configuration sets `"shutdownAction": "none"`. */
   shutdownActionNone: boolean;
+  /**
+   * Keep Running When Closed (registry field `keepRunning`; user decision 2026-09-26, "go with the proposal for
+   * closing"): the monitor never stops this environment, whatever the windows, the sleep grace, or a failed stop do.
+   * Only the user's Stop or Delete stops it.
+   */
+  keepRunning: boolean;
 }
 
 /** State that the Session Monitor keeps from one tick to the next. Only `decide` creates new states. */
@@ -205,7 +211,10 @@ export interface MonitorDecision {
  * environment is still not in use after the waiting time (`settings.waitingTimeSeconds`), it is stopped. An environment
  * that is in use again loses its waiting time, so the next waiting time starts from zero.
  * `settings.stopOnClose === false` → nothing is stopped. `settings.respectShutdownActionNone` and
- * `environment.shutdownActionNone` → this environment is never stopped.
+ * `environment.shutdownActionNone` → this environment is never stopped. `environment.keepRunning` (Keep Running When
+ * Closed, user decision 2026-09-26, "go with the proposal for closing") → this environment is never stopped: it gets no
+ * waiting time, Docker is not asked for it, and a waiting time that ran is dropped, so no stop follows a sleep, a stale
+ * window, or a failed stop.
  */
 export function decide(input: DecideInput): MonitorDecision {
   const { now, settings, running } = input;
@@ -306,6 +315,8 @@ export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSecond
 function mayStop(environment: MonitorEnvironment, settings: MonitorSettings): boolean {
   // monitor.json is written by windows; anything but an explicit false keeps the default (stop).
   if (settings.stopOnClose === false) return false;
+  // Keep Running When Closed (user decision 2026-09-26, "go with the proposal for closing"): only the user stops it.
+  if (environment.keepRunning) return false;
   return !(settings.respectShutdownActionNone === true && environment.shutdownActionNone);
 }
 

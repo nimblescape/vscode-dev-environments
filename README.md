@@ -28,6 +28,7 @@ Git on your computer is not needed.
    - **Start in New Window** (context menu of a repository, and **⋯**): the same, but a new window connects. The current window keeps its environment. If another window has the environment open already, that window comes to the front; an environment is never open in two windows.
    - **Stop**: stops the container at once. Your files are kept.
    - **Delete**: removes the container and the volume with the repository, after you confirm it. If the volume has uncommitted changes, unpushed commits, or stashes, the confirmation shows them.
+   - **Keep Running When Closed** (context menu of a repository with an environment, and **⋯**): the environment keeps running when no window uses it, for example for a server or an AI agent that works on after you close the window or quit VS Code. The row then shows `Running · kept`. Only **Stop** or **Delete** stops it; after a **Stop** it is still kept. **Stop When Closed** switches back: the container stops again after the waiting time. The choice is stored with the environment and survives restarts. Both commands are also in the Command Palette, with a list of your environments.
    - **⋯**: Switch Branch…, Select Configuration… (only for repositories with several configurations), Rebuild, and Show on GitHub.
 4. To go to another environment, use **Dev Environments: Switch Environment…** (`Ctrl+Alt+E`, on macOS `Cmd+Alt+E`), or select the status bar item. The same window connects to the other environment. **Dev Environments: Switch Environment in New Window…** opens the selected environment in a new window.
 
@@ -55,7 +56,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 |---|---|---|
 | `devEnvLauncher.reopenLastOnStartup` | `true` | Open the last used environment when VS Code starts. |
 | `devEnvLauncher.openInNewWindow` | `false` | If `true`, **Start** and **Switch Environment…** open the environment in a new window, and the current window keeps its environment. The context menu then offers **Start in Current Window**, and the Command Palette **Switch Environment in Current Window…**. From an empty window, **Start** uses that window. Only the user settings count. |
-| `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it. If `false`, the container keeps running. |
+| `devEnvLauncher.stopOnClose` | `true` | Stop an environment when no window uses it (window closed, VS Code quit, or **Close Remote Connection**), after the waiting time. If `false`, all environments keep running. To keep only some environments running, use **Keep Running When Closed** on them. |
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time in seconds before a stop. It prevents a stop during a window reload. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection. |
 | `devEnvLauncher.respectShutdownActionNone` | `false` | If `true`, a repository with `"shutdownAction": "none"` keeps its container running after close. |

@@ -42,7 +42,7 @@ function settings(overrides: Partial<MonitorSettings> = {}): MonitorSettings {
 }
 
 function env(id: string, overrides: Partial<MonitorEnvironment> = {}): MonitorEnvironment {
-  return { id, busy: false, shutdownActionNone: false, ...overrides };
+  return { id, busy: false, shutdownActionNone: false, keepRunning: false, ...overrides };
 }
 
 function win(
@@ -703,6 +703,83 @@ describe('rule 2 details', () => {
     const ignored = run(false);
     expect(ignored.stopTimes('A')).toHaveLength(1);
     expect(ignored.stopTimes('B')).toHaveLength(1);
+  });
+
+  // User decision 2026-09-26, "go with the proposal for closing": Keep Running When Closed is the opt-out per environment.
+  // The Session Monitor never stops a kept environment; only the user's Stop or Delete does.
+  describe('Keep Running When Closed (keepRunning)', () => {
+    it('does not stop a kept environment when no window is left, and stops the others after the waiting time', () => {
+      const sim = new Sim().environment('A', { keepRunning: true }).environment('B').openWindow('w1', 'A').openWindow('w2', 'B').start();
+      const closedAt = sim.now;
+      sim.closeWindow('w1').endProcess('w1').closeWindow('w2').endProcess('w2');
+      sim.run(30 * 60_000);
+      expect(sim.stopTimes('A')).toEqual([]);
+      expectStoppedOnceAfterWaitingTime(sim, 'B', closedAt + TICK_MS);
+      expect(sim.state.idleSince).toEqual({});
+      // Docker is never asked for a kept environment, and the monitor ends although its container runs.
+      expect(sim.containers.has('A')).toBe(true);
+      expect(sim.exitAt).toBeDefined();
+    });
+
+    it('does not stop a kept environment after computer sleep, also when its window does not write again', () => {
+      const sim = new Sim().environment('A', { keepRunning: true }).openWindow('w1', 'A').start();
+      sim.hang('w1');
+      sim.sleep(8 * 3_600_000);
+      sim.run(SLEEP_GRACE_MS + 10 * 60_000);
+      expect(sim.stops).toEqual([]);
+      // The same after a sleep while no window was open at all (VS Code quit).
+      const quit = new Sim().environment('A', { keepRunning: true }).openWindow('w1', 'A').start();
+      quit.closeWindow('w1').endProcess('w1');
+      quit.run(10_000);
+      quit.sleep(3_600_000);
+      quit.run(10 * 60_000);
+      expect(quit.stops).toEqual([]);
+    });
+
+    it('does not stop a kept environment whose window hangs (a stale status file)', () => {
+      const sim = new Sim().environment('A', { keepRunning: true }).openWindow('w1', 'A').start();
+      sim.hang('w1');
+      sim.run(10 * 60_000);
+      expect(sim.stops).toEqual([]);
+    });
+
+    it('drops a running waiting time and a failing stop when the environment becomes kept', () => {
+      const sim = new Sim().environment('A');
+      sim.stopFails = true;
+      sim.start();
+      expect(sim.stopTimes('A').length).toBeGreaterThan(0);
+      expect(sim.state.idleSince.A).toBeDefined();
+      const before = sim.stops.length;
+      sim.environments.set('A', env('A', { keepRunning: true }));
+      sim.run(5 * 60_000);
+      expect(sim.stops).toHaveLength(before);
+      expect(sim.state.idleSince).toEqual({});
+    });
+
+    it('stops a kept environment again after the switch is turned off (Stop When Closed)', () => {
+      const sim = new Sim().environment('A', { keepRunning: true }).start();
+      expect(sim.stops).toEqual([]);
+      sim.environments.set('A', env('A'));
+      const releasedAt = sim.now;
+      sim.run(60_000);
+      const times = sim.stopTimes('A');
+      expect(times).toHaveLength(1);
+      expect(times[0]).toBeGreaterThanOrEqual(releasedAt + 30_000);
+      expect(times[0]).toBeLessThanOrEqual(releasedAt + 30_000 + 2 * TICK_MS);
+    });
+
+    it('is not needed from Docker, and stopOnClose = false still keeps all environments', () => {
+      const now = T0 + 60_000;
+      const base = {
+        now,
+        environments: [env('kept', { keepRunning: true }), env('idle')],
+        windows: [],
+        pendings: [],
+        state: runningState(now - TICK_MS),
+      };
+      expect(containerStatesNeeded({ ...base, settings: settings() })).toEqual(['idle']);
+      expect(containerStatesNeeded({ ...base, settings: settings({ stopOnClose: false }) })).toEqual([]);
+    });
   });
 
   it('stops an environment with a busy mark of an ended process (passed as busy = false)', () => {
