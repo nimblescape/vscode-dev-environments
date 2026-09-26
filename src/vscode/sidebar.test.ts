@@ -88,8 +88,8 @@ interface Harness {
   sidebar: Sidebar;
   models: OwnerGroup[][];
   signedInFlags: boolean[];
-  dockerMissingFlags: boolean[];
-  dockerMissing: { value: boolean };
+  /** The Docker setup is required (the view gets an empty model). */
+  setupRequired: { value: boolean };
   coordinator: { environmentId: string | null; otherActiveWindows: ReturnType<typeof vi.fn<() => Promise<WindowStatus[]>>> };
   service: { inspectStates: ReturnType<typeof vi.fn>; currentBranch: ReturnType<typeof vi.fn> };
   docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn> };
@@ -115,14 +115,12 @@ function createHarness(): Harness {
   const registry = new EnvironmentRegistry(paths, clock);
   const sessionFiles = new SessionFiles(paths, clock);
   const models: OwnerGroup[][] = [];
-  const dockerMissing = { value: false };
+  const setupRequired = { value: false };
   const signedInFlags: boolean[] = [];
-  const dockerMissingFlags: boolean[] = [];
   const tree = {
-    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean; dockerMissing?: boolean }) => {
+    setModel: (groups: OwnerGroup[], options: { signedIn?: boolean }) => {
       models.push(groups);
       signedInFlags.push(options.signedIn ?? true);
-      dockerMissingFlags.push(options.dockerMissing ?? false);
     },
     getModel: () => models[models.length - 1] ?? [],
   };
@@ -163,7 +161,7 @@ function createHarness(): Harness {
     auth,
     tree,
     settings: () => settings,
-    dockerMissing: () => dockerMissing.value,
+    dockerSetupRequired: () => setupRequired.value,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
@@ -174,8 +172,7 @@ function createHarness(): Harness {
     sidebar,
     models,
     signedInFlags,
-    dockerMissingFlags,
-    dockerMissing,
+    setupRequired,
     coordinator,
     service,
     docker,
@@ -217,11 +214,26 @@ function rowOf(repository: string): RepositoryRow {
 }
 
 describe('Sidebar', () => {
-  it('passes the Docker state to the view at each render, without asking Docker', async () => {
+  // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+  // shall not be shown, instead, the side view shall show the install docker wizard".
+  it('gives the view an empty model while the Docker setup is required, and the full model once Docker is found', async () => {
+    h.setupRequired.value = true;
+    await signedIn();
     await h.sidebar.render();
-    h.dockerMissing.value = true;
+    // The discovery ran in the background, but the view has no rows at all: VS Code shows the welcome view.
+    expect(h.discovery.refresh).toHaveBeenCalled();
+    expect(h.models.length).toBeGreaterThan(0);
+    expect(h.models.every((groups) => groups.length === 0)).toBe(true);
+    // The Command Palette (switcher) still gets the repositories.
+    expect(repositoryRows(h.sidebar.model()).map((row) => row.repository)).toEqual(['acme/api']);
+    // Docker is found: DockerSetup calls render (onDidChangeInstalled), and the list appears at once.
+    h.setupRequired.value = false;
     await h.sidebar.render();
-    expect(h.dockerMissingFlags).toEqual([false, true]);
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    // Lost again: the view is empty again.
+    h.setupRequired.value = true;
+    await h.sidebar.render();
+    expect(h.models[h.models.length - 1]).toEqual([]);
     expect(h.docker.isRunning).not.toHaveBeenCalled();
     expect(h.docker.isInstalled).not.toHaveBeenCalled();
   });

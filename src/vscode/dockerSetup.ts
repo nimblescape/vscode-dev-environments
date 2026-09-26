@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view, the Docker row, and the
+// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view (the setup in the sidebar), the
 // walkthrough "Set up Docker for Dev Environments", and the commands of the walkthrough. Nothing runs hidden: after a
 // modal confirmation that lists the exact commands, they run in a visible terminal, or the installer of Docker Desktop is
 // downloaded from desktop.docker.com with a progress notification and opened. The rules are pure functions in
@@ -24,6 +24,9 @@ import {
   WSL_INSTALL_COMMAND,
   brewCaskroomFolder,
   changedContextValues,
+  dockerContextValues,
+  dockerSetupRequired,
+  type DockerContextKey,
   hardwareArch,
   installConfirmation,
   installPlan,
@@ -90,8 +93,10 @@ export interface DockerSetupDeps {
   showLog: () => void;
   platform: NodeJS.Platform;
   env: NodeJS.ProcessEnv;
-  /** The CLI was found or lost: the sidebar shows or hides the Docker row. */
+  /** The CLI was found or lost: the sidebar shows the repositories or the Docker setup (`setupRequired`). */
   onDidChangeInstalled: () => void;
+  /** True when a remote Docker host is configured: a missing local CLI then needs no setup (see `dockerSetupRequired`). */
+  remoteDockerHostConfigured: () => boolean;
   /** For tests. Default: `readInstallPlanInput` (this computer). */
   planInput?: () => Promise<InstallPlanInput>;
   /** For tests. Default: the folder Downloads of the home folder. */
@@ -206,8 +211,8 @@ async function hasDockerAptSource(): Promise<boolean> {
 export class DockerSetup implements vscode.Disposable {
   private readonly clock: Clock;
   private state: DockerSetupState = INITIAL_DOCKER_SETUP_STATE;
-  /** The state that the context keys show; `undefined` until they were set once. */
-  private shown: DockerSetupState | undefined;
+  /** The values that the context keys show; `undefined` until they were set once. */
+  private shown: Record<DockerContextKey, boolean> | undefined;
   private missingTimer: NodeJS.Timeout | undefined;
   private watchTimer: NodeJS.Timeout | undefined;
   private watchStartedAt = 0;
@@ -221,6 +226,15 @@ export class DockerSetup implements vscode.Disposable {
   /** True while no Docker CLI is found. */
   get dockerMissing(): boolean {
     return !this.state.cliFound;
+  }
+
+  /**
+   * True while the sidebar shows the Docker setup instead of the repositories (`dockerSetupRequired`; user decision
+   * 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories shall not be
+   * shown, instead, the side view shall show the install docker wizard").
+   */
+  get setupRequired(): boolean {
+    return dockerSetupRequired(this.dockerMissing, this.deps.remoteDockerHostConfigured());
   }
 
   /** Sets the context keys; while the CLI is missing, it is looked up again every 10 seconds. No `docker info`. */
@@ -533,13 +547,14 @@ export class DockerSetup implements vscode.Disposable {
     const before = this.state;
     const first = this.shown === undefined;
     this.state = nextDockerSetupState(before, event);
-    for (const [key, value] of changedContextValues(this.shown, this.state)) {
+    const values = dockerContextValues(this.state, this.deps.remoteDockerHostConfigured());
+    for (const [key, value] of changedContextValues(this.shown, values)) {
       vscode.commands.executeCommand('setContext', key, value).then(undefined, (error: unknown) => {
         this.deps.logger.warn(`Could not set the context key ${key}: ${errorMessage(error)}`);
       });
     }
-    this.shown = this.state;
-    // The first check only sets the keys: the sidebar reads `dockerMissing` when it renders.
+    this.shown = values;
+    // The first check only sets the keys: the sidebar reads `setupRequired` when it renders.
     if (!first && before.cliFound !== this.state.cliFound) {
       this.deps.logger.info(this.state.cliFound ? 'The Docker CLI was found.' : 'The Docker CLI was not found.');
       this.deps.onDidChangeInstalled();

@@ -6,10 +6,12 @@
 // computer, the confirmation before anything runs, and the context keys of the setup walkthrough. Pure functions; the
 // VS Code side (terminal, download, walkthrough) is in src/vscode/dockerSetup.ts.
 
-/** Context keys of the welcome view, the sidebar row, and the walkthrough steps (package.json). */
+/** Context keys of the welcome view and the walkthrough steps (package.json). */
 export const DockerContextKeys = {
   /** No Docker CLI was found. */
   missing: 'devEnvironments.dockerMissing',
+  /** `dockerSetupRequired`: the sidebar shows the Docker setup instead of the repositories (welcome view). */
+  setupRequired: 'devEnvironments.dockerSetupRequired',
   /** A Docker CLI was found (the opposite of `missing`; walkthrough step "Install Docker"). */
   installed: 'devEnvironments.dockerInstalled',
   /** The last `docker info` succeeded (walkthrough step "Start Docker"). */
@@ -540,24 +542,33 @@ export function nextDockerSetupState(state: DockerSetupState, event: DockerSetup
   }
 }
 
+/**
+ * True while the sidebar shows the Docker setup instead of the repositories. User decision 2026-09-26: "when no remote
+ * docker is configured and local docker is not available, the repositories shall not be shown, instead, the side view
+ * shall show the install docker wizard". Local Docker is not available when no Docker CLI is found (`dockerMissing`).
+ * Docker that is installed but does not run is available: the extension starts it when it is needed (FR-14).
+ */
+export function dockerSetupRequired(dockerMissing: boolean, remoteDockerHostConfigured: boolean): boolean {
+  return dockerMissing && !remoteDockerHostConfigured;
+}
+
 /** Values of the context keys of a state. */
-export function dockerContextValues(state: DockerSetupState): Record<DockerContextKey, boolean> {
+export function dockerContextValues(state: DockerSetupState, remoteDockerHostConfigured: boolean): Record<DockerContextKey, boolean> {
   return {
     [DockerContextKeys.missing]: !state.cliFound,
     [DockerContextKeys.installed]: state.cliFound,
     [DockerContextKeys.ready]: state.cliFound && state.engineRunning,
     [DockerContextKeys.wslReady]: state.wslReady,
+    [DockerContextKeys.setupRequired]: dockerSetupRequired(!state.cliFound, remoteDockerHostConfigured),
   };
 }
 
 /** The context keys that change from `before` to `after` (all keys when `before` is undefined: nothing was set yet). */
 export function changedContextValues(
-  before: DockerSetupState | undefined,
-  after: DockerSetupState,
+  before: Readonly<Record<DockerContextKey, boolean>> | undefined,
+  after: Readonly<Record<DockerContextKey, boolean>>,
 ): Array<[DockerContextKey, boolean]> {
-  const next = dockerContextValues(after);
-  const previous = before ? dockerContextValues(before) : undefined;
-  return (Object.keys(next) as DockerContextKey[]).filter((key) => previous?.[key] !== next[key]).map((key) => [key, next[key]]);
+  return (Object.keys(after) as DockerContextKey[]).filter((key) => before?.[key] !== after[key]).map((key) => [key, after[key]]);
 }
 
 /** True while the CLI is looked up every 10 s: only while it is missing. */

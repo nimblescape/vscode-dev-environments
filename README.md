@@ -21,7 +21,7 @@ Git on your computer is not needed.
 
 ## How to use it
 
-1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, select **Install Docker…** (see [Installing Docker](#installing-docker)).
+1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, the view shows the steps to set it up instead of the repositories (see [Installing Docker](#installing-docker)).
 2. Select **Sign in with GitHub**. The list shows your repositories with a Dev Container configuration, grouped by owner.
 3. Use the actions of a repository:
    - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window.
@@ -37,7 +37,7 @@ The first load of the list can take some time with many repositories; the view s
 
 ## Installing Docker
 
-When Docker is not installed, the view shows **Install Docker…** above the sign-in. It opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
+When Docker is not installed, the view shows no repositories, but the steps to set Docker up, each with its button: on Windows **Install WSL 2**, then **Install Docker**. After the installation, your repositories appear in the view, and Docker is started when it is needed. **Open the Setup Guide** opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
 
 1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards).
 2. **Install Docker**:

@@ -459,21 +459,18 @@ describe('buildTreeModel', () => {
       expect(rootNodes([], false)).toEqual([]);
     });
 
-    it('adds the Docker row first, above the sign-in row, when no Docker CLI is found and the view is not empty', () => {
+    // Replaces the tests of the Docker row. User decision 2026-09-26: "when no remote docker is configured and local
+    // docker is not available, the repositories shall not be shown, instead, the side view shall show the install docker
+    // wizard". The sidebar passes an empty model then (sidebar.test.ts), so the view shows the welcome view with the setup
+    // (package.json, controller.test.ts); the rows never contain a Docker row, not even above a list.
+    it('never adds a Docker row: the Docker setup is the welcome view of the empty view', () => {
       const groups = buildTreeModel(input({ signedIn: false, environments: [environment('e1', 'acme/api')] }));
-      const docker = { kind: 'installDocker', id: 'installDocker', label: TreeTexts.installDocker, tooltip: TreeTexts.installDockerTooltip };
       const signIn = { kind: 'signIn', id: 'signIn', label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip };
-      expect(rootNodes(groups, false, true)).toEqual([docker, signIn, ...groups]);
-      expect(rootNodes(groups, true, true)).toEqual([docker, ...groups]);
-      expect(rootNodes(groups, true, false)).toEqual(groups);
-      // The welcome view shows the Install Docker button in an empty view.
-      expect(rootNodes([], false, true)).toEqual([]);
-      expect(rootNodes([], true, true)).toEqual([]);
-    });
-
-    it('uses the title of the command and the text of the welcome view for the Docker row', () => {
-      expect(TreeTexts.installDocker).toBe('Install Docker…');
-      expect(TreeTexts.installDockerTooltip).toBe('Dev Environments runs your environments in Docker, which is not installed on this computer.');
+      expect(rootNodes(groups, false)).toEqual([signIn, ...groups]);
+      expect(rootNodes(groups, true)).toEqual(groups);
+      expect(rootNodes([], false)).toEqual([]);
+      expect(rootNodes([], true)).toEqual([]);
+      expect(Object.keys(TreeTexts)).not.toContain('installDocker');
     });
   });
 

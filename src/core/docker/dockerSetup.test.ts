@@ -17,6 +17,7 @@ import {
   changedContextValues,
   dockerContextValues,
   dockerDesktopDownloadUrl,
+  dockerSetupRequired,
   hardwareArch,
   installConfirmation,
   installPlan,
@@ -558,43 +559,72 @@ describe('context keys', () => {
   });
 
   it.each<[DockerSetupState, Record<string, boolean>]>([
-    [state(false, false), { missing: true, installed: false, ready: false, wslReady: false }],
-    [state(true, false), { missing: false, installed: true, ready: false, wslReady: false }],
-    [state(true, true, true), { missing: false, installed: true, ready: true, wslReady: true }],
+    [state(false, false), { missing: true, installed: false, ready: false, wslReady: false, setupRequired: true }],
+    [state(true, false), { missing: false, installed: true, ready: false, wslReady: false, setupRequired: false }],
+    [state(true, true, true), { missing: false, installed: true, ready: true, wslReady: true, setupRequired: false }],
     // Never ready without a CLI, also for an inconsistent state.
-    [state(false, true), { missing: true, installed: false, ready: false, wslReady: false }],
+    [state(false, true), { missing: true, installed: false, ready: false, wslReady: false, setupRequired: true }],
   ])('values of %j', (value, expected) => {
-    const values = dockerContextValues(value);
+    const values = dockerContextValues(value, false);
     expect({
       missing: values[DockerContextKeys.missing],
       installed: values[DockerContextKeys.installed],
       ready: values[DockerContextKeys.ready],
       wslReady: values[DockerContextKeys.wslReady],
+      setupRequired: values[DockerContextKeys.setupRequired],
     }).toEqual(expected);
   });
 
+  it('does not require the setup without a CLI when a remote Docker host is configured', () => {
+    expect(dockerContextValues(state(false, false), true)[DockerContextKeys.setupRequired]).toBe(false);
+    expect(dockerContextValues(state(false, false), true)[DockerContextKeys.missing]).toBe(true);
+  });
+
   it('sets every key the first time, then only the keys that change', () => {
-    expect(changedContextValues(undefined, INITIAL_DOCKER_SETUP_STATE)).toEqual([
+    const values = (value: DockerSetupState) => dockerContextValues(value, false);
+    expect(changedContextValues(undefined, values(INITIAL_DOCKER_SETUP_STATE))).toEqual([
       [DockerContextKeys.missing, true],
       [DockerContextKeys.installed, false],
       [DockerContextKeys.ready, false],
       [DockerContextKeys.wslReady, false],
+      [DockerContextKeys.setupRequired, true],
     ]);
-    expect(changedContextValues(state(false, false), state(false, false))).toEqual([]);
-    expect(changedContextValues(state(false, false), state(true, false))).toEqual([
+    expect(changedContextValues(values(state(false, false)), values(state(false, false)))).toEqual([]);
+    expect(changedContextValues(values(state(false, false)), values(state(true, false)))).toEqual([
       [DockerContextKeys.missing, false],
       [DockerContextKeys.installed, true],
+      [DockerContextKeys.setupRequired, false],
     ]);
-    expect(changedContextValues(state(true, false), state(true, true))).toEqual([[DockerContextKeys.ready, true]]);
+    expect(changedContextValues(values(state(true, false)), values(state(true, true)))).toEqual([[DockerContextKeys.ready, true]]);
   });
 
   it('uses the key names of package.json', () => {
     expect(DockerContextKeys).toEqual({
       missing: 'devEnvironments.dockerMissing',
+      setupRequired: 'devEnvironments.dockerSetupRequired',
       installed: 'devEnvironments.dockerInstalled',
       ready: 'devEnvironments.dockerReady',
       wslReady: 'devEnvironments.wslReady',
     });
+  });
+});
+
+describe('dockerSetupRequired', () => {
+  // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+  // shall not be shown, instead, the side view shall show the install docker wizard".
+  it.each<[boolean, boolean, boolean]>([
+    // [no Docker CLI found, remote Docker host configured, setup required]
+    [true, false, true],
+    [true, true, false],
+    [false, false, false],
+    [false, true, false],
+  ])('dockerMissing %s, remote host %s: %s', (dockerMissing, remote, expected) => {
+    expect(dockerSetupRequired(dockerMissing, remote)).toBe(expected);
+  });
+
+  it('does not require the setup when Docker is installed but does not run (it is started when needed, FR-14)', () => {
+    const installedNotRunning: DockerSetupState = { cliFound: true, engineRunning: false, wslReady: false };
+    expect(dockerContextValues(installedNotRunning, false)[DockerContextKeys.setupRequired]).toBe(false);
   });
 });
 

@@ -11,7 +11,6 @@ import {
   stateIcon,
   type GroupNode,
   type HintRow,
-  type InstallDockerRow,
   type OwnerGroup,
   type RepositoryRow,
   type SignInRow,
@@ -20,12 +19,10 @@ import {
 export const REPOSITORIES_VIEW_ID = 'devEnvironments.repositories';
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
-export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | InstallDockerRow;
+export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow;
 
 /** Command of the sign-in row (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
-/** Command of the Docker row (package.json). */
-const INSTALL_DOCKER_COMMAND = 'devEnvironments.installDocker';
 
 export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNode>, vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
@@ -39,11 +36,11 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
 
   /**
    * Replaces the model and refreshes the view. `signedIn: false` adds the sign-in row at the top when the view is not
-   * empty, `dockerMissing: true` the Docker row above it (see `rootNodes`). Default: signed in, Docker found.
+   * empty (see `rootNodes`). Default: signed in. While the Docker setup is required, the sidebar passes an empty model.
    */
-  setModel(groups: OwnerGroup[], options: { signedIn?: boolean; dockerMissing?: boolean } = {}): void {
+  setModel(groups: OwnerGroup[], options: { signedIn?: boolean } = {}): void {
     this.groups = groups;
-    this.roots = rootNodes(groups, options.signedIn ?? true, options.dockerMissing ?? false);
+    this.roots = rootNodes(groups, options.signedIn ?? true);
     this.parents.clear();
     // The nodes of the setting repositoryGroups nest the rows: every parent is recorded, so reveal finds each row.
     const record = (parent: OwnerGroup | GroupNode): void => {
@@ -74,8 +71,6 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
           return hintItem(node);
         case 'signIn':
           return signInItem(node);
-        case 'installDocker':
-          return installDockerItem(node);
       }
     } catch (error) {
       this.logger.error('Could not show a row of the sidebar.', error);
@@ -89,7 +84,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   }
 
   getParent(node: TreeNode): TreeNode | undefined {
-    return node.kind === 'owner' || node.kind === 'signIn' || node.kind === 'installDocker' ? undefined : this.parents.get(node.id);
+    return node.kind === 'owner' || node.kind === 'signIn' ? undefined : this.parents.get(node.id);
   }
 
   dispose(): void {
@@ -140,16 +135,6 @@ function signInItem(row: SignInRow): vscode.TreeItem {
   item.contextValue = 'signIn';
   item.iconPath = new vscode.ThemeIcon('account');
   item.command = { command: SIGN_IN_COMMAND, title: row.label };
-  return item;
-}
-
-function installDockerItem(row: InstallDockerRow): vscode.TreeItem {
-  const item = new vscode.TreeItem(row.label, vscode.TreeItemCollapsibleState.None);
-  item.id = row.id;
-  item.tooltip = row.tooltip;
-  item.contextValue = 'installDocker';
-  item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
-  item.command = { command: INSTALL_DOCKER_COMMAND, title: row.label };
   return item;
 }
 

@@ -119,26 +119,21 @@ describe('RepositoriesTreeProvider', () => {
     provider.dispose();
   });
 
-  it('shows the Docker row with a warning first when no Docker CLI is found and the view lists environments', () => {
+  // Replaces the test of the Docker row. User decision 2026-09-26: "when no remote docker is configured and local docker
+  // is not available, the repositories shall not be shown, instead, the side view shall show the install docker wizard".
+  // The sidebar passes an empty model while the setup is required (sidebar.test.ts): the view has no rows at all, so
+  // VS Code shows the welcome view with the setup; with a list, the view shows no Docker row.
+  it('shows no rows for the empty model of the Docker setup, and no Docker row above a list', () => {
     const provider = new RepositoriesTreeProvider(silentLogger);
-    const groups = model();
-    provider.setModel(groups, { signedIn: false, dockerMissing: true });
-    const [first, second, ...rest] = provider.getChildren();
-    expect(first).toMatchObject({ kind: 'installDocker', id: 'installDocker' });
-    expect(second).toMatchObject({ kind: 'signIn', id: 'signIn' });
-    expect(rest).toEqual(groups);
-    const item = provider.getTreeItem(first) as unknown as TreeItem;
-    expect(item).toMatchObject({ label: 'Install Docker…', id: 'installDocker', contextValue: 'installDocker' });
-    expect(item.tooltip).toBe('Dev Environments runs your environments in Docker, which is not installed on this computer.');
-    expect(item.command).toMatchObject({ command: 'devEnvironments.installDocker' });
-    expect(item.iconPath).toMatchObject({ id: 'warning', color: { id: 'list.warningForeground' } });
-    expect(provider.getParent(first)).toBeUndefined();
-    expect(provider.getChildren(first)).toEqual([]);
-    expect(provider.getModel()).toEqual(groups);
-    provider.setModel(groups, { signedIn: true, dockerMissing: false });
-    expect(provider.getChildren()).toEqual(groups);
-    provider.setModel([], { signedIn: true, dockerMissing: true });
+    provider.setModel([], { signedIn: false });
     expect(provider.getChildren()).toEqual([]);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false });
+    const [first, ...rest] = provider.getChildren();
+    expect(first).toMatchObject({ kind: 'signIn', id: 'signIn' });
+    expect(rest).toEqual(groups);
+    provider.setModel(groups, { signedIn: true });
+    expect(provider.getChildren()).toEqual(groups);
     provider.dispose();
   });
 
