@@ -47,7 +47,7 @@ const shared = {
   define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(devcontainerCliVersion()) },
 };
 
-const outfiles = ['dist/extension.js', 'dist/sessionMonitor.js'];
+const outfiles = ['dist/extension.js', 'dist/sessionMonitor.js', 'dist/groupsPreviewWorker.js'];
 
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
 // match the minified bundles stays in dist/.
@@ -66,6 +66,12 @@ const contexts = await Promise.all([
     ...shared,
     entryPoints: ['src/monitor/sessionMonitor.ts'],
     outfile: outfiles[1],
+  }),
+  // The worker thread of the repository groups editor: runs the regular expressions of the draft with a time limit.
+  esbuild.context({
+    ...shared,
+    entryPoints: ['src/vscode/groupsPreviewWorker.ts'],
+    outfile: outfiles[2],
   }),
 ]);
 

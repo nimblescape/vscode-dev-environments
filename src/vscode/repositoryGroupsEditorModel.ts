@@ -18,7 +18,8 @@ export const EditorLimits = {
   entries: 200,
   name: 200,
   pattern: 5000,
-  testName: 300,
+  /** An owner (39 characters at most on GitHub), a slash, and a repository name (100 at most). */
+  testName: 140,
 } as const;
 
 /** At most this many nodes of the tree are sent to the preview, over all owners; the rest is counted. */
@@ -31,11 +32,6 @@ export interface EditorEntry {
   pattern: string;
   /** Subset of `ius`, in that order. */
   flags: string;
-  /**
-   * Index of the element of the setting value that the editor loaded this entry from (the base of the merge at Save);
-   * missing for an entry added in the editor.
-   */
-  origin?: number;
 }
 
 // User-visible texts that messages.ts lacks; to be moved there.
@@ -45,7 +41,7 @@ export const GroupsEditorTexts = {
     `Entry ${position} of the setting is neither a regular expression nor an object with "pattern" and optional "name" and "flags" texts. The editor does not show it, and Save removes it.`,
   ignoredFlagsLeftOut: (position: number, flags: string) =>
     `Entry ${position} of the setting uses the flags "${flags}", which are ignored (only i, u, and s are allowed). Save removes them.`,
-  notAList: 'The setting is not a list. The editor starts with no entries, and Save replaces the value.',
+  notAList: 'The setting is not a list. The editor starts with no entries, and Save asks before it replaces the value.',
   emptyPattern: 'Enter a regular expression.',
   invalidPattern: (error: string) => `This regular expression is not valid: ${error}`,
   patternTooLong: `The regular expression is longer than ${EditorLimits.pattern} characters.`,
@@ -59,15 +55,33 @@ export const GroupsEditorTexts = {
     `Entry ${position}${name !== undefined ? ` ("${name}")` : ''} matches.`,
   testInvalid: 'Enter the repository name without spaces, for example 2026-3cWI-SWP-module-oop-EnesHA81 or owner/name.',
   invalidEntriesNotSaved: 'Correct the entries with an error first. Nothing was saved.',
-  conflict: (position: number) =>
-    `Entry ${position} of devEnvLauncher.repositoryGroups was changed both in this editor and in settings.json. Which one do you want to keep?`,
-  conflictDetail: (base: string, mine: string, theirs: string) =>
-    `When the editor loaded it: ${base}\nThis editor: ${mine}\nsettings.json now: ${theirs}`,
-  keepMine: 'Keep Mine',
-  keepTheirs: 'Keep settings.json',
-  saveCancelled: 'Nothing was saved.',
+  changedMeanwhile: 'devEnvLauncher.repositoryGroups was changed in settings.json while this editor was open.',
+  changedMeanwhileDetail: (theirs: string) =>
+    `settings.json now:${theirs}\n\nLoad settings.json shows this list in the editor and drops your unsaved edits. Save Mine replaces it with the entries of this editor. Cancel changes nothing.`,
+  loadTheirs: 'Load settings.json',
+  saveMine: 'Save Mine',
+  saveCancelled: 'Nothing was saved. Your edits are still in the editor.',
+  saveFailed: 'The setting could not be saved. Your edits are still in the editor.',
   saved: 'Saved to the user settings.',
-  savedMerged: 'Saved to the user settings, together with the changes made in settings.json meanwhile.',
+  savedReplaced: 'Saved to the user settings. Your entries replaced the value that settings.json had.',
+  loadedTheirs: 'Loaded the setting from settings.json. Your unsaved edits were dropped. Nothing was saved.',
+  loaded: 'Loaded the setting from settings.json.',
+  alreadySaved: 'Saved: settings.json already holds these entries, so nothing had to be written.',
+  staleKept: 'The editor had changed meanwhile; your edits are kept, press Save again.',
+  saveRunning: 'A Save is already running; press Save again when it is done.',
+  notTakenDuringSave:
+    'Edits or a Save arrived while another Save ran and were not taken over. Check the entries, then press Save again.',
+  refusedMessage:
+    'The editor sent entries that cannot be used; they were not taken over, and the preview shows the entries before. Nothing was saved.',
+  entryTooSlow:
+    'This regular expression takes too long for the repository names of the view (for example a nested repetition such as (a+)+). It would make VS Code stop responding. Change it before you save.',
+  previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
+  testTooSlow: 'The test was stopped: the regular expressions took more than 1 second for this name.',
+  tooSlowNotSaved: 'A regular expression takes too long for the repository names of the view. Nothing was saved.',
+  previewFailed: 'The preview could not check these regular expressions; Save is not possible.',
+  notAListConflict: 'settings.json holds a value for devEnvLauncher.repositoryGroups that is not a list.',
+  notAListDetail: (theirs: string) =>
+    `The value in settings.json is not a list: ${theirs}\n\nLoad settings.json shows the editor for that value (with no entries) and drops your unsaved edits. Save Mine replaces that value with the entries of this editor. Cancel changes nothing.`,
   slow: (milliseconds: number) =>
     `Grouping took ${milliseconds} ms. A regular expression may be slow, for example one with a nested repetition such as (a+)+.`,
 } as const;
@@ -96,11 +110,11 @@ export function entriesFromSetting(value: unknown): { entries: EditorEntry[]; no
     const ignored = issues.find((issue) => issue.kind === 'ignoredFlags');
     if (ignored) notices.push(GroupsEditorTexts.ignoredFlagsLeftOut(index + 1, ignored.detail ?? ''));
     if (typeof entry === 'string') {
-      entries.push({ name: '', pattern: entry, flags: '', origin: index });
+      entries.push({ name: '', pattern: entry, flags: '' });
       return;
     }
     const { name, pattern, flags } = entry as { name?: string; pattern: string; flags?: string };
-    entries.push({ name: name ?? '', pattern, flags: normalizeFlags(flags ?? ''), origin: index });
+    entries.push({ name: name ?? '', pattern, flags: normalizeFlags(flags ?? '') });
   });
   return { entries, notices };
 }
@@ -140,7 +154,7 @@ export function checkEntries(entries: readonly EditorEntry[]): EntryCheck[] {
       if (problem?.kind === 'empty') return { error: GroupsEditorTexts.emptyPattern };
       return { error: GroupsEditorTexts.invalidPattern(problem?.detail ?? problem?.message ?? '') };
     }
-    const groups = capturingGroups(pattern.regex);
+    const groups = capturingGroups(pattern.source);
     const note =
       groups === 0 ? GroupsEditorTexts.noCapturingGroup : groups === 1 ? GroupsEditorTexts.oneCapturingGroup : GroupsEditorTexts.levels(groups);
     return { note };
@@ -152,13 +166,29 @@ export function canSave(checks: readonly EntryCheck[]): boolean {
   return checks.every((check) => check.error === undefined);
 }
 
-/** Number of capturing groups of a regular expression (the empty alternative always matches). */
-function capturingGroups(regex: RegExp): number {
-  try {
-    return (new RegExp(`${regex.source}|`, regex.flags).exec('')?.length ?? 1) - 1;
-  } catch {
-    return 0;
+/**
+ * Number of capturing groups of a regular expression, counted in its source without running it (no regular expression
+ * of the draft runs in the extension host): each `(` that is not escaped, not in a character class, and not followed by
+ * `?`, except a named group `(?<name>`. The source is valid (checkRepositoryGroupEntry compiled it); the flags are i, u,
+ * and s only, so a character class does not nest.
+ */
+export function capturingGroups(source: string): number {
+  let count = 0;
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+    if (char === '\\') {
+      i += 1;
+    } else if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') {
+      inClass = true;
+    } else if (char === '(') {
+      if (source[i + 1] !== '?') count += 1;
+      else if (source[i + 2] === '<' && source[i + 3] !== '=' && source[i + 3] !== '!') count += 1;
+    }
   }
+  return count;
 }
 
 /** Two values of the setting are the same (a missing value is the empty list; key order does not count). */
@@ -184,55 +214,61 @@ function stableJson(value: unknown): string {
 /** Messages of the webview. Every message is checked with parseEditorRequest; anything else is dropped. */
 export type EditorRequest =
   | { type: 'ready' }
-  | { type: 'update'; seq: number; entries: EditorEntry[]; testName: string }
-  | { type: 'save'; seq: number; entries: EditorEntry[] }
-  | { type: 'reload' }
-  | { type: 'cancel' };
+  | { type: 'update'; seq: number; generation: number; entries: EditorEntry[]; testName: string }
+  | { type: 'save'; seq: number; generation: number; entries: EditorEntry[]; testName: string }
+  /** Load settings.json; `testName` is the text of the test field, which the load keeps. */
+  | { type: 'reload'; testName: string }
+  | { type: 'cancel' }
+  /**
+   * An update or Save for entries of an earlier load (edited from another value): nothing is written, and the editor
+   * keeps these entries with a status (unless Load settings.json replaced that load).
+   */
+  | { type: 'stale'; seq: number; generation: number; entries: EditorEntry[]; testName: string };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
- * wrong types, flags other than i, u, and s, and texts or lists over EditorLimits are refused.
+ * wrong types, flags other than i, u, and s, and texts or lists over EditorLimits are refused. `generation` counts the
+ * loads of the editor; an update or Save of another load is `stale` (its entries were edited from another value).
  */
-export function parseEditorRequest(raw: unknown, context: { baseLength: number }): EditorRequest | undefined {
+export function parseEditorRequest(raw: unknown, context: { generation: number }): EditorRequest | undefined {
   if (!isPlainObject(raw)) return undefined;
   switch (raw.type) {
     case 'ready':
-    case 'reload':
     case 'cancel':
       return hasOnlyKeys(raw, ['type']) ? { type: raw.type } : undefined;
-    case 'update': {
-      if (!hasOnlyKeys(raw, ['type', 'seq', 'entries', 'testName']) || !isSeq(raw.seq)) return undefined;
-      const entries = parseEntries(raw.entries, context.baseLength);
-      if (!entries || !isText(raw.testName, EditorLimits.testName)) return undefined;
-      return { type: 'update', seq: raw.seq, entries, testName: raw.testName };
-    }
+    case 'reload':
+      return hasOnlyKeys(raw, ['type', 'testName']) && isText(raw.testName, EditorLimits.testName)
+        ? { type: 'reload', testName: raw.testName }
+        : undefined;
+    case 'update':
     case 'save': {
-      if (!hasOnlyKeys(raw, ['type', 'seq', 'entries']) || !isSeq(raw.seq)) return undefined;
-      const entries = parseEntries(raw.entries, context.baseLength);
-      return entries ? { type: 'save', seq: raw.seq, entries } : undefined;
+      if (!hasOnlyKeys(raw, ['type', 'seq', 'generation', 'entries', 'testName']) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
+      const entries = parseEntries(raw.entries);
+      if (!entries || !isText(raw.testName, EditorLimits.testName)) return undefined;
+      const message = { seq: raw.seq, generation: raw.generation, entries, testName: raw.testName };
+      if (raw.generation !== context.generation) return { type: 'stale', ...message };
+      return { type: raw.type, ...message };
     }
     default:
       return undefined;
   }
 }
 
-/** The entries of a message; an `origin` must be an index of the loaded setting value, at most once. */
-function parseEntries(value: unknown, baseLength: number): EditorEntry[] | undefined {
+/** The `seq` of a message that parseEditorRequest refused, when it has a valid one (to answer it with a state). */
+export function refusedRequestSeq(raw: unknown): number | undefined {
+  return isPlainObject(raw) && isSeq(raw.seq) ? raw.seq : undefined;
+}
+
+/** The entries of a message. */
+function parseEntries(value: unknown): EditorEntry[] | undefined {
   if (!Array.isArray(value) || value.length > EditorLimits.entries) return undefined;
   const entries: EditorEntry[] = [];
-  const origins = new Set<number>();
   for (const item of value) {
-    if (!isPlainObject(item)) return undefined;
-    const keys = 'origin' in item ? ['name', 'pattern', 'flags', 'origin'] : ['name', 'pattern', 'flags'];
-    if (!hasOnlyKeys(item, keys)) return undefined;
-    const { name, pattern, flags, origin } = item;
+    if (!isPlainObject(item) || !hasOnlyKeys(item, ['name', 'pattern', 'flags'])) return undefined;
+    const { name, pattern, flags } = item;
     if (!isText(name, EditorLimits.name) || !isText(pattern, EditorLimits.pattern)) return undefined;
     if (typeof flags !== 'string' || !/^[ius]{0,3}$/.test(flags) || normalizeFlags(flags).length !== flags.length) return undefined;
-    if (origin !== undefined) {
-      if (!isSeq(origin) || origin >= baseLength || origins.has(origin)) return undefined;
-      origins.add(origin);
-    }
-    entries.push({ name, pattern, flags: normalizeFlags(flags), ...(origin !== undefined ? { origin } : {}) });
+    entries.push({ name, pattern, flags: normalizeFlags(flags) });
   }
   return entries;
 }
@@ -256,246 +292,45 @@ function isSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-// ---- Merge at Save ----------------------------------------------------------------------------------------------
+// ---- Save: the question when settings.json changed the setting ----------------------------------------------------
+
+/** At most this many characters of one element of the setting are shown in a question; the rest is cut. */
+export const MAX_SHOWN_ENTRY = 200;
+/** At most this many elements of the list of settings.json are shown in a question; the rest is counted. */
+export const MAX_SHOWN_LINES = 20;
+/** At most this many characters of the list of settings.json are shown in a question (the first element always). */
+const MAX_SHOWN_LIST = 2000;
 
 /**
- * An element of the setting that both the editor and settings.json changed differently since the editor loaded it
- * (`mine` or `theirs` missing: removed on that side). Save asks which one to keep, for this element only.
+ * A short text of the list of settings.json for the question of Save: one element per line, each cut after
+ * MAX_SHOWN_ENTRY characters; after MAX_SHOWN_LINES elements or MAX_SHOWN_LIST characters the rest is counted. The
+ * first element is always shown, so the list is never hidden as a whole.
  */
-export interface MergeConflict {
-  /** Index in the loaded value (the base). */
-  baseIndex: number;
-  base: unknown;
-  mine?: unknown;
-  theirs?: unknown;
-}
-
-export type ConflictChoice = 'mine' | 'theirs';
-
-export type MergeOutcome =
-  | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[] }
-  | { status: 'conflicts'; conflicts: MergeConflict[] };
-
-type SideState = { kind: 'unchanged' } | { kind: 'removed' } | { kind: 'edited'; value: unknown };
-
-type Token = { kind: 'base'; index: number } | { kind: 'new'; value: unknown };
-
-/**
- * Save never overwrites a change made in settings.json meanwhile: a 3-way merge of the setting value. `base` is the
- * value that the editor loaded (the value when it opened or was last saved or loaded), `ours` the entries of the editor
- * (each with the `origin` it was loaded from, none when added), and `theirs` the value stored now. The changes of the
- * editor (additions, removals, edits, and moves) are applied to `theirs`; entries that only settings.json added or
- * changed stay. An element changed on both sides in the same way is no conflict. An element changed differently on both
- * sides (also removed on one side and edited on the other) is a conflict: without a choice in `choices` (by base index)
- * the result lists the conflicts and no value. The elements of `theirs` are matched to the base by content (longest
- * common subsequence of the entries, then entries with the same pattern or name, then by position in the gaps). The
- * order: the order of the editor when it moved entries, otherwise the order of settings.json; the entries that only the
- * other side has are placed after their predecessor on that side.
- */
-export function mergeRepositoryGroups(
-  baseValue: unknown,
-  ours: readonly EditorEntry[],
-  theirsValue: unknown,
-  choices: ReadonlyMap<number, ConflictChoice> = new Map(),
-): MergeOutcome {
-  const base = Array.isArray(baseValue) ? (baseValue as unknown[]) : [];
-  const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
-  const baseKeys = base.map(entryKey);
-
-  // The editor: its entries with a valid origin are the base elements (possibly edited); the others are additions.
-  const oursValues = toSettingValue(ours);
-  const oursTokens: Token[] = [];
-  const oursByOrigin = new Map<number, unknown>();
-  ours.forEach((entry, position) => {
-    const origin = entry.origin;
-    if (origin !== undefined && Number.isInteger(origin) && origin >= 0 && origin < base.length && !oursByOrigin.has(origin)) {
-      oursByOrigin.set(origin, oursValues[position]);
-      oursTokens.push({ kind: 'base', index: origin });
-    } else {
-      oursTokens.push({ kind: 'new', value: oursValues[position] });
+export function describeSettingList(value: unknown): string {
+  if (value === undefined || value === null) return '(no entries)';
+  if (!Array.isArray(value)) return describeSettingEntry(value);
+  if (value.length === 0) return '(no entries)';
+  let text = '';
+  for (const [index, entry] of value.entries()) {
+    const line = `\n${index + 1}. ${describeSettingEntry(entry)}`;
+    if (index > 0 && (index >= MAX_SHOWN_LINES || text.length + line.length > MAX_SHOWN_LIST)) {
+      const more = value.length - index;
+      return `${text}\n… and ${more} more ${more === 1 ? 'entry' : 'entries'}`;
     }
-  });
-
-  // settings.json: its elements matched to the base by content.
-  const theirsOrigins = alignToBase(base, theirs);
-  const theirsByOrigin = new Map<number, unknown>();
-  const theirsTokens: Token[] = theirs.map((value, position) => {
-    const origin = theirsOrigins[position];
-    if (origin === undefined) return { kind: 'new', value };
-    theirsByOrigin.set(origin, value);
-    return { kind: 'base', index: origin };
-  });
-
-  const state = (side: Map<number, unknown>, index: number): SideState => {
-    if (!side.has(index)) return { kind: 'removed' };
-    const value = side.get(index);
-    return entryKey(value) === baseKeys[index] ? { kind: 'unchanged' } : { kind: 'edited', value };
-  };
-
-  // The decision per base element: its value, or `undefined` when it is removed.
-  const conflicts: MergeConflict[] = [];
-  let unresolved = false;
-  const decided = new Map<number, { keep: true; value: unknown } | { keep: false }>();
-  base.forEach((baseEntry, index) => {
-    const mine = state(oursByOrigin, index);
-    const other = state(theirsByOrigin, index);
-    const valueOf = (side: SideState, values: Map<number, unknown>) =>
-      side.kind === 'removed' ? ({ keep: false } as const) : ({ keep: true, value: values.get(index) } as const);
-    if (mine.kind === 'unchanged') return decided.set(index, valueOf(other, theirsByOrigin));
-    if (other.kind === 'unchanged') return decided.set(index, valueOf(mine, oursByOrigin));
-    if (mine.kind === 'removed' && other.kind === 'removed') return decided.set(index, { keep: false });
-    if (mine.kind === 'edited' && other.kind === 'edited' && entryKey(mine.value) === entryKey(other.value)) {
-      return decided.set(index, { keep: true, value: other.value });
-    }
-    conflicts.push({
-      baseIndex: index,
-      base: baseEntry,
-      ...(mine.kind === 'edited' ? { mine: mine.value } : {}),
-      ...(other.kind === 'edited' ? { theirs: other.value } : {}),
-    });
-    const choice = choices.get(index);
-    if (choice === undefined) {
-      unresolved = true;
-      return decided.set(index, { keep: false });
-    }
-    return decided.set(index, choice === 'mine' ? valueOf(mine, oursByOrigin) : valueOf(other, theirsByOrigin));
-  });
-  if (unresolved) return { status: 'conflicts', conflicts };
-
-  const kept = (token: Token) => token.kind === 'new' || decided.get(token.index)?.keep === true;
-  const oursMoved = isReordered(oursTokens.filter(kept));
-  const [skeleton, other] = oursMoved ? [oursTokens, theirsTokens] : [theirsTokens, oursTokens];
-  const merged: Token[] = skeleton.filter(kept);
-  const newKeys = new Set(merged.filter((token) => token.kind === 'new').map((token) => entryKey((token as { value: unknown }).value)));
-  let last = -1;
-  for (const token of other) {
-    if (token.kind === 'base') {
-      const at = merged.findIndex((placed) => placed.kind === 'base' && placed.index === token.index);
-      if (at >= 0) {
-        last = at;
-        continue;
-      }
-      if (!kept(token)) continue;
-    } else {
-      // Both sides added the same entry: once.
-      const key = entryKey(token.value);
-      if (newKeys.has(key)) {
-        const at = merged.findIndex((placed) => placed.kind === 'new' && entryKey(placed.value) === key);
-        if (at >= 0) last = at;
-        continue;
-      }
-      newKeys.add(key);
-    }
-    merged.splice(last + 1, 0, token);
-    last += 1;
+    text += line;
   }
-  const value = merged.map((token) => {
-    if (token.kind === 'new') return token.value;
-    const decision = decided.get(token.index);
-    return decision?.keep ? decision.value : undefined;
-  });
-  return { status: 'merged', value, conflicts };
+  return text;
 }
 
-/** The base indices of the tokens that come from the base are not in increasing order: the entries were moved. */
-function isReordered(tokens: readonly Token[]): boolean {
-  let previous = -1;
-  for (const token of tokens) {
-    if (token.kind !== 'base') continue;
-    if (token.index < previous) return true;
-    previous = token.index;
-  }
-  return false;
-}
-
-/**
- * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition: equal
- * entries by the longest common subsequence; in each gap between them, the entries with the same pattern or the same
- * name, then the rest by position when both sides of the gap have the same number of entries.
- */
-function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Array<number | undefined> {
-  const a = base.map(entryKey);
-  const b = theirs.map(entryKey);
-  const lengths: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      lengths[i][j] = a[i] === b[j] ? lengths[i + 1][j + 1] + 1 : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
-    }
-  }
-  const origins = new Array<number | undefined>(theirs.length).fill(undefined);
-  const pairGap = (baseGap: number[], theirsGap: number[]) => {
-    const restBase: number[] = [];
-    const used = new Set<number>();
-    for (const i of baseGap) {
-      const fields = entryFieldsOf(base[i]);
-      const j = theirsGap.find((candidate) => {
-        if (used.has(candidate)) return false;
-        const other = entryFieldsOf(theirs[candidate]);
-        if (!fields || !other) return false;
-        return fields.pattern === other.pattern || (fields.name !== undefined && fields.name === other.name);
-      });
-      if (j === undefined) restBase.push(i);
-      else {
-        used.add(j);
-        origins[j] = i;
-      }
-    }
-    const restTheirs = theirsGap.filter((j) => !used.has(j));
-    if (restBase.length === restTheirs.length) restBase.forEach((i, k) => (origins[restTheirs[k]] = i));
-  };
-  let i = 0;
-  let j = 0;
-  let baseGap: number[] = [];
-  let theirsGap: number[] = [];
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
-      pairGap(baseGap, theirsGap);
-      baseGap = [];
-      theirsGap = [];
-      origins[j] = i;
-      i++;
-      j++;
-    } else if (lengths[i + 1][j] >= lengths[i][j + 1]) {
-      baseGap.push(i++);
-    } else {
-      theirsGap.push(j++);
-    }
-  }
-  while (i < a.length) baseGap.push(i++);
-  while (j < b.length) theirsGap.push(j++);
-  pairGap(baseGap, theirsGap);
-  return origins;
-}
-
-/** The name (trimmed, if any) and pattern of an element of the setting, or `undefined` for one of the wrong type. */
-function entryFieldsOf(entry: unknown): { name?: string; pattern: string; flags?: string } | undefined {
-  if (typeof entry === 'string') return { pattern: entry };
-  if (!isPlainObject(entry)) return undefined;
-  const { name, pattern, flags } = entry;
-  if (typeof pattern !== 'string') return undefined;
-  if (name !== undefined && typeof name !== 'string') return undefined;
-  if (flags !== undefined && typeof flags !== 'string') return undefined;
-  const trimmed = name?.trim();
-  return { ...(trimmed ? { name: trimmed } : {}), pattern, ...(flags ? { flags } : {}) };
-}
-
-/**
- * Compares elements of the setting by what they mean: a string and `{ "pattern" }` with the same text are equal, a
- * name is trimmed, and an empty name or flags text counts as none. Elements of the wrong type compare as JSON.
- */
-function entryKey(entry: unknown): string {
-  return stableJson(entryFieldsOf(entry) ?? { invalid: entry ?? null });
-}
-
-/** A short text of an element of the setting for the conflict question. */
+/** A short text of an element (or of a value that is not a list) of the setting for the question of Save, cut after MAX_SHOWN_ENTRY characters. */
 export function describeSettingEntry(entry: unknown): string {
-  if (entry === undefined) return '(removed)';
-  if (typeof entry === 'string') return JSON.stringify(entry);
+  let text: string;
   try {
-    return JSON.stringify(entry) ?? String(entry);
+    text = JSON.stringify(entry) ?? String(entry);
   } catch {
-    return String(entry);
+    text = String(entry);
   }
+  return text.length > MAX_SHOWN_ENTRY ? `${text.slice(0, MAX_SHOWN_ENTRY)}… (${text.length} characters)` : text;
 }
 
 // ---- Preview ----------------------------------------------------------------------------------------------------
@@ -537,6 +372,8 @@ export interface GroupsPreview {
   owners: OwnerPreview[];
   /** Nodes left out after MAX_PREVIEW_NODES. */
   truncated: number;
+  /** The regular expressions took longer than the time limit on the loaded names: no preview (PreviewRun). */
+  tooSlow?: boolean;
 }
 
 /**
@@ -662,13 +499,80 @@ export function testRepositoryName(entries: readonly EditorEntry[], text: string
   };
 }
 
+// ---- Preview job (runs in a worker thread) ----------------------------------------------------------------------
+
+/**
+ * The work of the preview and the test field, which runs the regular expressions of the draft. It runs in a worker
+ * thread (groupsPreviewWorker.ts) with a time limit (groupsPreviewRunner.ts), because a regular expression with a nested
+ * repetition such as `(\w+)+$` can take seconds for one name and would stop the extension host.
+ */
+export interface PreviewJob {
+  id: number;
+  entries: EditorEntry[];
+  testName: string;
+  /** The sidebar input without functions (cloneableInput), or `undefined` before the first render. */
+  input: TreeInput | undefined;
+}
+
+/** Messages of the worker: `probe` before each entry runs on all names, then the preview, then the test. */
+export type PreviewJobMessage =
+  | { type: 'probe'; id: number; entryIndex: number }
+  | { type: 'preview'; id: number; preview: GroupsPreview }
+  | { type: 'test'; id: number; test?: NameTest };
+
+/** The result of a preview job for the editor: what finished within the time limit. */
+export interface PreviewRun {
+  preview?: GroupsPreview;
+  test?: NameTest;
+  /** The names of the view took too long: no preview; `slowEntry` is the entry that ran when the limit was reached. */
+  previewTooSlow?: boolean;
+  slowEntry?: number;
+  /** The test name took too long (the preview finished). */
+  testTooSlow?: boolean;
+  /** The worker failed. */
+  failed?: boolean;
+}
+
+/** The input of the sidebar for a worker message: without `formatTime`, which a structured clone cannot copy. */
+export function cloneableInput(input: TreeInput | undefined): TreeInput | undefined {
+  if (!input) return undefined;
+  const { formatTime: _formatTime, ...rest } = input;
+  return rest;
+}
+
+/**
+ * Runs a preview job and reports each step through `post`: before an entry runs on all names of the view a `probe`
+ * (so a stopped worker names the slow entry), then the preview, then the test of the name.
+ */
+export function runPreviewJob(job: PreviewJob, post: (message: PreviewJobMessage) => void): void {
+  if (job.input) {
+    const { patterns } = parseRepositoryGroups(toSettingValue(job.entries));
+    const names = [...new Set(repositoryRows(buildTreeModel({ ...job.input, repositoryGroups: [] })).map((row) => row.name))];
+    for (const pattern of patterns) {
+      post({ type: 'probe', id: job.id, entryIndex: pattern.index });
+      for (const name of names) pattern.regex.exec(name);
+    }
+  }
+  post({ type: 'preview', id: job.id, preview: buildGroupsPreview(job.input, job.entries) });
+  const test = testRepositoryName(job.entries, job.testName);
+  post({ type: 'test', id: job.id, ...(test ? { test } : {}) });
+}
+
 // ---- State of the webview ---------------------------------------------------------------------------------------
 
-/** Message to the webview: the entries to show (at the start, and after Load Setting). */
+/** Message to the webview: the entries to show (at the start, after Load settings.json or Save, and after a stale Save or update). */
 export interface EditorLoadMessage {
   type: 'load';
+  /** Counts the loads; the webview sends it back with its updates. */
+  generation: number;
+  /** The highest `seq` that the extension has seen: the webview continues from it (also a page that starts again). */
+  seq: number;
   entries: EditorEntry[];
   notices: string[];
+  /** The text of the test field, so a page that starts again shows the text of its result (a running page keeps its own). */
+  testName: string;
+  /** A Save runs: the page is read-only from this load on, until a state with `saving: false` (a page that starts during Save). */
+  saving: boolean;
 }
 
 /** Message to the webview: everything the extension computes for the entries of the webview. */
@@ -680,34 +584,48 @@ export interface EditorStateMessage {
   canSave: boolean;
   /** The entries differ from those that were loaded. */
   dirty: boolean;
-  /** The setting was changed outside the editor since it was loaded. */
+  /**
+   * The setting was changed outside the editor since it was loaded (or last saved): the page shows the banner
+   * "settings.json changed this setting." with Load settings.json. The draft is never replaced without that button or
+   * the question of Save.
+   */
   changedOutside: boolean;
+  /** A Save runs: the webview stays read-only until a state with the `seq` of its Save and `saving: false`. */
+  saving: boolean;
   preview: GroupsPreview;
   test?: NameTest;
-  /** A text for the status line, for example after Save. */
+  /** A text for the status line, for example after Save; later states repeat it until the entries change. */
   status?: string;
 }
 
-/** The state for the webview: checks, preview, and the test of the name. */
+/** The state for the webview: the checks, and the preview and the test of a preview job (PreviewRun). */
 export function editorState(options: {
   seq: number;
   entries: readonly EditorEntry[];
   loaded: readonly EditorEntry[];
-  testName: string;
-  input: TreeInput | undefined;
+  run: PreviewRun | undefined;
   changedOutside: boolean;
+  saving?: boolean;
   status?: string;
 }): EditorStateMessage {
-  const checks = checkEntries(options.entries);
-  const test = testRepositoryName(options.entries, options.testName);
+  const run = options.run ?? {};
+  const checks = checkEntries(options.entries).map((check, index) =>
+    run.previewTooSlow && run.slowEntry === index && check.error === undefined ? { error: GroupsEditorTexts.entryTooSlow } : check,
+  );
+  const preview: GroupsPreview = run.previewTooSlow
+    ? { loaded: true, owners: [], truncated: 0, tooSlow: true }
+    : (run.preview ?? { loaded: false, owners: [], truncated: 0 });
+  const test: NameTest | undefined = run.testTooSlow ? { matched: false, text: GroupsEditorTexts.testTooSlow, path: [] } : run.test;
   return {
     type: 'state',
     seq: options.seq,
     checks,
-    canSave: canSave(checks),
+    // Save needs a run of the worker that checked these entries: a stopped or failed worker keeps it off.
+    canSave: canSave(checks) && !run.previewTooSlow && !run.failed,
     dirty: !sameSettingValue(toSettingValue(options.entries), toSettingValue(options.loaded)),
     changedOutside: options.changedOutside,
-    preview: buildGroupsPreview(options.input, options.entries),
+    saving: options.saving === true,
+    preview,
     ...(test ? { test } : {}),
     ...(options.status !== undefined ? { status: options.status } : {}),
   };
@@ -739,15 +657,17 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <h1>${GroupsEditorTexts.panelTitle}</h1>
 <p class="intro">Regular expressions (JavaScript syntax) that filter and group the repositories of the Dev Environments view. Each one is matched against the repository name without the owner; a repository goes under the first entry that matches. The capturing groups are the levels of the tree; the last one is the label of the row. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment.</p>
 <div id="notices" role="status" aria-live="polite"></div>
+<fieldset id="form" class="form">
 <div id="changed" class="banner" role="alert" hidden>
-<span>The setting was changed in settings.json after this editor loaded it. Save adds your changes to it and asks only about entries that were changed on both sides. Load Setting shows the current setting and discards your changes.</span>
-<button type="button" id="reload" class="secondary">Load Setting</button>
+<span>settings.json changed this setting.</span>
+<button type="button" id="reload" class="secondary">Load settings.json</button>
 </div>
 <section aria-labelledby="entries-heading">
 <h2 id="entries-heading">Entries</h2>
 <p id="no-entries" class="muted" hidden>No entries: the view shows the plain list of each owner.</p>
 <ol id="entries"></ol>
 <button type="button" id="add">Add Entry</button>
+<p id="entries-full" class="muted" hidden>The editor takes at most ${EditorLimits.entries} entries.</p>
 </section>
 <div class="actions">
 <button type="button" id="save">Save</button>
@@ -759,7 +679,9 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <label for="test-name">Repository name (or owner/name)</label>
 <input type="text" id="test-name" spellcheck="false" autocomplete="off" maxlength="${EditorLimits.testName}">
 <div id="test-result" role="status" aria-live="polite"></div>
+<p id="test-paused" class="muted" aria-live="polite"></p>
 </section>
+</fieldset>
 <section aria-labelledby="preview-heading">
 <h2 id="preview-heading">Preview</h2>
 <p class="muted">The repositories that the Dev Environments view has loaded, grouped with these entries. Repositories with an environment are always shown.</p>

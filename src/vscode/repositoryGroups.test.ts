@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { matchRepositoryGroup, parseRepositoryGroups, RepositoryGroupTexts } from './repositoryGroups';
 
 const EXAMPLE = String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`;
@@ -116,6 +116,21 @@ describe('matchRepositoryGroup', () => {
     ['no anchor: a match anywhere in the name', ['pi'], 'api', { index: 0, levels: [], label: 'api' }],
   ])('%s', (_case, entries, name, expected) => {
     expect(match(entries, name)).toEqual(expected);
+  });
+
+  // Review round 2 of PR #21, W1: a regular expression that throws while it is matched (a RangeError when the stack
+  // overflows, for example (?:(?:a?){10000}){3000}) must not break the sidebar.
+  it('treats a pattern that throws while it is matched as not matching, and keeps its error', () => {
+    const { patterns } = parseRepositoryGroups(['^x', '^(a)(.*)$', '^a']);
+    const exec = vi.fn(() => {
+      throw new RangeError('Maximum call stack size exceeded');
+    });
+    patterns[0].regex.exec = exec;
+    expect(matchRepositoryGroup(patterns, 'api')).toMatchObject({ pattern: { index: 1 }, levels: ['a'], label: 'pi' });
+    expect(matchRepositoryGroup(patterns, 'web')).toBeUndefined();
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(patterns[0].failure).toBe('Maximum call stack size exceeded');
+    expect(patterns[1].failure).toBeUndefined();
   });
 
   it('gives the same result when a pattern is used many times (no state between matches)', () => {

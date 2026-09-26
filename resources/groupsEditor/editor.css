@@ -252,3 +252,11 @@ button:disabled {
 .hidden-list {
   color: var(--vscode-descriptionForeground);
 }
+
+/* The form around the controls: read-only (disabled) while Save runs. */
+fieldset.form {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
