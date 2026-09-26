@@ -162,14 +162,14 @@ DEV ENVIRONMENTS         [Select Organizations] [Search] [Refresh] [Collapse All
   ▾ acme-university
       ● api        main (python)   Connected                  [Stop] [Delete] [⋯]
       ◐ docs       main            Running                    [Stop] [Delete] [⋯]
-      ○ web        feature-x       Stopped · 3 unpushed       [Start] [Delete] [⋯]
         infra                                                 [Start] [⋯]
+      ○ web        feature-x       Stopped · 3 unpushed       [Start] [Delete] [⋯]
   ▾ your-account
       ○ dotfiles   main            Stopped                    [Start] [Delete] [⋯]
         website                                               [Start] [⋯]
 ```
 
-The list groups the repositories by owner. In each group, the repositories with an environment come first, then the other repositories in alphabetical order.
+The list groups the repositories by owner. In each group, the repositories are in alphabetical order; a repository with an environment keeps its place.
 
 **Title bar.** **Select Organizations…** opens a list with the signed-in account (marked "your account"), every organization where the account is a member, and the owners of the setting `owners` that are in neither list, so that they can be removed. The current setting is selected. **OK** writes the selection to the setting `owners` (user settings), and the list loads again with the new scan scope (see [7.4](#74-repository-discovery)); no selection means all repositories. The icon is an empty filter while the setting is empty, and a filled filter while it limits the list. Without a sign-in, the command asks to sign in first.
 

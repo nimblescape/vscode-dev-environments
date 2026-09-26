@@ -161,7 +161,7 @@ export interface OwnerGroup {
   /** `owner:` + lower-case owner. */
   id: string;
   owner: string;
-  /** Hints first, then the repositories with an environment, then the other repositories. */
+  /** Hints first, then the repositories in alphabetical order, with or without an environment (user decision 2026-09-26). */
   children: Array<RepositoryRow | HintRow>;
 }
 
@@ -265,8 +265,8 @@ export function contextValue(actions: RowActions): string {
  * that has an environment. Environments are always listed, also when the settings filter their repository out, when
  * GitHub does not list the repository (`not on GitHub`), and when the user is not signed in, because they hold the
  * user's work. Without a sign-in, only the environments are listed.
- * Groups are sorted by owner; in each group, hints come first, then the repositories with an environment, then the
- * other repositories, each part in alphabetical order.
+ * Groups are sorted by owner; in each group, hints come first, then all repositories in alphabetical order: a repository
+ * with an environment keeps its place (user decision 2026-09-26).
  */
 export function buildTreeModel(input: TreeInput): OwnerGroup[] {
   const discovered = input.discovery?.repositories ?? [];
@@ -349,9 +349,7 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
     .sort((a, b) => compareNames(a.group.owner, b.group.owner))
     .map(({ group, hints, environments: withEnvironment, others }) => {
       hints.sort((a, b) => compareNames(a.organization, b.organization));
-      withEnvironment.sort(byName);
-      others.sort(byName);
-      group.children = [...hints, ...withEnvironment, ...others];
+      group.children = [...hints, ...[...withEnvironment, ...others].sort(byName)];
       return group;
     });
 }
