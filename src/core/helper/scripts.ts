@@ -172,9 +172,9 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
 /**
  * `$1` = folder name of the repository in /workspaces, `$2` = user.name, `$3` = user.email, `$4` = the credential helper
  * of the dev container (CONTAINER_CREDENTIAL_HELPER), `$5` = the GitHub login of the account that owns the environment
- * (isGitHubLogin). Token on stdin. Prepares the configuration folder of the dev container (CONFIG_FOLDER, concept section
- * 9 "Git inside the container"), which all files and folders get with the owner (numeric uid:gid) of the repository
- * folder, that is the remote user after the ownership fix:
+ * (isGitHubLogin; empty when it is not known). Token on stdin. Prepares the configuration folder of the dev container
+ * (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and folders get with the owner
+ * (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
  * - github-token: the token, mode 0600, written again at each run (a new sign-in gives a new token);
  * - gh/hosts.yml (GH_HOSTS_FILE, the sign-in of the GitHub CLI, GH_CONFIG_DIR): written again at each run, mode 0600 in
  *   the folder gh/ (0700), with the same token as github-token and the login `$5` for github.com, so gh in the container
@@ -182,7 +182,9 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
  *   keys `oauth_token`, `user`, and `git_protocol` of the host (gh before 2.40, and the active account of gh 2.40 and
  *   newer), and `users.<login>.oauth_token` (the accounts of gh 2.40 and newer). The other files of gh/ (for example
  *   config.yml, which gh writes itself) stay as they are. A token with characters that YAML would need to escape (no
- *   token of GitHub has them) signs gh in nowhere: the file is removed;
+ *   token of GitHub has them) signs gh in nowhere: the file is removed; so does a `$5` that is empty or no GitHub login
+ *   (the same rule as isGitHubLogin), which never goes into the file, while the token and the Git configuration are
+ *   still written (Git in the container works, gh is not signed in);
  * - gitconfig: created when missing, with user.name and user.email; of an existing file, only the section
  *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours);
  * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
@@ -201,10 +203,10 @@ case "$folder" in
   '' | . | .. | -* | */*) fail 2 "Invalid folder name: $folder" ;;
 esac
 case "$login" in
-  '' | -* | *[!A-Za-z0-9-]*) fail 2 "Invalid GitHub login: $login" ;;
+  '' | [!A-Za-z0-9]* | *[!A-Za-z0-9_-]*) login='' ;;
 esac
 if [ "\${#login}" -gt 39 ]; then
-  fail 2 "Invalid GitHub login: $login"
+  login=''
 fi
 repo='${WORKSPACES_ROOT}'/"$folder"
 dir='${CONFIG_FOLDER}'
@@ -235,18 +237,23 @@ hosts='${GH_HOSTS_FILE}'
 if [ -L "$hosts" ] || { [ -e "$hosts" ] && [ ! -f "$hosts" ]; }; then
   rm -rf "$hosts"
 fi
-case "$token" in
-  *[!A-Za-z0-9_.-]*)
-    rm -f "$hosts"
-    echo 'The GitHub CLI in the container is not signed in: the token has characters that its configuration cannot hold.'
-    ;;
-  *)
-    (umask 077 && printf 'github.com:\n    users:\n        "%s":\n            oauth_token: "%s"\n    git_protocol: https\n    oauth_token: "%s"\n    user: "%s"\n' "$login" "$token" "$token" "$login" > "$work/hosts.yml")
-    chmod 0600 "$work/hosts.yml"
-    chown "$owner" "$work/hosts.yml"
-    mv -fT "$work/hosts.yml" "$hosts"
-    ;;
-esac
+if [ -z "$login" ]; then
+  rm -f "$hosts"
+  echo 'The GitHub CLI in the container is not signed in: the GitHub login of the account is not known. Git works.'
+else
+  case "$token" in
+    *[!A-Za-z0-9_.-]*)
+      rm -f "$hosts"
+      echo 'The GitHub CLI in the container is not signed in: the token has characters that its configuration cannot hold.'
+      ;;
+    *)
+      (umask 077 && printf 'github.com:\n    users:\n        "%s":\n            oauth_token: "%s"\n    git_protocol: https\n    oauth_token: "%s"\n    user: "%s"\n' "$login" "$token" "$token" "$login" > "$work/hosts.yml")
+      chmod 0600 "$work/hosts.yml"
+      chown "$owner" "$work/hosts.yml"
+      mv -fT "$work/hosts.yml" "$hosts"
+      ;;
+  esac
+fi
 token=''
 cfg="$dir/gitconfig"
 if [ -L "$cfg" ]; then

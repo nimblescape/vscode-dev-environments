@@ -581,20 +581,54 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     expect(fs.readFileSync(path.join(env.ws, '.devenv+', 'github-token'), 'utf8')).toBe('gho_"x":\\y');
   });
 
+  it('signs the GitHub CLI in with the login of an Enterprise Managed User (with an underscore)', () => {
+    const env = setup();
+    const result = run(env, TOKEN, 'api', 'dev_acme');
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const text = fs.readFileSync(path.join(env.ws, '.devenv+', 'gh', 'hosts.yml'), 'utf8');
+    expect(text).toContain('    users:\n        "dev_acme":\n            oauth_token: "gho_secret_value"\n');
+    expect(text).toContain('    user: "dev_acme"\n');
+  });
+
+  // Until review round 1 of unit 5, an invalid login stopped the script before it wrote anything, so a login that the
+  // rule did not know (the underscore of Enterprise Managed Users) left the container without any Git setup. Now the
+  // invalid login never goes into hosts.yml, and the token and the Git configuration are still written.
   it.each([
     ['empty', ''],
     ['starting with a hyphen', '-octo'],
+    ['starting with an underscore', '_x'],
     ['with a quote', 'octo"'],
     ['with a colon and a space', 'a: b'],
     ['with a new line', 'octo\nuser: x'],
     ['too long', 'x'.repeat(40)],
-  ])('rejects a GitHub login %s before it writes anything', (_name, login) => {
+  ])('signs the GitHub CLI in nowhere for a GitHub login %s, and still writes the token and the Git configuration', (_name, login) => {
     const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    // A sign-in of an earlier run is removed, so gh never works with an old token or as another account.
+    expect(run(env).status).toBe(0);
+    expect(fs.existsSync(path.join(dir, 'gh', 'hosts.yml'))).toBe(true);
     const result = run(env, TOKEN, 'api', login);
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('Invalid GitHub login');
-    expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('The GitHub CLI in the container is not signed in: the GitHub login of the account is not known.');
+    expect(result.stdout + result.stderr).not.toContain(TOKEN);
+    expect(fs.existsSync(path.join(dir, 'gh', 'hosts.yml'))).toBe(false);
+    expect(fs.readFileSync(path.join(dir, 'github-token'), 'utf8')).toBe(TOKEN);
+    expect(gitConfig(path.join(dir, 'gitconfig'), '--get-all', 'credential.https://github.com.helper')).toBe(
+      `\n${CONTAINER_CREDENTIAL_HELPER}\n`,
+    );
     expect(fs.readdirSync(env.secrets)).toEqual([]);
+  });
+
+  it('writes the token and the Git configuration without a GitHub login on the first run too', () => {
+    const env = setup();
+    const result = run(env, TOKEN, 'api', '');
+    expect(result.status).toBe(0);
+    const dir = path.join(env.ws, '.devenv+');
+    expect(fs.readFileSync(path.join(dir, 'github-token'), 'utf8')).toBe(TOKEN);
+    expect(fs.statSync(path.join(dir, 'github-token')).mode & 0o777).toBe(0o600);
+    expect(gitConfig(path.join(dir, 'gitconfig'), 'user.name')).toBe('Hannes Stauss\n');
+    expect(fs.existsSync(path.join(dir, 'gh', 'hosts.yml'))).toBe(false);
   });
 
   it('writes nothing without the repository folder, and nothing without a tmpfs for the token', () => {

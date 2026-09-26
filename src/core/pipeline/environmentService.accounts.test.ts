@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, resourceName } from '../names';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
 import { EnvironmentClaims, availableEnvironments } from '../ownership';
 import { silentLogger } from '../ports';
 import type { Environment, GitHubAccount, RepositoryInfo } from '../types';
@@ -398,6 +398,56 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
     signIn(OTHER_ACCOUNT, OTHER_TOKEN);
     expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+  });
+});
+
+describe('a lost registry: the named volumes without labels that the container of an environment mounts (concept 7.5, section 9)', () => {
+  const PGDATA = 'pgdata';
+  const WORKSPACE = resourceName(REPO, OTHER_ID);
+
+  /** The registry is lost; the volume and the container of OTHER_ACCOUNT's environment are still there. */
+  function lostRegistry(mounted: string[]): void {
+    h.docker.volumes.set(WORKSPACE, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name: WORKSPACE, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    h.docker.containers.set(container.id, { ...container, volumes: [WORKSPACE, ...mounted] });
+  }
+
+  it('records the unlabelled volume again, so that the environment of another account is refused it', async () => {
+    h.docker.volumes.set(PGDATA, {});
+    lostRegistry([PGDATA]);
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual([PGDATA]);
+    // ACCOUNT's first open of the repository mounts the volume of OTHER_ACCOUNT's environment.
+    h.helper.config = { image: BASE_IMAGE, mounts: [`source=${PGDATA},target=/var/lib/postgresql/data,type=volume`] };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`volume ${PGDATA} of another environment`));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.volumes.get(PGDATA)).toEqual({});
+  });
+
+  it('keeps the unlabelled volume at the Delete of the restored environment: not offered, not removed, kept for its account', async () => {
+    h.docker.volumes.set(PGDATA, {});
+    lostRegistry([PGDATA]);
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    expect(await h.service.removableAdditionalVolumes(OTHER_ID)).toEqual([]);
+    // Even a confirmation of the name does not remove it: its labels do not make it the environment's own.
+    await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [PGDATA] });
+    expect(await h.registry.get(OTHER_ID)).toBeUndefined();
+    expect(h.docker.volumes.get(PGDATA)).toEqual({});
+    expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[PGDATA, OTHER_ACCOUNT.id]]);
+  });
+
+  it('records no anonymous volume, no volume of Docker Compose or of another environment, and no volume that does not exist', async () => {
+    const anonymous = 'ef'.repeat(32);
+    h.docker.volumes.set(anonymous, { 'com.docker.volume.anonymous': '' });
+    h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' });
+    h.docker.volumes.set('web-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001', ACCOUNT));
+    h.docker.volumes.set('devenv-acme-web-f0000001', { [LABEL_ENVIRONMENT_ID]: 'f0000001-0000-4000-8000-000000000001', [LABEL_REPOSITORY]: 'acme/web' });
+    lostRegistry([anonymous, 'shop_db', 'web-cache', 'devenv-acme-web-f0000001', 'gone']);
+    expect(await h.service.reconcileFromVolumes()).toBeGreaterThanOrEqual(1);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
   });
 });
 

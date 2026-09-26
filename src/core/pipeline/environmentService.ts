@@ -15,6 +15,7 @@ import { checkConfiguration } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
 import {
+  foreignVolumeName,
   hostAccessReport,
   isOwnVolume,
   mountedVolumeNames,
@@ -2283,8 +2284,10 @@ export class EnvironmentService {
    * Registry lost (concept 7.5): adds an entry for each volume with the label devenv.environment-id that the registry
    * lacks, with the owner of its label devenv.owner-id. A volume of a repository of which the owner account (or, without
    * the label, an entry of an older version) has an environment already is not added: one environment per repository and
-   * account (concept D-3). The entries have no build record, so the next connection with internet access rebuilds the
-   * container. Returns the number of added entries. Does not start Docker.
+   * account (concept D-3). The additional volumes of an entry are its own labelled volumes (devenv.volume, isOwnVolume)
+   * and the volumes without devenv labels that its surviving container mounts (protectedMountedVolumes), which protect
+   * them from other accounts; Delete removes only the own ones. The entries have no build record, so the next
+   * connection with internet access rebuilds the container. Returns the number of added entries. Does not start Docker.
    */
   async reconcileFromVolumes(): Promise<number> {
     const { docker } = this.deps;
@@ -2327,12 +2330,17 @@ export class EnvironmentService {
     }
     if (candidates.length === 0) return 0;
     // The additional volumes are not on the workspace volume: they are found by their labels, which make them the
-    // environment's own (isOwnVolume), as the pipeline records them. A volume without these labels is not added.
+    // environment's own (isOwnVolume), as the pipeline records them.
+    const containers = await docker.listEnvironmentContainers();
     for (const candidate of candidates) {
-      const volumes = additional
+      const labelled = additional
         .filter((volume) => isOwnVolume(volume.labels, candidate.id, candidate.owner?.id))
         .map((volume) => volume.name)
         .filter((name) => name !== candidate.volumeName);
+      const mounted = containers
+        .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
+        .flatMap((container) => container.volumes ?? []);
+      const volumes = [...new Set([...labelled, ...(await this.protectedMountedVolumes(mounted, candidate.volumeName))])];
       if (volumes.length > 0) candidate.additionalVolumes = volumes;
     }
     const skipped: string[] = [];
@@ -2354,6 +2362,26 @@ export class EnvironmentService {
     }
     if (added > 0) this.logger.info(`${added} environments were restored from the labels of their volumes.`);
     return added;
+  }
+
+  /**
+   * Registry lost: the named volumes without devenv labels that the container of a restored environment mounts (the
+   * container, which a lost registry does not remove, still mounts them), for example the volumes that a version before
+   * the labels recorded. Recorded again, they protect the data of the environment: without them, the environment of
+   * another account could mount them (the host access policy refuses the recorded volumes of other accounts). Delete
+   * never removes them (removableVolumes: they are not the environment's own). Not a volume that the policy gives to
+   * something else by its name (the workspace volume, an anonymous volume, a volume of the Dev Containers extension, of
+   * the helper, or of another environment, foreignVolumeName) or by its labels (volumeLabelOwner: Docker Compose, the
+   * Dev Containers extension, an anonymous volume, a volume of an environment), and not a volume that does not exist.
+   */
+  private async protectedMountedVolumes(names: readonly string[], workspaceVolume: string): Promise<string[]> {
+    const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined);
+    if (candidates.length === 0) return [];
+    const labels = new Map((await this.deps.docker.inspectVolumes(candidates)).map((volume) => [volume.name, volume.labels]));
+    return candidates.filter((name) => {
+      const volumeLabelsOf = labels.get(name);
+      return volumeLabelsOf !== undefined && volumeLabelOwner(volumeLabelsOf) === undefined;
+    });
   }
 
   // -------------------------------------------------------------------------------------------------------------------

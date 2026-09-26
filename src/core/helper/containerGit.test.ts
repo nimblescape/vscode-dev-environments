@@ -496,7 +496,10 @@ describe('GitHub login of the sign-in of the GitHub CLI (hosts.yml)', () => {
     ['x'.repeat(40), false],
     ['', false],
     ['-octo', false],
-    ['octo_cat', false],
+    // Enterprise Managed Users have logins `<handle>_<shortcode>`; an earlier expectation (false) had the rule wrong.
+    ['octo_cat', true],
+    ['dev_acme', true],
+    ['_x', false],
     ['octo cat', false],
     ['octo"cat', false],
     ['octo:cat', false],

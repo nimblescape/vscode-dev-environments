@@ -579,7 +579,8 @@ export class WorkspaceHelper {
    * Docker configuration of the dev container into the volume (GIT_FILES_SCRIPT, concept section 9 "Git inside the
    * container"), without the Docker socket, the cache volume, and network. The token goes to the helper on stdin only; it
    * is never on a command line, in a variable, or in the output. Throws CommandError (with the token removed from the
-   * output), and Error for a `login` that is no GitHub login.
+   * output). A `login` that is no GitHub login (isGitHubLogin) does not stop the Git setup: the helper gets no login,
+   * writes the token and the Git configuration, and signs the GitHub CLI in nowhere (no hosts.yml), with a warning.
    */
   async prepareGit(p: {
     volumeName: string;
@@ -593,10 +594,15 @@ export class WorkspaceHelper {
   }): Promise<void> {
     checkToken(p.token);
     const { name } = checkRepository(p.repository);
-    if (!isGitHubLogin(p.login)) throw new Error(`Invalid GitHub login: ${p.login}`);
+    let login = p.login;
+    if (!isGitHubLogin(login)) {
+      // Never put an invalid value into hosts.yml, but keep Git in the container working with the token.
+      this.deps.logger.warn(`The GitHub login ${JSON.stringify(login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
+      login = '';
+    }
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Writing the Git configuration and the GitHub token of ${p.repository} into the volume ${p.volumeName}.`);
-    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER, p.login), {
+    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER, login), {
       input: p.token,
       secrets: true,
       docker: false,

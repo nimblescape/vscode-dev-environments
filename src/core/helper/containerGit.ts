@@ -153,11 +153,12 @@ export interface GitIdentity {
 
 /**
  * True for a GitHub login, the user of the sign-in of the GitHub CLI (GIT_FILES_SCRIPT checks the same): 1 to 39
- * letters, digits, and hyphens, starting with a letter or a digit (this also accepts old logins with two hyphens in a row
- * or one at the end). Such a value is safe in the double quotes of hosts.yml.
+ * letters, digits, hyphens, and underscores, starting with a letter or a digit (this also accepts old logins with two
+ * hyphens in a row or one at the end, and the logins of Enterprise Managed Users, `<handle>_<shortcode>`). Such a value
+ * is safe in the double quotes of hosts.yml.
  */
 export function isGitHubLogin(login: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login);
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$/.test(login);
 }
 
 /** The account as the GitHub API names it: `viewer { databaseId login name }`. */

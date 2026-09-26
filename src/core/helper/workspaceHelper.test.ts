@@ -687,11 +687,20 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
     expect(docker.calls).toHaveLength(0);
   });
 
-  it.each(['', '-octo', 'octo cat', 'octo"', 'a: b'])('refuses the GitHub login %j before any Docker call', async (login) => {
-    await expect(createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login })).rejects.toThrow(
-      /Invalid GitHub login/,
-    );
-    expect(docker.calls).toHaveLength(0);
+  it('runs the helper with the login of an Enterprise Managed User (with an underscore)', async () => {
+    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login: 'dev_acme' });
+    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER, 'dev_acme']);
+  });
+
+  // Deliberate change of review round 1 of unit 5: an invalid login was refused before any Docker call, which left the
+  // container without the token and the Git configuration. Now the helper runs without the login: Git works, and the
+  // invalid value never reaches hosts.yml (GIT_FILES_SCRIPT signs the GitHub CLI in nowhere without a login).
+  it.each(['', '-octo', '_x', 'octo cat', 'octo"', 'a: b'])('runs the helper without the invalid GitHub login %j', async (login) => {
+    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login });
+    expect(docker.runs).toHaveLength(1);
+    expect(docker.runs[0].options.input).toBe(TOKEN);
+    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER, '']);
+    expect(logger.lines.join('\n')).toContain('the GitHub CLI in the container is not signed in');
   });
 });
 

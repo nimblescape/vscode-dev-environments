@@ -2108,7 +2108,10 @@ describe('reconcileFromVolumes', () => {
     expect(error.message).toBe(Messages.hostAccess('volume api-node_modules of another environment'));
   });
 
-  it('restores only the volumes whose labels make them its own: not anonymous ones, not those of other programs, environments, or owners', async () => {
+  // Review round 1 of unit 5 (VOL-2): a named volume without labels that the container mounts ('api-history', for
+  // example one that a version before the labels recorded) is restored again, as origin/main did, so that another
+  // account cannot mount it; this test expected it to be left out before. Delete still keeps it (not the environment's own).
+  it('restores its own labelled volumes and the unlabelled named volumes of its container: not anonymous ones, not those of other programs or environments', async () => {
     const name = resourceName('acme/api', OTHER_ID);
     const anonymous = 'ab'.repeat(32);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api' });
@@ -2118,14 +2121,16 @@ describe('reconcileFromVolumes', () => {
     // Mounted by the container, but without the labels (a version before them, or `${devcontainerId}`).
     h.docker.volumes.set('api-history', {});
     h.docker.volumes.set('x-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001'));
-    for (const volumes of [[name, 'api-node_modules', anonymous, 'api-history'], [name, 'api-node_modules', 'shop_db']]) {
+    // Mounted by another container only: never the environment's.
+    h.docker.volumes.set('x-only', {});
+    for (const volumes of [[name, 'api-node_modules', anonymous, 'api-history'], [name, 'api-node_modules', 'shop_db', 'x-cache', 'api-history']]) {
       const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
       h.docker.containers.set(container.id, { ...container, volumes });
     }
     const other = h.docker.addContainer({ environmentId: 'f0000001-0000-4000-8000-000000000001', name: 'x', state: 'stopped', image: 'x' });
-    h.docker.containers.set(other.id, { ...other, volumes: ['x-cache'] });
+    h.docker.containers.set(other.id, { ...other, volumes: ['x-cache', 'x-only'] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
-    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
+    expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules', 'api-history']);
   });
 
   it('lets a declined claim of a restored entry with only anonymous volumes create an environment of the account', async () => {
