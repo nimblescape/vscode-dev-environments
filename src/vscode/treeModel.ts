@@ -32,9 +32,6 @@ export const TreeTexts = {
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
   signIn: 'Sign in with GitHub',
   signInTooltip: 'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
-  /** Label of the Docker row (the title of the command devEnvironments.installDocker). */
-  installDocker: 'Install Docker…',
-  installDockerTooltip: 'Dev Environments runs your environments in Docker, which is not installed on this computer.',
 } as const;
 
 /** Container and volume state of one environment, as Docker reports it. */
@@ -159,19 +156,6 @@ export interface SignInRow {
 }
 
 export const SIGN_IN_ROW_ID = 'signIn';
-
-/**
- * Row at the top of the view when no Docker CLI is found and the view lists environments: the welcome view with its
- * Install Docker button only shows while the view is empty.
- */
-export interface InstallDockerRow {
-  kind: 'installDocker';
-  id: typeof INSTALL_DOCKER_ROW_ID;
-  label: string;
-  tooltip: string;
-}
-
-export const INSTALL_DOCKER_ROW_ID = 'installDocker';
 
 export interface OwnerGroup {
   kind: 'owner';
@@ -527,26 +511,15 @@ function sortGroupChildren(
 
 /**
  * Top-level nodes of the view: the groups, with the rows that stand for the welcome view when the view is not empty (an
- * empty view shows the welcome view with its buttons instead): first the Docker row when no Docker CLI is found, then
- * the sign-in row when the user is not signed in.
+ * empty view shows the welcome view with its buttons instead): the sign-in row when the user is not signed in.
+ * No Docker row: while no Docker CLI is found, the sidebar passes an empty model, so the view shows the Docker setup of
+ * the welcome view (user decision 2026-09-26: "when no remote docker is configured and local docker is not available,
+ * the repositories shall not be shown, instead, the side view shall show the install docker wizard").
  */
-export function rootNodes(
-  groups: readonly OwnerGroup[],
-  signedIn: boolean,
-  dockerMissing = false,
-): Array<InstallDockerRow | SignInRow | OwnerGroup> {
+export function rootNodes(groups: readonly OwnerGroup[], signedIn: boolean): Array<SignInRow | OwnerGroup> {
   if (groups.length === 0) return [];
-  const rows: Array<InstallDockerRow | SignInRow> = [];
-  if (dockerMissing) {
-    rows.push({
-      kind: 'installDocker',
-      id: INSTALL_DOCKER_ROW_ID,
-      label: TreeTexts.installDocker,
-      tooltip: TreeTexts.installDockerTooltip,
-    });
-  }
-  if (!signedIn) rows.push({ kind: 'signIn', id: SIGN_IN_ROW_ID, label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip });
-  return [...rows, ...groups];
+  if (signedIn) return [...groups];
+  return [{ kind: 'signIn', id: SIGN_IN_ROW_ID, label: TreeTexts.signIn, tooltip: TreeTexts.signInTooltip }, ...groups];
 }
 
 /** All repository rows of the model, in display order, also those inside the nodes of `repositoryGroups`. */

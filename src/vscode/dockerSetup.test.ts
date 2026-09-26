@@ -50,6 +50,7 @@ interface SetupOptions {
   wsl?: () => RunResult | Promise<RunResult>;
   download?: (options: DownloadOptions) => Promise<void>;
   startDocker?: DockerSetupDeps['startDocker'];
+  remoteDockerHost?: boolean;
 }
 
 function setup(installed: boolean, options: SetupOptions = {}) {
@@ -74,6 +75,7 @@ function setup(installed: boolean, options: SetupOptions = {}) {
     platform,
     env: {},
     onDidChangeInstalled: changed,
+    remoteDockerHostConfigured: () => options.remoteDockerHost ?? false,
     planInput: async () => ({ platform, arch: 'arm64', has: (tool: SetupTool) => tools.includes(tool), userName: 'octo', ...options.input }),
     downloadFolder: path.join(os.tmpdir(), 'devenv-downloads-test'),
     download,
@@ -114,8 +116,19 @@ describe('DockerSetup: context keys and CLI checks', () => {
       [DockerContextKeys.installed, false],
       [DockerContextKeys.ready, false],
       [DockerContextKeys.wslReady, false],
+      [DockerContextKeys.setupRequired, true],
     ]);
     expect(dockerSetup.dockerMissing).toBe(true);
+    expect(dockerSetup.setupRequired).toBe(true);
+    dockerSetup.dispose();
+  });
+
+  it('requires no setup without a CLI when a remote Docker host is configured', () => {
+    const { dockerSetup } = setup(false, { remoteDockerHost: true });
+    dockerSetup.initialize();
+    expect(contextCalls()).toContainEqual([DockerContextKeys.setupRequired, false]);
+    expect(dockerSetup.dockerMissing).toBe(true);
+    expect(dockerSetup.setupRequired).toBe(false);
     dockerSetup.dispose();
   });
 
@@ -134,10 +147,13 @@ describe('DockerSetup: context keys and CLI checks', () => {
     vi.advanceTimersByTime(10_000);
     expect(docker.isInstalled).toHaveBeenCalledTimes(3);
     expect(dockerSetup.dockerMissing).toBe(false);
+    // The sidebar renders again (onDidChangeInstalled) and shows the repositories instead of the setup.
+    expect(dockerSetup.setupRequired).toBe(false);
     expect(changed).toHaveBeenCalledTimes(1);
     expect(contextCalls()).toEqual([
       [DockerContextKeys.missing, false],
       [DockerContextKeys.installed, true],
+      [DockerContextKeys.setupRequired, false],
     ]);
     vi.advanceTimersByTime(60_000);
     expect(docker.isInstalled).toHaveBeenCalledTimes(3);

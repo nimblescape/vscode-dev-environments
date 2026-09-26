@@ -55,8 +55,38 @@
     "viewsWelcome": [
       {
         "view": "devEnvironments.repositories",
-        "contents": "Dev Environments runs your environments in Docker, which is not installed on this computer.\n[Install Docker…](command:devEnvironments.installDocker)",
-        "when": "devEnvironments.dockerMissing"
+        "contents": "Dev Environments runs your environments in Docker, which is not installed on this computer. Set it up in these steps:",
+        "when": "devEnvironments.dockerSetupRequired"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "1. Install WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs. Windows asks for administrator permission; restart the computer afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)",
+        "when": "devEnvironments.dockerSetupRequired && isWindows && !devEnvironments.wslReady"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "1. WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs:\n✓ WSL 2 is installed.",
+        "when": "devEnvironments.dockerSetupRequired && isWindows && devEnvironments.wslReady"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "1. Install Docker Desktop, with Homebrew or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+        "when": "devEnvironments.dockerSetupRequired && isMac"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "2. Install Docker Desktop, with winget or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+        "when": "devEnvironments.dockerSetupRequired && isWindows"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "1. Install Docker Engine from the package repository of Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)",
+        "when": "devEnvironments.dockerSetupRequired && isLinux"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.\n[Open the Setup Guide](command:devEnvironments.installDocker)",
+        "when": "devEnvironments.dockerSetupRequired"
       },
       {
         "view": "devEnvironments.repositories",
@@ -66,17 +96,17 @@
       {
         "view": "devEnvironments.repositories",
         "contents": "Loading your repositories…",
-        "when": "devEnvironments.signedIn && !devEnvironments.loaded"
+        "when": "devEnvironments.signedIn && !devEnvironments.loaded && !devEnvironments.dockerSetupRequired"
       },
       {
         "view": "devEnvironments.repositories",
         "contents": "No repository with a Dev Container configuration was found.\n[Refresh](command:devEnvironments.refresh)",
-        "when": "devEnvironments.signedIn && devEnvironments.loaded && !devEnvironments.loadFailed"
+        "when": "devEnvironments.signedIn && devEnvironments.loaded && !devEnvironments.loadFailed && !devEnvironments.dockerSetupRequired"
       },
       {
         "view": "devEnvironments.repositories",
         "contents": "The repository list could not be loaded. Check the internet connection and try again.\n[Refresh](command:devEnvironments.refresh)\n[Show Log](command:devEnvironments.showLog)",
-        "when": "devEnvironments.signedIn && devEnvironments.loadFailed"
+        "when": "devEnvironments.signedIn && devEnvironments.loadFailed && !devEnvironments.dockerSetupRequired"
       }
     ],
     "walkthroughs": [
