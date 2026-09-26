@@ -15,7 +15,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
-import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, Sidebar, type SidebarDeps } from './sidebar';
+import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SLOW_GROUPING_MS, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { TreeTexts, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
 
@@ -101,6 +101,7 @@ interface Harness {
   /** The settings that the sidebar reads; a test can change them. */
   settings: ExtensionSettings;
   logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
+  clock: { now: () => number };
 }
 
 function createHarness(): Harness {
@@ -179,6 +180,7 @@ function createHarness(): Harness {
     auth,
     settings,
     logger,
+    clock,
   };
 }
 
@@ -664,6 +666,26 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(3);
     // Without valid entries, the view lists the repositories as without the setting.
     expect(rows().map((row) => row.label)).toEqual(['api', 'web-shop']);
+  });
+
+  it('names the setting repositoryGroups once when grouping is slow, and never without patterns', async () => {
+    h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop')]));
+    await signedIn();
+    let now = 0;
+    const clockNow = vi.spyOn(h.clock, 'now').mockImplementation(() => (now += SLOW_GROUPING_MS));
+    const slow = () =>
+      fakeVscode.window.showWarningMessage.mock.calls.filter((call: unknown[]) => String(call[0]).includes('took'));
+    // Without patterns, a slow render is not about the setting.
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(0);
+    h.settings.repositoryGroups = ['^(web)-(.+)$'];
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(1);
+    expect(String(slow()[0][0])).toContain('devEnvLauncher.repositoryGroups');
+    expect(h.logger.warn).toHaveBeenCalledWith(slow()[0][0]);
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(1);
+    clockNow.mockRestore();
   });
 
   it('shows no part of a first load that failed', async () => {

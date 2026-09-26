@@ -45,6 +45,8 @@ export const RepositoryGroupTexts = {
     `The repository group ${entry} in the setting devEnvLauncher.repositoryGroups is ignored: its regular expression is not valid (${error}).`,
   ignoredFlags: (entry: string, flags: string) =>
     `The repository group ${entry} in the setting devEnvLauncher.repositoryGroups uses the flags "${flags}", which are ignored. Only the flags i, u, and s are allowed.`,
+  slow: (milliseconds: number) =>
+    `Grouping the repositories took ${milliseconds} ms. A regular expression in the setting devEnvLauncher.repositoryGroups may be slow, for example one with a nested repetition such as (a+)+. If VS Code stops responding, remove that entry from your settings.json.`,
 } as const;
 
 /**

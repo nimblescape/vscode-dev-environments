@@ -179,21 +179,22 @@ The list groups the repositories by owner. In each group, the repositories are i
 - **Order.** At every level, the group nodes come first in alphabetical order, then the rows in alphabetical order of their label.
 - **Expanded nodes.** A named node is expanded. The group levels are collapsed, except the nodes that hold the row of the environment of this window. VS Code remembers what the user expands or collapses.
 - **Invalid entries.** An entry of the wrong type, with an empty pattern, or with a regular expression that is not valid is ignored. The view shows a warning that names the entry and the error, once per window, and writes it to the log. With no valid entry, the view is the same as without the setting.
+- **Slow patterns.** The patterns run at each update of the view. A regular expression with a nested repetition, such as `(a+)+`, can take very long for some names and make VS Code stop responding. When one update with patterns takes 200 ms or more, the view names the setting once per window and writes it to the log; to recover, remove the entry from `settings.json`.
 
 Example: the setting `["^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$"]` shows the repositories `2025-3bWI-SWP-module-oop-hailo`, `2026-3cWI-SWP-module-oop-EnesHA81`, and `2026-3cWI-SWP-module-oop-felix-he021` of the owner `school` as:
 
 ```text
   ▾ school
-    ▸ 2025-3bWI-SWP
-        ▸ module-oop
+    ▾ 2025-3bWI-SWP
+        ▾ module-oop
             hailo
-    ▸ 2026-3cWI-SWP
-        ▸ module-oop
+    ▾ 2026-3cWI-SWP
+        ▾ module-oop
             EnesHA81
             felix-he021
 ```
 
-The tooltip of a row names the full `owner/name`.
+The example shows the nodes expanded. The tooltip of a row names the full `owner/name`.
 
 **Title bar.** **Select Organizations…** opens a list with the signed-in account (marked "your account"), every organization where the account is a member, and the owners of the setting `owners` that are in neither list, so that they can be removed. The current setting is selected. **OK** writes the selection to the setting `owners` (user settings), and the list loads again with the new scan scope (see [7.4](#74-repository-discovery)); no selection means all repositories. The icon is an empty filter while the setting is empty, and a filled filter while it limits the list. Without a sign-in, the command asks to sign in first.
 
