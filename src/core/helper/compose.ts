@@ -33,6 +33,7 @@ import {
   isOtherEnvironmentProjectName,
   isPathSource,
   parseMountString,
+  RESTART_POLICY,
   splitPortAddress,
   withLoopbackAddress,
 } from './hostAccess';
@@ -764,6 +765,23 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
       rewrites.push({ item: `${at}pull_policy ${service.pull_policy}`, reason: `Dev Environments pulls the images itself (${pullPolicy})` });
     }
     service.pull_policy = pullPolicy;
+    // Review round 7, P7-1: `always`/`unless-stopped` (the templates set it on the database) would start the container
+    // together with Docker, outside the Session Monitor (D-14): rewritten to `no`, not refused (it gives no access).
+    if (service.restart !== undefined && service.restart !== null && !RESTART_POLICY.test(String(service.restart))) {
+      rewrites.push({ item: `${at}restart ${String(service.restart)}`, reason: 'Dev Environments starts the containers itself (no)' });
+      service.restart = 'no';
+    }
+    // The same for `deploy.restart_policy`: a condition other than `none`/`on-failure` (also a missing one, which is
+    // `any`) becomes `none`.
+    if (isRecord(service.deploy) && isRecord(service.deploy.restart_policy)) {
+      const policy = service.deploy.restart_policy;
+      const condition = policy.condition;
+      if (condition !== 'none' && condition !== 'on-failure') {
+        const text = condition === undefined || condition === null ? '(none given, any)' : String(condition);
+        rewrites.push({ item: `${at}deploy.restart_policy.condition ${text}`, reason: 'Dev Environments starts the containers itself (none)' });
+        policy.condition = 'none';
+      }
+    }
     // Images that Compose builds: the name of the project, never a name that another environment could use too.
     if (!isDev && isRecord(service.build)) {
       const image = composeServiceImage(p.project, name);

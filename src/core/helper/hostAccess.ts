@@ -15,12 +15,12 @@
 // Pure functions, no I/O.
 import * as path from 'path';
 import {
+  analyzeDockerfileImages,
   cutAtSpace,
-  extractImageReferences,
   MAX_NESTING,
   MAX_REFERENCE_LENGTH,
   SHELL_NAME,
-  type DockerfileImageReference,
+  type DockerfileImages,
   type ImageReferenceKind,
 } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
@@ -569,7 +569,7 @@ export interface NamedImageReference {
  */
 export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
   return dockerfileReferences(text, args)
-    .filter(({ reference, unchecked, tooLong }) => !reference.includes('$') && unchecked === undefined && tooLong === undefined)
+    .references.filter(({ reference, unchecked, tooLong }) => !reference.includes('$') && unchecked === undefined && tooLong === undefined)
     .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
 }
 
@@ -578,14 +578,17 @@ export function dockerfileImageReferences(text: string, args: Readonly<Record<st
  * S3-3: the target stage can use a later stage with `COPY --from`), and the frontend that the build argument
  * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
  */
-function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImageReference[] {
-  const references = extractImageReferences(text, { ...args }, { withStages: true });
+function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
+  const images = analyzeDockerfileImages(text, { ...args }, { withStages: true });
+  // Review round 7 (S7-2): a Dockerfile that is too large is refused (dockerfileImageFindings), BUILDKIT_SYNTAX with it.
+  if (images.tooLarge === true) return images;
+  const references = images.references;
   // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
   const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
   if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
     references.unshift({ reference: syntax, kind: 'syntax' });
   }
-  return references;
+  return images;
 }
 
 /**
@@ -634,7 +637,16 @@ const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
  */
 export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
   const findings: HostAccessFinding[] = [];
-  for (const { reference, kind, unchecked, tooLong, stages } of dockerfileReferences(text, args)) {
+  const images = dockerfileReferences(text, args);
+  // Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS.
+  if (images.tooLarge === true) return [{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }];
+  // Review round 7 (S7-2): each stage name once, with the index of its first FROM (a reference names the first
+  // `stagesBefore` of them as stages), instead of a Set for each reference.
+  const firstStage = new Map<string, number>();
+  images.stageNames.forEach((name, index) => {
+    if (!firstStage.has(name)) firstStage.set(name, index);
+  });
+  for (const { reference, kind, unchecked, tooLong, tooComplex, stagesBefore } of images.references) {
     const what = DOCKERFILE_IMAGE_WHAT[kind];
     if (unchecked === 'protected') {
       findings.push({ item: `${what} ${shortReference(reference)} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
@@ -643,6 +655,11 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
     // Review round 6 (S6-1): before the variants, whose number grows with the length.
     if (tooLong === true || reference.length > MAX_REFERENCE_LENGTH) {
       findings.push(tooLongFinding(reference, what));
+      continue;
+    }
+    // Review round 7 (S7-1): the Dockerfile ran out of the budget of the pattern matcher.
+    if (tooComplex === true) {
+      findings.push({ item: `${what} ${shortReference(reference)} (the Dockerfile is too complex to check)`, class: 'unsupported' });
       continue;
     }
     if (unchecked === 'unsupported') {
@@ -671,8 +688,8 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
     // (for example `dev${TARGETVARIANT}env-…`), or give an operand of `:-` or `:+`.
     // Review round 6 (P6-2): a variant that names a stage (by its name, or by its index for `COPY --from` and
     // `RUN --mount from`) is no image, as extractImageReferences leaves out such a resolved text.
-    const stageNames = new Set(stages ?? []);
-    const isImage = (variant: string): boolean => !stageNames.has(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
+    const isStage = (name: string): boolean => (firstStage.get(name) ?? Infinity) < (stagesBefore ?? 0);
+    const isImage = (variant: string): boolean => !isStage(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
     const variants = unresolvedVariants(reference)?.filter(isImage);
     if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
       findings.push({

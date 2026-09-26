@@ -1600,3 +1600,99 @@ describe('review round 6 of unit 6 (S6-2)', () => {
     expect(h.logger.warnings.some((line) => line.includes('which is no configuration path'))).toBe(false);
   });
 });
+
+describe('review round 7 of unit 6 (P7-1, P7-2, D7-1)', () => {
+  it('opens a model with restart: unless-stopped (the templates), rewrites it to no, and logs it (P7-1)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.db.restart = 'unless-stopped';
+        m.services.db.deploy = { restart_policy: { condition: 'any' } };
+      }),
+    );
+    await h.service.open(TARGET, options());
+    expect(upModel().services.db.restart).toBe('no');
+    expect(upModel().services.db.deploy).toEqual({ restart_policy: { condition: 'none' } });
+    const changed = h.logger.infos.find((line) => line.startsWith('Changed in the Docker Compose model'));
+    expect(changed).toContain('service db: restart unless-stopped (Dev Environments starts the containers itself (no))');
+    expect(changed).toContain('service db: deploy.restart_policy.condition any');
+  });
+
+  it('takes the container state of an environment from its dev container, and marks running side services (P7-2)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true, servicesRunning: true });
+    await h.service.stop(ENV_ID);
+    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
+  });
+
+  it('reports a running dev container as running, and no dev container as missing (P7-2)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'running', volume: true });
+    h.docker.containers.delete(devContainer()!.id);
+    dbContainer()!.state = 'running';
+    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'missing', volume: true, servicesRunning: true });
+  });
+
+  /** The lines of the Docker log for `id`: `stop` must come before `rm`. */
+  function stopBeforeRemove(id: string): void {
+    const stop = h.docker.log.indexOf(`stop ${id}`);
+    const rm = h.docker.log.indexOf(`rm ${id}`);
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(rm).toBeGreaterThan(stop);
+  }
+
+  it('stops a running side service before Delete removes it (D7-1)', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    const db = dbContainer()!.id;
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    stopBeforeRemove(db);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+  });
+
+  it('removes a stopped side service at Delete without a stop (D7-1)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    const db = dbContainer()!.id;
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.log).not.toContain(`stop ${db}`);
+    expect(h.docker.log).toContain(`rm ${db}`);
+  });
+
+  it('removes a side service at Delete also when its stop fails (D7-1)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    const db = dbContainer()!.id;
+    const stop = h.docker.stopContainer.bind(h.docker);
+    h.docker.stopContainer = async (ref: string) => {
+      await stop(ref);
+      if (ref === db) throw new Error('stop timed out');
+    };
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.log).toContain(`rm ${db}`);
+    expect(h.logger.warnings.some((line) => line.includes('stop timed out'))).toBe(true);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  it('stops a running side service before the switch to a single container removes it (D7-1)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
+    const db = dbContainer()!.id;
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    stopBeforeRemove(db);
+  });
+
+  it('stops a running stray side service before it is removed next to a single container (D7-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    useSingle();
+    h.docker.images.add(DB_IMAGE);
+    const db = h.docker.addContainer({
+      environmentId: ENV_ID,
+      name: `${PROJECT}-db-1`,
+      state: 'running',
+      image: DB_IMAGE,
+      labels: { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db' },
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    stopBeforeRemove(db.id);
+  });
+});

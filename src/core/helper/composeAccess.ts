@@ -29,7 +29,6 @@ import {
   MAX_STOP_TIMEOUT_SECONDS,
   RESERVED_COMPOSE_LABEL,
   RESERVED_LABEL,
-  RESTART_POLICY,
   capabilityProblems,
   dockerfileImageFindings,
   dockerfileImageReferences,
@@ -259,8 +258,9 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   sysctls: allow,
   logging: loggingProblems,
   storage_opt: (value) => (isRecord(value) ? Object.keys(value).filter((key) => key !== 'size').map((key) => unsupported(`storage_opt ${key}`)) : []),
-  // `always` and `unless-stopped` would start the container together with Docker, outside the Session Monitor (D-14).
-  restart: (value) => (isUnset(value) || RESTART_POLICY.test(String(value)) ? [] : [unsupported(`restart ${String(value)}`)]),
+  // `always` and `unless-stopped` would start the container together with Docker, outside the Session Monitor (D-14):
+  // review round 7, P7-1, rewritten to `no` (rewriteModel in compose.ts), not refused; a restart gives no access.
+  restart: allow,
   stop_grace_period: (value) => {
     if (isUnset(value)) return [];
     const seconds = durationSeconds(value);
@@ -397,7 +397,7 @@ function loggingProblems(value: unknown): Problem[] {
 }
 
 /**
- * `deploy` (Swarm, out of scope): only limits of resources and the restart conditions `none`/`on-failure`; a GPU or
+ * `deploy` (Swarm, out of scope): only limits of resources and the restart condition (rewritten, P7-1); a GPU or
  * another device (`resources.reservations.devices`) is access to the computer.
  */
 function deployProblems(value: unknown): Problem[] {
@@ -422,7 +422,8 @@ function deployProblems(value: unknown): Problem[] {
     } else if (key === 'restart_policy' && isRecord(entry)) {
       for (const [name, setting] of Object.entries(entry)) {
         if (isUnset(setting)) continue;
-        if (name !== 'condition' || !['none', 'on-failure'].includes(String(setting))) {
+        // Review round 7, P7-1: every condition is allowed, rewriteModel makes one other than `none`/`on-failure` `none`.
+        if (name !== 'condition') {
           problems.push(unsupported(`deploy.restart_policy.${name} ${String(setting)}`));
         }
       }

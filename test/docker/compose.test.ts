@@ -131,6 +131,8 @@ describe('open pipeline for a Docker Compose configuration', () => {
   db:
     image: ${TEST_BASE_IMAGE}
     command: sleep infinity
+    # Review round 7 (P7-1): as the templates (Python & PostgreSQL); rewritten to no.
+    restart: unless-stopped
     ports:
       - "5432"
     volumes:
@@ -284,6 +286,10 @@ ${extra}volumes:
     expect(details?.State.Running).toBe(true);
     expect(details?.Config.Hostname).not.toBe('tiny-compose');
     expect(details?.Config.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_COMPOSE_SERVICE]: 'db', 'com.docker.compose.project': app.project });
+    // Review round 7 (P7-1): `restart: unless-stopped` of the compose file opens, and Docker never starts db by itself.
+    expect(details?.HostConfig.RestartPolicy?.Name).toBe('no');
+    expect(dev?.HostConfig.RestartPolicy?.Name ?? 'no').toBe('no');
+    expect(fs.readFileSync(log.file, 'utf8')).toContain('service db: restart unless-stopped');
     const ports = cli.lines(['port', db, '5432/tcp']);
     expect(ports.length).toBeGreaterThan(0);
     for (const binding of ports) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
@@ -355,8 +361,16 @@ ${extra}volumes:
     expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]).length).toBeGreaterThan(0);
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`]).length).toBeGreaterThan(0);
     expect(await service.removableServiceDataVolumes(app.id)).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
+    // Review round 7 (D7-1): a running db is stopped (its stop time) before `docker rm -f`, so that it shuts down cleanly.
+    const db = dbContainer();
+    cli.ok(['start', db]);
+    const logBefore = fs.readFileSync(log.file, 'utf8').length;
 
     await service.delete(app.id, { progress: new RecordingProgress(), additionalVolumesToRemove: [`${app.project}_cache`] });
+
+    const deleteLog = fs.readFileSync(log.file, 'utf8').slice(logBefore);
+    expect(deleteLog.indexOf(`Stopping container ${db}`)).toBeGreaterThanOrEqual(0);
+    expect(deleteLog.indexOf(`Removing container ${db}`)).toBeGreaterThan(deleteLog.indexOf(`Stopping container ${db}`));
 
     expect(containers(app)).toEqual([]);
     expect(cli.container(oneOff)).toBeUndefined();

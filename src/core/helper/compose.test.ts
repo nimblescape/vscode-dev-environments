@@ -398,7 +398,8 @@ describe('composeUpModel', () => {
         db: {
           image: 'postgres:16',
           pull_policy: 'missing',
-          restart: 'unless-stopped',
+          // Review round 7, P7-1: changed expectation, `restart: unless-stopped` is rewritten to `no`.
+          restart: 'no',
           labels: { 'devenv.environment-id': ID, 'devenv.compose-service': 'db', 'devenv.host-access': 'checked' },
           ports: [{ mode: 'ingress', target: 5432, published: '5432', protocol: 'tcp', host_ip: '127.0.0.1' }],
           volumes: [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data', volume: {} }],
@@ -415,8 +416,52 @@ describe('composeUpModel', () => {
       { item: 'service app: bind mount /workspaces → /workspaces', reason: 'the workspace volume is mounted there' },
       { item: 'service db: container_name db1', reason: 'removed: two environments of one repository would use the same name' },
       { item: 'service db: port 5432:5432', reason: 'published on 127.0.0.1 only' },
+      // Review round 7, P7-1: changed expectation, the rewrite of `restart` is logged.
+      { item: 'service db: restart unless-stopped', reason: 'Dev Environments starts the containers itself (no)' },
       { item: 'service app: build', reason: 'the environment image devenv-3f2a9c1e:7 is used' },
     ]);
+  });
+
+  // Review round 7, P7-1: the templates (Python & PostgreSQL, …) set `restart: unless-stopped` on the database.
+  it.each<[string, unknown, unknown]>([
+    ['always', 'always', 'no'],
+    ['unless-stopped', 'unless-stopped', 'no'],
+    ['no', 'no', 'no'],
+    ['on-failure', 'on-failure', 'on-failure'],
+    ['on-failure:3', 'on-failure:3', 'on-failure:3'],
+  ])('rewrites restart %s to a restart that Docker does not start by itself', (_name, value, expected) => {
+    for (const service of ['app', 'db']) {
+      const model = templateModel();
+      model.services[service].restart = value;
+      const { model: result, rewrites } = up(model);
+      expect(result.services[service].restart).toBe(expected);
+      const logged = rewrites.some((entry) => entry.item === `service ${service}: restart ${String(value)}`);
+      expect(logged).toBe(expected !== value);
+      expect(composeBuildModel(model, params()).model.services[service].restart).toBe(expected);
+    }
+  });
+
+  it('leaves a missing restart missing', () => {
+    const model = templateModel();
+    delete model.services.db.restart;
+    const { model: result, rewrites } = up(model);
+    expect(result.services.db.restart).toBeUndefined();
+    expect(rewrites.some((entry) => entry.item.includes('restart'))).toBe(false);
+  });
+
+  it.each<[string, Record<string, unknown>, Record<string, unknown>, boolean]>([
+    ['condition any', { condition: 'any' }, { condition: 'none' }, true],
+    ['no condition', { max_attempts: 3 }, { max_attempts: 3, condition: 'none' }, true],
+    ['an empty restart_policy', {}, { condition: 'none' }, true],
+    ['condition none', { condition: 'none' }, { condition: 'none' }, false],
+    ['condition on-failure', { condition: 'on-failure', max_attempts: 2 }, { condition: 'on-failure', max_attempts: 2 }, false],
+  ])('rewrites deploy.restart_policy with %s (review round 7, P7-1)', (_name, policy, expected, logged) => {
+    const model = templateModel();
+    model.services.db.deploy = { resources: { limits: { memory: '1g' } }, restart_policy: policy };
+    const { model: result, rewrites } = up(model);
+    expect(result.services.db.deploy).toEqual({ resources: { limits: { memory: '1g' } }, restart_policy: expected });
+    expect(rewrites.some((entry) => entry.item.startsWith('service db: deploy.restart_policy.condition'))).toBe(logged);
+    expect(model.services.db.deploy).toEqual({ resources: { limits: { memory: '1g' } }, restart_policy: policy });
   });
 
   it('does not change the model that it gets', () => {

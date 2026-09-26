@@ -234,6 +234,8 @@ Green always means that the container runs; the shape tells which window uses it
 
 **Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (green while the container runs, the grey ring while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
 
+**Other services of Docker Compose.** The state of a Docker Compose environment is the state of its dev container, the container that VS Code connects to. When the dev container is stopped or missing while another service still runs (for example a database), the row adds ` · services running` (for example `Stopped · services running`) with the tooltip line "Other services of Docker Compose run. Stop stops them.", and offers **Stop** as well as **Start** (review round 7 of unit 6, P7-2).
+
 **Actions in a row:**
 
 | Action | Shown when | Effect |

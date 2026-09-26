@@ -3,7 +3,21 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { cutAtSpace, detectSyntax, extractBaseImages, extractBuilderFlags, extractImageReferences, SHELL_NAME } from './dockerfile';
+import {
+  analyzeDockerfileImages,
+  cutAtSpace,
+  detectSyntax,
+  extractBaseImages,
+  extractBuilderFlags,
+  extractImageReferences,
+  MAX_DOCKERFILE_INSTRUCTIONS,
+  MAX_DOCKERFILE_LENGTH,
+  replaceShellPattern,
+  SHELL_NAME,
+  trimShellPrefix,
+  trimShellSuffix,
+} from './dockerfile';
+import { dockerfileImageFindings } from '../helper/hostAccess';
 
 describe('extractBaseImages', () => {
   it('returns the image of a single FROM', () => {
@@ -378,5 +392,204 @@ describe('review round 5 of unit 6 (S5-1, S5-3, P5-2)', () => {
     expect(cutAtSpace('a b c')).toBe('a');
     expect(cutAtSpace('a\tb')).toBe('a\tb');
     expect(cutAtSpace('a')).toBe('a');
+  });
+});
+
+describe('review round 7 of unit 6 (S7-1): the pattern matcher', () => {
+  /** Milliseconds that `fn` takes. */
+  function timed<T>(fn: () => T): { result: T; ms: number } {
+    const start = performance.now();
+    const result = fn();
+    return { result, ms: performance.now() - start };
+  }
+
+  it('evaluates ${A#*a*a*a*a*b} on 400 characters in linear time (before: 65 s)', () => {
+    const value = 'a'.repeat(400);
+    const { result, ms } = timed(() => extractImageReferences(`ARG A=${value}\nFROM \${A#*a*a*a*a*b}\n`));
+    expect(ms).toBeLessThan(1000);
+    // No match: the value stays.
+    expect(result).toEqual([{ reference: value, kind: 'FROM' }]);
+    expect(timed(() => extractImageReferences(`ARG A=${'a'.repeat(60_000)}\nFROM \${A#*a*a*a*a*b}\n`)).ms).toBeLessThan(1000);
+  });
+
+  it('evaluates ${A//*a*a*a*b/x} on 200 characters in linear time (before: 4 s)', () => {
+    const value = 'a'.repeat(200);
+    const { result, ms } = timed(() => extractImageReferences(`ARG A=${value}\nFROM alpine\${A//*a*a*a*b/x}\n`));
+    expect(ms).toBeLessThan(1000);
+    expect(result).toEqual([{ reference: `alpine${value}`, kind: 'FROM' }]);
+    const text = `ARG A=${'a'.repeat(60_000)}\n${Array.from({ length: 20 }, (_, i) => `ARG B${i}=\${A//a*b/x}`).join('\n')}\nFROM alpine\n`;
+    expect(timed(() => dockerfileImageFindings(text, {})).ms).toBeLessThan(1000);
+  });
+
+  it('refuses a Dockerfile that runs out of the budget of the matcher as too complex', () => {
+    const forms = Array.from({ length: 12 }, (_, i) => `ARG B${i}=\${A#*a*a*a*a*a*a*a*a*a*a*b}`).join('\n');
+    const text = `ARG A=${'a'.repeat(60_000)}\n${forms}\nFROM alpine:\${B11}\nCOPY --from=base:\${B0} / /\nFROM debian:\${A#a}\n`;
+    const { result, ms } = timed(() => extractImageReferences(text));
+    expect(ms).toBeLessThan(2000);
+    const late = result.find((reference) => reference.kind === 'FROM' && reference.reference.startsWith('alpine:'));
+    expect(late).toMatchObject({ unchecked: 'unsupported', tooComplex: true });
+    // After the budget ran out, no pattern form of the file is evaluated.
+    expect(result.find((reference) => reference.reference.startsWith('debian:'))).toMatchObject({ unchecked: 'unsupported', tooComplex: true });
+    // The variable keeps the form that was not evaluated.
+    expect(late?.reference).toBe('alpine:${A#*a*a*a*a*a*a*a*a*a*a*b}');
+    expect(dockerfileImageFindings(text, {})).toEqual([
+      { item: 'FROM image alpine:${A#*a*a*a*a*a*a*a*a*a*a*b} (the Dockerfile is too complex to check)', class: 'unsupported' },
+      { item: 'FROM image debian:${A#a} (the Dockerfile is too complex to check)', class: 'unsupported' },
+    ]);
+    // A value with `devenv` stays protected.
+    const protectedText = `ARG A=devenv-${'a'.repeat(60_000)}\n${forms}\nFROM alpine:\${B11}\n`;
+    expect(dockerfileImageFindings(protectedText, {}).map((finding) => finding.class)).toEqual(['protected']);
+  });
+
+  it('gives each Dockerfile a budget of its own', () => {
+    const forms = Array.from({ length: 12 }, (_, i) => `ARG B${i}=\${A#*a*a*a*a*a*a*a*a*a*a*b}`).join('\n');
+    extractImageReferences(`ARG A=${'a'.repeat(60_000)}\n${forms}\nFROM alpine\n`);
+    expect(extractImageReferences('ARG A=a.b.c\nFROM x:${A##*.}\n')).toEqual([{ reference: 'x:c', kind: 'FROM' }]);
+  });
+
+  // The implementation of review rounds 4 to 6: BuildKit's regular expression in JavaScript (a backtracking matcher).
+  function oracleRegex(pattern: string, greedy: boolean, anchored: boolean): RegExp | undefined {
+    const chars = Array.from(pattern);
+    let out = anchored ? '^' : '';
+    for (let i = 0; i < chars.length; i++) {
+      let char = chars[i];
+      if (char === '*') {
+        out += greedy ? '.*' : '.*?';
+        continue;
+      }
+      if (char === '?') {
+        out += '.';
+        continue;
+      }
+      if (char === '\\') {
+        if (chars[i + 1] === '}' || chars[i + 1] === '/') continue;
+        char = chars[++i];
+        if (char !== '*' && char !== '?' && char !== '\\') return undefined;
+        out += `\\${char}`;
+        continue;
+      }
+      out += /[[\]{}.+()|^$]/.test(char) ? `\\${char}` : char;
+    }
+    return new RegExp(out, 'u');
+  }
+  function oraclePrefix(pattern: string, value: string, greedy: boolean): string | undefined {
+    const regex = oracleRegex(pattern, greedy, true);
+    if (regex === undefined) return undefined;
+    const match = regex.exec(value);
+    return match ? value.slice(match.index + match[0].length) : value;
+  }
+  function oracleSuffix(pattern: string, value: string, greedy: boolean): string | undefined {
+    const chars = Array.from(pattern);
+    const reversed: string[] = new Array<string>(chars.length);
+    const last = chars.length - 1;
+    for (let i = 0; i <= last; ) {
+      const out = last - i;
+      if (chars[i] === '\\' && i !== last) {
+        reversed[out - 1] = chars[i];
+        reversed[out] = chars[i + 1];
+        i += 2;
+      } else {
+        reversed[out] = chars[i];
+        i++;
+      }
+    }
+    const trimmed = oraclePrefix(reversed.join(''), Array.from(value).reverse().join(''), greedy);
+    return trimmed === undefined ? undefined : Array.from(trimmed).reverse().join('');
+  }
+  function oracleReplace(pattern: string, replacement: string, value: string, all: boolean): string | undefined {
+    const regex = oracleRegex(pattern, true, false);
+    if (regex === undefined) return undefined;
+    const global = new RegExp(regex.source, `${regex.flags}g`);
+    const width = (index: number): number => ((value.codePointAt(index) ?? 0) > 0xffff ? 2 : 1);
+    let result = '';
+    let position = 0;
+    let previousEnd = -1;
+    let searchFrom = 0;
+    while (searchFrom <= value.length) {
+      global.lastIndex = searchFrom;
+      const match = global.exec(value);
+      if (match === null) break;
+      const matchStart = match.index;
+      const matchEnd = matchStart + match[0].length;
+      if (matchEnd === matchStart && matchStart === previousEnd) {
+        searchFrom = matchStart + width(matchStart);
+        continue;
+      }
+      result += value.slice(position, matchStart) + replacement;
+      position = matchEnd;
+      previousEnd = matchEnd;
+      if (!all) break;
+      searchFrom = matchEnd > matchStart ? matchEnd : matchStart + width(matchStart);
+    }
+    return result + value.slice(position);
+  }
+
+  it('gives the results of the regular expressions of review round 4 on a random corpus', () => {
+    let seed = 7;
+    const random = (): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const pick = <T,>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
+    const VALUE = ['a', 'b', 'c', 'a', 'b', '.', '/', '*', '?', '[', '\n', '\u{1F600}', '-'];
+    const PATTERN = ['a', 'b', 'c', '*', '*', '?', '.', '/', '[', '\\*', '\\?', '\\\\', '\\}', '\\/', '\u{1F600}', '\\x'];
+    let compared = 0;
+    for (let n = 0; n < 4000; n++) {
+      const value = Array.from({ length: Math.floor(random() * 10) }, () => pick(VALUE)).join('');
+      const pattern = Array.from({ length: Math.floor(random() * 6) }, () => pick(PATTERN)).join('');
+      const context = JSON.stringify({ value, pattern });
+      for (const greedy of [false, true]) {
+        expect(trimShellPrefix(pattern, value, greedy), `# ${greedy} ${context}`).toBe(oraclePrefix(pattern, value, greedy));
+        expect(trimShellSuffix(pattern, value, greedy), `% ${greedy} ${context}`).toBe(oracleSuffix(pattern, value, greedy));
+      }
+      for (const all of [false, true]) expect(replaceShellPattern(pattern, 'X', value, all), `/ ${all} ${context}`).toBe(oracleReplace(pattern, 'X', value, all));
+      compared++;
+    }
+    expect(compared).toBe(4000);
+  });
+});
+
+describe('review round 7 of unit 6 (S7-2): large Dockerfiles', () => {
+  it('reads 20000 references with 10000 stages in linear time', () => {
+    const n = 10_000;
+    const text = `${Array.from({ length: n }, (_, i) => `FROM a AS s${i}`).join('\n')}\n${Array.from({ length: n }, (_, i) => `COPY --from=$Y${i} a b`).join('\n')}\n`;
+    const heap = process.memoryUsage().heapUsed;
+    const start = performance.now();
+    const findings = dockerfileImageFindings(text, {});
+    expect(performance.now() - start).toBeLessThan(1000);
+    // Before: 8 s and 600 MB (a copy of the stage names for each reference).
+    expect(process.memoryUsage().heapUsed - heap).toBeLessThan(300 * 1024 * 1024);
+    expect(findings).toEqual([]);
+    const images = analyzeDockerfileImages(text, {}, { withStages: true });
+    expect(images.stageNames).toHaveLength(n);
+    expect(images.references.filter((reference) => reference.kind === 'COPY --from').every((reference) => reference.stagesBefore === n)).toBe(true);
+  });
+
+  it('reads 20000 FROM images in linear time', () => {
+    const text = `${Array.from({ length: MAX_DOCKERFILE_INSTRUCTIONS }, (_, i) => `FROM a${i}`).join('\n')}\n`;
+    const start = performance.now();
+    expect(extractImageReferences(text)).toHaveLength(MAX_DOCKERFILE_INSTRUCTIONS);
+    expect(dockerfileImageFindings(text, {})).toEqual([]);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it('keeps the stages of a reference with a variable apart: FROM the earlier ones, the others all', () => {
+    const images = analyzeDockerfileImages('FROM a AS one\nFROM $TARGETARCH AS two\nFROM b AS three\nCOPY --from=$Y / /\n', {}, { withStages: true });
+    expect(images.stageNames).toEqual(['one', 'two', 'three']);
+    expect(images.references).toEqual([
+      { reference: 'a', kind: 'FROM' },
+      { reference: '$TARGETARCH', kind: 'FROM', stagesBefore: 1 },
+      { reference: 'b', kind: 'FROM' },
+      { reference: '$Y', kind: 'COPY --from', stagesBefore: 3 },
+    ]);
+  });
+
+  it('refuses a Dockerfile with more instructions or characters than the check reads', () => {
+    const many = `${Array.from({ length: MAX_DOCKERFILE_INSTRUCTIONS + 1 }, (_, i) => `FROM a${i}`).join('\n')}\n`;
+    expect(analyzeDockerfileImages(many)).toEqual({ references: [], stageNames: [], tooLarge: true });
+    expect(dockerfileImageFindings(many, {})).toEqual([{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }]);
+    const long = `FROM alpine\n# ${'x'.repeat(MAX_DOCKERFILE_LENGTH)}\n`;
+    expect(dockerfileImageFindings(long, {})).toEqual([{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }]);
+    expect(dockerfileImageFindings(`FROM devenv-11111111:1\n# ${'x'.repeat(MAX_DOCKERFILE_LENGTH)}\n`, { BUILDKIT_SYNTAX: 'evil/frontend' })).toHaveLength(1);
   });
 });

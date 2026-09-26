@@ -242,6 +242,11 @@ export const StateTexts = {
    * or `Stopped · kept` (Keep Running When Closed; user decision 2026-09-26, "go with the proposal for closing").
    */
   kept: 'kept',
+  /**
+   * Review round 7, P7-2: the suffix of the state text of an environment whose dev container does not run while another
+   * service of Docker Compose runs, for example `Stopped · services running` (Stop stays offered).
+   */
+  servicesRunning: 'services running',
 } as const;
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */

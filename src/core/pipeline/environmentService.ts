@@ -347,8 +347,14 @@ export interface OpenResult {
 }
 
 export interface EnvironmentRuntimeState {
+  /** Review round 7, P7-2: the state of the dev container only (isDevContainer), not of the other services. */
   container: ContainerState;
   volume: boolean;
+  /**
+   * Review round 7, P7-2: `true` when a container of another service of Docker Compose (label devenv.compose-service)
+   * runs; not set otherwise. Stop stays offered while it runs, also when the dev container is stopped.
+   */
+  servicesRunning?: boolean;
 }
 
 const BUSY_POLL_MS = 500;
@@ -2363,6 +2369,7 @@ export class EnvironmentService {
         this.logger.info(
           `The container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${env.repository} is left over next to its single container. It is removed; its volumes are kept.`,
         );
+        await this.stopServiceBeforeRemoval(container, env);
         await this.deps.docker.removeContainer(container.id);
       }
       services = [];
@@ -3123,6 +3130,7 @@ export class EnvironmentService {
       this.logger.info(
         `The configuration of ${ctx.env.repository} no longer uses Docker Compose: the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} is removed. Its volumes are kept.`,
       );
+      await this.stopServiceBeforeRemoval(container, ctx.env);
       await this.deps.docker.removeContainer(container.id);
       (ctx.kindSwitchRemoved ??= []).push(`the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]}`);
     }
@@ -3199,6 +3207,22 @@ export class EnvironmentService {
   }
 
   /** The running containers of the other services of a Docker Compose environment are stopped (label devenv.compose-service). */
+  /**
+   * Review round 7, D7-1: a running container of another service of Docker Compose (label devenv.compose-service) is
+   * stopped before `docker rm -f` removes it, so that it can shut down cleanly (for example a database whose volume is
+   * kept) instead of a SIGKILL. `docker stop` gives it its own stop time (`stop_grace_period`, which the policy caps at
+   * 20 s, else 10 s). A failed stop is logged; the removal follows anyway.
+   */
+  private async stopServiceBeforeRemoval(container: ContainerInfo, env: Environment): Promise<void> {
+    if (container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.state !== 'running') return;
+    this.logger.info(`Stopping the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${env.repository} before it is removed.`);
+    try {
+      await this.deps.docker.stopContainer(container.id);
+    } catch (error) {
+      this.logger.warn(`The container ${container.name} could not be stopped, it is removed anyway: ${errorMessage(error)}`);
+    }
+  }
+
   private async stopServices(env: Environment): Promise<void> {
     const services = (await this.environmentContainers(env.id)).filter(
       (container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined && container.state === 'running',
@@ -3279,7 +3303,10 @@ export class EnvironmentService {
     try {
       // Step 3: container, environment image, unused base images.
       const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
-      for (const container of containers) await docker.removeContainer(container.id);
+      for (const container of containers) {
+        await this.stopServiceBeforeRemoval(container, env);
+        await docker.removeContainer(container.id);
+      }
       await docker.removeContainer(env.containerName);
       // Docker Compose: the other containers, the networks, and the built images of the project too.
       const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)));
@@ -3506,17 +3533,29 @@ export class EnvironmentService {
         docker.listEnvironmentContainers(),
         docker.listEnvironmentVolumes(),
       ]);
+      // Review round 7, P7-2: the state of the environment is the one of its dev container; a running container of another
+      // service of Docker Compose only sets servicesRunning (before: any running container made it "running").
+      const containerNames = new Map(environments.map((env) => [env.id, env.containerName]));
       const containerStates = new Map<string, ContainerState>();
+      const servicesRunning = new Set<string>();
       for (const container of containers) {
         const id = container.labels[LABEL_ENVIRONMENT_ID];
-        if (id && containerStates.get(id) !== 'running') containerStates.set(id, container.state);
+        const containerName = id === undefined ? undefined : containerNames.get(id);
+        if (!id || containerName === undefined) continue;
+        if (!isDevContainer(container, containerName)) {
+          if (container.state === 'running') servicesRunning.add(id);
+        } else if (containerStates.get(id) !== 'running') {
+          containerStates.set(id, container.state);
+        }
       }
       const volumeNames = new Set(volumes.map((volume) => volume.name));
       const states = new Map<string, EnvironmentRuntimeState>();
       for (const env of environments) {
         // A volume without the labels (created outside of this extension) is found by its name.
         const volume = volumeNames.has(env.volumeName) || (await docker.volumeExists(env.volumeName));
-        states.set(env.id, { container: containerStates.get(env.id) ?? 'missing', volume });
+        const state: EnvironmentRuntimeState = { container: containerStates.get(env.id) ?? 'missing', volume };
+        if (servicesRunning.has(env.id)) state.servicesRunning = true;
+        states.set(env.id, state);
       }
       return states;
     } catch (error) {

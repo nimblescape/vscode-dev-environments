@@ -50,7 +50,14 @@ interface Instruction {
  * Value of a variable: `{ value: undefined }` is unset; `'unresolved'` keeps the variable text in the result. `unchecked`:
  * the value came from an expansion that could not be evaluated (Expansion.unchecked).
  */
-type Lookup = (name: string) => { value: string | undefined; unchecked?: UncheckedClass } | 'unresolved';
+type Lookup = (name: string) => LookupValue | 'unresolved';
+
+/** A value of Lookup; `tooComplex`: its expansion ran out of the budget of the pattern matcher (review round 7, S7-1). */
+interface LookupValue {
+  value: string | undefined;
+  unchecked?: UncheckedClass;
+  tooComplex?: boolean;
+}
 
 /**
  * Review round 4 (S4-3): how a reference whose expansion could not be evaluated is refused. `protected`: the value of the
@@ -64,11 +71,22 @@ interface Expansion {
   unresolved?: boolean;
   /** extractBaseImages: the pattern operators stay unevaluated (the reference keeps its `$` and is skipped). */
   keepPatterns?: boolean;
+  /**
+   * Review round 7 (S7-1): a pattern form was not evaluated because the Dockerfile ran out of the budget of the pattern
+   * matcher (MAX_PATTERN_STEPS); `unchecked` is set too.
+   */
+  tooComplex?: boolean;
 }
 
 function markUnchecked(state: Expansion | undefined, value: UncheckedClass | undefined): void {
   if (state === undefined || value === undefined) return;
   if (state.unchecked !== 'protected') state.unchecked = value;
+}
+
+/** What the value of a variable brings into an expansion: its class, and whether it was too complex (S7-1). */
+function markFound(state: Expansion | undefined, found: LookupValue): void {
+  markUnchecked(state, found.unchecked);
+  if (state !== undefined && found.tooComplex === true) state.tooComplex = true;
 }
 
 /**
@@ -151,10 +169,32 @@ export interface DockerfileImageReference {
    */
   tooLong?: true;
   /**
-   * Review round 6 (P6-2), with the option `withStages`, for a reference with a variable that is not resolved: the stage
-   * names (lower case) that the reference names as a stage instead of an image (for FROM the earlier stages, else all).
+   * Review round 7 (S7-1): a pattern form of the reference (or of a variable that it uses) was not evaluated because the
+   * Dockerfile ran out of the budget of the pattern matcher (MAX_PATTERN_STEPS); `unchecked` is set too.
    */
-  stages?: string[];
+  tooComplex?: true;
+  /**
+   * Review round 6 (P6-2), with the option `withStages`, for a reference with a variable that is not resolved: the stage names that the reference names
+   * as a stage instead of an image are the first `stagesBefore` entries of DockerfileImages.stageNames (for FROM the
+   * earlier stages, else all). Review round 7 (S7-2): a count instead of a copy of the names for each reference.
+   */
+  stagesBefore?: number;
+}
+
+/**
+ * Review round 7 (S7-2): the largest Dockerfile (in characters) and the most instructions that the check reads; a larger
+ * one is refused as unsupported (the Dockerfile is too large to check).
+ */
+export const MAX_DOCKERFILE_LENGTH = 1024 * 1024;
+export const MAX_DOCKERFILE_INSTRUCTIONS = 20_000;
+
+/** The images of a Dockerfile (analyzeDockerfileImages). */
+export interface DockerfileImages {
+  references: DockerfileImageReference[];
+  /** The stage names (lower case) of the FROM instructions with `AS`, in the order of the file (DockerfileImageReference.stagesBefore). */
+  stageNames: string[];
+  /** Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS; no references. */
+  tooLarge?: true;
 }
 
 /**
@@ -165,54 +205,94 @@ export interface DockerfileImageReference {
  * and stage indexes (`--from=0`) are not images and are left out, and so is `scratch`. Variables of a stage: its ARGs
  * (with `buildArgs`) and ENVs; any other variable stays unresolved (the text keeps its `$`). `ADD` has no `--from`. With
  * `target`, the stages after the target stage are not included, as in extractBaseImages. In order, without duplicates.
+ * A Dockerfile that is too large (analyzeDockerfileImages) gives no references.
  */
 export function extractImageReferences(
   dockerfileText: string,
   buildArgs?: Record<string, string>,
   options: { target?: string; withStages?: boolean } = {},
 ): DockerfileImageReference[] {
+  return analyzeDockerfileImages(dockerfileText, buildArgs, options).references;
+}
+
+/**
+ * extractImageReferences with the stage names of the file (DockerfileImageReference.stagesBefore). Review round 7: a
+ * Dockerfile longer than MAX_DOCKERFILE_LENGTH or with more instructions than MAX_DOCKERFILE_INSTRUCTIONS is not read
+ * (`tooLarge`, S7-2); all pattern forms of the file share one budget of the matcher (MAX_PATTERN_STEPS, S7-1).
+ */
+export function analyzeDockerfileImages(
+  dockerfileText: string,
+  buildArgs?: Record<string, string>,
+  options: { target?: string; withStages?: boolean } = {},
+): DockerfileImages {
+  if (dockerfileText.length > MAX_DOCKERFILE_LENGTH) return { references: [], stageNames: [], tooLarge: true };
   const { escape, syntax, instructions } = parseInstructions(dockerfileText);
+  if (instructions.length > MAX_DOCKERFILE_INSTRUCTIONS) return { references: [], stageNames: [], tooLarge: true };
+  return withPatternBudget(() => readImageReferences(escape, syntax, instructions, buildArgs, options));
+}
+
+function readImageReferences(
+  escape: string,
+  syntax: string | undefined,
+  instructions: readonly Instruction[],
+  buildArgs: Record<string, string> | undefined,
+  options: { target?: string; withStages?: boolean },
+): DockerfileImages {
   const override = (name: string): string | undefined =>
     buildArgs && Object.prototype.hasOwnProperty.call(buildArgs, name) ? buildArgs[name] : undefined;
   const globals = new Map<string, string | undefined>();
-  // Review round 4 (S4-3): the variables whose value came from an expansion that could not be evaluated.
+  // Review round 4 (S4-3): the variables whose value came from an expansion that could not be evaluated; review round 7
+  // (S7-1): or that ran out of the budget of the pattern matcher.
   const globalUnchecked = new Map<string, UncheckedClass>();
+  const globalComplex = new Set<string>();
   const globalLookup: Lookup = (name) => {
     if (PLATFORM_ARGS.has(name)) return override(name) !== undefined ? { value: override(name) } : 'unresolved';
     if (!globals.has(name)) return { value: undefined };
     if (override(name) !== undefined) return { value: override(name) };
-    return withUnchecked(globals.get(name), globalUnchecked.get(name));
+    return withUnchecked(globals.get(name), globalUnchecked.get(name), globalComplex.has(name));
   };
   // The variables of the current stage; `null`: declared, but its value is not known here (a platform ARG).
   let stage = new Map<string, string | undefined | null>();
   let stageUnchecked = new Map<string, UncheckedClass>();
+  let stageComplex = new Set<string>();
   const stageLookup: Lookup = (name) => {
     if (!stage.has(name)) return 'unresolved';
     const value = stage.get(name);
-    return value === null ? 'unresolved' : withUnchecked(value, stageUnchecked.get(name));
+    return value === null ? 'unresolved' : withUnchecked(value, stageUnchecked.get(name), stageComplex.has(name));
   };
   /** Sets a variable of the current stage (or of the global scope) with what its expansion met. */
   const setVariable = (scope: 'global' | 'stage', name: string, value: string | undefined | null, state?: Expansion): void => {
-    const values = scope === 'global' ? globals : stage;
     const unchecked = scope === 'global' ? globalUnchecked : stageUnchecked;
+    const complex = scope === 'global' ? globalComplex : stageComplex;
     if (scope === 'global') globals.set(name, value ?? undefined);
-    else values.set(name, value);
+    else stage.set(name, value);
     if (state?.unchecked !== undefined) unchecked.set(name, state.unchecked);
     else unchecked.delete(name);
+    if (state?.tooComplex === true) complex.add(name);
+    else complex.delete(name);
   };
 
+  // The stage names in the order of the file (review round 7, S7-2: one list; a reference keeps a count of it).
+  const stageNames: string[] = [];
   const stages = new Set<string>();
   for (const instruction of instructions) {
     if (instruction.keyword !== 'FROM') continue;
     const words = instruction.args.split(/\s+/).filter((word) => word !== '');
     while (words.length > 0 && words[0].startsWith('--')) words.shift();
-    if (words.length >= 3 && words[1].toLowerCase() === 'as') stages.add(words[2].toLowerCase());
+    if (words.length >= 3 && words[1].toLowerCase() === 'as') {
+      const name = words[2].toLowerCase();
+      stageNames.push(name);
+      stages.add(name);
+    }
   }
 
   const result: DockerfileImageReference[] = [];
-  const seen = new Set<string>();
-  // FROM: only the stages before it, as in extractBaseImages (the conservative side for a later name).
+  // Review round 7 (S7-2): the references by `${kind} ${text}`, instead of a search of the list for each one.
+  const known = new Map<string, DockerfileImageReference>();
+  // FROM: only the stages before it, as in extractBaseImages (the conservative side for a later name): the first
+  // `earlierCount` entries of stageNames, whose names are in `earlier`.
   const earlier = new Set<string>();
+  let earlierCount = 0;
   const add = (reference: string, kind: ImageReferenceKind, state?: Expansion, raw?: string): void => {
     // Review round 6 (S6-1): a value longer than MAX_REFERENCE_LENGTH is kept as it is written, as too long.
     const tooLong = (raw !== undefined && raw.length > MAX_REFERENCE_LENGTH) || reference.trim().length > MAX_REFERENCE_LENGTH;
@@ -220,21 +300,24 @@ export function extractImageReferences(
     const key = text.toLowerCase();
     const isStage = kind === 'FROM' ? earlier.has(key) : stages.has(key);
     if (!tooLong && (text === '' || key === 'scratch' || isStage || (kind !== 'FROM' && /^\d+$/.test(text)))) return;
-    const known = result.find((other) => other.kind === kind && other.reference === text);
-    if (known) {
-      if (state?.unchecked !== undefined && known.unchecked !== 'protected') known.unchecked = state.unchecked;
-      if (tooLong) known.tooLong = true;
+    const tooComplex = state?.tooComplex === true;
+    const entry = known.get(`${kind} ${text}`);
+    if (entry) {
+      if (state?.unchecked !== undefined && entry.unchecked !== 'protected') entry.unchecked = state.unchecked;
+      if (tooLong) entry.tooLong = true;
+      if (tooComplex) entry.tooComplex = true;
       return;
     }
-    if (seen.has(`${kind} ${text}`)) return;
-    seen.add(`${kind} ${text}`);
-    result.push({
+    const created: DockerfileImageReference = {
       reference: text,
       kind,
       ...(state?.unchecked !== undefined ? { unchecked: state.unchecked } : {}),
       ...(tooLong ? { tooLong: true as const } : {}),
-      ...(options.withStages === true && text.includes('$') ? { stages: [...(kind === 'FROM' ? earlier : stages)] } : {}),
-    });
+      ...(tooComplex ? { tooComplex: true as const } : {}),
+      ...(options.withStages === true && text.includes('$') ? { stagesBefore: kind === 'FROM' ? earlierCount : stageNames.length } : {}),
+    };
+    known.set(`${kind} ${text}`, created);
+    result.push(created);
   };
   /** Expands a reference, noting what the expansion met (review round 4, S4-3). */
   const reference = (word: string, lookup: Lookup): { text: string; state: Expansion } => {
@@ -263,7 +346,12 @@ export function extractImageReferences(
         if (override(name) !== undefined) setVariable('stage', name, override(name));
         else if (defaultValue !== undefined) setVariable('stage', name, defaultValue, state);
         else if (PLATFORM_ARGS.has(name)) setVariable('stage', name, null);
-        else setVariable('stage', name, globals.get(name), globalUnchecked.has(name) ? { unchecked: globalUnchecked.get(name) } : undefined);
+        else {
+          const inherited: Expansion = {};
+          if (globalUnchecked.has(name)) inherited.unchecked = globalUnchecked.get(name);
+          if (globalComplex.has(name)) inherited.tooComplex = true;
+          setVariable('stage', name, globals.get(name), inherited);
+        }
       }
       continue;
     }
@@ -272,13 +360,17 @@ export function extractImageReferences(
       fromSeen = true;
       stage = new Map();
       stageUnchecked = new Map();
+      stageComplex = new Set();
       const words = instruction.args.split(/\s+/).filter((word) => word !== '');
       while (words.length > 0 && words[0].startsWith('--')) words.shift();
       if (words.length === 0) continue;
       const from = reference(words[0], globalLookup);
       add(from.text, 'FROM', from.state, words[0]);
       const name = words.length >= 3 && words[1].toLowerCase() === 'as' ? words[2].toLowerCase() : undefined;
-      if (name !== undefined) earlier.add(name);
+      if (name !== undefined) {
+        earlier.add(name);
+        earlierCount++;
+      }
       if (target && name === target) targetDone = true;
       continue;
     }
@@ -323,7 +415,7 @@ export function extractImageReferences(
       }
     }
   }
-  return result;
+  return { references: result, stageNames };
 }
 
 /**
@@ -576,8 +668,10 @@ function splitWords(text: string, escape: string): string[] {
   return words;
 }
 
-function withUnchecked(value: string | undefined, unchecked: UncheckedClass | undefined): { value: string | undefined; unchecked?: UncheckedClass } {
-  return unchecked !== undefined ? { value, unchecked } : { value };
+function withUnchecked(value: string | undefined, unchecked: UncheckedClass | undefined, tooComplex = false): LookupValue {
+  const found: LookupValue = unchecked !== undefined ? { value, unchecked } : { value };
+  if (tooComplex) found.tooComplex = true;
+  return found;
 }
 
 /**
@@ -635,7 +729,7 @@ function expand(word: string, lookup: Lookup, escape: string, state?: Expansion,
 /**
  * Expands the variable at `word[start] === '$'`. An unresolvable variable keeps its text, so the result contains `$`.
  * Review round 4 (S4-3): the pattern operators of BuildKit's shell lexer (`${VAR#p}`, `${VAR##p}`, `${VAR%p}`,
- * `${VAR%%p}`, `${VAR/p/r}`, `${VAR//p/r}`) are evaluated as BuildKit evaluates them (shellPatternRegex); a form that
+ * `${VAR%%p}`, `${VAR/p/r}`, `${VAR//p/r}`) are evaluated as BuildKit evaluates them (matchShellPattern); a form that
  * cannot be evaluated keeps its text and is marked in `state` (UncheckedClass).
  */
 function expandVariable(word: string, start: number, lookup: Lookup, escape: string, state?: Expansion): { text: string; end: number } {
@@ -651,7 +745,7 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
       const next = word[end];
       return { text: next === escape || next === '"' || next === "'" ? `\${${name}}` : word.slice(start, end), end };
     }
-    markUnchecked(state, found.unchecked);
+    markFound(state, found);
     return { text: found.value ?? '', end };
   }
 
@@ -699,16 +793,20 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
     if (!/^(|:?[-+?][\s\S]*)$/.test(modifier)) markUnchecked(state, 'protected');
     return { text: raw, end };
   }
-  markUnchecked(state, found.unchecked);
+  markFound(state, found);
   if (state?.keepPatterns === true && /^[#%/]/.test(modifier)) return { text: raw, end };
 
   const value = found.value;
   const isSet = value !== undefined;
   const isNonEmpty = isSet && value !== '';
   const operand = (length: number) => expand(modifier.slice(length), lookup, escape, state);
-  /** A form that cannot be evaluated: refused as protected when the value holds `devenv`, else as unsupported. */
-  const unevaluated = (): { text: string; end: number } => {
+  /**
+   * A form that cannot be evaluated: refused as protected when the value holds `devenv`, else as unsupported. `result`
+   * `'budget'`: the Dockerfile ran out of the budget of the pattern matcher (review round 7, S7-1).
+   */
+  const unevaluated = (result?: 'budget'): { text: string; end: number } => {
     markUnchecked(state, /devenv/i.test(value ?? '') ? 'protected' : 'unsupported');
+    if (result === 'budget' && state !== undefined) state.tooComplex = true;
     return { text: raw, end };
   };
   /** A pattern or a replacement as BuildKit reads it (escapes kept); `undefined` when a variable in it is not resolved. */
@@ -716,6 +814,7 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
     const own: Expansion = {};
     const result = expand(text, lookup, escape, own, true);
     markUnchecked(state, own.unchecked);
+    if (state !== undefined && own.tooComplex === true) state.tooComplex = true;
     return own.unresolved === true || own.unchecked !== undefined ? undefined : result;
   };
 
@@ -732,8 +831,9 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
     if (pattern === undefined || (escape !== '\\' && pattern.includes(escape))) return unevaluated();
     const greedy = pattern.startsWith(operator);
     if (greedy) pattern = pattern.slice(1);
-    const trimmed = operator === '#' ? trimPrefix(pattern, value ?? '', greedy) : trimSuffix(pattern, value ?? '', greedy);
-    return trimmed === undefined ? unevaluated() : { text: trimmed, end };
+    // Review round 7 (S7-1): a linear matcher instead of a backtracking regular expression.
+    const trimmed = operator === '#' ? trimShellPrefix(pattern, value ?? '', greedy) : trimShellSuffix(pattern, value ?? '', greedy);
+    return trimmed === undefined || trimmed === 'budget' ? unevaluated(trimmed) : { text: trimmed, end };
   }
   if (modifier.startsWith('/')) {
     const all = modifier.startsWith('//');
@@ -746,8 +846,8 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
     if (pattern === undefined || replacement === undefined || replacement.includes('$') || (escape !== '\\' && pattern.includes(escape))) {
       return unevaluated();
     }
-    const replaced = replacePattern(pattern, replacement, value ?? '', all);
-    return replaced === undefined ? unevaluated() : { text: replaced, end };
+    const replaced = replaceShellPattern(pattern, replacement, value ?? '', all);
+    return replaced === undefined || replaced === 'budget' ? unevaluated(replaced) : { text: replaced, end };
   }
   // An operator that BuildKit's shell lexer does not know (for example `${VAR:#x}` or `${VAR:1}`).
   return unevaluated();
@@ -781,53 +881,178 @@ function topLevelIndex(text: string, stop: string, escape: string): number {
 }
 
 /**
- * A shell pattern as a regular expression, as `convertShellPatternToRegex` of BuildKit's shell lexer converts it (review
- * round 4, S4-3): `*` any text (shortest unless `greedy`), `?` one character, `\*`, `\?`, `\\` the character itself,
- * `\}` and `\/` the character after the backslash; every other character stands for itself (also `[`: BuildKit has no
- * bracket expressions). `undefined` for a pattern that BuildKit refuses (another escape).
+ * Review round 7 (S7-1): the most steps that the pattern matcher may take for one Dockerfile (all its `${VAR#p}`,
+ * `${VAR%p}`, and `${VAR/p/r}` together): a step is one position of the value for one state of the pattern, so the sum of
+ * value length × pattern length. Beyond it, the forms are not evaluated, and the reference is refused as unsupported
+ * (the Dockerfile is too complex to check).
  */
-export function shellPatternRegex(pattern: string, greedy: boolean, anchored: boolean): RegExp | undefined {
+export const MAX_PATTERN_STEPS = 10_000_000;
+
+/** Review round 7 (S7-1): the steps that the pattern matcher has left for the Dockerfile that is being read. */
+export interface PatternBudget {
+  steps: number;
+  exceeded?: boolean;
+}
+
+/** One element of a shell pattern: a character, `?` (any one character), or `*` (any text). */
+type PatternToken = { kind: 'char'; char: string } | { kind: 'any' } | { kind: 'star' };
+
+/**
+ * A shell pattern as `convertShellPatternToRegex` of BuildKit's shell lexer reads it (review round 4, S4-3): `*` any
+ * text, `?` one character, `\*`, `\?`, `\\` the character itself, `\}` and `\/` the character after the backslash;
+ * every other character stands for itself (also `[`: BuildKit has no bracket expressions). `undefined` for a pattern that
+ * BuildKit refuses (another escape). By code points, as Go's regexp reads UTF-8.
+ */
+export function parseShellPattern(pattern: string): PatternToken[] | undefined {
   const chars = Array.from(pattern);
-  let out = anchored ? '^' : '';
+  const tokens: PatternToken[] = [];
   for (let i = 0; i < chars.length; i++) {
     let char = chars[i];
     if (char === '*') {
-      out += greedy ? '.*' : '.*?';
+      tokens.push({ kind: 'star' });
       continue;
     }
     if (char === '?') {
-      out += '.';
+      tokens.push({ kind: 'any' });
       continue;
     }
     if (char === '\\') {
       if (chars[i + 1] === '}' || chars[i + 1] === '/') continue;
       char = chars[++i];
       if (char !== '*' && char !== '?' && char !== '\\') return undefined;
-      out += `\\${char}`;
-      continue;
     }
-    out += /[[\]{}.+()|^$]/.test(char) ? `\\${char}` : char;
+    tokens.push({ kind: 'char', char });
   }
+  return tokens;
+}
+
+/**
+ * Review round 7 (S7-1): the match of a shell pattern (parseShellPattern) in `value` (code points) that Go's regexp
+ * finds for the regular expression of BuildKit (`.*` for `*` when `greedy`, else `.*?`; `.` for `?`, which, as `.*`,
+ * does not match a line feed): the leftmost match, and of the matches that start there the one that a backtracking
+ * matcher takes first (leftmost-first, as Go and JavaScript choose). A simulation of the pattern's automaton with
+ * threads in the order of their priority (Pike's VM), in O(value length × pattern length) steps, instead of a
+ * backtracking regular expression, which needs exponential time for some patterns (`*a*a*a*b`). `anchored`: only a match
+ * at `from`. `undefined`: no match; `'budget'`: the budget of steps ran out.
+ */
+export function matchShellPattern(
+  tokens: readonly PatternToken[],
+  value: readonly string[],
+  from: number,
+  greedy: boolean,
+  anchored: boolean,
+  budget: PatternBudget,
+): { start: number; end: number } | undefined | 'budget' {
+  const accept = tokens.length;
+  interface Threads {
+    /** The state of each thread: a token index, or `accept`. */
+    states: number[];
+    /** Where the match of each thread started. */
+    starts: number[];
+  }
+  // Each state once per list: the first thread (of the highest priority) wins.
+  const mark = new Int32Array(accept + 1).fill(-1);
+  let generation = 0;
+  const lazyStars: number[] = [];
+  /** Adds the ε-closure of `state`: `*` either matches one more character (the state stays) or ends (the next state). */
+  const add = (list: Threads, first: number, start: number): void => {
+    let state = first;
+    lazyStars.length = 0;
+    while (state !== accept && tokens[state].kind === 'star' && mark[state] !== generation) {
+      mark[state] = generation;
+      if (greedy) {
+        // One more character first, then the end of the star.
+        list.states.push(state);
+        list.starts.push(start);
+      } else {
+        lazyStars.push(state);
+      }
+      state++;
+    }
+    if (mark[state] !== generation) {
+      mark[state] = generation;
+      list.states.push(state);
+      list.starts.push(start);
+    }
+    // Lazy: the end of each star first, then one more character, the innermost first.
+    for (let i = lazyStars.length - 1; i >= 0; i--) {
+      list.states.push(lazyStars[i]);
+      list.starts.push(start);
+    }
+  };
+  let current: Threads = { states: [], starts: [] };
+  add(current, 0, from);
+  let match: { start: number; end: number } | undefined;
+  for (let position = from; ; position++) {
+    budget.steps -= current.states.length + 1;
+    if (budget.steps < 0) {
+      budget.exceeded = true;
+      return 'budget';
+    }
+    generation++;
+    const next: Threads = { states: [], starts: [] };
+    const char = position < value.length ? value[position] : undefined;
+    for (let i = 0; i < current.states.length; i++) {
+      const state = current.states[i];
+      if (state === accept) {
+        // The threads of lower priority are cut; those of higher priority may still find a match that wins.
+        match = { start: current.starts[i], end: position };
+        break;
+      }
+      if (char === undefined) continue;
+      const token = tokens[state];
+      if (token.kind === 'char' ? token.char !== char : char === '\n') continue;
+      add(next, token.kind === 'star' ? state : state + 1, current.starts[i]);
+    }
+    if (char === undefined) break;
+    // A new start at the next position, of the lowest priority, while no match was found.
+    if (match === undefined && !anchored) add(next, 0, position + 1);
+    if (next.states.length === 0) break;
+    current = next;
+  }
+  return match;
+}
+
+/**
+ * Review round 7 (S7-1): the budget of the Dockerfile that extractImageReferences reads (the expansion is synchronous, so
+ * one at a time); outside of it, each pattern gets a budget of its own.
+ */
+let activeBudget: PatternBudget | undefined;
+
+function patternBudget(): PatternBudget {
+  return activeBudget ?? { steps: MAX_PATTERN_STEPS };
+}
+
+/** Runs `fn` with a fresh budget of MAX_PATTERN_STEPS for all patterns of one Dockerfile. */
+function withPatternBudget<T>(fn: (budget: PatternBudget) => T): T {
+  const previous = activeBudget;
+  const budget: PatternBudget = { steps: MAX_PATTERN_STEPS };
+  activeBudget = budget;
   try {
-    return new RegExp(out, 'u');
-  } catch {
-    return undefined;
+    return fn(budget);
+  } finally {
+    activeBudget = previous;
   }
 }
 
-/** `${VAR#pattern}` and `${VAR##pattern}` as BuildKit's `trimPrefix`. */
-function trimPrefix(pattern: string, value: string, greedy: boolean): string | undefined {
-  const regex = shellPatternRegex(pattern, greedy, true);
-  if (regex === undefined) return undefined;
-  const match = regex.exec(value);
-  return match ? value.slice(match.index + match[0].length) : value;
+/** The result of a pattern form: the text, `undefined` for a pattern that BuildKit refuses, or `'budget'` (S7-1). */
+type PatternResult = string | undefined | 'budget';
+
+/** `${VAR#pattern}` and `${VAR##pattern}` as BuildKit's `trimPrefix` (the shortest match, or the longest when `greedy`). */
+export function trimShellPrefix(pattern: string, value: string, greedy: boolean, budget: PatternBudget = patternBudget()): PatternResult {
+  const tokens = parseShellPattern(pattern);
+  if (tokens === undefined) return undefined;
+  const chars = Array.from(value);
+  const match = matchShellPattern(tokens, chars, 0, greedy, true, budget);
+  if (match === 'budget') return match;
+  return match === undefined ? value : chars.slice(match.end).join('');
 }
 
 /**
  * `${VAR%pattern}` and `${VAR%%pattern}` as BuildKit's `trimSuffix`: the prefix rule on the reversed value, with the
  * pattern reversed (an escape stays before its character).
  */
-function trimSuffix(pattern: string, value: string, greedy: boolean): string | undefined {
+export function trimShellSuffix(pattern: string, value: string, greedy: boolean, budget: PatternBudget = patternBudget()): PatternResult {
   const chars = Array.from(pattern);
   const reversed: string[] = new Array<string>(chars.length);
   const last = chars.length - 1;
@@ -842,40 +1067,44 @@ function trimSuffix(pattern: string, value: string, greedy: boolean): string | u
       i++;
     }
   }
-  const trimmed = trimPrefix(reversed.join(''), Array.from(value).reverse().join(''), greedy);
-  return trimmed === undefined ? undefined : Array.from(trimmed).reverse().join('');
+  const trimmed = trimShellPrefix(reversed.join(''), Array.from(value).reverse().join(''), greedy, budget);
+  return trimmed === undefined || trimmed === 'budget' ? trimmed : Array.from(trimmed).reverse().join('');
 }
 
 /**
  * `${VAR/pattern/replacement}` (the first match) and `${VAR//pattern/replacement}` (every match, as Go's
  * `ReplaceAllString`: an empty match right after a match does not count), with a greedy pattern, as BuildKit does.
  */
-function replacePattern(pattern: string, replacement: string, value: string, all: boolean): string | undefined {
-  const regex = shellPatternRegex(pattern, true, false);
-  if (regex === undefined) return undefined;
-  const global = new RegExp(regex.source, `${regex.flags}g`);
-  const width = (index: number): number => ((value.codePointAt(index) ?? 0) > 0xffff ? 2 : 1);
-  let result = '';
+export function replaceShellPattern(
+  pattern: string,
+  replacement: string,
+  value: string,
+  all: boolean,
+  budget: PatternBudget = patternBudget(),
+): PatternResult {
+  const tokens = parseShellPattern(pattern);
+  if (tokens === undefined) return undefined;
+  const chars = Array.from(value);
+  const parts: string[] = [];
   let position = 0;
   let previousEnd = -1;
   let searchFrom = 0;
-  while (searchFrom <= value.length) {
-    global.lastIndex = searchFrom;
-    const match = global.exec(value);
-    if (match === null) break;
-    const matchStart = match.index;
-    const matchEnd = matchStart + match[0].length;
-    if (matchEnd === matchStart && matchStart === previousEnd) {
-      searchFrom = matchStart + width(matchStart);
+  while (searchFrom <= chars.length) {
+    const match = matchShellPattern(tokens, chars, searchFrom, true, false, budget);
+    if (match === 'budget') return match;
+    if (match === undefined) break;
+    if (match.end === match.start && match.start === previousEnd) {
+      searchFrom = match.start + 1;
       continue;
     }
-    result += value.slice(position, matchStart) + replacement;
-    position = matchEnd;
-    previousEnd = matchEnd;
+    parts.push(chars.slice(position, match.start).join(''), replacement);
+    position = match.end;
+    previousEnd = match.end;
     if (!all) break;
-    searchFrom = matchEnd > matchStart ? matchEnd : matchStart + width(matchStart);
+    searchFrom = match.end > match.start ? match.end : match.start + 1;
   }
-  return result + value.slice(position);
+  parts.push(chars.slice(position).join(''));
+  return parts.join('');
 }
 
 function escapeRegExp(text: string): string {

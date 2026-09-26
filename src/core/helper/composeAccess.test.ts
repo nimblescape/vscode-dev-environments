@@ -69,6 +69,32 @@ describe('composeAccessReport: the allowed model', () => {
     expect(composeAccessReport(input())).toEqual(NONE);
   });
 
+  // Review round 7, P7-1: the Python & PostgreSQL template of the Dev Containers (restart: unless-stopped, network_mode: service:db).
+  it('allows the Python & PostgreSQL template', () => {
+    const template: ComposeModel = {
+      name: PROJECT,
+      services: {
+        app: {
+          build: { context: `${REPO}/.devcontainer`, dockerfile: 'Dockerfile' },
+          command: ['sleep', 'infinity'],
+          network_mode: 'service:db',
+          volumes: [{ type: 'bind', source: '/workspaces', target: '/workspaces', bind: { create_host_path: true } }],
+          env_file: [{ path: `${REPO}/.devcontainer/.env`, required: true }],
+        },
+        db: {
+          image: 'postgres:latest',
+          restart: 'unless-stopped',
+          env_file: [{ path: `${REPO}/.devcontainer/.env`, required: true }],
+          volumes: [{ type: 'volume', source: 'postgres-data', target: '/var/lib/postgresql/data', volume: {} }],
+          networks: { default: null },
+        },
+      },
+      networks: { default: { name: `${PROJECT}_default` } },
+      volumes: { 'postgres-data': { name: `${PROJECT}_postgres-data` } },
+    };
+    expect(composeAccessReport(input({ model: template }))).toEqual(NONE);
+  });
+
   it('allows extension fields at every level', () => {
     const base = model();
     base['x-common'] = { a: 1 };
@@ -199,8 +225,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     // restart and stop (D-14)
     ['restart no', 'db', { restart: 'no' }, NONE],
     ['restart on-failure:3', 'db', { restart: 'on-failure:3' }, NONE],
-    ['restart always', 'db', { restart: 'always' }, U('service db: restart always')],
-    ['restart unless-stopped', 'db', { restart: 'unless-stopped' }, U('service db: restart unless-stopped')],
+    // Review round 7, P7-1: changed expectations, `always` and `unless-stopped` are rewritten to `no` (composeUpModel).
+    ['restart always', 'db', { restart: 'always' }, NONE],
+    ['restart unless-stopped', 'db', { restart: 'unless-stopped' }, NONE],
+    ['restart unless-stopped of the dev service', 'app', { restart: 'unless-stopped' }, NONE],
     ['stop_grace_period 20s', 'db', { stop_grace_period: '20s' }, NONE],
     ['stop_grace_period 21s', 'db', { stop_grace_period: '21s' }, U('service db: stop_grace_period 21s')],
     ['stop_grace_period 1m', 'db', { stop_grace_period: '1m' }, U('service db: stop_grace_period 1m')],
@@ -209,7 +237,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     // deploy
     ['deploy limits and reservations', 'db', { deploy: { resources: { limits: { cpus: '1', memory: '1g', pids: 100 }, reservations: { memory: '100m' } }, restart_policy: { condition: 'on-failure' } } }, NONE],
     ['a GPU reservation', 'db', { deploy: { resources: { reservations: { devices: [{ capabilities: ['gpu'] }] } } } }, A('service db: GPU or device access (deploy.resources.reservations.devices)')],
-    ['deploy restart_policy any', 'db', { deploy: { restart_policy: { condition: 'any' } } }, U('service db: deploy.restart_policy.condition any')],
+    // Review round 7, P7-1: changed expectation, the condition `any` is rewritten to `none` (composeUpModel).
+    ['deploy restart_policy any', 'db', { deploy: { restart_policy: { condition: 'any' } } }, NONE],
+    ['deploy restart_policy without a condition', 'db', { deploy: { restart_policy: {} } }, NONE],
+    ['deploy restart_policy delay', 'db', { deploy: { restart_policy: { condition: 'any', delay: '5s' } } }, U('service db: deploy.restart_policy.delay 5s')],
     ['deploy replicas', 'db', { deploy: { replicas: 2 } }, U('service db: deploy.replicas')],
     ['deploy generic_resources', 'db', { deploy: { resources: { reservations: { generic_resources: [{}] } } } }, U('service db: deploy.resources.reservations.generic_resources')],
     ['pull_policy (rewritten, D-16)', 'db', { pull_policy: 'always' }, NONE],
@@ -324,10 +355,11 @@ describe('composeAccessReport: devcontainer.json (rule table 4.3)', () => {
 
   it('lists each item once, and splits access and unsupported settings', () => {
     const base = model();
-    base.services.db = { ...base.services.db, privileged: true, restart: 'always', cap_add: ['NET_ADMIN', 'NET_ADMIN'] };
+    // Review round 7, P7-1: changed expectation, `restart: always` is rewritten, not refused; stop_grace_period 1m is.
+    base.services.db = { ...base.services.db, privileged: true, restart: 'always', stop_grace_period: '1m', cap_add: ['NET_ADMIN', 'NET_ADMIN'] };
     expect(composeAccessReport(input({ model: base }))).toEqual({
       hostAccess: ['service db: privileged mode', 'service db: capability NET_ADMIN'],
-      unsupported: ['service db: restart always'],
+      unsupported: ['service db: stop_grace_period 1m'],
     });
   });
 
