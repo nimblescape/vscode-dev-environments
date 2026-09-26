@@ -11,9 +11,11 @@ import { recentEnvironments, repositoriesForPicker, stateIcon, type OwnerGroup }
 export const SwitcherTexts = {
   title: 'Switch Environment',
   placeholder: 'Select an environment to open in this window',
+  newWindowPlaceholder: 'Select an environment to open in a new window',
   recentEnvironments: 'Recent environments',
   openRepository: 'Open repository…',
   repositoryPlaceholder: 'Search a repository to open in this window',
+  newWindowRepositoryPlaceholder: 'Search a repository to open in a new window',
   archived: 'archived',
   fork: 'fork',
 } as const;
@@ -33,15 +35,17 @@ interface RepositoryItem extends vscode.QuickPickItem {
 /**
  * First list: the recent environments with their state (most recently used first), then "Open repository…", which
  * shows all repositories with a text search. Without environments, the repository list opens at once.
- * The caller opens the result in the current window.
+ * The caller opens the result in the current window, or with `newWindow` in a new window (the texts say which).
  */
 export async function showSwitcher(input: {
   groups: readonly OwnerGroup[];
   environments: readonly Environment[];
   repositories: readonly RepositoryInfo[];
+  newWindow?: boolean;
 }): Promise<SwitcherChoice | undefined> {
+  const newWindow = input.newWindow === true;
   const recent = recentEnvironments(input.groups, input.environments);
-  if (recent.length === 0) return openRepository(input.repositories);
+  if (recent.length === 0) return openRepository(input.repositories, newWindow);
 
   const items: ChoiceItem[] = [
     { label: SwitcherTexts.recentEnvironments, kind: vscode.QuickPickItemKind.Separator },
@@ -55,13 +59,13 @@ export async function showSwitcher(input: {
   ];
   const picked = await vscode.window.showQuickPick(items, {
     title: SwitcherTexts.title,
-    placeHolder: SwitcherTexts.placeholder,
+    placeHolder: newWindow ? SwitcherTexts.newWindowPlaceholder : SwitcherTexts.placeholder,
     matchOnDescription: true,
   });
   const choice = picked?.choice;
   if (!choice) return undefined;
   if (choice.kind === 'environment') return choice;
-  return openRepository(input.repositories);
+  return openRepository(input.repositories, newWindow);
 }
 
 /**
@@ -94,7 +98,10 @@ export async function pickRepository(
   return picked?.repository;
 }
 
-async function openRepository(repositories: readonly RepositoryInfo[]): Promise<SwitcherChoice | undefined> {
-  const repository = await pickRepository(repositories);
+async function openRepository(repositories: readonly RepositoryInfo[], newWindow: boolean): Promise<SwitcherChoice | undefined> {
+  const repository = await pickRepository(
+    repositories,
+    newWindow ? SwitcherTexts.newWindowRepositoryPlaceholder : SwitcherTexts.repositoryPlaceholder,
+  );
   return repository ? { kind: 'repository', repository } : undefined;
 }

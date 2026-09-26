@@ -58,7 +58,8 @@ export class ConnectionAdapter {
    * reloads the window; the returned promise may not settle before that.
    *
    * `forceReuseWindow` is set in addition to `forceNewWindow: false`, because without it the user setting
-   * `window.openFoldersInNewWindow: "on"` would open a new window (concept 6.2: Start never opens a new window).
+   * `window.openFoldersInNewWindow: "on"` would open a new window (concept 6.2: Start in the current window
+   * stays in it; a new window is `openInNewWindow`).
    *
    * When this window has exactly this folder open already (Reconnect after the connection was lost, concept 7.12),
    * `vscode.openFolder` would only focus the window, so the window is reloaded instead: the reload connects again.
@@ -75,6 +76,21 @@ export class ConnectionAdapter {
     const uri = vscode.Uri.from(parts);
     this.logger.info(`Connecting the window to ${containerName} (${uri.toString()}).`);
     await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: false, forceReuseWindow: true });
+  }
+
+  /**
+   * Opens the folder URI of the running container in a NEW window (Start in New Window, concept 6.2): `vscode.openFolder`
+   * with `forceNewWindow: true`. This window keeps its folder and its connection; its extension host keeps running.
+   *
+   * When another window has this folder open already, VS Code shows that window instead of opening a second one: its
+   * main process looks for a window with the same folder URI before it opens a new one, also with `forceNewWindow`
+   * (the same assumption as in `open`, V-2, concept 7.11). The caller does not open an environment that another window
+   * uses (concept 6.2).
+   */
+  async openInNewWindow(containerName: string, remoteWorkspaceFolder: string): Promise<void> {
+    const uri = vscode.Uri.from(folderUriParts(containerName, remoteWorkspaceFolder));
+    this.logger.info(`Connecting a new window to ${containerName} (${uri.toString()}).`);
+    await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: true });
   }
 
   /** "Close Remote Connection": the window becomes an empty local window, and the extension activates again in it. */

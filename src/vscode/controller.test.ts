@@ -208,6 +208,7 @@ interface Harness {
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
+    openInNewWindow: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
     closeRemoteConnection: ReturnType<typeof vi.fn<() => Promise<void>>>;
     isEmptyWindow: ReturnType<typeof vi.fn<() => boolean>>;
     currentContainerName: ReturnType<typeof vi.fn<() => string | undefined>>;
@@ -281,6 +282,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
+    openInNewWindow: vi.fn(async () => {}),
     closeRemoteConnection: vi.fn(async () => {}),
     isEmptyWindow: vi.fn(() => false),
     currentContainerName: vi.fn(() => undefined),
@@ -507,7 +509,9 @@ describe('Controller commands', () => {
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
     // 20 since unit 10: Turn Off Host Access Checks… and Turn On Host Access Checks (the switch per repository).
-    expect(declared).toHaveLength(20);
+    // 24 since unit 14 (spec: open in a new window): Start in New Window, Start in Current Window, and the switcher for
+    // a new window and for the current window.
+    expect(declared).toHaveLength(24);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -1156,6 +1160,18 @@ describe('Switch branch…', () => {
     h.quickPicks[0].pick('release/2.0');
     await command;
     expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0' }));
+  });
+
+  it('connects the current window after Switch branch… also while the setting openInNewWindow is on (unit 14 review)', async () => {
+    h.settings.openInNewWindow = true;
+    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+    const command = run('switchBranch', row('acme/api'));
+    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+    h.quickPicks[0].type('release/2.0');
+    h.quickPicks[0].pick('release/2.0');
+    await command;
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+    expect(h.connection.open).toHaveBeenCalled();
   });
 
   it('switches and connects an environment that this window is not connected to', async () => {
@@ -2768,5 +2784,245 @@ describe('the switch of the host access checks (concept section 9 "Host access",
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+});
+
+describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
+  const web = (): Environment =>
+    environment({
+      id: 'b1c2d3e4-0000-4000-8000-000000000002',
+      repository: 'acme/web',
+      containerName: 'web',
+      volumeName: 'web',
+      remoteWorkspaceFolder: '/workspaces/web',
+    });
+
+  it('Start in New Window runs the pipeline, writes the pending connection file of this window, and opens a new window', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await run('startInNewWindow', row('acme/api', env));
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.coordinator.writePending).toHaveBeenCalledWith(ENV_ID);
+    // The window that ran the pipeline wrote the pending connection file: the container is in use until the new window
+    // has written its status file.
+    expect(await h.sessionFiles.readPendings()).toEqual([{ environmentId: ENV_ID, windowId: WINDOW_ID, createdAt: iso(NOW) }]);
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('keeps the environment of this window: this window does not take the new environment as its own', async () => {
+    const own = environment();
+    await h.registry.add(own);
+    await h.registry.add(web());
+    await connectHere(own);
+    h.coordinator.setEnvironment.mockClear();
+    h.statusBar.showConnected.mockClear();
+    await run('startInNewWindow', row('acme/web', web()));
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith('web', '/workspaces/web');
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    expect(h.coordinator.setEnvironment).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnected).not.toHaveBeenCalled();
+    // A later Start of the own environment in this window still finds it connected here.
+    await run('start', row('acme/api', own));
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+  });
+
+  it('opens a new repository (first open) in a new window', async () => {
+    const info = repositoryInfo('acme/api');
+    h.sidebar.infos.set('acme/api', info);
+    h.service.open.mockImplementation(async () => {
+      const env = environment();
+      await h.registry.add(env);
+      return openResult(env);
+    });
+    await run('startInNewWindow', row('acme/api', undefined, info));
+    expect(h.service.open).toHaveBeenCalledTimes(1);
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('opens a new window also from an empty window, because the user asked for it', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    await run('startInNewWindow', row('acme/api', environment()));
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('plain Start uses this window by default', async () => {
+    await h.registry.add(environment());
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+  });
+
+  it('with the setting openInNewWindow, plain Start opens a new window and Start in Current Window uses this one', async () => {
+    h.settings.openInNewWindow = true;
+    await h.registry.add(environment());
+    await h.registry.add(web());
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.open).not.toHaveBeenCalled();
+    await run('startInCurrentWindow', row('acme/web', web()));
+    expect(h.connection.open).toHaveBeenCalledWith('web', '/workspaces/web');
+    expect(h.connection.openInNewWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it('with the setting openInNewWindow, plain Start in an empty window uses the empty window', async () => {
+    h.settings.openInNewWindow = true;
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    await h.registry.add(environment());
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+  });
+
+  it('shows the other window instead of a second connection when another window uses the environment', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    otherWindowConnected();
+    await run('startInNewWindow', row('acme/api', env));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    // Review of unit 14: a request for a new window never uses the current window, also here. VS Code shows the window
+    // that has this folder open (concept 7.11); if it did not find it, a new window opens and this one stays.
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+  });
+
+  it('shows the other window with the current-window call for plain Start', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    otherWindowConnected();
+    await run('start', row('acme/api', env));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+  });
+
+  it('opens no second window for the environment of this window', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('startInNewWindow', row('acme/api', env));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+  });
+
+  it('reconnects this window when its own container does not run, also with the setting openInNewWindow', async () => {
+    h.settings.openInNewWindow = true;
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.docker.containerState.mockResolvedValue('stopped');
+    await run('startInNewWindow', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+  });
+
+  it('a new window neither skips nor is skipped by the connection of this window', async () => {
+    await h.registry.add(environment());
+    await h.registry.add(web());
+    const api = deferred<OpenResult>();
+    h.service.openEnvironment.mockImplementation(async (id: string) => (id === ENV_ID ? api.promise : openResult(web())));
+    const first = run('start', row('acme/api', environment()));
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the first pipeline');
+    await run('startInNewWindow', row('acme/web', web()));
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith('web', '/workspaces/web');
+    api.resolve(openResult(environment()));
+    await first;
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+  });
+
+  it('removes the pending connection file and opens no window when the user cancels', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const progress = cancellableProgress();
+    h.service.openEnvironment.mockImplementation(async (id: string) => {
+      await h.sessionFiles.writePending(id, WINDOW_ID);
+      progress.cancel();
+      return openResult(env);
+    });
+    await run('startInNewWindow', row('acme/api', env));
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  it('Try again after a failure opens a new window again', async () => {
+    await h.registry.add(environment());
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
+    await run('startInNewWindow', row('acme/api', environment()));
+    await settle(() => h.connection.openInNewWindow.mock.calls.length === 1, 'the new window of Try again');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('the switcher for a new window opens the selected environment in a new window', async () => {
+    await h.registry.add(environment());
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ choice?: { kind: string } }>) =>
+      items.find((item) => item.choice?.kind === 'environment'),
+    );
+    await run('switchEnvironmentInNewWindow');
+    const options = fakeVscode.window.showQuickPick.mock.calls[0][1] as { placeHolder?: string };
+    expect(options.placeHolder).toBe('Select an environment to open in a new window');
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('with the setting openInNewWindow, the switcher for the current window uses this window', async () => {
+    h.settings.openInNewWindow = true;
+    await h.registry.add(environment());
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ choice?: { kind: string } }>) =>
+      items.find((item) => item.choice?.kind === 'environment'),
+    );
+    await run('switchEnvironmentInCurrentWindow');
+    const options = fakeVscode.window.showQuickPick.mock.calls[0][1] as { placeHolder?: string };
+    expect(options.placeHolder).toBe('Select an environment to open in this window');
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+  });
+
+  it('role A in the new window: the pending connection file of the window that ran the pipeline means no second pipeline', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    // The file names the window that ran the pipeline, not this (new) window.
+    await h.controller.openAttachedWindow(env, CONTAINER, { environmentId: ENV_ID, windowId: OTHER_WINDOW_ID, createdAt: iso(NOW - 5000) });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnected).toHaveBeenCalled();
+  });
+
+  it('offers Start in New Window next to Start, or Start in Current Window while the setting is on (package.json)', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        menus: Record<string, Array<{ command?: string; when?: string; group?: string }>>;
+        configuration: { properties: Record<string, { scope?: string; default?: unknown; type?: string }> };
+      };
+    };
+    const menus = manifest.contributes.menus;
+    const entries = (menu: string, command: string) =>
+      menus[menu].filter((item) => item.command === command).map((item) => [item.when, item.group]);
+    // Review of unit 14: right after Start (1_actions@1), in a fixed order.
+    expect(entries('view/item/context', Commands.startInNewWindow)).toEqual([
+      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow', '1_actions@2'],
+    ]);
+    expect(entries('view/item/context', Commands.startInCurrentWindow)).toEqual([
+      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow', '1_actions@2'],
+    ]);
+    expect(entries('devEnvironments.more', Commands.startInNewWindow)).toEqual([
+      ['viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow', '0_start@1'],
+    ]);
+    expect(entries('commandPalette', Commands.startInNewWindow)).toEqual([['!config.devEnvLauncher.openInNewWindow', undefined]]);
+    expect(entries('commandPalette', Commands.startInCurrentWindow)).toEqual([['config.devEnvLauncher.openInNewWindow', undefined]]);
+    expect(entries('commandPalette', Commands.switchEnvironmentInNewWindow)).toEqual([['!config.devEnvLauncher.openInNewWindow', undefined]]);
+    expect(entries('commandPalette', Commands.switchEnvironmentInCurrentWindow)).toEqual([['config.devEnvLauncher.openInNewWindow', undefined]]);
+    // Only the user settings decide which window a Start uses.
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.openInNewWindow`]).toMatchObject({
+      type: 'boolean',
+      scope: 'application',
+      default: false,
+    });
   });
 });

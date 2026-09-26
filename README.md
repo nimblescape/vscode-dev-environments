@@ -2,7 +2,7 @@
 
 Open your GitHub repositories in local dev containers with one action.
 
-Dev Environments lists the GitHub repositories that you can access and that contain a Dev Container configuration. **Start** opens a repository in a container on your computer, in the current window. The extension does the rest for you:
+Dev Environments lists the GitHub repositories that you can access and that contain a Dev Container configuration. **Start** opens a repository in a container on your computer, in the current window. **Start in New Window** opens it in a new window instead, so you can work in several environments at the same time. The extension does the rest for you:
 
 - It starts Docker when Docker is not running.
 - It downloads the repository into a Docker volume. Your work stays in this volume when the container is created again.
@@ -25,10 +25,11 @@ Git on your computer is not needed.
 2. Select **Sign in with GitHub**. The list shows your repositories with a Dev Container configuration, grouped by owner.
 3. Use the actions of a repository:
    - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window.
+   - **Start in New Window** (context menu of a repository, and **⋯**): the same, but a new window connects. The current window keeps its environment. If another window has the environment open already, that window comes to the front; an environment is never open in two windows.
    - **Stop**: stops the container at once. Your files are kept.
    - **Delete**: removes the container and the volume with the repository, after you confirm it. If the volume has uncommitted changes, unpushed commits, or stashes, the confirmation shows them.
    - **⋯**: Switch Branch…, Select Configuration… (only for repositories with several configurations), Rebuild, and Show on GitHub.
-4. To go to another environment, use **Dev Environments: Switch Environment…** (`Ctrl+Alt+E`, on macOS `Cmd+Alt+E`), or select the status bar item. The same window connects to the other environment.
+4. To go to another environment, use **Dev Environments: Switch Environment…** (`Ctrl+Alt+E`, on macOS `Cmd+Alt+E`), or select the status bar item. The same window connects to the other environment. **Dev Environments: Switch Environment in New Window…** opens the selected environment in a new window.
 
 **Select Organizations…**, **Search**, and **Refresh** are at the top of the view. **Select Organizations…** limits the list to the organizations and accounts that you select: only their repositories are scanned, which is faster when you can access many repositories. Select none to see all repositories again. **Dev Environments: Show Log** opens the complete log.
 
@@ -53,6 +54,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 | Setting | Default | Description |
 |---|---|---|
 | `devEnvLauncher.reopenLastOnStartup` | `true` | Open the last used environment when VS Code starts. |
+| `devEnvLauncher.openInNewWindow` | `false` | If `true`, **Start** and **Switch Environment…** open the environment in a new window, and the current window keeps its environment. The context menu then offers **Start in Current Window**, and the Command Palette **Switch Environment in Current Window…**. From an empty window, **Start** uses that window. Only the user settings count. |
 | `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it. If `false`, the container keeps running. |
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time in seconds before a stop. It prevents a stop during a window reload. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection. |

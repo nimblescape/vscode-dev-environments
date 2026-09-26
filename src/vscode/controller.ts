@@ -65,6 +65,7 @@ import {
   type CommandArgument,
 } from './targets';
 import { TreeTexts, recentEnvironments, stateIcon } from './treeModel';
+import { opensNewWindow, type WindowRequest } from './windowChoice';
 
 /**
  * After "Close Remote Connection", the window reloads and this extension host ends. If it still runs after this time,
@@ -160,6 +161,11 @@ interface Target {
 }
 
 interface StartOptions {
+  /**
+   * The window that connects (concept 6.2): plain Start follows the setting openInNewWindow (default); Start in New
+   * Window and Start in Current Window name it. Default: `default`.
+   */
+  window?: WindowRequest;
   /** First open only: the branch to clone (Switch branch… without environment). */
   branch?: string;
   /** First open only: the configuration (Select configuration… without environment). */
@@ -189,6 +195,9 @@ interface LeftEnvironment {
   repository: string;
   reason: 'account' | 'outdated';
 }
+
+/** A flow that connects this window (numbered, see `connectingFlow`), or a new window. */
+type ConnectRequest = { newWindow: false; number: number } | { newWindow: true };
 
 type HandOffRequest = Pick<PendingOperation, 'operation' | 'reason' | 'configPath' | 'additionalVolumesToRemove'>;
 
@@ -243,10 +252,12 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 20 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 24 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
+      startInNewWindow: (argument) => this.start(parseCommandArgument(argument), 'newWindow'),
+      startInCurrentWindow: (argument) => this.start(parseCommandArgument(argument), 'currentWindow'),
       stop: (argument) => this.stop(parseCommandArgument(argument)),
       delete: (argument) => this.delete(parseCommandArgument(argument)),
       switchBranch: (argument) => this.switchBranch(parseCommandArgument(argument)),
@@ -254,6 +265,8 @@ export class Controller implements vscode.Disposable {
       rebuild: (argument) => this.rebuild(parseCommandArgument(argument)),
       showOnGitHub: (argument) => this.showOnGitHub(parseCommandArgument(argument)),
       switchEnvironment: () => this.switchEnvironment(),
+      switchEnvironmentInNewWindow: () => this.switchEnvironment('newWindow'),
+      switchEnvironmentInCurrentWindow: () => this.switchEnvironment('currentWindow'),
       refresh: () => this.refresh(),
       search: () => this.search(),
       showLog: async () => this.logger.show(),
@@ -518,10 +531,13 @@ export class Controller implements vscode.Disposable {
   // -------------------------------------------------------------------------------------------------------------------
   // Commands
 
-  /** Start (concept 6.2, 6.6, 7.6, 7.11). */
-  async start(argument: CommandArgument): Promise<void> {
+  /**
+   * Start (concept 6.2, 6.6, 7.6, 7.11). `window`: Start in New Window or Start in Current Window; plain Start follows the
+   * setting openInNewWindow.
+   */
+  async start(argument: CommandArgument, window: WindowRequest = 'default'): Promise<void> {
     const target = await this.resolveTarget(argument, 'open', ControllerTexts.selectRepositoryToStart);
-    if (target) await this.startTarget(target);
+    if (target) await this.startTarget(target, { window });
   }
 
   /** Stop (concept 6.2): the container stops at once; a connected window closes its connection first. */
@@ -684,7 +700,7 @@ export class Controller implements vscode.Disposable {
   private async applyConfiguration(target: Target, configPath: string): Promise<void> {
     const environment = target.environment;
     if (!environment) {
-      await this.startTarget(target, { configPath }, async () =>
+      await this.startTarget(target, { configPath, window: 'currentWindow' }, async () =>
         this.applyConfiguration(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), configPath),
       );
       return;
@@ -721,7 +737,7 @@ export class Controller implements vscode.Disposable {
     const environment = target.environment;
     if (!environment) {
       // Concept 6.2: without an environment, the first Start creates it on the selected branch.
-      await this.startTarget(target, { branch }, async () =>
+      await this.startTarget(target, { branch, window: 'currentWindow' }, async () =>
         this.switchToBranch(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), branch),
       );
       return;
@@ -746,8 +762,11 @@ export class Controller implements vscode.Disposable {
     await vscode.env.openExternal(vscode.Uri.parse(info.url));
   }
 
-  /** Switch Environment… (concept 6.4): the selected environment or repository opens in this window. */
-  async switchEnvironment(): Promise<void> {
+  /**
+   * Switch Environment… (concept 6.4): the selected environment or repository opens in this window, or in a new window
+   * (Switch Environment in New Window…, or the setting openInNewWindow).
+   */
+  async switchEnvironment(window: WindowRequest = 'default'): Promise<void> {
     const { registry, sidebar } = this.deps;
     // Only the environments and the repositories of the signed-in account (concept 7.5).
     const [environments, repositories] = await Promise.all([sidebar.availableEnvironments(), sidebar.repositoriesForPicker()]);
@@ -756,7 +775,8 @@ export class Controller implements vscode.Disposable {
       return;
     }
     await this.renderQuietly();
-    const choice = await showSwitcher({ groups: sidebar.model(), environments, repositories });
+    const newWindow = this.opensNewWindow(window);
+    const choice = await showSwitcher({ groups: sidebar.model(), environments, repositories, newWindow });
     if (!choice) return;
     if (choice.kind === 'environment') {
       const environment = await registry.get(choice.environmentId);
@@ -765,10 +785,10 @@ export class Controller implements vscode.Disposable {
         return;
       }
       const target = await this.ownTarget(this.environmentTarget(environment));
-      if (target) await this.startTarget(target);
+      if (target) await this.startTarget(target, { window });
       return;
     }
-    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner, 'token'));
+    await this.startTarget(await this.repositoryTargetFor(choice.repository.nameWithOwner, 'token'), { window });
   }
 
   /** Refresh: the repository list (sign-in first when needed), a lost registry, and the states. */
@@ -902,8 +922,10 @@ export class Controller implements vscode.Disposable {
   // Flows
 
   /**
-   * Start flow (concept 6.2, 6.6, 7.6, 7.11): the open pipeline, then the connection of this window. The window stays
-   * connected to its previous environment while the pipeline runs (a switch is the same flow).
+   * Start flow (concept 6.2, 6.6, 7.6, 7.11): the open pipeline, then the connection of this window or of a new window
+   * (`options.window`, windowChoice.ts). The window stays connected to its previous environment while the pipeline runs
+   * (a switch is the same flow); with a new window, it keeps its environment afterwards too.
+   * An environment that another window uses is never opened a second time: that window is shown instead.
    */
   /** `retry`: Try again after a failure; by default a Start of the target again (a first open of a command sets its own). */
   private async startTarget(target: Target, options: StartOptions = {}, retry?: () => Promise<void>): Promise<void> {
@@ -945,9 +967,12 @@ export class Controller implements vscode.Disposable {
         if (await this.containerRuns(environment.containerName)) {
           // The pipeline must not replace the container under the other window (an update would disconnect it).
           // Assumption (V-2): VS Code shows the window that has this folder open instead of opening it again (concept 7.11).
+          // Also for Start in New Window: never two windows on one environment.
           this.logger.info(`${repository} is open in another window. That window is shown.`);
           const folder = environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository);
-          await connection.open(environment.containerName, folder);
+          // A request for a new window never replaces the current window, also if VS Code does not find the other one.
+          if (this.opensNewWindow(options.window ?? 'default', false)) await connection.openInNewWindow(environment.containerName, folder);
+          else await connection.open(environment.containerName, folder);
           return;
         }
         // Concept 6.2 "Stopped: the next Start starts it": the other window has lost its connection, so the container
@@ -957,6 +982,7 @@ export class Controller implements vscode.Disposable {
         );
       }
     }
+    const newWindow = this.opensNewWindow(options.window ?? 'default', reconnecting);
     const started = await this.operation(
       repository,
       'Start',
@@ -966,7 +992,7 @@ export class Controller implements vscode.Disposable {
           repository,
           cancellable: true,
           task: (progress, signal) =>
-            this.connectingFlow(async (request) => {
+            this.connectingFlow(newWindow, async (request) => {
               let result: OpenResult;
               if (environment) {
                 result = await service.openEnvironment(environment.id, { progress, signal, configPath: options.configPath });
@@ -983,19 +1009,38 @@ export class Controller implements vscode.Disposable {
               await this.connect(result, progress, request, signal);
             }),
         }),
-      // Try again is a Start: a repository takes the account of a session with a working token, as at the first try.
-      { retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'))) },
+      // Try again is a Start: a repository takes the account of a session with a working token, as at the first try; it
+      // opens in the same kind of window as the first try.
+      { retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'), { window: options.window })) },
     );
     // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
     if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
   }
 
-  /** Runs a flow that ends by connecting this window, with its number for `connect`. */
-  private async connectingFlow<T>(fn: (request: number) => Promise<T>): Promise<T> {
+  /**
+   * True if a Start with this request opens a new window (windowChoice.ts): the setting openInNewWindow, and whether this
+   * window is empty or reconnects its own environment.
+   */
+  private opensNewWindow(request: WindowRequest, reconnecting = false): boolean {
+    return opensNewWindow({
+      request,
+      openInNewWindow: this.deps.settings().openInNewWindow === true,
+      emptyWindow: this.deps.connection.isEmptyWindow(),
+      reconnecting,
+    });
+  }
+
+  /**
+   * Runs a flow that ends by connecting this window, with its number for `connect`. A flow that connects a new window
+   * (`newWindow`) leaves this window as it is: it is not one of the connecting flows of this window, so it neither skips
+   * nor is skipped by them.
+   */
+  private async connectingFlow<T>(newWindow: boolean, fn: (request: ConnectRequest) => Promise<T>): Promise<T> {
+    if (newWindow) return fn({ newWindow: true });
     const request = ++this.connectRequests;
     this.activeConnectRequests.add(request);
     try {
-      return await fn(request);
+      return await fn({ newWindow: false, number: request });
     } finally {
       this.activeConnectRequests.delete(request);
     }
@@ -1008,9 +1053,14 @@ export class Controller implements vscode.Disposable {
    * finishes first. The skipped environment's container stops after the waiting time.
    * Cancel in the progress notification also counts when the pipeline has finished its last step already: the window
    * stays as it is (concept 7.10 #2: "[Cancel] lets the user stay in the empty window").
+   *
+   * A new window (Start in New Window, concept 6.2, 7.9): the pending connection file (written with the ID of this
+   * window, the window that ran the pipeline) keeps the container in use until the new window has written its status
+   * file; the new window finds the fresh file at its activation, so it does not run the pipeline again (role A,
+   * `pipelineJustRan`), and removes it. This window keeps its own environment, status file, and reopen record.
    */
-  private async connect(result: OpenResult, progress: ProgressReporter, request: number, signal: AbortSignal): Promise<void> {
-    if ([...this.activeConnectRequests].some((other) => other > request)) {
+  private async connect(result: OpenResult, progress: ProgressReporter, request: ConnectRequest, signal: AbortSignal): Promise<void> {
+    if (!request.newWindow && [...this.activeConnectRequests].some((other) => other > request.number)) {
       this.logger.info(`${result.environment.repository} is not connected: another environment is opening in this window.`);
       return;
     }
@@ -1039,6 +1089,10 @@ export class Controller implements vscode.Disposable {
     }
     progress.step('connecting');
     await this.deps.coordinator.writePending(result.environment.id);
+    if (request.newWindow) {
+      await this.deps.connection.openInNewWindow(result.containerName, result.remoteWorkspaceFolder);
+      return;
+    }
     await this.deps.connection.open(result.containerName, result.remoteWorkspaceFolder);
   }
 
@@ -1153,7 +1207,7 @@ export class Controller implements vscode.Disposable {
     // Concept 6.2: Switch branch… connects the current window; the pipeline applies the rule for a changed configuration.
     // It connects the environment whose branch it switched, also when the target was a repository: after an account
     // change during the switch, the pipeline refuses that environment (otherAccount) instead of opening another one.
-    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }));
+    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }), { window: 'currentWindow' });
   }
 
   /**
@@ -1460,7 +1514,7 @@ export class Controller implements vscode.Disposable {
           repository,
           cancellable: true,
           task: (progress, signal) =>
-            this.connectingFlow(async (request) => {
+            this.connectingFlow(false, async (request) => {
               const result = await this.deps.service.openEnvironment(environment.id, {
                 progress,
                 signal,
