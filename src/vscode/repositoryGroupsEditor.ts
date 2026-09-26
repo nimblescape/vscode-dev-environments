@@ -3,10 +3,16 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The editor of the setting `devEnvLauncher.repositoryGroups` (concept 6.2, 8): a webview panel, because the Settings
-// editor of VS Code cannot edit a list of strings and objects. Thin glue: the checks, the preview, the merge at Save,
-// and the checks of the webview messages are in repositoryGroupsEditorModel.ts (no `vscode` import, unit-tested); the
-// regular expressions of the draft run in a worker thread with a time limit (groupsPreviewRunner.ts).
+// editor of VS Code cannot edit a list of strings and objects. Thin glue: the checks, the preview, the value that Save
+// writes, and the checks of the webview messages are in repositoryGroupsEditorModel.ts (no `vscode` import,
+// unit-tested); the regular expressions of the draft run in a worker thread with a time limit (groupsPreviewRunner.ts).
 // The webview is untrusted: every message is checked, and Save checks the entries again before it writes.
+//
+// Save writes only this one setting, as the user decided (A, 2026-09-26):
+// > A. Only this setting is written. Save reads settings.json, replaces just the value of devEnvLauncher.repositoryGroups,
+// > and leaves every other setting and comment untouched. If that one value was also changed in settings.json while the
+// > editor was open, the editor shows it and asks: Load settings.json (your unsaved edits are dropped) or Save mine
+// > (replaces that one value). No merging of individual entries.
 import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
@@ -22,10 +28,9 @@ import {
   editorHtml,
   editorState,
   entriesFromSetting,
-  mergeRepositoryGroups,
   parseEditorRequest,
   sameSettingValue,
-  type ConflictChoice,
+  toSettingValue,
   type EditorEntry,
   type EditorLoadMessage,
   type EditorStateMessage,
@@ -52,9 +57,12 @@ export interface RepositoryGroupsEditorDeps {
 /** The session of one open panel. */
 interface EditorSession {
   panel: vscode.WebviewPanel;
-  /** The setting value that the entries were loaded from: the base of the merge at Save. */
+  /**
+   * The setting value that the entries were loaded from (or that Save wrote last): Save writes without a question only
+   * while settings.json still holds it.
+   */
   base: unknown;
-  /** Counts the loads; updates and Saves of another load are ignored (their origins name another base). */
+  /** Counts the loads; updates and Saves of another load are ignored (their entries were edited from another value). */
   generation: number;
   /** The entries as loaded (for `dirty`). */
   loaded: EditorEntry[];
@@ -117,7 +125,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         this.onMessage(session, raw).catch((error: unknown) => this.deps.logger.error('The repository groups editor failed.', error));
       }),
       vscode.workspace.onDidChangeConfiguration((event) => {
-        if (event.affectsConfiguration(`${SETTINGS_SECTION}.${REPOSITORY_GROUPS_KEY}`)) this.refresh(session);
+        if (event.affectsConfiguration(`${SETTINGS_SECTION}.${REPOSITORY_GROUPS_KEY}`)) this.onSettingChanged(session);
       }),
       this.deps.onDidRender(() => this.refresh(session)),
     ];
@@ -136,10 +144,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   }
 
   private async onMessage(session: EditorSession, raw: unknown): Promise<void> {
-    const request = parseEditorRequest(raw, {
-      baseLength: Array.isArray(session.base) ? session.base.length : 0,
-      generation: session.generation,
-    });
+    const request = parseEditorRequest(raw, { generation: session.generation });
     if (!request) {
       this.deps.logger.warn('The repository groups editor sent a message that is not valid. It is ignored.');
       return;
@@ -167,7 +172,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         return;
       case 'reload':
         if (session.saving) return;
-        this.load(session, readSettingValue());
+        this.load(session, readSettingValue(), GroupsEditorTexts.loaded);
         return;
       case 'cancel':
         session.panel.dispose();
@@ -176,14 +181,28 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   }
 
   /**
+   * The setting changed (in settings.json, or by Save). A draft without edits shows the stored value at once; a draft
+   * with edits stays, and the state shows the banner "settings.json changed this setting" (changedOutside).
+   */
+  private onSettingChanged(session: EditorSession): void {
+    if (this.session !== session) return;
+    const stored = readSettingValue();
+    if (!session.saving && !sameSettingValue(stored, session.base) && !isEdited(session)) {
+      this.load(session, stored);
+      return;
+    }
+    this.refresh(session);
+  }
+
+  /**
    * Save: checks the entries again (the webview is not trusted), also against the time limit on the names of the view
-   * (a run of the worker that failed or was stopped saves nothing), then applies the changes of the editor as a patch to
-   * the value stored now (mergeRepositoryGroups), asks only where settings.json no longer has an entry unchanged that the
-   * editor edited or removed (and once about the order when both sides moved entries differently, and before it
-   * replaces a stored value that is not a list), and writes the key in the user settings. Each question re-reads the
-   * stored value: the answers count only while the value that the questions showed is unchanged. `update` of one key
-   * changes only that key in settings.json; the other settings and the comments stay. Afterwards the editor shows the
-   * written value (the new base). After Cancel or a closed panel, nothing is written.
+   * (a run of the worker that failed or was stopped saves nothing). Then it reads the stored value: while it is still
+   * the base, it writes the draft. Otherwise (and for a stored value that is not a list) it asks: Load settings.json
+   * (the draft is dropped and nothing is written), Save Mine (the draft replaces that value), or Cancel (nothing is
+   * written, the draft stays). The value is read again after the question; when it changed during the question, Save
+   * asks again with the new value. `update` of this one key changes only that key in settings.json; the other settings
+   * and the comments stay. Afterwards the editor shows the written value (the new base). After a closed panel, nothing
+   * is written.
    */
   private async save(session: EditorSession): Promise<void> {
     if (!canSave(checkEntries(session.entries))) {
@@ -192,7 +211,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     }
     session.saving = true;
     let status: string | undefined;
-    let written: { value: unknown } | undefined;
+    let reload: { value: unknown } | undefined;
     const closed = () => this.session !== session;
     try {
       const run = await this.deps.previewRunner.run({
@@ -209,80 +228,55 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         status = GroupsEditorTexts.previewFailed;
         return;
       }
-      // The answers, with the value of settings.json that they were given for: the questions show that value.
-      let answers: { theirs: unknown; entries: Map<number, ConflictChoice>; order?: ConflictChoice; replace?: boolean } | undefined;
+      const mine = toSettingValue(session.entries);
+      const value = mine.length > 0 ? mine : undefined;
+      /** The stored value that the user answered Save Mine for; the draft may replace only that value. */
+      let confirmed: { theirs: unknown } | undefined;
       for (;;) {
         const current = readSettingValue();
-        // An answer counts only while settings.json holds what the question showed; otherwise it is asked again.
-        if (!answers || !sameSettingValue(answers.theirs, current)) answers = { theirs: current, entries: new Map() };
-        const outcome = mergeRepositoryGroups(session.base, session.entries, current, {
-          entries: answers.entries,
-          ...(answers.order ? { order: answers.order } : {}),
-          ...(answers.replace ? { replaceNotAList: true } : {}),
-        });
-        if (outcome.status === 'notAList') {
-          const answer = await vscode.window.showWarningMessage(
-            GroupsEditorTexts.notAListConflict,
-            { modal: true, detail: GroupsEditorTexts.notAListDetail(describeSettingEntry(outcome.theirs)) },
-            GroupsEditorTexts.replaceWithMine,
-          );
-          if (closed()) return;
-          if (answer !== GroupsEditorTexts.replaceWithMine) {
-            status = GroupsEditorTexts.saveCancelled;
-            return;
+        const notAList = current !== undefined && current !== null && !Array.isArray(current);
+        const unchanged = !notAList && sameSettingValue(current, session.base);
+        if (unchanged || (confirmed && sameSettingValue(confirmed.theirs, current))) {
+          // Nothing awaits between the read above and this write, so it replaces exactly the value that was checked.
+          if (!sameSettingValue(value, current)) {
+            await vscode.workspace.getConfiguration(SETTINGS_SECTION).update(REPOSITORY_GROUPS_KEY, value, vscode.ConfigurationTarget.Global);
           }
-          answers.replace = true;
-          continue;
+          this.deps.logger.info(`The setting devEnvLauncher.repositoryGroups was saved with ${mine.length} entries.`);
+          reload = { value };
+          status = unchanged ? GroupsEditorTexts.saved : GroupsEditorTexts.savedReplaced;
+          return;
         }
-        if (outcome.status === 'conflicts') {
-          const [conflict] = outcome.conflicts;
-          const answer = conflict
-            ? await vscode.window.showWarningMessage(
-                GroupsEditorTexts.conflict(conflict.baseIndex + 1),
-                {
-                  modal: true,
-                  detail: GroupsEditorTexts.conflictDetail(
-                    describeSettingEntry(conflict.base),
-                    describeSettingEntry(conflict.mine),
-                    describeSettingList(current),
-                  ),
-                },
-                GroupsEditorTexts.keepMine,
-                GroupsEditorTexts.keepTheirs,
-              )
-            : await vscode.window.showWarningMessage(
-                GroupsEditorTexts.orderConflict,
-                { modal: true, detail: GroupsEditorTexts.orderConflictDetail },
-                GroupsEditorTexts.keepMine,
-                GroupsEditorTexts.keepTheirs,
-              );
-          if (closed()) return;
-          if (answer === undefined) {
-            status = GroupsEditorTexts.saveCancelled;
-            return;
-          }
-          const choice: ConflictChoice = answer === GroupsEditorTexts.keepMine ? 'mine' : 'theirs';
-          if (conflict) answers.entries.set(conflict.baseIndex, choice);
-          else answers.order = choice;
-          continue;
+        const changed = !sameSettingValue(current, session.base);
+        const answer = await vscode.window.showWarningMessage(
+          changed ? GroupsEditorTexts.changedMeanwhile : GroupsEditorTexts.notAListConflict,
+          {
+            modal: true,
+            detail: notAList
+              ? GroupsEditorTexts.notAListDetail(describeSettingEntry(current))
+              : GroupsEditorTexts.changedMeanwhileDetail(describeSettingList(current)),
+          },
+          GroupsEditorTexts.loadTheirs,
+          GroupsEditorTexts.saveMine,
+        );
+        if (closed()) return;
+        if (answer === GroupsEditorTexts.loadTheirs) {
+          reload = { value: readSettingValue() };
+          status = GroupsEditorTexts.loadedTheirs;
+          return;
         }
-        const merged = outcome.value;
-        const changedMeanwhile = !sameSettingValue(current, session.base);
-        const value = merged.length > 0 ? merged : undefined;
-        if (!sameSettingValue(merged, current)) {
-          await vscode.workspace.getConfiguration(SETTINGS_SECTION).update(REPOSITORY_GROUPS_KEY, value, vscode.ConfigurationTarget.Global);
+        if (answer !== GroupsEditorTexts.saveMine) {
+          status = GroupsEditorTexts.saveCancelled;
+          return;
         }
-        this.deps.logger.info(`The setting devEnvLauncher.repositoryGroups was saved with ${merged.length} entries.`);
-        written = { value };
-        status = changedMeanwhile ? GroupsEditorTexts.savedMerged : GroupsEditorTexts.saved;
-        return;
+        // Save Mine counts for the value that the question showed; the loop reads it again and asks again if it changed.
+        confirmed = { theirs: current };
       }
     } catch (error) {
       this.deps.logger.error('The setting devEnvLauncher.repositoryGroups could not be saved.', error);
       void vscode.window.showErrorMessage(`The repository groups could not be saved: ${errorMessage(error)}`);
     } finally {
       session.saving = false;
-      if (written) this.load(session, written.value, status);
+      if (reload) this.load(session, reload.value, status);
       else this.refresh(session, status);
     }
   }
@@ -372,4 +366,9 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
 /** The value in the user settings (scope `application`: no other value counts). */
 function readSettingValue(): unknown {
   return vscode.workspace.getConfiguration(SETTINGS_SECTION).inspect<unknown>(REPOSITORY_GROUPS_KEY)?.globalValue;
+}
+
+/** The draft differs from the entries as loaded (the webview shows it as not saved). */
+function isEdited(session: EditorSession): boolean {
+  return !sameSettingValue(toSettingValue(session.entries), toSettingValue(session.loaded));
 }

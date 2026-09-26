@@ -16,7 +16,7 @@
   ];
   const UPDATE_DELAY_MS = 150;
 
-  /** @type {{name: string, pattern: string, flags: string, origin?: number}[]} */
+  /** @type {{name: string, pattern: string, flags: string}[]} */
   let entries = [];
   let seq = 0;
   /** The load of the extension that the entries come from; sent back with each update. */
@@ -46,11 +46,7 @@
   }
 
   function entriesForMessage() {
-    return entries.map((entry) => {
-      const item = { name: entry.name, pattern: entry.pattern, flags: entry.flags };
-      if (typeof entry.origin === 'number') item.origin = entry.origin;
-      return item;
-    });
+    return entries.map((entry) => ({ name: entry.name, pattern: entry.pattern, flags: entry.flags }));
   }
 
   function sendUpdate() {
@@ -338,11 +334,11 @@
     if (message.type === 'load' && Array.isArray(message.entries)) {
       clearTimeout(timer);
       timer = undefined;
-      entries = message.entries.map((entry) => {
-        const item = { name: String(entry.name), pattern: String(entry.pattern), flags: normalizeFlags(String(entry.flags)) };
-        if (typeof entry.origin === 'number') item.origin = entry.origin;
-        return item;
-      });
+      entries = message.entries.map((entry) => ({
+        name: String(entry.name),
+        pattern: String(entry.pattern),
+        flags: normalizeFlags(String(entry.flags)),
+      }));
       lastState = undefined;
       if (typeof message.generation === 'number') generation = message.generation;
       if (typeof message.testName === 'string') $('test-name').value = message.testName;

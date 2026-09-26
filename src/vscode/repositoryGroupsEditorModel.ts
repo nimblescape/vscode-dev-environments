@@ -32,11 +32,6 @@ export interface EditorEntry {
   pattern: string;
   /** Subset of `ius`, in that order. */
   flags: string;
-  /**
-   * Index of the element of the setting value that the editor loaded this entry from (the base of the merge at Save);
-   * missing for an entry added in the editor.
-   */
-  origin?: number;
 }
 
 // User-visible texts that messages.ts lacks; to be moved there.
@@ -60,14 +55,16 @@ export const GroupsEditorTexts = {
     `Entry ${position}${name !== undefined ? ` ("${name}")` : ''} matches.`,
   testInvalid: 'Enter the repository name without spaces, for example 2026-3cWI-SWP-module-oop-EnesHA81 or owner/name.',
   invalidEntriesNotSaved: 'Correct the entries with an error first. Nothing was saved.',
-  conflict: (position: number) =>
-    `Entry ${position} of devEnvLauncher.repositoryGroups was changed in this editor, but settings.json no longer has it unchanged. Which one do you want to keep?`,
-  conflictDetail: (base: string, mine: string, theirs: string) =>
-    `This editor: ${mine}\nsettings.json no longer has ${base} unchanged.\nsettings.json now: ${theirs}\nKeep Mine applies the change of this editor to that list; Keep settings.json leaves the list as it is.`,
-  keepMine: 'Keep Mine',
-  keepTheirs: 'Keep settings.json',
-  saveCancelled: 'Nothing was saved.',
+  changedMeanwhile: 'devEnvLauncher.repositoryGroups was changed in settings.json while this editor was open.',
+  changedMeanwhileDetail: (theirs: string) =>
+    `settings.json now:${theirs}\n\nLoad settings.json shows this list in the editor and drops your unsaved edits. Save Mine replaces it with the entries of this editor. Cancel changes nothing.`,
+  loadTheirs: 'Load settings.json',
+  saveMine: 'Save Mine',
+  saveCancelled: 'Nothing was saved. Your edits are still in the editor.',
   saved: 'Saved to the user settings.',
+  savedReplaced: 'Saved to the user settings. Your entries replaced the value that settings.json had.',
+  loadedTheirs: 'Loaded the setting from settings.json. Your unsaved edits were dropped. Nothing was saved.',
+  loaded: 'Loaded the setting from settings.json.',
   entryTooSlow:
     'This regular expression takes too long for the repository names of the view (for example a nested repetition such as (a+)+). It would make VS Code stop responding. Change it before you save.',
   previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
@@ -76,12 +73,7 @@ export const GroupsEditorTexts = {
   previewFailed: 'The preview could not check these regular expressions; Save is not possible.',
   notAListConflict: 'settings.json holds a value for devEnvLauncher.repositoryGroups that is not a list.',
   notAListDetail: (theirs: string) =>
-    `settings.json now: ${theirs}\nReplace with Mine writes the entries of this editor instead of that value. Cancel saves nothing.`,
-  replaceWithMine: 'Replace with Mine',
-  orderConflict:
-    'The entries of devEnvLauncher.repositoryGroups were moved both in this editor and in settings.json. Which order do you want to keep?',
-  orderConflictDetail: 'The other changes of both sides are kept either way.',
-  savedMerged: 'Saved to the user settings, together with the changes made in settings.json meanwhile.',
+    `The value in settings.json is not a list: ${theirs}\n\nLoad settings.json shows the editor for that value (with no entries) and drops your unsaved edits. Save Mine replaces that value with the entries of this editor. Cancel changes nothing.`,
   slow: (milliseconds: number) =>
     `Grouping took ${milliseconds} ms. A regular expression may be slow, for example one with a nested repetition such as (a+)+.`,
 } as const;
@@ -110,11 +102,11 @@ export function entriesFromSetting(value: unknown): { entries: EditorEntry[]; no
     const ignored = issues.find((issue) => issue.kind === 'ignoredFlags');
     if (ignored) notices.push(GroupsEditorTexts.ignoredFlagsLeftOut(index + 1, ignored.detail ?? ''));
     if (typeof entry === 'string') {
-      entries.push({ name: '', pattern: entry, flags: '', origin: index });
+      entries.push({ name: '', pattern: entry, flags: '' });
       return;
     }
     const { name, pattern, flags } = entry as { name?: string; pattern: string; flags?: string };
-    entries.push({ name: name ?? '', pattern, flags: normalizeFlags(flags ?? ''), origin: index });
+    entries.push({ name: name ?? '', pattern, flags: normalizeFlags(flags ?? '') });
   });
   return { entries, notices };
 }
@@ -218,15 +210,15 @@ export type EditorRequest =
   | { type: 'save'; seq: number; generation: number; entries: EditorEntry[] }
   | { type: 'reload' }
   | { type: 'cancel' }
-  /** An update or Save for entries of an earlier load (their origins name another base): ignored. */
+  /** An update or Save for entries of an earlier load (edited from another value): ignored. */
   | { type: 'stale' };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
  * wrong types, flags other than i, u, and s, and texts or lists over EditorLimits are refused. `generation` counts the
- * loads of the editor; an update or Save of another load is `stale`.
+ * loads of the editor; an update or Save of another load is `stale` (its entries were edited from another value).
  */
-export function parseEditorRequest(raw: unknown, context: { baseLength: number; generation: number }): EditorRequest | undefined {
+export function parseEditorRequest(raw: unknown, context: { generation: number }): EditorRequest | undefined {
   if (!isPlainObject(raw)) return undefined;
   switch (raw.type) {
     case 'ready':
@@ -238,7 +230,7 @@ export function parseEditorRequest(raw: unknown, context: { baseLength: number; 
       const keys = raw.type === 'update' ? ['type', 'seq', 'generation', 'entries', 'testName'] : ['type', 'seq', 'generation', 'entries'];
       if (!hasOnlyKeys(raw, keys) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
       if (raw.generation !== context.generation) return { type: 'stale' };
-      const entries = parseEntries(raw.entries, context.baseLength);
+      const entries = parseEntries(raw.entries);
       if (!entries) return undefined;
       if (raw.type === 'save') return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
       if (!isText(raw.testName, EditorLimits.testName)) return undefined;
@@ -249,23 +241,16 @@ export function parseEditorRequest(raw: unknown, context: { baseLength: number; 
   }
 }
 
-/** The entries of a message; an `origin` must be an index of the loaded setting value, at most once. */
-function parseEntries(value: unknown, baseLength: number): EditorEntry[] | undefined {
+/** The entries of a message. */
+function parseEntries(value: unknown): EditorEntry[] | undefined {
   if (!Array.isArray(value) || value.length > EditorLimits.entries) return undefined;
   const entries: EditorEntry[] = [];
-  const origins = new Set<number>();
   for (const item of value) {
-    if (!isPlainObject(item)) return undefined;
-    const keys = 'origin' in item ? ['name', 'pattern', 'flags', 'origin'] : ['name', 'pattern', 'flags'];
-    if (!hasOnlyKeys(item, keys)) return undefined;
-    const { name, pattern, flags, origin } = item;
+    if (!isPlainObject(item) || !hasOnlyKeys(item, ['name', 'pattern', 'flags'])) return undefined;
+    const { name, pattern, flags } = item;
     if (!isText(name, EditorLimits.name) || !isText(pattern, EditorLimits.pattern)) return undefined;
     if (typeof flags !== 'string' || !/^[ius]{0,3}$/.test(flags) || normalizeFlags(flags).length !== flags.length) return undefined;
-    if (origin !== undefined) {
-      if (!isSeq(origin) || origin >= baseLength || origins.has(origin)) return undefined;
-      origins.add(origin);
-    }
-    entries.push({ name, pattern, flags: normalizeFlags(flags), ...(origin !== undefined ? { origin } : {}) });
+    entries.push({ name, pattern, flags: normalizeFlags(flags) });
   }
   return entries;
 }
@@ -289,402 +274,45 @@ function isSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-// ---- Save: the changes of the editor as a patch -----------------------------------------------------------------
+// ---- Save: the question when settings.json changed the setting ----------------------------------------------------
 
-/**
- * A change of the editor that Save cannot apply without a question: settings.json no longer has the entry that the
- * editor edited or removed unchanged (it changed or removed it meanwhile, or it holds another number of equal copies,
- * so the copy cannot be told). The question shows the current list of settings.json.
- */
-export interface MergeConflict {
-  /** Index in the loaded value (the base). */
-  baseIndex: number;
-  /** The entry as the editor loaded it. */
-  base: unknown;
-  /** The entry of the editor; missing when the editor removed it. */
-  mine?: unknown;
-}
-
-export type ConflictChoice = 'mine' | 'theirs';
-
-/** The answers to the questions of Save: per base index, and for the order. */
-export interface MergeChoices {
-  entries?: ReadonlyMap<number, ConflictChoice>;
-  order?: ConflictChoice;
-  /** The value stored now is not a list, and the user chose to replace it with the entries of the editor. */
-  replaceNotAList?: boolean;
-}
-
-export type MergeOutcome =
-  /** `conflicts` and `orderConflict`: the questions that the choices answered. */
-  | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[]; orderConflict: boolean }
-  /** Questions without an answer in the choices: the changes of entries, and whether both sides moved entries differently. */
-  | { status: 'conflicts'; conflicts: MergeConflict[]; orderConflict: boolean }
-  /** The value stored now is not a list (nor missing): Save must ask before it replaces it (`choices.replaceNotAList`). */
-  | { status: 'notAList'; theirs: unknown };
-
-/** An edit (`to` set) or a removal of the editor, of the base entry `baseIndex`. */
-interface EditorChange {
-  baseIndex: number;
-  /** Position of the edited entry in the editor. */
-  position?: number;
-  to?: unknown;
-  toKey?: string;
-  /**
-   * Only what loading did to the entry (flags other than i, u, and s dropped, an entry of the wrong type left out), not
-   * a change of the user: applied when the entry is found in settings.json, otherwise dropped without a question.
-   */
-  loading: boolean;
-}
-
-/** One element of the stored value (settings.json) while the patch is applied. */
-interface Cell {
-  value: unknown;
-  /** The base entry that this element is (located by its value, step 1 of mergeRepositoryGroups). */
-  base?: number;
-  removed?: boolean;
-  /** An element that a Keep Mine answer already changed. */
-  taken?: boolean;
-  /** Entries of the editor inserted after this element, in order. */
-  after: Item[];
-}
-
-interface Item {
-  value: unknown;
-}
-
-/**
- * Save never overwrites settings.json. As the user put it: "it shall not overwrite, but read the settings and insert
- * the part that we want to change". So Save applies the changes of the editor as a patch to the value stored now; it
- * never guesses which element of settings.json is which entry of the editor.
- *
- * `base` is the value that the editor loaded (when it opened, or was last saved or loaded), `ours` the entries of the
- * editor, each with the `origin` it was loaded from (none when added), and `theirs` the value stored now. The patch is
- * the difference of the editor to the base: an edit or a removal of a base entry, an addition after the nearest entry
- * of the editor before it that has an origin, and a move (the entries with an origin are not in the order of the base).
- *
- * 1. Each base entry is located in `theirs` by its value (pattern, name, and flags as the editor compares them): the
- *    k-th copy of a value in the base is the k-th copy in `theirs`, but only when `theirs` has as many copies as the
- *    base; otherwise the entry is not located.
- * 2. An edit or removal of a located entry is applied in place.
- * 3. An edit or removal of an entry that is not located: when `theirs` made the same change (a removed value is gone
- *    from `theirs`; for an edit, `theirs` has one copy less of the old value and one more of the new value than the
- *    base), nothing is left to do. Otherwise it is a conflict, answered in `choices.entries` by base index: Keep Mine
- *    applies the change to a copy of the old value that `theirs` still holds (the nearest to the place of the entry:
- *    after the nearest located base entry before it), and otherwise inserts the new value as an addition is inserted;
- *    Keep settings.json drops the change.
- * 4. An addition goes after the nearest entry of the editor before it that is in the result (after the elements that
- *    settings.json holds right after that entry and that are not located); without one, at the start when an entry of
- *    the editor that is located follows it, otherwise at the end. An addition that `theirs` already made (it has more
- *    copies of the value than the base, not yet used by another change) is not added twice. No question.
- * 5. A move: when the editor has the located entries in another order than the base, and `theirs` still has them in
- *    the order of the base, they are put into the order of the editor; each takes along the elements that follow it in
- *    `theirs` up to the next such entry. When `theirs` has them in the order of the editor, nothing is to do. When
- *    `theirs` moved them too, one question (`orderConflict`, answered in `choices.order`).
- * 6. A stored value that is not a list is never patched: the outcome `notAList` asks first, and
- *    `choices.replaceNotAList` writes the entries of the editor instead.
- * 7. Without changes in the editor, the result is `theirs` as it is; when `theirs` equals the base, it is the entries
- *    of the editor exactly.
- *
- * The time is linear in the number of entries for the lookups by value (maps), plus the number of insertions times the
- * number of entries for their places; no two texts are compared for similarity.
- */
-export function mergeRepositoryGroups(
-  baseValue: unknown,
-  ours: readonly EditorEntry[],
-  theirsValue: unknown,
-  choices: MergeChoices = {},
-): MergeOutcome {
-  const base = Array.isArray(baseValue) ? (baseValue as unknown[]) : [];
-  if (theirsValue !== undefined && theirsValue !== null && !Array.isArray(theirsValue)) {
-    // Not a list: nothing to patch, and never overwritten without a question.
-    if (!choices.replaceNotAList) return { status: 'notAList', theirs: theirsValue };
-    return { status: 'merged', value: toSettingValue(ours), conflicts: [], orderConflict: false };
-  }
-  const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
-  const mine = toSettingValue(ours);
-  const baseKeys = base.map(entryKey);
-  const theirsKeys = theirs.map(entryKey);
-  const mineKeys = mine.map(entryKey);
-  const merged = (value: unknown[], conflicts: MergeConflict[] = [], orderConflict = false): MergeOutcome => ({
-    status: 'merged',
-    value,
-    conflicts,
-    orderConflict,
-  });
-  // settings.json is as the editor loaded it: the entries of the editor, exactly.
-  if (sameKeys(theirsKeys, baseKeys)) return merged(mine);
-  // settings.json already holds the entries of the editor (review round 2 of PR #21, F2): nothing to write.
-  if (sameKeys(mineKeys, theirsKeys)) return merged([...theirs]);
-
-  // The patch of the editor.
-  const origins = ours.map((entry) => entry.origin);
-  const positionOf = new Map<number, number>();
-  origins.forEach((origin, position) => {
-    if (origin !== undefined && Number.isInteger(origin) && origin >= 0 && origin < base.length && !positionOf.has(origin)) {
-      positionOf.set(origin, position);
-    } else {
-      origins[position] = undefined;
-    }
-  });
-  const changes: EditorChange[] = [];
-  base.forEach((entry, baseIndex) => {
-    const position = positionOf.get(baseIndex);
-    if (position === undefined) {
-      changes.push({ baseIndex, loading: loadedKey(entry) === undefined });
-    } else if (mineKeys[position] !== baseKeys[baseIndex]) {
-      changes.push({ baseIndex, position, to: mine[position], toKey: mineKeys[position], loading: mineKeys[position] === loadedKey(entry) });
-    }
-  });
-  const additions = origins.flatMap((origin, position) => (origin === undefined ? [position] : []));
-  const originOrder = origins.filter((origin): origin is number => origin !== undefined);
-  if (changes.length === 0 && additions.length === 0 && isIncreasing(originOrder)) return merged([...theirs]);
-
-  // 1. Locate the base entries in settings.json by value.
-  const baseCount = countKeys(baseKeys);
-  const theirsCount = countKeys(theirsKeys);
-  const theirsPositions = new Map<string, number[]>();
-  theirsKeys.forEach((key, position) => {
-    const positions = theirsPositions.get(key);
-    if (positions) positions.push(position);
-    else theirsPositions.set(key, [position]);
-  });
-  const cells: Cell[] = theirs.map((value) => ({ value, after: [] }));
-  const located = new Array<number | undefined>(base.length).fill(undefined);
-  const copiesSeen = new Map<string, number>();
-  baseKeys.forEach((key, baseIndex) => {
-    const copy = copiesSeen.get(key) ?? 0;
-    copiesSeen.set(key, copy + 1);
-    if (baseCount.get(key) !== theirsCount.get(key)) return;
-    const position = (theirsPositions.get(key) ?? [])[copy];
-    located[baseIndex] = position;
-    cells[position].base = baseIndex;
-  });
-  // The last element of the run of elements that are not located after each element.
-  const runEnd = new Array<number>(cells.length);
-  for (let position = cells.length - 1; position >= 0; position--) {
-    runEnd[position] = position + 1 < cells.length && cells[position + 1].base === undefined ? runEnd[position + 1] : position;
-  }
-  // The place in settings.json of each base entry: after the run of the nearest located base entry before it.
-  const basePlace = new Array<number>(base.length);
-  let place = -0.5;
-  base.forEach((_entry, baseIndex) => {
-    basePlace[baseIndex] = place;
-    const position = located[baseIndex];
-    if (position !== undefined) place = runEnd[position] + 0.5;
-  });
-
-  // Copies of a value that settings.json added or removed, not yet used by a change of the editor that it also made.
-  const used = { added: new Map<string, number>(), removed: new Map<string, number>() };
-  const left = (kind: 'added' | 'removed', key: string) => {
-    const delta = (theirsCount.get(key) ?? 0) - (baseCount.get(key) ?? 0);
-    return (kind === 'added' ? delta : -delta) - (used[kind].get(key) ?? 0);
-  };
-  const use = (kind: 'added' | 'removed', key: string) => used[kind].set(key, (used[kind].get(key) ?? 0) + 1);
-  /** The copy of `key` in settings.json nearest to `at`, that no answer changed yet. */
-  const nearestCopy = (key: string, at: number): number | undefined => {
-    let best: number | undefined;
-    for (const position of theirsPositions.get(key) ?? []) {
-      if (cells[position].removed || cells[position].taken) continue;
-      if (best === undefined || Math.abs(position - at) <= Math.abs(best - at)) best = position;
-    }
-    return best;
-  };
-
-  // 2. and 3. Edits and removals.
-  const conflicts: MergeConflict[] = [];
-  const open: MergeConflict[] = [];
-  const placedCell = new Map<number, number>();
-  const insertLater = new Set<number>();
-  origins.forEach((origin, position) => {
-    if (origin !== undefined && located[origin] !== undefined) placedCell.set(position, located[origin] as number);
-  });
-  for (const change of changes) {
-    const at = located[change.baseIndex];
-    if (at !== undefined) {
-      if (change.position === undefined) cells[at].removed = true;
-      else cells[at].value = change.to;
-      continue;
-    }
-    // settings.json changed or removed an entry that loading changed: its value stays.
-    if (change.loading) continue;
-    const from = baseKeys[change.baseIndex];
-    if (change.position === undefined) {
-      if (!theirsCount.has(from)) continue;
-    } else if (change.toKey !== undefined && left('removed', from) > 0 && left('added', change.toKey) > 0) {
-      use('removed', from);
-      use('added', change.toKey);
-      continue;
-    }
-    const conflict: MergeConflict = {
-      baseIndex: change.baseIndex,
-      base: base[change.baseIndex],
-      ...(change.position !== undefined ? { mine: change.to } : {}),
-    };
-    conflicts.push(conflict);
-    const choice = choices.entries?.get(change.baseIndex);
-    if (choice === undefined) {
-      open.push(conflict);
-      continue;
-    }
-    if (choice === 'theirs') continue;
-    const copy = nearestCopy(from, basePlace[change.baseIndex]);
-    if (change.position === undefined) {
-      if (copy !== undefined) cells[copy].removed = true;
-    } else if (copy !== undefined) {
-      cells[copy].value = change.to;
-      cells[copy].taken = true;
-      placedCell.set(change.position, copy);
-    } else {
-      insertLater.add(change.position);
-    }
-  }
-
-  // 5. The order (decided before the questions are returned, so they are asked together).
-  const moved = origins.flatMap((origin, position) =>
-    origin !== undefined && located[origin] !== undefined ? [{ position, base: origin, cell: located[origin] as number }] : [],
-  );
-  const byCell = [...moved].sort((a, b) => a.cell - b.cell);
-  let orderConflict = false;
-  let reorder = false;
-  if (!isIncreasing(moved.map((entry) => entry.base)) && byCell.some((entry, index) => entry !== moved[index])) {
-    if (isIncreasing(byCell.map((entry) => entry.base))) {
-      reorder = true;
-    } else {
-      orderConflict = true;
-      reorder = choices.order === 'mine';
-    }
-  }
-  const orderOpen = orderConflict && choices.order === undefined;
-  if (open.length > 0 || orderOpen) return { status: 'conflicts', conflicts: open, orderConflict: orderOpen };
-
-  // 4. Additions (and edits answered with Keep Mine whose entry settings.json no longer has), in the order of the editor.
-  const start: Item[] = [];
-  const end: Item[] = [];
-  const placedItem = new Map<number, { list: Item[]; item: Item }>();
-  const cellAfter = new Array<boolean>(ours.length + 1).fill(false);
-  for (let position = ours.length - 1; position >= 0; position--) cellAfter[position] = cellAfter[position + 1] || placedCell.has(position);
-  const insert = (position: number) => {
-    const item: Item = { value: mine[position] };
-    for (let before = position - 1; before >= 0; before--) {
-      const cell = placedCell.get(before);
-      if (cell !== undefined) {
-        const list = cells[runEnd[cell]].after;
-        list.push(item);
-        placedItem.set(position, { list, item });
-        return;
-      }
-      const anchor = placedItem.get(before);
-      if (anchor) {
-        anchor.list.splice(anchor.list.indexOf(anchor.item) + 1, 0, item);
-        placedItem.set(position, { list: anchor.list, item });
-        return;
-      }
-    }
-    const list = cellAfter[position + 1] ? start : end;
-    list.push(item);
-    placedItem.set(position, { list, item });
-  };
-  ours.forEach((_entry, position) => {
-    if (origins[position] === undefined) {
-      if (left('added', mineKeys[position]) > 0) use('added', mineKeys[position]);
-      else insert(position);
-    } else if (insertLater.has(position)) {
-      insert(position);
-    }
-  });
-
-  const value: unknown[] = start.map((item) => item.value);
-  const append = (from: number, to: number) => {
-    for (let position = from; position < to; position++) {
-      if (!cells[position].removed) value.push(cells[position].value);
-      for (const item of cells[position].after) value.push(item.value);
-    }
-  };
-  if (!reorder) {
-    append(0, cells.length);
-  } else {
-    // Each located entry of the editor with the elements after it, up to the next one; in the order of the editor.
-    append(0, byCell[0].cell);
-    const until = new Map(byCell.map((entry, index) => [entry.cell, index + 1 < byCell.length ? byCell[index + 1].cell : cells.length]));
-    for (const entry of moved) append(entry.cell, until.get(entry.cell) ?? cells.length);
-  }
-  for (const item of end) value.push(item.value);
-  return merged(value, conflicts, orderConflict);
-}
-
-function isIncreasing(values: readonly number[]): boolean {
-  return values.every((value, index) => index === 0 || value > values[index - 1]);
-}
-
-function sameKeys(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((key, index) => key === b[index]);
-}
-
-function countKeys(keys: readonly string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
-  return counts;
-}
-
-/** The key of an element of the setting as the editor loads it (flags other than i, u, and s dropped); `undefined` for one that it leaves out. */
-function loadedKey(entry: unknown): string | undefined {
-  const fields = entryFieldsOf(entry);
-  if (!fields) return undefined;
-  return entryKey(toSettingValue([{ name: fields.name ?? '', pattern: fields.pattern, flags: normalizeFlags(fields.flags ?? '') }])[0]);
-}
-
-/** The name (trimmed, if any) and pattern of an element of the setting, or `undefined` for one of the wrong type. */
-function entryFieldsOf(entry: unknown): { name?: string; pattern: string; flags?: string } | undefined {
-  if (typeof entry === 'string') return { pattern: entry };
-  if (!isPlainObject(entry)) return undefined;
-  const { name, pattern, flags } = entry;
-  if (typeof pattern !== 'string') return undefined;
-  if (name !== undefined && typeof name !== 'string') return undefined;
-  if (flags !== undefined && typeof flags !== 'string') return undefined;
-  const trimmed = name?.trim();
-  // The order of the flags and a repeated flag do not change the meaning ('si' is 'is').
-  const sorted = [...new Set(flags ?? '')].sort().join('');
-  return { ...(trimmed ? { name: trimmed } : {}), pattern, ...(sorted ? { flags: sorted } : {}) };
-}
-
-/**
- * Compares elements of the setting by what they mean: a string and `{ "pattern" }` with the same text are equal, a
- * name is trimmed, and an empty name or flags text counts as none. Elements of the wrong type compare as JSON.
- */
-function entryKey(entry: unknown): string {
-  const fields = entryFieldsOf(entry);
-  if (!fields) return `invalid:${stableJson(entry ?? null)}`;
-  // The texts with their lengths (unambiguous): no JSON of long patterns, so Save of long lists stays fast.
-  const name = fields.name ?? '';
-  return `${fields.pattern.length}:${fields.pattern}${name.length}:${name}${fields.flags ?? ''}`;
-}
-
-/** At most this many characters of the list of settings.json are shown in a question. */
+/** At most this many characters of one element of the setting are shown in a question; the rest is cut. */
+export const MAX_SHOWN_ENTRY = 200;
+/** At most this many elements of the list of settings.json are shown in a question; the rest is counted. */
+export const MAX_SHOWN_LINES = 20;
+/** At most this many characters of the list of settings.json are shown in a question (the first element always). */
 const MAX_SHOWN_LIST = 2000;
 
-/** A short text of the list of settings.json for the conflict question: one element per line, cut after MAX_SHOWN_LIST characters. */
+/**
+ * A short text of the list of settings.json for the question of Save: one element per line, each cut after
+ * MAX_SHOWN_ENTRY characters; after MAX_SHOWN_LINES elements or MAX_SHOWN_LIST characters the rest is counted. The
+ * first element is always shown, so the list is never hidden as a whole.
+ */
 export function describeSettingList(value: unknown): string {
+  if (value === undefined || value === null) return '(no entries)';
   if (!Array.isArray(value)) return describeSettingEntry(value);
   if (value.length === 0) return '(no entries)';
   let text = '';
   for (const [index, entry] of value.entries()) {
     const line = `\n${index + 1}. ${describeSettingEntry(entry)}`;
-    if (text.length + line.length > MAX_SHOWN_LIST) return `${text}\n… (${value.length - index} more)`;
+    if (index > 0 && (index >= MAX_SHOWN_LINES || text.length + line.length > MAX_SHOWN_LIST)) {
+      const more = value.length - index;
+      return `${text}\n… and ${more} more ${more === 1 ? 'entry' : 'entries'}`;
+    }
     text += line;
   }
   return text;
 }
 
-/** A short text of an element of the setting for the conflict question. */
+/** A short text of an element (or of a value that is not a list) of the setting for the question of Save, cut after MAX_SHOWN_ENTRY characters. */
 export function describeSettingEntry(entry: unknown): string {
-  if (entry === undefined) return '(removed)';
-  if (typeof entry === 'string') return JSON.stringify(entry);
+  let text: string;
   try {
-    return JSON.stringify(entry) ?? String(entry);
+    text = JSON.stringify(entry) ?? String(entry);
   } catch {
-    return String(entry);
+    text = String(entry);
   }
+  return text.length > MAX_SHOWN_ENTRY ? `${text.slice(0, MAX_SHOWN_ENTRY)}… (${text.length} characters)` : text;
 }
 
 // ---- Preview ----------------------------------------------------------------------------------------------------
@@ -914,7 +542,7 @@ export function runPreviewJob(job: PreviewJob, post: (message: PreviewJobMessage
 
 // ---- State of the webview ---------------------------------------------------------------------------------------
 
-/** Message to the webview: the entries to show (at the start, and after Load Setting or Save). */
+/** Message to the webview: the entries to show (at the start, after Load settings.json or Save, and when settings.json changed a draft without edits). */
 export interface EditorLoadMessage {
   type: 'load';
   /** Counts the loads; the webview sends it back with its updates. */
@@ -1000,8 +628,8 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <p class="intro">Regular expressions (JavaScript syntax) that filter and group the repositories of the Dev Environments view. Each one is matched against the repository name without the owner; a repository goes under the first entry that matches. The capturing groups are the levels of the tree; the last one is the label of the row. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment.</p>
 <div id="notices" role="status" aria-live="polite"></div>
 <div id="changed" class="banner" role="alert" hidden>
-<span>The setting was changed in settings.json after this editor loaded it. Save applies your changes to the current setting. It asks only where settings.json changed or removed an entry that you changed too, or where both moved entries differently. Load Setting shows the current setting and discards your changes.</span>
-<button type="button" id="reload" class="secondary">Load Setting</button>
+<span>settings.json changed this setting.</span>
+<button type="button" id="reload" class="secondary">Load settings.json</button>
 </div>
 <section aria-labelledby="entries-heading">
 <h2 id="entries-heading">Entries</h2>

@@ -86,6 +86,7 @@ import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { PreviewRunner } from './groupsPreviewRunner';
 import { GroupsEditorTexts, describeSettingList, runPreviewJob, type PreviewJobMessage, type PreviewRun } from './repositoryGroupsEditorModel';
+import { SETTINGS_SECTION } from './settings';
 
 /** Runs the job in this thread, as the worker does; `next` replaces the result of the next job. */
 function inlineRunner(): PreviewRunner & { next: PreviewRun | undefined; run: ReturnType<typeof vi.fn> } {
@@ -154,7 +155,31 @@ function gen(panel: FakePanel): number {
 
 function loaded(panel: FakePanel) {
   const loads = panel.posted.filter((message) => message.type === 'load');
-  return loads[loads.length - 1] as unknown as { entries: Array<{ name: string; pattern: string; flags: string; origin?: number }> };
+  return loads[loads.length - 1] as unknown as { entries: Array<{ name: string; pattern: string; flags: string }> };
+}
+
+function lastState(panel: FakePanel) {
+  return panel.posted.filter((message) => message.type === 'state').pop();
+}
+
+function loadCount(panel: FakePanel): number {
+  return panel.posted.filter((message) => message.type === 'load').length;
+}
+
+/** settings.json changes the setting while the editor is open. */
+function changeStored(value: unknown): void {
+  hoisted.stored.value = value;
+  for (const listener of hoisted.configurationListeners) listener({ affectsConfiguration: () => true });
+}
+
+/** The question of Save for a list that settings.json changed. */
+function changedQuestion(theirs: unknown): unknown[] {
+  return [
+    GroupsEditorTexts.changedMeanwhile,
+    { modal: true, detail: GroupsEditorTexts.changedMeanwhileDetail(describeSettingList(theirs)) },
+    GroupsEditorTexts.loadTheirs,
+    GroupsEditorTexts.saveMine,
+  ];
 }
 
 describe('RepositoryGroupsEditor', () => {
@@ -164,8 +189,8 @@ describe('RepositoryGroupsEditor', () => {
     expect(panel.webview.html).toContain("default-src 'none'");
     expect(panel.webview.html).toContain('webview:file:///ext/resources/groupsEditor/editor.js');
     expect(loaded(panel).entries).toEqual([
-      { name: '', pattern: EXAMPLE, flags: '', origin: 0 },
-      { name: 'Web', pattern: '^web-(.+)$', flags: '', origin: 1 },
+      { name: '', pattern: EXAMPLE, flags: '' },
+      { name: 'Web', pattern: '^web-(.+)$', flags: '' },
     ]);
     expect(panel.posted.some((message) => message.type === 'state')).toBe(true);
     // A second open shows the same panel.
@@ -193,63 +218,148 @@ describe('RepositoryGroupsEditor', () => {
     expect(state).toMatchObject({ type: 'state', status: GroupsEditorTexts.invalidEntriesNotSaved });
   });
 
-  it('writes the user settings (Global) as strings and objects, and loads the written value as the new base', async () => {
+  it('writes the user settings (Global) as strings and objects without a question while settings.json holds the loaded value', async () => {
     const { panel } = await openEditor();
     const [example] = loaded(panel).entries;
     panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [example, { name: '', pattern: '^api-(.+)$', flags: 'i' }] });
     await flush();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledTimes(1);
     expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { pattern: '^api-(.+)$', flags: 'i' }], fakeVscode.ConfigurationTarget.Global);
     expect(loaded(panel).entries).toEqual([
-      { name: '', pattern: EXAMPLE, flags: '', origin: 0 },
-      { name: '', pattern: '^api-(.+)$', flags: 'i', origin: 1 },
+      { name: '', pattern: EXAMPLE, flags: '' },
+      { name: '', pattern: '^api-(.+)$', flags: 'i' },
     ]);
     expect(panel.posted[panel.posted.length - 1]).toMatchObject({ type: 'state', status: GroupsEditorTexts.saved, dirty: false });
   });
 
-  it('merges a change made in settings.json meanwhile instead of overwriting it', async () => {
+  // User decision A (2026-09-26): only this one setting is written; the other settings and the comments stay.
+  it('changes only the key repositoryGroups of the section devEnvLauncher, in the user settings', async () => {
     const { panel } = await openEditor();
-    const [example, web] = loaded(panel).entries;
-    hoisted.stored.value = ['^first', EXAMPLE, { name: 'Web', pattern: '^web-(.+)$' }];
-    for (const listener of hoisted.configurationListeners) listener({ affectsConfiguration: () => true });
-    // The state is computed with the preview job (asynchronous since the worker thread).
+    const [example] = loaded(panel).entries;
+    changeStored(['^theirs']);
+    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.saveMine);
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example] });
     await flush();
-    expect(panel.posted[panel.posted.length - 1]).toMatchObject({ type: 'state', changedOutside: true });
-    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries: [example, { ...web, pattern: '^www-(.+)$' }] });
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [] });
     await flush();
-    expect(update).toHaveBeenCalledWith(
-      'repositoryGroups',
-      ['^first', EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }],
-      fakeVscode.ConfigurationTarget.Global,
-    );
-    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
-    expect(panel.posted[panel.posted.length - 1]).toMatchObject({ status: GroupsEditorTexts.savedMerged, changedOutside: false });
+    expect(update.mock.calls).toEqual([
+      ['repositoryGroups', [EXAMPLE], fakeVscode.ConfigurationTarget.Global],
+      ['repositoryGroups', undefined, fakeVscode.ConfigurationTarget.Global],
+    ]);
+    for (const call of fakeVscode.workspace.getConfiguration.mock.calls) expect(call).toEqual([SETTINGS_SECTION]);
   });
 
-  it('asks about a conflicting entry only, and saves nothing when the question is dismissed', async () => {
-    const { panel } = await openEditor();
-    const [example, web] = loaded(panel).entries;
-    hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
-    const entries = [example, { ...web, pattern: '^www-(.+)$' }];
-    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries });
-    await flush();
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
-      GroupsEditorTexts.conflict(2),
-      expect.objectContaining({ modal: true }),
-      GroupsEditorTexts.keepMine,
-      GroupsEditorTexts.keepTheirs,
-    );
-    expect(update).not.toHaveBeenCalled();
+  describe('when settings.json changed the setting while the editor was open', () => {
+    const THEIRS = ['^first', EXAMPLE];
+    async function editedDraft() {
+      const opened = await openEditor();
+      const [example, web] = loaded(opened.panel).entries;
+      const entries = [example, { ...web, pattern: '^www-(.+)$' }];
+      opened.panel.receive({ type: 'update', seq: 1, generation: gen(opened.panel), entries, testName: '' });
+      await flush();
+      changeStored(THEIRS);
+      await flush();
+      return { ...opened, entries };
+    }
 
-    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.keepMine);
-    panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries });
-    await flush();
-    // Patch-based Save (review round 3 of PR #21): Keep Mine adds the entry of the editor, and the entry that
-    // settings.json changed stays (was [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }]).
-    expect(update).toHaveBeenCalledWith(
-      'repositoryGroups',
-      [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }, { name: 'Web', pattern: '^www-(.+)$' }],
-      fakeVscode.ConfigurationTarget.Global,
-    );
+    it('shows the banner and keeps the draft', async () => {
+      const { panel } = await editedDraft();
+      expect(lastState(panel)).toMatchObject({ changedOutside: true, dirty: true });
+      expect(loadCount(panel)).toBe(1);
+    });
+
+    it('reloads silently when the draft has no edits', async () => {
+      const { panel } = await openEditor();
+      changeStored(THEIRS);
+      await flush();
+      expect(loadCount(panel)).toBe(2);
+      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
+      expect(lastState(panel)).toMatchObject({ changedOutside: false, dirty: false });
+      expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('Load settings.json of the banner shows the stored value and drops the draft', async () => {
+      const { panel } = await editedDraft();
+      panel.receive({ type: 'reload' });
+      await flush();
+      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
+      expect(lastState(panel)).toMatchObject({ changedOutside: false, dirty: false, status: GroupsEditorTexts.loaded });
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('Save asks with the current list of settings.json; Load settings.json reloads, writes nothing, and drops the draft', async () => {
+      const { panel, entries } = await editedDraft();
+      fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.loadTheirs);
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(...changedQuestion(THEIRS));
+      expect(update).not.toHaveBeenCalled();
+      expect(hoisted.stored.value).toEqual(THEIRS);
+      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
+      expect(lastState(panel)).toMatchObject({ dirty: false, changedOutside: false, status: GroupsEditorTexts.loadedTheirs });
+    });
+
+    it('Save Mine replaces the value with the draft', async () => {
+      const { panel, entries } = await editedDraft();
+      fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.saveMine);
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(update).toHaveBeenCalledWith(
+        'repositoryGroups',
+        [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }],
+        fakeVscode.ConfigurationTarget.Global,
+      );
+      expect(lastState(panel)).toMatchObject({ dirty: false, changedOutside: false, status: GroupsEditorTexts.savedReplaced });
+    });
+
+    it('Cancel writes nothing and keeps the draft', async () => {
+      const { panel, entries } = await editedDraft();
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+      expect(update).not.toHaveBeenCalled();
+      expect(loadCount(panel)).toBe(1);
+      expect(lastState(panel)).toMatchObject({ dirty: true, changedOutside: true, status: GroupsEditorTexts.saveCancelled });
+      // The draft is still the one that Save writes after Save Mine.
+      fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.saveMine);
+      panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries });
+      await flush();
+      expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
+    });
+
+    it('asks again when settings.json changes the value again while the question is open', async () => {
+      const { panel, entries } = await editedDraft();
+      const details: string[] = [];
+      fakeVscode.window.showWarningMessage.mockImplementation(async (_message: string, options: { detail: string }) => {
+        details.push(options.detail);
+        if (details.length === 1) changeStored(['^again']);
+        return GroupsEditorTexts.saveMine;
+      });
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
+      await flush();
+      expect(details).toEqual([
+        GroupsEditorTexts.changedMeanwhileDetail(describeSettingList(THEIRS)),
+        GroupsEditorTexts.changedMeanwhileDetail(describeSettingList(['^again'])),
+      ]);
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
+    });
+
+    it('shows a long list of settings.json cut per entry', async () => {
+      const long = ['a'.repeat(5000), '^short'];
+      const { panel, entries } = await editedDraft();
+      changeStored(long);
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
+      const detail = (fakeVscode.window.showWarningMessage.mock.calls[0][1] as { detail: string }).detail;
+      expect(detail).toContain('2. "^short"');
+      expect(detail.length).toBeLessThan(1000);
+    });
   });
 
   it('removes the setting when the list is empty, and discards the draft with Cancel', async () => {
@@ -271,6 +381,7 @@ describe('RepositoryGroupsEditor', () => {
     panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: [example, web], testName: 'school/web-shop' });
     await flush();
     let answer: (value: unknown) => void = () => {};
+    // Set without the event, so the draft without edits is not reloaded before Save.
     hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
     fakeVscode.window.showWarningMessage.mockReturnValue(new Promise((resolve) => (answer = resolve)));
     const oldGeneration = gen(panel);
@@ -278,44 +389,18 @@ describe('RepositoryGroupsEditor', () => {
     await flush();
     // While the question of Save is open, an update does not change the draft that Save writes.
     panel.receive({ type: 'update', seq: 3, generation: oldGeneration, entries: [], testName: 'school/web-shop' });
-    answer(GroupsEditorTexts.keepMine);
+    answer(GroupsEditorTexts.saveMine);
     await flush();
-    // Patch-based Save (review round 3 of PR #21): Keep Mine adds the entry of the editor, and the entry that
-    // settings.json changed stays (was [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }]).
-    expect(update).toHaveBeenCalledWith(
-      'repositoryGroups',
-      [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }, { name: 'Web', pattern: '^www-(.+)$' }],
-      fakeVscode.ConfigurationTarget.Global,
-    );
+    expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
     const load = loaded(panel) as unknown as { generation: number; testName: string };
     expect(load.generation).toBe(oldGeneration + 1);
     expect(load.testName).toBe('school/web-shop');
-    // An update of the earlier load names origins of another base: ignored without a warning.
+    // An update of the earlier load was edited from another value: ignored without a warning.
     update.mockClear();
     panel.receive({ type: 'save', seq: 4, generation: oldGeneration, entries: [] });
     await flush();
     expect(update).not.toHaveBeenCalled();
     expect(logger.warn).not.toHaveBeenCalled();
-  });
-
-  it('asks once about the order when both sides moved entries differently', async () => {
-    hoisted.stored.value = ['^a', '^b', '^c'];
-    const { panel } = await openEditor();
-    const [a, b, c] = loaded(panel).entries;
-    hoisted.stored.value = ['^b', '^a', '^c'];
-    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.keepTheirs);
-    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [c, a, b] });
-    await flush();
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
-      GroupsEditorTexts.orderConflict,
-      expect.objectContaining({ modal: true }),
-      GroupsEditorTexts.keepMine,
-      GroupsEditorTexts.keepTheirs,
-    );
-    // Nothing else changed, so the stored value stays.
-    expect(update).not.toHaveBeenCalled();
-    expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(['^b', '^a', '^c']);
   });
 
   it('does not save a regular expression that is too slow for the names of the view, and names it', async () => {
@@ -350,57 +435,43 @@ describe('RepositoryGroupsEditor', () => {
   it('asks before it replaces a stored value that is not a list, and saves nothing without the answer', async () => {
     const { panel } = await openEditor();
     const [example] = loaded(panel).entries;
-    hoisted.stored.value = { pattern: '^typed-by-hand' };
-    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [example] });
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: [example], testName: '' });
+    await flush();
+    changeStored({ pattern: '^typed-by-hand' });
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [example] });
     await flush();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
-      GroupsEditorTexts.notAListConflict,
+      GroupsEditorTexts.changedMeanwhile,
       { modal: true, detail: GroupsEditorTexts.notAListDetail('{"pattern":"^typed-by-hand"}') },
-      GroupsEditorTexts.replaceWithMine,
+      GroupsEditorTexts.loadTheirs,
+      GroupsEditorTexts.saveMine,
     );
     expect(update).not.toHaveBeenCalled();
     expect(hoisted.stored.value).toEqual({ pattern: '^typed-by-hand' });
 
-    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.replaceWithMine);
-    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries: [example] });
+    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.saveMine);
+    panel.receive({ type: 'save', seq: 3, generation: gen(panel), entries: [example] });
     await flush();
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
     expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE], fakeVscode.ConfigurationTarget.Global);
   });
 
-  // Review round 2 of PR #21, M6: an answer counts only for the value of settings.json that the question showed.
-  it('asks again about an entry that settings.json changed after the question about it', async () => {
-    hoisted.stored.value = ['^a', '^b'];
+  it('asks also when the value was not a list already when the editor loaded it; Load settings.json keeps it', async () => {
+    hoisted.stored.value = { pattern: '^typed-by-hand' };
     const { panel } = await openEditor();
-    const [a, b] = loaded(panel).entries;
-    hoisted.stored.value = ['^a-theirs', '^b-theirs'];
-    const details: string[] = [];
-    fakeVscode.window.showWarningMessage.mockImplementation(async (_message: string, options: { detail: string }) => {
-      details.push(options.detail);
-      // While the second question is open, settings.json changes entry 1 again.
-      if (details.length === 2) hoisted.stored.value = ['^a-theirs-2', '^b-theirs'];
-      return GroupsEditorTexts.keepMine;
-    });
-    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ ...a, pattern: '^a-mine' }, { ...b, pattern: '^b-mine' }] });
+    expect(loaded(panel).entries).toEqual([]);
+    fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.loadTheirs);
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ name: '', pattern: '^new', flags: '' }] });
     await flush();
-    await flush();
-    // Patch-based Save (review round 3 of PR #21): each question shows the whole list of settings.json, so a change of
-    // it drops all answers and both entries are asked about again (was three questions: a, b, a); Keep Mine adds the
-    // entries of the editor, and those of settings.json stay (was ['^a-mine', '^b-mine']).
-    const first = describeSettingList(['^a-theirs', '^b-theirs']);
-    const second = describeSettingList(['^a-theirs-2', '^b-theirs']);
-    expect(details).toEqual([
-      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', first),
-      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', first),
-      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', second),
-      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', second),
-    ]);
-    expect(update).toHaveBeenCalledWith(
-      'repositoryGroups',
-      ['^a-theirs-2', '^b-theirs', '^a-mine', '^b-mine'],
-      fakeVscode.ConfigurationTarget.Global,
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(
+      GroupsEditorTexts.notAListConflict,
+      { modal: true, detail: GroupsEditorTexts.notAListDetail('{"pattern":"^typed-by-hand"}') },
+      GroupsEditorTexts.loadTheirs,
+      GroupsEditorTexts.saveMine,
     );
+    expect(update).not.toHaveBeenCalled();
+    expect(lastState(panel)).toMatchObject({ dirty: false, status: GroupsEditorTexts.loadedTheirs });
   });
 
   // Review round 2 of PR #21, W7: after Cancel or a closed panel, a Save in progress writes nothing.
@@ -418,18 +489,27 @@ describe('RepositoryGroupsEditor', () => {
     await flush();
     expect(update).not.toHaveBeenCalled();
 
-    const second = await openEditor();
-    const [example2, web2] = loaded(second.panel).entries;
-    hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }];
-    let answer: (value: unknown) => void = () => {};
-    fakeVscode.window.showWarningMessage.mockReturnValue(new Promise((resolve) => (answer = resolve)));
-    second.panel.receive({ type: 'save', seq: 1, generation: gen(second.panel), entries: [example2, { ...web2, pattern: '^www-(.+)$' }] });
-    await flush();
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    second.panel.dispose();
-    answer(GroupsEditorTexts.keepMine);
-    await flush();
-    expect(update).not.toHaveBeenCalled();
+    for (const choice of [GroupsEditorTexts.saveMine, GroupsEditorTexts.loadTheirs]) {
+      hoisted.stored.value = [EXAMPLE, { name: 'Web', pattern: '^web-(.+)$' }];
+      const second = await openEditor();
+      const [example2, web2] = loaded(second.panel).entries;
+      const entries = [example2, { ...web2, pattern: '^www-(.+)$' }];
+      second.panel.receive({ type: 'update', seq: 1, generation: gen(second.panel), entries, testName: '' });
+      await flush();
+      changeStored([EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }]);
+      let answer: (value: unknown) => void = () => {};
+      fakeVscode.window.showWarningMessage.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+      second.panel.receive({ type: 'save', seq: 2, generation: gen(second.panel), entries });
+      await flush();
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+      const posted = second.panel.posted.length;
+      second.panel.dispose();
+      answer(choice);
+      await flush();
+      expect(update).not.toHaveBeenCalled();
+      expect(second.panel.posted).toHaveLength(posted);
+      fakeVscode.window.showWarningMessage.mockClear();
+    }
   });
 
   // Review round 3 of PR #21: a run that failed because the panel was closed (the runner was disposed) is not logged.
