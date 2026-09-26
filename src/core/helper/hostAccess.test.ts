@@ -29,6 +29,8 @@ import {
   removedRunArgs,
   runArgsProblems,
   splitPortAddress,
+  volumeLabelOwner,
+  volumeNameItems,
   withLoopbackAddress,
   withoutNameArgs,
   type HostAccessReport,
@@ -828,6 +830,30 @@ describe('volumes of other programs, by their labels (restrictions summary, find
       }),
     ).toEqual(['1r60kajr11nn-history']);
     expect(mountedVolumeNames({ config: { image: 'x' }, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, composeAccess.ts)', () => {
+  it.each<[string, Record<string, string>, string | undefined]>([
+    ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop' }, 'the Docker Compose project shop'],
+    // The volumes of the Compose project of an environment carry both: the environment label decides (spec u6).
+    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': 'devenv-11111111', 'devenv.environment-id': 'x' }, 'another environment'],
+    ['a volume of an environment', { 'devenv.environment-id': 'x' }, 'another environment'],
+    ['no labels', {}, undefined],
+  ])('volumeLabelOwner: %s', (_name, labels, expected) => {
+    expect(volumeLabelOwner(labels)).toBe(expected);
+  });
+
+  it('volumeNameItems applies the rules of the named volumes of mounts', () => {
+    const environment = { id: 'e1', ownerId: '1' };
+    expect(volumeNameItems(OWN, { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('cache', { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('devenv-helper-cache', { ownVolume: OWN })).toEqual(['volume devenv-helper-cache of the workspace helper']);
+    expect(volumeNameItems('cache', { ownVolume: OWN, foreignVolumes: ['cache'] })).toEqual(['volume cache of another environment']);
+    const own = { 'devenv.environment-id': 'e1', 'devenv.owner-id': '1', 'devenv.volume': 'compose' };
+    expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: own } })).toEqual([]);
+    const other = { ...own, 'devenv.environment-id': 'e2' };
+    expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: other } })).toEqual(['volume data of another environment']);
   });
 });
 

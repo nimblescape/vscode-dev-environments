@@ -1,0 +1,598 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Host access policy for Docker Compose configurations (concept section 9 "Host access", implementation notes section
+// "Docker Compose"): the rules of hostAccess.ts for every service of the merged model that `docker compose config`
+// prints (all profiles), not only for the dev service, because Compose starts them all with the Docker engine of the
+// computer. An allow-list, like RUN_FLAGS: a key that the policy does not know is refused as not supported, because a
+// new key of Compose can reach the computer. The mounts and the ports are decided by the functions of compose.ts that
+// the rewrite uses too, so the check and the model that runs cannot disagree. Pure functions, no I/O.
+import * as path from 'path';
+import { isOciFeatureReference } from '../imageCheck/reference';
+import {
+  composeVolumeNames,
+  decideServiceMount,
+  decideServicePort,
+  isOtherEnvironmentProjectName,
+  WORKSPACE_VOLUME_KEY,
+  type ComposeModel,
+  type ComposeMountContext,
+} from './compose';
+import {
+  LOG_DRIVERS,
+  LOG_OPTIONS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  RESERVED_LABEL,
+  RESTART_POLICY,
+  capabilityProblems,
+  refusedVariableItem,
+  securityOptionProblems,
+  volumeNameItems,
+  type HostAccessReport,
+  type VolumeInput,
+} from './hostAccess';
+
+export interface ComposeAccessInput extends VolumeInput {
+  /** The merged model (ComposeModelOutput.model). */
+  model: ComposeModel;
+  /** `service` of devcontainer.json. */
+  devService: string;
+  /** `runServices` of devcontainer.json, when it has one. */
+  runServices?: unknown;
+  /** composeProjectName of the environment. */
+  project: string;
+  /** The folder of the repository in the helper, for example `/workspaces/api`. */
+  repositoryFolder: string;
+  /** The Docker Engine API version, for the bind mounts of repository files (supportsVolumeSubpath). */
+  engineApiVersion?: string;
+  /** ComposeModelOutput.realPaths: bind mount sources and `env_file`s whose links lead out of the repository are refused. */
+  realPaths?: Readonly<Record<string, string | null>>;
+}
+
+interface Problem {
+  item: string;
+  kind: 'hostAccess' | 'unsupported';
+}
+
+const access = (item: string): Problem => ({ item, kind: 'hostAccess' });
+const unsupported = (item: string): Problem => ({ item, kind: 'unsupported' });
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A value that `docker compose config` prints for a key that is not set, or that sets nothing. */
+function isUnset(value: unknown): boolean {
+  if (value === undefined || value === null || value === false || value === '') return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (isRecord(value)) return Object.keys(value).length === 0;
+  return false;
+}
+
+/** Extension fields (`x-…`): no effect in Compose. */
+const isExtension = (key: string): boolean => key.startsWith('x-');
+
+/** Label keys that the extension, the Dev Container CLI, and Compose use to find and set up the containers. */
+const RESERVED_COMPOSE_LABEL = /^com\.docker\.compose\./i;
+
+function labelKeys(labels: unknown): string[] {
+  if (isRecord(labels)) return Object.keys(labels);
+  if (Array.isArray(labels)) return labels.map((entry) => String(entry).split('=')[0]);
+  return [];
+}
+
+function labelProblems(labels: unknown, where: string): Problem[] {
+  return labelKeys(labels)
+    .map((key) => key.trim())
+    .filter((key) => RESERVED_LABEL.test(key) || RESERVED_COMPOSE_LABEL.test(key))
+    .map((key) => unsupported(`${where}label ${key}`));
+}
+
+/** An image of the namespace of Dev Environments (`devenv-…`): the image of another environment, perhaps of another account. */
+function isEnvironmentImage(image: string): boolean {
+  return /^(docker\.io\/)?(library\/)?devenv-/i.test(image.trim());
+}
+
+/** A Go duration (`20s`, `1m30s`, `500ms`) in seconds; `undefined` when it is none. */
+export function durationSeconds(value: unknown): number | undefined {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string' || !/^(\d+(\.\d+)?(h|m|s|ms|us|µs|ns))+$/.test(value.trim())) return undefined;
+  const factors: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, µs: 1e-6, ns: 1e-9 };
+  let seconds = 0;
+  for (const match of value.trim().matchAll(/(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)/g)) seconds += Number(match[1]) * factors[match[2]];
+  return seconds;
+}
+
+function isInside(file: string, folder: string): boolean {
+  return file === folder || file.startsWith(`${folder}/`);
+}
+
+/** A path of the model (absolute, as `docker compose config` resolves it) strictly below the repository folder. */
+function isRepositoryPath(file: string, repositoryFolder: string): boolean {
+  return file.startsWith('/') && !file.split('/').includes('..') && isInside(path.posix.normalize(file), repositoryFolder);
+}
+
+/** A remote build context: a URL of Git or HTTP(S). */
+function isRemoteContext(context: string): boolean {
+  return /^(https?:\/\/|git@|git:\/\/|ssh:\/\/)/i.test(context);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Services
+
+/** The context of the checks of one service. */
+interface ServiceContext {
+  name: string;
+  isDev: boolean;
+  input: ComposeAccessInput;
+  mounts: ComposeMountContext;
+  services: ReadonlySet<string>;
+}
+
+type KeyRule = (value: unknown, ctx: ServiceContext) => Problem[];
+
+const allow: KeyRule = () => [];
+/** Refused as access to the computer when set (a true-like value, a non-empty list or map). */
+const refuseAccess =
+  (item: string): KeyRule =>
+  (value) =>
+    isUnset(value) ? [] : [access(item)];
+const refuseUnsupported =
+  (item: string): KeyRule =>
+  (value) =>
+    isUnset(value) ? [] : [unsupported(item)];
+
+/** A namespace mode (`pid`, `ipc`, `uts`, `userns_mode`, `cgroup`): the allowed values, `host`/`service:`/`container:` refused. */
+function namespaceRule(key: string, allowed: readonly string[]): KeyRule {
+  return (value) => {
+    if (isUnset(value)) return [];
+    const text = String(value).trim();
+    if (allowed.includes(text)) return [];
+    if (/^(host|service:|container:)/i.test(text)) return [access(`${key} ${text}`)];
+    return [unsupported(`${key} ${text}`)];
+  };
+}
+
+function listOf(value: unknown): unknown[] {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
+  // The image of another environment is refused (D-17); the images of built services are renamed (rewrite).
+  image: (value) => (typeof value === 'string' && isEnvironmentImage(value) ? [access(`image ${value} of another environment`)] : []),
+  build: buildProblems,
+  // Rewritten: the dev container gets the name of the environment, the others none (D-12).
+  container_name: allow,
+  labels: (value) => labelProblems(value, ''),
+  // A file of labels, read by Compose where it runs.
+  label_file: refuseUnsupported('label_file'),
+  // Only the dev container gets the token and the configuration of Git (D-5): the rules of containerEnv there.
+  environment: (value, ctx) => {
+    if (!ctx.isDev) return [];
+    const names = isRecord(value) ? Object.keys(value) : listOf(value).map((entry) => String(entry).split('=')[0]);
+    return names.flatMap((name) => {
+      const item = refusedVariableItem(name.trim(), 'environment');
+      return item === undefined ? [] : [access(item)];
+    });
+  },
+  env_file: envFileProblems,
+  ports: (value) =>
+    listOf(value).flatMap((entry) => {
+      const decision = decideServicePort(entry);
+      return decision.action === 'refuse' ? [{ item: decision.item, kind: decision.kind }] : [];
+    }),
+  expose: allow,
+  network_mode: networkModeProblems,
+  networks: allow,
+  volumes: (value, ctx) =>
+    listOf(value).flatMap((entry) => {
+      const decision = decideServiceMount(entry, ctx.mounts);
+      return decision.action === 'refuse' ? [{ item: decision.item, kind: decision.kind }] : [];
+    }),
+  // Other containers, whose volumes, environment, and network would join this one.
+  volumes_from: refuseAccess('volumes_from'),
+  links: refuseAccess('links'),
+  external_links: refuseAccess('external_links'),
+  privileged: refuseAccess('privileged mode'),
+  cap_add: (value) => capabilityProblems(listOf(value)).map(access),
+  cap_drop: allow,
+  security_opt: (value) => securityOptionProblems(listOf(value)).map(access),
+  devices: refuseAccess('devices'),
+  device_cgroup_rules: refuseAccess('device_cgroup_rules'),
+  gpus: refuseAccess('GPU access (gpus)'),
+  blkio_config: blkioProblems,
+  // Another runtime can add devices of the computer; a control group of the computer; without the OOM killer, a
+  // container can make the computer hang (as in RUN_FLAGS).
+  runtime: refuseAccess('runtime'),
+  cgroup_parent: refuseAccess('cgroup_parent'),
+  oom_kill_disable: refuseAccess('oom_kill_disable'),
+  oom_score_adj: (value) => (value === undefined || value === null || (typeof value === 'number' && value >= 0) ? [] : [access(`oom_score_adj ${String(value)}`)]),
+  pid: namespaceRule('pid', []),
+  ipc: namespaceRule('ipc', ['private', 'shareable', 'none']),
+  uts: namespaceRule('uts', []),
+  userns_mode: namespaceRule('userns_mode', []),
+  cgroup: namespaceRule('cgroup', ['private']),
+  // Docker accepts only settings of the namespaces of the container (as --sysctl, D-13).
+  sysctls: allow,
+  logging: loggingProblems,
+  storage_opt: (value) => (isRecord(value) ? Object.keys(value).filter((key) => key !== 'size').map((key) => unsupported(`storage_opt ${key}`)) : []),
+  // `always` and `unless-stopped` would start the container together with Docker, outside the Session Monitor (D-14).
+  restart: (value) => (isUnset(value) || RESTART_POLICY.test(String(value)) ? [] : [unsupported(`restart ${String(value)}`)]),
+  stop_grace_period: (value) => {
+    if (isUnset(value)) return [];
+    const seconds = durationSeconds(value);
+    return seconds !== undefined && seconds <= MAX_STOP_TIMEOUT_SECONDS ? [] : [unsupported(`stop_grace_period ${String(value)}`)];
+  },
+  stop_signal: allow,
+  deploy: deployProblems,
+  // Rewritten (D-16).
+  pull_policy: allow,
+  // Mounts the Docker socket and the registry credentials of the computer.
+  use_api_socket: refuseAccess('the Docker socket (use_api_socket)'),
+  // Files of the computer, mounted by Compose.
+  secrets: refuseAccess('secrets'),
+  configs: refuseAccess('configs'),
+  models: refuseUnsupported('models'),
+  provider: refuseUnsupported('provider'),
+  credential_spec: refuseUnsupported('credential_spec'),
+  scale: (value) => (value === undefined || value === null || value === 1 ? [] : [unsupported(`scale ${String(value)}`)]),
+  extends: refuseUnsupported('extends'),
+  post_start: hookProblems('post_start'),
+  pre_stop: hookProblems('pre_stop'),
+  // No access to the computer.
+  entrypoint: allow,
+  command: allow,
+  working_dir: allow,
+  user: allow,
+  group_add: allow,
+  hostname: allow,
+  domainname: allow,
+  mac_address: allow,
+  dns: allow,
+  dns_opt: allow,
+  dns_search: allow,
+  extra_hosts: allow,
+  init: allow,
+  tty: allow,
+  stdin_open: allow,
+  read_only: allow,
+  tmpfs: allow,
+  shm_size: allow,
+  ulimits: allow,
+  cpu_count: allow,
+  cpu_percent: allow,
+  cpu_shares: allow,
+  cpu_period: allow,
+  cpu_quota: allow,
+  cpu_rt_runtime: allow,
+  cpu_rt_period: allow,
+  cpus: allow,
+  cpuset: allow,
+  mem_limit: allow,
+  mem_reservation: allow,
+  mem_swappiness: allow,
+  memswap_limit: allow,
+  pids_limit: allow,
+  healthcheck: allow,
+  depends_on: allow,
+  profiles: allow,
+  platform: allow,
+  isolation: allow,
+  annotations: allow,
+  attach: allow,
+  develop: allow,
+};
+
+/** `post_start`/`pre_stop`: commands in the container, but not with `privileged`. */
+function hookProblems(key: string): KeyRule {
+  return (value) => (listOf(value).some((hook) => isRecord(hook) && hook.privileged === true) ? [access(`privileged ${key}`)] : []);
+}
+
+/**
+ * `env_file`: Compose reads the file where it runs, the workspace helper, which mounts the volume with the GitHub token.
+ * Only a file below the repository folder (after links, with realPaths).
+ */
+function envFileProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  const problems: Problem[] = [];
+  for (const entry of listOf(value)) {
+    const file = typeof entry === 'string' ? entry : isRecord(entry) ? entry.path : undefined;
+    if (typeof file !== 'string') {
+      problems.push(unsupported(`env_file ${JSON.stringify(entry)}`));
+      continue;
+    }
+    const real = ctx.input.realPaths?.[file];
+    const inRepository = isRepositoryPath(file, ctx.input.repositoryFolder) && (typeof real !== 'string' || isInside(real, ctx.input.repositoryFolder));
+    if (!inRepository) problems.push(access(`env_file ${file}`));
+  }
+  return problems;
+}
+
+/**
+ * `network_mode`: every network, also `host` (user decision), except the network of another container
+ * (`container:…`), of a service that is not in this configuration (`service:…`, D-9), or of another environment.
+ */
+function networkModeProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  if (isUnset(value)) return [];
+  const mode = String(value).trim();
+  if (/^container:/i.test(mode)) return [access(`network of another container (${mode})`)];
+  if (/^service:/i.test(mode)) {
+    const target = mode.slice('service:'.length);
+    return ctx.services.has(target) && target !== ctx.name ? [] : [access(`network of another container (${mode})`)];
+  }
+  if (isOtherEnvironmentProjectName(mode, ctx.input.project)) return [access(`network ${mode} of another environment`)];
+  return [];
+}
+
+/** `blkio_config`: the weight only; the limits of devices name devices of the computer. */
+function blkioProblems(value: unknown): Problem[] {
+  if (!isRecord(value)) return [];
+  const problems: Problem[] = [];
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'weight' || isUnset(entry)) continue;
+    if (/^(weight_device|device_(read|write)_(bps|iops))$/.test(key)) problems.push(access(`blkio_config ${key}`));
+    else problems.push(unsupported(`blkio_config ${key}`));
+  }
+  return problems;
+}
+
+/** `logging`: drivers that keep the log in files of the container (LOG_DRIVERS), and the options of LOG_OPTIONS. */
+function loggingProblems(value: unknown): Problem[] {
+  if (!isRecord(value)) return [];
+  const problems: Problem[] = [];
+  const driver = value.driver;
+  if (!isUnset(driver) && !LOG_DRIVERS.includes(String(driver).toLowerCase())) problems.push(access(`log driver ${String(driver)}`));
+  if (isRecord(value.options)) {
+    for (const key of Object.keys(value.options)) if (!LOG_OPTIONS.includes(key)) problems.push(unsupported(`log option ${key}`));
+  }
+  for (const key of Object.keys(value)) if (key !== 'driver' && key !== 'options') problems.push(unsupported(`logging ${key}`));
+  return problems;
+}
+
+/**
+ * `deploy` (Swarm, out of scope): only limits of resources and the restart conditions `none`/`on-failure`; a GPU or
+ * another device (`resources.reservations.devices`) is access to the computer.
+ */
+function deployProblems(value: unknown): Problem[] {
+  if (!isRecord(value)) return [];
+  const problems: Problem[] = [];
+  for (const [key, entry] of Object.entries(value)) {
+    if (isUnset(entry)) continue;
+    if (key === 'resources' && isRecord(entry)) {
+      for (const [kind, resources] of Object.entries(entry)) {
+        if (isUnset(resources)) continue;
+        const allowed = kind === 'limits' ? ['cpus', 'memory', 'pids'] : kind === 'reservations' ? ['cpus', 'memory'] : undefined;
+        if (!allowed || !isRecord(resources)) {
+          problems.push(unsupported(`deploy.resources.${kind}`));
+          continue;
+        }
+        for (const [name, setting] of Object.entries(resources)) {
+          if (allowed.includes(name) || isUnset(setting)) continue;
+          if (kind === 'reservations' && name === 'devices') problems.push(access('GPU or device access (deploy.resources.reservations.devices)'));
+          else problems.push(unsupported(`deploy.resources.${kind}.${name}`));
+        }
+      }
+    } else if (key === 'restart_policy' && isRecord(entry)) {
+      for (const [name, setting] of Object.entries(entry)) {
+        if (isUnset(setting)) continue;
+        if (name !== 'condition' || !['none', 'on-failure'].includes(String(setting))) {
+          problems.push(unsupported(`deploy.restart_policy.${name} ${String(setting)}`));
+        }
+      }
+    } else {
+      problems.push(unsupported(`deploy.${key}`));
+    }
+  }
+  return problems;
+}
+
+const BUILD_ALLOWED = new Set([
+  'context',
+  'dockerfile',
+  'dockerfile_inline',
+  'args',
+  'target',
+  'network',
+  'shm_size',
+  'extra_hosts',
+  'isolation',
+  'platforms',
+  'pull',
+  'no_cache',
+  'ulimits',
+  'labels',
+  'cache_from',
+  'additional_contexts',
+]);
+
+/**
+ * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it)
+ * or a remote context; the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
+ * access to the computer; tags and exported caches could overwrite images or write files.
+ */
+function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  if (isUnset(value)) return [];
+  if (!isRecord(value)) return [unsupported(`build ${JSON.stringify(value)}`)];
+  const repository = ctx.input.repositoryFolder;
+  const problems: Problem[] = [];
+  const context = typeof value.context === 'string' ? value.context : undefined;
+  const remote = context !== undefined && isRemoteContext(context);
+  if (context === undefined || (!remote && !isRepositoryPath(context, repository))) problems.push(access(`build context ${String(value.context)}`));
+  if (typeof value.dockerfile === 'string' && !remote && context !== undefined && value.dockerfile_inline === undefined) {
+    const file = path.posix.resolve(context, value.dockerfile);
+    if (!isRepositoryPath(file, repository)) problems.push(access(`Dockerfile ${value.dockerfile}`));
+  }
+  problems.push(...labelProblems(value.labels, 'build '));
+  for (const [key, setting] of Object.entries(value)) {
+    if (BUILD_ALLOWED.has(key) || isExtension(key) || isUnset(setting)) continue;
+    if (['ssh', 'secrets', 'entitlements', 'privileged'].includes(key)) problems.push(access(`build ${key}`));
+    else problems.push(unsupported(`build ${key}`));
+  }
+  for (const entry of listOf(value.cache_from)) {
+    const text = String(entry).trim();
+    if (text.includes('=') ? !/^type=registry(,|$)/.test(text) : text === '') problems.push(unsupported(`build cache_from ${text}`));
+  }
+  if (isRecord(value.additional_contexts)) {
+    for (const [name, source] of Object.entries(value.additional_contexts)) {
+      if (!/^(docker-image|https?):\/\//i.test(String(source))) problems.push(access(`build additional_contexts ${name}=${String(source)}`));
+    }
+  } else if (!isUnset(value.additional_contexts)) {
+    problems.push(unsupported('build additional_contexts'));
+  }
+  return problems;
+}
+
+function serviceProblems(service: unknown, ctx: ServiceContext): Problem[] {
+  if (!isRecord(service)) return [unsupported('the service is no object')];
+  const problems: Problem[] = [];
+  for (const [key, value] of Object.entries(service)) {
+    if (isExtension(key)) continue;
+    const rule = Object.prototype.hasOwnProperty.call(SERVICE_RULES, key) ? SERVICE_RULES[key] : undefined;
+    if (rule) problems.push(...rule(value, ctx));
+    else if (value !== undefined && value !== null) problems.push(unsupported(key));
+  }
+  if (ctx.isDev && isUnset(service.image) && isUnset(service.build)) problems.push(unsupported('no image and no build'));
+  return problems;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Top level
+
+const VOLUME_ALLOWED = new Set(['name', 'external', 'driver', 'driver_opts', 'labels']);
+
+function topLevelVolumeProblems(input: ComposeAccessInput): Problem[] {
+  const problems: Problem[] = [];
+  const volumes = isRecord(input.model.volumes) ? input.model.volumes : {};
+  const names = new Map(composeVolumeNames(input.model, input.project).map((volume) => [volume.key, volume.name]));
+  for (const [key, volume] of Object.entries(volumes)) {
+    const at = `volume ${key}: `;
+    if (key === WORKSPACE_VOLUME_KEY) problems.push(unsupported(`volume key ${key} (Dev Environments uses it)`));
+    const name = names.get(key) ?? key;
+    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(access(`volume ${name} of another environment`));
+    else problems.push(...volumeNameItems(name, input).map(access));
+    if (!isRecord(volume)) continue;
+    if (!isUnset(volume.driver) && String(volume.driver) !== 'local') problems.push(access(`${at}driver ${String(volume.driver)}`));
+    if (!isUnset(volume.driver_opts)) problems.push(access(`${at}driver options`));
+    problems.push(...labelProblems(volume.labels, at));
+    for (const [option, value] of Object.entries(volume)) {
+      if (!VOLUME_ALLOWED.has(option) && !isExtension(option) && value !== undefined && value !== null) problems.push(unsupported(`${at}${option}`));
+    }
+  }
+  return problems;
+}
+
+const NETWORK_ALLOWED = new Set(['name', 'external', 'driver', 'driver_opts', 'ipam', 'internal', 'attachable', 'enable_ipv4', 'enable_ipv6', 'labels']);
+
+/**
+ * Top-level `networks`: the bridge driver only (macvlan and ipvlan put the containers on the network of the computer,
+ * without the rule that ports reach it only on localhost), no driver options, and no network of another environment.
+ */
+function topLevelNetworkProblems(input: ComposeAccessInput): Problem[] {
+  const problems: Problem[] = [];
+  const networks = isRecord(input.model.networks) ? input.model.networks : {};
+  for (const [key, network] of Object.entries(networks)) {
+    if (!isRecord(network)) continue;
+    const at = `network ${key}: `;
+    const name = typeof network.name === 'string' ? network.name : key;
+    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(access(`network ${name} of another environment`));
+    if (!isUnset(network.driver) && String(network.driver) !== 'bridge') problems.push(access(`${at}driver ${String(network.driver)}`));
+    if (!isUnset(network.driver_opts)) problems.push(access(`${at}driver options`));
+    problems.push(...labelProblems(network.labels, at));
+    for (const [option, value] of Object.entries(network)) {
+      if (!NETWORK_ALLOWED.has(option) && !isExtension(option) && value !== undefined && value !== null) problems.push(unsupported(`${at}${option}`));
+    }
+  }
+  return problems;
+}
+
+const TOP_LEVEL_ALLOWED = new Set(['name', 'services', 'volumes', 'networks', 'version']);
+
+function topLevelProblems(input: ComposeAccessInput): Problem[] {
+  const problems: Problem[] = [];
+  const model = input.model;
+  if (model.name !== undefined && model.name !== input.project) problems.push(unsupported(`project name ${String(model.name)}`));
+  for (const [key, value] of Object.entries(model)) {
+    if (TOP_LEVEL_ALLOWED.has(key) || isExtension(key) || isUnset(value)) continue;
+    // Compose mounts file secrets and configs as bind mounts of the computer.
+    if (key === 'secrets' || key === 'configs') problems.push(access(key));
+    else problems.push(unsupported(key));
+  }
+  problems.push(...topLevelVolumeProblems(input), ...topLevelNetworkProblems(input));
+  return problems;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Report
+
+function report(problems: readonly Problem[]): HostAccessReport {
+  const result: HostAccessReport = { hostAccess: [], unsupported: [] };
+  for (const problem of problems) if (!result[problem.kind].includes(problem.item)) result[problem.kind].push(problem.item);
+  return result;
+}
+
+/**
+ * The settings of the merged model of a Docker Compose configuration that need access to the computer, or that the
+ * policy does not know (implementation notes, section "Docker Compose", rule table), in two lists as hostAccessReport:
+ * the top level (project name, volumes, networks, secrets, configs, unknown keys), then each service, its items
+ * prefixed `service <name>: `. The dev service must be in the model, and so must each name of `runServices`.
+ */
+export function composeAccessReport(input: ComposeAccessInput): HostAccessReport {
+  const problems: Problem[] = [];
+  const services = isRecord(input.model.services) ? input.model.services : {};
+  const names = new Set(Object.keys(services));
+  if (!names.has(input.devService)) problems.push(unsupported(`service ${input.devService} (not in the Docker Compose configuration)`));
+  if (input.runServices !== undefined) {
+    if (!Array.isArray(input.runServices)) problems.push(unsupported(`runServices ${JSON.stringify(input.runServices)}`));
+    else {
+      for (const name of input.runServices) {
+        if (typeof name !== 'string' || !names.has(name)) problems.push(unsupported(`runServices ${JSON.stringify(name)} (not in the Docker Compose configuration)`));
+      }
+    }
+  }
+  problems.push(...topLevelProblems(input));
+  const volumeNames = new Map(composeVolumeNames(input.model, input.project).map((volume) => [volume.key, volume.name]));
+  for (const [name, service] of Object.entries(services)) {
+    const isDev = name === input.devService;
+    const ctx: ServiceContext = {
+      name,
+      isDev,
+      input,
+      services: names,
+      mounts: {
+        isDev,
+        repositoryFolder: input.repositoryFolder,
+        volumeNames,
+        ownVolume: input.ownVolume,
+        engineApiVersion: input.engineApiVersion,
+        realPaths: input.realPaths,
+      },
+    };
+    for (const problem of serviceProblems(service, ctx)) problems.push({ ...problem, item: `service ${name}: ${problem.item}` });
+  }
+  return report(problems);
+}
+
+/**
+ * The settings of devcontainer.json that a Docker Compose configuration does not support (beside the rules of
+ * hostAccessReport, which apply as for a single container): a local Feature (`./…`). The CLI's `build` has no
+ * `--override-config`, so the configuration is built from our copy in the helper (buildArgs), where a local Feature,
+ * which the CLI resolves against the folder of the configuration, is not found.
+ */
+export function composeConfigurationReport(config: Readonly<Record<string, unknown>>): HostAccessReport {
+  const features = isRecord(config.features) ? Object.keys(config.features) : [];
+  const local = features.filter((key) => !isOciFeatureReference(key) && /^\.{1,2}\//.test(key.trim()));
+  return { hostAccess: [], unsupported: local.map((key) => `local Feature ${key} in a Docker Compose configuration`) };
+}
+
+/**
+ * The properties of devcontainer.json that the Dev Container CLI ignores for Docker Compose (D-18), for a log line:
+ * `runArgs` and `appPort` (read only for a single container), `workspaceMount` (CLI 0.89.0: `if("dockerComposeFile"in
+ * t)return{workspaceFolder:pp(t),workspaceMount:void 0,…}`), and `build.options`. The policy does not check them.
+ */
+export function composeIgnoredProperties(config: Readonly<Record<string, unknown>>): string[] {
+  const ignored: string[] = [];
+  for (const key of ['runArgs', 'appPort', 'workspaceMount']) if (config[key] !== undefined) ignored.push(key);
+  if (isRecord(config.build) && config.build.options !== undefined) ignored.push('build.options');
+  return ignored;
+}

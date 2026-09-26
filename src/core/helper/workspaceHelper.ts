@@ -12,6 +12,7 @@ import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '
 import { gitSummaryCommand, parseGitSummaryOutput } from '../git/gitSummary';
 import { Messages } from '../messages';
 import {
+  CONFIG_FOLDER,
   HELPER_CACHE_VOLUME,
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
@@ -38,17 +39,21 @@ import {
   type HelperBuildKind,
 } from './helperImage';
 import { CONTAINER_CREDENTIAL_HELPER, isGitHubLogin, type GitIdentity } from './containerGit';
+import { parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import {
   OVERRIDE_CONFIG_PATH,
+  OVERRIDE_FOLDER,
   SECRETS_FOLDER,
   buildCommand,
   cloneCommand,
+  composeModelCommand,
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
   removeGitTokenCommand,
   switchBranchCommand,
   upCommand,
+  writeAndRunCommand,
 } from './scripts';
 
 /** The part of ContainerAdapter that the helper uses. A ContainerAdapter fits. */
@@ -166,6 +171,11 @@ export interface HelperRunSpec {
   docker?: boolean;
   /** `false`: `--network none`, for runs that need no network (default `true`). */
   network?: boolean;
+  /**
+   * An empty tmpfs over the configuration folder of the volume (CONFIG_FOLDER, with the GitHub token), for runs that
+   * read files of the repository with a tool that follows its references (the model run of Docker Compose).
+   */
+  hideConfigFolder?: boolean;
   command: readonly string[];
 }
 
@@ -188,6 +198,7 @@ export function helperRunArgs(spec: HelperRunSpec): string[] {
     '--mount',
     mountOption({ type: 'volume', source: spec.volumeName, target: WORKSPACES_ROOT }),
   ];
+  if (spec.hideConfigFolder === true) args.push('--mount', mountOption({ type: 'tmpfs', destination: CONFIG_FOLDER }));
   if (spec.docker !== false) {
     args.push(
       '--mount',
@@ -304,9 +315,35 @@ interface StreamOptions {
   docker?: boolean;
   /** See HelperRunSpec.network (default `true`). */
   network?: boolean;
+  /** See HelperRunSpec.hideConfigFolder. */
+  hideConfigFolder?: boolean;
   signal?: AbortSignal;
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
+}
+
+/** Files of the extension for a run of the Dev Container CLI (WRITE_AND_RUN_SCRIPT): absolute path below OVERRIDE_FOLDER → text. */
+export type HelperFiles = Readonly<Record<string, string>>;
+
+/** Time limit of the model run of a Docker Compose configuration (composeModel). */
+export const COMPOSE_MODEL_TIMEOUT_MS = 60_000;
+
+/** Paths of `files` below OVERRIDE_FOLDER, absolute and without `.`/`..` (WRITE_AND_RUN_SCRIPT checks them again). */
+function checkHelperFiles(files: HelperFiles): void {
+  for (const file of Object.keys(files)) {
+    const segments = file.split('/').slice(1);
+    if (!file.startsWith(`${OVERRIDE_FOLDER}/`) || segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+      throw new Error(`Invalid helper file: ${file}`);
+    }
+  }
+}
+
+/** Standard input of WRITE_AND_RUN_SCRIPT: the files, and the override configuration at OVERRIDE_CONFIG_PATH. */
+function writeAndRunInput(files: HelperFiles | undefined, override: Record<string, unknown> | undefined): string {
+  const all: Record<string, string> = { ...(files ?? {}) };
+  if (override !== undefined) all[OVERRIDE_CONFIG_PATH] = JSON.stringify(override, null, 2);
+  checkHelperFiles(all);
+  return JSON.stringify({ files: all });
 }
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
@@ -460,6 +497,13 @@ export class WorkspaceHelper {
     environmentId: string;
     /** Whether to read the merged configuration (default `true`). */
     merged?: boolean;
+    /**
+     * Docker Compose: `--override-config` (composeConfigOverride), written into the helper at OVERRIDE_CONFIG_PATH with
+     * `files` (our model, COMPOSE_MODEL_PATH), and `env` (COMPOSE_PROJECT_NAME) for the helper.
+     */
+    override?: Record<string, unknown>;
+    files?: HelperFiles;
+    env?: Record<string, string>;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
@@ -478,18 +522,32 @@ export class WorkspaceHelper {
   }
 
   private async readConfigurationOutput(
-    p: { volumeName: string; repository: string; configPath: string; environmentId: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    p: {
+      volumeName: string;
+      repository: string;
+      configPath: string;
+      environmentId: string;
+      override?: Record<string, unknown>;
+      files?: HelperFiles;
+      env?: Record<string, string>;
+      onOutput?: (text: string) => void;
+      signal?: AbortSignal;
+    },
     merged: boolean,
     timeoutMs?: number,
   ): Promise<Record<string, unknown> & { configuration: Record<string, unknown> }> {
     const folder = this.repositoryFolder(p.repository);
+    const withFiles = p.override !== undefined || p.files !== undefined;
     const args = readConfigurationArgs({
       workspaceFolder: folder,
       configPath: `${folder}/${checkConfigPath(p.configPath)}`,
       idLabel: `${LABEL_ENVIRONMENT_ID}=${p.environmentId}`,
       merged,
+      overrideConfigPath: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined,
     });
-    const result = await this.runStreams(p.volumeName, ['devcontainer', ...args], {
+    const result = await this.runStreams(p.volumeName, withFiles ? writeAndRunCommand({}, args) : ['devcontainer', ...args], {
+      input: withFiles ? writeAndRunInput(p.files, p.override) : undefined,
+      env: p.env,
       timeoutMs,
       signal: p.signal,
       onStderr: p.onOutput ?? this.logOutput,
@@ -520,17 +578,71 @@ export class WorkspaceHelper {
     repository: string;
     configPath: string;
     imageName: string;
+    /**
+     * Docker Compose: our copy of the configuration (composeConfigOverride), written into the helper at
+     * OVERRIDE_CONFIG_PATH and named by `--config` (`build` has no `--override-config`, buildArgs), with `files` (our
+     * model, the Dockerfile of a synthesized build) and `env` (COMPOSE_PROJECT_NAME). The repository's lockfile is used
+     * (WRITE_AND_RUN_SCRIPT).
+     */
+    override?: Record<string, unknown>;
+    files?: HelperFiles;
+    env?: Record<string, string>;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
     const folder = this.repositoryFolder(p.repository);
     const configFile = `${folder}/${checkConfigPath(p.configPath)}`;
-    const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
     this.deps.logger.info(`Building the environment image ${p.imageName} from ${p.configPath}.`);
-    return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
+    if (p.override === undefined && p.files === undefined) {
+      const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
+      return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
+        env: p.env,
+        onOutput: p.onOutput,
+        signal: p.signal,
+      });
+    }
+    const config = p.override !== undefined ? OVERRIDE_CONFIG_PATH : configFile;
+    const args = buildArgs({ workspaceFolder: folder, configPath: config, imageName: p.imageName });
+    const command = writeAndRunCommand({ repositoryConfig: configFile, config: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined }, args);
+    return this.runDevcontainer('devcontainer build', p.volumeName, command, {
+      input: writeAndRunInput(p.files, p.override),
+      env: p.env,
       onOutput: p.onOutput,
       signal: p.signal,
     });
+  }
+
+  /**
+   * The merged model of a Docker Compose configuration (COMPOSE_MODEL_SCRIPT: `docker compose config --format json` of
+   * `files`, all profiles, with COMPOSE_PROJECT_NAME=`project`), without the Docker socket, the cache volume, and
+   * network, and with the configuration folder of the volume hidden (the GitHub token): the files of the repository can
+   * reach only files of the helper image and of the repository. `files` are absolute paths in the repository folder
+   * (resolveComposeFiles). `{ error }` carries the message of Docker Compose. Throws CommandError when the helper fails.
+   */
+  async composeModel(p: {
+    volumeName: string;
+    repository: string;
+    files: readonly string[];
+    project: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<ComposeModelOutput | { error: string }> {
+    const folder = this.repositoryFolder(p.repository);
+    if (p.files.length === 0 || p.files.some((file) => !file.startsWith(`${folder}/`) || file.split('/').some((part) => part === '..' || part === '.'))) {
+      throw new Error(`Invalid compose files: ${p.files.join(', ')}`);
+    }
+    this.deps.logger.info(`Reading the Docker Compose configuration of ${p.repository} (${p.files.join(', ')}).`);
+    const result = await this.runStreams(p.volumeName, composeModelCommand(folder, p.files), {
+      env: { COMPOSE_PROJECT_NAME: p.project },
+      docker: false,
+      network: false,
+      hideConfigFolder: true,
+      timeoutMs: p.timeoutMs ?? COMPOSE_MODEL_TIMEOUT_MS,
+      signal: p.signal,
+      onStderr: this.logOutput,
+    });
+    if (result.exitCode !== 0) throw new CommandError('docker compose config', result.exitCode, result.stdout, result.stderr);
+    return parseComposeModelOutput(result.stdout);
   }
 
   /**
@@ -546,6 +658,9 @@ export class WorkspaceHelper {
     override: Record<string, unknown>;
     environmentId: string;
     removeExistingContainer: boolean;
+    /** Docker Compose: files for the helper besides the override configuration (our model), and `env` (COMPOSE_PROJECT_NAME). */
+    files?: HelperFiles;
+    env?: Record<string, string>;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -560,8 +675,10 @@ export class WorkspaceHelper {
       `Starting the container of ${p.repository}${p.removeExistingContainer ? ' (replacing the existing container)' : ''}.`,
     );
     try {
-      return await this.runDevcontainer('devcontainer up', p.volumeName, upCommand(OVERRIDE_CONFIG_PATH, args), {
-        input: JSON.stringify(p.override, null, 2),
+      const command = p.files !== undefined ? writeAndRunCommand({}, args) : upCommand(OVERRIDE_CONFIG_PATH, args);
+      return await this.runDevcontainer('devcontainer up', p.volumeName, command, {
+        input: p.files !== undefined ? writeAndRunInput(p.files, p.override) : JSON.stringify(p.override, null, 2),
+        env: p.env,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -789,7 +906,7 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { input?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: { input?: string; env?: Record<string, string>; onOutput?: (text: string) => void; signal?: AbortSignal },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
     const stdoutFilter = new ResultLineFilter(output);
@@ -797,6 +914,7 @@ export class WorkspaceHelper {
     try {
       result = await this.runStreams(volumeName, helperCommand, {
         input: options.input,
+        env: options.env,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
         onStderr: output,
@@ -860,6 +978,7 @@ export class WorkspaceHelper {
       secrets: options.secrets === true,
       docker: options.docker !== false,
       network: options.network !== false,
+      hideConfigFolder: options.hideConfigFolder === true,
       command,
     });
     const envNames = Object.keys(env);

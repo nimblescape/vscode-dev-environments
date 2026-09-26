@@ -16,6 +16,18 @@ export const LABEL_OWNER_ID = 'devenv.owner-id';
  */
 export const LABEL_VOLUME = 'devenv.volume';
 export const VOLUME_KIND_ADDITIONAL = 'additional';
+/**
+ * devenv.volume of a named volume of the Compose project of an environment (`devenv-<short id>_<key>`, the data of its
+ * services, for example of a database): created by the extension before `up` with the labels of the environment, never
+ * shared with another environment, and removed by Delete only when the user asks for it.
+ */
+export const VOLUME_KIND_COMPOSE = 'compose';
+/**
+ * Container label of the containers of a Compose environment other than the dev container: the name of their service.
+ * They carry devenv.environment-id too, so Stop, the Session Monitor, and Delete find them; the lookup of the dev
+ * container skips them.
+ */
+export const LABEL_COMPOSE_SERVICE = 'devenv.compose-service';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
 export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
 /**
@@ -109,6 +121,15 @@ export const ENVIRONMENT_VOLUME_PATTERN = /^devenv-[a-z0-9_.-]*-[0-9a-f]{8}$/i;
 /** Repository part of the environment image name: `devenv-<short id>`. */
 export function environmentImageRepository(environmentId: string): string {
   return `devenv-${sanitize(shortId(environmentId))}`;
+}
+
+/**
+ * Compose project of an environment: `devenv-<short id>`, the same as environmentImageRepository. Stable for the life of
+ * the environment (the Dev Container CLI finds the dev container again only by the project and the service) and unique
+ * among the environments (short IDs are unique among the entries and the volumes).
+ */
+export function composeProjectName(environmentId: string): string {
+  return environmentImageRepository(environmentId);
 }
 
 /** Environment image: `devenv-<short id>:<build number>`. */

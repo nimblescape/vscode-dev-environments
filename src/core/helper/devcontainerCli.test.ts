@@ -9,7 +9,9 @@ import {
   DevcontainerCommandError,
   HELPER_CACHE_FOLDER,
   buildArgs,
+  buildComposeOverrideConfig,
   buildOverrideConfig,
+  composeConfigOverride,
   isLifecycleCommandFailure,
   parseDevcontainerResult,
   readConfigurationArgs,
@@ -296,5 +298,71 @@ describe('buildOverrideConfig', () => {
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);
+  });
+});
+
+describe('Docker Compose configurations', () => {
+  it('read-configuration with an override configuration', () => {
+    expect(
+      readConfigurationArgs({
+        workspaceFolder: '/workspaces/api',
+        configPath: '/workspaces/api/.devcontainer/devcontainer.json',
+        idLabel: 'devenv.environment-id=3f2a',
+        overrideConfigPath: '/tmp/devenv-override/devcontainer.json',
+      }),
+    ).toEqual([
+      'read-configuration',
+      '--workspace-folder',
+      '/workspaces/api',
+      '--config',
+      '/workspaces/api/.devcontainer/devcontainer.json',
+      '--id-label',
+      'devenv.environment-id=3f2a',
+      '--override-config',
+      '/tmp/devenv-override/devcontainer.json',
+      '--include-merged-configuration',
+    ]);
+  });
+
+  it('composeConfigOverride names only our model and drops initializeCommand', () => {
+    const raw = {
+      dockerComposeFile: ['../compose.yml', 'extra.yml'],
+      service: 'app',
+      runServices: ['app', 'db'],
+      features: { './local': {}, 'ghcr.io/devcontainers/features/node:1': {} },
+      initializeCommand: 'echo on the computer',
+      workspaceFolder: '/workspaces/${localWorkspaceFolderBasename}',
+    };
+    const before = JSON.stringify(raw);
+    expect(composeConfigOverride(raw, '/tmp/devenv-override/compose.json')).toEqual({
+      dockerComposeFile: ['/tmp/devenv-override/compose.json'],
+      service: 'app',
+      runServices: ['app', 'db'],
+      features: { './local': {}, 'ghcr.io/devcontainers/features/node:1': {} },
+      workspaceFolder: '/workspaces/${localWorkspaceFolderBasename}',
+    });
+    expect(JSON.stringify(raw)).toBe(before);
+  });
+
+  it('buildComposeOverrideConfig: our model, the service, and the settings and variables of container-only Git', () => {
+    const override = buildComposeOverrideConfig({
+      modelPath: '/tmp/devenv-override/compose.json',
+      service: 'app',
+      runServices: ['db'],
+      repositoryName: 'api',
+    });
+    expect(override).toEqual({
+      dockerComposeFile: ['/tmp/devenv-override/compose.json'],
+      service: 'app',
+      runServices: ['db'],
+      workspaceFolder: '/workspaces/api',
+      containerEnv: containerEnvironment(),
+      remoteEnv: remoteEnvironment(),
+      customizations: { vscode: { settings: devContainersSettings() } },
+      shutdownAction: 'none',
+    });
+    // No properties that the CLI ignores for Compose, and never initializeCommand.
+    for (const key of ['image', 'runArgs', 'appPort', 'workspaceMount', 'initializeCommand']) expect(override).not.toHaveProperty(key);
+    expect(buildComposeOverrideConfig({ modelPath: '/m', service: 'app', repositoryName: 'api' })).not.toHaveProperty('runServices');
   });
 });

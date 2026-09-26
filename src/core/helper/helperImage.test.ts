@@ -229,6 +229,9 @@ describe('ensureHelperImage', () => {
     expect(content).toMatch(/^FROM \$\{BASE_IMAGE\}$/m);
     expect(content).toMatch(/^ARG DEVCONTAINER_CLI_VERSION$/m);
     expect(content).toMatch(/^LABEL devenv\.helper=true$/m);
+    // The Docker CLI with the buildx and the Compose plugins from download.docker.com (Compose configurations, spec u6).
+    expect(content).toMatch(/apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin;/);
+    expect(content).toMatch(/^\s*docker compose version; \\$/m);
     // Classic builder compatibility: no syntax directive, no heredoc, no RUN --mount.
     expect(content).not.toMatch(/^#\s*syntax=/m);
     expect(content).not.toMatch(/^[^#]*<</m);

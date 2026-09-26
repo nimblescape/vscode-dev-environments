@@ -23,12 +23,25 @@ export const HELPER_CACHE_FOLDER = '/devenv-cache';
  * the host access policy checks (concept section 9). Without a container, the CLI reads the base image and the Features
  * for it (from the registries, if they are not local).
  */
-export function readConfigurationArgs(p: { workspaceFolder: string; configPath: string; idLabel: string; merged?: boolean }): string[] {
+export function readConfigurationArgs(p: {
+  workspaceFolder: string;
+  configPath: string;
+  idLabel: string;
+  merged?: boolean;
+  /** `--override-config` (Docker Compose: composeConfigOverride, which names our model). */
+  overrideConfigPath?: string;
+}): string[] {
   const args = ['read-configuration', '--workspace-folder', p.workspaceFolder, '--config', p.configPath, '--id-label', p.idLabel];
+  if (p.overrideConfigPath !== undefined) args.push('--override-config', p.overrideConfigPath);
   if (p.merged !== false) args.push('--include-merged-configuration');
   return args;
 }
 
+/**
+ * Arguments of `devcontainer build`. `build` has no `--override-config` (CLI 0.89.0, devContainersSpecCLI.js, the
+ * handler of `build`: `configFile:v,overrideConfigFile:J` with `J=void 0`), so a Docker Compose configuration is built
+ * with `--config` naming our copy of the configuration (composeConfigOverride) in the helper.
+ */
 export function buildArgs(p: { workspaceFolder: string; configPath: string; imageName: string }): string[] {
   return [
     'build',
@@ -185,6 +198,48 @@ export function buildOverrideConfig(p: {
   if (appPort !== undefined) override.appPort = appPort;
   // Merged over the containerEnv, remoteEnv, and settings of the image metadata; these values win. The settings only add
   // to the customizations of the image metadata (its extensions and other settings stay).
+  override.containerEnv = containerEnvironment();
+  override.remoteEnv = remoteEnvironment();
+  override.customizations = { vscode: { settings: devContainersSettings() } };
+  override.shutdownAction = ATTACHED_SHUTDOWN_ACTION;
+  return override;
+}
+
+/**
+ * The configuration of a Docker Compose configuration for `read-configuration` (`--override-config`) and `build`
+ * (`--config`, buildArgs): the repository configuration as written (`raw`, parsed devcontainer.json; the CLI resolves
+ * its variables as usual), with `dockerComposeFile` naming only our model (an absolute path: the CLI resolves the paths
+ * against the folder of `--config`, CLI 0.89.0 function `sg`), and without `initializeCommand`, which the host access
+ * policy refuses anyway (it would run in the helper, which has the Docker socket).
+ */
+export function composeConfigOverride(raw: Readonly<Record<string, unknown>>, modelPath: string): Record<string, unknown> {
+  const config: Record<string, unknown> = { ...raw, dockerComposeFile: [modelPath] };
+  delete config.initializeCommand;
+  return config;
+}
+
+/**
+ * Override configuration of `devcontainer up` for a Docker Compose configuration (the counterpart of buildOverrideConfig):
+ * `dockerComposeFile` names only our model (composeUpModel, an absolute path), `service`, `runServices` (when the
+ * repository names them), `workspaceFolder`, and, as in buildOverrideConfig, containerEnv, remoteEnv, the settings of
+ * the Dev Containers extension, and shutdownAction 'none'. No image, runArgs, appPort, or workspaceMount: the CLI
+ * ignores them for Compose (CLI 0.89.0: `if("dockerComposeFile"in t)return{workspaceFolder:pp(t),workspaceMount:void 0,…}`;
+ * runArgs and appPort are read only for a single container); the model carries the image, the name, the labels, the
+ * ports, and the workspace volume. The CLI writes containerEnv as `environment` of the dev service into its last compose
+ * file, so these values win. `initializeCommand` is never passed.
+ */
+export function buildComposeOverrideConfig(p: {
+  modelPath: string;
+  service: string;
+  runServices?: readonly string[];
+  repositoryName: string;
+}): Record<string, unknown> {
+  const override: Record<string, unknown> = {
+    dockerComposeFile: [p.modelPath],
+    service: p.service,
+  };
+  if (p.runServices !== undefined) override.runServices = [...p.runServices];
+  override.workspaceFolder = `${WORKSPACES_ROOT}/${p.repositoryName}`;
   override.containerEnv = containerEnvironment();
   override.remoteEnv = remoteEnvironment();
   override.customizations = { vscode: { settings: devContainersSettings() } };

@@ -11,25 +11,30 @@ import { detectConfigurations } from '../discovery/detect';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
+  COMPOSE_MODEL_SCRIPT,
   CREDENTIAL_HELPER,
   GIT_FILES_SCRIPT,
   GIT_SUMMARY_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
+  OVERRIDE_FOLDER,
   READ_FILES_SCRIPT,
   REMOVE_GIT_TOKEN_SCRIPT,
   SECRETS_FOLDER,
   SWITCH_BRANCH_SCRIPT,
   TOKEN_FILE,
   UP_SCRIPT,
+  WRITE_AND_RUN_SCRIPT,
   buildCommand,
   cloneCommand,
+  composeModelCommand,
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
   removeGitTokenCommand,
   switchBranchCommand,
   upCommand,
+  writeAndRunCommand,
 } from './scripts';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
@@ -199,6 +204,242 @@ describe('shell scripts', () => {
     expect(run(rootConfig)).toBe('build|--x|--no-lockfile|');
     write(path.join(dir, 'repo', '.devcontainer-lock.json'), '{}');
     expect(run(rootConfig)).toBe('build|--x|');
+  });
+});
+
+describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', () => {
+  /** A fake `devcontainer` that prints its arguments, one per line, and exits with $FAKE_EXIT. */
+  function setup(): { dir: string; folder: string; env: NodeJS.ProcessEnv } {
+    const dir = tempDir();
+    write(path.join(dir, 'bin', 'devcontainer'), `#!/bin/sh\nprintf '%s\\n' "$@"\nexit "\${FAKE_EXIT:-0}"\n`);
+    fs.chmodSync(path.join(dir, 'bin', 'devcontainer'), 0o755);
+    const env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}` };
+    return { dir, folder: path.join(dir, 'override'), env };
+  }
+
+  function run(
+    folder: string,
+    env: NodeJS.ProcessEnv,
+    files: Record<string, string>,
+    args: string[],
+    configs: { repository?: string; own?: string } = {},
+  ): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync(process.execPath, ['-e', WRITE_AND_RUN_SCRIPT, folder, configs.repository ?? '', configs.own ?? '', ...args], {
+      encoding: 'utf8',
+      input: JSON.stringify({ files }),
+      env,
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  it('builds its command with the override folder', () => {
+    expect(writeAndRunCommand({}, ['up', '--x'])).toEqual(['node', '-e', WRITE_AND_RUN_SCRIPT, OVERRIDE_FOLDER, '', '', 'up', '--x']);
+    expect(writeAndRunCommand({ repositoryConfig: '/workspaces/api/.devcontainer/devcontainer.json', config: OVERRIDE_CONFIG_PATH }, ['build'])).toEqual([
+      'node',
+      '-e',
+      WRITE_AND_RUN_SCRIPT,
+      OVERRIDE_FOLDER,
+      '/workspaces/api/.devcontainer/devcontainer.json',
+      OVERRIDE_CONFIG_PATH,
+      'build',
+    ]);
+    expect(OVERRIDE_CONFIG_PATH).toBe(`${OVERRIDE_FOLDER}/devcontainer.json`);
+  });
+
+  it('writes the files (mode 0600) and the empty build context, then runs the CLI with the arguments', () => {
+    const { folder, env } = setup();
+    const files = { [`${folder}/devcontainer.json`]: '{"service":"app"}', [`${folder}/sub/compose.json`]: '{}' };
+    const result = run(folder, env, files, ['up', '--override-config', `${folder}/devcontainer.json`]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`up\n--override-config\n${folder}/devcontainer.json\n`);
+    expect(fs.readFileSync(`${folder}/devcontainer.json`, 'utf8')).toBe('{"service":"app"}');
+    expect(fs.readFileSync(`${folder}/sub/compose.json`, 'utf8')).toBe('{}');
+    expect(fs.statSync(`${folder}/devcontainer.json`).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(`${folder}/context`).isDirectory()).toBe(true);
+    expect(fs.readdirSync(`${folder}/context`)).toEqual([]);
+  });
+
+  it('passes the exit code of the CLI on', () => {
+    const { folder, env } = setup();
+    expect(run(folder, { ...env, FAKE_EXIT: '3' }, {}, ['up']).status).toBe(3);
+  });
+
+  it.each<[string, (folder: string) => string]>([
+    ['a path outside the folder', () => '/tmp/elsewhere.json'],
+    ['a path with ..', (folder) => `${folder}/../escape.json`],
+    ['a relative path', () => 'compose.json'],
+    ['the folder itself', (folder) => folder],
+  ])('refuses %s and does not run the CLI', (_name, file) => {
+    const { folder, env } = setup();
+    const result = run(folder, env, { [file(folder)]: 'x' }, ['up']);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('Invalid file');
+    expect(result.stdout).toBe('');
+  });
+
+  it('refuses a text that is no text', () => {
+    const { folder, env } = setup();
+    const result = spawnSync(process.execPath, ['-e', WRITE_AND_RUN_SCRIPT, folder, '', '', 'up'], {
+      encoding: 'utf8',
+      input: JSON.stringify({ files: { [`${folder}/a.json`]: 1 } }),
+      env,
+    });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+  });
+
+  it('uses the lockfile of the repository next to our copy of the configuration, and adds --no-lockfile without one', () => {
+    const { dir, folder, env } = setup();
+    const repositoryConfig = path.join(dir, 'repo', '.devcontainer', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    const own = `${folder}/devcontainer.json`;
+    expect(run(folder, env, { [own]: '{}' }, ['build'], { repository: repositoryConfig, own }).stdout).toBe('build\n--no-lockfile\n');
+    expect(fs.existsSync(`${folder}/devcontainer-lock.json`)).toBe(false);
+    write(path.join(dir, 'repo', '.devcontainer', 'devcontainer-lock.json'), '{"features":{}}');
+    expect(run(folder, env, { [own]: '{}' }, ['build'], { repository: repositoryConfig, own }).stdout).toBe('build\n');
+    expect(fs.readFileSync(`${folder}/devcontainer-lock.json`, 'utf8')).toBe('{"features":{}}');
+    // Without a copy of the configuration, the rule of BUILD_SCRIPT alone.
+    expect(run(folder, env, {}, ['build'], { repository: repositoryConfig }).stdout).toBe('build\n');
+    // A root .devcontainer.json has the lockfile .devcontainer-lock.json.
+    const rootConfig = path.join(dir, 'repo', '.devcontainer.json');
+    write(rootConfig, '{}');
+    expect(run(folder, env, {}, ['build'], { repository: rootConfig }).stdout).toBe('build\n--no-lockfile\n');
+  });
+
+  it('refuses a copy of the configuration outside the folder', () => {
+    const { dir, folder, env } = setup();
+    const repositoryConfig = path.join(dir, 'repo', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    const result = run(folder, env, {}, ['build'], { repository: repositoryConfig, own: path.join(dir, 'elsewhere.json') });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
+  const MODEL = {
+    name: 'devenv-3f2a9c1e',
+    services: {
+      app: { build: { context: '<repo>/.devcontainer', dockerfile: 'Dockerfile' }, volumes: [{ type: 'bind', source: '<repo>', target: '/app' }] },
+      inline: { build: { context: '<repo>', dockerfile_inline: 'FROM alpine:3.22' } },
+      outside: { build: { context: '<repo>', dockerfile: '../outside/Dockerfile' } },
+      linked: { build: { context: '<repo>', dockerfile: 'linked.Dockerfile' } },
+      remote: { build: { context: 'https://github.com/acme/tool.git' } },
+      db: {
+        image: 'postgres:16',
+        env_file: ['<repo>/db.env', { path: '<repo>/missing.env', required: false }],
+        volumes: [
+          { type: 'bind', source: '<repo>/link-out', target: '/x' },
+          { type: 'bind', source: '<repo>/missing', target: '/y' },
+          { type: 'volume', source: 'pgdata', target: '/data' },
+        ],
+      },
+    },
+  };
+
+  /**
+   * A temporary repository and a fake `docker` on PATH: `compose version --short` prints 2.29.1, the probe prints
+   * $FAKE_PROBE, and `config` writes its arguments and working folder to a file and prints $FAKE_MODEL (or fails with
+   * $FAKE_ERROR).
+   */
+  function setup(): { dir: string; repo: string; argsFile: string; env: NodeJS.ProcessEnv } {
+    const dir = tempDir();
+    const repo = path.join(dir, 'repo');
+    const argsFile = path.join(dir, 'args');
+    write(path.join(repo, '.devcontainer', 'Dockerfile'), 'FROM node:24\n');
+    write(path.join(repo, 'db.env'), 'A=1\n');
+    write(path.join(dir, 'outside', 'Dockerfile'), 'FROM secret\n');
+    write(path.join(dir, 'secret.txt'), 'secret\n');
+    fs.symlinkSync(path.join(dir, 'outside', 'Dockerfile'), path.join(repo, 'linked.Dockerfile'));
+    fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, 'link-out'));
+    const fake = [
+      '#!/bin/sh',
+      'shift',
+      'if [ "$1 $2" = "version --short" ]; then echo 2.29.1; exit 0; fi',
+      'case "$*" in',
+      '  *"-p devenv-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;;',
+      'esac',
+      `printf '%s\\n' "$PWD" "$COMPOSE_PROJECT_NAME" "$@" > '${argsFile}'`,
+      'if [ -n "\${FAKE_ERROR:-}" ]; then printf \'%s\\n\' "$FAKE_ERROR" >&2; exit 15; fi',
+      'printf \'%s\\n\' "$FAKE_MODEL"',
+    ].join('\n');
+    write(path.join(dir, 'bin', 'docker'), `${fake}\n`);
+    fs.chmodSync(path.join(dir, 'bin', 'docker'), 0o755);
+    const model = JSON.stringify(MODEL).split('<repo>').join(repo);
+    const env = {
+      ...process.env,
+      PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`,
+      COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e',
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$$b' } } } }),
+      FAKE_MODEL: model,
+    };
+    return { dir, repo, argsFile, env };
+  }
+
+  function runModel(repo: string, files: string[], env: NodeJS.ProcessEnv): unknown {
+    const command = composeModelCommand(repo, files);
+    expect(command.slice(0, 3)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT]);
+    const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env });
+    expect(result.status, result.stderr).toBe(0);
+    const lines = result.stdout.trim().split('\n');
+    expect(lines).toHaveLength(1);
+    return JSON.parse(lines[0]);
+  }
+
+  it('prints the model of all profiles, the Dockerfiles in the repository, and the real paths', () => {
+    const { dir, repo, argsFile, env } = setup();
+    const files = [path.join(repo, 'compose.yml'), path.join(repo, '.devcontainer', 'compose.yml')];
+    const output = runModel(repo, files, env) as Record<string, unknown>;
+    expect(fs.readFileSync(argsFile, 'utf8').split('\n').slice(0, -1)).toEqual([
+      repo,
+      'devenv-3f2a9c1e',
+      '-f',
+      files[0],
+      '-f',
+      files[1],
+      '--profile',
+      '*',
+      'config',
+      '--format',
+      'json',
+    ]);
+    expect(output.version).toBe('2.29.1');
+    expect(output.dollarEscaped).toBe(true);
+    expect(output.model).toEqual(JSON.parse(env.FAKE_MODEL!));
+    // Not the Dockerfile outside the repository, also not through a link, and none of a remote context.
+    expect(output.dockerfiles).toEqual({ app: 'FROM node:24\n', inline: 'FROM alpine:3.22' });
+    expect(output.realPaths).toEqual({
+      [repo]: fs.realpathSync(repo),
+      [`${repo}/link-out`]: fs.realpathSync(path.join(dir, 'secret.txt')),
+      [`${repo}/missing`]: null,
+      [`${repo}/db.env`]: fs.realpathSync(path.join(repo, 'db.env')),
+      [`${repo}/missing.env`]: null,
+    });
+  });
+
+  it('reports a $ that the output does not escape', () => {
+    const { repo, env } = setup();
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$b' } } } }) });
+    expect((output as Record<string, unknown>).dollarEscaped).toBe(false);
+  });
+
+  it('reports an unknown form of $ as an error', () => {
+    const { repo, env } = setup();
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'ab' } } } }) });
+    expect(output).toEqual({ error: 'docker compose config printed an unknown form of $: "ab"' });
+  });
+
+  it('prints the message of Docker Compose when config fails', () => {
+    const { repo, env } = setup();
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_ERROR: 'yaml: line 3: mapping values are not allowed' });
+    expect(output).toEqual({ error: 'yaml: line 3: mapping values are not allowed' });
+  });
+
+  it('prints an error when Docker Compose is missing', () => {
+    const { repo, env } = setup();
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, PATH: path.join(tempDir(), 'empty') });
+    expect(output).toMatchObject({ error: expect.stringContaining('ENOENT') });
   });
 });
 

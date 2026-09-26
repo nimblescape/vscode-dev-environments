@@ -23,8 +23,13 @@ export { GIT_SUMMARY_SCRIPT };
 export const SECRETS_FOLDER = '/run/devenv-secrets';
 /** File of the token in SECRETS_FOLDER. */
 export const TOKEN_FILE = `${SECRETS_FOLDER}/github-token`;
-/** Path of the override configuration of `devcontainer up` inside the helper (each helper run is a new container). */
-export const OVERRIDE_CONFIG_PATH = '/tmp/devenv-override/devcontainer.json';
+/**
+ * Folder of the files that the extension writes into a helper run for the Dev Container CLI (the override configuration,
+ * and for Docker Compose our model): only in the helper, never in the repository (each helper run is a new container).
+ */
+export const OVERRIDE_FOLDER = '/tmp/devenv-override';
+/** Path of the override configuration of `devcontainer up` inside the helper. */
+export const OVERRIDE_CONFIG_PATH = `${OVERRIDE_FOLDER}/devcontainer.json`;
 
 /**
  * Git credential helper (a shell function, run by Git with `sh -c`). It answers only `get` requests for
@@ -472,6 +477,170 @@ const main = () => {
 process.stdout.write(JSON.stringify(main()) + '\n');
 `;
 
+/**
+ * `node -e` script for the runs of the Dev Container CLI with files of the extension (Docker Compose: the override
+ * configuration and our model, and the Dockerfile of a synthesized build). `argv[1]` = the folder for the files
+ * (OVERRIDE_FOLDER), `argv[2]` = path of the repository's devcontainer.json for the lockfile rule of BUILD_SCRIPT (`''`:
+ * none), `argv[3]` = path of our copy of the configuration that `--config` names (`''`: none), then the arguments of
+ * `devcontainer`. Standard input: JSON `{ "files": { "<absolute path>": "<text>" } }`. Each path must be below the
+ * folder, absolute and without `.`/`..` segments; the files get mode 0600, and the folder `context/` (the empty build
+ * context of a synthesized build) is created. Lockfile: when the repository has one next to its configuration, it is
+ * copied next to our copy (so the CLI uses it; a change that the CLI writes stays in the helper); without one,
+ * `--no-lockfile` is added, so that a build never adds a file to the repository. Then `devcontainer` runs with the
+ * output of this process; its exit code is the exit code (128 + the signal number after a signal), and a stop signal is
+ * passed on to it.
+ */
+export const WRITE_AND_RUN_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const folder = process.argv[1];
+const repositoryConfig = process.argv[2];
+const ownConfig = process.argv[3];
+const args = process.argv.slice(4);
+const lockfileOf = (config) =>
+  path.posix.join(path.posix.dirname(config), path.posix.basename(config).startsWith('.') ? '.devcontainer-lock.json' : 'devcontainer-lock.json');
+const prepare = () => {
+  if (!folder || path.posix.resolve(folder) !== folder || folder === '/') throw new Error('Invalid folder: ' + folder);
+  const input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+  const files = input && typeof input.files === 'object' && input.files !== null ? input.files : {};
+  fs.mkdirSync(path.posix.join(folder, 'context'), { recursive: true, mode: 0o700 });
+  for (const [file, text] of Object.entries(files)) {
+    if (typeof file !== 'string' || path.posix.resolve(file) !== file || !file.startsWith(folder + '/') || typeof text !== 'string') {
+      throw new Error('Invalid file: ' + file);
+    }
+    fs.mkdirSync(path.posix.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, text, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  }
+  if (ownConfig && (path.posix.resolve(ownConfig) !== ownConfig || !ownConfig.startsWith(folder + '/'))) {
+    throw new Error('Invalid configuration path: ' + ownConfig);
+  }
+  if (repositoryConfig) {
+    const lockfile = lockfileOf(repositoryConfig);
+    if (!fs.existsSync(lockfile)) {
+      args.push('--no-lockfile');
+    } else if (ownConfig) {
+      const copy = lockfileOf(ownConfig);
+      fs.mkdirSync(path.posix.dirname(copy), { recursive: true, mode: 0o700 });
+      fs.copyFileSync(lockfile, copy);
+      fs.chmodSync(copy, 0o600);
+    }
+  }
+};
+try {
+  prepare();
+} catch (error) {
+  process.stderr.write(String(error && error.message ? error.message : error) + '\n');
+  process.exitCode = 2;
+}
+if (process.exitCode === undefined) {
+  const child = spawn('devcontainer', args, { stdio: ['ignore', 'inherit', 'inherit'] });
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+  child.on('error', (error) => {
+    process.stderr.write('devcontainer could not be started: ' + error.message + '\n');
+    process.exitCode = 127;
+  });
+  child.on('exit', (code, signal) => {
+    process.exitCode = code !== null ? code : 128 + (os.constants.signals[signal] || 1);
+  });
+}
+`;
+
+/**
+ * `node -e` script of the model run of a Docker Compose configuration. `argv[1]` = repository folder (absolute), then
+ * the compose files (absolute, resolveComposeFiles). The project name comes from COMPOSE_PROJECT_NAME. The run has no
+ * Docker socket and no network (the Compose plugin needs no engine for `config`), and the configuration folder of the
+ * volume is hidden (WorkspaceHelper.composeModel). Prints one JSON line (ComposeModelOutput of compose.ts):
+ * - `version`: `docker compose version --short`;
+ * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
+ * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles);
+ * - `dockerfiles`: the Dockerfile of each service with a local build (`build.dockerfile_inline`, or the file, only when
+ *   it is in the repository folder, also after links);
+ * - `realPaths`: the real path of each bind mount source and `env_file` of the model (`null` when it does not exist).
+ * On an error of Docker Compose: `{ "error": "<its message>" }`, exit code 0.
+ */
+export const COMPOSE_MODEL_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const root = path.posix.resolve(process.argv[1]);
+const files = process.argv.slice(2);
+const inside = (file) => file === root || file.startsWith(root + '/');
+const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+const compose = (args, options) =>
+  spawnSync('docker', ['compose', ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
+const failure = (result, what) => {
+  const text = ((result.stderr || '') + (result.error ? ' ' + result.error.message : '')).trim();
+  return { error: text || what + ' failed with exit code ' + result.status + '.' };
+};
+const realPath = (file) => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+};
+const readInside = (file) => {
+  const real = realPath(file);
+  if (!inside(file) || real === null || !inside(real)) return undefined;
+  try {
+    return fs.readFileSync(real, 'utf8');
+  } catch {
+    return undefined;
+  }
+};
+const main = () => {
+  const version = compose(['version', '--short']);
+  if (version.status !== 0) return failure(version, 'docker compose version');
+  const probeFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-compose-probe-'));
+  const probe = compose(['--project-directory', probeFolder, '-p', 'devenv-probe', '-f', '-', 'config', '--format', 'json'], {
+    cwd: probeFolder,
+    input: 'services:\n  probe:\n    image: probe\n    environment:\n      V: "a$$b"\n',
+  });
+  fs.rmSync(probeFolder, { recursive: true, force: true });
+  if (probe.status !== 0) return failure(probe, 'docker compose config');
+  const value = JSON.parse(probe.stdout).services.probe.environment.V;
+  if (value !== 'a$$b' && value !== 'a$b') return { error: 'docker compose config printed an unknown form of $: ' + JSON.stringify(value) };
+  const args = [];
+  for (const file of files) args.push('-f', file);
+  const result = compose([...args, '--profile', '*', 'config', '--format', 'json'], { cwd: root });
+  if (result.status !== 0) return failure(result, 'docker compose config');
+  const model = JSON.parse(result.stdout);
+  const dockerfiles = {};
+  const realPaths = {};
+  for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
+    if (!isObject(service)) continue;
+    const build = service.build;
+    if (isObject(build)) {
+      if (typeof build.dockerfile_inline === 'string') {
+        dockerfiles[name] = build.dockerfile_inline;
+      } else if (typeof build.context === 'string' && build.context.startsWith('/')) {
+        const text = readInside(path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile'));
+        if (text !== undefined) dockerfiles[name] = text;
+      }
+    }
+    for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
+      if (isObject(volume) && volume.type === 'bind' && typeof volume.source === 'string') realPaths[volume.source] = realPath(volume.source);
+    }
+    for (const entry of Array.isArray(service.env_file) ? service.env_file : []) {
+      const file = typeof entry === 'string' ? entry : isObject(entry) ? entry.path : undefined;
+      if (typeof file === 'string') realPaths[file] = realPath(file);
+    }
+  }
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths };
+};
+let output;
+try {
+  output = main();
+} catch (error) {
+  output = { error: String(error && error.message ? error.message : error) };
+}
+process.stdout.write(JSON.stringify(output) + '\n');
+`;
+
 /** `sh -c` command that clones the repository into the volume. Token on stdin, secrets mount required. */
 export function cloneCommand(repository: string, folderName: string, branch?: string): string[] {
   return ['sh', '-c', CLONE_SCRIPT, 'sh', repository, folderName, branch ?? ''];
@@ -511,6 +680,21 @@ export function readFilesCommand(repoFolder: string, configPath: string): string
 /** `sh -c` command for `devcontainer up`: the override configuration is expected on stdin. */
 export function upCommand(overrideConfigPath: string, args: readonly string[]): string[] {
   return ['sh', '-c', UP_SCRIPT, 'sh', overrideConfigPath, ...args];
+}
+
+/**
+ * `node -e` command of WRITE_AND_RUN_SCRIPT: writes the files of its standard input below OVERRIDE_FOLDER, then runs
+ * `devcontainer <args…>`. For `build`: `repositoryConfig` (absolute path of the repository's devcontainer.json in the
+ * helper) with the lockfile rule of BUILD_SCRIPT, and `config`, our copy of the configuration below OVERRIDE_FOLDER that
+ * `--config` names, which gets the repository's lockfile.
+ */
+export function writeAndRunCommand(p: { repositoryConfig?: string; config?: string }, args: readonly string[]): string[] {
+  return ['node', '-e', WRITE_AND_RUN_SCRIPT, OVERRIDE_FOLDER, p.repositoryConfig ?? '', p.config ?? '', ...args];
+}
+
+/** `node -e` command of COMPOSE_MODEL_SCRIPT for the compose files (absolute paths) of a configuration. */
+export function composeModelCommand(repoFolder: string, files: readonly string[]): string[] {
+  return ['node', '-e', COMPOSE_MODEL_SCRIPT, repoFolder, ...files];
 }
 
 /** `sh -c` command for `devcontainer build`. `configFile` is the absolute path of devcontainer.json in the helper. */

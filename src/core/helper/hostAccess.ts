@@ -348,7 +348,7 @@ function configurationSources(input: HostAccessInput): Record<string, unknown>[]
   return sources;
 }
 
-function volumeContext(input: HostAccessInput): VolumeContext {
+function volumeContext(input: VolumeInput): VolumeContext {
   return {
     own: input.ownVolume,
     foreign: new Set(input.foreignVolumes ?? []),
@@ -356,6 +356,9 @@ function volumeContext(input: HostAccessInput): VolumeContext {
     environment: input.environment,
   };
 }
+
+/** The part of HostAccessInput that decides which named volumes a mount may use. */
+export type VolumeInput = Pick<HostAccessInput, 'ownVolume' | 'foreignVolumes' | 'volumeLabels' | 'environment'>;
 
 /**
  * `mounts`, `capAdd`, and `securityOpt` as the Dev Container CLI reads them from each metadata entry
@@ -379,7 +382,7 @@ function hasCommand(value: unknown): boolean {
  * (isContainerGitVariable), named alone, or a variable that chooses the account of the GitHub CLI
  * (isGitHubCliAccountVariable), with the reason. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
  */
-function refusedVariableItem(name: string, where: string): string | undefined {
+export function refusedVariableItem(name: string, where: string): string | undefined {
   if (isContainerGitVariable(name)) return `variable ${name} in ${where}`;
   if (isGitHubCliAccountVariable(name)) return `variable ${name} in ${where} (${GITHUB_CLI_ACCOUNT_REASON})`;
   return undefined;
@@ -615,13 +618,15 @@ export function isOwnVolume(labels: Readonly<Record<string, string>>, environmen
  */
 export function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
   const keys = Object.keys(labels);
+  // Before the labels of Docker Compose: a volume of the Compose project of an environment carries both (whether it is
+  // the environment's own is decided by isOwnVolume first everywhere).
+  if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   if (keys.some((key) => key.startsWith('com.docker.compose.'))) {
     const project = labels['com.docker.compose.project'];
     return project ? `the Docker Compose project ${project}` : 'Docker Compose';
   }
   if (hasDevContainersVolumeLabel(labels)) return 'the Dev Containers extension';
   if (keys.includes('com.docker.volume.anonymous')) return 'another container';
-  if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   return undefined;
 }
 
@@ -685,6 +690,16 @@ function volumeNameProblems(name: string, volumes: VolumeContext): string[] {
 }
 
 /**
+ * The items of a named volume that belongs to something else (the rules of `mounts`: the workspace helper, another
+ * environment, the Dev Containers extension, or another program, by the name and the labels of the volume), for the
+ * volumes of a Docker Compose configuration (composeAccess.ts). Empty for the workspace volume and a volume that may be
+ * used.
+ */
+export function volumeNameItems(name: string, input: VolumeInput): string[] {
+  return volumeNameProblems(name, volumeContext(input));
+}
+
+/**
  * Source of a `-v`/`--volume` value `source:target[:options]`; `undefined` for an anonymous volume (only a target).
  * A colon of a Windows drive letter does not end the source.
  */
@@ -727,7 +742,8 @@ function networkProblems(value: string): Problem[] {
   return joined ? [access(`network of another container (${value.trim()})`)] : [];
 }
 
-function capabilityProblems(values: readonly unknown[]): string[] {
+/** `capAdd`, `--cap-add`, and `cap_add`: every capability except SYS_PTRACE (for debuggers). */
+export function capabilityProblems(values: readonly unknown[]): string[] {
   const items: string[] = [];
   for (const value of values) {
     const name = String(value).trim();
@@ -737,7 +753,8 @@ function capabilityProblems(values: readonly unknown[]): string[] {
   return items;
 }
 
-function securityOptionProblems(values: readonly unknown[]): string[] {
+/** `securityOpt`, `--security-opt`, and `security_opt`: every option except seccomp=unconfined and no-new-privileges. */
+export function securityOptionProblems(values: readonly unknown[]): string[] {
   const items: string[] = [];
   for (const value of values) {
     const option = String(value).trim();
@@ -823,7 +840,7 @@ export function loopbackAppPorts(appPort: unknown): string[] | undefined {
 // Values of flags of `docker run`
 
 /** Label keys of Dev Environments (`devenv.`) and of the Dev Container CLI and the Dev Containers extension (`devcontainer.`). */
-const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
+export const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
 
 /** The labels that the override configuration adds to runArgs itself, with their values. */
 const OWN_LABELS: readonly string[] = [CONTAINER_VERSION_LABEL, CONTAINER_CONFIG_UNKNOWN_LABEL];
@@ -890,8 +907,11 @@ function stopTimeoutProblems(value: string): Problem[] {
  * Docker, without a window and outside the Session Monitor (concept 7.9).
  */
 function restartProblems(value: string): Problem[] {
-  return /^(no|on-failure(:\d+)?)$/.test(value) ? [] : [unsupported(`--restart=${value}`)];
+  return RESTART_POLICY.test(value) ? [] : [unsupported(`--restart=${value}`)];
 }
+
+/** The restart policies that may be used (restartProblems): `no` and `on-failure[:<count>]`. */
+export const RESTART_POLICY = /^(no|on-failure(:\d+)?)$/;
 
 /**
  * `--oom-score-adj`: 0 or more, in decimal digits. A negative value makes the kernel end other processes of the
@@ -905,7 +925,7 @@ function oomScoreProblems(value: string): Problem[] {
  * Log drivers that keep the log in files of the container, or keep none. Other drivers write to a socket or the journal
  * of the computer (syslog, journald, fluentd), or use credentials of Docker (awslogs, gcplogs).
  */
-const LOG_DRIVERS: readonly string[] = ['json-file', 'local', 'none'];
+export const LOG_DRIVERS: readonly string[] = ['json-file', 'local', 'none'];
 
 function logDriverProblems(value: string): string[] {
   return LOG_DRIVERS.includes(value.toLowerCase()) ? [] : [`--log-driver=${value}`];
@@ -915,7 +935,7 @@ function logDriverProblems(value: string): string[] {
  * Keys of `--log-opt`: the size and the rotation of the log files, the mode, and what an entry contains. The options of
  * other drivers name sockets, files, or servers, and apply when Docker uses such a driver by default.
  */
-const LOG_OPTIONS: readonly string[] = [
+export const LOG_OPTIONS: readonly string[] = [
   'max-size',
   'max-file',
   'compress',
