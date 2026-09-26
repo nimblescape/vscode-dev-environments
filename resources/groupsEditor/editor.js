@@ -22,6 +22,10 @@
   /** The load of the extension that the entries come from; sent back with each update. */
   let generation = 0;
   let timer = undefined;
+  /** The highest `seq` that a state of the extension answered: a higher `seq` is an edit that it may not have yet. */
+  let answered = 0;
+  /** The `seq` of the Save that runs: the editor is read-only until its state (`saving: false`) arrives. */
+  let savingSeq = undefined;
   let lastState = undefined;
   /** Open state of the preview nodes that the user changed, by owner and label path. */
   const openNodes = new Map();
@@ -171,14 +175,26 @@
     sendUpdate();
   });
 
+  // While Save waits for the check or for an answer, the extension takes no edits: the form is read-only until then.
+  function setSaving(value) {
+    savingSeq = value;
+    $('form').disabled = value !== undefined;
+  }
+
   $('save').addEventListener('click', () => {
     clearTimeout(timer);
     timer = undefined;
     seq += 1;
+    setSaving(seq);
     send({ type: 'save', seq, generation, entries: entriesForMessage() });
   });
   $('cancel').addEventListener('click', () => send({ type: 'cancel' }));
-  $('reload').addEventListener('click', () => send({ type: 'reload' }));
+  $('reload').addEventListener('click', () => {
+    // Load settings.json drops the draft: a keystroke that still waits is dropped with it, not sent after the load.
+    clearTimeout(timer);
+    timer = undefined;
+    send({ type: 'reload' });
+  });
   $('test-name').addEventListener('input', scheduleUpdate);
 
   // A hidden tab loses this page: the last change goes to the extension first, which keeps the draft.
@@ -205,6 +221,8 @@
   }
 
   function applyState(state) {
+    if (typeof state.seq === 'number' && state.seq > answered) answered = state.seq;
+    if (savingSeq !== undefined && state.seq >= savingSeq && !state.saving) setSaving(undefined);
     // An answer to an older update: the entries changed since; the next answer follows.
     if (state.seq < seq && state.checks.length !== entries.length) return;
     lastState = state;
@@ -324,6 +342,23 @@
     return (node.children || []).reduce((sum, child) => sum + countRows(child), 0);
   }
 
+  function load(message) {
+    clearTimeout(timer);
+    timer = undefined;
+    // The extension has the entries of this load: nothing of the draft is unanswered.
+    answered = seq;
+    entries = message.entries.map((entry) => ({
+      name: String(entry.name),
+      pattern: String(entry.pattern),
+      flags: normalizeFlags(String(entry.flags)),
+    }));
+    lastState = undefined;
+    if (typeof message.generation === 'number') generation = message.generation;
+    if (typeof message.testName === 'string') $('test-name').value = message.testName;
+    renderNotices(Array.isArray(message.notices) ? message.notices.map(String) : []);
+    renderEntries();
+  }
+
   function renderNotices(notices) {
     $('notices').replaceChildren(...notices.map((text) => el('p', { className: 'notice', text })));
   }
@@ -332,18 +367,18 @@
     const message = event.data;
     if (!message || typeof message !== 'object') return;
     if (message.type === 'load' && Array.isArray(message.entries)) {
-      clearTimeout(timer);
-      timer = undefined;
-      entries = message.entries.map((entry) => ({
-        name: String(entry.name),
-        pattern: String(entry.pattern),
-        flags: normalizeFlags(String(entry.flags)),
-      }));
-      lastState = undefined;
-      if (typeof message.generation === 'number') generation = message.generation;
-      if (typeof message.testName === 'string') $('test-name').value = message.testName;
-      renderNotices(Array.isArray(message.notices) ? message.notices.map(String) : []);
-      renderEntries();
+      load(message);
+    } else if (message.type === 'external' && Array.isArray(message.entries) && typeof message.generation === 'number') {
+      // settings.json changed the setting. Without edits that the extension may not have, show the new value; otherwise
+      // keep the draft, show the banner, and send the draft (the extension keeps its base until an accept).
+      if (timer !== undefined || seq > answered || savingSeq !== undefined) {
+        $('changed').hidden = false;
+        flushUpdate();
+        return;
+      }
+      load(message);
+      $('changed').hidden = true;
+      send({ type: 'accept', generation: message.generation });
     } else if (message.type === 'state') {
       applyState(message);
     }

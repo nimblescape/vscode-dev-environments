@@ -65,6 +65,8 @@ export const GroupsEditorTexts = {
   savedReplaced: 'Saved to the user settings. Your entries replaced the value that settings.json had.',
   loadedTheirs: 'Loaded the setting from settings.json. Your unsaved edits were dropped. Nothing was saved.',
   loaded: 'Loaded the setting from settings.json.',
+  alreadySaved: 'Saved: settings.json already holds these entries, so nothing had to be written.',
+  staleKept: 'settings.json changed while you were editing; your edits are kept, press Save again.',
   entryTooSlow:
     'This regular expression takes too long for the repository names of the view (for example a nested repetition such as (a+)+). It would make VS Code stop responding. Change it before you save.',
   previewTooSlow: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.',
@@ -210,8 +212,13 @@ export type EditorRequest =
   | { type: 'save'; seq: number; generation: number; entries: EditorEntry[] }
   | { type: 'reload' }
   | { type: 'cancel' }
-  /** An update or Save for entries of an earlier load (edited from another value): ignored. */
-  | { type: 'stale' };
+  /** The webview showed the value of the `external` message with this generation (it had no unsent edits). */
+  | { type: 'accept'; generation: number }
+  /**
+   * An update or Save for entries of an earlier load (edited from another value): nothing is written, and the editor
+   * keeps these entries with a status. `testName` only for an update.
+   */
+  | { type: 'stale'; seq: number; entries: EditorEntry[]; testName?: string };
 
 /**
  * The message of the webview, or `undefined` when it is not one of EditorRequest exactly: unknown types or properties,
@@ -225,16 +232,19 @@ export function parseEditorRequest(raw: unknown, context: { generation: number }
     case 'reload':
     case 'cancel':
       return hasOnlyKeys(raw, ['type']) ? { type: raw.type } : undefined;
+    case 'accept':
+      return hasOnlyKeys(raw, ['type', 'generation']) && isSeq(raw.generation) ? { type: 'accept', generation: raw.generation } : undefined;
     case 'update':
     case 'save': {
       const keys = raw.type === 'update' ? ['type', 'seq', 'generation', 'entries', 'testName'] : ['type', 'seq', 'generation', 'entries'];
       if (!hasOnlyKeys(raw, keys) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
-      if (raw.generation !== context.generation) return { type: 'stale' };
       const entries = parseEntries(raw.entries);
       if (!entries) return undefined;
-      if (raw.type === 'save') return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
-      if (!isText(raw.testName, EditorLimits.testName)) return undefined;
-      return { type: 'update', seq: raw.seq, generation: raw.generation, entries, testName: raw.testName };
+      if (raw.type === 'update' && !isText(raw.testName, EditorLimits.testName)) return undefined;
+      const testName = raw.type === 'update' ? (raw.testName as string) : undefined;
+      if (raw.generation !== context.generation) return { type: 'stale', seq: raw.seq, entries, ...(testName !== undefined ? { testName } : {}) };
+      if (testName === undefined) return { type: 'save', seq: raw.seq, generation: raw.generation, entries };
+      return { type: 'update', seq: raw.seq, generation: raw.generation, entries, testName };
     }
     default:
       return undefined;
@@ -542,7 +552,7 @@ export function runPreviewJob(job: PreviewJob, post: (message: PreviewJobMessage
 
 // ---- State of the webview ---------------------------------------------------------------------------------------
 
-/** Message to the webview: the entries to show (at the start, after Load settings.json or Save, and when settings.json changed a draft without edits). */
+/** Message to the webview: the entries to show (at the start, after Load settings.json or Save, and after a stale Save or update). */
 export interface EditorLoadMessage {
   type: 'load';
   /** Counts the loads; the webview sends it back with its updates. */
@@ -551,6 +561,19 @@ export interface EditorLoadMessage {
   notices: string[];
   /** The text of the test field, so a restored webview shows the text of its result. */
   testName: string;
+}
+
+/**
+ * Message to the webview: settings.json changed the setting, and the draft of the extension has no edits. The webview
+ * shows `entries` and answers `accept` with `generation` only when it has no edits that the extension has not answered
+ * yet (a keystroke that waits for its delay, or an update without its state); otherwise it keeps its draft, shows the
+ * banner, and sends the draft. The extension keeps its base until the answer.
+ */
+export interface EditorExternalMessage {
+  type: 'external';
+  generation: number;
+  entries: EditorEntry[];
+  notices: string[];
 }
 
 /** Message to the webview: everything the extension computes for the entries of the webview. */
@@ -564,6 +587,8 @@ export interface EditorStateMessage {
   dirty: boolean;
   /** The setting was changed outside the editor since it was loaded. */
   changedOutside: boolean;
+  /** A Save runs: the webview stays read-only until a state with the `seq` of its Save and `saving: false`. */
+  saving: boolean;
   preview: GroupsPreview;
   test?: NameTest;
   /** A text for the status line, for example after Save. */
@@ -577,6 +602,7 @@ export function editorState(options: {
   loaded: readonly EditorEntry[];
   run: PreviewRun | undefined;
   changedOutside: boolean;
+  saving?: boolean;
   status?: string;
 }): EditorStateMessage {
   const run = options.run ?? {};
@@ -595,6 +621,7 @@ export function editorState(options: {
     canSave: canSave(checks) && !run.previewTooSlow && !run.failed,
     dirty: !sameSettingValue(toSettingValue(options.entries), toSettingValue(options.loaded)),
     changedOutside: options.changedOutside,
+    saving: options.saving === true,
     preview,
     ...(test ? { test } : {}),
     ...(options.status !== undefined ? { status: options.status } : {}),
@@ -627,6 +654,7 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <h1>${GroupsEditorTexts.panelTitle}</h1>
 <p class="intro">Regular expressions (JavaScript syntax) that filter and group the repositories of the Dev Environments view. Each one is matched against the repository name without the owner; a repository goes under the first entry that matches. The capturing groups are the levels of the tree; the last one is the label of the row. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment.</p>
 <div id="notices" role="status" aria-live="polite"></div>
+<fieldset id="form" class="form">
 <div id="changed" class="banner" role="alert" hidden>
 <span>settings.json changed this setting.</span>
 <button type="button" id="reload" class="secondary">Load settings.json</button>
@@ -648,6 +676,7 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <input type="text" id="test-name" spellcheck="false" autocomplete="off" maxlength="${EditorLimits.testName}">
 <div id="test-result" role="status" aria-live="polite"></div>
 </section>
+</fieldset>
 <section aria-labelledby="preview-heading">
 <h2 id="preview-heading">Preview</h2>
 <p class="muted">The repositories that the Dev Environments view has loaded, grouped with these entries. Repositories with an environment are always shown.</p>

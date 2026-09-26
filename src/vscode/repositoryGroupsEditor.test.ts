@@ -269,15 +269,119 @@ describe('RepositoryGroupsEditor', () => {
       expect(loadCount(panel)).toBe(1);
     });
 
-    it('reloads silently when the draft has no edits', async () => {
+    // Review of PR #21, F1: the webview may hold keystrokes that the extension has not seen yet (150 ms delay), so the
+    // extension only offers the new value (`external`); the webview takes it (`accept`) only without such edits.
+    it('offers the new value to a draft without edits, and shows it when the webview accepts it', async () => {
+      const { panel } = await openEditor();
+      const before = gen(panel);
+      changeStored(THEIRS);
+      await flush();
+      expect(loadCount(panel)).toBe(1);
+      const offer = panel.posted[panel.posted.length - 1] as unknown as { type: string; generation: number; entries: Array<{ pattern: string }> };
+      expect(offer).toMatchObject({ type: 'external', notices: [] });
+      expect(offer.entries.map((entry) => entry.pattern)).toEqual(THEIRS);
+      expect(offer.generation).toBeGreaterThan(before);
+      panel.receive({ type: 'accept', generation: offer.generation });
+      await flush();
+      expect(lastState(panel)).toMatchObject({ changedOutside: false, dirty: false });
+      // The accepted value is the new base: Save of an edit writes without a question.
+      panel.receive({ type: 'save', seq: 1, generation: offer.generation, entries: [{ name: '', pattern: '^mine', flags: '' }] });
+      await flush();
+      expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+      expect(update).toHaveBeenCalledWith('repositoryGroups', ['^mine'], fakeVscode.ConfigurationTarget.Global);
+    });
+
+    it('keeps the base when the webview keeps its draft: its update is not stale, and Save asks', async () => {
+      const { panel } = await openEditor();
+      const [example, web] = loaded(panel).entries;
+      const before = gen(panel);
+      changeStored(THEIRS);
+      await flush();
+      // The webview had a keystroke waiting: it keeps the draft and sends it with the generation of its load.
+      const entries = [example, { ...web, pattern: '^www-(.+)$' }];
+      panel.receive({ type: 'update', seq: 1, generation: before, entries, testName: '' });
+      await flush();
+      expect(lastState(panel)).toMatchObject({ seq: 1, changedOutside: true, dirty: true });
+      expect(lastState(panel)).not.toHaveProperty('status');
+      fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.saveMine);
+      panel.receive({ type: 'save', seq: 2, generation: before, entries });
+      await flush();
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(...changedQuestion(THEIRS));
+      expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
+    });
+
+    it('offers the new value again to a webview that starts again (a hidden tab that was shown)', async () => {
       const { panel } = await openEditor();
       changeStored(THEIRS);
       await flush();
-      expect(loadCount(panel)).toBe(2);
-      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual(THEIRS);
-      expect(lastState(panel)).toMatchObject({ changedOutside: false, dirty: false });
+      const first = panel.posted[panel.posted.length - 1] as unknown as { generation: number };
+      panel.receive({ type: 'ready' });
+      await flush();
+      expect(loaded(panel).entries.map((entry) => entry.pattern)).toEqual([EXAMPLE, '^web-(.+)$']);
+      const again = panel.posted[panel.posted.length - 1] as unknown as { type: string; generation: number };
+      expect(again.type).toBe('external');
+      expect(again.generation).toBeGreaterThan(first.generation);
+    });
+
+    it('ignores an accept of an offer that a later load replaced', async () => {
+      const { panel } = await openEditor();
+      changeStored(THEIRS);
+      await flush();
+      const offer = panel.posted[panel.posted.length - 1] as unknown as { generation: number };
+      panel.receive({ type: 'reload' });
+      await flush();
+      const current = gen(panel);
+      panel.receive({ type: 'accept', generation: offer.generation });
+      await flush();
+      panel.receive({ type: 'save', seq: 1, generation: current, entries: [] });
+      await flush();
+      expect(update).toHaveBeenCalledWith('repositoryGroups', undefined, fakeVscode.ConfigurationTarget.Global);
+    });
+
+    // Review of PR #21, F1: a Save or update of an earlier load does not vanish: its entries stay, with a status.
+    it('keeps the entries of a stale Save and says so', async () => {
+      const { panel } = await openEditor();
+      const old = gen(panel);
+      panel.receive({ type: 'reload' });
+      await flush();
+      const mine = [{ name: '', pattern: '^mine-(.+)$', flags: 'i' }];
+      panel.receive({ type: 'save', seq: 3, generation: old, entries: mine });
+      await flush();
+      expect(update).not.toHaveBeenCalled();
+      const load = loaded(panel) as unknown as { generation: number; entries: unknown };
+      expect(load.entries).toEqual(mine);
+      expect(load.generation).toBe(gen(panel));
+      expect(lastState(panel)).toMatchObject({ seq: 3, dirty: true, status: GroupsEditorTexts.staleKept });
+      expect(logger.warn).not.toHaveBeenCalled();
+      // Save again writes them.
+      panel.receive({ type: 'save', seq: 4, generation: load.generation, entries: mine });
+      await flush();
+      expect(update).toHaveBeenCalledWith('repositoryGroups', [{ pattern: '^mine-(.+)$', flags: 'i' }], fakeVscode.ConfigurationTarget.Global);
+    });
+
+    it('keeps the entries of a stale update and says so', async () => {
+      const { panel } = await openEditor();
+      const old = gen(panel);
+      panel.receive({ type: 'reload' });
+      await flush();
+      const mine = [{ name: '', pattern: '^mine-(.+)$', flags: '' }];
+      panel.receive({ type: 'update', seq: 2, generation: old, entries: mine, testName: 'mine-x' });
+      await flush();
+      expect(loaded(panel)).toMatchObject({ entries: mine, testName: 'mine-x' });
+      expect(lastState(panel)).toMatchObject({ seq: 2, dirty: true, status: GroupsEditorTexts.staleKept });
+    });
+
+    // Nit of the review of PR #21: settings.json already holds the draft.
+    it('writes nothing and asks nothing when settings.json already holds the draft, and counts it as saved', async () => {
+      const { panel, entries } = await editedDraft();
+      changeStored([EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }]);
+      await flush();
+      panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries });
+      await flush();
       expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
       expect(update).not.toHaveBeenCalled();
+      expect(loaded(panel).entries).toEqual(entries);
+      expect(lastState(panel)).toMatchObject({ dirty: false, changedOutside: false, status: GroupsEditorTexts.alreadySaved });
     });
 
     it('Load settings.json of the banner shows the stored value and drops the draft', async () => {
@@ -529,6 +633,23 @@ describe('RepositoryGroupsEditor', () => {
     second.panel.receive({ type: 'update', seq: 1, generation: gen(second.panel), entries: [], testName: '' });
     await flush();
     expect(logger.warn).toHaveBeenCalledWith('The preview of the repository groups could not be made in its worker thread.');
+  });
+
+  // Review of PR #21, F2: the state tells the webview whether Save still runs; the webview stays read-only until then.
+  it('marks the states during Save, and the state after it', async () => {
+    const { panel } = await openEditor();
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    expect(lastState(panel)).toMatchObject({ saving: false });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [] });
+    await flush();
+    changeStored(['^during']);
+    await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 1, saving: true, changedOutside: true });
+    release({});
+    await flush();
+    await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 1, saving: false });
   });
 
   // Review round 2 of PR #21, W6: the worker of the preview stops with the panel.

@@ -323,7 +323,19 @@ describe('messages of the webview', () => {
     });
     expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [] }, context)).toEqual({ type: 'save', seq: 0, generation: 5, entries: [] });
     // An update of an earlier load: its entries were edited from another value.
-    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid] }, context)).toEqual({ type: 'stale' });
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid] }, context)).toEqual({ type: 'stale', seq: 0, entries: [valid] });
+    expect(parseEditorRequest({ type: 'update', seq: 2, generation: 6, entries: [valid], testName: 'x' }, context)).toEqual({
+      type: 'stale',
+      seq: 2,
+      entries: [valid],
+      testName: 'x',
+    });
+    expect(parseEditorRequest({ type: 'accept', generation: 7 }, context)).toEqual({ type: 'accept', generation: 7 });
+  });
+
+  it('checks a stale update or Save as strictly as a current one', () => {
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [{ ...valid, flags: 'g' }] }, context)).toBeUndefined();
+    expect(parseEditorRequest({ type: 'update', seq: 0, generation: 4, entries: [], testName: 1 }, context)).toBeUndefined();
   });
 
   it.each<[string, unknown]>([
@@ -333,6 +345,8 @@ describe('messages of the webview', () => {
     ['an unknown type', { type: 'write' }],
     ['an extra property', { type: 'ready', extra: 1 }],
     ['a missing property', { type: 'update', seq: 1, generation: 5, entries: [] }],
+    ['an accept without a generation', { type: 'accept' }],
+    ['an accept with an extra property', { type: 'accept', generation: 1, entries: [] }],
     ['a missing generation', { type: 'save', seq: 1, entries: [] }],
     ['a generation that is no number', { type: 'save', seq: 1, generation: '5', entries: [] }],
     ['a sequence that is no whole number', { type: 'save', seq: 1.5, generation: 5, entries: [] }],

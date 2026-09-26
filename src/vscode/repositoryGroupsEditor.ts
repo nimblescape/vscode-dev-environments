@@ -32,6 +32,7 @@ import {
   sameSettingValue,
   toSettingValue,
   type EditorEntry,
+  type EditorExternalMessage,
   type EditorLoadMessage,
   type EditorStateMessage,
 } from './repositoryGroupsEditorModel';
@@ -62,8 +63,15 @@ interface EditorSession {
    * while settings.json still holds it.
    */
   base: unknown;
-  /** Counts the loads; updates and Saves of another load are ignored (their entries were edited from another value). */
+  /** The generation of the entries of the webview; an update or Save of another one is stale (edited from another value). */
   generation: number;
+  /** The last generation handed out, for a load or an offer. */
+  issued: number;
+  /**
+   * The values of settings.json offered to the webview (`external`) by generation. The base changes only when the
+   * webview accepts one: until then, it may still hold keystrokes that the extension has not seen.
+   */
+  offers: Map<number, unknown>;
   /** The entries as loaded (for `dirty`). */
   loaded: EditorEntry[];
   notices: string[];
@@ -103,6 +111,8 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       panel,
       base,
       generation: 0,
+      issued: 0,
+      offers: new Map(),
       loaded: entries,
       notices,
       entries,
@@ -151,13 +161,26 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     }
     switch (request.type) {
       case 'stale':
+        // Edited from an earlier load (the generation does not change during Save, and the webview is read-only then).
+        // Nothing is written; the entries become the draft again, with the current generation, and the status says so.
+        if (session.saving) return;
+        session.entries = request.entries;
+        if (request.testName !== undefined) session.testName = request.testName;
+        session.seq = Math.max(session.seq, request.seq);
+        this.postLoad(session);
+        this.refresh(session, GroupsEditorTexts.staleKept);
         return;
       case 'ready':
         this.postLoad(session);
-        this.refresh(session);
+        // A new page has no unsent edits: a changed value without edits is offered to it again.
+        this.onSettingChanged(session);
+        return;
+      case 'accept':
+        this.accept(session, request.generation);
         return;
       case 'update':
-        // During Save, the draft stays as it was sent with Save; the written value replaces it afterwards.
+        // During Save, the draft stays as it was sent with Save (the webview is read-only then); the written value
+        // replaces it afterwards.
         if (session.saving) return;
         session.entries = request.entries;
         session.testName = request.testName;
@@ -181,16 +204,36 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   }
 
   /**
-   * The setting changed (in settings.json, or by Save). A draft without edits shows the stored value at once; a draft
-   * with edits stays, and the state shows the banner "settings.json changed this setting" (changedOutside).
+   * The setting changed (in settings.json, or by Save). A draft with edits stays, and the state shows the banner
+   * "settings.json changed this setting" (changedOutside). A draft without edits here is offered the stored value
+   * (`external`): the webview may still hold keystrokes that are not sent yet (the update waits 150 ms), so it decides.
+   * It shows the value and answers `accept`, or keeps its draft, shows the banner, and sends the draft.
    */
   private onSettingChanged(session: EditorSession): void {
     if (this.session !== session) return;
     const stored = readSettingValue();
-    if (!session.saving && !sameSettingValue(stored, session.base) && !isEdited(session)) {
-      this.load(session, stored);
+    if (session.saving || sameSettingValue(stored, session.base) || isEdited(session)) {
+      this.refresh(session);
       return;
     }
+    const generation = ++session.issued;
+    session.offers.set(generation, stored);
+    const { entries, notices } = entriesFromSetting(stored);
+    const message: EditorExternalMessage = { type: 'external', generation, entries, notices };
+    this.post(session, message);
+  }
+
+  /** The webview shows the offered value of `generation`: it is the new base. An offer that a load replaced is ignored. */
+  private accept(session: EditorSession, generation: number): void {
+    if (session.saving || !session.offers.has(generation)) return;
+    const value = session.offers.get(generation);
+    for (const offered of session.offers.keys()) if (offered <= generation) session.offers.delete(offered);
+    const { entries, notices } = entriesFromSetting(value);
+    session.base = value;
+    session.generation = generation;
+    session.loaded = entries;
+    session.entries = entries;
+    session.notices = notices;
     this.refresh(session);
   }
 
@@ -246,6 +289,13 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
           status = unchanged ? GroupsEditorTexts.saved : GroupsEditorTexts.savedReplaced;
           return;
         }
+        if (sameSettingValue(value, current)) {
+          // settings.json already holds the draft: nothing to write and nothing to ask; it is the new base.
+          this.deps.logger.info('The setting devEnvLauncher.repositoryGroups already held the entries of the editor.');
+          reload = { value: current };
+          status = GroupsEditorTexts.alreadySaved;
+          return;
+        }
         const changed = !sameSettingValue(current, session.base);
         const answer = await vscode.window.showWarningMessage(
           changed ? GroupsEditorTexts.changedMeanwhile : GroupsEditorTexts.notAListConflict,
@@ -285,7 +335,8 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
   private load(session: EditorSession, value: unknown, status?: string): void {
     const { entries, notices } = entriesFromSetting(value);
     session.base = value;
-    session.generation += 1;
+    session.generation = ++session.issued;
+    session.offers.clear();
     session.loaded = entries;
     session.entries = entries;
     session.notices = notices;
@@ -350,12 +401,13 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       loaded: session.loaded,
       run,
       changedOutside: !sameSettingValue(readSettingValue(), session.base),
+      saving: session.saving,
       ...(status !== undefined ? { status } : {}),
     });
     this.post(session, message);
   }
 
-  private post(session: EditorSession, message: EditorLoadMessage | EditorStateMessage): void {
+  private post(session: EditorSession, message: EditorLoadMessage | EditorExternalMessage | EditorStateMessage): void {
     if (this.session !== session) return;
     session.panel.webview.postMessage(message).then(undefined, (error: unknown) => {
       this.deps.logger.warn(`The repository groups editor could not be updated: ${errorMessage(error)}`);
