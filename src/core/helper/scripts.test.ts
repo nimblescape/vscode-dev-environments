@@ -11,6 +11,7 @@ import { detectConfigurations } from '../discovery/detect';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
+  COMPOSE_FILES_MAX_AGE_MS,
   COMPOSE_MODEL_SCRIPT,
   CREDENTIAL_HELPER,
   GIT_FILES_SCRIPT,
@@ -263,6 +264,32 @@ describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', 
   it('passes the exit code of the CLI on', () => {
     const { folder, env } = setup();
     expect(run(folder, { ...env, FAKE_EXIT: '3' }, {}, ['up']).status).toBe(3);
+  });
+
+  // Limit L-5 of unit 6: the compose files that the CLI generates in the cache volume accumulate otherwise.
+  it('removes the compose files of the CLI older than 30 days from the data folder before up, and nothing else', () => {
+    const { dir, folder, env } = setup();
+    const data = path.join(dir, 'cache');
+    const compose = path.join(data, 'docker-compose');
+    const old = (Date.now() - COMPOSE_FILES_MAX_AGE_MS - 60_000) / 1000;
+    const names = {
+      oldFeatures: 'docker-compose.devcontainer.containerFeatures-1700000000000-3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d.yml',
+      oldBuild: 'docker-compose.devcontainer.build-1700000000000.yml',
+      newFeatures: 'docker-compose.devcontainer.containerFeatures-1800000000000-0a1b.yml',
+      oldOther: 'notes.yml',
+    };
+    for (const [key, name] of Object.entries(names)) {
+      write(path.join(compose, name), 'x');
+      if (key.startsWith('old')) fs.utimesSync(path.join(compose, name), old, old);
+    }
+    // `build` and a run without the data folder leave them.
+    expect(run(folder, env, {}, ['build', '--user-data-folder', data]).status).toBe(0);
+    expect(run(folder, env, {}, ['up']).status).toBe(0);
+    expect(fs.readdirSync(compose).sort()).toEqual(Object.values(names).sort());
+    expect(run(folder, env, {}, ['up', '--user-data-folder', data]).status).toBe(0);
+    expect(fs.readdirSync(compose).sort()).toEqual([names.newFeatures, names.oldOther].sort());
+    // A missing folder is no error.
+    expect(run(folder, env, {}, ['up', '--user-data-folder', path.join(dir, 'none')]).status).toBe(0);
   });
 
   it.each<[string, (folder: string) => string]>([

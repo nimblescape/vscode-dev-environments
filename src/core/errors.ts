@@ -11,7 +11,6 @@ export type UserErrorCode =
   | 'helperFailed'
   | 'cloneFailed'
   | 'firstOpenOffline'
-  | 'composeNotSupported'
   | 'noConfiguration'
   | 'buildFailed'
   | 'startFailed'

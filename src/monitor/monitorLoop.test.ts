@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BUSY_OWNER_STATUS_MAX_AGE_MS } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { gitSummaryCommand } from '../core/git/gitSummary';
-import { LABEL_ENVIRONMENT_ID } from '../core/names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import type { Logger, RunResult } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -20,6 +20,7 @@ import {
   GIT_SUMMARY_TIMEOUT_MS,
   MAX_FAILED_TICKS,
   MonitorLoop,
+  devContainerFirst,
   environmentLabel,
   type MonitorDocker,
   type MonitorLoopDeps,
@@ -739,6 +740,56 @@ describe('MonitorLoop.tick', () => {
     expect(h.docker.calls.filter((call) => call.startsWith('stop')).sort()).toEqual(
       [`stop id-${env.containerName}`, `stop id-${env.containerName}-old`].sort(),
     );
+  });
+
+  // Unit 6 (D-20): a Docker Compose environment has a container per service; the dev container goes first.
+  describe('Docker Compose environment', () => {
+    function serviceOf(env: Environment, service: string): ContainerInfo {
+      const container = containerOf(env, 'running', `-${service}`);
+      return { ...container, name: `devenv-${env.id.slice(0, 8)}-${service}-1`, labels: { ...container.labels, [LABEL_COMPOSE_SERVICE]: service } };
+    }
+
+    it('stops the dev container first, then the other services, and reads Git only in the dev container', async () => {
+      const env = await closedWindowScenario(h);
+      const db = serviceOf(env, 'db');
+      const cache = serviceOf(env, 'cache');
+      h.docker.containers = [db, containerOf(env), cache];
+      await runUntil(h, T0 + WAITING_MS + 1);
+      expect(h.docker.execCalls.map((call) => call.container)).toEqual([`id-${env.containerName}`]);
+      expect(h.docker.calls.filter((call) => call.startsWith('stop'))).toEqual([`stop id-${env.containerName}`, `stop ${db.id}`, `stop ${cache.id}`]);
+    });
+
+    it('refreshes the lock before each further container, and stops no further one after losing it', async () => {
+      const env = await closedWindowScenario(h);
+      h.docker.containers = [serviceOf(env, 'db'), containerOf(env)];
+      const refreshes: number[] = [];
+      h.docker.stopHook = async () => {
+        refreshes.push(h.lock.refreshes);
+        h.lock.held = false;
+      };
+      const results = await runUntil(h, T0 + WAITING_MS + 1);
+      expect(results.at(-1)?.end).toBe('lockLost');
+      expect(h.docker.calls.filter((call) => call.startsWith('stop'))).toEqual([`stop id-${env.containerName}`]);
+      // One more refresh after the first stop, which found the lock lost.
+      expect(h.lock.refreshes).toBe(refreshes[0] + 1);
+    });
+
+    it('reads no Git state when only other services run', async () => {
+      const env = await closedWindowScenario(h);
+      const db = serviceOf(env, 'db');
+      h.docker.containers = [db];
+      await runUntil(h, T0 + WAITING_MS + 1);
+      expect(h.docker.execCalls).toEqual([]);
+      expect(h.docker.calls.filter((call) => call.startsWith('stop'))).toEqual([`stop ${db.id}`]);
+      expect((await h.registry.get(ID_A))?.gitSummary).toEqual(OLD_SUMMARY);
+    });
+
+    it('orders by the name of the environment, then without the label of a service', () => {
+      const env = environment(ID_A, 'acme/api');
+      const db = serviceOf(env, 'db');
+      const old = containerOf(env, 'running', '-old');
+      expect(devContainerFirst([db, old, containerOf(env)], env.containerName).map((c) => c.id)).toEqual([`id-${env.containerName}`, old.id, db.id]);
+    });
   });
 
   it('passes the state from one tick to the next (sleep grace at the start, waiting times)', async () => {

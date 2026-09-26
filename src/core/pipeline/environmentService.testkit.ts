@@ -115,7 +115,28 @@ export class FakeDocker implements EnvironmentDocker {
   runError: Maybe<Error>;
   /** The API version of the Docker Engine (engineApiVersion). `undefined`: the engine does not tell it. */
   apiVersion: string | undefined = '1.48';
+  /** Networks by name, with their labels (Docker Compose creates them for a project). */
+  readonly networks = new Map<string, Record<string, string>>();
   private counter = 0;
+
+  async listProjectContainers(project: string): Promise<ContainerInfo[]> {
+    return [...this.containers.values()]
+      .filter((c) => c.labels['com.docker.compose.project'] === project)
+      .map((c) => ({ ...c, labels: { ...c.labels } }));
+  }
+
+  async listProjectNetworks(project: string): Promise<string[]> {
+    return [...this.networks.entries()].filter(([, labels]) => labels['com.docker.compose.project'] === project).map(([name]) => name);
+  }
+
+  async removeNetwork(name: string): Promise<void> {
+    this.log.push(`network rm ${name}`);
+    this.networks.delete(name);
+  }
+
+  async listProjectImages(project: string): Promise<string[]> {
+    return [...this.images].filter((image) => image.startsWith(`${project}-`)).sort();
+  }
 
   async engineApiVersion(): Promise<string | undefined> {
     return this.apiVersion;
@@ -589,6 +610,8 @@ export class FakeHelper implements EnvironmentHelper {
     if (error && this.upFailsBeforeRemoval) throw error;
     if (existing && p.removeExistingContainer) this.docker.containers.delete(existing.id);
     if (error) throw error;
+    // Compose creates the default network of the project.
+    this.docker.networks.set(`${project}_default`, { 'com.docker.compose.project': project });
     const volumeNames = (entries: unknown): string[] =>
       (Array.isArray(entries) ? entries : [])
         .map((entry: { type?: string; source?: string }) => (entry.type === 'volume' && entry.source ? model.volumes?.[entry.source]?.name : undefined))

@@ -205,6 +205,7 @@ interface Harness {
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
+    removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
@@ -278,6 +279,8 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     reconcileFromVolumes: vi.fn(async () => 0),
     // By default, Delete could remove every recorded volume (their labels make them the environment's own).
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
+    // No volumes of a Docker Compose project, unless a test gives them (D-19).
+    removableServiceDataVolumes: vi.fn(async () => []),
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
@@ -887,6 +890,52 @@ describe('Delete', () => {
     await run('delete', row('acme/api', environment()));
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+  });
+
+  // Unit 6, D-19: the volumes of a Docker Compose project (the data of its services) are asked about apart, none ticked.
+  describe('the data of the services of a Docker Compose environment', () => {
+    const DATA = ['devenv-3f2a9c1e_pgdata', 'devenv-3f2a9c1e_cache'];
+
+    async function deleteWithServiceData(pick: (items: Array<{ label: string; picked?: boolean }>) => unknown): Promise<void> {
+      await h.registry.add(environment({ additionalVolumes: ['api-db', ...DATA] }));
+      h.service.removableAdditionalVolumes.mockResolvedValueOnce(['api-db']);
+      h.service.removableServiceDataVolumes.mockResolvedValueOnce([...DATA]);
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete).mockResolvedValueOnce(Actions.remove);
+      fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; picked?: boolean }>) => pick(items));
+      await run('delete', row('acme/api', environment()));
+    }
+
+    it('lists them with nothing ticked and keeps them when none is ticked', async () => {
+      await deleteWithServiceData((items) => {
+        expect(items.map((item) => item.label)).toEqual(DATA);
+        expect(items.every((item) => item.picked === false)).toBe(true);
+        return [];
+      });
+      expect(fakeVscode.window.showQuickPick).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ canPickMany: true, title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder }),
+      );
+      expect(h.service.removableServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    });
+
+    it('removes the ticked ones', async () => {
+      await deleteWithServiceData((items) => [items[0]]);
+      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db', DATA[0]] }));
+    });
+
+    it('cancels the Delete on Escape', async () => {
+      await deleteWithServiceData(() => undefined);
+      expect(h.service.delete).not.toHaveBeenCalled();
+    });
+
+    it('asks nothing when the environment has none', async () => {
+      await h.registry.add(environment());
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+      await run('delete', row('acme/api', environment()));
+      expect(fakeVscode.window.showQuickPick).not.toHaveBeenCalled();
+      expect(h.service.delete).toHaveBeenCalled();
+    });
   });
 
   it('opens the environment instead when the user selects Open environment', async () => {

@@ -786,7 +786,16 @@ function volumeNameProblems(name: string, volumes: VolumeContext): Problem[] {
  * used.
  */
 export function volumeNameItems(name: string, input: VolumeInput): string[] {
-  return volumeNameProblems(name, volumeContext(input)).map((problem) => problem.item);
+  return volumeNameFindings(name, input).map((finding) => finding.item);
+}
+
+/**
+ * volumeNameItems with the class of each item (HostAccessClass), for the switch of the host access checks in the Docker
+ * Compose policy: a volume of another environment or of the workspace helper stays refused (`protected`), a volume of
+ * another program is access to the computer (`computer`), as for the `mounts` of a single container.
+ */
+export function volumeNameFindings(name: string, input: VolumeInput): HostAccessFinding[] {
+  return volumeNameProblems(name, volumeContext(input)).map((problem) => ({ item: problem.item, class: problem.class }));
 }
 
 /**

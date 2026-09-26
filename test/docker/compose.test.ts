@@ -8,7 +8,9 @@
 // of the environment and the workspace volume, the published port of db on 127.0.0.1 only, the repository files that db
 // mounts (a folder and a single file) from the workspace volume (volume.subpath), the volumes of the project and of
 // `mounts` with our labels; the refusal of a privileged service before any build; Stop of both; open again without a
-// build. Delete, the Session Monitor, and the restore are tested with package C of unit 6.
+// build. Package C of unit 6: the host name of the dev container; Delete (all containers, the network, and the images of
+// the project; the data volumes of the services only when the user ticks them); the label devenv.host-access=unrestricted
+// on every container, and ports as the model writes them, while the host access checks are off for the repository.
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -19,11 +21,12 @@ import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,
+  HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
   LABEL_ENVIRONMENT_ID,
+  LABEL_HOST_ACCESS,
   LABEL_REPOSITORY,
   LABEL_VOLUME,
-  VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
   environmentImageRepository,
@@ -61,7 +64,7 @@ git add -A
 git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
 `;
 
-const settings: ExtensionSettings = {
+let settings: ExtensionSettings = {
   reopenLastOnStartup: true,
   stopOnClose: true,
   waitingTimeSeconds: 30,
@@ -109,6 +112,7 @@ describe('open pipeline for a Docker Compose configuration', () => {
   }
   const app = environment('devenv-test/tiny-compose');
   const refused = environment('devenv-test/refused-compose');
+  const unrestricted = environment('devenv-test/unrestricted-compose');
   let apiVersion: string;
 
   /** The compose file: `db` publishes a port without an address and mounts a folder and a file of the repository. */
@@ -179,8 +183,8 @@ ${extra}volumes:
     return cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${target.id}`]);
   }
 
-  function dbContainer(): string {
-    const ids = cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${app.id}`, '--filter', `label=${LABEL_COMPOSE_SERVICE}=db`]);
+  function dbContainer(target = app): string {
+    const ids = cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${target.id}`, '--filter', `label=${LABEL_COMPOSE_SERVICE}=db`]);
     expect(ids).toHaveLength(1);
     return ids[0];
   }
@@ -193,7 +197,7 @@ ${extra}volumes:
 
   /** The containers, networks, and volumes of the Compose projects: they carry the labels of the environment. */
   function removeProjectObjects(): void {
-    for (const target of [app, refused]) {
+    for (const target of [app, refused, unrestricted]) {
       for (const id of containers(target)) cli.run(['rm', '-f', id]);
       for (const id of cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${target.project}`])) cli.run(['network', 'rm', id]);
       for (const name of cli.lines(['volume', 'ls', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${target.id}`])) {
@@ -210,6 +214,10 @@ ${extra}volumes:
     log.info(`Docker Engine API ${apiVersion}`);
     await seed(app, composeFile());
     await seed(refused, composeFile('').replace('    command: sleep infinity\n    ports:', '    command: sleep infinity\n    privileged: true\n    ports:'));
+    await seed(unrestricted, composeFile());
+    // Delete removes the base images that no build record uses any more; a stopped container of the base image keeps it
+    // for the other tests and for the baseline of the engine (Docker does not remove an image that a container uses).
+    cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--name', `devenv-test-compose-guard-${run.runId}`, TEST_BASE_IMAGE, 'true']);
   });
 
   afterAll(() => {
@@ -255,9 +263,12 @@ ${extra}volumes:
     });
     expect(dev?.Config.Labels?.[LABEL_COMPOSE_SERVICE]).toBeUndefined();
     expect(dev?.Mounts.find((mount) => mount.Destination === '/workspaces')).toMatchObject({ Type: 'volume', Name: app.name });
+    // The host name of the dev container is the repository name, as for a single container; db keeps the one of Docker.
+    expect(dev?.Config.Hostname).toBe('tiny-compose');
     // The volume of `mounts` is the project volume that we created with the labels (the CLI's declaration merged into ours).
     expect(dev?.Mounts.find((mount) => mount.Destination === '/cache')).toMatchObject({ Type: 'volume', Name: `${app.project}_cache` });
-    expect(cli.volume(`${app.project}_cache`)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL });
+    // D-7 (package C): a volume of the project, like the data of the services: `compose`, never shared.
+    expect(cli.volume(`${app.project}_cache`)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
     // Compose kept our declaration `external: true` for it and for the project volume: it created no volume and warned
     // about none that it did not create.
     expect(fs.readFileSync(log.file, 'utf8')).not.toContain('was not created by Docker Compose');
@@ -267,6 +278,7 @@ ${extra}volumes:
     const db = dbContainer();
     const details = cli.container(db);
     expect(details?.State.Running).toBe(true);
+    expect(details?.Config.Hostname).not.toBe('tiny-compose');
     expect(details?.Config.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_COMPOSE_SERVICE]: 'db', 'com.docker.compose.project': app.project });
     const ports = cli.lines(['port', db, '5432/tcp']);
     expect(ports.length).toBeGreaterThan(0);
@@ -308,5 +320,67 @@ ${extra}volumes:
     expect(cli.container(dbContainer())?.State.Running).toBe(true);
     expect(cli.lines(['image', 'ls', '--format', '{{.Tag}}', environmentImageRepository(app.id)])).toEqual(['1']);
     expect((await registry.get(app.id))?.buildRecord?.buildNumber).toBe(1);
+  });
+
+  it('Delete removes the containers, the network, and the images of the project, and only the ticked data volumes', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) return;
+    // A one-off container of the project (`docker compose run`), without the labels of the environment.
+    const oneOff = cli.ok([
+      'create',
+      '--label',
+      `com.docker.compose.project=${app.project}`,
+      '--label',
+      `${TEST_RUN_LABEL}=${run.runId}`,
+      TEST_BASE_IMAGE,
+      'true',
+    ]);
+    expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]).length).toBeGreaterThan(0);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`]).length).toBeGreaterThan(0);
+    expect(await service.removableServiceDataVolumes(app.id)).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
+
+    await service.delete(app.id, { progress: new RecordingProgress(), additionalVolumesToRemove: [`${app.project}_cache`] });
+
+    expect(containers(app)).toEqual([]);
+    expect(cli.container(oneOff)).toBeUndefined();
+    expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(app.id)}:*`])).toEqual([]);
+    expect(cli.volume(app.name)).toBeUndefined();
+    // Ticked: removed. Not ticked: the data of the database stays.
+    expect(cli.volume(`${app.project}_cache`)).toBeUndefined();
+    expect(cli.volume(`${app.project}_dbdata`)).toBeDefined();
+    expect(await registry.get(app.id)).toBeUndefined();
+  });
+
+  it('labels every container devenv.host-access=unrestricted and keeps the ports while the checks are off', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) return;
+    settings = { ...settings, hostAccessChecksOff: [unrestricted.repository] };
+    try {
+      await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
+    } finally {
+      settings = { ...settings, hostAccessChecksOff: [] };
+    }
+    const dev = cli.container(unrestricted.name);
+    expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
+    const db = dbContainer(unrestricted);
+    expect(cli.container(db)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
+    // The port without an address is published as the model writes it: not only on 127.0.0.1.
+    const ports = cli.lines(['port', db, '5432/tcp']);
+    expect(ports.length).toBeGreaterThan(0);
+    expect(ports.some((binding) => !binding.startsWith('127.0.0.1:'))).toBe(true);
+
+    // With the checks on again, the next open creates the containers again without the label, the port on 127.0.0.1.
+    await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
+    expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBeUndefined();
+    const again = dbContainer(unrestricted);
+    expect(cli.container(again)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBeUndefined();
+    for (const binding of cli.lines(['port', again, '5432/tcp'])) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
+
+    await service.delete(unrestricted.id, {
+      progress: new RecordingProgress(),
+      additionalVolumesToRemove: await service.removableServiceDataVolumes(unrestricted.id),
+    });
+    expect(containers(unrestricted)).toEqual([]);
+    expect(cli.volume(`${unrestricted.project}_dbdata`)).toBeUndefined();
   });
 });

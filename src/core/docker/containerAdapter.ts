@@ -102,6 +102,9 @@ const MISSING_PATTERNS: Record<ObjectKind, RegExp> = {
   image: /no such (image|object)/i,
 };
 
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+
 /** Docker refuses to remove an image that a container or another image uses. */
 const IMAGE_IN_USE_PATTERN = /conflict|in use|being used|is using|dependent child images/i;
 
@@ -468,6 +471,47 @@ export class ContainerAdapter {
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));
     return containers.map(publicInfo);
+  }
+
+  /**
+   * All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not, also
+   * those without the label devenv.environment-id (for example one-off containers of `docker compose run`).
+   */
+  async listProjectContainers(project: string): Promise<ContainerInfo[]> {
+    const containers = await this.inspectContainers(await this.containerIds(`label=${COMPOSE_PROJECT_LABEL}=${project}`));
+    return containers.map(publicInfo);
+  }
+
+  /** The names of the networks of the Docker Compose project `project` (label com.docker.compose.project). */
+  async listProjectNetworks(project: string): Promise<string[]> {
+    const args = ['network', 'ls', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${project}`, '--format', '{{json .Name}}'];
+    const names = parseJsonLines(await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS }));
+    return [...new Set(names.filter((name): name is string => typeof name === 'string' && name !== ''))];
+  }
+
+  /** `docker network rm`. A missing network is not an error; a network in use is (CommandError). */
+  async removeNetwork(name: string): Promise<void> {
+    this.logger.info(`Removing network ${name}.`);
+    const args = ['network', 'rm', name];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode === 0 || (!result.timedOut && /not found|no such network/i.test(result.stderr))) return;
+    throw this.commandError(args, result);
+  }
+
+  /**
+   * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). Throws CommandError.
+   */
+  async listProjectImages(project: string): Promise<string[]> {
+    const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
+    const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    const images = new Set<string>();
+    for (const item of parseJsonLines(stdout)) {
+      if (!isRecord(item) || typeof item.Repository !== 'string' || typeof item.Tag !== 'string') continue;
+      if (!item.Repository.startsWith(`${project}-`) || !item.Tag || item.Tag === '<none>') continue;
+      images.add(`${item.Repository}:${item.Tag}`);
+    }
+    return [...images].sort();
   }
 
   /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */

@@ -28,6 +28,11 @@ export const TOKEN_FILE = `${SECRETS_FOLDER}/github-token`;
  * and for Docker Compose our model): only in the helper, never in the repository (each helper run is a new container).
  */
 export const OVERRIDE_FOLDER = '/tmp/devenv-override';
+/**
+ * Age after which WRITE_AND_RUN_SCRIPT removes a compose file that the Dev Container CLI generated in the cache volume
+ * (30 days, limit L-5 of the implementation notes, section "Docker Compose").
+ */
+export const COMPOSE_FILES_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Path of the override configuration of `devcontainer up` inside the helper. */
 export const OVERRIDE_CONFIG_PATH = `${OVERRIDE_FOLDER}/devcontainer.json`;
 
@@ -486,9 +491,11 @@ process.stdout.write(JSON.stringify(main()) + '\n');
  * folder, absolute and without `.`/`..` segments; the files get mode 0600, and the folder `context/` (the empty build
  * context of a synthesized build) is created. Lockfile: when the repository has one next to its configuration, it is
  * copied next to our copy (so the CLI uses it; a change that the CLI writes stays in the helper); without one,
- * `--no-lockfile` is added, so that a build never adds a file to the repository. Then `devcontainer` runs with the
- * output of this process; its exit code is the exit code (128 + the signal number after a signal), and a stop signal is
- * passed on to it.
+ * `--no-lockfile` is added, so that a build never adds a file to the repository. Before `devcontainer up`, the compose
+ * files that the Dev Container CLI generated in `<--user-data-folder>/docker-compose` (the shared cache volume) and that
+ * are older than COMPOSE_FILES_MAX_AGE_MS are removed (limit L-5: nothing else removes them; the CLI writes a missing one
+ * again without a build). Then `devcontainer` runs with the output of this process; its exit code is the exit code
+ * (128 + the signal number after a signal), and a stop signal is passed on to it.
  */
 export const WRITE_AND_RUN_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -529,6 +536,31 @@ const prepare = () => {
     }
   }
 };
+const composeFile = /^docker-compose\.devcontainer\.(build|containerFeatures)-\d+(-[0-9A-Fa-f-]+)?\.yml$/;
+const removeOldComposeFiles = () => {
+  if (args[0] !== 'up') return;
+  const index = args.indexOf('--user-data-folder');
+  const data = index >= 0 ? args[index + 1] : undefined;
+  if (!data || path.posix.resolve(data) !== data || data === '/') return;
+  const dir = path.posix.join(data, 'docker-compose');
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const limit = Date.now() - ${COMPOSE_FILES_MAX_AGE_MS};
+  for (const name of names) {
+    if (!composeFile.test(name)) continue;
+    const file = path.posix.join(dir, name);
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && stat.mtimeMs < limit) fs.unlinkSync(file);
+    } catch {
+      // Removed by another run, or not ours to remove.
+    }
+  }
+};
 try {
   prepare();
 } catch (error) {
@@ -536,6 +568,7 @@ try {
   process.exitCode = 2;
 }
 if (process.exitCode === undefined) {
+  removeOldComposeFiles();
   const child = spawn('devcontainer', args, { stdio: ['ignore', 'inherit', 'inherit'] });
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.on('error', (error) => {

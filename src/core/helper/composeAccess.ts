@@ -7,7 +7,10 @@
 // prints (all profiles), not only for the dev service, because Compose starts them all with the Docker engine of the
 // computer. An allow-list, like RUN_FLAGS: a key that the policy does not know is refused as not supported, because a
 // new key of Compose can reach the computer. The mounts and the ports are decided by the functions of compose.ts that
-// the rewrite uses too, so the check and the model that runs cannot disagree. Pure functions, no I/O.
+// the rewrite uses too, so the check and the model that runs cannot disagree. Each refused item has the class of the
+// switch of the host access checks (HostAccessClass of hostAccess.ts, container-restrictions.md section 12), as the same
+// setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
+// Pure functions, no I/O.
 import * as path from 'path';
 import { isOciFeatureReference } from '../imageCheck/reference';
 import {
@@ -28,7 +31,9 @@ import {
   capabilityProblems,
   refusedVariableItem,
   securityOptionProblems,
-  volumeNameItems,
+  volumeNameFindings,
+  type HostAccessClass,
+  type HostAccessFinding,
   type HostAccessReport,
   type VolumeInput,
 } from './hostAccess';
@@ -52,11 +57,20 @@ export interface ComposeAccessInput extends VolumeInput {
 
 interface Problem {
   item: string;
-  kind: 'hostAccess' | 'unsupported';
+  class: HostAccessClass;
 }
 
-const access = (item: string): Problem => ({ item, kind: 'hostAccess' });
-const unsupported = (item: string): Problem => ({ item, kind: 'unsupported' });
+/** Access to the computer: lifted while the host access checks are off (HostAccessClass `computer`). */
+const access = (item: string): Problem => ({ item, class: 'computer' });
+/** Refused whatever the switch says (HostAccessClass `protected`): account separation, the token, the owner account. */
+const guarded = (item: string): Problem => ({ item, class: 'protected' });
+const unsupported = (item: string): Problem => ({ item, class: 'unsupported' });
+
+/** A refusal of decideServiceMount or decideServicePort as a problem with its class. */
+function decisionProblem(decision: { item: string; kind: 'hostAccess' | 'unsupported'; guarded?: true }): Problem {
+  if (decision.kind === 'unsupported') return unsupported(decision.item);
+  return decision.guarded ? guarded(decision.item) : access(decision.item);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -160,28 +174,30 @@ function listOf(value: unknown): unknown[] {
 }
 
 const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
-  // The image of another environment is refused (D-17); the images of built services are renamed (rewrite).
-  image: (value) => (typeof value === 'string' && isEnvironmentImage(value) ? [access(`image ${value} of another environment`)] : []),
+  // The image of another environment is refused (D-17): account separation. The images of built services are renamed
+  // (rewrite).
+  image: (value) => (typeof value === 'string' && isEnvironmentImage(value) ? [guarded(`image ${value} of another environment`)] : []),
   build: buildProblems,
   // Rewritten: the dev container gets the name of the environment, the others none (D-12).
   container_name: allow,
   labels: (value) => labelProblems(value, ''),
   // A file of labels, read by Compose where it runs.
   label_file: refuseUnsupported('label_file'),
-  // Only the dev container gets the token and the configuration of Git (D-5): the rules of containerEnv there.
+  // Only the dev container gets the token and the configuration of Git (D-5): the rules of containerEnv there, which
+  // stay refused with the checks off (the identity of the owner account).
   environment: (value, ctx) => {
     if (!ctx.isDev) return [];
     const names = isRecord(value) ? Object.keys(value) : listOf(value).map((entry) => String(entry).split('=')[0]);
     return names.flatMap((name) => {
       const item = refusedVariableItem(name.trim(), 'environment');
-      return item === undefined ? [] : [access(item)];
+      return item === undefined ? [] : [guarded(item)];
     });
   },
   env_file: envFileProblems,
   ports: (value) =>
     listOf(value).flatMap((entry) => {
       const decision = decideServicePort(entry);
-      return decision.action === 'refuse' ? [{ item: decision.item, kind: decision.kind }] : [];
+      return decision.action === 'refuse' ? [decisionProblem(decision)] : [];
     }),
   expose: allow,
   network_mode: networkModeProblems,
@@ -189,7 +205,7 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   volumes: (value, ctx) =>
     listOf(value).flatMap((entry) => {
       const decision = decideServiceMount(entry, ctx.mounts);
-      return decision.action === 'refuse' ? [{ item: decision.item, kind: decision.kind }] : [];
+      return decision.action === 'refuse' ? [decisionProblem(decision)] : [];
     }),
   // Other containers, whose volumes, environment, and network would join this one.
   volumes_from: refuseAccess('volumes_from'),
@@ -204,11 +220,12 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   gpus: refuseAccess('GPU access (gpus)'),
   blkio_config: blkioProblems,
   // Another runtime can add devices of the computer; a control group of the computer; without the OOM killer, a
-  // container can make the computer hang (as in RUN_FLAGS).
+  // container can make the computer hang (as in RUN_FLAGS, where --oom-kill-disable and a negative --oom-score-adj stay
+  // refused with the checks off: the safer choice).
   runtime: refuseAccess('runtime'),
   cgroup_parent: refuseAccess('cgroup_parent'),
-  oom_kill_disable: refuseAccess('oom_kill_disable'),
-  oom_score_adj: (value) => (value === undefined || value === null || (typeof value === 'number' && value >= 0) ? [] : [access(`oom_score_adj ${String(value)}`)]),
+  oom_kill_disable: (value) => (isUnset(value) ? [] : [guarded('oom_kill_disable')]),
+  oom_score_adj: (value) => (value === undefined || value === null || (typeof value === 'number' && value >= 0) ? [] : [guarded(`oom_score_adj ${String(value)}`)]),
   pid: namespaceRule('pid', []),
   ipc: namespaceRule('ipc', ['private', 'shareable', 'none']),
   uts: namespaceRule('uts', []),
@@ -292,7 +309,8 @@ function hookProblems(key: string): KeyRule {
 
 /**
  * `env_file`: Compose reads the file where it runs, the workspace helper, which mounts the volume with the GitHub token.
- * Only a file below the repository folder (after links, with realPaths).
+ * Only a file below the repository folder (after links, with realPaths). A file of the workspace helper, not of the
+ * computer: refused whatever the switch says, as `--env-file` of a single container.
  */
 function envFileProblems(value: unknown, ctx: ServiceContext): Problem[] {
   const problems: Problem[] = [];
@@ -304,7 +322,7 @@ function envFileProblems(value: unknown, ctx: ServiceContext): Problem[] {
     }
     const real = ctx.input.realPaths?.[file];
     const inRepository = isRepositoryPath(file, ctx.input.repositoryFolder) && (typeof real !== 'string' || isInside(real, ctx.input.repositoryFolder));
-    if (!inRepository) problems.push(access(`env_file ${file}`));
+    if (!inRepository) problems.push(guarded(`env_file ${file}`));
   }
   return problems;
 }
@@ -321,7 +339,7 @@ function networkModeProblems(value: unknown, ctx: ServiceContext): Problem[] {
     const target = mode.slice('service:'.length);
     return ctx.services.has(target) && target !== ctx.name ? [] : [access(`network of another container (${mode})`)];
   }
-  if (isOtherEnvironmentProjectName(mode, ctx.input.project)) return [access(`network ${mode} of another environment`)];
+  if (isOtherEnvironmentProjectName(mode, ctx.input.project)) return [guarded(`network ${mode} of another environment`)];
   return [];
 }
 
@@ -337,12 +355,15 @@ function blkioProblems(value: unknown): Problem[] {
   return problems;
 }
 
-/** `logging`: drivers that keep the log in files of the container (LOG_DRIVERS), and the options of LOG_OPTIONS. */
+/**
+ * `logging`: drivers that keep the log in files of the container (LOG_DRIVERS), and the options of LOG_OPTIONS. Other
+ * drivers stay refused with the checks off, as `--log-driver` (user decision).
+ */
 function loggingProblems(value: unknown): Problem[] {
   if (!isRecord(value)) return [];
   const problems: Problem[] = [];
   const driver = value.driver;
-  if (!isUnset(driver) && !LOG_DRIVERS.includes(String(driver).toLowerCase())) problems.push(access(`log driver ${String(driver)}`));
+  if (!isUnset(driver) && !LOG_DRIVERS.includes(String(driver).toLowerCase())) problems.push(guarded(`log driver ${String(driver)}`));
   if (isRecord(value.options)) {
     for (const key of Object.keys(value.options)) if (!LOG_OPTIONS.includes(key)) problems.push(unsupported(`log option ${key}`));
   }
@@ -469,8 +490,8 @@ function topLevelVolumeProblems(input: ComposeAccessInput): Problem[] {
     const at = `volume ${key}: `;
     if (key === WORKSPACE_VOLUME_KEY) problems.push(unsupported(`volume key ${key} (Dev Environments uses it)`));
     const name = names.get(key) ?? key;
-    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(access(`volume ${name} of another environment`));
-    else problems.push(...volumeNameItems(name, input).map(access));
+    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(guarded(`volume ${name} of another environment`));
+    else problems.push(...volumeNameFindings(name, input));
     if (!isRecord(volume)) continue;
     if (!isUnset(volume.driver) && String(volume.driver) !== 'local') problems.push(access(`${at}driver ${String(volume.driver)}`));
     if (!isUnset(volume.driver_opts)) problems.push(access(`${at}driver options`));
@@ -495,7 +516,7 @@ function topLevelNetworkProblems(input: ComposeAccessInput): Problem[] {
     if (!isRecord(network)) continue;
     const at = `network ${key}: `;
     const name = typeof network.name === 'string' ? network.name : key;
-    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(access(`network ${name} of another environment`));
+    if (isOtherEnvironmentProjectName(name, input.project)) problems.push(guarded(`network ${name} of another environment`));
     if (!isUnset(network.driver) && String(network.driver) !== 'bridge') problems.push(access(`${at}driver ${String(network.driver)}`));
     if (!isUnset(network.driver_opts)) problems.push(access(`${at}driver options`));
     problems.push(...labelProblems(network.labels, at));
@@ -525,9 +546,17 @@ function topLevelProblems(input: ComposeAccessInput): Problem[] {
 // ---------------------------------------------------------------------------------------------------------------------
 // Report
 
-function report(problems: readonly Problem[]): HostAccessReport {
-  const result: HostAccessReport = { hostAccess: [], unsupported: [] };
-  for (const problem of problems) if (!result[problem.kind].includes(problem.item)) result[problem.kind].push(problem.item);
+/**
+ * The problems without duplicates: an item that two rules name keeps the class that the switch does not lift (as
+ * hostAccessFindings does).
+ */
+function findings(problems: readonly Problem[]): Problem[] {
+  const result: Problem[] = [];
+  for (const problem of problems) {
+    const known = result.find((other) => other.item === problem.item);
+    if (!known) result.push({ ...problem });
+    else if (known.class === 'computer' && problem.class !== 'computer') known.class = problem.class;
+  }
   return result;
 }
 
@@ -536,8 +565,27 @@ function report(problems: readonly Problem[]): HostAccessReport {
  * policy does not know (implementation notes, section "Docker Compose", rule table), in two lists as hostAccessReport:
  * the top level (project name, volumes, networks, secrets, configs, unknown keys), then each service, its items
  * prefixed `service <name>: `. The dev service must be in the model, and so must each name of `runServices`.
+ * `checksOn`: the switch of the repository (../hostAccessChecks.ts); `false` leaves out the items of the class
+ * `computer` (composeAccessClassification), exactly as hostAccessReport does for a single container.
  */
-export function composeAccessReport(input: ComposeAccessInput): HostAccessReport {
+export function composeAccessReport(input: ComposeAccessInput, checksOn = true): HostAccessReport {
+  const result: HostAccessReport = { hostAccess: [], unsupported: [] };
+  for (const problem of composeFindings(input)) {
+    if (!checksOn && problem.class === 'computer') continue;
+    result[problem.class === 'unsupported' ? 'unsupported' : 'hostAccess'].push(problem.item);
+  }
+  return result;
+}
+
+/**
+ * Every item that composeAccessReport refuses while the checks are on, with its class: which of them the switch lifts
+ * (`computer`) and which stay refused (`protected`, `unsupported`). For the tests and the documentation of the switch.
+ */
+export function composeAccessClassification(input: ComposeAccessInput): HostAccessFinding[] {
+  return composeFindings(input).map((problem) => ({ item: problem.item, class: problem.class }));
+}
+
+function composeFindings(input: ComposeAccessInput): Problem[] {
   const problems: Problem[] = [];
   const services = isRecord(input.model.services) ? input.model.services : {};
   const names = new Set(Object.keys(services));
@@ -570,7 +618,7 @@ export function composeAccessReport(input: ComposeAccessInput): HostAccessReport
     };
     for (const problem of serviceProblems(service, ctx)) problems.push({ ...problem, item: `service ${name}: ${problem.item}` });
   }
-  return report(problems);
+  return findings(problems);
 }
 
 /**

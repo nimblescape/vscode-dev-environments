@@ -11,14 +11,18 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ConfigReferences } from '../imageCheck/imageCheck';
+import type { HostAccessChecks } from '../hostAccessChecks';
 import { extractBaseImages } from '../imageCheck/dockerfile';
 import { hasDigest, isOciFeatureReference } from '../imageCheck/reference';
 import {
   CONTAINER_VERSION,
+  HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
+  LABEL_HOST_ACCESS,
   WORKSPACES_ROOT,
+  containerHostname,
 } from '../names';
 import { isLoopbackAddress, isPathSource, parseMountString, splitPortAddress, withLoopbackAddress } from './hostAccess';
 import { OVERRIDE_FOLDER } from './scripts';
@@ -337,12 +341,17 @@ export function composeUserArgs(service: ComposeService | undefined): string[] {
 // ---------------------------------------------------------------------------------------------------------------------
 // Mounts and ports of a service (shared by the check and the rewrite)
 
-/** What happens to a mount or a published port of a service. */
+/**
+ * What happens to a mount or a published port of a service. A refusal of the kind `hostAccess` is access to the computer
+ * (HostAccessClass `computer`, lifted while the host access checks are off), unless `guarded` says that it stays refused
+ * whatever the switch says (HostAccessClass `protected`: the workspace volume with the GitHub token, and a path whose
+ * target is not clear).
+ */
 export type ComposeEntryDecision =
   | { action: 'keep' }
   | { action: 'drop'; reason: string }
   | { action: 'replace'; value: unknown; reason: string }
-  | { action: 'refuse'; kind: 'hostAccess' | 'unsupported'; item: string };
+  | { action: 'refuse'; kind: 'hostAccess' | 'unsupported'; item: string; guarded?: true };
 
 /** What decides the mounts of a service. */
 export interface ComposeMountContext {
@@ -401,12 +410,14 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
     const name = ctx.volumeNames.get(source);
     if (name === undefined) return { action: 'refuse', kind: 'unsupported', item: `volume ${source} (not in the top-level volumes)` };
     if (name === ctx.ownVolume && !ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `volume ${name} (the workspace volume, which holds the GitHub token)` };
+      return { action: 'refuse', kind: 'hostAccess', item: `volume ${name} (the workspace volume, which holds the GitHub token)`, guarded: true };
     }
     return { action: 'keep' };
   }
   if (type !== 'bind') return { action: 'refuse', kind: 'unsupported', item: `mount of the type ${type} (${describe})` };
-  if (!source.startsWith('/')) return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
+  if (!source.startsWith('/')) {
+    return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
+  }
   const lexical = path.posix.normalize(source).replace(/(.)\/+$/, '$1');
   const parent = WORKSPACES_ROOT;
   const repository = ctx.repositoryFolder;
@@ -414,23 +425,26 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
   if (atWorkspaces && (lexical === repository || lexical === parent)) {
     return { action: 'drop', reason: 'the workspace volume is mounted there' };
   }
+  // Any other folder at WORKSPACES_ROOT of the dev service, also one that the host access checks off would allow: the
+  // workspace volume is mounted there.
+  if (atWorkspaces) return { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` };
   if (lexical === parent) {
     if (!ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (the workspace volume, which holds the GitHub token)` };
+      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (the workspace volume, which holds the GitHub token)`, guarded: true };
     }
     const value: Record<string, unknown> = { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: entry.target };
     if (readOnly) value.read_only = true;
     return { action: 'replace', value, reason: 'the workspace volume in place of the folder' };
   }
   if (!isInside(lexical, repository)) return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
-  if (atWorkspaces) return { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` };
   if (ctx.realPaths && Object.prototype.hasOwnProperty.call(ctx.realPaths, source)) {
     const real = ctx.realPaths[source];
     if (real === null) {
       return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (the path does not exist in the repository)` };
     }
     if (!isInside(real, repository)) {
-      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${real}, outside of the repository)` };
+      // A subpath of the workspace volume that a link leads out of the repository, for example to the GitHub token: not clear.
+      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${real}, outside of the repository)`, guarded: true };
     }
   }
   if (!supportsVolumeSubpath(ctx.engineApiVersion)) {
@@ -499,6 +513,12 @@ export interface ComposeRewriteParams {
    * environment, so Compose creates none without them.
    */
   mountVolumeSources?: readonly string[];
+  /**
+   * The switch of the host access checks of the repository (../hostAccessChecks.ts), as the check used it. `off`: the
+   * published ports keep the address that the model gives them, the mounts that only the class `computer` refuses stay
+   * as they are, and every container gets the label devenv.host-access=unrestricted (containerIsCurrent). Default `on`.
+   */
+  hostAccessChecks?: HostAccessChecks;
 }
 
 /** A change of the rewrite, for the log: what, and why. */
@@ -569,6 +589,10 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     rewrites.push({ item: `project name ${String(model.name)}`, reason: `the project of the environment is ${p.project}` });
   }
   model.name = p.project;
+  const checksOn = p.hostAccessChecks !== 'off';
+  // With the checks off, a refusal of the class `computer` is no refusal: the entry stays as the model has it.
+  const lifted = (decision: ComposeEntryDecision): boolean =>
+    !checksOn && decision.action === 'refuse' && decision.kind === 'hostAccess' && decision.guarded !== true;
   for (const [name, service] of Object.entries(model.services)) {
     if (!isRecord(service)) throw notChecked(`service ${name}`);
     const isDev = name === p.devService;
@@ -578,6 +602,8 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     labels[LABEL_ENVIRONMENT_ID] = p.environmentId;
     if (isDev) labels[LABEL_CONTAINER_VERSION] = String(CONTAINER_VERSION);
     else labels[LABEL_COMPOSE_SERVICE] = name;
+    // Created while the host access checks were off: not current once they are on again (containerIsCurrent).
+    if (!checksOn) labels[LABEL_HOST_ACCESS] = HOST_ACCESS_UNRESTRICTED;
     service.labels = labels;
     // Names: the dev container has the name of the environment; the others the default names of Compose (a fixed name
     // would collide between two environments of one repository).
@@ -590,10 +616,11 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
       rewrites.push({ item: `${at}container_name ${String(service.container_name)}`, reason: 'removed: two environments of one repository would use the same name' });
       delete service.container_name;
     }
-    // Published ports: on 127.0.0.1 only.
+    // Published ports: on 127.0.0.1 only (with the checks off: as the model has them).
     if (Array.isArray(service.ports)) {
       service.ports = service.ports.map((entry) => {
         const decision = decideServicePort(entry);
+        if (!checksOn && (decision.action === 'replace' || lifted(decision))) return entry;
         if (decision.action === 'refuse') throw notChecked(`${at}${decision.item}`);
         if (decision.action !== 'replace') return entry;
         rewrites.push({ item: `${at}port ${portText(entry)}`, reason: decision.reason });
@@ -605,8 +632,8 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     const volumes: unknown[] = [];
     for (const entry of Array.isArray(service.volumes) ? service.volumes : []) {
       const decision = decideServiceMount(entry, ctx);
-      if (decision.action === 'refuse') throw notChecked(`${at}${decision.item}`);
-      if (decision.action === 'keep') {
+      if (decision.action === 'refuse' && !lifted(decision)) throw notChecked(`${at}${decision.item}`);
+      if (decision.action === 'keep' || decision.action === 'refuse') {
         volumes.push(entry);
         continue;
       }
@@ -666,10 +693,13 @@ function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
  * - the other services: the label devenv.compose-service, no `container_name` (D-12), `image: <project>-<service>` when
  *   Compose builds them;
  * - the dev service: the environment image (`image`, no `build`, `pull_policy: never`), the name of the environment
- *   (`container_name`), the label devenv.container-version, and the workspace volume at WORKSPACES_ROOT (the templates'
- *   bind mount there is dropped);
+ *   (`container_name`), the label devenv.container-version, the workspace volume at WORKSPACES_ROOT (the templates'
+ *   bind mount there is dropped), and the host name of the repository (containerHostname) unless the service decides
+ *   it (serviceDecidesHostname);
  * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY) and the
  *   volumes of `mountVolumeSources`;
+ * - with the host access checks off (`hostAccessChecks`): the label devenv.host-access=unrestricted on every service,
+ *   the published ports as the model has them, and the mounts that only the class `computer` refuses unchanged;
  * - each text escaped (`$$`) when the output of `docker compose config` does not escape it.
  * `network_mode: service:<name>` stays as it is: the check allows only a service of the same model, which Compose
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check
@@ -681,7 +711,23 @@ export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { 
   if (dev.build !== undefined && dev.build !== null) rewrites.push({ item: `service ${p.devService}: build`, reason: `the environment image ${p.image} is used` });
   delete dev.build;
   dev.image = p.image;
+  // Without it, Docker names the host after the container ID, and the shell prompt shows that ID (as for a single
+  // container, buildOverrideConfig). The other services keep theirs.
+  if (!serviceDecidesHostname(dev)) dev.hostname = containerHostname(path.posix.basename(p.repositoryFolder));
   return { model: finish(result, p.dollarEscaped), rewrites };
+}
+
+/**
+ * Whether a service decides the host name of its container itself (the counterpart of runArgsDecideHostname): with
+ * `hostname`; with the network of another service or container (`network_mode: service:…`/`container:…`) or `uts: host`,
+ * where Docker refuses a host name; or with `network_mode: host`, where the container keeps the host name of the
+ * computer. The up model then sets no `hostname`.
+ */
+export function serviceDecidesHostname(service: ComposeService): boolean {
+  if (typeof service.hostname === 'string' && service.hostname.trim() !== '') return true;
+  const network = typeof service.network_mode === 'string' ? service.network_mode.trim().toLowerCase() : '';
+  if (network === 'host' || network.startsWith('service:') || network.startsWith('container:')) return true;
+  return typeof service.uts === 'string' && service.uts.trim().toLowerCase() === 'host';
 }
 
 /** The result of composeBuildModel: the model, and the Dockerfile of the dev service to write at COMPOSE_DEV_DOCKERFILE. */

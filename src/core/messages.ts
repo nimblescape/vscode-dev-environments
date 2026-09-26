@@ -35,7 +35,6 @@ export const Messages = {
   newerImage: 'A newer image is available. The environment is updated. Your files are kept.',
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',
-  composeNotSupported: 'Docker Compose configurations are not supported yet.',
   /** Docker Compose could not read the compose files of a configuration (the details have its message). */
   composeConfigurationFailed: 'The Docker Compose files of this configuration could not be read. The details show why.',
   noConfiguration: (repository: string) => `The repository ${repository} has no Dev Container configuration.`,
@@ -69,6 +68,12 @@ export const Messages = {
    */
   containerHostAccessChecksOn:
     'The host access checks are on again for this repository, so the container is set up again with them. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * The configuration of an environment of a Docker Compose configuration no longer uses Docker Compose: its container
+   * is created again as a single container, and the containers of its other services are removed (their volumes stay).
+   */
+  containerComposeReplaced:
+    'The configuration of the environment no longer uses Docker Compose, so the container is set up again, and the containers of the other services are removed. Your files in the repository and the data of the services are kept. Files in other folders of the container, for example in the home folder, are removed.',
   /**
    * The modal question of Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26), with
    * what the configuration of the repository can then use (hostAccessChecksOffDetail).
@@ -143,6 +148,16 @@ export const Messages = {
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   deleteAdditionalVolumes: (volumes: string) =>
     `The environment also used these volumes: ${volumes}. Remove them too?`,
+  /**
+   * D-19: the title of the question of Delete about the volumes of the Docker Compose project (the data of its services),
+   * a list in which the user ticks the volumes to remove; none is ticked, and nothing ticked keeps them all.
+   */
+  deleteServiceDataTitle: 'Remove the data of the services too?',
+  /** D-19: the hint of that list. */
+  deleteServiceDataPlaceholder:
+    'These volumes hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
+  /** D-19: the description of each volume in that list. */
+  deleteServiceDataItem: 'data of the services',
   helperFailed: 'The workspace helper could not be prepared.',
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,

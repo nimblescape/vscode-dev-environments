@@ -1004,3 +1004,43 @@ describe('ContainerAdapter.engineApiVersion', () => {
     expect(await docker.engineApiVersion()).toBeUndefined();
   });
 });
+
+// Unit 6, package C: Delete and a failed first open of a Docker Compose environment remove the whole project.
+describe('ContainerAdapter: the objects of a Docker Compose project', () => {
+  it('lists the containers of the project by its label, also those without the label of the environment', async () => {
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['run1']));
+      return ok(inspectOutput([containerJson({ id: 'run1', name: 'devenv-3f2a9c1e-db-run-1', status: 'exited', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } })]));
+    });
+    expect((await docker.listProjectContainers('devenv-3f2a9c1e')).map((c) => c.id)).toEqual(['run1']);
+    expect(runner.calls[0].args).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=com.docker.compose.project=devenv-3f2a9c1e', '--format', '{{json .ID}}']);
+  });
+
+  it('lists the networks of the project by its label', async () => {
+    const { docker, runner } = adapter(() => ok('"devenv-3f2a9c1e_default"\n"devenv-3f2a9c1e_backend"\n'));
+    expect(await docker.listProjectNetworks('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e_default', 'devenv-3f2a9c1e_backend']);
+    expect(runner.calls[0].args).toEqual(['network', 'ls', '--filter', 'label=com.docker.compose.project=devenv-3f2a9c1e', '--format', '{{json .Name}}']);
+  });
+
+  it('removes a network; a missing one is no error, a network in use is', async () => {
+    const { docker, runner } = adapter(() => ok());
+    await docker.removeNetwork('devenv-3f2a9c1e_default');
+    expect(runner.calls[0].args).toEqual(['network', 'rm', 'devenv-3f2a9c1e_default']);
+    await expect(adapter(() => fail('Error response from daemon: network devenv-3f2a9c1e_default not found')).docker.removeNetwork('x')).resolves.toBeUndefined();
+    await expect(adapter(() => fail('Error: No such network: x')).docker.removeNetwork('x')).resolves.toBeUndefined();
+    await expect(adapter(() => fail('Error response from daemon: error while removing network: network x has active endpoints')).docker.removeNetwork('x')).rejects.toThrow('active endpoints');
+  });
+
+  it('lists the images that Compose built for the project, and only those', async () => {
+    const lines = [
+      { Repository: 'devenv-3f2a9c1e-app', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-worker', Tag: 'latest' },
+      // Docker's filter is a pattern: the result is checked again.
+      { Repository: 'devenv-3f2a9c1e', Tag: '2' },
+      { Repository: 'devenv-3f2a9c1e-old', Tag: '<none>' },
+    ].map((line) => JSON.stringify(line));
+    const { docker, runner } = adapter(() => ok(`${lines.join('\n')}\n`));
+    expect(await docker.listProjectImages('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-worker:latest']);
+    expect(runner.calls[0].args).toEqual(['image', 'ls', '--filter', 'reference=devenv-3f2a9c1e-*', '--format', '{{json .}}']);
+  });
+});

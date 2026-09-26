@@ -323,13 +323,16 @@ describe('decideServiceMount (D-6, D-11)', () => {
     reason: `the folder ${sub} of the workspace volume (the service can read and change these files of the repository)`,
   });
 
+  // Package C of unit 6 (the switch of the host access checks for Compose): the refusals that stay refused whatever the
+  // switch says carry `guarded: true` (HostAccessClass `protected`): the workspace volume with the GitHub token in
+  // another service, and a link out of the repository, whose target is not clear.
   it.each<[string, unknown, Partial<ComposeMountContext>, ReturnType<typeof decideServiceMount>]>([
     ['a tmpfs', { type: 'tmpfs', target: '/tmp/x' }, {}, { action: 'keep' }],
     ['an anonymous volume', { type: 'volume', target: '/data' }, {}, { action: 'keep' }],
     ['a named volume', { type: 'volume', source: 'pgdata', target: '/data' }, {}, { action: 'keep' }],
     ['a named volume without type', { source: 'pgdata', target: '/data' }, {}, { action: 'keep' }],
     ['a volume that is not declared', { type: 'volume', source: 'nope', target: '/data' }, {}, { action: 'refuse', kind: 'unsupported', item: 'volume nope (not in the top-level volumes)' }],
-    ['the workspace volume in another service', { type: 'volume', source: 'ws', target: '/w' }, {}, { action: 'refuse', kind: 'hostAccess', item: `volume ${OWN} (the workspace volume, which holds the GitHub token)` }],
+    ['the workspace volume in another service', { type: 'volume', source: 'ws', target: '/w' }, {}, { action: 'refuse', kind: 'hostAccess', item: `volume ${OWN} (the workspace volume, which holds the GitHub token)`, guarded: true }],
     ['the workspace volume in the dev service', { type: 'volume', source: 'ws', target: '/w' }, dev, { action: 'keep' }],
     ['a volume at /workspaces in the dev service', { type: 'volume', source: 'pgdata', target: '/workspaces' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
     ['a tmpfs at /workspaces/ in the dev service', { type: 'tmpfs', target: '/workspaces/' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
@@ -337,7 +340,7 @@ describe('decideServiceMount (D-6, D-11)', () => {
     ['the templates\' ../..:/workspaces in the dev service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, dev, { action: 'drop', reason: 'the workspace volume is mounted there' }],
     ['the repository at /workspaces in the dev service', { type: 'bind', source: `${REPO}/`, target: '/workspaces' }, dev, { action: 'drop', reason: 'the workspace volume is mounted there' }],
     ['the parent at another target in the dev service', { type: 'bind', source: '/workspaces', target: '/src', read_only: true }, dev, { action: 'replace', value: { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/src', read_only: true }, reason: 'the workspace volume in place of the folder' }],
-    ['the parent in another service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, {}, { action: 'refuse', kind: 'hostAccess', item: 'bind mount /workspaces → /workspaces (the workspace volume, which holds the GitHub token)' }],
+    ['the parent in another service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, {}, { action: 'refuse', kind: 'hostAccess', item: 'bind mount /workspaces → /workspaces (the workspace volume, which holds the GitHub token)', guarded: true }],
     ['the repository in another service', { type: 'bind', source: REPO, target: '/app' }, {}, subpath('api', '/app')],
     ['the repository at /workspace (older templates) in the dev service', { type: 'bind', source: REPO, target: '/workspace' }, dev, subpath('api', '/workspace')],
     ['a file of the repository, read-only', { type: 'bind', source: `${REPO}/init.sql`, target: '/docker-entrypoint-initdb.d/init.sql', read_only: true }, {}, subpath('api/init.sql', '/docker-entrypoint-initdb.d/init.sql', true)],
@@ -345,7 +348,7 @@ describe('decideServiceMount (D-6, D-11)', () => {
     ['a folder of the repository at /workspaces in the dev service', { type: 'bind', source: `${REPO}/data`, target: '/workspaces' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
     ['repository files with an old engine', { type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }, { engineApiVersion: '1.44' }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/init.sql → /i.sql (needs Docker Engine 26 or newer)` }],
     ['repository files with an unknown engine', { type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }, { engineApiVersion: undefined }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/init.sql → /i.sql (needs Docker Engine 26 or newer)` }],
-    ['a link out of the repository', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: '/workspaces/.devenv+' } }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${REPO}/data → /d (a link to /workspaces/.devenv+, outside of the repository)` }],
+    ['a link out of the repository', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: '/workspaces/.devenv+' } }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${REPO}/data → /d (a link to /workspaces/.devenv+, outside of the repository)`, guarded: true }],
     ['a link in the repository', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: `${REPO}/real` } }, subpath('api/data', '/d')],
     ['a path that does not exist', { type: 'bind', source: `${REPO}/data`, target: '/d' }, { realPaths: { [`${REPO}/data`]: null } }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${REPO}/data → /d (the path does not exist in the repository)` }],
     ['a sibling that starts like the repository', { type: 'bind', source: '/workspaces/api2', target: '/x' }, {}, { action: 'refuse', kind: 'hostAccess', item: 'bind mount /workspaces/api2 → /x' }],
@@ -380,6 +383,8 @@ describe('composeUpModel', () => {
           environment: { POSTGRES_HOST: 'db' },
           labels: { 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION) },
           volumes: [{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' }],
+          // Package C of unit 6: the dev container is named after the repository, as a single container (containerHostname).
+          hostname: 'api',
         },
         db: {
           image: 'postgres:16',

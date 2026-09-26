@@ -4,7 +4,7 @@ This document lists every restriction that Dev Environments applies to its dev c
 
 **Principle.** Nothing that configures the container may reach the computer, with three exceptions that the user decided to keep: the network (including VPN connections of the computer), ports of the container on `localhost` of the computer, and URLs that open in the computer's browser.
 
-**Switch per repository.** The checks are on for every repository by default. The user setting `devEnvLauncher.hostAccessChecksOff` turns them off for the repositories that it lists; then only the refusals of access to the computer are lifted, and everything else in this document still applies. Section 12 lists the class of every refused item.
+**Switch per repository.** The checks are on for every repository by default. The user setting `devEnvLauncher.hostAccessChecksOff` turns them off for the repositories that it lists; then only the refusals of access to the computer are lifted, and everything else in this document still applies. Section 12 lists the class of every refused item; section 13 does so for Docker Compose configurations.
 
 **Kinds of restriction.**
 
@@ -37,7 +37,7 @@ This document lists every restriction that Dev Environments applies to its dev c
 | `build.options` (the CLI appends them unchanged to `docker build`) | Refused: `--secret`, `--ssh`, `--allow`, `--output`/`-o`, `--build-context` except `docker-image://` and `http(s)://`, stray arguments, unknown options. Allowed: `--network` (also `host`), `--add-host`, `--build-arg`, `--target`, `--label`, `--platform`, `--pull`, `--no-cache`. | Refused |
 | `hostRequirements.gpu` (Dev Containers turns it into `--gpus all`) | Every value other than `false`, `null`, or absent is refused. The cpus, memory, and storage requirements are neither checked nor applied. | Refused |
 | `initializeCommand` (Dev Containers runs it on the computer) | Refused (any non-empty value) and never passed to `up`: in the workspace helper it would run with the Docker socket. | Refused |
-| `dockerComposeFile` | Refused: "Docker Compose configurations are not supported yet." | Refused |
+| `dockerComposeFile` (Docker Compose) | Every service is checked with the rules of this document, and Docker Compose runs the checked model, rewritten: section 13. | Refused / Rewritten |
 | `workspaceMount` and `workspaceFolder` | Always the environment's named volume at `/workspaces`, with the folder `/workspaces/<repository>`; the repository's values are ignored. | Rewritten |
 | `${localEnv:NAME}` and `${env:NAME}` (values of the computer) | Not passed. They resolve to their default, to an empty value, or to the helper's own value (`HOME=/root`, `PATH`, `HOSTNAME`, `NODE_VERSION`, `YARN_VERSION`). One warning names them, and those that get the helper's value. | Not passed |
 
@@ -157,7 +157,7 @@ User request (2026-09-26): "application of the security policy shall be configur
 
 **Switching back on.** At the next open, the checks run as before. A container with `devenv.host-access=unrestricted` is not current while the checks are on (`containerIsCurrent`): it is created again from its environment image (the files in the volume are kept, the progress says so) when the configuration and the image metadata pass the checks. The merged configuration of such a container is not checked (the Dev Container CLI merges the metadata of the existing container into it, which holds what the checks allowed while they were off); the image metadata of the environment image is checked before `up`. If a check refuses, the open stops with the usual refusal and the container is not started; a window that is attached to it closes its connection. A refused update of an environment image (concept 7.7) is remembered with the state of the switch: a refusal while the checks were on does not block the update once they are off, and the other way round.
 
-**Classes.** *computer*: lifted while the checks are off. *protected*: refused whatever the switch says: account separation, the identity of the owner account, the integrity of the extension, and items whose class is not clear (the safer choice). *unsupported*: options that the policy does not know or does not support, refused whatever the switch says. The unit test `src/core/helper/hostAccess.checksOff.test.ts` checks each row.
+**Classes.** *computer*: lifted while the checks are off. *protected*: refused whatever the switch says: account separation, the identity of the owner account, the integrity of the extension, and items whose class is not clear (the safer choice). *unsupported*: options that the policy does not know or does not support, refused whatever the switch says. The unit test `src/core/helper/hostAccess.checksOff.test.ts` checks each row. The items of Docker Compose configurations have the same classes (section 13, `src/core/helper/composeAccess.checksOff.test.ts`); their containers all get the label `devenv.host-access=unrestricted`.
 
 | Item (as the refusal names it) | Where | Class | Why |
 |---|---|---|---|
@@ -201,3 +201,63 @@ User request (2026-09-26): "application of the security policy shall be configur
 | `--restart=…` other than `no` and `on-failure`, `--stop-timeout` over 20, `--log-opt` of other drivers, `--storage-opt` other than `size`, a `--network` text that Docker would read otherwise | `runArgs` | unsupported | Not supported. |
 
 Always removed or rewritten, whatever the switch says: `--name`, `--rm`, `-i`, `-t`, `-d` (section 1), the workspace mount and folder, the variables and settings of container-only Git and of the GitHub CLI (section 5), `shutdownAction`, and the labels of the extension (section 4).
+
+## 13. Docker Compose configurations
+
+A devcontainer.json with `dockerComposeFile` and `service` starts several containers: the dev service, which VS Code connects to, and the other services (for example a database). Docker Compose starts all of them with the Docker engine of the computer, so the rules of this document apply to **every service**, not only to the dev service. The technical design is in the [implementation notes, section 15](implementation-notes.md#15-docker-compose).
+
+**How it is checked.** The extension reads the merged model of the compose files (`docker compose config`, all profiles) in the workspace helper, without the Docker socket, without network, and with the folder that holds the token hidden. It checks that model before anything is pulled or built, and again before the containers are created. Then Docker Compose runs exactly that model, rewritten as listed below; the compose files of the repository are not read again, so they cannot change between the check and the start. The check is an allow-list: a setting that it does not know is refused as not supported. Items are named `service <name>: …`.
+
+**Rewritten, whatever the switch says** (logged as "Changed in the Docker Compose model"):
+
+| Setting | What the extension does |
+|---|---|
+| Project name (`name:`, `COMPOSE_PROJECT_NAME`, a `.env` of the repository) | Always `devenv-<short id>` of the environment. |
+| Dev service | Runs the environment image (no `build`, never pulled); the name of the environment; the workspace volume at `/workspaces` (the templates' bind mount `../..:/workspaces` is dropped); the host name of the repository unless the service sets `hostname`, `network_mode: host`, `service:…`, `container:…`, or `uts: host`. |
+| Other services | `container_name` removed (two environments of one repository would collide); a built image is named `devenv-<short id>-<service>`. |
+| Labels | Every container gets `devenv.environment-id`; the other services also `devenv.compose-service`. |
+| Published ports without an address | Bound to `127.0.0.1` (with the checks off: as the model writes them). |
+| Bind mount of a file or folder of the repository (for example `./init.sql:/docker-entrypoint-initdb.d/init.sql`) | A mount of that path of the workspace volume (`volume.subpath`, Docker Engine 26 or newer), read-only as before. **The service can read and change those files of the repository**, as the dev container can; it sees nothing else of the volume. With an older Docker Engine it is refused (not supported), naming the version. |
+| Named volumes | All declared `external`; the extension creates each missing one before the start with the labels of the environment: the volumes of the project (`devenv-<short id>_<name>`, also of `mounts` in devcontainer.json and Features) with `devenv.volume=compose` (the data of the services, never shared with another environment), the others with `devenv.volume=additional`. |
+| `pull_policy` | `missing` (the extension pulls the images before the start, with the credentials of the image check); the dev service `never`. |
+| `runArgs`, `appPort`, `workspaceMount`, `build.options` in devcontainer.json | Not used and not checked: the Dev Container CLI ignores them for Docker Compose (logged). |
+| `initializeCommand` | Refused, as for a single container (class *protected*). |
+
+**Refused.** Class as in section 12: *computer* is lifted while the host access checks are off for the repository; *protected* and *unsupported* stay refused.
+
+| Item | Class | Why |
+|---|---|---|
+| `bind mount <path> → <target>` outside the repository (also the Docker socket), `secrets`, `configs` (service or top level) | computer | Files of the computer. |
+| `privileged mode`, `capability …` (except `SYS_PTRACE`), `security option …` (except `seccomp=unconfined`, `no-new-privileges`), `privileged post_start`/`pre_stop` | computer | Privileges. |
+| `devices`, `device_cgroup_rules`, `GPU access (gpus)`, `GPU or device access (deploy.resources.reservations.devices)`, `blkio_config` of devices, `runtime`, `cgroup_parent` | computer | Devices and control groups of the computer. |
+| `pid`, `ipc`, `uts`, `userns_mode`, `cgroup` with `host`, `service:…`, or `container:…` (`ipc: private/shareable/none` and `cgroup: private` are allowed) | computer | Namespaces of the computer or of another container. |
+| `volumes_from`, `links`, `external_links`, `network of another container (container:…)`, `service:<name>` of a service that is not in the configuration | computer | Another container. (`network_mode: service:<name>` of a service of the same configuration is allowed, as the templates use it.) |
+| `published port <address>:…` on another address than a loopback address | computer | Ports on all network addresses. |
+| `the Docker socket (use_api_socket)` | computer | The Docker socket. |
+| `build context …` outside the repository, `Dockerfile …` outside the repository, `build ssh`, `build secrets`, `build entitlements`, `build privileged`, `build additional_contexts` of a folder or a service | computer | As `build.options` of a single container: files, keys, and agents of the workspace helper at the build. |
+| `volume <key>: driver …`, `volume <key>: driver options`, `network <key>: driver …` (other than `bridge`, for example macvlan), `network <key>: driver options` | computer | A volume driver can bind a folder of the computer; macvlan and ipvlan put the containers on the network of the computer. |
+| `volume <name> of the Docker Compose project …` (another project), `… of the Dev Containers extension`, `… of another container` | computer | A volume of another program, as in `mounts`. |
+| `image devenv-… of another environment` | protected | Account separation: the image of another environment, perhaps of another account. |
+| `volume … of another environment`, `network … of another environment` (a project name `devenv-<8 hex>_…` of another environment, the labels of another environment, a volume of an environment of another account), `volume devenv-helper-cache of the workspace helper` | protected | Account separation. |
+| `… (the workspace volume, which holds the GitHub token)` in a service other than the dev service (the workspace volume, or a bind mount of `/workspaces`) | protected | The token of the owner account. |
+| `bind mount … (a link to …, outside of the repository)` | protected | Unclear: a link of the repository that leads elsewhere in the volume (for example to the token). |
+| `env_file …` outside the repository (also after links) | protected | A file of the workspace helper, as `--env-file`. |
+| `variable … in environment` of the dev service (container-only Git, the GitHub CLI; also from `env_file`) | protected | The identity of the owner account. The other services may set these variables: they have neither the token nor the Git configuration. |
+| `log driver …` other than `json-file`, `local`, `none`; `oom_kill_disable`; a negative `oom_score_adj` | protected | As `--log-driver`, `--oom-kill-disable`, and `--oom-score-adj`. |
+| `label devenv.…`, `label devcontainer.…`, `label com.docker.compose.…` (service, build, volume, network), `label_file` | unsupported | The labels by which the extension, the CLI, and Compose find the containers. |
+| `restart` other than `no`/`on-failure`, `deploy.restart_policy` other than `none`/`on-failure`, `stop_grace_period` over 20 s, `logging` options of other drivers, `storage_opt` other than `size`, `scale` other than 1, `build tags`, `build cache_to`, `cache_from` of a local folder | unsupported | Against how the extension runs the containers (the Session Monitor stops them within 30 s per call; a container must not start with Docker). |
+| `mount at /workspaces` in the dev service, the volume key `devenv-workspace`, a project name other than the one of the environment, a volume not declared at the top level, mount types `npipe`, `cluster`, `image` | unsupported | The workspace volume is mounted there; names of the extension. |
+| `bind mount … (needs Docker Engine 26 or newer)`, `bind mount … (the path does not exist in the repository)` | unsupported | `volume.subpath` needs Docker Engine 26. |
+| `dockerComposeFile` missing, empty, with a variable, or outside the repository; `service` missing or not in the model; `runServices` not in the model; a local Feature (`./…`); every unknown key of a service, of the top level, of a volume, or of a network (for example `models`, `provider`, `extends`) | unsupported | Not known to the policy, or not supported in a Compose configuration. |
+
+The rules of sections 1 to 5 for devcontainer.json, Features, and the base image apply as for a single container (`mounts`, `privileged`, `capAdd`, `securityOpt`, `containerEnv`, `remoteEnv`, `remote.localPortHost`, and the image metadata before each start), with the same switch.
+
+**Stop, start, Delete.** Stop and the Session Monitor stop every container of the environment, the dev container first. A stopped service of a running dev container is started with `docker start`. Delete removes the containers of all services, the networks of the project, and the images that Docker Compose built for it; the volumes of the project (the data of the services) only when the user ticks them in the question of Delete, the others stay.
+
+**Limits.**
+- **Repository files in a service.** A service that mounts files or folders of the repository can read and change them, while it runs (for example a database that writes into a mounted folder). It sees only those paths of the workspace volume, not the token.
+- **Other services on the network.** The services share the networks of the project and reach each other by name. Every published port is bound to `127.0.0.1`, but, as in section 10, every container reaches `localhost` of the computer through `host.docker.internal`.
+- **Variables of other services.** A service other than the dev service may set `GH_TOKEN` and the variables of Git: it has no token of the owner account and no Git configuration of the extension.
+- **Remote `include` and `extends`** (Git, OCI) do not work: the model is read without network. Local ones can only name files of the repository and of the helper image (the token is hidden).
+- **Newer Compose versions.** The helper installs the current Compose plugin; a new setting of a newer version is refused as not supported until the policy knows it.
+- **Old images of rebuilt services** stay as dangling images (`docker image prune` removes them).

@@ -598,6 +598,17 @@ export class Controller implements vscode.Disposable {
           if (choice === undefined) return;
           additionalVolumesToRemove = choice === Actions.remove ? [...volumes] : [];
         }
+        // D-19: the volumes of a Docker Compose project hold the data of its services (for example a database). They are
+        // listed apart, none ticked: only the ticked ones are removed, and Escape cancels the Delete.
+        const serviceData = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableServiceDataVolumes(confirmed.id) : [];
+        if (serviceData.length > 0) {
+          const picked = await vscode.window.showQuickPick(
+            serviceData.map((name) => ({ label: name, description: Messages.deleteServiceDataItem, picked: false })),
+            { title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder, canPickMany: true, ignoreFocusOut: true },
+          );
+          if (picked === undefined) return;
+          additionalVolumesToRemove = [...additionalVolumesToRemove, ...picked.map((item) => item.label)];
+        }
         // Concept 7.15: Delete is possible in every state; during an operation of another window it runs afterwards.
         if (!(await this.waitForOtherWindowOperation(repository, environment.id))) return;
         const current = await this.deps.registry.get(environment.id);
