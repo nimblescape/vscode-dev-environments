@@ -20,7 +20,9 @@ import {
   INSTALL_WATCH_INTERVAL_MS,
   LINUX_ENGINE_START_COMMAND,
   MISSING_CLI_CHECK_MS,
+  DOCKER_APP_PATH,
   WSL_INSTALL_COMMAND,
+  brewCaskroomFolder,
   changedContextValues,
   hardwareArch,
   installConfirmation,
@@ -130,15 +132,31 @@ export async function readInstallPlanInput(
       }
     }
   }
+  const brewPath = platform === 'darwin' ? findExecutable('brew', env, platform) : undefined;
   return {
     platform,
     arch: hardwareArch(platform, process.arch, translated),
     osRelease,
     // findExecutable also searches /opt/homebrew/bin and /usr/local/bin on macOS.
     has: (tool) => findExecutable(tool, env, platform) !== undefined,
-    brewPath: platform === 'darwin' ? findExecutable('brew', env, platform) : undefined,
+    brewPath,
+    ...(platform === 'darwin' ? readBrewCaskState(brewPath) : {}),
     userName: currentUserName(),
     existingDockerSource,
+  };
+}
+
+/**
+ * macOS: whether Homebrew records the cask docker-desktop (in the prefix of the `brew` that was found) and whether
+ * /Applications/Docker.app exists. Without a Homebrew the cask counts as not recorded.
+ */
+export function readBrewCaskState(
+  brewPath: string | undefined,
+  exists: (file: string) => boolean = fs.existsSync,
+): Pick<InstallPlanInput, 'brewCaskRecorded' | 'dockerAppPresent'> {
+  return {
+    brewCaskRecorded: brewPath !== undefined && exists(brewCaskroomFolder(brewPath)),
+    dockerAppPresent: exists(DOCKER_APP_PATH),
   };
 }
 

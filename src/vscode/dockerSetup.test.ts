@@ -31,6 +31,7 @@ import {
   DockerSetupUiTexts,
   INSTALL_TERMINAL_NAME,
   OPEN_WALKTHROUGH_COMMAND,
+  readBrewCaskState,
   type DockerSetupDeps,
 } from './dockerSetup';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
@@ -227,6 +228,20 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(confirmation.detail).toContain('brew install --cask docker-desktop');
     expect(fakeVscode.terminals).toHaveLength(1);
     expect(fakeVscode.terminals[0]).toMatchObject({ name: INSTALL_TERMINAL_NAME, shown: 1, lines: ['brew install --cask docker-desktop'] });
+    dockerSetup.dispose();
+  });
+
+  it('removes a stale Homebrew record first and installs only when that succeeded (joined with &&)', async () => {
+    const { dockerSetup } = setup(false, {
+      tools: ['brew'],
+      input: { brewPath: '/opt/homebrew/bin/brew', brewCaskRecorded: true, dockerAppPresent: false },
+    });
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.install();
+    expect(modalCalls()[0][1].detail).toContain(DockerSetupTexts.brewStaleCask);
+    expect(fakeVscode.terminals[0].lines).toEqual([
+      '/opt/homebrew/bin/brew uninstall --cask --force docker-desktop && /opt/homebrew/bin/brew install --cask docker-desktop',
+    ]);
     dockerSetup.dispose();
   });
 
@@ -449,6 +464,54 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(download).not.toHaveBeenCalled();
     expect(runner.run).not.toHaveBeenCalled();
     dockerSetup.dispose();
+  });
+});
+
+describe('readBrewCaskState (input of the installation plan on macOS)', () => {
+  const exists = (present: string[]) => (file: string) => present.includes(file);
+
+  it('finds the stale record: the cask is in the Caskroom of /opt/homebrew, Docker.app is gone', () => {
+    expect(readBrewCaskState('/opt/homebrew/bin/brew', exists(['/opt/homebrew/Caskroom/docker-desktop']))).toEqual({
+      brewCaskRecorded: true,
+      dockerAppPresent: false,
+    });
+  });
+
+  it('looks the Caskroom up in the prefix of the brew that was found (/usr/local)', () => {
+    const lookedUp: string[] = [];
+    const state = readBrewCaskState('/usr/local/bin/brew', (file) => {
+      lookedUp.push(file);
+      return file === '/usr/local/Caskroom/docker-desktop' || file === '/Applications/Docker.app';
+    });
+    expect(state).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+    expect(lookedUp).toContain('/usr/local/Caskroom/docker-desktop');
+    expect(lookedUp).not.toContain('/opt/homebrew/Caskroom/docker-desktop');
+  });
+
+  it('the cask not recorded: the plain install', () => {
+    const state = readBrewCaskState('/opt/homebrew/bin/brew', exists([]));
+    expect(state).toEqual({ brewCaskRecorded: false, dockerAppPresent: false });
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: () => true, brewPath: '/opt/homebrew/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['/opt/homebrew/bin/brew install --cask docker-desktop']);
+  });
+
+  it('recorded and Docker.app present: the plain install (Homebrew upgrades normally)', () => {
+    const state = readBrewCaskState('/opt/homebrew/bin/brew', exists(['/opt/homebrew/Caskroom/docker-desktop', '/Applications/Docker.app']));
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: () => true, brewPath: '/opt/homebrew/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['/opt/homebrew/bin/brew install --cask docker-desktop']);
+  });
+
+  it('stale record in /usr/local: uninstall, then install, with that brew', () => {
+    const state = readBrewCaskState('/usr/local/bin/brew', exists(['/usr/local/Caskroom/docker-desktop']));
+    const plan = installPlan({ platform: 'darwin', arch: 'x64', has: () => true, brewPath: '/usr/local/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual([
+      '/usr/local/bin/brew uninstall --cask --force docker-desktop',
+      '/usr/local/bin/brew install --cask docker-desktop',
+    ]);
+  });
+
+  it('without a Homebrew the cask counts as not recorded', () => {
+    expect(readBrewCaskState(undefined, () => true)).toEqual({ brewCaskRecorded: false, dockerAppPresent: true });
   });
 });
 
