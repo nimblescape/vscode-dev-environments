@@ -152,7 +152,7 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', name]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', name, '--hostname', 'api']);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
     // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
@@ -2503,7 +2503,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     for (const env of [override.containerEnv, override.remoteEnv]) {
       for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
     }
-    expect((override.runArgs as string[]).slice(-4)).toEqual(['--label', 'devenv.container-version=4', '--name', NAME]);
+    expect((override.runArgs as string[]).slice(-6)).toEqual(['--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
   });
 
   it('starts a current container as it is', async () => {
@@ -2756,7 +2756,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     // What Docker gets passes the policy as a whole: the extension's --label and --name included.
     const given = h.helper.ups[0].override.runArgs as string[];
     expect(runArgsProblems(given, NAME)).toEqual([]);
-    expect(given.slice(-2)).toEqual(['--name', NAME]);
+    expect(given.slice(-4)).toEqual(['--name', NAME, '--hostname', 'api']);
     expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
   });
 
@@ -2780,14 +2780,14 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       return;
     }
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', '--name', NAME]);
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
     await seedEnvironment(h, { container: null });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', NAME]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {

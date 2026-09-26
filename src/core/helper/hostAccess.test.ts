@@ -369,12 +369,15 @@ describe('host access policy: the runArgs that Docker gets', () => {
     expect(name(['--label', '--name', '--init', '--label', '--privileged'])).toEqual(['--label', '--name', '--init', '--label', '--privileged']);
   });
 
-  /** The repository part of the runArgs of the override configuration: without the label and the name it adds. */
+  /** The repository part of the runArgs of the override configuration: without the label, the name, and the host name it adds. */
   function dockerRunArgs(runArgs: string[]): string[] {
     const all = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
       .runArgs as string[];
-    expect(all.slice(-4)).toEqual(['--label', 'devenv.container-version=4', '--name', OWN]);
-    return all.slice(0, -4);
+    // The host name is left out where the repository decides it (runArgsDecideHostname).
+    const added = all.at(-2) === '--hostname' ? ['--hostname', 'api'] : [];
+    const tail = ['--label', 'devenv.container-version=4', '--name', OWN, ...added];
+    expect(all.slice(-tail.length)).toEqual(tail);
+    return all.slice(0, -tail.length);
   }
 
   const CASES: string[][] = [
@@ -448,7 +451,7 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       containerName: OWN,
       runArgs: ['--platform', 'linux/amd64', '--rm', '-it', '--cap-drop', 'ALL', '-d', '--label', '--rm'],
     });
-    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', OWN]);
+    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', OWN, '--hostname', 'api']);
     expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual([]);
   });
 });

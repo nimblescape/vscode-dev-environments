@@ -394,6 +394,9 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
     expect(container?.Config.Labels?.[LABEL_ENVIRONMENT_ID]).toBe(environmentId);
     expect(workspaceMount()).toMatchObject({ Type: 'volume', Name: volumeName });
+    // The host name is the repository name (the shell prompt shows it), not the container ID.
+    expect(container?.Config.Hostname).toBe('tiny');
+    expect(execIn(REMOTE_USER, 'hostname')).toBe('tiny');
     expect(cli.image(`${imageRepository}:1`)?.Config.Labels?.['devcontainer.metadata']).toContain(REMOTE_USER);
     // The Dev Container CLI left no other image (for example a `vsc-…` image).
     expect(runImages()).toEqual([[`${imageRepository}:1`]]);

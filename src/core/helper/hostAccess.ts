@@ -795,6 +795,23 @@ function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
 // Privileges and ports
 
 /**
+ * The networks of a `--network` value as Docker reads it: the value itself, or, as soon as it has a `key=value` pair,
+ * each `name` of its long form `name=<network>[,alias=…]` (CSV). `undefined` for a text that Docker would read otherwise
+ * (csvFields).
+ */
+function networkNames(value: string): string[] | undefined {
+  if (!/\w+=\w+/.test(value)) return [value];
+  const fields = csvFields(value);
+  if (!fields) return undefined;
+  const networks: string[] = [];
+  for (const field of fields) {
+    const index = field.indexOf('=');
+    if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'name') networks.push(field.slice(index + 1));
+  }
+  return networks;
+}
+
+/**
  * `--network container:<name>` shares the network namespace of another container, for example of an environment of
  * another account: its services on localhost. Every other network, also `host`, is allowed. With `host` (and macvlan or
  * ipvlan), Docker ignores `-p`, so the ports of the container are not limited to localhost (concept section 9 "Host
@@ -803,16 +820,8 @@ function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
  * `name` is checked; a text that Docker would read otherwise (csvFields) is not supported.
  */
 function networkProblems(value: string): Problem[] {
-  let networks = [value];
-  if (/\w+=\w+/.test(value)) {
-    const fields = csvFields(value);
-    if (!fields) return [unsupported(`network ${JSON.stringify(value)}`)];
-    networks = [];
-    for (const field of fields) {
-      const index = field.indexOf('=');
-      if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'name') networks.push(field.slice(index + 1));
-    }
-  }
+  const networks = networkNames(value);
+  if (!networks) return [unsupported(`network ${JSON.stringify(value)}`)];
   const joined = networks.some((network) => /^container:/i.test(network.trim()));
   return joined ? [access(`network of another container (${value.trim()})`)] : [];
 }
@@ -1211,6 +1220,28 @@ export function runArgsUser(runArgs: unknown): string | undefined {
     if ((flag.name === '--user' || flag.name === '-u') && flag.value !== undefined) user = flag.value;
   }
   return user === undefined || user.trim() === '' ? undefined : user;
+}
+
+/**
+ * Whether `runArgs` decide the host name of the container themselves, read as Docker reads the arguments (parseFlags):
+ * with `--hostname`/`-h` (also in a group of short flags such as `-Ph`); with the network of another container (`--network container:<name>`, also as `--net` and in
+ * the long form `name=container:<name>`, networkNames) or `--uts host`, where Docker refuses a host name; or with
+ * `--network host`, where the container keeps the host name of the computer. A network value that Docker would read
+ * otherwise counts too (the policy refuses it). The override configuration then adds no `--hostname`.
+ */
+export function runArgsDecideHostname(runArgs: readonly string[]): boolean {
+  return parseFlags(runArgs, RUN_FLAGS).some((flag) => {
+    if (flag.name === '--hostname' || flag.name === '-h') return true;
+    // A group of short flags that parseFlags does not split (it holds a flag with a value), for example `-Ph mine`:
+    // Docker may read an `-h` in it (the policy refuses such a group while the checks are on).
+    if (flag.rule === undefined && /^-[A-Za-z]*h/.test(flag.raw)) return true;
+    if (flag.value === undefined) return false;
+    if (flag.name === '--network' || flag.name === '--net') {
+      const networks = networkNames(flag.value);
+      return !networks || networks.some((network) => /^(host$|container:)/i.test(network.trim()));
+    }
+    return flag.name === '--uts' && flag.value.trim().toLowerCase() === 'host';
+  });
 }
 
 /** A flag that overrideRunArgs removes from `runArgs`, for the log. */
