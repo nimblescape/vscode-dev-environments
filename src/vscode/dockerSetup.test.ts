@@ -31,6 +31,8 @@ import {
   DockerSetupUiTexts,
   INSTALL_TERMINAL_NAME,
   OPEN_WALKTHROUGH_COMMAND,
+  dockerAppLocations,
+  readBrewCaskState,
   type DockerSetupDeps,
 } from './dockerSetup';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
@@ -50,6 +52,7 @@ interface SetupOptions {
   wsl?: () => RunResult | Promise<RunResult>;
   download?: (options: DownloadOptions) => Promise<void>;
   startDocker?: DockerSetupDeps['startDocker'];
+  remoteDockerHost?: boolean;
 }
 
 function setup(installed: boolean, options: SetupOptions = {}) {
@@ -74,6 +77,7 @@ function setup(installed: boolean, options: SetupOptions = {}) {
     platform,
     env: {},
     onDidChangeInstalled: changed,
+    remoteDockerHostConfigured: () => options.remoteDockerHost ?? false,
     planInput: async () => ({ platform, arch: 'arm64', has: (tool: SetupTool) => tools.includes(tool), userName: 'octo', ...options.input }),
     downloadFolder: path.join(os.tmpdir(), 'devenv-downloads-test'),
     download,
@@ -114,8 +118,19 @@ describe('DockerSetup: context keys and CLI checks', () => {
       [DockerContextKeys.installed, false],
       [DockerContextKeys.ready, false],
       [DockerContextKeys.wslReady, false],
+      [DockerContextKeys.setupRequired, true],
     ]);
     expect(dockerSetup.dockerMissing).toBe(true);
+    expect(dockerSetup.setupRequired).toBe(true);
+    dockerSetup.dispose();
+  });
+
+  it('requires no setup without a CLI when a remote Docker host is configured', () => {
+    const { dockerSetup } = setup(false, { remoteDockerHost: true });
+    dockerSetup.initialize();
+    expect(contextCalls()).toContainEqual([DockerContextKeys.setupRequired, false]);
+    expect(dockerSetup.dockerMissing).toBe(true);
+    expect(dockerSetup.setupRequired).toBe(false);
     dockerSetup.dispose();
   });
 
@@ -134,10 +149,13 @@ describe('DockerSetup: context keys and CLI checks', () => {
     vi.advanceTimersByTime(10_000);
     expect(docker.isInstalled).toHaveBeenCalledTimes(3);
     expect(dockerSetup.dockerMissing).toBe(false);
+    // The sidebar renders again (onDidChangeInstalled) and shows the repositories instead of the setup.
+    expect(dockerSetup.setupRequired).toBe(false);
     expect(changed).toHaveBeenCalledTimes(1);
     expect(contextCalls()).toEqual([
       [DockerContextKeys.missing, false],
       [DockerContextKeys.installed, true],
+      [DockerContextKeys.setupRequired, false],
     ]);
     vi.advanceTimersByTime(60_000);
     expect(docker.isInstalled).toHaveBeenCalledTimes(3);
@@ -227,6 +245,20 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(confirmation.detail).toContain('brew install --cask docker-desktop');
     expect(fakeVscode.terminals).toHaveLength(1);
     expect(fakeVscode.terminals[0]).toMatchObject({ name: INSTALL_TERMINAL_NAME, shown: 1, lines: ['brew install --cask docker-desktop'] });
+    dockerSetup.dispose();
+  });
+
+  it('removes a stale Homebrew record first and installs only when that succeeded (joined with &&)', async () => {
+    const { dockerSetup } = setup(false, {
+      tools: ['brew'],
+      input: { brewPath: '/opt/homebrew/bin/brew', brewCaskRecorded: true, dockerAppPresent: false },
+    });
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.install();
+    expect(modalCalls()[0][1].detail).toContain(DockerSetupTexts.brewStaleCask);
+    expect(fakeVscode.terminals[0].lines).toEqual([
+      '/opt/homebrew/bin/brew uninstall --cask --force docker-desktop && /opt/homebrew/bin/brew install --cask docker-desktop',
+    ]);
     dockerSetup.dispose();
   });
 
@@ -449,6 +481,86 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     expect(download).not.toHaveBeenCalled();
     expect(runner.run).not.toHaveBeenCalled();
     dockerSetup.dispose();
+  });
+});
+
+describe('Docker.app outside /Applications (review of the stale-cask fix)', () => {
+  it('counts Docker.app in ~/Applications as present, so a working app is not uninstalled', () => {
+    const state = readBrewCaskState(
+      '/opt/homebrew/bin/brew',
+      (file) => ['/opt/homebrew/Caskroom/docker-desktop', '/Users/u/Applications/Docker.app'].includes(file),
+      undefined,
+      '/Users/u',
+    );
+    expect(state).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+  });
+
+  it('counts Docker.app in the --appdir of HOMEBREW_CASK_OPTS as present', () => {
+    for (const opts of ['--appdir=~/Apps', '--no-quarantine --appdir ~/Apps', '--appdir="~/Apps/"']) {
+      const state = readBrewCaskState(
+        '/opt/homebrew/bin/brew',
+        (file) => ['/opt/homebrew/Caskroom/docker-desktop', '/Users/u/Apps/Docker.app'].includes(file),
+        opts,
+        '/Users/u',
+      );
+      expect(state, opts).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+    }
+  });
+
+  it('lists /Applications, ~/Applications, and the appdir once each', () => {
+    expect(dockerAppLocations('--appdir=/Applications', '/Users/u')).toEqual([
+      '/Applications/Docker.app',
+      '/Users/u/Applications/Docker.app',
+    ]);
+    expect(dockerAppLocations(undefined, undefined)).toEqual(['/Applications/Docker.app']);
+  });
+});
+
+describe('readBrewCaskState (input of the installation plan on macOS)', () => {
+  const exists = (present: string[]) => (file: string) => present.includes(file);
+
+  it('finds the stale record: the cask is in the Caskroom of /opt/homebrew, Docker.app is gone', () => {
+    expect(readBrewCaskState('/opt/homebrew/bin/brew', exists(['/opt/homebrew/Caskroom/docker-desktop']))).toEqual({
+      brewCaskRecorded: true,
+      dockerAppPresent: false,
+    });
+  });
+
+  it('looks the Caskroom up in the prefix of the brew that was found (/usr/local)', () => {
+    const lookedUp: string[] = [];
+    const state = readBrewCaskState('/usr/local/bin/brew', (file) => {
+      lookedUp.push(file);
+      return file === '/usr/local/Caskroom/docker-desktop' || file === '/Applications/Docker.app';
+    });
+    expect(state).toEqual({ brewCaskRecorded: true, dockerAppPresent: true });
+    expect(lookedUp).toContain('/usr/local/Caskroom/docker-desktop');
+    expect(lookedUp).not.toContain('/opt/homebrew/Caskroom/docker-desktop');
+  });
+
+  it('the cask not recorded: the plain install', () => {
+    const state = readBrewCaskState('/opt/homebrew/bin/brew', exists([]));
+    expect(state).toEqual({ brewCaskRecorded: false, dockerAppPresent: false });
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: () => true, brewPath: '/opt/homebrew/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['/opt/homebrew/bin/brew install --cask docker-desktop']);
+  });
+
+  it('recorded and Docker.app present: the plain install (Homebrew upgrades normally)', () => {
+    const state = readBrewCaskState('/opt/homebrew/bin/brew', exists(['/opt/homebrew/Caskroom/docker-desktop', '/Applications/Docker.app']));
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: () => true, brewPath: '/opt/homebrew/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['/opt/homebrew/bin/brew install --cask docker-desktop']);
+  });
+
+  it('stale record in /usr/local: uninstall, then install, with that brew', () => {
+    const state = readBrewCaskState('/usr/local/bin/brew', exists(['/usr/local/Caskroom/docker-desktop']));
+    const plan = installPlan({ platform: 'darwin', arch: 'x64', has: () => true, brewPath: '/usr/local/bin/brew', ...state });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual([
+      '/usr/local/bin/brew uninstall --cask --force docker-desktop',
+      '/usr/local/bin/brew install --cask docker-desktop',
+    ]);
+  });
+
+  it('without a Homebrew the cask counts as not recorded', () => {
+    expect(readBrewCaskState(undefined, () => true)).toEqual({ brewCaskRecorded: false, dockerAppPresent: true });
   });
 });
 

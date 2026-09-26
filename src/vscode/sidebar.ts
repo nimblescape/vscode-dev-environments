@@ -56,8 +56,11 @@ export interface SidebarDeps {
   claims: EnvironmentClaims;
   tree: RepositoriesTreeProvider;
   settings: () => ExtensionSettings;
-  /** True while no Docker CLI is found: the view shows the Docker row (concept 6.1 step 2). Default: false. */
-  dockerMissing?: () => boolean;
+  /**
+   * True while the view shows the Docker setup instead of the repositories (`dockerSetupRequired`, concept 6.1 step 2).
+   * Default: false.
+   */
+  dockerSetupRequired?: () => boolean;
   clock?: Clock;
   isAlive?: (pid: number) => boolean;
 }
@@ -94,6 +97,8 @@ export class Sidebar implements vscode.Disposable {
   private readonly discoveryTask = new CoalescingTask(() => this.refreshDiscoveryNow());
   private readonly statesEmitter = new vscode.EventEmitter<void>();
   private readonly renderEmitter = new vscode.EventEmitter<void>();
+  /** The model of the last render, also while the view shows the Docker setup (model). */
+  private groups: readonly OwnerGroup[] = [];
   /** The input of the last render, without the patterns of repositoryGroups (groupingInput). */
   private lastInput: TreeInput | undefined;
 
@@ -131,9 +136,12 @@ export class Sidebar implements vscode.Disposable {
     return this.lastInput;
   }
 
-  /** The current model of the view (for the switcher). */
+  /**
+   * The current model of the repositories (for the switcher). While the view shows the Docker setup, the view is empty,
+   * but this is the full model: the commands of the Command Palette keep working as before.
+   */
   model(): readonly OwnerGroup[] {
-    return this.deps.tree.getModel();
+    return this.groups;
   }
 
   /**
@@ -341,7 +349,13 @@ export class Sidebar implements vscode.Disposable {
     const groups = buildTreeModel({ ...input, repositoryGroups });
     this.warnIfGroupingIsSlow(repositoryGroups, this.clock.now() - started);
     this.logGroupFailures(repositoryGroups);
-    this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
+    this.groups = groups;
+    // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+    // shall not be shown, instead, the side view shall show the install docker wizard". The view gets an empty model, so
+    // VS Code shows the welcome view with the setup. The discovery keeps running, so that the list appears at once when
+    // Docker is found (DockerSetup calls render then).
+    const setupRequired = this.deps.dockerSetupRequired?.() ?? false;
+    this.deps.tree.setModel(setupRequired ? [] : groups, { signedIn: this.signedIn });
     this.renderEmitter.fire();
   }
 

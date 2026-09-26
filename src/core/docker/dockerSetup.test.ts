@@ -13,9 +13,11 @@ import {
   INITIAL_DOCKER_SETUP_STATE,
   INSTALL_WATCH_TIMEOUT_MS,
   WINGET_INSTALL_COMMAND,
+  brewCaskroomFolder,
   changedContextValues,
   dockerContextValues,
   dockerDesktopDownloadUrl,
+  dockerSetupRequired,
   hardwareArch,
   installConfirmation,
   installPlan,
@@ -329,6 +331,75 @@ describe('the install terminal', () => {
   });
 });
 
+describe('installPlan on macOS: Homebrew still records docker-desktop', () => {
+  const brewPath = '/opt/homebrew/bin/brew';
+
+  it('removes the stale record first, then installs, when Docker.app is gone', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded: true, dockerAppPresent: false });
+    expect(plan).toEqual({
+      kind: 'terminal',
+      commands: ['/opt/homebrew/bin/brew uninstall --cask --force docker-desktop', '/opt/homebrew/bin/brew install --cask docker-desktop'],
+      needsAdmin: true,
+      description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+    });
+    // The install runs only when the uninstall succeeded.
+    expect(plan.kind === 'terminal' && terminalLines(plan.commands, 'darwin')).toEqual([
+      '/opt/homebrew/bin/brew uninstall --cask --force docker-desktop && /opt/homebrew/bin/brew install --cask docker-desktop',
+    ]);
+  });
+
+  it('uses the plain brew without a path', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewCaskRecorded: true, dockerAppPresent: false });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['brew uninstall --cask --force docker-desktop', BREW_INSTALL_COMMAND]);
+  });
+
+  it('never zaps: that would delete the Docker volumes in ~/Library/Containers/com.docker.docker', () => {
+    for (const brewCaskRecorded of [true, false]) {
+      for (const dockerAppPresent of [true, false]) {
+        const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded, dockerAppPresent });
+        if (plan.kind !== 'terminal') throw new Error('terminal plan expected');
+        for (const command of plan.commands) expect(command).not.toContain('zap');
+      }
+    }
+  });
+
+  it.each<[string, boolean | undefined, boolean | undefined]>([
+    ['recorded and Docker.app present (Homebrew upgrades normally)', true, true],
+    ['not recorded, Docker.app gone', false, false],
+    ['not recorded, Docker.app present', false, true],
+    ['unknown', undefined, undefined],
+  ])('installs plainly when %s', (_name, brewCaskRecorded, dockerAppPresent) => {
+    expect(installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded, dockerAppPresent })).toEqual({
+      kind: 'terminal',
+      commands: ['/opt/homebrew/bin/brew install --cask docker-desktop'],
+      needsAdmin: true,
+      description: DockerSetupTexts.descriptionBrew,
+    });
+  });
+
+  it('keeps the download for an unusual brew path, also with a stale record', () => {
+    expect(
+      installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/o c/brew', brewCaskRecorded: true, dockerAppPresent: false }).kind,
+    ).toBe('download');
+  });
+
+  it('says in the confirmation that the old entry is removed and the Docker data stays', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewCaskRecorded: true, dockerAppPresent: false });
+    expect(installConfirmation(plan)?.detail).toBe(
+      `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}\n\n${DockerSetupTexts.confirmCommands}\n\n` +
+        `brew uninstall --cask --force docker-desktop\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}`,
+    );
+  });
+
+  it.each([
+    ['/opt/homebrew/bin/brew', '/opt/homebrew/Caskroom/docker-desktop'],
+    ['/usr/local/bin/brew', '/usr/local/Caskroom/docker-desktop'],
+    ['/Users/octo/homebrew/bin/brew', '/Users/octo/homebrew/Caskroom/docker-desktop'],
+  ])('looks the cask up in the prefix of %s', (brew, folder) => {
+    expect(brewCaskroomFolder(brew)).toBe(folder);
+  });
+});
+
 describe('marks of a downloaded installer', () => {
   it('gives the quarantine value of macOS and the zone of Windows', () => {
     expect(quarantineAttribute(Date.parse('2026-09-25T12:00:00Z'))).toBe(`0081;${(Date.parse('2026-09-25T12:00:00Z') / 1000).toString(16)};Dev Environments;`);
@@ -488,43 +559,72 @@ describe('context keys', () => {
   });
 
   it.each<[DockerSetupState, Record<string, boolean>]>([
-    [state(false, false), { missing: true, installed: false, ready: false, wslReady: false }],
-    [state(true, false), { missing: false, installed: true, ready: false, wslReady: false }],
-    [state(true, true, true), { missing: false, installed: true, ready: true, wslReady: true }],
+    [state(false, false), { missing: true, installed: false, ready: false, wslReady: false, setupRequired: true }],
+    [state(true, false), { missing: false, installed: true, ready: false, wslReady: false, setupRequired: false }],
+    [state(true, true, true), { missing: false, installed: true, ready: true, wslReady: true, setupRequired: false }],
     // Never ready without a CLI, also for an inconsistent state.
-    [state(false, true), { missing: true, installed: false, ready: false, wslReady: false }],
+    [state(false, true), { missing: true, installed: false, ready: false, wslReady: false, setupRequired: true }],
   ])('values of %j', (value, expected) => {
-    const values = dockerContextValues(value);
+    const values = dockerContextValues(value, false);
     expect({
       missing: values[DockerContextKeys.missing],
       installed: values[DockerContextKeys.installed],
       ready: values[DockerContextKeys.ready],
       wslReady: values[DockerContextKeys.wslReady],
+      setupRequired: values[DockerContextKeys.setupRequired],
     }).toEqual(expected);
   });
 
+  it('does not require the setup without a CLI when a remote Docker host is configured', () => {
+    expect(dockerContextValues(state(false, false), true)[DockerContextKeys.setupRequired]).toBe(false);
+    expect(dockerContextValues(state(false, false), true)[DockerContextKeys.missing]).toBe(true);
+  });
+
   it('sets every key the first time, then only the keys that change', () => {
-    expect(changedContextValues(undefined, INITIAL_DOCKER_SETUP_STATE)).toEqual([
+    const values = (value: DockerSetupState) => dockerContextValues(value, false);
+    expect(changedContextValues(undefined, values(INITIAL_DOCKER_SETUP_STATE))).toEqual([
       [DockerContextKeys.missing, true],
       [DockerContextKeys.installed, false],
       [DockerContextKeys.ready, false],
       [DockerContextKeys.wslReady, false],
+      [DockerContextKeys.setupRequired, true],
     ]);
-    expect(changedContextValues(state(false, false), state(false, false))).toEqual([]);
-    expect(changedContextValues(state(false, false), state(true, false))).toEqual([
+    expect(changedContextValues(values(state(false, false)), values(state(false, false)))).toEqual([]);
+    expect(changedContextValues(values(state(false, false)), values(state(true, false)))).toEqual([
       [DockerContextKeys.missing, false],
       [DockerContextKeys.installed, true],
+      [DockerContextKeys.setupRequired, false],
     ]);
-    expect(changedContextValues(state(true, false), state(true, true))).toEqual([[DockerContextKeys.ready, true]]);
+    expect(changedContextValues(values(state(true, false)), values(state(true, true)))).toEqual([[DockerContextKeys.ready, true]]);
   });
 
   it('uses the key names of package.json', () => {
     expect(DockerContextKeys).toEqual({
       missing: 'devEnvironments.dockerMissing',
+      setupRequired: 'devEnvironments.dockerSetupRequired',
       installed: 'devEnvironments.dockerInstalled',
       ready: 'devEnvironments.dockerReady',
       wslReady: 'devEnvironments.wslReady',
     });
+  });
+});
+
+describe('dockerSetupRequired', () => {
+  // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
+  // shall not be shown, instead, the side view shall show the install docker wizard".
+  it.each<[boolean, boolean, boolean]>([
+    // [no Docker CLI found, remote Docker host configured, setup required]
+    [true, false, true],
+    [true, true, false],
+    [false, false, false],
+    [false, true, false],
+  ])('dockerMissing %s, remote host %s: %s', (dockerMissing, remote, expected) => {
+    expect(dockerSetupRequired(dockerMissing, remote)).toBe(expected);
+  });
+
+  it('does not require the setup when Docker is installed but does not run (it is started when needed, FR-14)', () => {
+    const installedNotRunning: DockerSetupState = { cliFound: true, engineRunning: false, wslReady: false };
+    expect(dockerContextValues(installedNotRunning, false)[DockerContextKeys.setupRequired]).toBe(false);
   });
 });
 
