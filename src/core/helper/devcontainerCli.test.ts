@@ -196,7 +196,7 @@ describe('buildOverrideConfig', () => {
       image: 'devenv-3f2a9c1e:2',
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
-      runArgs: ['--label', 'devenv.container-version=4', '--name', 'devenv-acme-api-3f2a9c1e'],
+      runArgs: ['--label', 'devenv.container-version=4', '--name', 'devenv-acme-api-3f2a9c1e', '--hostname', 'api'],
       containerEnv: containerEnvironment(),
       remoteEnv: remoteEnvironment(),
       customizations: { vscode: { settings: devContainersSettings() } },
@@ -297,6 +297,8 @@ describe('buildOverrideConfig', () => {
       'devenv.container-version=4',
       '--name',
       'devenv-acme-api-3f2a9c1e',
+      '--hostname',
+      'api',
     ]);
   });
 });

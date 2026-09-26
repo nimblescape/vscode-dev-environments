@@ -165,3 +165,18 @@ export function configurationFolder(configPath: string): string {
   const index = configPath.lastIndexOf('/');
   return index < 0 ? '.' : configPath.slice(0, index);
 }
+
+/**
+ * The host name of the container of a repository (`--hostname`, the name that the shell prompt shows instead of the
+ * container ID): the repository name in lowercase, each run of characters other than letters, digits, and `-` as one
+ * `-`, without `-` at the ends, at most 63 characters (one DNS label). `devenv` when nothing is left.
+ */
+export function containerHostname(repositoryName: string): string {
+  const label = repositoryName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/, '');
+  return label === '' ? 'devenv' : label;
+}

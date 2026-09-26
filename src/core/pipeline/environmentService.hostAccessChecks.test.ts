@@ -96,7 +96,7 @@ describe('host access checks off for the repository', () => {
     expect(h.helper.ups).toHaveLength(1);
     const runArgs = h.helper.ups[0].override.runArgs as string[];
     const name = environment.containerName;
-    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', '--name', name]);
+    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', '--name', name, '--hostname', 'api']);
     // The labels of the override configuration pass the policy also with the checks on.
     expect(runArgsProblems(runArgs, environment.volumeName)).toEqual([]);
     expect(h.docker.containersOf(environment.id)[0].labels[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
@@ -121,6 +121,8 @@ describe('host access checks off for the repository', () => {
       'devenv.host-access=unrestricted',
       '--name',
       NAME,
+      '--hostname',
+      'api',
     ]);
   });
 
@@ -139,7 +141,7 @@ describe('host access checks off for the repository', () => {
     h.helper.config = { image: BASE_IMAGE, runArgs: ['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P'], appPort: [3000, '5000:5000', '0.0.0.0:6000:6000'] };
     await h.service.openEnvironment(ENV_ID, options());
     const override = h.helper.ups[0].override;
-    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', '--name', NAME]);
+    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', '--name', NAME, '--hostname', 'api']);
     expect(override.appPort).toEqual([3000, '5000:5000', '0.0.0.0:6000:6000']);
   });
 
@@ -216,7 +218,7 @@ describe('host access checks on again (containerIsCurrent)', () => {
     const [container] = h.docker.containersOf(ENV_ID);
     expect(container.id).not.toBe(before);
     expect(container.labels[LABEL_HOST_ACCESS]).toBeUndefined();
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', NAME]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
     expect(h.progress.details).toEqual([Messages.containerHostAccessChecksOn]);
     expect(h.logger.infos.some((line) => line.includes('was created while the host access checks were off. They are on now'))).toBe(true);
     // The next open starts it as it is.
