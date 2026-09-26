@@ -49,6 +49,8 @@ export const WSL_INSTALL_COMMAND = 'wsl --install';
 export const LINUX_ENGINE_START_COMMAND = 'sudo systemctl enable --now docker';
 /** Homebrew cask of Docker Desktop (the former cask `docker` was renamed to `docker-desktop`). */
 export const BREW_INSTALL_COMMAND = 'brew install --cask docker-desktop';
+/** Where the cask docker-desktop puts Docker Desktop. */
+export const DOCKER_APP_PATH = '/Applications/Docker.app';
 export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
@@ -68,6 +70,8 @@ const FEDORA_DNF5_VERSION = 41;
 // User-visible texts that messages.ts lacks; to be moved there.
 export const DockerSetupTexts = {
   descriptionBrew: 'Docker Desktop is installed with Homebrew from its official cask docker-desktop.',
+  brewStaleCask:
+    'Homebrew still lists Docker Desktop, but the app is missing. Homebrew first removes its old entry (your Docker data stays), then installs Docker Desktop.',
   descriptionWinget: 'Docker Desktop is installed with winget from its official package Docker.DockerDesktop.',
   descriptionEngine: (distribution: string) =>
     `Docker Engine is installed from the official package repository of Docker for ${distribution} (download.docker.com).`,
@@ -107,6 +111,13 @@ export interface InstallPlanInput {
    * fixed search path) runs this Homebrew, also one outside /opt/homebrew and /usr/local, and the confirmation shows it.
    */
   brewPath?: string;
+  /**
+   * macOS: Homebrew records the cask docker-desktop (the folder `Caskroom/docker-desktop` of its prefix exists, see
+   * `brewCaskroomFolder`).
+   */
+  brewCaskRecorded?: boolean;
+  /** macOS: Docker.app exists (in /Applications, ~/Applications, or the appdir of HOMEBREW_CASK_OPTS). */
+  dockerAppPresent?: boolean;
   /** The login name of the user (Linux: joins the group docker). Missing or unusual: the documentation instead. */
   userName?: string;
   /**
@@ -177,6 +188,16 @@ function fileNameOf(url: string): string {
   return decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '');
 }
 
+/**
+ * The folder in which Homebrew records the cask docker-desktop: `Caskroom/docker-desktop` of the prefix of the `brew`
+ * at `brewPath` (the parent of its folder bin, for example /opt/homebrew or /usr/local).
+ */
+export function brewCaskroomFolder(brewPath: string): string {
+  const bin = brewPath.replace(/\/+$/, '').replace(/\/[^/]*$/, '');
+  const prefix = bin.replace(/\/[^/]*$/, '');
+  return `${prefix}/Caskroom/docker-desktop`;
+}
+
 /** Debian architecture name of a Node.js architecture, as `dpkg --print-architecture` gives it. */
 const DEBIAN_ARCHITECTURES: Record<string, string> = {
   x64: 'amd64',
@@ -189,6 +210,7 @@ const DEBIAN_ARCHITECTURES: Record<string, string> = {
 /**
  * How Docker is installed on this computer:
  * - macOS: Homebrew → `brew install --cask docker-desktop`; otherwise the .dmg of Docker Desktop (Apple silicon or Intel).
+ *   Homebrew still records the cask but Docker.app is gone: first `brew uninstall --cask --force docker-desktop`.
  * - Windows: winget → `winget install … Docker.DockerDesktop`; otherwise the installer .exe (x64 or Arm).
  * - Linux: Docker Engine from the repository of Docker for Ubuntu, Debian, Fedora, RHEL, and CentOS (the commands of
  *   https://docs.docker.com/engine/install/), then the user joins the group docker. Other distributions: the documentation.
@@ -201,6 +223,19 @@ export function installPlan(input: InstallPlanInput): InstallPlan {
     if (platform === 'darwin' && input.has('brew') && brew !== undefined) {
       // The cask links the CLI into /usr/local/bin with sudo, so Homebrew may ask for the password.
       const command = brew === 'brew' ? BREW_INSTALL_COMMAND : `${brew} install --cask docker-desktop`;
+      if (input.brewCaskRecorded === true && input.dockerAppPresent === false) {
+        // Homebrew still records docker-desktop, but Docker.app was removed by hand: `install` would upgrade the
+        // recorded version, remove its services and helpers, and then stop because the app is not there. `--force`
+        // drops the record although the app files are missing; it does not touch the Docker data.
+        // NEVER `--zap`: it deletes ~/Library/Containers/com.docker.docker, which holds all Docker volumes (the
+        // workspaces of the user: data loss).
+        return {
+          kind: 'terminal',
+          commands: [`${brew} uninstall --cask --force docker-desktop`, command],
+          needsAdmin: true,
+          description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+        };
+      }
       return { kind: 'terminal', commands: [command], needsAdmin: true, description: DockerSetupTexts.descriptionBrew };
     }
     if (platform === 'win32' && input.has('winget')) {
