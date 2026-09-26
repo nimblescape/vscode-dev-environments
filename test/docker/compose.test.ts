@@ -216,7 +216,10 @@ ${extra}volumes:
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     log.info(`Docker Engine API ${apiVersion}`);
     await seed(app, composeFile());
-    await seed(refused, composeFile('').replace('    command: sleep infinity\n    ports:', '    command: sleep infinity\n    privileged: true\n    ports:'));
+    // The privileged line goes into the db service; the replace must match (review round 7 put `restart` before `ports`).
+    const refusedFile = composeFile('').replace('    restart: unless-stopped\n    ports:', '    restart: unless-stopped\n    privileged: true\n    ports:');
+    expect(refusedFile).toContain('privileged: true');
+    await seed(refused, refusedFile);
     await seed(unrestricted, composeFile());
     // Delete removes the base images that no build record uses any more; a stopped container of the base image keeps it
     // for the other tests and for the baseline of the engine (Docker does not remove an image that a container uses).
