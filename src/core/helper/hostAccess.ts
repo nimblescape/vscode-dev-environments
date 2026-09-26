@@ -943,6 +943,32 @@ export function resolvedByImageId(reference: string, repoTags: readonly string[]
   return parsed.digest !== undefined ? !repoDigests.some((other) => matches(other, true)) : !repoTags.some((other) => matches(other, false));
 }
 
+/**
+ * Review round 9 (S9-3): of `references` (distinct), those that Docker resolves by the ID of an image, from the images
+ * that one `docker image inspect` of all of them found (`found`, each with its ID, tags, and digests), as Docker resolves
+ * a reference: by its name first (a tag, or a digest of the repository: resolvedByImageId is false for a found image),
+ * else by the ID: a prefix of the hexadecimal ID (also with `sha256:`), or a digest that is the ID. A reference that
+ * resolves to no found image is missing.
+ */
+export function imageIdResolvedReferences(
+  references: readonly string[],
+  found: ReadonlyArray<{ id: string; repoTags: readonly string[]; repoDigests: readonly string[] }>,
+): string[] {
+  const result: string[] = [];
+  for (const reference of references) {
+    if (found.some((image) => !resolvedByImageId(reference, image.repoTags, image.repoDigests))) continue;
+    const text = reference.trim().toLowerCase();
+    const hex = /^(sha256:)?([0-9a-f]+)$/.exec(text)?.[2];
+    const digest = /@(sha256:[0-9a-f]{64})$/.exec(text)?.[1];
+    const byId = found.some((image) => {
+      const id = image.id.toLowerCase();
+      return (hex !== undefined && id.startsWith(`sha256:${hex}`)) || (digest !== undefined && id === digest);
+    });
+    if (byId) result.push(reference);
+  }
+  return result;
+}
+
 /** The item of an image reference that Docker resolved by the ID of the image (resolvedByImageId): not supported. */
 export function imageIdItem(reference: string, what = 'image'): string {
   return `${what} ${reference.trim()} (an image ID; name the image)`;

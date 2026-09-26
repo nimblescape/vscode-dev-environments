@@ -18,8 +18,9 @@ import {
   LABEL_CONTAINER_CONFIG,
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
+  repositoryFolder,
 } from '../names';
-import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, RefusedUpdate } from '../types';
+import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
 
 export type { RefusedUpdate };
 
@@ -409,7 +410,30 @@ export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRe
     ...(serviceImages !== undefined ? { serviceImages } : {}),
     ...(typeof value.version === 'string' ? { version: value.version } : {}),
     ...(typeof value.inputsHash === 'string' ? { inputsHash: value.inputsHash } : {}),
+    // Review round 9 (D9-1): only a list of texts; the scripts take only the paths below the repository folder.
+    ...(Array.isArray(value.serviceFolders) && value.serviceFolders.every((folder) => typeof folder === 'string')
+      ? { serviceFolders: [...(value.serviceFolders as string[])] }
+      : {}),
   };
+}
+
+/**
+ * Review round 9 (D9-1, D9-2): the paths of the repository that the other services of the Docker Compose environment
+ * mounted at its last `up` (ComposeBuildRecord.serviceFolders); empty for a record without them.
+ */
+export function serviceFoldersOf(record: BuildRecord | undefined): string[] {
+  return composeRecordOf(record)?.serviceFolders ?? [];
+}
+
+/**
+ * Review round 9 (D9-2): serviceFoldersOf relative to the repository folder, as the user knows them (`./data/postgres`),
+ * for the confirmation of Delete. Only the paths below the repository folder.
+ */
+export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'buildRecord'>): string[] {
+  const folder = repositoryFolder(env.repository);
+  return serviceFoldersOf(env.buildRecord)
+    .filter((path) => path.startsWith(`${folder}/`) && path.length > folder.length + 1)
+    .map((path) => `./${path.slice(folder.length + 1)}`);
 }
 
 /**

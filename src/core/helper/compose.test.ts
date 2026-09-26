@@ -13,6 +13,7 @@ import {
   composeBuildModel,
   composeConfigHash,
   composeInputsHash,
+  composeModelLimit,
   composeMountVolumeName,
   composeNetworkNames,
   composeNetworkReferences,
@@ -789,9 +790,74 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     expect(decideServiceMount(entry(bind), context(ancestors))).toEqual(expected);
   });
 
+  it('names the paths of the repository that other services mount, not those of the dev service nor the repository itself (review round 9, D9-1)', () => {
+    const model = templateModel();
+    model.services.db.volumes = [
+      entry(),
+      { type: 'bind', source: `${REPO}/seed`, target: '/seed', read_only: true, bind: {} },
+      { type: 'bind', source: REPO, target: '/src', bind: {} },
+      { type: 'volume', source: 'pgdata', target: '/data', volume: {} },
+    ];
+    model.volumes = { pgdata: { name: 'devenv-3f2a9c1e_pgdata' } };
+    model.services.app.volumes = [...(model.services.app.volumes as unknown[]), { type: 'bind', source: `${REPO}/dev-only`, target: '/dev-only', bind: {} }];
+    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: 'devenv-3f2a9c1e:7' });
+    expect(result.serviceFolders).toEqual([SOURCE, `${REPO}/seed`]);
+    expect(composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7' })).not.toHaveProperty('serviceFolders');
+  });
+
   it('reads the nearest folders of the model run, and ignores values that are no paths', () => {
     const line = JSON.stringify({ version: '2.40.3', dollarEscaped: true, model: { services: {} }, dockerfiles: {}, realPaths: {}, mountAncestors: { [SOURCE]: REPO, a: null, b: 3 } });
     expect(parseComposeModelOutput(line)).toMatchObject({ mountAncestors: { [SOURCE]: REPO, a: null } });
     expect(parseComposeModelOutput(line)).not.toHaveProperty(['mountAncestors', 'b']);
+  });
+});
+
+describe('review round 9 (S9-1): the bounds of the model in the extension host', () => {
+  const REPO_FOLDER = '/workspaces/api';
+
+  it('rewrites a model with 40000 folders to create in less than 1 s', () => {
+    const volumes = Array.from({ length: 40_000 }, (_, i) => ({ type: 'bind', source: `${REPO_FOLDER}/d/${i}`, target: `/m/${i}`, bind: { create_host_path: true } }));
+    const realPaths = Object.fromEntries(volumes.map((v) => [v.source, null]));
+    const mountAncestors = Object.fromEntries(volumes.map((v) => [v.source, REPO_FOLDER]));
+    const model = { name: 'devenv-3f2a9c1e', services: { app: { image: 'ubuntu', command: ['sleep'] }, db: { image: 'postgres:16', volumes } } } as unknown as ComposeModel;
+    const start = performance.now();
+    const up = composeUpModel(model, {
+      project: 'devenv-3f2a9c1e',
+      devService: 'app',
+      environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d',
+      containerName: 'c',
+      volumeName: 'devenv-x',
+      repositoryFolder: REPO_FOLDER,
+      dollarEscaped: true,
+      engineApiVersion: '1.47',
+      realPaths,
+      mountAncestors,
+      image: 'img',
+    });
+    // Before: 3 s (createFolders.includes for each mount).
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(up.createFolders).toHaveLength(40_000);
+    // The pipeline refuses such a model before (MAX_COMPOSE_MOUNTS).
+    expect(composeModelLimit(model)).toBe('40000 mounts (at most 5000)');
+  });
+
+  it('names a model beyond the limits of services and mounts', () => {
+    const services = (n: number, mounts = 0) =>
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [`s${i}`, { image: 'alpine', volumes: Array.from({ length: mounts }, () => ({ type: 'tmpfs', target: '/t' })) }]));
+    expect(composeModelLimit({ services: services(500, 10) } as ComposeModel)).toBeUndefined();
+    expect(composeModelLimit({ services: services(501) } as ComposeModel)).toBe('501 services (at most 500)');
+    expect(composeModelLimit({ services: services(2, 2501) } as ComposeModel)).toBe('5002 mounts (at most 5000)');
+  });
+});
+
+describe('review round 9 (S9-2): each Dockerfile once in the output of the model run', () => {
+  it('gives each service the text of its file, and refuses a file without a text', () => {
+    const base = { version: '2.40.3', dollarEscaped: true, model: { services: {} }, realPaths: {} };
+    const line = JSON.stringify({ ...base, dockerfiles: { inline: 'FROM a' }, dockerfileFiles: { s0: '/r/D', s1: '/r/D' }, dockerfileTexts: { '/r/D': 'FROM b' } });
+    const parsed = parseComposeModelOutput(line);
+    expect(parsed).toMatchObject({ dockerfiles: { inline: 'FROM a', s0: 'FROM b', s1: 'FROM b' } });
+    expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: { s0: '/r/X' }, dockerfileTexts: {} }))).toThrow('invalid Compose model');
+    expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: { s0: '/r/D' }, dockerfileTexts: { '/r/D': 3 } }))).toThrow('invalid Compose model');
+    expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: [] }))).toThrow('invalid Compose model');
   });
 });

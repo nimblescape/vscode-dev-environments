@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
-import { ANALYSIS_FAILED_ITEM } from '../helper/configurationAnalysis';
+import { ANALYSIS_FAILED_ITEM, analysisInternalItem } from '../helper/configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from '../helper/configurationAnalysisRunner';
 import { Messages } from '../messages';
 import type { RepositoryTarget } from './environmentService';
@@ -101,8 +101,9 @@ describe('the open pipeline with the host access analysis in the worker (review 
     const failing = harness({}, path.join(outDir, 'missing.js'));
     const error = await rejection(failing.service.open(TARGET, { progress: failing.progress }));
     expect(error.code).toBe('hostAccess');
-    expect(error.message).toBe(Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM));
-    expect(error.message).toBe('The configuration is too large or too complex to check (it took too long or used too much memory). Change the configuration of the repository.');
+    // Review round 9, P9-2: an internal error, not "too complex, change the configuration" (the configuration is not to
+    // blame); still refused.
+    expect(error.message).toMatch(/^The configuration check failed to start \(internal error\): the worker did not start: .*\. Try again; if it fails again, reinstall Dev Environments\.$/);
     expect(failing.helper.builds).toEqual([]);
     expect(failing.helper.ups).toEqual([]);
     expect(failing.logger.warnings.filter((line) => FAILED_LINE.test(line))).toHaveLength(1);
@@ -111,10 +112,11 @@ describe('the open pipeline with the host access analysis in the worker (review 
   it('refuses the configuration when the analysis takes longer than its time limit', async () => {
     const slow = harness({ timeoutMs: 1 });
     const error = await rejection(slow.service.open(TARGET, { progress: slow.progress }));
-    expect(error.message).toBe(Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM));
+    // Review round 9, P9-2: within 1 ms the worker is not even running: that is no limit of the configuration.
+    expect(error.message).toBe(Messages.configurationCheckInternal(analysisInternalItem('the worker did not start within 1 ms')));
     expect(slow.helper.builds).toEqual([]);
     expect(slow.logger.warnings.filter((line) => FAILED_LINE.test(line))).toEqual([
-      'The host access analysis of the configuration failed (it took longer than 1 ms); the configuration is refused.',
+      'The host access analysis of the configuration failed (the worker did not start within 1 ms); the configuration is refused.',
     ]);
   });
 

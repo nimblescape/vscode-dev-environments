@@ -80,6 +80,17 @@ export const Messages = {
    * crashed): refused, never allowed. The text is ANALYSIS_FAILED_ITEM of helper/configurationAnalysis.ts.
    */
   configurationTooComplex: (item: string) => `${item}. Change the configuration of the repository.`,
+  /**
+   * Review round 9 (P9-2): the analysis of the configuration could not run (its worker did not start, or crashed without
+   * an answer): no fault of the configuration. The item is analysisInternalItem of helper/configurationAnalysis.ts.
+   */
+  configurationCheckInternal: (item: string) => `${item}. Try again; if it fails again, reinstall Dev Environments.`,
+  /**
+   * Review round 9 (P9-1): the check of the new environment image of an update failed (not a refusal of the policy): the
+   * old one starts, and the next open tries the update again. The item says why (ANALYSIS_FAILED_ITEM or
+   * analysisInternalItem).
+   */
+  updateCheckFailed: (item: string) => `The configuration could not be checked. Try again. (${item}.) The environment is started without the update.`,
   /** Both: settings that need access to the computer, and settings that the policy does not know. */
   hostAccessAndUnsupported: (items: string, unsupported: string) =>
     `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. It also uses options that Dev Environments does not support: ${unsupported}. Change the configuration of the repository.`,
@@ -181,6 +192,12 @@ export const Messages = {
     `Delete the environment of ${repository}? The container and the files in the environment are removed.`,
   deleteUnsaved: (repository: string, changes: string) =>
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
+  /**
+   * Review round 9 (D9-2): the paths of the repository that the other services of Docker Compose mount
+   * (ComposeBuildRecord.serviceFolders): they are in the workspace volume, so Delete removes them with the repository;
+   * the confirmation names them, as the question about the data volumes of the services (D-19) names those.
+   */
+  deleteRepositoryServiceData: (folders: string) => `Service data in the repository will be deleted: ${folders}.`,
   deleteAdditionalVolumes: (volumes: string) =>
     `The environment also used these volumes: ${volumes}. Remove them too?`,
   /**
@@ -253,6 +270,18 @@ export const StateTexts = {
    */
   servicesRunning: 'services running',
 } as const;
+
+/** The most names that one message lists (review round 9, S9-1). */
+export const MAX_LISTED_NAMES = 20;
+
+/**
+ * Review round 9 (S9-1): `items` joined with `, `, at most `max` of them, then `and <n> more`, so that a configuration
+ * with thousands of names gives a message of normal length.
+ */
+export function listSome(items: readonly string[], max = MAX_LISTED_NAMES, separator = ', '): string {
+  if (items.length <= max) return items.join(separator);
+  return `${items.slice(0, max).join(separator)}${separator}and ${items.length - max} more`;
+}
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */
 export function formatChanges(summary: { uncommittedFiles: number; unpushedCommits: number; stashes?: number }): string {

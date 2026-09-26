@@ -38,6 +38,7 @@ import {
   splitPortAddress,
   withLoopbackAddress,
 } from './hostAccess';
+import { MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES } from './analysisLimits';
 import { OVERRIDE_FOLDER } from './scripts';
 
 /** A service of the merged model (`services.<name>`), as `docker compose config --format json` prints it. */
@@ -193,6 +194,19 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     throw new Error('The workspace helper printed an invalid Compose model.');
   }
   if (isRecord(value) && typeof value.error === 'string') return { error: value.error };
+  // Review round 9 (S9-2): the text of each Dockerfile once (dockerfileTexts, by path), named by the services
+  // (dockerfileFiles); every service gets the same string, not a copy.
+  if (isRecord(value) && isRecord(value.dockerfiles) && (value.dockerfileFiles !== undefined || value.dockerfileTexts !== undefined)) {
+    const files = value.dockerfileFiles;
+    const texts = value.dockerfileTexts;
+    if (!isRecord(files) || !isRecord(texts)) throw new Error('The workspace helper printed an invalid Compose model.');
+    const dockerfiles: Record<string, unknown> = { ...value.dockerfiles };
+    for (const [service, file] of Object.entries(files)) {
+      if (typeof file !== 'string' || !Object.prototype.hasOwnProperty.call(texts, file)) throw new Error('The workspace helper printed an invalid Compose model.');
+      if (!Object.prototype.hasOwnProperty.call(dockerfiles, service)) dockerfiles[service] = texts[file];
+    }
+    value.dockerfiles = dockerfiles;
+  }
   if (
     !isRecord(value) ||
     typeof value.version !== 'string' ||
@@ -219,6 +233,21 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     ...(Array.isArray(value.missing) ? { missing: value.missing.filter((file): file is string => typeof file === 'string') } : {}),
     inputsHash: typeof value.inputsHash === 'string' ? value.inputsHash : '',
   };
+}
+
+/**
+ * Review round 9 (S9-1): why a model is beyond the limits of the extension host (MAX_COMPOSE_SERVICES services,
+ * MAX_COMPOSE_MOUNTS mounts of all services together), or `undefined`. Counted without a copy; the pipeline refuses such
+ * a model as too large or too complex before any other work on it.
+ */
+export function composeModelLimit(model: ComposeModel): string | undefined {
+  const services = isRecord(model.services) ? Object.values(model.services) : [];
+  if (services.length > MAX_COMPOSE_SERVICES) return `${services.length} services (at most ${MAX_COMPOSE_SERVICES})`;
+  let mounts = 0;
+  for (const service of services) {
+    if (isRecord(service) && Array.isArray(service.volumes)) mounts += service.volumes.length;
+  }
+  return mounts > MAX_COMPOSE_MOUNTS ? `${mounts} mounts (at most ${MAX_COMPOSE_MOUNTS})` : undefined;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -739,9 +768,14 @@ function mountContext(model: ComposeModel, p: ComposeRewriteParams, isDev: boole
 }
 
 /** The rewrites that the up model and the build model share. */
-function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: ComposeModel; rewrites: ComposeRewrite[]; createFolders: string[] } {
+function rewriteModel(
+  source: ComposeModel,
+  p: ComposeRewriteParams,
+): { model: ComposeModel; rewrites: ComposeRewrite[]; createFolders: string[]; serviceFolders: string[] } {
   const rewrites: ComposeRewrite[] = [];
-  const createFolders: string[] = [];
+  // Review round 9 (S9-1): Sets, so that many mounts cost linear time in the extension host.
+  const createFolders = new Set<string>();
+  const serviceFolders = new Set<string>();
   const model = JSON.parse(JSON.stringify(source)) as ComposeModel;
   if (!isRecord(model.services[p.devService])) throw new Error(`The Compose configuration has no service ${p.devService}.`);
   if (model.name !== undefined && model.name !== p.project) {
@@ -804,7 +838,13 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
       }
       rewrites.push({ item: `${at}bind mount ${mountText(entry)}`, reason: decision.reason });
       if (decision.action === 'replace') volumes.push(decision.value);
-      if (decision.action === 'replace' && decision.createFolder !== undefined && !createFolders.includes(decision.createFolder)) createFolders.push(decision.createFolder);
+      if (decision.action === 'replace' && decision.createFolder !== undefined) createFolders.add(decision.createFolder);
+      // Review round 9 (D9-1): a path of the repository that another service mounts (from the workspace volume) may hold
+      // the data of that service, with the owner that the service gives it: the ownership fix leaves it out.
+      if (!isDev && decision.action === 'replace') {
+        const folder = serviceRepositoryPath(decision.value, p.repositoryFolder);
+        if (folder !== undefined) serviceFolders.add(folder);
+      }
     }
     if (isDev) volumes.unshift({ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: WORKSPACES_ROOT });
     if (volumes.length > 0) service.volumes = volumes;
@@ -872,7 +912,19 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
   }
   volumes[WORKSPACE_VOLUME_KEY] = { name: p.volumeName, external: true };
   model.volumes = volumes;
-  return { model, rewrites, createFolders };
+  return { model, rewrites, createFolders: [...createFolders], serviceFolders: [...serviceFolders] };
+}
+
+/**
+ * Review round 9 (D9-1): the path in the helper (and in the dev container) of a mount of the workspace volume with a
+ * subpath below the repository folder (decideServiceMount), for example `/workspaces/api/data/postgres`; `undefined` for
+ * any other mount, and for the repository folder itself (a service that mounts the whole repository shares its source,
+ * and leaving it out would leave every file of the repository to root).
+ */
+function serviceRepositoryPath(value: unknown, repositoryFolder: string): string | undefined {
+  if (!isRecord(value) || value.source !== WORKSPACE_VOLUME_KEY || !isRecord(value.volume) || typeof value.volume.subpath !== 'string') return undefined;
+  const folder = path.posix.join(WORKSPACES_ROOT, value.volume.subpath);
+  return folder !== repositoryFolder && folder.startsWith(`${repositoryFolder}/`) ? folder : undefined;
 }
 
 function portText(entry: unknown): string {
@@ -911,8 +963,11 @@ function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check
  * refuses (composeAccessReport must pass first). `rewrites` names each change for the log.
  */
-export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { image: string }): ComposeModelRewrite & { createFolders?: string[] } {
-  const { model: result, rewrites, createFolders } = rewriteModel(model, p);
+export function composeUpModel(
+  model: ComposeModel,
+  p: ComposeRewriteParams & { image: string },
+): ComposeModelRewrite & { createFolders?: string[]; serviceFolders?: string[] } {
+  const { model: result, rewrites, createFolders, serviceFolders } = rewriteModel(model, p);
   const dev = result.services[p.devService];
   if (dev.build !== undefined && dev.build !== null) rewrites.push({ item: `service ${p.devService}: build`, reason: `the environment image ${p.image} is used` });
   delete dev.build;
@@ -921,7 +976,13 @@ export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { 
   // container, buildOverrideConfig). The other services keep theirs.
   if (!serviceDecidesHostname(dev)) dev.hostname = containerHostname(path.posix.basename(p.repositoryFolder));
   // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.
-  return createFolders.length > 0 ? { model: finish(result, p.dollarEscaped), rewrites, createFolders } : { model: finish(result, p.dollarEscaped), rewrites };
+  // Review round 9 (D9-1): the paths of the repository that the other services mount (serviceRepositoryPath).
+  return {
+    model: finish(result, p.dollarEscaped),
+    rewrites,
+    ...(createFolders.length > 0 ? { createFolders } : {}),
+    ...(serviceFolders.length > 0 ? { serviceFolders } : {}),
+  };
 }
 
 /**

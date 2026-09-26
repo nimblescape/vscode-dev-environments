@@ -44,3 +44,15 @@ describe('helperEnvNames', () => {
     expect(HELPER_ENV_NAMES).toContain('HOME');
   });
 });
+
+describe('review round 9 (P9-3): many names', () => {
+  it('finds 80000 names in less than 1 s', () => {
+    const text = `{"containerEnv":{${Array.from({ length: 80_000 }, (_, i) => `"a${i}":"\${localEnv:V${i}}"`).join(',')}}}`;
+    const start = performance.now();
+    const names = findLocalEnvNames(text);
+    // Before: 17 s (names.includes for each name).
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(names).toHaveLength(80_000);
+    expect(names.slice(0, 2)).toEqual(['V0', 'V1']);
+  });
+});

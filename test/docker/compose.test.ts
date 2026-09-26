@@ -328,7 +328,8 @@ ${extra}volumes:
     const entry = await registry.get(app.id);
     expect(entry?.buildRecord).toMatchObject({
       environmentImage: `${environmentImageRepository(app.id)}:1`,
-      compose: { service: 'app', images: [`${app.project}-app`] },
+      // Review round 9 (D9-1): the paths of the repository that db mounts, which the ownership fixes leave out.
+      compose: { service: 'app', images: [`${app.project}-app`], serviceFolders: [`${app.folder}/seed`, `${app.folder}/init.sql`] },
     });
     expect(entry?.buildRecord?.images).toHaveProperty([TEST_BASE_IMAGE]);
     expect(entry?.additionalVolumes).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));

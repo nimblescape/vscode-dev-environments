@@ -47,14 +47,47 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
 `;
 
 /**
+ * Review round 9 (D9-1): shell text that turns the positional parameters (the patterns of servicePrunePatterns) into
+ * the arguments `-path <pattern> -prune -o` of `find`, each pattern one argument (never shell text). After it, `"$@"`
+ * holds these arguments only. The `for` list is expanded once, before `set --` changes the parameters.
+ */
+export const PRUNE_ARGUMENTS = `count=$#
+for pattern do
+  set -- "$@" -path "$pattern" -prune -o
+done
+shift "$count"
+`;
+
+/**
+ * Review round 9 (D9-1): the `find -path` patterns of the paths of the repository that the other services of Docker
+ * Compose mount (ComposeBuildRecord.serviceFolders), which the ownership fixes leave out with their content: a service
+ * such as a database gives its data files its own owner, and would not start with others. Only absolute paths below
+ * `repoFolder` (never the folder itself, which would leave out everything); the characters that `-path` reads as a
+ * pattern (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path.
+ */
+export function servicePrunePatterns(repoFolder: string, folders: readonly string[] | undefined): string[] {
+  const patterns = new Set<string>();
+  for (const folder of folders ?? []) {
+    if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`)) continue;
+    const segments = folder.slice(repoFolder.length + 1).split('/');
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) continue;
+    patterns.add(folder.replace(/[\\*?[]/g, '\\$&'));
+  }
+  return [...patterns];
+}
+
+/**
  * Changes the owner of every file in `$1` that does not belong to the user `$2` (and its primary group) to that user.
  * `chown -h` changes a symbolic link itself, never its target, and `-xdev` stays out of other mounts, so that no file
- * outside of the workspace volume changes. Works with GNU and BusyBox tools.
+ * outside of the workspace volume changes. Review round 9 (D9-1): the paths of the patterns `$3`… (servicePrunePatterns)
+ * and their content are left out. Works with GNU and BusyBox tools.
  */
 export const OWNERSHIP_FIX_SCRIPT = `set -eu
+dir="$1"
 uid=$(id -u "$2")
 gid=$(id -g "$2")
-find "$1" -xdev \\( ! -user "$uid" -o ! -group "$gid" \\) -exec chown -h "$uid:$gid" {} +
+shift 2
+${PRUNE_ARGUMENTS}find "$dir" -xdev "$@" \\( ! -user "$uid" -o ! -group "$gid" \\) -exec chown -h "$uid:$gid" {} +
 `;
 
 /**
@@ -94,6 +127,6 @@ export function gitSummaryCommand(repoFolder: string): string[] {
  * Command for `docker exec -u root` in the dev container after its first creation (implementation notes 7 "Ownership"):
  * the helper clones as root, so the files get the user and the primary group of `remoteUser`.
  */
-export function ownershipFixCommand(repoFolder: string, user: string): string[] {
-  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user];
+export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: readonly string[]): string[] {
+  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePrunePatterns(repoFolder, serviceFolders)];
 }

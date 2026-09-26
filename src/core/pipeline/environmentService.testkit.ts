@@ -286,6 +286,24 @@ export class FakeDocker implements EnvironmentDocker {
     return this.imageRepoNames.get(reference) ?? (reference.includes('@') ? { repoTags: [], repoDigests: [reference] } : { repoTags: [reference], repoDigests: [] });
   }
 
+  /** Review round 9 (S9-3): the references of each inspectImageNames. */
+  readonly imageInspections: string[][] = [];
+
+  /**
+   * As `docker image inspect` of several references: the images that exist, in their order. An image of a reference that
+   * imageRepoNames does not name has the reference as its tag (or digest); its ID is imageIds, a hexadecimal reference
+   * padded to an ID, or `sha256:image-of-<reference>`.
+   */
+  async inspectImageNames(references: readonly string[]): Promise<Array<{ id: string; repoTags: string[]; repoDigests: string[] }>> {
+    this.imageInspections.push([...references]);
+    return references
+      .filter((reference) => this.images.has(reference))
+      .map((reference) => ({
+        id: this.imageIds.get(reference) ?? (/^[0-9a-f]+$/.test(reference) ? `sha256:${reference.padEnd(64, '0')}` : `sha256:image-of-${reference}`),
+        ...(this.imageRepoNames.get(reference) ?? (reference.includes('@') ? { repoTags: [], repoDigests: [reference] } : { repoTags: [reference], repoDigests: [] })),
+      }));
+  }
+
   async imageExists(reference: string): Promise<boolean> {
     return this.images.has(reference);
   }
@@ -778,9 +796,13 @@ export class FakeHelper implements EnvironmentHelper {
     return { ...this.gitSummaryResult };
   }
 
-  async switchBranch(p: { volumeName: string; branch: string; token: string }): Promise<void> {
+  /** Review round 9 (D9-1): the serviceFolders of each switchBranch. */
+  readonly switchServiceFolders: Array<readonly string[] | undefined> = [];
+
+  async switchBranch(p: { volumeName: string; branch: string; token: string; serviceFolders?: readonly string[] }): Promise<void> {
     this.mount(p.volumeName);
     this.calls.push(`switchBranch ${p.branch}`);
+    this.switchServiceFolders.push(p.serviceFolders);
     if (this.switchError) throw this.switchError;
   }
 }

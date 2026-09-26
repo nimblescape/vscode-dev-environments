@@ -813,6 +813,11 @@ export class WorkspaceHelper {
     repository: string;
     branch: string;
     token: string;
+    /**
+     * Review round 9 (D9-1): the paths of the repository that the other services of Docker Compose mount
+     * (ComposeBuildRecord.serviceFolders); the restore of the owner leaves them out.
+     */
+    serviceFolders?: readonly string[];
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -820,7 +825,7 @@ export class WorkspaceHelper {
     const folder = this.repositoryFolder(p.repository);
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Switching ${p.repository} to the branch ${p.branch}.`);
-    const result = await this.runStreams(p.volumeName, switchBranchCommand(folder, p.branch, p.repository), {
+    const result = await this.runStreams(p.volumeName, switchBranchCommand(folder, p.branch, p.repository, p.serviceFolders), {
       input: p.token,
       secrets: true,
       docker: false,

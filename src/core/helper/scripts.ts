@@ -13,8 +13,10 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // The only copies in the volume are the token file of the dev container and the sign-in of the GitHub CLI there
 // (GIT_FILES_SCRIPT, both mode 0600); REMOVE_GIT_TOKEN_SCRIPT removes both.
-import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, PRUNE_ARGUMENTS, servicePrunePatterns } from '../git/gitSummary';
 import { CONFIG_FOLDER, GH_CONFIG_FOLDER, GH_HOSTS_FILE, GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
+import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
 export { GIT_SUMMARY_SCRIPT };
@@ -143,7 +145,9 @@ echo "The repository is in $target."
 `;
 
 /**
- * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository. Token on stdin.
+ * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find
+ * -path` patterns of the paths that the other services of Docker Compose mount (servicePrunePatterns), which the
+ * restore of the owner leaves out with their content. Token on stdin.
  * Fetches the branches of https://github.com/<owner>/<repository>.git into refs/remotes/origin (the same result as
  * `git fetch origin`, but independent of the remote in .git/config), removes the token, runs `git switch <branch>`
  * (a remote branch gets a local tracking branch), and gives files that the helper created as root the owner of the
@@ -155,7 +159,8 @@ export const SWITCH_BRANCH_SCRIPT = `${TOKEN_PRELUDE}
 dir="$1"
 branch="$2"
 repo="$3"
-check_repository "$repo"
+shift 3
+${PRUNE_ARGUMENTS}check_repository "$repo"
 check_branch "$branch"
 if [ -z "$branch" ]; then
   fail 2 'No branch name.'
@@ -170,7 +175,7 @@ if [ "$status" -eq 0 ]; then
   if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
   out=$(git_local switch "$branch" 2>&1) || status=$?
 fi
-if ! find "$dir" -xdev \\( ! -uid "\${owner%%:*}" -o ! -gid "\${owner#*:}" \\) -exec chown -h "$owner" {} +; then
+if ! find "$dir" -xdev "$@" \\( ! -uid "\${owner%%:*}" -o ! -gid "\${owner#*:}" \\) -exec chown -h "$owner" {} +; then
   echo 'The owner of some files could not be restored.'
 fi
 if [ "$status" -ne 0 ]; then
@@ -390,6 +395,31 @@ process.stdout.write(JSON.stringify(found) + '\n');
 `;
 
 /**
+ * Review round 9 (S9-2): the function `readLimited(file, limit)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they
+ * define `fs`): the text of a file, at most `limit + 1` characters of it, so that the length check of the extension
+ * (MAX_DOCKERFILE_LENGTH, MAX_CONFIG_TEXT_LENGTH) still refuses a longer file, while a file of any size costs at most
+ * 4 · (`limit` + 1) bytes (4 bytes per character of UTF-8 at most), never the whole file. Throws what `fs` throws.
+ */
+const READ_LIMITED = String.raw`const readLimited = (file, limit) => {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.alloc(4 * (limit + 1));
+    let length = 0;
+    for (;;) {
+      const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+      if (length === buffer.length) break;
+    }
+    const text = buffer.toString('utf8', 0, length);
+    return text.length > limit ? text.slice(0, limit + 1) : text;
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+`;
+
+/**
  * The function `missingInRepository(file)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they define `fs`, `path`,
  * `root`, `inside`, and `realPath`): whether a path of the repository does not exist, as a plain error of the
  * configuration (review round 3, P3-1). Review round 4 (P4-1): a link that leads nowhere counts too when its chain stays
@@ -465,9 +495,10 @@ const fs = require('fs');
 const path = require('path');
 const root = path.posix.resolve(process.argv[1]);
 const inside = (file) => file === root || file.startsWith(root + '/');
-const read = (file) => {
+${READ_LIMITED}// Review round 9 (S9-1, S9-2): at most one character more than the extension takes.
+const read = (file, limit) => {
   try {
-    return fs.readFileSync(file, 'utf8');
+    return readLimited(file, limit);
   } catch (error) {
     if (error && ['ENOENT', 'ENOTDIR', 'EISDIR'].includes(error.code)) return undefined;
     throw error;
@@ -530,7 +561,7 @@ ${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
 const main = () => {
   const configFile = path.posix.resolve(root, process.argv[2] || '');
   if (!inside(configFile) || configFile === root) throw new Error('The configuration path is outside of the repository.');
-  const configText = read(configFile);
+  const configText = read(configFile, ${MAX_CONFIG_TEXT_LENGTH});
   if (configText === undefined) return null;
   const result = { configText };
   let config;
@@ -554,7 +585,7 @@ const main = () => {
   const real = realPath(dockerfileFile);
   const rootReal = realPath(root);
   if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
-  const dockerfileText = read(dockerfileFile);
+  const dockerfileText = read(dockerfileFile, ${MAX_DOCKERFILE_LENGTH});
   if (dockerfileText !== undefined) result.dockerfileText = dockerfileText;
   return result;
 };
@@ -668,9 +699,12 @@ if (process.exitCode === undefined) {
  * - `version`: `docker compose version --short`;
  * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
  * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles);
- * - `dockerfiles`: the Dockerfile of each service with a local build (`build.dockerfile_inline`, or the file: when it
- *   is in the repository folder, also after links, or when it is outside of it and no path of the workspace helper
- *   (isHelperPath of hostAccess.ts, the same paths here), also after links);
+ * - `dockerfiles`: the `build.dockerfile_inline` of each service that has one;
+ * - `dockerfileFiles` and `dockerfileTexts` (review round 9, S9-2): of each other service with a local build, the real
+ *   path of its Dockerfile (when it is in the repository folder, also after links, or when it is outside of it and no
+ *   path of the workspace helper (isHelperPath of hostAccess.ts, the same paths here), also after links), and the text
+ *   of each such file once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH (readLimited);
+ *   parseComposeModelOutput gives each service its text in `dockerfiles`;
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
  *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
  *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
@@ -754,13 +788,18 @@ const nearestFolder = (file) => {
     }
   }
 };
+${READ_LIMITED}// Review round 9 (S9-2): each file once (dockerfileTexts, by its real path), at most one character more than
+// MAX_DOCKERFILE_LENGTH. Returns the real path of the text, or undefined.
+const dockerfileTexts = {};
 const readDockerfile = (file) => {
   const real = realPath(file);
   if (real === null) return undefined;
   const allowed = inside(file) ? inside(real) : !isHelperPath(file) && !isHelperPath(real);
   if (!allowed) return undefined;
+  if (Object.prototype.hasOwnProperty.call(dockerfileTexts, real)) return real;
   try {
-    return fs.readFileSync(real, 'utf8');
+    dockerfileTexts[real] = readLimited(real, ${MAX_DOCKERFILE_LENGTH});
+    return real;
   } catch {
     return undefined;
   }
@@ -783,8 +822,16 @@ const main = () => {
   if (result.status !== 0) return failure(result, 'docker compose config');
   const model = JSON.parse(result.stdout);
   const dockerfiles = {};
+  const dockerfileFiles = {};
   const realPaths = {};
   const missing = [];
+  // Review round 9 (S9-1): a Set, so that many services cost linear time.
+  const missingSeen = new Set();
+  const addMissing = (file) => {
+    if (missingSeen.has(file)) return;
+    missingSeen.add(file);
+    missing.push(file);
+  };
   const mountAncestors = {};
   for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
     if (!isObject(service)) continue;
@@ -792,7 +839,7 @@ const main = () => {
     if (isObject(build)) {
       const local = typeof build.context === 'string' && build.context.startsWith('/');
       if (local) realPaths[build.context] = realPath(build.context);
-      if (local && missingInRepository(build.context) && !missing.includes(build.context)) missing.push(build.context);
+      if (local && !missingSeen.has(build.context) && missingInRepository(build.context)) addMissing(build.context);
       // Review round 2 (S2-03): the other files and folders that the build client reads in the helper.
       for (const source of Object.values(isObject(build.additional_contexts) ? build.additional_contexts : {})) {
         const folder = localFolder(source);
@@ -809,9 +856,9 @@ const main = () => {
       } else if (local) {
         const file = path.posix.resolve(build.context, typeof build.dockerfile === 'string' ? build.dockerfile : 'Dockerfile');
         realPaths[file] = realPath(file);
-        if (missingInRepository(file) && !missing.includes(file)) missing.push(file);
-        const text = readDockerfile(file);
-        if (text !== undefined) dockerfiles[name] = text;
+        if (!missingSeen.has(file) && missingInRepository(file)) addMissing(file);
+        const real = readDockerfile(file);
+        if (real !== undefined) dockerfileFiles[name] = real;
       }
     }
     for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
@@ -843,7 +890,7 @@ const main = () => {
     }
   }
   const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, missing, mountAncestors, inputsHash };
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, dockerfileFiles, dockerfileTexts, realPaths, missing, mountAncestors, inputsHash };
 };
 let output;
 try {
@@ -878,8 +925,8 @@ export function removeGitTokenCommand(): string[] {
 }
 
 /** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */
-export function switchBranchCommand(repoFolder: string, branch: string, repository: string): string[] {
-  return ['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', repoFolder, branch, repository];
+export function switchBranchCommand(repoFolder: string, branch: string, repository: string, serviceFolders?: readonly string[]): string[] {
+  return ['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', repoFolder, branch, repository, ...servicePrunePatterns(repoFolder, serviceFolders)];
 }
 
 export function listConfigsCommand(repoFolder: string): string[] {

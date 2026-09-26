@@ -12,6 +12,7 @@ import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo,
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
+import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
 import {
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
@@ -19,6 +20,7 @@ import {
   composeBuildModel,
   composeConfigHash,
   composeInputsHash,
+  composeModelLimit,
   composeNetworkReferences,
   composeServiceImageReferences,
   composeServiceVolumeNames,
@@ -32,14 +34,21 @@ import {
 } from '../helper/compose';
 import { composeConfigurationReport, composeIgnoredProperties, composeMissingBuildPaths } from '../helper/composeAccess';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
-import { ANALYSIS_FAILED_ITEM, type AnalysisJob, type AnalysisResult, type ConfigurationAnalyzer } from '../helper/configurationAnalysis';
+import {
+  ANALYSIS_FAILED_ITEM,
+  analysisFailureItem,
+  type AnalysisFailure,
+  type AnalysisJob,
+  type AnalysisResult,
+  type ConfigurationAnalyzer,
+} from '../helper/configurationAnalysis';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import {
   foreignVolumeName,
   imageIdItem,
   imageReferenceFinding,
-  resolvedByImageId,
+  imageIdResolvedReferences,
   type NamedImageReference,
   imageLabelItems,
   isOwnVolume,
@@ -65,7 +74,7 @@ import {
 } from '../imageCheck/imageCheck';
 import { registryDisplayName } from '../imageCheck/reference';
 import { parseJsonc } from '../jsonc';
-import { Messages, Steps, type ProgressStep } from '../messages';
+import { Messages, Steps, listSome, type ProgressStep } from '../messages';
 import {
   CONFIG_FOLDER,
   CONTAINER_CONFIG_UNKNOWN_LABEL,
@@ -130,6 +139,7 @@ import {
   composeContainerOrder,
   composeMountVolumes,
   composeRecordOf,
+  serviceFoldersOf,
   configHash,
   containerIsCurrent,
   digestReference,
@@ -195,7 +205,7 @@ export type EnvironmentDocker = Pick<
   | 'removeNetwork'
   | 'listProjectImages'
   | 'inspectNetworks'
-  | 'imageNames'
+  | 'inspectImageNames'
 > & {
   /**
    * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
@@ -442,6 +452,16 @@ interface PipelineContext {
   cloned: boolean;
   /** The ownership fix before the first `up` of this run was tried. */
   ownershipPrepared: boolean;
+  /**
+   * Review round 9 (D9-1): the clone completed one that a window which ended had begun (resumeInterruptedClone): the
+   * volume may hold files that the services wrote, so the ownership fix before `up` leaves out their paths too.
+   */
+  resumedClone?: boolean;
+  /**
+   * Review round 9 (D9-1): the paths of the repository that the other services of the Docker Compose model of this run
+   * mount (composeUpModel's `serviceFolders`), set by runComposeUp.
+   */
+  serviceFolders?: string[];
   /** This run holds a busy mark. */
   busy: boolean;
   /** The workspace helper image could not be prepared (for example offline after an extension update). */
@@ -718,10 +738,41 @@ class HostAccessError extends UserFacingError {
   /** All refused settings, for the message of a refused update (Messages.updateRefused). */
   readonly items: readonly string[];
 
-  constructor(readonly report: HostAccessReport) {
-    super('hostAccess', refusalMessage(report), `Refused by the host access policy: ${describeRefusal(report)}`);
+  constructor(
+    readonly report: HostAccessReport,
+    message: string = refusalMessage(report),
+  ) {
+    super('hostAccess', message, `Refused by the host access policy: ${describeRefusal(report)}`);
     this.items = [...report.hostAccess, ...report.unsupported];
   }
+}
+
+/**
+ * Review round 9 (P9-1, P9-2): the analysis of the host access policy failed (AnalysisFailure): refused like a refusal
+ * of the policy (fail closed), but an update is not remembered as refused (it is tried again), and an analysis that
+ * could not run (`internal`) has a message of its own, does not block an existing environment whose container is only
+ * started, and blames no configuration.
+ */
+class AnalysisFailedError extends HostAccessError {
+  constructor(readonly failure: AnalysisFailure) {
+    const item = analysisFailureItem(failure);
+    super({ hostAccess: [], unsupported: [item] }, failure.kind === 'limit' ? Messages.configurationTooComplex(item) : Messages.configurationCheckInternal(item));
+  }
+
+  /** The text for the user: ANALYSIS_FAILED_ITEM, or analysisInternalItem. */
+  get item(): string {
+    return analysisFailureItem(this.failure);
+  }
+}
+
+/** Review round 9 (P9-2): an analysis that could not run (AnalysisFailure `internal`). */
+function isInternalAnalysisFailure(error: unknown): error is AnalysisFailedError {
+  return error instanceof AnalysisFailedError && error.failure.kind === 'internal';
+}
+
+/** Review round 9 (S9-1): a configuration beyond the limits of analysisLimits.ts, refused as too large or too complex. */
+function tooLargeError(reason: string): AnalysisFailedError {
+  return new AnalysisFailedError({ kind: 'limit', reason });
 }
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
@@ -1165,6 +1216,7 @@ export class EnvironmentService {
       throw error;
     }
     ctx.cloned = true;
+    ctx.resumedClone = true;
   }
 
   /** Steps 5 to 11 of the pipeline. */
@@ -1188,7 +1240,9 @@ export class EnvironmentService {
       loaded = await this.loadConfiguration(ctx, imagePresent, container);
     } catch (error) {
       const usable = container !== undefined || imagePresent;
-      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) {
+      // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
+      // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
+      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
         throw configurationError(error);
       }
       this.logger.error(`The configuration of ${ctx.env.repository} could not be used. The existing environment is started.`, error);
@@ -1342,9 +1396,12 @@ export class EnvironmentService {
       ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
     });
     const report = analysis.report;
-    // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
-    for (const item of await this.imageIdItems(analysis.imageReferences, ctx.signal)) {
-      if (!report.unsupported.includes(item)) report.unsupported.push(item);
+    // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image. Review round 9 (S9-3): only when
+    // the configuration is not refused already.
+    if (!isRefused(report)) {
+      for (const item of await this.imageIdItems(analysis.imageReferences, ctx.signal)) {
+        if (!report.unsupported.includes(item)) report.unsupported.push(item);
+      }
     }
     if (isRefused(report)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
@@ -1412,18 +1469,18 @@ export class EnvironmentService {
 
   /** The warnings of a configuration that the pipeline uses: `${localWorkspaceFolder}`, and variables of the computer. */
   private warnAboutConfiguration(configPath: string, files: ConfigFiles, problems: ConfigurationProblems): void {
+    // Review round 9 (S9-1): each message names at most MAX_LISTED_NAMES (listSome), the log at most 200.
     if (problems.computerDependent.length > 0) {
-      const items = problems.computerDependent.join(', ');
-      this.logger.warn(`The configuration ${configPath} depends on the computer: ${items}`);
-      this.deps.ui.warn(Messages.computerDependent(items));
+      this.logger.warn(`The configuration ${configPath} depends on the computer: ${listSome(problems.computerDependent, 200)}`);
+      this.deps.ui.warn(Messages.computerDependent(listSome(problems.computerDependent)));
     }
     // The values of the computer are not passed to the workspace helper: the CLI resolves the variables there, so a
     // variable that the helper sets (for example HOME) gets its value, any other one is empty or has its default.
     const localEnvNames = findLocalEnvNames(files.configText);
     if (localEnvNames.length > 0) {
       const fromHelper = helperEnvNames(localEnvNames);
-      this.logger.info(`Variables of the computer that the configuration uses and that are not passed: ${localEnvNames.join(', ')}`);
-      this.deps.ui.warn(Messages.localEnvNotPassed(localEnvNames.join(', '), fromHelper.length > 0 ? fromHelper.join(', ') : undefined));
+      this.logger.info(`Variables of the computer that the configuration uses and that are not passed: ${listSome(localEnvNames, 200)}`);
+      this.deps.ui.warn(Messages.localEnvNotPassed(listSome(localEnvNames), fromHelper.length > 0 ? fromHelper.join(', ') : undefined));
     }
   }
 
@@ -1480,6 +1537,12 @@ export class EnvironmentService {
       this.logger.warn(`Docker Compose could not read the configuration ${configPath} of ${env.repository}: ${output.error}`);
       throw new UserFacingError('buildFailed', Messages.composeConfigurationFailed, output.error);
     }
+    // Review round 9 (S9-1): before anything in this thread works on the model.
+    const tooLarge = composeModelLimit(output.model);
+    if (tooLarge !== undefined) {
+      this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} is too large to check: ${tooLarge}.`);
+      throw tooLargeError(tooLarge);
+    }
     const engineApiVersion = await this.deps.docker.engineApiVersion(ctx.signal);
     this.logger.info(
       `Docker Compose configuration ${configPath} of ${env.repository}: project ${project}, dev service ${service}, services ${Object.keys(output.model.services).join(', ')}; Docker Compose ${output.version}, Docker Engine API ${engineApiVersion ?? 'unknown'}.`,
@@ -1513,8 +1576,8 @@ export class EnvironmentService {
     // configuration, not a refusal: the existing environment still starts (runPipeline), and nothing is built.
     const missing = composeMissingBuildPaths({ model: output.model, missing: output.missing, repositoryFolder: repositoryFolder(env.repository) });
     if (missing.length > 0) {
-      this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} names paths that do not exist: ${missing.join('; ')}`);
-      throw new UserFacingError('buildFailed', Messages.buildFileMissing(missing.join('; ')));
+      this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} names paths that do not exist: ${listSome(missing, 200, '; ')}`);
+      throw new UserFacingError('buildFailed', Messages.buildFileMissing(listSome(missing, undefined, '; ')));
     }
     const ignored = composeIgnoredProperties(config);
     if (ignored.length > 0) {
@@ -1599,7 +1662,8 @@ export class EnvironmentService {
     const model = analysis.report;
     const configuration = composeConfigurationReport(config);
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
-    const ids = await this.imageIdItems(analysis.imageReferences);
+    // Review round 9 (S9-3): only when the configuration is not refused already.
+    const ids = isRefused(model) || isRefused(configuration) ? [] : await this.imageIdItems(analysis.imageReferences, ctx.signal);
     return {
       report: {
         hostAccess: [...configuration.hostAccess, ...model.hostAccess],
@@ -1617,6 +1681,12 @@ export class EnvironmentService {
     this.throwIfCancelled(ctx.signal);
     const result = await waitUnlessAborted(this.deps.analyzer.analyze(job), ctx.signal);
     this.throwIfCancelled(ctx.signal);
+    // Review round 9 (P9-1, P9-2): a failed analysis is an error of its own (still a refusal: never allowed).
+    const failure = (result as { failure?: AnalysisFailure }).failure;
+    if (failure !== undefined) {
+      this.logger.warn(`The host access analysis of the configuration of ${ctx.env.repository} failed (${failure.kind}: ${failure.reason}).`);
+      throw new AnalysisFailedError(failure);
+    }
     return result;
   }
 
@@ -1632,16 +1702,23 @@ export class EnvironmentService {
    * left (the pull or the build fails, or it is pulled by its name).
    */
   private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
-    const items: string[] = [];
+    const named: NamedImageReference[] = [];
     const seen = new Set<string>();
-    for (const { reference, what } of references) {
-      if (seen.has(`${what} ${reference}`) || imageReferenceFinding(reference, what) !== undefined) continue;
-      seen.add(`${what} ${reference}`);
-      this.throwIfCancelled(signal);
-      const names = await this.deps.docker.imageNames(reference).catch(() => undefined);
-      if (names && resolvedByImageId(reference, names.repoTags, names.repoDigests)) items.push(imageIdItem(reference, what));
+    for (const entry of references) {
+      if (seen.has(`${entry.what} ${entry.reference}`) || imageReferenceFinding(entry.reference, entry.what) !== undefined) continue;
+      seen.add(`${entry.what} ${entry.reference}`);
+      named.push(entry);
     }
-    return items;
+    const distinct = [...new Set(named.map((entry) => entry.reference))];
+    if (distinct.length === 0) return [];
+    // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
+    if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
+    this.throwIfCancelled(signal);
+    // Docker cannot inspect them: the pull or the build fails, or it is pulled by its name (as before, for each one).
+    const found = await this.deps.docker.inspectImageNames(distinct).catch(() => []);
+    this.throwIfCancelled(signal);
+    const byId = new Set(imageIdResolvedReferences(distinct, found));
+    return named.filter((entry) => byId.has(entry.reference)).map((entry) => imageIdItem(entry.reference, entry.what));
   }
 
   /** What composeBuildModel and composeUpModel need to know about the environment. */
@@ -1674,14 +1751,25 @@ export class EnvironmentService {
     const { helper } = this.deps;
     await this.requireVolume(env);
     const files = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath, signal });
-    if (files) return { configPath, files, fallback: false };
+    if (files) return { configPath, files: this.limitedConfigFiles(env, configPath, files), fallback: false };
     await this.requireVolume(env);
     const available = await helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal });
     if (available.length === 0) return undefined;
     const fallback = available[0];
     await this.requireVolume(env);
     const fallbackFiles = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath: fallback, signal });
-    return fallbackFiles ? { configPath: fallback, files: fallbackFiles, fallback: true } : undefined;
+    return fallbackFiles ? { configPath: fallback, files: this.limitedConfigFiles(env, fallback, fallbackFiles), fallback: true } : undefined;
+  }
+
+  /**
+   * Review round 9 (S9-1): a devcontainer.json longer than MAX_CONFIG_TEXT_LENGTH (READ_FILES_SCRIPT reads at most one
+   * character more) is refused as too large, before this thread parses or searches it.
+   */
+  private limitedConfigFiles(env: Environment, configPath: string, files: ConfigFiles): ConfigFiles {
+    if (files.configText.length <= MAX_CONFIG_TEXT_LENGTH) return files;
+    const reason = `the configuration ${configPath} is longer than ${MAX_CONFIG_TEXT_LENGTH} characters`;
+    this.logger.warn(`The configuration ${configPath} of ${env.repository} is too large to check: ${reason}.`);
+    throw tooLargeError(reason);
   }
 
   /**
@@ -1927,6 +2015,15 @@ export class EnvironmentService {
     try {
       result = await this.runUp(ctx, imageName, loaded.config, container !== undefined, true, loaded.compose);
     } catch (error) {
+      if (error instanceof AnalysisFailedError) {
+        // Review round 9 (P9-1): the check of the new image failed (for example a worker that ran out of time on a busy
+        // computer): no refusal of the policy, so the update is not remembered as refused; the next open tries again.
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        if (!canFallBack) throw error;
+        this.logger.warn(`The new environment image of ${env.repository} could not be checked. The existing environment is started; the next open tries the update again.`);
+        this.deps.ui.warn(Messages.updateCheckFailed(error.item));
+        return undefined;
+      }
       if (isHostAccess(error)) {
         // The new image needs access to the computer (for example a Feature of a newer version): it is not used. The check
         // runs before `up`, so the old container is unchanged. Like a failed update (concept 7.7), the environment starts
@@ -2003,6 +2100,8 @@ export class EnvironmentService {
               serviceImages: composeServiceImageReferences(loaded.compose.output.model, loaded.compose.service),
               version: loaded.compose.output.version,
               inputsHash: loaded.compose.inputsHash,
+              // Review round 9 (D9-1): of the `up` of this build.
+              ...(ctx.serviceFolders !== undefined && ctx.serviceFolders.length > 0 ? { serviceFolders: ctx.serviceFolders } : {}),
             },
           }
         : {}),
@@ -2378,7 +2477,16 @@ export class EnvironmentService {
     });
     // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
     // pass the policy too (the check of the configuration covers them as the repository wrote them).
-    const finalRunArgs = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: { runArgs: override.runArgs }, overrideConfiguration: true }), checksOn);
+    let finalRunArgs: HostAccessReport;
+    try {
+      finalRunArgs = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: { runArgs: override.runArgs }, overrideConfiguration: true }), checksOn);
+    } catch (error) {
+      // Review round 9 (P9-2): `up` only starts the existing container, which passed the check when it was created, and
+      // applies no runArgs: an analysis that could not run does not keep it from starting.
+      if (createsContainer || !isInternalAnalysisFailure(error)) throw error;
+      this.logger.warn(`The runArgs of ${env.repository} could not be checked (${error.failure.reason}). The existing container is started as it is.`);
+      finalRunArgs = { hostAccess: [], unsupported: [] };
+    }
     // What Docker gets: its last --user decides the user of the container (imageRemoteUser).
     const dockerRunArgs = stringList(override.runArgs) ?? [];
     if (isRefused(finalRunArgs)) {
@@ -2514,7 +2622,12 @@ export class EnvironmentService {
     // later"): Compose would refuse an external volume that does not exist. Only the missing ones are created.
     await this.createComposeVolumes(ctx, compose, mounts);
     // Review round 4 (D4-2): every container carries the configuration path (reconcileFromVolumes).
-    const { model, rewrites, createFolders } = composeUpModel(compose.output.model, { ...this.composeParams(env, compose, mounts.sources), image, configPath: env.configPath });
+    const { model, rewrites, createFolders, serviceFolders } = composeUpModel(compose.output.model, {
+      ...this.composeParams(env, compose, mounts.sources),
+      image,
+      configPath: env.configPath,
+    });
+    await this.recordServiceFolders(ctx, serviceFolders ?? []);
     if (rewrites.length > 0) {
       this.logger.info(`Changed in the Docker Compose model of ${env.repository}: ${rewrites.map((rewrite) => `${rewrite.item} (${rewrite.reason})`).join(', ')}.`);
     }
@@ -2532,6 +2645,8 @@ export class EnvironmentService {
       );
       // Review round 1 (P-1): as for the other recreations, the user learns that the files outside the repository go.
       ctx.steps.detail(Messages.containerComposeCreated);
+      // Review round 9 (D9-3): stopped first, so that it can shut down cleanly, as the side services (D7-1).
+      await this.stopServiceBeforeRemoval(replaced, env);
       await docker.removeContainer(replaced.id);
       (ctx.kindSwitchRemoved ??= []).push(`the container ${replaced.name}`);
       // Review round 4 (D4-1): the containers of Docker Compose that exist now (for example of an earlier switch that
@@ -2574,6 +2689,22 @@ export class EnvironmentService {
     }
     const failure = nonEmptyString(result.lifecycleCommandFailure);
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image, userArgs);
+  }
+
+  /**
+   * Review round 9 (D9-1): the paths of the repository that the other services of the model of this `up` mount
+   * (composeUpModel's `serviceFolders`): kept for the ownership fix after `up`, and in the Docker Compose build record
+   * (ComposeBuildRecord.serviceFolders) for Switch branch… and Delete. A new build record takes them from the context.
+   */
+  private async recordServiceFolders(ctx: PipelineContext, folders: string[]): Promise<void> {
+    ctx.serviceFolders = folders;
+    const current = serviceFoldersOf(ctx.env.buildRecord);
+    if (composeRecordOf(ctx.env.buildRecord) === undefined || (current.length === folders.length && current.every((folder, i) => folder === folders[i]))) return;
+    await this.updateEntry(ctx, (entry) => {
+      if (!entry.buildRecord || composeRecordOf(entry.buildRecord) === undefined || !isRecord(entry.buildRecord.compose)) return;
+      if (folders.length > 0) entry.buildRecord.compose.serviceFolders = [...folders];
+      else delete entry.buildRecord.compose.serviceFolders;
+    });
   }
 
   /**
@@ -3028,7 +3159,8 @@ export class EnvironmentService {
     const folder = repositoryFolder(env.repository);
 
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser);
+      // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner).
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, ctx.serviceFolders ?? serviceFoldersOf(env.buildRecord));
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
       // is still root when the ownership fix before `up` did not run or failed.
       await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
@@ -3075,7 +3207,9 @@ export class EnvironmentService {
       const user = await this.imageUser(image, runArgs, ctx.signal);
       if (isRootUser(user)) return;
       this.logger.info(`Giving the files in ${folder} to ${user} before the container is created.`);
-      const [shell, ...args] = ownershipFixCommand(folder, user);
+      // Review round 9 (D9-1): after a new clone, no service has run on the files yet: every file gets its owner (also the
+      // source folders that a service mounts). After a resumed clone, the paths of the services are left out.
+      const [shell, ...args] = ownershipFixCommand(folder, user, ctx.resumedClone === true ? ctx.serviceFolders : undefined);
       await docker.runChecked(
         [
           'run',
@@ -3104,10 +3238,12 @@ export class EnvironmentService {
   }
 
   /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */
-  private async fixOwnership(ctx: PipelineContext, container: string, folder: string, user: string): Promise<void> {
-    this.logger.info(`Giving the files in ${folder} to ${user}.`);
+  private async fixOwnership(ctx: PipelineContext, container: string, folder: string, user: string, serviceFolders?: readonly string[]): Promise<void> {
+    this.logger.info(
+      `Giving the files in ${folder} to ${user}${serviceFolders !== undefined && serviceFolders.length > 0 ? `, except ${serviceFolders.join(', ')} (mounted by other services)` : ''}.`,
+    );
     try {
-      const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user), {
+      const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user, serviceFolders), {
         user: 'root',
         signal: ctx.signal,
         timeoutMs: OWNERSHIP_TIMEOUT_MS,
@@ -3266,13 +3402,15 @@ export class EnvironmentService {
   /** The running containers of the other services of a Docker Compose environment are stopped (label devenv.compose-service). */
   /**
    * Review round 7, D7-1: a running container of another service of Docker Compose (label devenv.compose-service) is
-   * stopped before `docker rm -f` removes it, so that it can shut down cleanly (for example a database whose volume is
+   * stopped before `docker rm -f` removes it (review round 9, D9-3: also a dev container), so that it can shut down cleanly (for example a database whose volume is
    * kept) instead of a SIGKILL. `docker stop` gives it its own stop time (`stop_grace_period`, which the policy caps at
    * 20 s, else 10 s). A failed stop is logged; the removal follows anyway.
    */
   private async stopServiceBeforeRemoval(container: ContainerInfo, env: Environment): Promise<void> {
-    if (container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.state !== 'running') return;
-    this.logger.info(`Stopping the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${env.repository} before it is removed.`);
+    if (container.state !== 'running') return;
+    // Review round 9 (D9-3): the dev container too (its stop time is capped by the policy as well: `--stop-timeout`).
+    const service = container.labels[LABEL_COMPOSE_SERVICE];
+    this.logger.info(`Stopping the container ${container.name}${service !== undefined ? ` of the service ${service}` : ''} of ${env.repository} before it is removed.`);
     try {
       await this.deps.docker.stopContainer(container.id);
     } catch (error) {
@@ -3364,6 +3502,9 @@ export class EnvironmentService {
         await this.stopServiceBeforeRemoval(container, env);
         await docker.removeContainer(container.id);
       }
+      // Review round 9 (D9-3): a dev container without the ID label (an older version) is stopped first too.
+      const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
+      if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
       await docker.removeContainer(env.containerName);
       // Docker Compose: the other containers, the networks, and the built images of the project too.
       const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)));
@@ -3410,6 +3551,8 @@ export class EnvironmentService {
             repository: env.repository,
             branch,
             token,
+            // Review round 9 (D9-1): the restore of the owner leaves out the paths that the other services mount.
+            serviceFolders: serviceFoldersOf(env.buildRecord),
             onOutput: this.output,
             signal: options.signal,
           })
@@ -3557,7 +3700,8 @@ export class EnvironmentService {
       project: composeProjectName(env.id),
       signal,
     });
-    if ('error' in output) return undefined;
+    // Review round 9 (S9-1): a model beyond the limits counts as a change; the open refuses it.
+    if ('error' in output || composeModelLimit(output.model) !== undefined) return undefined;
     return {
       configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
       inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),

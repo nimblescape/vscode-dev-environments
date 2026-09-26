@@ -24,6 +24,7 @@ import {
   imageReferenceFinding,
   resolveNetworkReference,
   resolvedByImageId,
+  imageIdResolvedReferences,
   isHelperPath,
   isLoopbackAddress,
   isOwnVolume,
@@ -1297,5 +1298,23 @@ describe('review round 8 of unit 6 (S8-6): --restart is not passed to Docker', (
     const override = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['--restart=on-failure:5', '--init'] });
     expect((override.runArgs as string[]).some((arg) => arg.startsWith('--restart'))).toBe(false);
     expect(override.runArgs).toContain('--init');
+  });
+});
+
+describe('imageIdResolvedReferences (review round 9, S9-3)', () => {
+  const ID = `sha256:a1b2c3${'0'.repeat(58)}`;
+  const PG = { id: `sha256:${'e'.repeat(64)}`, repoTags: ['postgres:16'], repoDigests: [`postgres@sha256:${'f'.repeat(64)}`] };
+
+  it('takes the name first, then a prefix of the ID or a digest that is the ID, as Docker resolves them', () => {
+    const found = [PG, { id: ID, repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] }];
+    expect(
+      imageIdResolvedReferences(
+        ['postgres:16', `postgres@sha256:${'f'.repeat(64)}`, 'a1b2c3', 'sha256:a1b2c3', `other@${ID}`, 'missing:1', 'eeee', 'fff'],
+        found,
+      ),
+    ).toEqual(['a1b2c3', 'sha256:a1b2c3', `other@${ID}`, 'eeee']);
+    // A hexadecimal name that is a tag of an image is its name.
+    expect(imageIdResolvedReferences(['a1b2c3'], [{ id: ID, repoTags: ['a1b2c3:latest'], repoDigests: [] }])).toEqual([]);
+    expect(imageIdResolvedReferences(['a1b2c3'], [])).toEqual([]);
   });
 });

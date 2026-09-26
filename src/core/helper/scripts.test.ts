@@ -39,6 +39,9 @@ import {
   writeAndRunCommand,
 } from './scripts';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
+import { parseComposeModelOutput } from './compose';
+import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 
 function hasProgram(name: string, args: string[]): boolean {
   return !spawnSync(name, args, { stdio: 'ignore' }).error;
@@ -412,7 +415,12 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(result.status, result.stderr).toBe(0);
     const lines = result.stdout.trim().split('\n');
     expect(lines).toHaveLength(1);
-    return JSON.parse(lines[0]);
+    const value = JSON.parse(lines[0]) as Record<string, unknown>;
+    // Review round 9, S9-2: the script prints each Dockerfile once (dockerfileTexts); parseComposeModelOutput gives
+    // each service its text in `dockerfiles`, as the extension reads it.
+    const parsed = parseComposeModelOutput(lines[0]);
+    if (!('error' in parsed)) value.dockerfiles = parsed.dockerfiles;
+    return value;
   }
 
   it('prints the real paths of additional contexts, SSH keys, and the files of build secrets (review round 2, S2-03)', () => {
@@ -444,6 +452,30 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
       [`${repo}/secret-link`]: fs.realpathSync(path.join(dir, 'secret.txt')),
     });
     expect(Object.keys(output.realPaths).some((key) => key.includes('alpine') || key.includes('example.com'))).toBe(false);
+  });
+
+  it('reads each Dockerfile once, and at most one character more than the extension takes (review round 9, S9-2)', () => {
+    const { repo, env } = setup();
+    // Five services build the same Dockerfile, which is much longer than MAX_DOCKERFILE_LENGTH.
+    write(path.join(repo, 'Dockerfile'), `FROM alpine\nRUN echo ${'a'.repeat(MAX_DOCKERFILE_LENGTH + 5000)}\n`);
+    const services = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`s${i}`, { build: { context: repo, dockerfile: 'Dockerfile' } }]));
+    const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+    const result = spawnSync(process.execPath, command.slice(1), {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      env: { ...env, FAKE_MODEL: JSON.stringify({ name: 'devenv-3f2a9c1e', services }) },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    // Before: the whole file, once per service (5 × the file).
+    expect(result.stdout.length).toBeLessThan(MAX_DOCKERFILE_LENGTH + 10_000);
+    const raw = JSON.parse(result.stdout) as { dockerfileTexts: Record<string, string>; dockerfileFiles: Record<string, string> };
+    expect(Object.keys(raw.dockerfileTexts)).toEqual([fs.realpathSync(path.join(repo, 'Dockerfile'))]);
+    expect(Object.keys(raw.dockerfileFiles)).toEqual(['s0', 's1', 's2', 's3', 's4']);
+    const parsed = parseComposeModelOutput(result.stdout);
+    if ('error' in parsed) throw new Error(parsed.error);
+    // Each service has the text, one character longer than the limit: the check refuses it as too large.
+    for (let i = 0; i < 5; i++) expect(parsed.dockerfiles[`s${i}`]).toHaveLength(MAX_DOCKERFILE_LENGTH + 1);
+    expect(parsed.dockerfiles.s0.startsWith('FROM alpine\nRUN echo aaa')).toBe(true);
   });
 
   it('prints the model of all profiles, the Dockerfiles in the repository, and the real paths', () => {
@@ -678,7 +710,7 @@ describe('LIST_CONFIGS_SCRIPT', () => {
 describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
   // The script needs Linux (a tmpfs in /proc/mounts, GNU stat). Fake tools on PATH stand in for them and for Git, and
   // record what the script does.
-  function runSwitch(git: { fetchExit: number; switchExit: number }): {
+  function runSwitch(git: { fetchExit: number; switchExit: number }, serviceFolders?: (repo: string) => string[]): {
     status: number | null;
     stdout: string;
     stderr: string;
@@ -712,7 +744,8 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
       ].join('\n'),
     );
     const script = SWITCH_BRANCH_SCRIPT.split(SECRETS_FOLDER).join(secrets);
-    const result = spawnSync('sh', ['-c', script, 'sh', repo, 'dev', 'acme/api'], {
+    const command = switchBranchCommand(repo, 'dev', 'acme/api', serviceFolders?.(repo));
+    const result = spawnSync('sh', ['-c', script, ...command.slice(3)], {
       encoding: 'utf8',
       input: 'gho_secret',
       env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
@@ -741,6 +774,23 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     expect(result.log).toContain('git switch');
     expect(result.log).toMatch(/find .*-exec chown -h 1000:1000/);
     expect(result.tokenLeft).toBe(false);
+  });
+
+  it('leaves out the paths that other services mount when it restores the owner (review round 9, D9-1)', () => {
+    let repoFolder = '';
+    const result = runSwitch({ fetchExit: 0, switchExit: 0 }, (repo) => {
+      repoFolder = repo;
+      return [`${repo}/data/postgres`, `${repo}/-data/my db`, '/elsewhere'];
+    });
+    expect(result.status).toBe(0);
+    // Before: `find <repo> -xdev \( … \) -exec chown …`, over the data of the services.
+    expect(result.log).toContain(`find ${repoFolder} -xdev -path ${repoFolder}/data/postgres -prune -o -path ${repoFolder}/-data/my db -prune -o ( ! -uid 1000`);
+    expect(switchBranchCommand('/workspaces/api', 'dev', 'acme/api', ['/workspaces/api/data/postgres']).slice(4)).toEqual([
+      '/workspaces/api',
+      'dev',
+      'acme/api',
+      '/workspaces/api/data/postgres',
+    ]);
   });
 
   it('restores the owner and does not switch when the fetch fails', () => {
@@ -1109,6 +1159,26 @@ describe('READ_FILES_SCRIPT', () => {
     expect(result.status).toBe(0);
     return JSON.parse(result.stdout);
   }
+
+  it('reads at most one character more than the extension takes of the configuration and the Dockerfile (review round 9, S9-1, S9-2)', () => {
+    const repo = tempDir();
+    const readBig = (): { configText: string; dockerfileText?: string } => {
+      const command = readFilesCommand(repo, '.devcontainer/devcontainer.json');
+      const run = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      expect(run.status, run.stderr).toBe(0);
+      return JSON.parse(run.stdout) as { configText: string; dockerfileText?: string };
+    };
+    write(path.join(repo, '.devcontainer', 'devcontainer.json'), '{ "build": { "dockerfile": "Dockerfile" } }');
+    // Of 3 bytes per character in UTF-8: the limit counts characters, not bytes. A Dockerfile within it is read whole.
+    const within = `FROM alpine\n# ${'€'.repeat(MAX_DOCKERFILE_LENGTH - 20)}\n`;
+    write(path.join(repo, '.devcontainer', 'Dockerfile'), within);
+    expect(readBig().dockerfileText).toBe(within);
+    // Before: the whole file of any size.
+    write(path.join(repo, '.devcontainer', 'Dockerfile'), `FROM alpine\n# ${'€'.repeat(MAX_DOCKERFILE_LENGTH * 2)}\n`);
+    expect(readBig().dockerfileText).toHaveLength(MAX_DOCKERFILE_LENGTH + 1);
+    write(path.join(repo, '.devcontainer', 'devcontainer.json'), `{ "image": "alpine", "x": "${'€'.repeat(MAX_CONFIG_TEXT_LENGTH * 2)}" }`);
+    expect(readBig().configText).toHaveLength(MAX_CONFIG_TEXT_LENGTH + 1);
+  });
 
   it('reads a configuration in a folder whose name has a backslash (review round 6, note of S)', () => {
     const repo = tempDir();

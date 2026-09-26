@@ -172,6 +172,11 @@ async function activateExtension(
   });
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
+  // Review round 9 (P9-2): without its bundle every analysis fails (as an internal error, which refuses new and changed
+  // configurations): the log says why at once.
+  if (!fs.existsSync(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')))) {
+    logger.error('The bundle of the configuration check (dist/configurationAnalysisWorker.js) is missing. Reinstall Dev Environments.');
+  }
   const service = new EnvironmentService({
     docker,
     runner,

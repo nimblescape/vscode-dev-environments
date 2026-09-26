@@ -10,9 +10,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   GIT_SUMMARY_SCRIPT,
   OWNERSHIP_FIX_SCRIPT,
+  PRUNE_ARGUMENTS,
   gitSummaryCommand,
   ownershipFixCommand,
   parseGitSummaryOutput,
+  servicePrunePatterns,
 } from './gitSummary';
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';
@@ -122,6 +124,51 @@ describe('commands', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     expect(fs.statSync(path.join(dir, 'sub', 'file.txt')).uid).toBe(os.userInfo().uid);
+  });
+});
+
+describe('review round 9 (D9-1): the ownership fix leaves out the paths that other services mount', () => {
+  const REPO = '/workspaces/api';
+
+  it('passes each path as one argument, escaped as a pattern of find -path, and only paths below the repository', () => {
+    expect(servicePrunePatterns(REPO, [`${REPO}/data/postgres`, `${REPO}/-data/my db`, `${REPO}/a*b/[x]?\\y`])).toEqual([
+      `${REPO}/data/postgres`,
+      `${REPO}/-data/my db`,
+      `${REPO}/a\\*b/\\[x]\\?\\\\y`,
+    ]);
+    // Never the repository itself, a path outside of it, a relative path, `..`, or a duplicate.
+    expect(servicePrunePatterns(REPO, [REPO, `${REPO}/`, '/workspaces/other/data', 'data', `${REPO}/../other`, `${REPO}//x`, `${REPO}/x`, `${REPO}/x`])).toEqual([
+      `${REPO}/x`,
+    ]);
+    expect(servicePrunePatterns(REPO, undefined)).toEqual([]);
+    expect(ownershipFixCommand(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', REPO, 'vscode', `${REPO}/data/postgres`]);
+  });
+
+  it('turns the parameters into -path/-prune arguments without reading them as shell text', () => {
+    // As SWITCH_BRANCH_SCRIPT uses it: after `shift 3`.
+    const script = `shift 3\n${PRUNE_ARGUMENTS}printf '<%s>\\n' "$@"`;
+    const result = spawnSync('sh', ['-c', script, 'sh', 'a', 'b', 'c', '/r/-x y', '/r/$(touch z)'], { encoding: 'utf8' });
+    expect(result.stdout).toBe('<-path>\n</r/-x y>\n<-prune>\n<-o>\n<-path>\n</r/$(touch z)>\n<-prune>\n<-o>\n');
+    expect(spawnSync('sh', ['-c', `shift 3\n${PRUNE_ARGUMENTS}echo "$#"`, 'sh', 'a', 'b', 'c'], { encoding: 'utf8' }).stdout).toBe('0\n');
+  });
+
+  it('changes the owner of every file but the pruned paths and their content (with spaces and a leading -)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'api');
+    const bin = path.join(root, 'bin');
+    const log = path.join(root, 'chown.log');
+    for (const folder of ['src', 'data/postgres/base', '-data/my db', 'datax']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'data/postgres/base/1', 'data/keep.txt', '-data/my db/f', 'datax/g']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The user 4242 owns none of the files: the fix would change all of them; chown only writes its arguments.
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'chown'), `#!/bin/sh\nshift 2\nfor f do printf '%s\\n' "$f" >> '${log}'; done\n`, { mode: 0o755 });
+    const [file, ...args] = ownershipFixCommand(repo, 'someone', [`${repo}/data/postgres`, `${repo}/-data/my db`]);
+    const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const changed = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => path.relative(repo, line)).sort();
+    expect(changed).toEqual(['', '-data', 'data', 'data/keep.txt', 'datax', 'datax/g', 'src', 'src/a.ts']);
   });
 });
 

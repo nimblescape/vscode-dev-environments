@@ -10,14 +10,14 @@ import { isBlockingBusyMark } from '../core/busy';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
-import { Actions, Messages, formatChanges } from '../core/messages';
+import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import type { WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import { PipelineTexts, type ConfigurationKindChange, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
-import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
+import { containerIsCurrent, isUnrestrictedContainer, repositoryServiceDataFolders } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -628,9 +628,13 @@ export class Controller implements vscode.Disposable {
           : '';
         // Without a summary (the volume is missing), the confirmation follows at once.
         const changes = summary ? formatChanges(summary) : '';
+        // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
+        // confirmation names them, as the question about the data volumes of the services (D-19) names those.
+        const repositoryData = repositoryServiceDataFolders((await this.deps.registry.get(environment.id)) ?? environment);
+        const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
         if (changes !== '') {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteUnsaved(repository, changes)}${otherWindow}`,
+            `${Messages.deleteUnsaved(repository, changes)}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.openEnvironment,
             Actions.deleteAnyway,
@@ -639,7 +643,7 @@ export class Controller implements vscode.Disposable {
           if (choice !== Actions.deleteAnyway) return;
         } else {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteConfirm(repository)}${otherWindow}`,
+            `${Messages.deleteConfirm(repository)}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.delete,
           );

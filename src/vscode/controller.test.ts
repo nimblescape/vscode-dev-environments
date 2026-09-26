@@ -1065,6 +1065,39 @@ describe('Delete', () => {
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
+  it('names the service data in folders of the repository in the confirmation (review round 9, D9-2)', async () => {
+    const record = {
+      builtAt: iso(NOW),
+      environmentImage: 'devenv-3f2a9c1e:1',
+      buildNumber: 1,
+      configPath: '.devcontainer/devcontainer.json',
+      configHash: 'sha256:x',
+      images: {},
+      features: {},
+      compose: { service: 'app', images: [], serviceFolders: ['/workspaces/api/data/postgres', '/workspaces/api/init.sql', '/workspaces/other/x'] },
+    };
+    await h.registry.add(environment({ buildRecord: record }));
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', environment({ buildRecord: record })));
+    // Before: only Messages.deleteConfirm: the data of the database went with the volume without a word.
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toEqual([
+      `${Messages.deleteConfirm('acme/api')} ${Messages.deleteRepositoryServiceData('./data/postgres, ./init.sql')}`,
+      { modal: true },
+      Actions.delete,
+    ]);
+    expect(Messages.deleteRepositoryServiceData('./data/postgres')).toBe('Service data in the repository will be deleted: ./data/postgres.');
+    expect(h.service.delete).toHaveBeenCalled();
+
+    // With unsaved changes too.
+    fakeVscode.window.showWarningMessage.mockReset();
+    h.service.safetyCheck.mockResolvedValueOnce({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment({ buildRecord: record })));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
+      `${Messages.deleteUnsaved('acme/api', '1 uncommitted')} ${Messages.deleteRepositoryServiceData('./data/postgres, ./init.sql')}`,
+    );
+  });
+
   it('offers only the additional volumes that Delete would remove, and asks nothing when there are none', async () => {
     await h.registry.add(environment({ additionalVolumes: ['api-db', 'legacy-cache'] }));
     h.service.removableAdditionalVolumes.mockResolvedValueOnce(['api-db']);

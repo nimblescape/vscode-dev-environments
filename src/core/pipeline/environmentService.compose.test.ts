@@ -17,6 +17,7 @@ import {
   type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
+import { ANALYSIS_FAILED_ITEM } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
 import {
@@ -1165,6 +1166,8 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
       serviceImages: [DB_IMAGE],
       version: '2.40.3',
       inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}),
+      // Review round 9, D9-1: the path of the repository that db mounts (init.sql).
+      serviceFolders: [`${FOLDER}/init.sql`],
     });
   });
 });
@@ -1789,5 +1792,160 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     h.helper.createFoldersError = new Error('data leads out of the repository');
     await expect(h.service.open(TARGET, options())).rejects.toThrow();
     expect(h.helper.ups).toEqual([]);
+  });
+});
+
+describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the paths of the repository that other services mount', () => {
+  const SOURCE = `${FOLDER}/data/postgres`;
+  const INIT_SQL = `${FOLDER}/init.sql`;
+
+  function withDataFolder(): void {
+    const out = output((m) => {
+      m.services.db.volumes = [
+        { type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } },
+        { type: 'bind', source: INIT_SQL, target: '/docker-entrypoint-initdb.d/init.sql', read_only: true, bind: {} },
+      ];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: FOLDER };
+    useCompose(h, out);
+  }
+
+  /** The arguments after `sh -c <script> sh` of the ownership fix of the repository folder with `docker exec`. */
+  function fixArguments(): string[][] {
+    return h.docker.execs
+      .filter((e) => e.user === 'root' && e.command[0] === 'sh' && e.command[2].includes('chown') && e.command[4] === FOLDER)
+      .map((e) => e.command.slice(4));
+  }
+
+  it('leaves the data folder of db out of the fix after up, and records the paths in the build record', async () => {
+    withDataFolder();
+    await h.service.open(TARGET, options());
+    // Before: `[FOLDER, 'vscode']`: the fix after `up` (db has run) gave the data of Postgres to vscode.
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE, INIT_SQL]]);
+    // The fix before `up` of the new clone: no service has run on the files yet, so every file gets its owner.
+    const before = h.docker.runs.filter((run) => run.all.includes('--entrypoint'));
+    expect(before).toHaveLength(1);
+    expect(before[0].args.slice(-2)).toEqual([FOLDER, 'vscode']);
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toEqual([SOURCE, INIT_SQL]);
+  });
+
+  it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
+    withDataFolder();
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE, INIT_SQL]]);
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders).toEqual([[SOURCE, INIT_SQL]]);
+  });
+
+  it('records the paths at an up without a build, and leaves out nothing for a build record written before them', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    // A record without serviceFolders (written by an earlier version): Switch branch… leaves out nothing, as before.
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders).toEqual([[]]);
+    // The next start with up records the paths of the model (the default model: init.sql of db).
+    await h.service.openEnvironment(ENV_ID, options());
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toEqual([INIT_SQL]);
+    await h.service.switchBranch(ENV_ID, 'main', options());
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([INIT_SQL]);
+  });
+});
+
+describe('review round 9 of unit 6 (D9-3): a dev container is stopped before it is removed', () => {
+  function stopBeforeRemove(id: string): void {
+    const stop = h.docker.log.indexOf(`stop ${id}`);
+    const rm = h.docker.log.indexOf(`rm ${id}`);
+    // Before: only `rm -f` (a SIGKILL of the processes of the running container).
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(rm).toBeGreaterThan(stop);
+  }
+
+  it('stops the running dev container of Docker Compose before Delete removes it', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    const dev = devContainer()!;
+    const db = dbContainer()!;
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    stopBeforeRemove(dev.id);
+    stopBeforeRemove(db.id);
+  });
+
+  it('stops a running single container before Delete removes it', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const dev = h.docker.containersOf(ENV_ID)[0];
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    stopBeforeRemove(dev.id);
+  });
+
+  it('stops the running single container before the switch to Docker Compose replaces it', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.containers.has(single.id)).toBe(false);
+    stopBeforeRemove(single.id);
+  });
+
+  it('removes a stopped dev container without a stop', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    const dev = h.docker.containersOf(ENV_ID)[0];
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.log).not.toContain(`stop ${dev.id}`);
+    expect(h.docker.log).toContain(`rm ${dev.id}`);
+  });
+});
+
+describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension host for a Docker Compose model', () => {
+  it('refuses a model with more services than MAX_COMPOSE_SERVICES before it analyses or rewrites it (S9-1)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        for (let i = 0; i < 501; i++) m.services[`s${i}`] = { image: 'alpine:3.22' };
+      }),
+    );
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.includes('503 services (at most 500)'))).toBe(true);
+  });
+
+  it('asks Docker about the image IDs of all services with one call, and not at all for a refused model (S9-3)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        for (let i = 0; i < 50; i++) m.services[`s${i}`] = { image: `example.com/s${i}:1` };
+      }),
+    );
+    await h.service.open(TARGET, options());
+    // Before: one `docker image inspect` per reference (104). Now one for each check of the model: before the build, and
+    // before the `up` that creates the containers.
+    expect(h.docker.imageInspections).toHaveLength(2);
+    for (const references of h.docker.imageInspections) {
+      expect(references).toHaveLength(52);
+      expect(references).toEqual(expect.arrayContaining([DB_IMAGE, BASE_IMAGE, 'example.com/s0:1', 'example.com/s49:1']));
+    }
+    h.docker.imageInspections.length = 0;
+    useCompose(
+      h,
+      output((m) => {
+        m.services.db.privileged = true;
+      }),
+    );
+    await expect(h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true })).rejects.toMatchObject({ code: 'hostAccess' });
+    expect(h.docker.imageInspections).toEqual([]);
+  });
+
+  it('still refuses a service image that Docker resolves by its image ID', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: 'a1b2c3' };
+      }),
+    );
+    h.docker.images.add('a1b2c3');
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain('image a1b2c3 (an image ID; name the image)');
   });
 });

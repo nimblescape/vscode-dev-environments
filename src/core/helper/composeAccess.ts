@@ -549,7 +549,19 @@ function dockerfilePath(context: string, build: Record<string, unknown>): string
 
 /** Whether `file` is a missing path of the repository (ComposeAccessInput.missing, review round 3, P3-1). */
 function isMissing(file: string, ctx: ServiceContext): boolean {
-  return (ctx.input.missing ?? []).includes(file) && isRepositoryPath(file, ctx.input.repositoryFolder);
+  return missingSet(ctx.input.missing).has(file) && isRepositoryPath(file, ctx.input.repositoryFolder);
+}
+
+/** Review round 9 (S9-1): ComposeAccessInput.missing as a Set (one per list), so that a lookup costs constant time. */
+const missingSets = new WeakMap<readonly string[], ReadonlySet<string>>();
+function missingSet(missing: readonly string[] | undefined): ReadonlySet<string> {
+  if (missing === undefined) return new Set();
+  let set = missingSets.get(missing);
+  if (set === undefined) {
+    set = new Set(missing);
+    missingSets.set(missing, set);
+  }
+  return set;
 }
 
 /**
@@ -559,14 +571,14 @@ function isMissing(file: string, ctx: ServiceContext): boolean {
  * and builds nothing. A link that leads out of the repository, or nowhere, is no missing path: the policy refuses it.
  */
 export function composeMissingBuildPaths(input: Pick<ComposeAccessInput, 'model' | 'missing' | 'repositoryFolder'>): string[] {
-  const missing = input.missing ?? [];
+  const missing = missingSet(input.missing);
   const items: string[] = [];
-  if (missing.length === 0) return items;
+  if (missing.size === 0) return items;
   for (const [name, service] of Object.entries(isRecord(input.model.services) ? input.model.services : {})) {
     const build = isRecord(service) && isRecord(service.build) ? service.build : undefined;
     const context = build !== undefined && typeof build.context === 'string' ? build.context : undefined;
     if (build === undefined || context === undefined || isRemoteContext(context)) continue;
-    const inRepository = (file: string): boolean => missing.includes(file) && isRepositoryPath(file, input.repositoryFolder);
+    const inRepository = (file: string): boolean => missing.has(file) && isRepositoryPath(file, input.repositoryFolder);
     if (inRepository(context)) items.push(`service ${name}: build context ${context}`);
     else if (isUnset(build.dockerfile_inline) && inRepository(dockerfilePath(context, build))) items.push(`service ${name}: Dockerfile ${dockerfilePath(context, build)}`);
   }

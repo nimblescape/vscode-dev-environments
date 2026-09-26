@@ -685,6 +685,26 @@ describe('images', () => {
     ]);
   });
 
+  it('inspectImageNames asks about many references with one call per batch, and leaves out missing ones (review round 9, S9-3)', async () => {
+    const line = (id: string, tag: string) => JSON.stringify({ id, repoTags: [tag], repoDigests: null });
+    const { docker, runner } = adapter((call) => {
+      const refs = call.args.slice(call.args.indexOf('--') + 1);
+      if (refs.includes('broken')) return fail('Cannot connect to the Docker daemon');
+      const found = refs.filter((ref) => !ref.startsWith('gone'));
+      const stdout = found.map((ref) => line(`sha256:${ref.length}`, ref)).join('\n') + '\n';
+      return found.length === refs.length ? ok(stdout) : { exitCode: 1, stdout, stderr: 'Error response from daemon: No such image: gone', timedOut: false };
+    });
+    const references = Array.from({ length: 150 }, (_, i) => (i === 3 ? 'gone:1' : `r${i}:1`));
+    const found = await docker.inspectImageNames(references);
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[0].args.slice(0, 5)).toEqual(['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--']);
+    expect(runner.calls[0].args).toHaveLength(105);
+    expect(found).toHaveLength(149);
+    expect(found[0]).toEqual({ id: 'sha256:4', repoTags: ['r0:1'], repoDigests: [] });
+    await expect(docker.inspectImageNames(['broken'])).rejects.toBeInstanceOf(CommandError);
+    expect(await docker.inspectImageNames([])).toEqual([]);
+  });
+
   it('imageId returns the ID, undefined for a missing image, and throws for other errors', async () => {
     const id = `sha256:${'7'.repeat(64)}`;
     const { docker, runner } = adapter((call) => {

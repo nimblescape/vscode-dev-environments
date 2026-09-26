@@ -57,6 +57,13 @@ export interface ComposeBuildRecord {
    */
   version?: string;
   inputsHash?: string;
+  /**
+   * Review round 9 (D9-1): the paths of the repository (absolute, for example `/workspaces/api/data/postgres`) that the
+   * other services mount from the workspace volume (composeUpModel's `serviceFolders`), as the last `up` used them. They
+   * may hold the data of those services with their own owner: the ownership fixes after `up` and of Switch branch… leave
+   * them out, and the question of Delete names them. A record without it (written before) leaves nothing out.
+   */
+  serviceFolders?: string[];
 }
 
 export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';

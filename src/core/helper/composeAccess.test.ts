@@ -8,6 +8,7 @@ import {
   composeAccessReport,
   composeConfigurationReport,
   composeIgnoredProperties,
+  composeMissingBuildPaths,
   durationSeconds,
   type ComposeAccessInput,
 } from './composeAccess';
@@ -508,5 +509,23 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
   it('refuses it when the nearest folder is a link out of the repository, or not known', () => {
     expect(withData({ [SOURCE]: '/workspaces/.devenv+' })).toEqual(A(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /workspaces/.devenv+, outside of the repository)`));
     expect(withData()).toEqual(U(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (the path does not exist in the repository)`));
+  });
+});
+
+describe('review round 9 (S9-1): many missing build paths', () => {
+  it('names 20000 missing build contexts in less than 1 s', () => {
+    const repo = '/workspaces/api';
+    const services: Record<string, unknown> = { app: { image: 'alpine:3.22' } };
+    const missing: string[] = [];
+    for (let i = 0; i < 20_000; i++) {
+      services[`s${i}`] = { build: { context: `${repo}/m${i}`, dockerfile: 'Dockerfile' } };
+      missing.push(`${repo}/m${i}`, `${repo}/m${i}/Dockerfile`);
+    }
+    const start = performance.now();
+    const items = composeMissingBuildPaths({ model: { services } as ComposeModel, missing, repositoryFolder: repo });
+    // Before: seconds (missing.includes for each service).
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(items).toHaveLength(20_000);
+    expect(items[0]).toBe(`service s0: build context ${repo}/m0`);
   });
 });

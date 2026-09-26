@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
+import { IMAGE_INSPECT_BATCH } from '../helper/analysisLimits';
 import { Messages } from '../messages';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
@@ -132,6 +133,13 @@ export function mapContainerState(rawState: string): ContainerState {
     default:
       return 'stopped';
   }
+}
+
+/** Review round 9 (S9-3): an image as `docker image inspect` describes it: its ID, tags, and digests. */
+export interface ImageNames {
+  id: string;
+  repoTags: string[];
+  repoDigests: string[];
 }
 
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
@@ -704,6 +712,28 @@ export class ContainerAdapter {
     if (!isRecord(value)) throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
     const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
     return { repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) };
+  }
+
+  /**
+   * Review round 9 (S9-3): the ID, tags, and digests of the local images that `references` name, with one `docker image
+   * inspect` per IMAGE_INSPECT_BATCH references (not one per reference), in the order that Docker prints them (the
+   * order of the references; a missing one is left out). Which reference found which image: imageIdResolvedReferences.
+   * Throws CommandError when Docker fails for another reason than a missing image.
+   */
+  async inspectImageNames(references: readonly string[]): Promise<ImageNames[]> {
+    const found: ImageNames[] = [];
+    for (let start = 0; start < references.length; start += IMAGE_INSPECT_BATCH) {
+      const batch = references.slice(start, start + IMAGE_INSPECT_BATCH);
+      const args = ['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--', ...batch];
+      const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+      if (result.exitCode !== 0 && !this.isMissing(result, 'image')) throw this.commandError(args, result);
+      const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
+      for (const value of parseJsonLines(result.stdout)) {
+        if (!isRecord(value) || typeof value.id !== 'string') throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
+        found.push({ id: value.id, repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) });
+      }
+    }
+    return found;
   }
 
   /**

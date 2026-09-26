@@ -17,7 +17,17 @@
 // the worker beyond the same limit.
 import { Worker } from 'worker_threads';
 import type { Logger } from '../ports';
-import { analysisFailure, isAnalysisResult, type AnalysisJob, type AnalysisResult, type ConfigurationAnalyzer } from './configurationAnalysis';
+import { MAX_ANALYSIS_JOB_CHARACTERS } from './analysisLimits';
+import {
+  analysisFailure,
+  exceedsJobSize,
+  isAnalysisResult,
+  thrownFailure,
+  type AnalysisFailureKind,
+  type AnalysisJob,
+  type AnalysisResult,
+  type ConfigurationAnalyzer,
+} from './configurationAnalysis';
 import type { AnalysisWorkerMessage } from './configurationAnalysisWorker';
 
 /** The limits of one job: its time, and the memory of its worker (Node's `resourceLimits` of a Worker). */
@@ -39,16 +49,29 @@ export const ANALYSIS_LIMITS: Readonly<AnalysisLimits> = {
   stackSizeMb: 4,
 };
 
+/**
+ * Review round 9 (P9-1, P9-2): each failure is of the kind `limit` (the time or memory of the worker, or the size of the
+ * job: the configuration) or `internal` (the worker did not start, ended or crashed without an answer, or answered with
+ * something else; also the time limit before the worker was running).
+ */
 export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
   constructor(
     private readonly scriptPath: string,
     private readonly logger?: Pick<Logger, 'warn'>,
     private readonly limits: Readonly<AnalysisLimits> = ANALYSIS_LIMITS,
+    private readonly maxJobCharacters: number = MAX_ANALYSIS_JOB_CHARACTERS,
   ) {}
 
   analyze<J extends AnalysisJob>(job: J): Promise<AnalysisResult<J>> {
+    // Review round 9 (S9-2): the structured clone of postMessage copies the job in this thread: never one of this size.
+    if (exceedsJobSize(job, this.maxJobCharacters)) {
+      const reason = `the configuration is larger than ${Math.round(this.maxJobCharacters / (1024 * 1024))} million characters`;
+      this.logger?.warn(`The host access analysis of the configuration failed (${reason}); the configuration is refused.`);
+      return Promise.resolve(analysisFailure(job, { kind: 'limit', reason }));
+    }
     return new Promise((resolve) => {
       let worker: Worker | undefined;
+      let online = false;
       let done = false;
       let watch: ReturnType<typeof setInterval> | undefined;
       const finish = (result: AnalysisResult<J>, failure?: string): void => {
@@ -67,8 +90,12 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
         }
         resolve(result);
       };
-      const fail = (reason: string): void => finish(analysisFailure(job), reason);
-      const timer = setTimeout(() => fail(`it took longer than ${this.limits.timeoutMs} ms`), this.limits.timeoutMs);
+      const fail = (reason: string, kind: AnalysisFailureKind = 'internal'): void => finish(analysisFailure(job, { kind, reason }), reason);
+      // A worker that is not running yet when the time is up did not start (for example on a machine under load).
+      const timer = setTimeout(
+        () => (online ? fail(`it took longer than ${this.limits.timeoutMs} ms`, 'limit') : fail(`the worker did not start within ${this.limits.timeoutMs} ms`)),
+        this.limits.timeoutMs,
+      );
       try {
         worker = new Worker(this.scriptPath, {
           resourceLimits: {
@@ -82,14 +109,30 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
         return;
       }
       worker.on('message', (message: AnalysisWorkerMessage) => {
-        if (message?.ok === true && isAnalysisResult(job, message.result)) finish(message.result as AnalysisResult<J>);
-        else fail(message?.ok === false ? `error: ${message.error}` : 'an answer that is no result');
+        if (message?.ok === true && isAnalysisResult(job, message.result)) {
+          // Only what a result has: a failure is never taken from a worker.
+          const { failure: _ignored, ...result } = message.result as AnalysisResult<J> & { failure?: unknown };
+          finish(result as AnalysisResult<J>);
+        } else if (message?.ok === false) {
+          const failure = thrownFailure(message.error);
+          fail(failure.reason, failure.kind);
+        } else fail('an answer that is no result');
       });
-      // ERR_WORKER_OUT_OF_MEMORY for a limit of `resourceLimits`, or an error of the script.
-      worker.on('error', (error: Error & { code?: string }) => fail(error.code === 'ERR_WORKER_OUT_OF_MEMORY' ? 'it used too much memory' : `error: ${error.message}`));
+      // ERR_WORKER_OUT_OF_MEMORY for a limit of `resourceLimits`, or an error of the script (before `online`: it did not
+      // start, for example a missing bundle).
+      worker.on('error', (error: Error & { code?: string }) =>
+        error.code === 'ERR_WORKER_OUT_OF_MEMORY'
+          ? fail('it used too much memory', 'limit')
+          : fail(
+              online && error.code !== 'MODULE_NOT_FOUND' && error.code !== 'ERR_MODULE_NOT_FOUND'
+                ? `error: ${error.message}`
+                : `the worker did not start: ${error.message}`,
+            ),
+      );
       worker.on('exit', (code) => fail(`the worker ended with exit code ${code}`));
       worker.once('online', () => {
-        if (!done && worker !== undefined) watch = this.watchMemory(worker, () => fail('it used too much memory'));
+        online = true;
+        if (!done && worker !== undefined) watch = this.watchMemory(worker, () => fail('it used too much memory', 'limit'));
       });
       try {
         worker.postMessage(job);

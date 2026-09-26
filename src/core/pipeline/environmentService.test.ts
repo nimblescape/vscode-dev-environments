@@ -11,6 +11,16 @@ import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { hostAccessProblems } from '../helper/hostAccess';
+import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
+import {
+  ANALYSIS_FAILED_ITEM,
+  analysisFailure,
+  analysisInternalItem,
+  inProcessAnalyzer,
+  type AnalysisFailure,
+  type AnalysisJob,
+  type ConfigurationAnalyzer,
+} from '../helper/configurationAnalysis';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
 import type { EnsureImageOptions } from '../helper/workspaceHelper';
@@ -3477,5 +3487,131 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
       Messages.hostAccess('FROM image devenv-7c1d2e3f:1 of another environment, FROM image devenv-7c1d2e3f:2 of another environment'),
     );
     expect(h.helper.builds).toEqual([]);
+  });
+});
+
+describe('review round 9 (P9-1, P9-2): a failed analysis of the host access policy', () => {
+  /** An analyzer that fails the jobs that `fails` picks, with `failure`, and runs the others in this thread. */
+  function failingAnalyzer(fails: (job: AnalysisJob) => boolean, failure: AnalysisFailure): { analyzer: ConfigurationAnalyzer; enabled: { on: boolean } } {
+    const enabled = { on: true };
+    return {
+      enabled,
+      analyzer: {
+        analyze: <J extends AnalysisJob>(job: J) => (enabled.on && fails(job) ? Promise.resolve(analysisFailure(job, failure)) : inProcessAnalyzer.analyze(job)),
+      },
+    };
+  }
+  const isMetadataJob = (job: AnalysisJob): boolean => job.kind === 'hostAccess' && job.input.metadata !== undefined;
+
+  it('does not remember an update whose new image could not be checked, and tries it again at the next open (P9-1)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(isMetadataJob, { kind: 'limit', reason: 'it took longer than 10000 ms' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: remembered as a refused update (Messages.updateRefused), so the next opens did not build it again.
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(ANALYSIS_FAILED_ITEM)]);
+    expect(Messages.updateCheckFailed('x')).toBe('The configuration could not be checked. Try again. (x.) The environment is started without the update.');
+    // The old container started.
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.containersOf(ENV_ID)[0].image).toBe(IMAGE_1);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    // The next open (the worker works again) builds the update again, and uses it.
+    failing.enabled.on = false;
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    h.ui.warnings.length = 0;
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.builds).toHaveLength(2);
+    expect(h.ui.warnings).toEqual([]);
+  });
+
+  it('starts an existing environment when the analysis cannot run, with an internal-error text, and builds nothing (P9-2)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(() => true, { kind: 'internal', reason: 'the worker did not start: Cannot find module' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { container: 'stopped' });
+    // A changed configuration: it is not applied (fail closed), the existing container starts as it is.
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: DEFAULT_CONFIG_TEXT.replace('{', '{ "name": "changed",') };
+    // Before: refused with "too large or too complex … Change the configuration of the repository"; nothing started.
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    const text = Messages.configurationCheckInternal(analysisInternalItem('the worker did not start: Cannot find module'));
+    expect(text).toBe('The configuration check failed to start (internal error): the worker did not start: Cannot find module. Try again; if it fails again, reinstall Dev Environments.');
+    expect(h.ui.warnings).toEqual([text]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.helper.ups[0].removeExistingContainer).toBe(false);
+  });
+
+  it('keeps refusing when the analysis cannot run and a container would be created (P9-2)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(() => true, { kind: 'internal', reason: 'the worker ended with exit code 1' });
+    h = createHarness({ analyzer: failing.analyzer });
+    // A first open: nothing to start.
+    const first = await h.service.open(TARGET, { progress: h.progress }).then(
+      () => undefined,
+      (error: unknown) => error as UserFacingError,
+    );
+    expect(first?.code).toBe('hostAccess');
+    expect(first?.message).toBe(Messages.configurationCheckInternal(analysisInternalItem('the worker ended with exit code 1')));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    h.cleanup();
+    // The image exists, the container not: `up` would create one.
+    h = createHarness({ analyzer: failingAnalyzer(() => true, { kind: 'internal', reason: 'crash' }).analyzer });
+    await seedEnvironment(h, { container: null });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'hostAccess' });
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('keeps refusing an existing environment whose configuration is beyond a limit of the analysis', async () => {
+    h.cleanup();
+    h = createHarness({ analyzer: failingAnalyzer(() => true, { kind: 'limit', reason: 'it used too much memory' }).analyzer });
+    await seedEnvironment(h, { container: 'stopped' });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({
+      code: 'hostAccess',
+      message: Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM),
+    });
+    expect(h.helper.ups).toEqual([]);
+  });
+});
+
+describe('review round 9 (S9-1, S9-3): the bounds of the extension host', () => {
+  it('refuses a devcontainer.json longer than MAX_CONFIG_TEXT_LENGTH before it parses it (S9-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${BASE_IMAGE}", "x": "${'a'.repeat(MAX_CONFIG_TEXT_LENGTH)}" }` };
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({
+      code: 'hostAccess',
+      message: Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM),
+    });
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('opens a configuration with 30000 variables of the computer in less than 1 s, and names 20 of them (S9-1, P9-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    const containerEnv = Array.from({ length: 30_000 }, (_, i) => `"A${i}": "\${localEnv:V${i}}"`).join(', ');
+    const configText = `{ "image": "${BASE_IMAGE}", "containerEnv": { ${containerEnv} } }`;
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText };
+    const start = performance.now();
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: seconds in the extension host (names.includes for each name).
+    expect(performance.now() - start).toBeLessThan(1000);
+    const names = Array.from({ length: 20 }, (_, i) => `V${i}`).join(', ');
+    expect(h.ui.warnings).toContain(Messages.localEnvNotPassed(`${names}, and 29980 more`));
+  });
+
+  it('asks Docker about the image IDs of all references with one call, and not at all when the configuration is refused (S9-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "build": { "dockerfile": "Dockerfile" } }`, dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: `FROM ${BASE_IMAGE}\n` };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.docker.imageInspections).toHaveLength(1);
+    h.docker.imageInspections.length = 0;
+    h.helper.config = { image: BASE_IMAGE, privileged: true };
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${BASE_IMAGE}", "privileged": true }` };
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'hostAccess' });
+    // Before: one `docker image inspect` per reference, also for a refused configuration.
+    expect(h.docker.imageInspections).toEqual([]);
   });
 });

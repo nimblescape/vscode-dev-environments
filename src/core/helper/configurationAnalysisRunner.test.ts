@@ -13,7 +13,7 @@ import { Worker } from 'worker_threads';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
 import type { ComposeAccessInput } from './composeAccess';
-import { ANALYSIS_FAILED_ITEM, analysisFailure, inProcessAnalyzer, runAnalysisJob, type AnalysisJob } from './configurationAnalysis';
+import { ANALYSIS_FAILED_ITEM, analysisFailure, analysisInternalItem, inProcessAnalyzer, runAnalysisJob, type AnalysisJob } from './configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from './configurationAnalysisRunner';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
@@ -186,7 +186,8 @@ describe('WorkerConfigurationAnalyzer', () => {
     const start = performance.now();
     const result = await analyzer({ timeoutMs: 300 }, logger).analyze(job);
     expect(performance.now() - start).toBeLessThan(1500);
-    expect(result).toEqual(analysisFailure(job));
+    // Review round 9, P9-1: the result names the failure (a limit: the configuration is too complex).
+    expect(result).toEqual(analysisFailure(job, { kind: 'limit', reason: 'it took longer than 300 ms' }));
     expect(result.report).toEqual(REFUSED);
     expect(logger.lines).toEqual(['The host access analysis of the configuration failed (it took longer than 300 ms); the configuration is refused.']);
   });
@@ -201,7 +202,8 @@ describe('WorkerConfigurationAnalyzer', () => {
     const start = performance.now();
     const result = await analyzer({ maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 1 }, logger).analyze(job);
     expect(performance.now() - start).toBeLessThan(2000);
-    expect(result).toEqual(analysisFailure(job));
+    // Review round 9, P9-1: the result names the failure (a limit).
+    expect(result).toEqual(analysisFailure(job, { kind: 'limit', reason: 'it used too much memory' }));
     expect(logger.lines).toEqual(['The host access analysis of the configuration failed (it used too much memory); the configuration is refused.']);
   });
 
@@ -213,7 +215,8 @@ describe('WorkerConfigurationAnalyzer', () => {
     try {
       const logger = warnings();
       const result = await analyzer({ maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 1 }, logger).analyze(job);
-      expect(result).toEqual(analysisFailure(job));
+      // Review round 9, P9-1: the result names the failure (a limit).
+      expect(result).toEqual(analysisFailure(job, { kind: 'limit', reason: 'it used too much memory' }));
       expect(logger.lines).toEqual(['The host access analysis of the configuration failed (it used too much memory); the configuration is refused.']);
     } finally {
       if (own) Object.defineProperty(Worker.prototype, 'getHeapStatistics', own);
@@ -237,19 +240,55 @@ describe('WorkerConfigurationAnalyzer', () => {
       fs.writeFileSync(file, text);
       paths.push(file);
     }
+    // Review round 9, P9-2: none of them is a limit of the configuration: an internal error, with its own item (still
+    // refused: never allowed).
+    const internal = (result: { report: unknown; failure?: { kind: string; reason: string } }) => {
+      expect(result.failure?.kind).toBe('internal');
+      expect(result.report).toEqual({ hostAccess: [], unsupported: [analysisInternalItem(result.failure!.reason)] });
+    };
+    const reasons: string[] = [];
     for (const file of paths) {
       const logger = warnings();
       const result = await new WorkerConfigurationAnalyzer(file, logger, { ...ANALYSIS_LIMITS, timeoutMs: 5000 }).analyze(job);
-      expect(result, file).toEqual({ report: REFUSED });
+      internal(result);
+      reasons.push(result.failure!.reason);
       expect(logger.lines, file).toHaveLength(1);
     }
+    expect(reasons[0]).toMatch(/^the worker did not start: /);
+    expect(reasons.slice(1)).toEqual(['error: crash', 'the worker ended with exit code 3', 'the worker ended with exit code 0', 'error: thrown', 'an answer that is no result', 'an answer that is no result']);
     // A job that cannot be passed to a worker (a function is no structured clone).
     const unclonable = { kind: 'hostAccess', checksOn: true, input: { config: { f: () => 1 }, ownVolume: OWN } } as unknown as AnalysisJob;
-    expect(await analyzer().analyze(unclonable)).toEqual({ report: REFUSED });
+    internal(await analyzer().analyze(unclonable));
     // A job that the analysis throws on, in this thread too.
     const unknown = { kind: 'other' } as unknown as AnalysisJob;
-    expect(await analyzer().analyze(unknown)).toEqual({ report: REFUSED, imageReferences: [], references: { images: [], features: [] } });
-    expect(await inProcessAnalyzer.analyze(unknown)).toEqual({ report: REFUSED, imageReferences: [], references: { images: [], features: [] } });
+    const thrown = await analyzer().analyze(unknown);
+    internal(thrown);
+    expect(thrown).toMatchObject({ imageReferences: [], references: { images: [], features: [] } });
+    internal(await inProcessAnalyzer.analyze(unknown));
+  });
+
+  it('refuses a job whose texts are larger than the budget before it is passed to a worker (review round 9, S9-2)', async () => {
+    const logger = warnings();
+    const worker = new WorkerConfigurationAnalyzer(bundle, logger, ANALYSIS_LIMITS, 1000);
+    const job: AnalysisJob = singleJob(`FROM alpine\n# ${'a'.repeat(2000)}\n`);
+    const result = await worker.analyze(job);
+    expect(result.failure).toEqual({ kind: 'limit', reason: 'the configuration is larger than 0 million characters' });
+    expect(result.report).toEqual(REFUSED);
+    // Many small values count too.
+    const many: AnalysisJob = { kind: 'hostAccess', checksOn: true, input: { config: { runArgs: Array.from({ length: 200 }, () => '') }, ownVolume: OWN } };
+    expect((await worker.analyze(many)).failure?.kind).toBe('limit');
+    // Within the budget: the worker runs it.
+    expect((await new WorkerConfigurationAnalyzer(bundle, logger).analyze(job)).failure).toBeUndefined();
+  });
+
+  it('tells a worker that did not start in time apart from one that took too long (review round 9, P9-1, P9-2)', async () => {
+    const file = path.join(outDir, 'slow-start.js');
+    fs.writeFileSync(file, 'require("worker_threads").parentPort.on("message", () => { const t = Date.now(); while (Date.now() - t < 2000); });');
+    const job: AnalysisJob = { kind: 'hostAccess', checksOn: true, input: { config: {}, ownVolume: OWN } };
+    const result = await new WorkerConfigurationAnalyzer(file, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 300 }).analyze(job);
+    expect(result.failure).toEqual({ kind: 'limit', reason: 'it took longer than 300 ms' });
+    const early = await new WorkerConfigurationAnalyzer(file, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 1 }).analyze(job);
+    expect(early.failure).toEqual({ kind: 'internal', reason: 'the worker did not start within 1 ms' });
   });
 
   it('is built by esbuild.mjs and included in the package', () => {
