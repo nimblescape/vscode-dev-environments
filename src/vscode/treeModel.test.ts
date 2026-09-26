@@ -313,8 +313,8 @@ describe('buildTreeModel', () => {
         rows: [
           ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub'],
           ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub'],
-          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub'],
           ['infra', undefined, '', 'repository;canStart;onGitHub'],
+          ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub'],
         ],
       },
       {
@@ -349,7 +349,8 @@ describe('buildTreeModel', () => {
     });
   });
 
-  it('sorts groups by owner and rows alphabetically, environments first, case-insensitive and natural', () => {
+  // User decision 2026-09-26: a repository with an environment keeps its alphabetical place (it was listed first before).
+  it('sorts groups by owner and rows alphabetically, with or without an environment, case-insensitive and natural', () => {
     const groups = buildTreeModel(
       input({
         discovery: discovery([
@@ -366,7 +367,7 @@ describe('buildTreeModel', () => {
       }),
     );
     expect(groups.map((group) => group.owner)).toEqual(['Alpha', 'alpha-2', 'zeta']);
-    expect(rows([groups[0]]).map((entry) => entry.name)).toEqual(['Charlie', 'yankee', 'beta', 'repo2', 'repo10', 'zulu']);
+    expect(rows([groups[0]]).map((entry) => entry.name)).toEqual(['beta', 'Charlie', 'repo2', 'repo10', 'yankee', 'zulu']);
   });
 
   it('lists an environment whose repository GitHub does not list, with "not on GitHub"', () => {
@@ -516,7 +517,7 @@ describe('buildTreeModel', () => {
         environments: [environment('e1', 'other/tool'), environment('e2', 'acme/archived-env')],
       }),
     );
-    expect(rows(groups).map((entry) => entry.repository)).toEqual(['acme/archived-env', 'acme/api', 'other/tool']);
+    expect(rows(groups).map((entry) => entry.repository)).toEqual(['acme/api', 'acme/archived-env', 'other/tool']);
     expect(row(groups, 'other/tool').notOnGitHub).toBe(false);
     expect(row(groups, 'acme/archived-env').tooltip).toContain(TreeTexts.archived);
   });
@@ -717,7 +718,7 @@ describe('buildTreeModel', () => {
     );
     const ids = groups.flatMap((group) => [group.id, ...group.children.map((child) => child.id)]);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(rows(groups).map((entry) => entry.repository)).toEqual(['acme/web', 'acme/api']);
+    expect(rows(groups).map((entry) => entry.repository)).toEqual(['acme/api', 'acme/web']);
   });
 
   it('tolerates an invalid repository name in the registry', () => {
