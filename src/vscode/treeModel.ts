@@ -617,7 +617,12 @@ function environmentRow(
   const changes =
     (state === 'stopped' || state === 'noContainer') && environment.gitSummary ? formatChanges(environment.gitSummary) : '';
 
-  const checks = hostAccessChecks(repository, input.settings);
+  // After a rename or transfer on GitHub the row shows the current name, while the pipeline reads the switch under the
+  // registry name: the row counts as off when either name is listed (review finding A1).
+  const checks: HostAccessChecks =
+    hostAccessChecks(environment.repository, input.settings) === 'off' || hostAccessChecks(repository, input.settings) === 'off'
+      ? 'off'
+      : 'on';
   const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   const left = [branch, configuration !== undefined ? `(${configuration})` : undefined].filter(isText).join(' ');
   const right = [stateText(state), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');

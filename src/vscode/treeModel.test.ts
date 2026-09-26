@@ -861,6 +861,27 @@ describe('the switch of the host access checks in the rows (concept section 9 "H
     expect(docs?.contextValue).toBe('repository;canStart;onGitHub;hostAccessChecked');
   });
 
+  it('marks a renamed or transferred repository when either its registry name or its name on GitHub is listed (A1)', () => {
+    // The registry keeps alice/tool (the name the open pipeline reads the switch under); GitHub answers bob/tool.
+    const moved = repo('bob/tool', { configPaths: [] });
+    for (const listed of ['alice/tool', 'bob/tool']) {
+      const groups = buildTreeModel(
+        input({
+          discovery: discovery([repo('acme/api')]),
+          environments: [environment('e1', 'alice/tool')],
+          repositoryLookups: new Map([['alice/tool', moved]]),
+          settings: settings([listed]),
+        }),
+      );
+      const entry = row(groups, 'bob/tool');
+      expect(entry.hostAccessChecks).toBe('off');
+      expect(entry.description).toBe(`main   Stopped · ${StateTexts.hostAccessUnrestricted}`);
+      expect(entry.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
+      expect(flags(entry.contextValue)).toContain('hostAccessUnrestricted');
+      expect(flags(entry.contextValue)).not.toContain('hostAccessChecked');
+    }
+  });
+
   it('adds no flag of the switch to contextValue without it', () => {
     const actions = rowActions('stopped', repo('acme/api'));
     expect(contextValue(actions)).toBe('repository;canStart;canDelete;canRebuild;onGitHub');

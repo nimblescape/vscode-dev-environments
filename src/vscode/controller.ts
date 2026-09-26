@@ -795,9 +795,11 @@ export class Controller implements vscode.Disposable {
    * devEnvLauncher.hostAccessChecksOff. The next open of its environment applies it.
    */
   async turnOffHostAccessChecks(argument: CommandArgument): Promise<void> {
-    const repository = await this.hostAccessRepository(argument);
-    if (!repository) return;
-    if (hostAccessChecks(repository, this.deps.settings()) === 'off') {
+    const names = await this.hostAccessNames(argument);
+    if (!names) return;
+    const { repository, key } = names;
+    const settings = this.deps.settings();
+    if (names.all.some((name) => hostAccessChecks(name, settings) === 'off')) {
       this.inform(Messages.hostAccessChecksTurnedOff(repository));
       return;
     }
@@ -807,43 +809,61 @@ export class Controller implements vscode.Disposable {
       Actions.turnOffChecks,
     );
     if (choice !== Actions.turnOffChecks) return;
-    await this.writeHostAccessChecks(repository, 'off');
-    this.logger.warn(`The host access checks were turned off for ${repository}. They apply from the next open of its environment.`);
+    await this.writeHostAccessChecks([key], 'off');
+    this.logger.warn(`The host access checks were turned off for ${repository}. They apply from the next creation of its container.`);
     this.inform(Messages.hostAccessChecksTurnedOff(repository));
   }
 
   /**
-   * Turn On Host Access Checks: the repository leaves the user setting devEnvLauncher.hostAccessChecksOff (no question).
-   * At the next open, the checks run again, and a container that was created without them is created again when the
-   * configuration passes them (containerIsCurrent).
+   * Turn On Host Access Checks: the repository leaves the user setting devEnvLauncher.hostAccessChecksOff (no question),
+   * under every name it has here (the name on GitHub and the name in the registry, which differ after a rename or a
+   * transfer). At the next open, the checks run again, and a container that was created without them is created again
+   * when the configuration passes them (containerIsCurrent).
    */
   async turnOnHostAccessChecks(argument: CommandArgument): Promise<void> {
-    const repository = await this.hostAccessRepository(argument);
-    if (!repository) return;
-    await this.writeHostAccessChecks(repository, 'on');
-    this.logger.info(`The host access checks were turned on again for ${repository}. They apply from the next open of its environment.`);
-    this.inform(Messages.hostAccessChecksTurnedOn(repository));
+    const names = await this.hostAccessNames(argument);
+    if (!names) return;
+    await this.writeHostAccessChecks(names.all, 'on');
+    this.logger.info(`The host access checks were turned on again for ${names.repository}. They apply from the next open of its environment.`);
+    this.inform(Messages.hostAccessChecksTurnedOn(names.repository));
   }
 
-  /** The repository of a row or an environment for the switch of the host access checks; none without an argument. */
-  private async hostAccessRepository(argument: CommandArgument): Promise<string | undefined> {
-    if (argument.kind === 'row') return argument.repository;
+  /**
+   * The names of a row or an environment for the switch of the host access checks (review finding A1): `repository` for
+   * the messages (the name the sidebar shows), `key` the name the open pipeline reads the switch under (the registry name
+   * of the environment when there is one), and `all` every name involved (after a rename or a transfer on GitHub the
+   * registry keeps the old name). None without an argument.
+   */
+  private async hostAccessNames(
+    argument: CommandArgument,
+  ): Promise<{ repository: string; key: string; all: string[] } | undefined> {
+    if (argument.kind === 'row') {
+      const environment = argument.environmentId !== undefined ? await this.deps.registry.get(argument.environmentId) : undefined;
+      const key = environment?.repository ?? argument.repository;
+      return { repository: argument.repository, key, all: uniqueNames([argument.repository, key]) };
+    }
     if (argument.kind === 'environment') {
       const environment = await this.deps.registry.get(argument.environmentId);
-      if (!environment) this.inform(PipelineTexts.environmentMissing);
-      return environment ? this.displayName({ repository: environment.repository }) : undefined;
+      if (!environment) {
+        this.inform(PipelineTexts.environmentMissing);
+        return undefined;
+      }
+      const repository = this.displayName({ repository: environment.repository });
+      return { repository, key: environment.repository, all: uniqueNames([environment.repository, repository]) };
     }
     this.logger.info('The switch of the host access checks needs a repository row.');
     return undefined;
   }
 
   /**
-   * Writes the switch of `repository` into the user setting devEnvLauncher.hostAccessChecksOff (ConfigurationTarget.Global:
+   * Writes the switch of `repositories` into the user setting devEnvLauncher.hostAccessChecksOff (ConfigurationTarget.Global:
    * the setting has the scope `application`, so no workspace or folder can turn a check off). The other entries stay.
    */
-  private async writeHostAccessChecks(repository: string, checks: HostAccessChecks): Promise<void> {
+  private async writeHostAccessChecks(repositories: readonly string[], checks: HostAccessChecks): Promise<void> {
     const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);
-    const entries = withHostAccessChecks(hostAccessChecksOffValue(configuration), repository, checks);
+    let value: unknown = hostAccessChecksOffValue(configuration);
+    for (const repository of repositories) value = withHostAccessChecks(value, repository, checks);
+    const entries: unknown[] = Array.isArray(value) ? value : [];
     await configuration.update(HOST_ACCESS_CHECKS_OFF_SETTING, entries.length > 0 ? entries : undefined, vscode.ConfigurationTarget.Global);
   }
 
@@ -2171,4 +2191,15 @@ export class Controller implements vscode.Disposable {
       this.timers.add(timer);
     });
   }
+}
+
+/** The names without repeats (compared without case and surrounding spaces), in their order. */
+function uniqueNames(names: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return names.filter((name) => {
+    const key = name.trim().toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

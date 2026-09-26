@@ -1529,7 +1529,7 @@ export class EnvironmentService {
       this.logger.info(
         this.recreatedForHostAccess(ctx, container)
           ? `The container ${container.name} was created while the host access checks were off. They are on now: it is created again from ${image}; the files in the volume are kept.`
-          : containerIsCurrent(container.labels, false)
+          : containerIsCurrent(container.labels, false, ctx.hostAccessChecks)
             ? `The container ${container.name} was created without the configuration, which can be read now. It is created again from ${image}; the files in the volume are kept.`
             : `The container ${container.name} was created by an older version of Dev Environments. It is created again from ${image}; the files in the volume are kept.`,
       );
@@ -1561,7 +1561,7 @@ export class EnvironmentService {
       return;
     }
     // Current apart from the configuration: it was created while the configuration could not be read.
-    const withoutConfiguration = containerIsCurrent(container.labels, false);
+    const withoutConfiguration = containerIsCurrent(container.labels, false, ctx.hostAccessChecks);
     ctx.steps.detail(withoutConfiguration ? Messages.containerConfigApplied : Messages.containerRecreated);
   }
 

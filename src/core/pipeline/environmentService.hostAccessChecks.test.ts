@@ -11,8 +11,10 @@ import { GITHUB_CLI_ACCOUNT_REASON } from '../helper/containerGit';
 import { runArgsProblems } from '../helper/hostAccess';
 import { Messages } from '../messages';
 import {
+  CONTAINER_CONFIG_UNKNOWN,
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
+  LABEL_CONTAINER_CONFIG,
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
   environmentImageName,
@@ -186,6 +188,21 @@ describe('host access checks off for the repository', () => {
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.ups.map((up) => [up.image, up.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
     expect(h.docker.containersOf(ENV_ID)[0].labels[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
+  });
+
+  it('names the configuration as the reason when a container of the checks-off time was created without it (B2)', async () => {
+    // Created while the checks were off and the configuration could not be read; the checks stay off and the
+    // configuration can be read now: the reason is the configuration, not an older version of Dev Environments.
+    await seedEnvironment(h, {
+      container: 'stopped',
+      containerLabels: { ...UNRESTRICTED_LABELS, [LABEL_CONTAINER_CONFIG]: CONTAINER_CONFIG_UNKNOWN },
+    });
+    checksOff(REPO);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups.map((up) => [up.image, up.removeExistingContainer])).toEqual([[IMAGE_1, true]]);
+    expect(h.progress.details).toEqual([Messages.containerConfigApplied]);
+    expect(h.logger.infos.some((line) => line.includes('was created without the configuration, which can be read now'))).toBe(true);
+    expect(h.logger.infos.some((line) => line.includes('older version of Dev Environments'))).toBe(false);
   });
 });
 

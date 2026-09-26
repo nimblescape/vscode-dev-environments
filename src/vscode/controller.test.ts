@@ -2669,6 +2669,44 @@ describe('the switch of the host access checks (concept section 9 "Host access",
     expect(last.update).toHaveBeenCalledWith('hostAccessChecksOff', undefined, fakeVscode.ConfigurationTarget.Global);
   });
 
+  it('Turn On Host Access Checks removes every name of a renamed repository: the name on GitHub and the registry name (A1)', async () => {
+    // alice/tool was transferred to bob/tool on GitHub: the row shows bob/tool, the registry (and the pipeline) keep alice/tool.
+    const env = environment({ repository: 'alice/tool' });
+    await h.registry.add(env);
+    const settings = userSettings(['alice/tool', 'me/dotfiles', 'Bob/Tool']);
+    h.settings.hostAccessChecksOff = ['alice/tool', 'me/dotfiles', 'Bob/Tool'];
+    await run('turnOnHostAccessChecks', row('bob/tool', env));
+    expect(settings.update).toHaveBeenCalledWith('hostAccessChecksOff', ['me/dotfiles'], fakeVscode.ConfigurationTarget.Global);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.hostAccessChecksTurnedOn('bob/tool'));
+
+    // Only the registry name is listed: it is removed as well.
+    const registryOnly = userSettings(['alice/tool']);
+    await run('turnOnHostAccessChecks', row('bob/tool', env));
+    expect(registryOnly.update).toHaveBeenCalledWith('hostAccessChecksOff', undefined, fakeVscode.ConfigurationTarget.Global);
+  });
+
+  it('Turn Off Host Access Checks… on a renamed repository writes the registry name, which the open pipeline reads (A1)', async () => {
+    const env = environment({ repository: 'alice/tool' });
+    await h.registry.add(env);
+    const settings = userSettings(undefined);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.turnOffChecks);
+    await run('turnOffHostAccessChecks', row('bob/tool', env));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.hostAccessChecksOffConfirm('bob/tool'));
+    expect(settings.update).toHaveBeenCalledWith('hostAccessChecksOff', ['alice/tool'], fakeVscode.ConfigurationTarget.Global);
+  });
+
+  it('Turn Off Host Access Checks… asks nothing when either name of a renamed repository is listed (A1)', async () => {
+    const env = environment({ repository: 'alice/tool' });
+    await h.registry.add(env);
+    for (const listed of ['alice/tool', 'bob/tool']) {
+      const settings = userSettings([listed]);
+      h.settings.hostAccessChecksOff = [listed];
+      await run('turnOffHostAccessChecks', row('bob/tool', env));
+      expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+      expect(settings.update).not.toHaveBeenCalled();
+    }
+  });
+
   it('needs a row: without an argument, nothing is written', async () => {
     const settings = userSettings(undefined);
     await run('turnOffHostAccessChecks');

@@ -81,10 +81,10 @@ export const Messages = {
     '• devices and GPUs of your computer\n' +
     '• published ports on all network addresses, so that other computers of the network can reach them\n' +
     '• the volumes of other programs, for example of Docker Compose or of the Dev Containers extension\n\n' +
-    'Still checked: the volumes of your other environments and of other GitHub accounts, the GitHub account of the environment, and options that Dev Environments does not support. The change applies at the next start of the environment.',
+    'Still checked: the volumes of your other environments and of other GitHub accounts, the GitHub account of the environment, and options that Dev Environments does not support. The change applies when the container of the environment is created next, for example with Rebuild. An existing container keeps its current settings, such as ports that are bound to this computer only.',
   /** After Turn Off Host Access Checks… */
   hostAccessChecksTurnedOff: (repository: string) =>
-    `The host access checks are off for ${repository}. They apply again when you turn them on. The change takes effect at the next start of the environment.`,
+    `The host access checks are off for ${repository}. They apply again when you turn them on. The change applies when the container of the environment is created next, for example with Rebuild; an existing container keeps its current settings, such as ports that are bound to this computer only.`,
   /** After Turn On Host Access Checks. */
   hostAccessChecksTurnedOn: (repository: string) =>
     `The host access checks are on again for ${repository}. At the next start, a container that was made without them is set up again, if the configuration passes the checks.`,
