@@ -352,7 +352,7 @@ describe('host access policy: the runArgs that Docker gets', () => {
   function dockerRunArgs(runArgs: string[]): string[] {
     const all = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
       .runArgs as string[];
-    expect(all.slice(-4)).toEqual(['--label', 'devenv.container-version=3', '--name', OWN]);
+    expect(all.slice(-4)).toEqual(['--label', 'devenv.container-version=4', '--name', OWN]);
     return all.slice(0, -4);
   }
 
@@ -427,7 +427,7 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       containerName: OWN,
       runArgs: ['--platform', 'linux/amd64', '--rm', '-it', '--cap-drop', 'ALL', '-d', '--label', '--rm'],
     });
-    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=3', '--name', OWN]);
+    expect(override.runArgs).toEqual(['--platform', 'linux/amd64', '--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', OWN]);
     expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual([]);
   });
 });
@@ -788,5 +788,29 @@ describe('ports on localhost', () => {
   it('keeps --network host as it is (Docker ignores -p there, concept section 9 "Host access", exception)', () => {
     expect(loopbackRunArgs(['--network', 'host', '-p', '3000:3000'])).toEqual(['--network', 'host', '-p', '127.0.0.1:3000:3000']);
     expect(hostAccessProblems({ config: { runArgs: ['--network', 'host', '-p', '3000:3000'] }, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account (concept section 9)', () => {
+  it.each<[string, Record<string, unknown>, string[]]>([
+    ['in containerEnv', { containerEnv: { GH_CONFIG_DIR: '/home/node/.config/gh' } }, ['variable GH_CONFIG_DIR in containerEnv']],
+    ['in remoteEnv', { remoteEnv: { gh_config_dir: '/tmp/gh' } }, ['variable gh_config_dir in remoteEnv']],
+    ['in runArgs with -e', { runArgs: ['-e', 'GH_CONFIG_DIR=/tmp/gh'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with --env=', { runArgs: ['--env=GH_CONFIG_DIR=/x'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with -e and the value attached', { runArgs: ['-eGH_CONFIG_DIR=/y'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    // Without a value, Docker removes the variable of the override configuration.
+    ['in runArgs without a value', { runArgs: ['--env', 'GH_CONFIG_DIR'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['other variables of the GitHub CLI', { containerEnv: { GH_PAGER: 'cat' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] }, []],
+  ])('%s', (_name, config, expected) => {
+    expect(configProblems(config)).toEqual(expected);
+  });
+
+  it('refuses it in the image metadata, and accepts the value of the override configuration in the merged configuration', () => {
+    expect(hostAccessProblems({ metadata: [{ id: 'feature', containerEnv: { GH_CONFIG_DIR: '/g' } }], ownVolume: OWN })).toEqual([
+      'variable GH_CONFIG_DIR in containerEnv',
+    ]);
+    const merged = { containerEnv: containerEnvironment(), remoteEnv: remoteEnvironment() };
+    expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
+    expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
   });
 });

@@ -133,6 +133,8 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
       [first.volumeName, TOKEN, '1001+octo@users.noreply.github.com'],
       [second.volumeName, OTHER_TOKEN, '2002+someone@users.noreply.github.com'],
     ]);
+    // Concept section 9: the GitHub CLI of each environment is signed in as the account that owns it, with its token.
+    expect(h.helper.gitPreparations.map((call) => call.login)).toEqual(['octo', 'someone']);
     expect(h.docker.containersOf(first.id)).toHaveLength(1);
     expect(h.docker.containersOf(second.id)).toHaveLength(1);
     expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);

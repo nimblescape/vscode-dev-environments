@@ -323,7 +323,13 @@ export class FakeHelper implements EnvironmentHelper {
   readonly builds: Array<{ imageName: string; configPath: string }> = [];
   readonly ups: Array<{ image: string; removeExistingContainer: boolean; override: Record<string, unknown> }> = [];
   /** Each write of the token and the Git configuration into the volume. */
-  readonly gitPreparations: Array<{ volumeName: string; repository: string; token: string; identity: { name: string; email: string } }> = [];
+  readonly gitPreparations: Array<{
+    volumeName: string;
+    repository: string;
+    token: string;
+    identity: { name: string; email: string };
+    login: string;
+  }> = [];
   /** Volumes that a helper run created silently (the real helper does this for a missing volume). Must stay empty. */
   readonly silentlyCreatedVolumes: string[] = [];
 
@@ -371,10 +377,16 @@ export class FakeHelper implements EnvironmentHelper {
     return this.merged === undefined ? { config } : { config, merged: { ...config, ...this.merged } };
   }
 
-  async prepareGit(p: { volumeName: string; repository: string; token: string; identity: { name: string; email: string } }): Promise<void> {
+  async prepareGit(p: {
+    volumeName: string;
+    repository: string;
+    token: string;
+    identity: { name: string; email: string };
+    login: string;
+  }): Promise<void> {
     this.mount(p.volumeName);
     this.calls.push('prepareGit');
-    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity } });
+    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity }, login: p.login });
     if (this.prepareGitError) throw this.prepareGitError;
   }
 
