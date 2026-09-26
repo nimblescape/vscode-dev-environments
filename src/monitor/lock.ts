@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { writeJsonAtomicSync } from '../core/storage/atomicJson';
-import { readJsonTolerantSync, retryTransientSync } from '../core/storage/paths';
+import { parseJson, readJsonTolerantSync, readTextFileSync, retryTransientSync } from '../core/storage/paths';
 
 /**
  * A lock file that was not refreshed for this time counts as stale, also when its process ID belongs to a live process.
@@ -24,7 +24,11 @@ export const MONITOR_LOCK_STALE_MS = 120_000;
  * whenever a monitor of the previous version would decide wrongly with the files that a window of this version writes.
  *
  * - 1 (no version file): monitors before Keep Running When Closed; they would stop kept environments. The extension was
- *   not published with them, so no window asks them to exit: after an update from such a version, restart VS Code once.
+ *   not published with them, so no window asks them to exit. A restart of VS Code alone does not retire such a monitor:
+ *   it ends only when no window is alive, no pending connection file is fresh (2 minutes), and no waiting time runs
+ *   (30 seconds by default), and before it ends it stops kept environments one last time. After an update from such a
+ *   version: quit VS Code, wait at least the waiting time (up to 2 minutes after a connection was opened), or until
+ *   `<global storage>/monitor.log` shows "Session Monitor ends", then reopen VS Code and start kept environments again.
  * - 2: knows `keepRunning` of the registry, writes monitor.version, and ends on a request in monitor.exit.
  */
 export const MONITOR_PROTOCOL_VERSION = 2;
@@ -164,14 +168,15 @@ export function readMonitorVersion(versionFile: string, pid: number): number | u
 }
 
 /**
- * Asks the monitor `pid` to exit: monitor.exit names it (a JSON object `{ pid, requestedAt }`). The monitor honours it
- * only when `requestedAt` is later than its own start (`isMonitorExitRequested`). Throws for file errors.
+ * Asks the monitor `pid` to exit: monitor.exit names it (a JSON object `{ pid, requestedAt }`). `requestedAt` is only for
+ * diagnostics: the monitor ignores exactly the request that was present at its start (`isMonitorExitRequested`), so a
+ * clock that was set back does not matter. Throws for file errors.
  */
 export function requestMonitorExit(exitFile: string, pid: number, requestedAt: Date = new Date()): void {
   retryTransientSync(() => writeJsonAtomicSync(exitFile, { pid, requestedAt: requestedAt.toISOString() }));
 }
 
-/** A request in monitor.exit: the process ID it names, and the time of the request in milliseconds. */
+/** A request in monitor.exit: the process ID it names, and the time of the request in milliseconds (for diagnostics). */
 export interface MonitorExitRequest {
   pid: number;
   requestedAt: number;
@@ -179,7 +184,13 @@ export interface MonitorExitRequest {
 
 /** The request in monitor.exit, or `undefined` if the file is missing, cannot be read, or is not valid. */
 export function readMonitorExitRequest(exitFile: string): MonitorExitRequest | undefined {
-  const value = readJsonObject(exitFile);
+  const text = readMonitorExitText(exitFile);
+  return text === undefined ? undefined : parseMonitorExitRequest(text);
+}
+
+function parseMonitorExitRequest(text: string): MonitorExitRequest | undefined {
+  const parsed = parseJson(text);
+  const value = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
   const pid = value?.pid;
   const requestedAt = typeof value?.requestedAt === 'string' ? Date.parse(value.requestedAt) : NaN;
   return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pid <= MAX_PID && Number.isFinite(requestedAt)
@@ -188,36 +199,60 @@ export function readMonitorExitRequest(exitFile: string): MonitorExitRequest | u
 }
 
 /**
- * For the running monitor `pid` that started at `startedAt` (milliseconds): monitor.exit names it, and the request was
- * written after its start. A leftover request for an earlier process with the same ID does not end it (review finding
- * R2-2 of PR #26).
+ * The exact content of monitor.exit, or `undefined` if the file is missing or cannot be read (transient errors are
+ * retried). A monitor records it at its start (`isMonitorExitRequested`). Never throws.
  */
-export function isMonitorExitRequested(exitFile: string, pid: number, startedAt: number): boolean {
-  const request = readMonitorExitRequest(exitFile);
-  return request !== undefined && request.pid === pid && request.requestedAt > startedAt;
+export function readMonitorExitText(exitFile: string): string | undefined {
+  try {
+    return readTextFileSync(exitFile);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
- * For a monitor that starts: removes monitor.exit unless it names the live monitor that holds the lock and has a known,
- * older protocol version (a request that `waitForRetiringMonitor` waits for). Any other request is left over, for
- * example for a monitor that has ended, whose process ID a new monitor may get. Never throws.
+ * For the running monitor `pid`: monitor.exit names it, and its content is not `presentAtStart`, the exact content that
+ * the file had at the start of the monitor (`readMonitorExitText`). A leftover request for an earlier process with the
+ * same ID does not end it (review finding R2-2 of PR #26). The check compares content, not times, so a clock that was
+ * set back neither lets a leftover request end the monitor nor blocks a new request (round-3 review of PR #26).
+ */
+export function isMonitorExitRequested(exitFile: string, pid: number, presentAtStart: string | undefined): boolean {
+  const text = readMonitorExitText(exitFile);
+  if (text === undefined || text === presentAtStart) return false;
+  return parseMonitorExitRequest(text)?.pid === pid;
+}
+
+/**
+ * For a monitor that starts: removes monitor.exit only when it is known to be left over (round-3 review of PR #26):
+ * the file is not a valid request, no lock file exists, or the lock names a dead process or a live process other than
+ * the one the request names. A request that names the live lock holder stays (`waitForRetiringMonitor` waits for it),
+ * and so does every request when the request or the lock cannot be read or the lock has no valid process ID yet.
+ * Transient file errors are retried. Never throws.
  */
 export function removeLeftoverExitRequest(
   lockFile: string,
-  versionFile: string,
   exitFile: string,
   isAlive: (pid: number) => boolean = isProcessAlive,
 ): void {
-  const request = readMonitorExitRequest(exitFile);
-  if (request) {
-    const monitor = runningMonitor(lockFile, isAlive);
-    const version = monitor?.pid === request.pid ? readMonitorVersion(versionFile, request.pid) : undefined;
-    if (version !== undefined && version < MONITOR_PROTOCOL_VERSION) return;
+  let text: string | undefined;
+  let lock: LockInfo | undefined;
+  try {
+    text = readTextFileSync(exitFile);
+    if (text === undefined) return;
+    lock = inspectOrThrow(lockFile);
+  } catch {
+    // A read failed: the request may be valid.
+    return;
+  }
+  const request = parseMonitorExitRequest(text);
+  if (request && lock) {
+    if (lock.pid === undefined) return;
+    if (lock.pid === request.pid && isAlive(lock.pid)) return;
   }
   try {
     retryTransientSync(() => fs.rmSync(exitFile, { force: true }));
   } catch {
-    // The request stays; a monitor honours it only when it was written after its start.
+    // The request stays; a monitor ignores the request that was present at its start.
   }
 }
 
@@ -253,14 +288,27 @@ function parsePid(text: string): number | undefined {
   return pid <= MAX_PID ? pid : undefined;
 }
 
+/** The lock file, or `undefined` if it cannot be read. Transient file errors (Windows) are retried. */
 function inspect(lockFile: string): LockInfo | undefined {
   try {
-    const text = fs.readFileSync(lockFile, 'utf8');
-    const { mtimeMs } = fs.statSync(lockFile);
-    return { text, pid: parsePid(text), mtimeMs };
+    return inspectOrThrow(lockFile);
   } catch {
     return undefined;
   }
+}
+
+/** The lock file, or `undefined` if it does not exist. Retries transient file errors, and throws other errors. */
+function inspectOrThrow(lockFile: string): LockInfo | undefined {
+  return retryTransientSync(() => {
+    try {
+      const text = fs.readFileSync(lockFile, 'utf8');
+      const { mtimeMs } = fs.statSync(lockFile);
+      return { text, pid: parsePid(text), mtimeMs };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  });
 }
 
 function isStale(lock: LockInfo, isAlive: (pid: number) => boolean, staleMs: number): boolean {

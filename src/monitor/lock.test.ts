@@ -15,6 +15,7 @@ import {
   MONITOR_LOCK_STALE_MS,
   MONITOR_PROTOCOL_VERSION,
   readMonitorExitRequest,
+  readMonitorExitText,
   readMonitorLockPid,
   readMonitorVersion,
   refreshMonitorLock,
@@ -276,55 +277,138 @@ describe('monitor protocol version and exit request', () => {
   });
 
   // Round-2 review finding 2 of PR #26: a leftover request must not end a new monitor that got the same process ID.
-  it('honours a request only when it names the monitor and was written after its start', () => {
+  // Round-3 review of PR #26: by content, not by time, so that a clock that was set back does not matter.
+  it('ignores exactly the request that was present at the start of the monitor', () => {
     const startedAt = Date.parse('2026-09-26T10:00:00.000Z');
-    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
-    requestMonitorExit(exitFile, 1111, new Date(startedAt - 60_000));
-    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
-    requestMonitorExit(exitFile, 1111, new Date(startedAt));
-    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
-    requestMonitorExit(exitFile, 2222, new Date(startedAt + 1_000));
-    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
-    requestMonitorExit(exitFile, 1111, new Date(startedAt + 1_000));
-    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(true);
+    expect(readMonitorExitText(exitFile)).toBeUndefined();
+    expect(isMonitorExitRequested(exitFile, 1111, undefined)).toBe(false);
+    // A leftover request that names the process ID of the new monitor, even one "from the future" (the clock was set
+    // back after it was written).
+    requestMonitorExit(exitFile, 1111, new Date(startedAt + 60_000));
+    const atStart = readMonitorExitText(exitFile);
+    expect(atStart).toBe(fs.readFileSync(exitFile, 'utf8'));
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(false);
+    // The same request written again is still that request.
+    fs.writeFileSync(exitFile, atStart!);
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(false);
   });
 
-  it('removes a leftover exit request at the start of a monitor, but keeps one for a live monitor of an older version', () => {
+  it('honours a request written after the start that names the monitor, also with a time before the start', () => {
+    const startedAt = Date.parse('2026-09-26T10:00:00.000Z');
+    // Nothing at the start.
+    requestMonitorExit(exitFile, 1111, new Date(startedAt + 1_000));
+    expect(isMonitorExitRequested(exitFile, 1111, undefined)).toBe(true);
+    // Another request at the start.
+    requestMonitorExit(exitFile, 1111, new Date(startedAt - 120_000));
+    const atStart = readMonitorExitText(exitFile);
+    // The clock was set back: the new request has a time before the start of the monitor.
+    requestMonitorExit(exitFile, 1111, new Date(startedAt - 60_000));
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(true);
+    requestMonitorExit(exitFile, 1111, new Date(startedAt));
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(true);
+    // Only a request that names this monitor.
+    requestMonitorExit(exitFile, 2222, new Date(startedAt + 1_000));
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(false);
+    fs.writeFileSync(exitFile, 'x');
+    expect(isMonitorExitRequested(exitFile, 1111, atStart)).toBe(false);
+  });
+
+  it('removes an exit request at the start of a monitor only when it is known to be left over', () => {
     const request = (): void => requestMonitorExit(exitFile, 1111);
+    // No request: nothing to do.
+    removeLeftoverExitRequest(lockFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
     // No lock: the monitor that the request names has ended.
     request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    removeLeftoverExitRequest(lockFile, exitFile, alive);
     expect(fs.existsSync(exitFile)).toBe(false);
     // The lock holds a dead process.
     fs.writeFileSync(lockFile, '1111\n');
-    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
     request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, dead);
+    removeLeftoverExitRequest(lockFile, exitFile, dead);
     expect(fs.existsSync(exitFile)).toBe(false);
-    // Another process holds the lock.
+    // Another live process holds the lock (for example the new monitor itself, after it took the lock).
     fs.writeFileSync(lockFile, '2222\n');
     request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
-    expect(fs.existsSync(exitFile)).toBe(false);
-    // The live lock holder has the current version, or an unknown one.
-    fs.writeFileSync(lockFile, '1111\n');
-    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION);
-    request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
-    expect(fs.existsSync(exitFile)).toBe(false);
-    fs.rmSync(versionFile);
-    request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    removeLeftoverExitRequest(lockFile, exitFile, alive);
     expect(fs.existsSync(exitFile)).toBe(false);
     // An invalid request.
     fs.writeFileSync(exitFile, 'x');
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    removeLeftoverExitRequest(lockFile, exitFile, alive);
     expect(fs.existsSync(exitFile)).toBe(false);
-    // The live lock holder has an older version: the new monitor waits for it.
-    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
-    request();
-    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    // The request names the live lock holder: whatever its version (older, current, unknown), the request may be valid.
+    fs.writeFileSync(lockFile, '1111\n');
+    for (const version of [MONITOR_PROTOCOL_VERSION - 1, MONITOR_PROTOCOL_VERSION, undefined]) {
+      if (version === undefined) fs.rmSync(versionFile, { force: true });
+      else writeMonitorVersion(versionFile, 1111, version);
+      request();
+      removeLeftoverExitRequest(lockFile, exitFile, alive);
+      expect(readMonitorExitRequest(exitFile)?.pid).toBe(1111);
+    }
+    // The lock has no valid process ID yet (its creator may still write it).
+    fs.writeFileSync(lockFile, '');
+    removeLeftoverExitRequest(lockFile, exitFile, alive);
     expect(readMonitorExitRequest(exitFile)?.pid).toBe(1111);
+  });
+
+  // Round-3 review of PR #26: a read that fails must not remove a request that may be valid.
+  it('keeps the exit request when the lock or the request cannot be read', () => {
+    // The lock names a dead process: a readable lock would make the request a leftover.
+    fs.writeFileSync(lockFile, '1111\n');
+    requestMonitorExit(exitFile, 1111);
+    const text = fs.readFileSync(exitFile, 'utf8');
+    for (const failing of [lockFile, exitFile]) {
+      for (const code of ['EBUSY', 'EIO']) {
+        fsHooks.readFileSync = (file) => {
+          if (file === failing) throw fsError(code);
+        };
+        try {
+          removeLeftoverExitRequest(lockFile, exitFile, dead);
+        } finally {
+          delete fsHooks.readFileSync;
+        }
+        expect(fs.readFileSync(exitFile, 'utf8')).toBe(text);
+      }
+    }
+    // A lock that cannot be read at all (here a folder).
+    fs.rmSync(lockFile);
+    fs.mkdirSync(lockFile);
+    removeLeftoverExitRequest(lockFile, exitFile, dead);
+    expect(fs.readFileSync(exitFile, 'utf8')).toBe(text);
+  });
+
+  it('retries transient errors when it reads the lock, and then removes a leftover request', () => {
+    fs.writeFileSync(lockFile, '1111\n');
+    requestMonitorExit(exitFile, 1111);
+    let failures = 0;
+    fsHooks.readFileSync = (file) => {
+      if (file === lockFile && failures < 2) {
+        failures++;
+        throw fsError('EBUSY');
+      }
+    };
+    try {
+      removeLeftoverExitRequest(lockFile, exitFile, dead);
+    } finally {
+      delete fsHooks.readFileSync;
+    }
+    expect(failures).toBe(2);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // Also for windows: a lock that is briefly held by a virus scanner still shows the running monitor.
+    fs.writeFileSync(lockFile, '1111\n');
+    failures = 0;
+    fsHooks.readFileSync = (file) => {
+      if (file === lockFile && failures < 2) {
+        failures++;
+        throw fsError('EBUSY');
+      }
+    };
+    try {
+      expect(runningMonitor(lockFile, alive)).toEqual({ pid: 1111 });
+    } finally {
+      delete fsHooks.readFileSync;
+    }
+    expect(failures).toBe(2);
   });
 
   // Round-2 review finding 3 of PR #26: transient file errors of Windows (a virus scanner holds the file).

@@ -17,6 +17,7 @@ import {
   isMonitorExitRequested,
   refreshMonitorLock,
   releaseMonitorLock,
+  readMonitorExitText,
   removeLeftoverExitRequest,
   waitForRetiringMonitor,
   writeMonitorVersion,
@@ -48,10 +49,11 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
 
   const paths = new StoragePaths(root);
   const logger = new FileLogger(paths.monitorLog);
-  // Only an exit request written after this time ends this monitor: a leftover request may name its process ID.
-  const startedAt = Date.now();
-  // A request that does not name a live monitor of an older version is left over (round-2 review finding 2 of PR #26).
-  removeLeftoverExitRequest(paths.monitorLock, paths.monitorVersion, paths.monitorExit);
+  // The request present now is never for this monitor: a leftover request may name its process ID. Exactly this content
+  // is ignored later; content, not times, so that a clock that is set back does not matter (round-3 review of PR #26).
+  const exitRequestAtStart = readMonitorExitText(paths.monitorExit);
+  // A request that is known to be left over is removed (round-2 review finding 2 of PR #26).
+  removeLeftoverExitRequest(paths.monitorLock, paths.monitorExit);
   // A window asked an older monitor to exit and started this one: it finishes its current step first.
   if (!(await waitForRetiringMonitor(paths.monitorLock, paths.monitorExit, { timeoutMs: RETIRING_MONITOR_WAIT_MS }))) {
     logger.info('The older Session Monitor did not end in time.');
@@ -66,7 +68,7 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
   if (!acquired) return 0;
   // The older monitor has ended: its request is left over. Before the version is written, so that no request of a
   // window that has read this version is removed.
-  removeLeftoverExitRequest(paths.monitorLock, paths.monitorVersion, paths.monitorExit);
+  removeLeftoverExitRequest(paths.monitorLock, paths.monitorExit);
   try {
     writeMonitorVersion(paths.monitorVersion);
   } catch (error) {
@@ -84,7 +86,7 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
   // Checked in every tick (refreshLock): a window of a newer version asks this monitor to exit. It ends after its
   // current step, so a `docker stop` that has started is finished; it keeps the lock until then.
   const checkExitRequest = (): void => {
-    if (exitRequested || !isMonitorExitRequested(paths.monitorExit, process.pid, startedAt)) return;
+    if (exitRequested || !isMonitorExitRequested(paths.monitorExit, process.pid, exitRequestAtStart)) return;
     exitRequested = true;
     logger.info('A window of a newer version asked this Session Monitor to exit.');
     loop.stop();

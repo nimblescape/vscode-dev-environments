@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 let outDir: string;
 let bundle: string;
+let gated: string;
 const roots: string[] = [];
 
 beforeAll(() => {
@@ -28,6 +29,20 @@ beforeAll(() => {
     outfile: bundle,
     logLevel: 'silent',
   });
+  // Starts main() of the bundle only when a "go" file exists, so that a test knows the process ID of the monitor before
+  // the monitor starts, and can prepare files that name it.
+  gated = path.join(outDir, 'gated.js');
+  fs.writeFileSync(
+    gated,
+    `const fs = require('fs');
+const [bundle, root, go] = process.argv.slice(2);
+const wait = () => {
+  if (!fs.existsSync(go)) return void setTimeout(wait, 10);
+  require(bundle).main(['', '', root]).then((code) => process.exit(code), () => process.exit(1));
+};
+wait();
+`,
+  );
 });
 
 afterAll(() => {
@@ -46,6 +61,34 @@ function start(args: string[]): ChildProcess {
     stdio: 'ignore',
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   });
+}
+
+/** A monitor that starts when `go()` is called; its process ID is known before. */
+function startGated(root: string): { child: ChildProcess; go: () => void } {
+  const goFile = path.join(outDir, `go-${path.basename(root)}`);
+  const child = spawn(process.execPath, [gated, bundle, root, goFile], {
+    stdio: 'ignore',
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+  });
+  return { child, go: () => fs.writeFileSync(goFile, '') };
+}
+
+/** The modification time of the lock, which the monitor refreshes in every tick (0 if it cannot be read). */
+function lockTime(root: string): number {
+  try {
+    return fs.statSync(path.join(root, 'monitor.lock')).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** Waits until the monitor has run a whole tick (checked monitor.exit, then refreshed its lock) after this call. */
+async function waitForWholeTick(root: string): Promise<void> {
+  const before = lockTime(root);
+  // The first refresh after `before` may belong to a tick that read monitor.exit before this call; the second may not.
+  await waitFor(() => lockTime(root) > before, 15_000);
+  const first = lockTime(root);
+  await waitFor(() => lockTime(root) > first, 15_000);
 }
 
 function exitOf(child: ChildProcess): Promise<number | null> {
@@ -153,34 +196,62 @@ describe('sessionMonitor bundle', () => {
   );
 
   // Round-2 review finding 2 of PR #26: a leftover exit request that names the process ID of a new, current monitor
-  // does not end it; only a request written after its start does.
+  // does not end it. Round-3 review of PR #26: the monitor ignores exactly the request present at its start (by content,
+  // not by time), so a request written later is honoured also when the clock was set back.
   it.skipIf(process.platform === 'win32')(
-    'is not ended by a leftover exit request that names its process ID',
+    'removes a leftover exit request that names its process ID at its start, when no lock is held',
     async () => {
       const root = storageRoot();
       writeLiveWindow(root);
       const exitFile = path.join(root, 'monitor.exit');
-      const child = start([root]);
+      const { child, go } = startGated(root);
       const exit = exitOf(child);
-      const leftover = JSON.stringify({ pid: child.pid, requestedAt: new Date(Date.now() - 60_000).toISOString() });
       try {
-        // Written as early as possible: the monitor removes it at its start, or it is older than the start.
-        fs.writeFileSync(exitFile, leftover);
+        // A leftover request for an earlier monitor that had the same process ID. After the monitor takes the lock, a
+        // request that names the live lock holder is kept, so only the removal before the lock removes this one.
+        fs.writeFileSync(exitFile, JSON.stringify({ pid: child.pid, requestedAt: new Date(Date.now() - 60_000).toISOString() }));
+        go();
         await waitFor(() => readLog(root).includes('Session Monitor started'));
-        // Also a leftover written after the start (older than the start) does not end it in the next ticks.
+        expect(fs.existsSync(exitFile)).toBe(false);
+        expect(child.exitCode).toBeNull();
+      } finally {
+        child.kill('SIGTERM');
+      }
+      expect(await exit).toBe(0);
+      expect(readLog(root)).not.toContain('asked this Session Monitor to exit');
+    },
+    20_000,
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'is not ended by the exit request present at its start, but by a later one, also with an earlier time',
+    async () => {
+      const root = storageRoot();
+      writeLiveWindow(root);
+      const exitFile = path.join(root, 'monitor.exit');
+      const { child, go } = startGated(root);
+      const exit = exitOf(child);
+      // A leftover request with a time after the start of the monitor: the clock was set back since it was written.
+      const leftover = JSON.stringify({ pid: child.pid, requestedAt: new Date(Date.now() + 60_000).toISOString() });
+      try {
         fs.writeFileSync(exitFile, leftover);
-        await new Promise((resolve) => setTimeout(resolve, 6_000));
+        go();
+        // Past its start-up handling, which removed the request.
+        await waitFor(() => readLog(root).includes('Session Monitor started'));
+        // The same request appears again (for example written late by an earlier window): it is still ignored.
+        fs.writeFileSync(exitFile, leftover);
+        await waitForWholeTick(root);
         expect(child.exitCode).toBeNull();
         expect(readLog(root)).not.toContain('asked this Session Monitor to exit');
-        // A request of a window after the start ends it.
-        fs.writeFileSync(exitFile, JSON.stringify({ pid: child.pid, requestedAt: new Date().toISOString() }));
+        // A new request of a window ends it, although its time lies before the start of the monitor.
+        fs.writeFileSync(exitFile, JSON.stringify({ pid: child.pid, requestedAt: new Date(Date.now() - 60_000).toISOString() }));
         expect(await exit).toBe(0);
         expect(readLog(root)).toContain('A window of a newer version asked this Session Monitor to exit.');
       } finally {
         child.kill('SIGTERM');
       }
     },
-    25_000,
+    45_000,
   );
 
   // Round-2 review finding 3 of PR #26: a failed write of the version file does not end the new monitor.
