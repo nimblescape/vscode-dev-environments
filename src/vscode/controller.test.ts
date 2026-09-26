@@ -1162,6 +1162,18 @@ describe('Switch branch…', () => {
     expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0' }));
   });
 
+  it('connects the current window after Switch branch… also while the setting openInNewWindow is on (unit 14 review)', async () => {
+    h.settings.openInNewWindow = true;
+    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+    const command = run('switchBranch', row('acme/api'));
+    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
+    h.quickPicks[0].type('release/2.0');
+    h.quickPicks[0].pick('release/2.0');
+    await command;
+    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+    expect(h.connection.open).toHaveBeenCalled();
+  });
+
   it('switches and connects an environment that this window is not connected to', async () => {
     await h.registry.add(environment());
     const command = run('switchBranch', row('acme/api', environment()));
@@ -2873,8 +2885,19 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await run('startInNewWindow', row('acme/api', env));
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    // Review of unit 14: a request for a new window never uses the current window, also here. VS Code shows the window
+    // that has this folder open (concept 7.11); if it did not find it, a new window opens and this one stays.
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+  });
+
+  it('shows the other window with the current-window call for plain Start', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    otherWindowConnected();
+    await run('start', row('acme/api', env));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
-    // The same call as plain Start: VS Code shows the window that has this folder open (concept 7.11).
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -2981,11 +3004,12 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     const menus = manifest.contributes.menus;
     const entries = (menu: string, command: string) =>
       menus[menu].filter((item) => item.command === command).map((item) => [item.when, item.group]);
+    // Review of unit 14: right after Start (1_actions@1), in a fixed order.
     expect(entries('view/item/context', Commands.startInNewWindow)).toEqual([
-      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow', '1_actions@1'],
+      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow', '1_actions@2'],
     ]);
     expect(entries('view/item/context', Commands.startInCurrentWindow)).toEqual([
-      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow', '1_actions@1'],
+      ['view == devEnvironments.repositories && viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow', '1_actions@2'],
     ]);
     expect(entries('devEnvironments.more', Commands.startInNewWindow)).toEqual([
       ['viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow', '0_start@1'],

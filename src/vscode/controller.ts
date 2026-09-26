@@ -700,7 +700,7 @@ export class Controller implements vscode.Disposable {
   private async applyConfiguration(target: Target, configPath: string): Promise<void> {
     const environment = target.environment;
     if (!environment) {
-      await this.startTarget(target, { configPath }, async () =>
+      await this.startTarget(target, { configPath, window: 'currentWindow' }, async () =>
         this.applyConfiguration(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), configPath),
       );
       return;
@@ -737,7 +737,7 @@ export class Controller implements vscode.Disposable {
     const environment = target.environment;
     if (!environment) {
       // Concept 6.2: without an environment, the first Start creates it on the selected branch.
-      await this.startTarget(target, { branch }, async () =>
+      await this.startTarget(target, { branch, window: 'currentWindow' }, async () =>
         this.switchToBranch(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), branch),
       );
       return;
@@ -970,7 +970,9 @@ export class Controller implements vscode.Disposable {
           // Also for Start in New Window: never two windows on one environment.
           this.logger.info(`${repository} is open in another window. That window is shown.`);
           const folder = environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository);
-          await connection.open(environment.containerName, folder);
+          // A request for a new window never replaces the current window, also if VS Code does not find the other one.
+          if (this.opensNewWindow(options.window ?? 'default', false)) await connection.openInNewWindow(environment.containerName, folder);
+          else await connection.open(environment.containerName, folder);
           return;
         }
         // Concept 6.2 "Stopped: the next Start starts it": the other window has lost its connection, so the container
@@ -1205,7 +1207,7 @@ export class Controller implements vscode.Disposable {
     // Concept 6.2: Switch branch… connects the current window; the pipeline applies the rule for a changed configuration.
     // It connects the environment whose branch it switched, also when the target was a repository: after an account
     // change during the switch, the pipeline refuses that environment (otherAccount) instead of opening another one.
-    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }));
+    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }), { window: 'currentWindow' });
   }
 
   /**
