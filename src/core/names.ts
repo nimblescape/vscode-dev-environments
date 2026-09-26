@@ -23,9 +23,11 @@ export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
  * Containers extension for the container (no copy of the Git configuration of the computer, no forwarding credential
  * helpers, no sign-in of the GitHub CLI), which it reads from the label devcontainer.metadata only at the first attach of
  * a new container, and only the documented variables of Git and Docker (no more GIT_CONFIG_PARAMETERS, GNUPGHOME, and
- * SSH_AUTH_SOCK). A container with an older version (or without the label) is created again from its environment image.
+ * SSH_AUTH_SOCK). 4: the GitHub CLI reads its configuration from the volume (GH_CONFIG_DIR, GH_CONFIG_FOLDER), where
+ * it is signed in with the account that owns the environment. A container with an older version (or without the label) is
+ * created again from its environment image.
  */
-export const CONTAINER_VERSION = 3;
+export const CONTAINER_VERSION = 4;
 /**
  * Container label: `unknown` when the container was created without the configuration of the repository (it could not
  * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
@@ -52,6 +54,13 @@ export const GIT_CONFIG_FILE = `${CONFIG_FOLDER}/gitconfig`;
 export const GITHUB_TOKEN_FILE = `${CONFIG_FOLDER}/github-token`;
 /** DOCKER_CONFIG of the container. */
 export const DOCKER_CONFIG_FOLDER = `${CONFIG_FOLDER}/docker`;
+/** GH_CONFIG_DIR of the container: the configuration folder of the GitHub CLI (gh). */
+export const GH_CONFIG_FOLDER = `${CONFIG_FOLDER}/gh`;
+/**
+ * The sign-in of the GitHub CLI: the account that owns the environment, with the token of GITHUB_TOKEN_FILE, mode 0600.
+ * Written again at each open (GIT_FILES_SCRIPT); the other files of GH_CONFIG_FOLDER belong to the user.
+ */
+export const GH_HOSTS_FILE = `${GH_CONFIG_FOLDER}/hosts.yml`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();

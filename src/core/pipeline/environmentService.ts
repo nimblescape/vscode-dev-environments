@@ -1804,6 +1804,8 @@ export class EnvironmentService {
         repository: env.repository,
         token: ctx.session.token,
         identity,
+        // The environment belongs to the account of the session (concept 7.5): the GitHub CLI there is signed in as it.
+        login: ctx.session.account.login,
         onOutput: this.output,
         signal: ctx.signal,
       });

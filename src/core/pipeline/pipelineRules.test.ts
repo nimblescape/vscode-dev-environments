@@ -56,9 +56,10 @@ describe('configHash', () => {
 
 describe('containerIsCurrent (concept section 9: containers of an older setup are created again)', () => {
   it.each<[string, Record<string, string>, boolean]>([
-    ['the current version', { 'devenv.container-version': '3' }, true],
-    ['a newer version', { 'devenv.container-version': '4' }, true],
-    ['the version before (container-only Git without the settings of the Dev Containers extension)', { 'devenv.container-version': '2' }, false],
+    ['the current version', { 'devenv.container-version': '4' }, true],
+    ['a newer version', { 'devenv.container-version': '5' }, true],
+    ['the version before (without GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account)', { 'devenv.container-version': '3' }, false],
+    ['container-only Git without the settings of the Dev Containers extension', { 'devenv.container-version': '2' }, false],
     ['an older version', { 'devenv.container-version': '1' }, false],
     ['no label (created by version 1 of the extension)', { 'devenv.environment-id': 'x' }, false],
     ['an invalid label', { 'devenv.container-version': 'two' }, false],
@@ -68,11 +69,11 @@ describe('containerIsCurrent (concept section 9: containers of an older setup ar
   });
 
   it('counts a container created without the configuration as current only while the configuration cannot be read', () => {
-    const provisional = { 'devenv.container-version': '3', 'devenv.container-config': 'unknown' };
+    const provisional = { 'devenv.container-version': '4', 'devenv.container-config': 'unknown' };
     expect(containerIsCurrent(provisional)).toBe(false);
     expect(containerIsCurrent(provisional, true)).toBe(false);
     expect(containerIsCurrent(provisional, false)).toBe(true);
-    expect(containerIsCurrent({ 'devenv.container-version': '3' }, false)).toBe(true);
+    expect(containerIsCurrent({ 'devenv.container-version': '4' }, false)).toBe(true);
     expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
   });
 });

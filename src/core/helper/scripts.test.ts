@@ -17,6 +17,7 @@ import {
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   READ_FILES_SCRIPT,
+  REMOVE_GIT_TOKEN_SCRIPT,
   SECRETS_FOLDER,
   SWITCH_BRANCH_SCRIPT,
   TOKEN_FILE,
@@ -26,6 +27,7 @@ import {
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
+  removeGitTokenCommand,
   switchBranchCommand,
   upCommand,
 } from './scripts';
@@ -70,6 +72,7 @@ const SHELL_SCRIPTS: Array<[string, string]> = [
   ['CLONE_SCRIPT', CLONE_SCRIPT],
   ['SWITCH_BRANCH_SCRIPT', SWITCH_BRANCH_SCRIPT],
   ['GIT_FILES_SCRIPT', GIT_FILES_SCRIPT],
+  ['REMOVE_GIT_TOKEN_SCRIPT', REMOVE_GIT_TOKEN_SCRIPT],
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
   ['BUILD_SCRIPT', BUILD_SCRIPT],
@@ -100,7 +103,7 @@ describe('shell scripts', () => {
       'feature/x',
       'acme/api',
     ]);
-    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual([
+    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper', 'octo')).toEqual([
       'sh',
       '-c',
       GIT_FILES_SCRIPT,
@@ -109,7 +112,9 @@ describe('shell scripts', () => {
       'Me',
       'me@x',
       'helper',
+      'octo',
     ]);
+    expect(removeGitTokenCommand()).toEqual(['sh', '-c', REMOVE_GIT_TOKEN_SCRIPT, 'sh']);
     expect(upCommand(OVERRIDE_CONFIG_PATH, ['up', '--x'])).toEqual(['sh', '-c', UP_SCRIPT, 'sh', OVERRIDE_CONFIG_PATH, 'up', '--x']);
     expect(buildCommand('/workspaces/api/.devcontainer/devcontainer.json', ['build'])).toEqual([
       'sh',
@@ -386,9 +391,14 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     return { ws, secrets, bin, log };
   }
 
-  function run(env: { ws: string; secrets: string; bin: string }, token = TOKEN, folder = 'api') {
+  function run(env: { ws: string; secrets: string; bin: string }, token = TOKEN, folder = 'api', login = 'scalarion') {
     const script = GIT_FILES_SCRIPT.split(SECRETS_FOLDER).join(env.secrets).split('/workspaces').join(env.ws);
-    const command = gitFilesCommand(folder, { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
+    const command = gitFilesCommand(
+      folder,
+      { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' },
+      CONTAINER_CREDENTIAL_HELPER,
+      login,
+    );
     const result = spawnSync('sh', ['-c', script, ...command.slice(3)], {
       encoding: 'utf8',
       input: token,
@@ -423,15 +433,16 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     // The token is gone from the tmpfs, and no temporary folder is left.
     expect(fs.readdirSync(env.secrets)).toEqual([]);
     // No GnuPG folder: the extension does not change where GnuPG works (user decision 2026-09-25).
-    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gitconfig', 'github-token']);
+    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig', 'github-token']);
     // The file for the credential helpers of the user: only comments, readable by every user of the container.
     const credentials = path.join(dir, 'credentials.gitconfig');
     expect(fs.readFileSync(credentials, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
     expect(fs.statSync(credentials).mode & 0o777).toBe(0o644);
     expect(spawnSync('git', ['config', '--file', credentials, '--list'], { encoding: 'utf8' })).toMatchObject({ status: 0, stdout: '' });
     expect(chowned).toContain(`${cfg} ${credentials}`);
-    // The token is only in the token file.
-    expect(spawnSync('grep', ['-rl', TOKEN, env.ws], { encoding: 'utf8' }).stdout.trim()).toBe(tokenFile);
+    // The token is only in the token file and in the sign-in of the GitHub CLI.
+    const hosts = path.join(dir, 'gh', 'hosts.yml');
+    expect(spawnSync('grep', ['-rl', TOKEN, env.ws], { encoding: 'utf8' }).stdout.trim().split('\n').sort()).toEqual([hosts, tokenFile].sort());
   });
 
   it('writes a new token at each run, and keeps the changes of the user in the Git configuration', () => {
@@ -485,6 +496,107 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     expect(fs.readFileSync(path.join(dir, 'credentials.gitconfig'), 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
   });
 
+  it('signs the GitHub CLI in as the owner account with the token of the token file (hosts.yml, 0600 in a 0700 folder)', () => {
+    const env = setup();
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const gh = path.join(env.ws, '.devenv+', 'gh');
+    const hosts = path.join(gh, 'hosts.yml');
+    // Both forms that gh reads: the keys of the host (gh before 2.40, and the active account of gh 2.40 and newer), and
+    // the accounts under `users` (gh 2.40 and newer).
+    expect(fs.readFileSync(hosts, 'utf8')).toBe(
+      [
+        'github.com:',
+        '    users:',
+        '        "scalarion":',
+        `            oauth_token: "${TOKEN}"`,
+        '    git_protocol: https',
+        `    oauth_token: "${TOKEN}"`,
+        '    user: "scalarion"',
+        '',
+      ].join('\n'),
+    );
+    expect(fs.statSync(hosts).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(gh).mode & 0o777).toBe(0o700);
+    const chowned = fs.readFileSync(env.log, 'utf8');
+    expect(chowned).toMatch(new RegExp(`chown 1000:1001 \\S*/\\.work\\.[^/]+/hosts\\.yml`));
+    expect(chowned).toContain(`${path.join(env.ws, '.devenv+', 'credentials.gitconfig')} ${gh}`);
+    expect(result.stdout).not.toContain(TOKEN);
+    // No temporary folder is left, and gh's own config.yml is not written.
+    expect(fs.readdirSync(path.join(env.ws, '.devenv+')).filter((name) => name.startsWith('.work'))).toEqual([]);
+    expect(fs.readdirSync(gh)).toEqual(['hosts.yml']);
+  });
+
+  it('writes hosts.yml again at each run (a new sign-in), and keeps the other files of the gh folder', () => {
+    const env = setup();
+    expect(run(env).status).toBe(0);
+    const gh = path.join(env.ws, '.devenv+', 'gh');
+    const hosts = path.join(gh, 'hosts.yml');
+    // gh changed it (for example `gh auth login` as another account in the container), and wrote its own files.
+    fs.writeFileSync(hosts, 'github.com:\n    user: someone-else\n    oauth_token: gho_other\nghe.example.com:\n    user: x\n');
+    fs.writeFileSync(path.join(gh, 'config.yml'), 'version: "1"\neditor: vim\n');
+    expect(run(env, 'gho_new_token', 'api', 'octo-cat').status).toBe(0);
+    const text = fs.readFileSync(hosts, 'utf8');
+    expect(text).toContain('    oauth_token: "gho_new_token"\n    user: "octo-cat"\n');
+    expect(text).toContain('        "octo-cat":\n            oauth_token: "gho_new_token"\n');
+    expect(text).not.toMatch(/someone-else|gho_other|ghe\.example\.com/);
+    expect(fs.readFileSync(path.join(gh, 'config.yml'), 'utf8')).toBe('version: "1"\neditor: vim\n');
+  });
+
+  it('replaces a link or a folder in place of the gh folder or hosts.yml, so the token never goes to another place', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const elsewhere = path.join(env.ws, 'api', 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    fs.symlinkSync(elsewhere, path.join(dir, 'gh'));
+    expect(run(env).status).toBe(0);
+    expect(fs.lstatSync(path.join(dir, 'gh')).isDirectory()).toBe(true);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+
+    const target = path.join(env.ws, 'api', 'target');
+    fs.writeFileSync(target, 'x');
+    fs.rmSync(path.join(dir, 'gh', 'hosts.yml'));
+    fs.symlinkSync(target, path.join(dir, 'gh', 'hosts.yml'));
+    expect(run(env).status).toBe(0);
+    expect(fs.lstatSync(path.join(dir, 'gh', 'hosts.yml')).isFile()).toBe(true);
+    expect(fs.readFileSync(target, 'utf8')).toBe('x');
+
+    fs.rmSync(path.join(dir, 'gh', 'hosts.yml'));
+    fs.mkdirSync(path.join(dir, 'gh', 'hosts.yml'));
+    expect(run(env).status).toBe(0);
+    expect(fs.lstatSync(path.join(dir, 'gh', 'hosts.yml')).isFile()).toBe(true);
+  });
+
+  it('signs the GitHub CLI in nowhere for a token that YAML would need to escape, and still writes the token file', () => {
+    const env = setup();
+    expect(run(env).status).toBe(0);
+    const hosts = path.join(env.ws, '.devenv+', 'gh', 'hosts.yml');
+    expect(fs.existsSync(hosts)).toBe(true);
+    const result = run(env, 'gho_"x":\\y');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('The GitHub CLI in the container is not signed in');
+    expect(fs.existsSync(hosts)).toBe(false);
+    expect(fs.readFileSync(path.join(env.ws, '.devenv+', 'github-token'), 'utf8')).toBe('gho_"x":\\y');
+  });
+
+  it.each([
+    ['empty', ''],
+    ['starting with a hyphen', '-octo'],
+    ['with a quote', 'octo"'],
+    ['with a colon and a space', 'a: b'],
+    ['with a new line', 'octo\nuser: x'],
+    ['too long', 'x'.repeat(40)],
+  ])('rejects a GitHub login %s before it writes anything', (_name, login) => {
+    const env = setup();
+    const result = run(env, TOKEN, 'api', login);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('Invalid GitHub login');
+    expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
+    expect(fs.readdirSync(env.secrets)).toEqual([]);
+  });
+
   it('writes nothing without the repository folder, and nothing without a tmpfs for the token', () => {
     const env = setup();
     const missing = run(env, TOKEN, 'other');
@@ -503,6 +615,71 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     const result = run(setup(), TOKEN, '../etc');
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Invalid folder name');
+  });
+});
+
+describe('REMOVE_GIT_TOKEN_SCRIPT (concept 7.5, in the workspace helper)', () => {
+  function runRemoval(ws: string): { status: number | null; stdout: string; stderr: string } {
+    const script = REMOVE_GIT_TOKEN_SCRIPT.split('/workspaces').join(ws);
+    const result = spawnSync('sh', ['-c', script, 'sh'], { encoding: 'utf8' });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  it('removes the token file and the sign-in of the GitHub CLI, and nothing else', () => {
+    const ws = tempDir();
+    const dir = path.join(ws, '.devenv+');
+    write(path.join(dir, 'github-token'), 'gho_secret');
+    write(path.join(dir, 'gh', 'hosts.yml'), 'github.com:\n    oauth_token: "gho_secret"\n');
+    write(path.join(dir, 'gh', 'config.yml'), 'editor: vim\n');
+    write(path.join(dir, 'gitconfig'), '[user]\n\tname = x\n');
+    write(path.join(ws, 'api', 'README.md'), 'x');
+    const result = runRemoval(ws);
+    expect(result).toMatchObject({ status: 0, stderr: '' });
+    expect(result.stdout).toContain('The GitHub token was removed');
+    expect(fs.existsSync(path.join(dir, 'github-token'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'gh', 'hosts.yml'))).toBe(false);
+    expect(fs.readdirSync(path.join(dir, 'gh'))).toEqual(['config.yml']);
+    expect(fs.readdirSync(dir).sort()).toEqual(['gh', 'gitconfig']);
+    expect(fs.readdirSync(path.join(ws, 'api'))).toEqual(['README.md']);
+  });
+
+  it('succeeds when there is no token (a volume of an older version, or removed before)', () => {
+    const ws = tempDir();
+    expect(runRemoval(ws)).toMatchObject({ status: 0, stderr: '' });
+    fs.mkdirSync(path.join(ws, '.devenv+'));
+    expect(runRemoval(ws)).toMatchObject({ status: 0, stderr: '' });
+  });
+
+  it('removes a link in place of the token file, not its target', () => {
+    const ws = tempDir();
+    const target = path.join(ws, 'api', 'kept');
+    write(target, 'x');
+    fs.mkdirSync(path.join(ws, '.devenv+', 'gh'), { recursive: true });
+    fs.symlinkSync(target, path.join(ws, '.devenv+', 'github-token'));
+    fs.symlinkSync(target, path.join(ws, '.devenv+', 'gh', 'hosts.yml'));
+    expect(runRemoval(ws).status).toBe(0);
+    expect(fs.existsSync(path.join(ws, '.devenv+', 'github-token'))).toBe(false);
+    expect(fs.readFileSync(target, 'utf8')).toBe('x');
+  });
+
+  it('fails with exit code 1 when a file cannot be removed, and removes the other one all the same', () => {
+    const ws = tempDir();
+    const dir = path.join(ws, '.devenv+');
+    write(path.join(dir, 'github-token'), 'gho_secret');
+    write(path.join(dir, 'gh', 'hosts.yml'), 'x');
+    // An rm that refuses the token file (root may remove any file, so a fake tool stands in for the refusal).
+    const bin = path.join(ws, 'bin');
+    write(path.join(bin, 'rm'), `#!/bin/sh\ncase "$*" in *github-token*) echo 'rm: Permission denied' >&2; exit 1 ;; esac\nexec /bin/rm "$@"\n`);
+    fs.chmodSync(path.join(bin, 'rm'), 0o755);
+    const script = REMOVE_GIT_TOKEN_SCRIPT.split('/workspaces').join(ws);
+    const result = spawnSync('sh', ['-c', script, 'sh'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('github-token could not be removed');
+    expect(result.stdout).not.toContain('The GitHub token was removed');
+    expect(fs.existsSync(path.join(dir, 'gh', 'hosts.yml'))).toBe(false);
   });
 });
 

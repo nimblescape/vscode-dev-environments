@@ -9,7 +9,6 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CONFIG_FOLDER, GIT_CONFIG_FILE } from '../names';
 import {
-  CONFIG_FOLDER_OWNER_COMMAND,
   CONTAINER_CREDENTIAL_HELPER,
   GIT_CREDENTIALS_CONFIG_FILE,
   HOME_GIT_CONFIG_CONTENT,
@@ -20,8 +19,8 @@ import {
   gitIdentity,
   homeGitConfigCommand,
   isContainerGitVariable,
+  isGitHubLogin,
   parseGitVersion,
-  parseOwnerIds,
   remoteEnvironment,
 } from './containerGit';
 
@@ -58,17 +57,19 @@ describe('environment of the dev container (concept section 9 "Git inside the co
     expect(env.GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     expect(env.DOCKER_CONFIG).toBe('/workspaces/.devenv+/docker');
     expect(env.GIT_SSH_COMMAND).toBe('ssh -o IdentityAgent=none');
+    // The GitHub CLI reads its sign-in (hosts.yml of the owner account) from the volume, not from ~/.config/gh.
+    expect(env.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
     expect(Object.keys(env).some((name) => /TOKEN/.test(name))).toBe(false);
     expect(remoteEnvironment()).toEqual(env);
   });
 
-  it('sets only documented variables of Git and Docker, never one of the Dev Containers extension or the VS Code server', () => {
-    const documented = /^(GIT_CONFIG_GLOBAL|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_SSH_COMMAND|DOCKER_CONFIG)$/;
+  it('sets only documented variables of Git, Docker, and the GitHub CLI, never one of the Dev Containers extension or the VS Code server', () => {
+    const documented = /^(GIT_CONFIG_GLOBAL|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_SSH_COMMAND|DOCKER_CONFIG|GH_CONFIG_DIR)$/;
     for (const env of [containerEnvironment(), remoteEnvironment()]) {
       for (const name of Object.keys(env)) expect(name).toMatch(documented);
       // User decision (2026-09-25): these keep the values of their owners, so the browser, the agents, and the
       // channels of the Dev Containers extension work as the Dev Containers extension and VS Code expect.
-      for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'GIT_CONFIG_PARAMETERS', 'GNUPGHOME']) {
+      for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'GIT_CONFIG_PARAMETERS', 'GNUPGHOME', 'GH_TOKEN', 'GITHUB_TOKEN']) {
         expect(env).not.toHaveProperty(name);
       }
     }
@@ -188,6 +189,9 @@ describe('variables of container-only Git, which a configuration may not set (co
     ['GIT_CONFIG_PARAMETERS', true],
     ['DOCKER_CONFIG', true],
     ['GIT_SSH_COMMAND', true],
+    ['GH_CONFIG_DIR', true],
+    ['gh_config_dir', true],
+    [' GH_CONFIG_DIR', true],
     ['git_config_global', true],
     [' GIT_SSH_COMMAND ', true],
     // Variables of the Dev Containers extension, the VS Code server, and GnuPG: the extension does not set them.
@@ -201,6 +205,8 @@ describe('variables of container-only Git, which a configuration may not set (co
     ['DOCKER_HOST', false],
     ['BROWSER', false],
     ['GITHUB_TOKEN', false],
+    ['GH_CONFIG', false],
+    ['GH_HOST', false],
     ['', false],
   ])('%j: %s', (name, expected) => {
     expect(isContainerGitVariable(name)).toBe(expected);
@@ -510,21 +516,26 @@ describe('Git version of the container', () => {
   });
 });
 
-describe('the owner of the configuration folder, who may remove the token when root may not (--cap-drop)', () => {
-  it('asks stat for the numeric owner and group of the configuration folder', () => {
-    expect(CONFIG_FOLDER_OWNER_COMMAND).toEqual(['stat', '-c', '%u:%g', CONFIG_FOLDER]);
-  });
-
-  it.each<[string, string | undefined]>([
-    ['1000:1000\n', '1000:1000'],
-    ['  501:20  ', '501:20'],
-    ['0:0', '0:0'],
-    ['', undefined],
-    ['vscode:vscode', undefined],
-    ['1000', undefined],
-    ["stat: can't stat '/workspaces/.devenv+': No such file or directory", undefined],
-    ['1000:1000\n1001:1001', undefined],
-  ])('%j', (output, ids) => {
-    expect(parseOwnerIds(output)).toBe(ids);
+describe('GitHub login of the sign-in of the GitHub CLI (hosts.yml)', () => {
+  it.each<[string, boolean]>([
+    ['scalarion', true],
+    ['octo-cat', true],
+    ['a', true],
+    ['1234', true],
+    ['null', true],
+    ['old--login', true],
+    ['old-login-', true],
+    ['x'.repeat(39), true],
+    ['x'.repeat(40), false],
+    ['', false],
+    ['-octo', false],
+    ['octo_cat', false],
+    ['octo cat', false],
+    ['octo"cat', false],
+    ['octo:cat', false],
+    ['octo\ncat', false],
+    ['${localEnv:USER}', false],
+  ])('%j: %s', (login, expected) => {
+    expect(isGitHubLogin(login)).toBe(expected);
   });
 });

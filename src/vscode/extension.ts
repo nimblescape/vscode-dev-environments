@@ -228,6 +228,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     sessionFiles,
     disconnectRequests,
     docker,
+    helper,
     service,
     discovery,
     auth,
