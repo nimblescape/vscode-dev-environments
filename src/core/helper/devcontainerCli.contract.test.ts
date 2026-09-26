@@ -249,6 +249,8 @@ describe('Docker Compose in the CLI bundle (implementation notes, section "Docke
     ['the project label', 'kG="com.docker.compose.project"'],
     ['the generated compose file of the container', '"docker-compose.devcontainer.containerFeatures"'],
     ['an existing dev container is started without recreating', '"--no-recreate"'],
+    // The result of `up` names the project, which the pipeline compares with the project of the environment (L-2).
+    ['the project name in the result of up', '{containerId:g,composeProjectName:C,'],
     // `build --image-name` tags the built dev service image.
     ['the image name of the built dev service', 'OA=mA||RA.image||mp('],
     ['the tag of the built dev service', 'Oe(q,"tag",OA,bA)'],

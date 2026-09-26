@@ -7,6 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
 import {
   baseImageKey,
+  composeContainerOrder,
+  composeMountVolumes,
+  composeRecordOf,
   configHash,
   containerIsCurrent,
   digestReference,
@@ -15,6 +18,7 @@ import {
   containerUserName,
   imageRemoteUser,
   imagesToPull,
+  isComposeContainer,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -444,5 +448,44 @@ describe('isGitHubTokenRejected', () => {
     "error: pathspec 'feature' did not match any file(s) known to git",
   ])('not a rejected token: %s', (text) => {
     expect(isGitHubTokenRejected(text)).toBe(false);
+  });
+});
+
+describe('Docker Compose rules (unit 6)', () => {
+  const record = { builtAt: '', environmentImage: 'devenv-3f2a9c1e:1', buildNumber: 1, configPath: 'c', configHash: 'h', images: {}, features: {} };
+
+  it.each([
+    ['no compose part', undefined, undefined],
+    ['a valid part', { service: 'app', images: ['devenv-3f2a9c1e-app'] }, { service: 'app', images: ['devenv-3f2a9c1e-app'] }],
+    ['an empty service', { service: '', images: [] }, undefined],
+    ['images that are no list of texts', { service: 'app', images: [1] }, undefined],
+    ['no object', 'app', undefined],
+  ])('composeRecordOf: %s', (_name, compose, expected) => {
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(expected);
+  });
+
+  it('isComposeContainer: only a container of the project of the environment', () => {
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'api_devcontainer' }, 'devenv-3f2a9c1e')).toBe(false);
+    expect(isComposeContainer({}, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('composeContainerOrder: the services start first and stop last', () => {
+    const dev = { id: 'dev', labels: {} };
+    const db = { id: 'db', labels: { 'devenv.compose-service': 'db' } };
+    const cache = { id: 'cache', labels: { 'devenv.compose-service': 'cache' } };
+    expect(composeContainerOrder([dev, db, cache], 'start').map((c) => c.id)).toEqual(['db', 'cache', 'dev']);
+    expect(composeContainerOrder([db, dev, cache], 'stop').map((c) => c.id)).toEqual(['dev', 'db', 'cache']);
+  });
+
+  it('composeMountVolumes: named volumes of mounts become volumes of the project, unless external', () => {
+    expect(
+      composeMountVolumes('devenv-3f2a9c1e', [
+        ['source=cache,target=/cache,type=volume', 'source=/tmp,target=/tmp,type=bind', 'type=tmpfs,target=/run'],
+        { source: 'shared', target: '/shared', type: 'volume', external: true },
+        undefined,
+        [{ source: 'cache', target: '/other', type: 'volume' }],
+      ]),
+    ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'] });
   });
 });

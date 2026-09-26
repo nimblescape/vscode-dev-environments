@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID } from '../names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
   isAbortError,
   systemClock,
@@ -429,14 +429,39 @@ export class ContainerAdapter {
     return (await this.daemonStatus(signal)).running;
   }
 
-  /** The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. */
+  /**
+   * The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. The
+   * other services of a Docker Compose environment carry the label too, with devenv.compose-service: they are skipped,
+   * so this is always the dev container.
+   */
   async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
-    const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+    const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+    const containers = all.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
     if (containers.length === 0) return undefined;
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
     }
     return publicInfo([...containers].sort(preferred)[0]);
+  }
+
+  /**
+   * The API version of the Docker Engine (`docker version --format '{{.Server.APIVersion}}'`, for example `1.48`), or
+   * `undefined` when the engine does not tell it. Docker Compose configurations need it for `volume.subpath`
+   * (supportsVolumeSubpath). Rejects only with an AbortError.
+   */
+  async engineApiVersion(signal?: AbortSignal): Promise<string | undefined> {
+    let result: RunResult;
+    try {
+      result = await this.run(['version', '--format', '{{.Server.APIVersion}}'], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.logger.warn(`The API version of the Docker Engine could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+    const version = result.stdout.trim();
+    if (result.exitCode === 0 && /^\d+\.\d+$/.test(version)) return version;
+    this.logger.warn(`The API version of the Docker Engine could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
+    return undefined;
   }
 
   /** All containers with the label devenv.environment-id, running or not. */

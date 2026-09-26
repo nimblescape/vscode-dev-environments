@@ -36,6 +36,8 @@ export const Messages = {
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',
   composeNotSupported: 'Docker Compose configurations are not supported yet.',
+  /** Docker Compose could not read the compose files of a configuration (the details have its message). */
+  composeConfigurationFailed: 'The Docker Compose files of this configuration could not be read. The details show why.',
   noConfiguration: (repository: string) => `The repository ${repository} has no Dev Container configuration.`,
   configurationNotFound: (configPath: string, configurationName: string) =>
     `The configuration ${configPath} does not exist on this branch. The configuration ${configurationName} is used.`,

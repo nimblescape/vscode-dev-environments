@@ -300,6 +300,28 @@ describe('containers', () => {
     expect((await docker.findContainer('env-1'))?.id).toBe('run');
   });
 
+  it('skips the other services of a Docker Compose environment: the dev container is found (unit 6, D-4)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db', 'dev']));
+      return ok(
+        inspectOutput([
+          // The running side service would win without the rule (a running container comes first).
+          containerJson({ id: 'db', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', labels: { 'devenv.environment-id': 'env-1' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1'))?.id).toBe('dev');
+  });
+
+  it('finds no container when only other services of a Docker Compose environment exist', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db']));
+      return ok(inspectOutput([containerJson({ id: 'db', name: 'db', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } })]));
+    });
+    expect(await docker.findContainer('env-1')).toBeUndefined();
+  });
+
   it('skips a container that was removed between list and inspect', async () => {
     const { docker } = adapter((call) => {
       if (call.args[0] === 'ps') return ok(idLines(['c1', 'gone']));
@@ -964,5 +986,21 @@ describe('ContainerAdapter.pullImage with credentials', () => {
     expect(JSON.parse(registryLoginConfig({ registry: 'ghcr.io', username: 'a', password: 'b:c' }))).toEqual({
       auths: { 'ghcr.io': { auth: Buffer.from('a:b:c').toString('base64') } },
     });
+  });
+});
+
+describe('ContainerAdapter.engineApiVersion', () => {
+  it('reads the API version of the engine', async () => {
+    const { docker, runner } = adapter(() => ok('1.48\n'));
+    expect(await docker.engineApiVersion()).toBe('1.48');
+    expect(runner.calls[0].args).toEqual(['version', '--format', '{{.Server.APIVersion}}']);
+  });
+
+  it.each([
+    ['a failed call', fail('Cannot connect to the Docker daemon', 1, '')],
+    ['an output that is no version', ok('<no value>\n')],
+  ])('is undefined after %s', async (_name, result) => {
+    const { docker } = adapter(() => result);
+    expect(await docker.engineApiVersion()).toBeUndefined();
   });
 });

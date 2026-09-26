@@ -29,6 +29,20 @@ export interface BuildRecord {
   images: Record<string, string>;
   /** Feature reference as written in the configuration → digest read right before the build. */
   features: Record<string, string>;
+  /**
+   * A Docker Compose configuration (implementation notes, section "Docker Compose"): the dev service, and the images
+   * that Compose and the Dev Container CLI built for the project (builtServiceImages), which Delete removes. The
+   * environment image is the image of the dev service.
+   */
+  compose?: ComposeBuildRecord;
+}
+
+/** BuildRecord.compose. */
+export interface ComposeBuildRecord {
+  /** `service` of devcontainer.json: the dev service. */
+  service: string;
+  /** `devenv-<short id>-<service>` of each service that Compose builds. */
+  images: string[];
 }
 
 export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';
@@ -301,6 +315,8 @@ export interface DevcontainerResult {
   message?: string;
   description?: string;
   containerId?: string;
+  /** `devcontainer up` of a Docker Compose configuration: the project name that the CLI used. */
+  composeProjectName?: string;
   imageName?: string | string[];
   remoteUser?: string;
   remoteWorkspaceFolder?: string;
@@ -324,6 +340,10 @@ export interface DevcontainerConfig {
   /** Deprecated form of `build.dockerfile`. */
   dockerFile?: string;
   dockerComposeFile?: string | string[];
+  /** Docker Compose: the dev service. */
+  service?: string;
+  /** Docker Compose: the services that `up` starts besides the dev service (default: all). */
+  runServices?: string[];
   features?: Record<string, unknown>;
   runArgs?: string[];
   appPort?: number | string | Array<number | string>;

@@ -19,6 +19,12 @@ describe('checkConfiguration', () => {
     expect(checkConfiguration('{ // "dockerComposeFile": "x.yml"\n "image": "x" }').compose).toBe(false);
   });
 
+  it('does not report ${localWorkspaceFolder} in dockerComposeFile: the compose files are read in the workspace helper', () => {
+    const text = '{ "dockerComposeFile": "\${localWorkspaceFolder}/.devcontainer/compose.yml", "service": "app" }';
+    expect(checkConfiguration(text)).toEqual({ compose: true, computerDependent: [] });
+    expect(checkConfiguration('{ "service": "\${localWorkspaceFolder}" }').computerDependent).toEqual(['\${localWorkspaceFolder}']);
+  });
+
   it('reports ${localWorkspaceFolder} only where it matters', () => {
     const harmless = `{
       "name": "\${localWorkspaceFolder}",

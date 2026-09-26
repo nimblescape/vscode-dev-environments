@@ -421,11 +421,14 @@ describe('open: first open', () => {
     expect(h.docker.volumes.size).toBe(0);
   });
 
-  it('refuses Docker Compose configurations', async () => {
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "docker-compose.yml", "service": "app" }' };
+  // Spec u6: Docker Compose configurations are supported (compose tests in environmentService.compose.test.ts); what is
+  // refused now is a compose file outside of the repository (resolveComposeFiles), before the model run.
+  it('refuses a Docker Compose configuration whose compose file is outside of the repository', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "../../docker-compose.yml", "service": "app" }' };
     const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('composeNotSupported');
-    expect(error.message).toBe(Messages.composeNotSupported);
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.unsupportedOptions('dockerComposeFile "../../docker-compose.yml" (outside of the repository)'));
+    expect(h.helper.composeModels).toEqual([]);
     expect(await h.registry.list()).toEqual([]);
   });
 
@@ -874,9 +877,11 @@ describe('open: existing environment', () => {
 
   it('starts the existing container when the configuration is broken', async () => {
     await seedEnvironment(h);
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "compose.yml" }' };
+    // Spec u6: Docker Compose is supported; a compose file that Docker Compose cannot read is the broken configuration.
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "compose.yml", "service": "app" }' };
+    h.helper.composeOutput = { error: 'yaml: line 3: mapping values are not allowed in this context' };
     await h.service.open(TARGET, options());
-    expect(h.ui.warnings).toEqual([Messages.composeNotSupported]);
+    expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
     expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
     expect(h.helper.builds).toEqual([]);
   });

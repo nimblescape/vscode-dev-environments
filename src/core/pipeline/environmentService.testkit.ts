@@ -9,11 +9,15 @@ import * as os from 'os';
 import * as path from 'path';
 import type { ContainerInfo, VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
+import { COMPOSE_MODEL_PATH, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
+import { checkConfiguration } from '../helper/configChecks';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import type { CheckOutcome, ConfigReferences } from '../imageCheck/imageCheck';
+import { parseJsonc } from '../jsonc';
 import type { ProgressStep } from '../messages';
 import {
   CONTAINER_VERSION,
+  LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
@@ -109,7 +113,13 @@ export class FakeDocker implements EnvironmentDocker {
   /** `docker run` calls: the image and the arguments after it. */
   readonly runs: Array<{ image: string; args: readonly string[]; all: readonly string[] }> = [];
   runError: Maybe<Error>;
+  /** The API version of the Docker Engine (engineApiVersion). `undefined`: the engine does not tell it. */
+  apiVersion: string | undefined = '1.48';
   private counter = 0;
+
+  async engineApiVersion(): Promise<string | undefined> {
+    return this.apiVersion;
+  }
 
   async isRunning(): Promise<boolean> {
     return this.running;
@@ -140,8 +150,11 @@ export class FakeDocker implements EnvironmentDocker {
     return '';
   }
 
+  /** Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped. */
   async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
-    const matching = [...this.containers.values()].filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId);
+    const matching = [...this.containers.values()].filter(
+      (c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId && c.labels[LABEL_COMPOSE_SERVICE] === undefined,
+    );
     const found = matching.find((c) => c.state === 'running') ?? matching[matching.length - 1];
     return found && { ...found, labels: { ...found.labels } };
   }
@@ -337,8 +350,36 @@ export class FakeHelper implements EnvironmentHelper {
   onBuild: (imageName: string) => void | Promise<void> = () => undefined;
   onClone: () => void | Promise<void> = () => undefined;
   readonly clones: Array<{ volumeName: string; repository: string; branch?: string; token: string }> = [];
-  readonly builds: Array<{ imageName: string; configPath: string }> = [];
-  readonly ups: Array<{ image: string; removeExistingContainer: boolean; override: Record<string, unknown> }> = [];
+  /** `override`, `files`, and `env` only for a Docker Compose configuration. */
+  readonly builds: Array<{
+    imageName: string;
+    configPath: string;
+    override?: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+  }> = [];
+  /** `files` and `env` only for a Docker Compose configuration. */
+  readonly ups: Array<{
+    image: string;
+    removeExistingContainer: boolean;
+    override: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+  }> = [];
+  /** Each readConfiguration, with what a Docker Compose configuration passes. */
+  readonly readConfigurations: Array<{
+    configPath: string;
+    merged?: boolean;
+    override?: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+  }> = [];
+  /** Result of composeModel (the model run of a Docker Compose configuration); an Error is thrown. */
+  composeOutput: ComposeModelOutput | { error: string } | Error = new Error('No Docker Compose model in this test.');
+  /** Each composeModel. */
+  readonly composeModels: Array<{ files: readonly string[]; project: string }> = [];
+  /** `composeProjectName` of the result of `up` of a Docker Compose configuration. Default: COMPOSE_PROJECT_NAME. */
+  composeProjectNameResult: string | undefined;
   /** Each write of the token and the Git configuration into the volume. */
   readonly gitPreparations: Array<{
     volumeName: string;
@@ -386,12 +427,38 @@ export class FakeHelper implements EnvironmentHelper {
     return this.configurations ?? Object.keys(this.files);
   }
 
-  async readConfiguration(p: { volumeName: string; configPath: string }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
+  async readConfiguration(p: {
+    volumeName: string;
+    configPath: string;
+    merged?: boolean;
+    override?: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+  }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
     this.mount(p.volumeName);
     this.calls.push(`readConfiguration ${p.configPath}`);
+    this.readConfigurations.push({
+      configPath: p.configPath,
+      ...(p.merged !== undefined ? { merged: p.merged } : {}),
+      ...(p.override !== undefined ? { override: p.override } : {}),
+      ...(p.files !== undefined ? { files: p.files } : {}),
+      ...(p.env !== undefined ? { env: p.env } : {}),
+    });
     if (this.readConfigurationError) throw this.readConfigurationError;
-    const config = JSON.parse(JSON.stringify(this.config)) as DevcontainerConfig;
+    // A Docker Compose configuration resolves to its own text (the fake resolves no variables); any other one to `config`.
+    const text = Object.prototype.hasOwnProperty.call(this.files, p.configPath) ? this.files[p.configPath].configText : undefined;
+    const compose = text !== undefined && checkConfiguration(text).compose;
+    const config = (compose && text !== undefined ? parseJsonc(text) : JSON.parse(JSON.stringify(this.config))) as DevcontainerConfig;
+    if (p.merged === false) return { config };
     return this.merged === undefined ? { config } : { config, merged: { ...config, ...this.merged } };
+  }
+
+  async composeModel(p: { volumeName: string; files: readonly string[]; project: string }): Promise<ComposeModelOutput | { error: string }> {
+    this.mount(p.volumeName);
+    this.calls.push(`composeModel ${p.project}`);
+    this.composeModels.push({ files: [...p.files], project: p.project });
+    if (this.composeOutput instanceof Error) throw this.composeOutput;
+    return JSON.parse(JSON.stringify(this.composeOutput)) as ComposeModelOutput | { error: string };
   }
 
   async prepareGit(p: {
@@ -407,10 +474,24 @@ export class FakeHelper implements EnvironmentHelper {
     if (this.prepareGitError) throw this.prepareGitError;
   }
 
-  async build(p: { volumeName: string; configPath: string; imageName: string; signal?: AbortSignal }): Promise<DevcontainerResult> {
+  async build(p: {
+    volumeName: string;
+    configPath: string;
+    imageName: string;
+    override?: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
     this.calls.push(`build ${p.imageName}`);
-    this.builds.push({ imageName: p.imageName, configPath: p.configPath });
+    this.builds.push({
+      imageName: p.imageName,
+      configPath: p.configPath,
+      ...(p.override !== undefined ? { override: p.override } : {}),
+      ...(p.files !== undefined ? { files: p.files } : {}),
+      ...(p.env !== undefined ? { env: p.env } : {}),
+    });
     await this.onBuild(p.imageName);
     if (p.signal?.aborted) throw abortError();
     const error = this.buildError(p.imageName);
@@ -426,8 +507,11 @@ export class FakeHelper implements EnvironmentHelper {
     override: Record<string, unknown>;
     environmentId: string;
     removeExistingContainer: boolean;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
   }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
+    if (p.override.dockerComposeFile !== undefined) return this.composeUp(p);
     const image = String(p.override.image);
     this.calls.push(`up ${image}${p.removeExistingContainer ? ' --remove-existing-container' : ''}`);
     this.ups.push({ image, removeExistingContainer: p.removeExistingContainer, override: p.override });
@@ -466,6 +550,94 @@ export class FakeHelper implements EnvironmentHelper {
       throw new DevcontainerCommandError('devcontainer up', 1, `${JSON.stringify(result)}\n`, 'npm ERR! code 1', result);
     }
     return { outcome: 'success', containerId, remoteUser: this.remoteUser, remoteWorkspaceFolder: workspaceFolder };
+  }
+
+  /**
+   * `up` of a Docker Compose configuration, as the Dev Container CLI and Compose do it: the dev container is found by the
+   * project and the service; `removeExistingContainer` replaces only it; the containers of the other services (of
+   * `runServices`, default all) are created with the labels of the model, or started.
+   */
+  private async composeUp(p: {
+    volumeName: string;
+    override: Record<string, unknown>;
+    environmentId: string;
+    removeExistingContainer: boolean;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+  }): Promise<DevcontainerResult> {
+    const text = p.files?.[COMPOSE_MODEL_PATH];
+    if (text === undefined) throw new DevcontainerCommandError('devcontainer up', 1, '', 'No compose file.');
+    const model = JSON.parse(text) as ComposeModel;
+    const service = String(p.override.service);
+    const dev = model.services[service];
+    const image = String(dev.image);
+    const project = p.env?.COMPOSE_PROJECT_NAME ?? String(model.name);
+    this.calls.push(`up ${image}${p.removeExistingContainer ? ' --remove-existing-container' : ''}`);
+    this.ups.push({
+      image,
+      removeExistingContainer: p.removeExistingContainer,
+      override: p.override,
+      ...(p.files !== undefined ? { files: p.files } : {}),
+      ...(p.env !== undefined ? { env: p.env } : {}),
+    });
+    const ofProject = (name: string) =>
+      this.docker
+        .containersOf(p.environmentId)
+        .find((c) => c.labels['com.docker.compose.project'] === project && c.labels['com.docker.compose.service'] === name);
+    const existing = ofProject(service);
+    const error = this.upError(image, p.removeExistingContainer);
+    if (error && this.upFailsBeforeRemoval) throw error;
+    if (existing && p.removeExistingContainer) this.docker.containers.delete(existing.id);
+    if (error) throw error;
+    const volumeNames = (entries: unknown): string[] =>
+      (Array.isArray(entries) ? entries : [])
+        .map((entry: { type?: string; source?: string }) => (entry.type === 'volume' && entry.source ? model.volumes?.[entry.source]?.name : undefined))
+        .filter((name): name is string => typeof name === 'string');
+    const create = (name: string, containerName: string, serviceImage: string, labels: unknown, volumes: string[]): ContainerInfo => {
+      if (!this.docker.images.has(serviceImage)) throw new DevcontainerCommandError('devcontainer up', 1, '', `Error: No such image: ${serviceImage}`);
+      const created = this.docker.addContainer({
+        environmentId: p.environmentId,
+        name: containerName,
+        state: 'running',
+        image: serviceImage,
+        labels: { ...(labels as Record<string, string>), 'com.docker.compose.project': project, 'com.docker.compose.service': name },
+      });
+      if (volumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes });
+      return created;
+    };
+    let containerId: string;
+    if (existing && !p.removeExistingContainer) {
+      existing.state = 'running';
+      existing.rawState = 'running';
+      containerId = existing.id;
+    } else {
+      const volumes = [...volumeNames(dev.volumes), ...this.containerVolumes];
+      containerId = create(service, String(dev.container_name), image, dev.labels, volumes).id;
+    }
+    const runServices = Array.isArray(p.override.runServices) ? (p.override.runServices as string[]) : Object.keys(model.services);
+    for (const name of runServices) {
+      if (name === service) continue;
+      const other = ofProject(name);
+      if (other) {
+        other.state = 'running';
+        other.rawState = 'running';
+        continue;
+      }
+      const definition = model.services[name];
+      create(name, `${project}-${name}-1`, String(definition.image), definition.labels, volumeNames(definition.volumes));
+    }
+    const failure = this.lifecycleFailure(image);
+    if (failure !== undefined) {
+      const result: DevcontainerResult = { outcome: 'error', message: 'Command failed', description: failure, containerId };
+      throw new DevcontainerCommandError('devcontainer up', 1, `${JSON.stringify(result)}\n`, 'failed', result);
+    }
+    return {
+      outcome: 'success',
+      containerId,
+      composeProjectName: this.composeProjectNameResult ?? project,
+      remoteUser: this.remoteUser,
+      remoteWorkspaceFolder: String(p.override.workspaceFolder),
+    };
   }
 
   async gitSummary(p: { volumeName: string }): Promise<GitSummary> {
