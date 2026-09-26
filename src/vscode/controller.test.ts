@@ -2695,16 +2695,25 @@ describe('the switch of the host access checks (concept section 9 "Host access",
     expect(settings.update).toHaveBeenCalledWith('hostAccessChecksOff', ['alice/tool'], fakeVscode.ConfigurationTarget.Global);
   });
 
-  it('Turn Off Host Access Checks… asks nothing when either name of a renamed repository is listed (A1)', async () => {
+  // Review finding R2-1: "already off" is decided under the pipeline key (the registry name) only; it was "either name"
+  // after finding A1, which answered "already off" while the pipeline still had the checks on.
+  it('Turn Off Host Access Checks… decides "already off" by the registry name of a renamed repository (A1, R2-1)', async () => {
     const env = environment({ repository: 'alice/tool' });
     await h.registry.add(env);
-    for (const listed of ['alice/tool', 'bob/tool']) {
-      const settings = userSettings([listed]);
-      h.settings.hostAccessChecksOff = [listed];
-      await run('turnOffHostAccessChecks', row('bob/tool', env));
-      expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
-      expect(settings.update).not.toHaveBeenCalled();
-    }
+    let settings = userSettings(['alice/tool']);
+    h.settings.hostAccessChecksOff = ['alice/tool'];
+    await run('turnOffHostAccessChecks', row('bob/tool', env));
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(settings.update).not.toHaveBeenCalled();
+
+    // Only the GitHub name is listed: the pipeline has the checks on, so Turn Off asks and writes the registry name.
+    settings = userSettings(['bob/tool']);
+    h.settings.hostAccessChecksOff = ['bob/tool'];
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.turnOffChecks);
+    await run('turnOffHostAccessChecks', row('bob/tool', env));
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(settings.update).toHaveBeenCalledTimes(1);
+    expect(settings.update.mock.calls[0]?.[1]).toEqual(['bob/tool', 'alice/tool']);
   });
 
   it('needs a row: without an argument, nothing is written', async () => {

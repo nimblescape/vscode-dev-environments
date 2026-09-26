@@ -87,7 +87,7 @@ export const Messages = {
     `The host access checks are off for ${repository}. They apply again when you turn them on. The change applies when the container of the environment is created next, for example with Rebuild; an existing container keeps its current settings, such as ports that are bound to this computer only.`,
   /** After Turn On Host Access Checks. */
   hostAccessChecksTurnedOn: (repository: string) =>
-    `The host access checks are on again for ${repository}. At the next start, a container that was made without them is set up again, if the configuration passes the checks.`,
+    `The host access checks are on again for ${repository}. At the next start, a container that was made without them is set up again, if the configuration passes the checks. Your files in the repository are kept. Files in other folders of that container, for example in the home folder, are removed; copy them out before you start it again.`,
   /** The warning in the tooltip of a repository row whose host access checks are off. */
   hostAccessUnrestrictedTooltip:
     'Warning: the host access checks are off for this repository. Its configuration can use the files, devices, and Docker of your computer.',

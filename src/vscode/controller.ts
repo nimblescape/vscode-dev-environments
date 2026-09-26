@@ -799,7 +799,8 @@ export class Controller implements vscode.Disposable {
     if (!names) return;
     const { repository, key } = names;
     const settings = this.deps.settings();
-    if (names.all.some((name) => hostAccessChecks(name, settings) === 'off')) {
+    // The state that the pipeline applies: the switch under its key (review finding R2-1).
+    if (hostAccessChecks(key, settings) === 'off') {
       this.inform(Messages.hostAccessChecksTurnedOff(repository));
       return;
     }

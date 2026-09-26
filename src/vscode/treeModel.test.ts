@@ -861,11 +861,13 @@ describe('the switch of the host access checks in the rows (concept section 9 "H
     expect(docs?.contextValue).toBe('repository;canStart;onGitHub;hostAccessChecked');
   });
 
-  it('marks a renamed or transferred repository when either its registry name or its name on GitHub is listed (A1)', () => {
+  // Review finding R2-1: the row shows the switch as the pipeline applies it, under the registry name only (it was
+  // "either name" after finding A1, which could show the checks off while the pipeline had them on).
+  it('marks a renamed or transferred repository by its registry name, the name the pipeline reads (A1, R2-1)', () => {
     // The registry keeps alice/tool (the name the open pipeline reads the switch under); GitHub answers bob/tool.
     const moved = repo('bob/tool', { configPaths: [] });
-    for (const listed of ['alice/tool', 'bob/tool']) {
-      const groups = buildTreeModel(
+    const build = (listed: string) =>
+      buildTreeModel(
         input({
           discovery: discovery([repo('acme/api')]),
           environments: [environment('e1', 'alice/tool')],
@@ -873,13 +875,17 @@ describe('the switch of the host access checks in the rows (concept section 9 "H
           settings: settings([listed]),
         }),
       );
-      const entry = row(groups, 'bob/tool');
-      expect(entry.hostAccessChecks).toBe('off');
-      expect(entry.description).toBe(`main   Stopped · ${StateTexts.hostAccessUnrestricted}`);
-      expect(entry.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
-      expect(flags(entry.contextValue)).toContain('hostAccessUnrestricted');
-      expect(flags(entry.contextValue)).not.toContain('hostAccessChecked');
-    }
+    const off = row(build('alice/tool'), 'bob/tool');
+    expect(off.hostAccessChecks).toBe('off');
+    expect(off.description).toBe(`main   Stopped · ${StateTexts.hostAccessUnrestricted}`);
+    expect(off.tooltip.split('\n')).toContain(Messages.hostAccessUnrestrictedTooltip);
+    expect(flags(off.contextValue)).toContain('hostAccessUnrestricted');
+    expect(flags(off.contextValue)).not.toContain('hostAccessChecked');
+
+    const on = row(build('bob/tool'), 'bob/tool');
+    expect(on.hostAccessChecks).toBe('on');
+    expect(on.description).not.toContain(StateTexts.hostAccessUnrestricted);
+    expect(flags(on.contextValue)).toContain('hostAccessChecked');
   });
 
   it('adds no flag of the switch to contextValue without it', () => {
