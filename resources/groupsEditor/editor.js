@@ -23,6 +23,7 @@
   const MAX_NAME = 200;
   const MAX_PATTERN = 5000;
   const MAX_TEST_NAME = 140;
+  const TEST_PAUSED = 'The test is paused until the entries are within the limits.';
 
   /** @type {{name: string, pattern: string, flags: string}[]} */
   let entries = [];
@@ -34,7 +35,10 @@
   let savingSeq = undefined;
   /** Load settings.json was pressed: the editor is read-only until the load arrives. */
   let reloading = false;
-  /** The last state of the extension said that a Save runs (for example one of a page before this one). */
+  /**
+   * The last load or state of the extension said that a Save runs (for example one of a page before this one): a page
+   * that starts during Save is read-only from its load on.
+   */
   let extensionSaving = false;
   let lastState = undefined;
   /** The first load sets the test field (a page that starts again); later loads keep what the user typed. */
@@ -89,9 +93,15 @@
     return `Entry ${index + 1} is too long for the editor. Shorten it: until then, the preview shows the entries before, and Save is off. Your edits stay here.`;
   }
 
+  /** A draft over the limits is not sent, so the test of the extension waits for it: the page says so at the test. */
+  function showTestPaused() {
+    $('test-paused').textContent = limitProblem() !== undefined ? TEST_PAUSED : '';
+  }
+
   function sendUpdate() {
     clearTimeout(timer);
     timer = undefined;
+    showTestPaused();
     if (limitProblem() !== undefined) {
       showLimits();
       return;
@@ -119,6 +129,7 @@
     $('add').disabled = entries.length >= MAX_ENTRIES;
     $('entries-full').hidden = entries.length < MAX_ENTRIES;
     applyChecks(lastState);
+    showTestPaused();
     if (limitProblem() !== undefined) showLimits();
     if (focus) {
       const target = document.getElementById(focus);
@@ -290,6 +301,7 @@
     $('save').disabled = !state.canSave || !state.dirty;
     $('status').textContent = state.status || (state.dirty ? 'Not saved.' : '');
     renderTest(state.test);
+    showTestPaused();
     renderPreview(state.preview);
     if (limitProblem() !== undefined) showLimits();
   }
@@ -414,6 +426,8 @@
       flags: normalizeFlags(String(entry.flags)),
     }));
     lastState = undefined;
+    // A page that starts during Save takes no edits until the state after that Save.
+    extensionSaving = message.saving === true;
     if (typeof message.generation === 'number') generation = message.generation;
     // The test field keeps what the user typed; only a page that starts again takes the test name of the extension.
     if (firstLoad && typeof message.testName === 'string') $('test-name').value = message.testName;

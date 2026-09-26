@@ -84,10 +84,18 @@ interface EditorSession {
   testName: string;
   seq: number;
   saving: boolean;
+  /**
+   * During this Save, an update, Save, or stale draft of another page was answered but not taken over: the state after
+   * Save must not report it as saved.
+   */
+  ignoredDuringSave: boolean;
   /** A state is being computed; `again`: compute once more afterwards. */
   computing: boolean;
   again: boolean;
-  /** Text for the status line of the next state. */
+  /**
+   * Text for the status line (for example the result of Save). Every state repeats it until the draft changes (an edit
+   * or a load), so a state computed afterwards (a change of settings.json, a render of the sidebar) does not hide it.
+   */
   status?: string;
 }
 
@@ -126,6 +134,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       testName: '',
       seq: 0,
       saving: false,
+      ignoredDuringSave: false,
       computing: false,
       again: false,
     };
@@ -172,10 +181,12 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     }
     // During Save, the draft stays as it was sent with Save (the page of that Save is read-only then). A message of another
     // page (for example after Developer: Reload Webviews) is not taken over, but it is answered with a state (`saving:
-    // true`, then the state after Save with at least its `seq`), so that page is never left read-only.
+    // true`, then the state after Save with at least its `seq`), so that page is never left read-only. Neither state says
+    // that its message was saved: the first says that a Save runs, the one after Save that it was not taken over.
     if (session.saving && (request.type === 'update' || request.type === 'save' || request.type === 'stale')) {
       session.seq = Math.max(session.seq, request.seq);
-      this.refresh(session);
+      session.ignoredDuringSave = true;
+      this.refresh(session, GroupsEditorTexts.saveRunning);
       return;
     }
     switch (request.type) {
@@ -198,13 +209,13 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         this.refresh(session);
         return;
       case 'update':
-        session.entries = request.entries;
+        this.takeDraft(session, request.entries);
         session.testName = request.testName;
         session.seq = Math.max(session.seq, request.seq);
         this.refresh(session);
         return;
       case 'save':
-        session.entries = request.entries;
+        this.takeDraft(session, request.entries);
         session.testName = request.testName;
         session.seq = Math.max(session.seq, request.seq);
         await this.save(session);
@@ -222,6 +233,12 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         session.panel.dispose();
         return;
     }
+  }
+
+  /** The entries of an update or Save become the draft; an edit ends the status of before (for example "Saved"). */
+  private takeDraft(session: EditorSession, entries: EditorEntry[]): void {
+    if (!sameEntries(entries, session.entries)) session.status = undefined;
+    session.entries = entries;
   }
 
   /** Load settings.json: the stored value replaces the draft; updates and Saves of earlier loads stay dropped. */
@@ -246,8 +263,11 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       return;
     }
     session.saving = true;
+    session.ignoredDuringSave = false;
     let status: string | undefined;
     let reload: { value: unknown } | undefined;
+    /** The answer Load settings.json: like the banner, it drops the draft of the loads before. */
+    let loadedTheirs = false;
     const closed = () => this.session !== session;
     try {
       const run = await this.deps.previewRunner.run({
@@ -304,6 +324,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
         if (closed()) return;
         if (answer === GroupsEditorTexts.loadTheirs) {
           reload = { value: readSettingValue() };
+          loadedTheirs = true;
           status = GroupsEditorTexts.loadedTheirs;
           return;
         }
@@ -317,14 +338,19 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     } catch (error) {
       this.deps.logger.error('The setting devEnvLauncher.repositoryGroups could not be saved.', error);
       void vscode.window.showErrorMessage(`The repository groups could not be saved: ${errorMessage(error)}`);
+      status = GroupsEditorTexts.saveFailed;
     } finally {
       session.saving = false;
+      // A message of another page was answered during Save but not taken over: this state answers it too (its `seq` is
+      // at least that of the message), so it must not say "Saved".
+      if (session.ignoredDuringSave) status = GroupsEditorTexts.notTakenDuringSave;
+      session.ignoredDuringSave = false;
       const queued = session.reloadQueued;
       session.reloadQueued = false;
       if (reload) {
         // The value of settings.json is loaded anyway: a queued Load settings.json is done with it.
         this.load(session, reload.value, status);
-        if (queued) session.reloaded = session.generation;
+        if (queued || loadedTheirs) session.reloaded = session.generation;
       } else if (queued && !closed()) {
         this.reloadFromSettings(session, GroupsEditorTexts.loaded);
       } else {
@@ -341,8 +367,10 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     session.loaded = entries;
     session.entries = entries;
     session.notices = notices;
+    // The draft is replaced: the status of before ends with it.
+    session.status = status;
     this.postLoad(session);
-    this.refresh(session, status);
+    this.refresh(session);
   }
 
   private postLoad(session: EditorSession): void {
@@ -353,6 +381,7 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       entries: session.entries,
       notices: session.notices,
       testName: session.testName,
+      saving: session.saving,
     };
     this.post(session, message);
   }
@@ -381,10 +410,13 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       });
   }
 
+  /**
+   * One state, from one snapshot of the session (seq, generation, entries, status). When the seq, the generation, or the
+   * entries changed during the run, the result is dropped: the change asked for a new computation, which sends the state.
+   */
   private async computeState(session: EditorSession): Promise<void> {
     if (this.session !== session) return;
-    const seq = session.seq;
-    const entries = session.entries;
+    const { seq, generation, entries, loaded, status: kept } = session;
     const run = await this.deps.previewRunner.run({
       entries,
       testName: session.testName,
@@ -392,15 +424,13 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
     });
     // The panel was closed meanwhile: the runner was disposed, so the run failed on purpose, and nobody sees the state.
     if (this.session !== session) return;
+    if (session.seq !== seq || session.generation !== generation || session.entries !== entries) return;
     if (run.failed) this.deps.logger.warn('The preview of the repository groups could not be made in its worker thread.');
-    const status =
-      session.status ??
-      (run.previewTooSlow ? GroupsEditorTexts.previewTooSlow : run.failed ? GroupsEditorTexts.previewFailed : undefined);
-    session.status = undefined;
+    const status = kept ?? (run.previewTooSlow ? GroupsEditorTexts.previewTooSlow : run.failed ? GroupsEditorTexts.previewFailed : undefined);
     const message: EditorStateMessage = editorState({
       seq,
       entries,
-      loaded: session.loaded,
+      loaded,
       run,
       changedOutside: !sameSettingValue(readSettingValue(), session.base),
       saving: session.saving,
@@ -415,6 +445,10 @@ export class RepositoryGroupsEditor implements vscode.Disposable {
       this.deps.logger.warn(`The repository groups editor could not be updated: ${errorMessage(error)}`);
     });
   }
+}
+
+function sameEntries(a: readonly EditorEntry[], b: readonly EditorEntry[]): boolean {
+  return a.length === b.length && a.every((entry, index) => entry.name === b[index].name && entry.pattern === b[index].pattern && entry.flags === b[index].flags);
 }
 
 /** The value in the user settings (scope `application`: no other value counts). */

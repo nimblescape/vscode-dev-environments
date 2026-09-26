@@ -763,6 +763,108 @@ describe('RepositoryGroupsEditor', () => {
     expect(lastState(panel)).toMatchObject({ seq: 7, saving: false, dirty: false, changedOutside: false, status: GroupsEditorTexts.loaded });
   });
 
+  // Review round 8 of PR #21, finding 1: a page that starts during a Save gets `saving` with its load (it locks at once),
+  // and a Save or update that the extension ignores because a Save runs is never reported as saved.
+  it('sends saving with the load of a page that starts during Save, and never reports its ignored Save as saved', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    expect(loaded(panel)).toMatchObject({ saving: false });
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    await flush();
+    panel.receive({ type: 'ready' });
+    await flush();
+    expect(loaded(panel)).toMatchObject({ saving: true });
+    panel.receive({ type: 'save', seq: 2, generation: gen(panel), entries, testName: '' });
+    await flush();
+    expect(lastState(panel)).toMatchObject({ seq: 2, saving: true, status: GroupsEditorTexts.saveRunning });
+    release({});
+    await flush();
+    await flush();
+    // The first Save wrote its draft; the state that unlocks the second page does not say that its Save was done.
+    expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE], fakeVscode.ConfigurationTarget.Global);
+    expect(loaded(panel)).toMatchObject({ saving: false });
+    expect(lastState(panel)).toMatchObject({ seq: 2, saving: false, status: GroupsEditorTexts.notTakenDuringSave });
+    for (const state of panel.posted.filter((message) => message.type === 'state' && (message.seq as number) >= 2)) {
+      expect(state.status).not.toBe(GroupsEditorTexts.saved);
+    }
+  });
+
+  // Review round 8 of PR #21, finding 2: the status of Save stays until the next edit, also when the write of Save makes
+  // settings.json send its change event (a state computed meanwhile repeats it).
+  it('keeps the status of Save in later states until the next edit', async () => {
+    const { panel } = await openEditor();
+    update.mockImplementation(async (_key: string, value: unknown) => changeStored(value));
+    const entries = loaded(panel).entries;
+    const inner = runner.run.getMockImplementation()!;
+    runner.run.mockImplementation(async (job: never) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return inner(job);
+    });
+    panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [entries[0]], testName: '' });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(lastState(panel)).toMatchObject({ seq: 1, saving: false, dirty: false, status: GroupsEditorTexts.saved });
+    changeStored([EXAMPLE]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lastState(panel)).toMatchObject({ seq: 1, status: GroupsEditorTexts.saved });
+    // An update without a change of the entries (the test field) keeps it; an edit ends it.
+    panel.receive({ type: 'update', seq: 2, generation: gen(panel), entries: [entries[0]], testName: 'web-shop' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lastState(panel)).toMatchObject({ seq: 2, status: GroupsEditorTexts.saved });
+    panel.receive({ type: 'update', seq: 3, generation: gen(panel), entries, testName: 'web-shop' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lastState(panel)).toMatchObject({ seq: 3, dirty: true });
+    expect(lastState(panel)?.status).toBeUndefined();
+  });
+
+  // Review round 8 of PR #21, finding 2: a state computed for the entries before a load is not sent after that load.
+  it('sends no state for the entries before a load after that load', async () => {
+    const { panel } = await openEditor();
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    const three = [
+      { name: '', pattern: '^a', flags: '' },
+      { name: '', pattern: '^b', flags: '' },
+      { name: '', pattern: '^c', flags: '' },
+    ];
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: three, testName: '' });
+    await flush();
+    panel.receive({ type: 'reload', testName: '' });
+    await flush();
+    const loadIndex = panel.posted.lastIndexOf(loaded(panel) as never);
+    release({});
+    await flush();
+    await flush();
+    const after = panel.posted.slice(loadIndex + 1);
+    expect(after.length).toBeGreaterThan(0);
+    for (const state of after) {
+      expect(state).toMatchObject({ type: 'state', status: GroupsEditorTexts.loaded, dirty: false });
+      expect(state.checks).toHaveLength(loaded(panel).entries.length);
+    }
+  });
+
+  // Review round 8 of PR #21, finding 3: Load settings.json in the question of Save drops the draft like the banner: an
+  // update or Save of the load before it stays dropped.
+  it('ignores an update of the load before Load settings.json of the question of Save', async () => {
+    const { panel } = await openEditor();
+    const entries = loaded(panel).entries;
+    const before = gen(panel);
+    changeStored(['^theirs']);
+    await flush();
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(GroupsEditorTexts.loadTheirs as never);
+    panel.receive({ type: 'save', seq: 1, generation: before, entries: [entries[0]], testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(loaded(panel).entries).toEqual([{ name: '', pattern: '^theirs', flags: '' }]);
+    const loads = loadCount(panel);
+    panel.receive({ type: 'update', seq: 2, generation: before, entries: [{ name: '', pattern: '^mine', flags: '' }], testName: '' });
+    for (let i = 0; i < 4; i++) await flush();
+    expect(loadCount(panel)).toBe(loads);
+    expect(lastState(panel)).toMatchObject({ seq: 2, dirty: false });
+    expect(lastState(panel)?.status).not.toBe(GroupsEditorTexts.staleKept);
+    expect(update).not.toHaveBeenCalled();
+  });
+
   // Review round 2 of PR #21, W6: the worker of the preview stops with the panel.
   it('stops the worker of the preview when the panel is closed', async () => {
     const { panel } = await openEditor();

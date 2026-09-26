@@ -346,6 +346,50 @@ describe('editor.js', () => {
     expect(testName.value).toBe('web-api');
   });
 
+  // Review round 8 of PR #21, finding 1: a page that starts during a Save locks at once with its load, not only at its
+  // first state, so it sends no Save that the extension would drop.
+  it('is read-only from a load with saving: true until a state without it', () => {
+    const page = loadScript();
+    page.receive({ type: 'load', seq: 3, generation: 1, entries: [ENTRY], notices: [], testName: '', saving: true });
+    expect(page.byId('form').disabled).toBe(true);
+    page.receive(state(3, { saving: true }));
+    expect(page.byId('form').disabled).toBe(true);
+    page.receive(state(3, { dirty: false }));
+    expect(page.byId('form').disabled).toBe(false);
+    // A load without a running Save unlocks too.
+    page.receive(state(3, { saving: true }));
+    page.receive({ type: 'load', seq: 3, generation: 2, entries: [ENTRY], notices: [], testName: '', saving: false });
+    expect(page.byId('form').disabled).toBe(false);
+  });
+
+  // Review round 8 of PR #21, finding 5: while the draft is over the limits, no update is sent, so the test field waits.
+  it('says that the test is paused while the draft is over the limits', () => {
+    const page = loadScript();
+    const long = { name: '', pattern: 'a'.repeat(EditorLimits.pattern + 1), flags: '' };
+    page.receive({ type: 'load', seq: 0, generation: 0, entries: [long, ENTRY], notices: [], testName: '' });
+    page.receive(state(0, { checks: [{ error: 'too long' }, {}], canSave: false, dirty: false }));
+    const paused = 'The test is paused until the entries are within the limits.';
+    expect(page.byId('test-paused').textContent).toBe(paused);
+    const testName = page.byId('test-name');
+    testName.value = 'web-shop';
+    testName.dispatch('input');
+    for (const timer of page.timers.splice(0)) timer();
+    expect(page.posted.slice(1)).toEqual([]);
+    expect(page.byId('test-paused').textContent).toBe(paused);
+    // Shortening the entry sends the draft again, and the test runs again.
+    const pattern = page.byId('entry-0-pattern');
+    pattern.value = '^a';
+    pattern.dispatch('input');
+    for (const timer of page.timers.splice(0)) timer();
+    expect(page.posted.slice(1)).toMatchObject([{ type: 'update', seq: 1, testName: 'web-shop' }]);
+    expect(page.byId('test-paused').textContent).toBe('');
+    // Adding an entry over the limits again (a load) pauses it; removing that entry ends the pause at once.
+    page.receive({ type: 'load', seq: 1, generation: 1, entries: [long, ENTRY], notices: [], testName: '' });
+    expect(page.byId('test-paused').textContent).toBe(paused);
+    page.byId('entry-0-remove').dispatch('click');
+    expect(page.byId('test-paused').textContent).toBe('');
+  });
+
   // Review round 6 of PR #21, finding 2: the extension refuses more entries than EditorLimits.entries.
   it(`disables Add at ${EditorLimits.entries} entries`, () => {
     const page = loadScript();

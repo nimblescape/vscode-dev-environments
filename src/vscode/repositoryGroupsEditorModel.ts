@@ -61,12 +61,16 @@ export const GroupsEditorTexts = {
   loadTheirs: 'Load settings.json',
   saveMine: 'Save Mine',
   saveCancelled: 'Nothing was saved. Your edits are still in the editor.',
+  saveFailed: 'The setting could not be saved. Your edits are still in the editor.',
   saved: 'Saved to the user settings.',
   savedReplaced: 'Saved to the user settings. Your entries replaced the value that settings.json had.',
   loadedTheirs: 'Loaded the setting from settings.json. Your unsaved edits were dropped. Nothing was saved.',
   loaded: 'Loaded the setting from settings.json.',
   alreadySaved: 'Saved: settings.json already holds these entries, so nothing had to be written.',
-  staleKept: 'settings.json changed while you were editing; your edits are kept, press Save again.',
+  staleKept: 'The editor had changed meanwhile; your edits are kept, press Save again.',
+  saveRunning: 'A Save is already running; press Save again when it is done.',
+  notTakenDuringSave:
+    'Edits or a Save arrived while another Save ran and were not taken over. Check the entries, then press Save again.',
   refusedMessage:
     'The editor sent entries that cannot be used; they were not taken over, and the preview shows the entries before. Nothing was saved.',
   entryTooSlow:
@@ -567,6 +571,8 @@ export interface EditorLoadMessage {
   notices: string[];
   /** The text of the test field, so a page that starts again shows the text of its result (a running page keeps its own). */
   testName: string;
+  /** A Save runs: the page is read-only from this load on, until a state with `saving: false` (a page that starts during Save). */
+  saving: boolean;
 }
 
 /** Message to the webview: everything the extension computes for the entries of the webview. */
@@ -588,7 +594,7 @@ export interface EditorStateMessage {
   saving: boolean;
   preview: GroupsPreview;
   test?: NameTest;
-  /** A text for the status line, for example after Save. */
+  /** A text for the status line, for example after Save; later states repeat it until the entries change. */
   status?: string;
 }
 
@@ -673,6 +679,7 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <label for="test-name">Repository name (or owner/name)</label>
 <input type="text" id="test-name" spellcheck="false" autocomplete="off" maxlength="${EditorLimits.testName}">
 <div id="test-result" role="status" aria-live="polite"></div>
+<p id="test-paused" class="muted" aria-live="polite"></p>
 </section>
 </fieldset>
 <section aria-labelledby="preview-heading">

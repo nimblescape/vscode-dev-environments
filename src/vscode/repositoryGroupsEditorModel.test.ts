@@ -461,6 +461,17 @@ describe('state and HTML of the webview', () => {
     expect(scripts).toEqual(['<script nonce="N0nce+/=" src="vscode-webview://abc/editor.js">']);
     expect(html).toContain('<label for="test-name">');
   });
+
+  // Review round 8 of PR #21, finding 5: the page names a paused test next to the test result.
+  it('has a place for the note of a paused test next to the test result', () => {
+    const html = editorHtml({ cspSource: 'c', nonce: 'n', scriptUri: 's', styleUri: 't' });
+    expect(html).toContain('<div id="test-result" role="status" aria-live="polite"></div>\n<p id="test-paused" class="muted" aria-live="polite"></p>');
+  });
+
+  // Review round 8 of PR #21, finding 4: since round 7, only a load after Save (not settings.json) makes an update stale.
+  it('names the cause of a stale draft that it has now', () => {
+    expect(GroupsEditorTexts.staleKept).toBe('The editor had changed meanwhile; your edits are kept, press Save again.');
+  });
 });
 
 describe('text of settings.json in the question of Save', () => {
