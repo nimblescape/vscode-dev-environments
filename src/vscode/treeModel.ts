@@ -18,6 +18,7 @@ import type {
   ExtensionSettings,
   RepositoryInfo,
 } from '../core/types';
+import { matchRepositoryGroup, type RepositoryGroupPattern } from './repositoryGroups';
 
 // User-visible texts that messages.ts lacks; to be moved there.
 export const TreeTexts = {
@@ -63,6 +64,11 @@ export interface TreeInput {
   /** Environment ID → branch read from the running container. */
   liveBranches: ReadonlyMap<string, string>;
   signedIn: boolean;
+  /**
+   * Compiled entries of the setting `repositoryGroups` (`parseRepositoryGroups`). Empty or missing: no grouping, the
+   * model is the same as without the setting.
+   */
+  repositoryGroups?: readonly RepositoryGroupPattern[];
   /**
    * Results of single repository lookups on GitHub (`DiscoveryService.getRepository`) for environments whose repository
    * the discovery does not list (it stores only repositories with a configuration on the default branch). Key: lower-case
@@ -172,8 +178,41 @@ export interface OwnerGroup {
   /** `owner:` + lower-case owner. */
   id: string;
   owner: string;
-  /** Hints first, then the repositories in alphabetical order, with or without an environment (user decision 2026-09-26). */
-  children: Array<RepositoryRow | HintRow>;
+  /**
+   * Hints first, then the repositories in alphabetical order, with or without an environment (user decision 2026-09-26).
+   * With the setting `repositoryGroups`, when a repository of the owner matches a pattern: hints first, then the root
+   * node of each named entry that a repository of the owner matches (in the order of the setting), then the top-level
+   * group nodes, then the rows at the top level (of patterns without levels, and repositories with an environment that
+   * match no pattern), each in alphabetical order. When no repository of the owner matches, the plain list.
+   */
+  children: Array<RepositoryRow | HintRow | GroupNode>;
+}
+
+/**
+ * Node of the setting `repositoryGroups` (concept 6.2): the root node of an entry with a `name` (`level` 0), or a group
+ * level made from a capturing group of a pattern (`level` 1 is the top level).
+ */
+export interface GroupNode {
+  kind: 'group';
+  /**
+   * `group:` + lower-case owner + `:` + the index of the named entry in the setting (`-` for the levels of unnamed
+   * entries) + `:` + the level values from the top down, each URI-encoded and joined by `/` (empty for a named root).
+   */
+  id: string;
+  owner: string;
+  /** 0 for the root of a pattern; 1 for the top group level, and so on. */
+  level: number;
+  /** A named root: the name of the entry. A level: the value of its capturing group. */
+  label: string;
+  /** A named root: the pattern text. */
+  tooltip?: string;
+  /**
+   * Initial state in the view: a named root is expanded; a group level is collapsed, except when it holds the row of the
+   * environment of this window.
+   */
+  expanded: boolean;
+  /** Group nodes in alphabetical order first, then the rows in alphabetical order of their label. */
+  children: Array<GroupNode | RepositoryRow>;
 }
 
 /** Icon of a state (concept 6.2), as a codicon ID and an optional theme color ID. */
@@ -284,6 +323,8 @@ export function contextValue(actions: RowActions, checks?: HostAccessChecks): st
  * user's work. Without a sign-in, only the environments are listed.
  * Groups are sorted by owner; in each group, hints come first, then all repositories in alphabetical order: a repository
  * with an environment keeps its place (user decision 2026-09-26).
+ * With valid entries of the setting `repositoryGroups`, the rows of each owner where a repository matches are filtered
+ * and nested in group nodes (`groupRows`); other owners, and every owner without valid entries, keep the plain list.
  */
 export function buildTreeModel(input: TreeInput): OwnerGroup[] {
   const discovered = input.discovery?.repositories ?? [];
@@ -362,13 +403,107 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
   }
 
   const byName = (a: RepositoryRow, b: RepositoryRow) => compareNames(a.name, b.name) || compareNames(a.id, b.id);
+  const patterns = input.repositoryGroups ?? [];
   return [...groups.values()]
     .sort((a, b) => compareNames(a.group.owner, b.group.owner))
     .map(({ group, hints, environments: withEnvironment, others }) => {
       hints.sort((a, b) => compareNames(a.organization, b.organization));
-      group.children = [...hints, ...[...withEnvironment, ...others].sort(byName)];
+      // Patterns apply per owner (user decision 2026-09-26): an owner where no repository matches a pattern keeps the
+      // plain list, so no owner is hidden by the patterns; without patterns, the model is exactly the plain list.
+      const grouped =
+        patterns.length > 0 ? groupRows(group.owner, withEnvironment, others, patterns, input.currentEnvironmentId) : undefined;
+      group.children = [...hints, ...(grouped ?? [...withEnvironment, ...others].sort(byName))];
       return group;
     });
+}
+
+/**
+ * The rows of one owner under the patterns of the setting `repositoryGroups` (user decision 2026-09-26), or `undefined`
+ * when no repository of the owner matches a pattern (the owner keeps the plain list). Each row goes under the first
+ * pattern that matches its repository name. The values of the capturing groups are the group nodes: the
+ * top level directly under the owner, or under the root node of an entry with a `name`. Group nodes are keyed by their
+ * label path under the same parent, so equal paths of different unnamed patterns are one node. Rows without environment
+ * that match no pattern are hidden (the patterns filter); rows with an environment stay directly under the owner
+ * (environments are always listed).
+ * Order: the named roots in the order of the setting, then the group nodes in alphabetical order, then the rows in
+ * alphabetical order of their label.
+ */
+function groupRows(
+  owner: string,
+  withEnvironment: readonly RepositoryRow[],
+  others: readonly RepositoryRow[],
+  patterns: readonly RepositoryGroupPattern[],
+  currentEnvironmentId: string | null,
+): Array<GroupNode | RepositoryRow> | undefined {
+  const ownerKey = owner.toLowerCase();
+  let matched = false;
+  const top: Array<GroupNode | RepositoryRow> = [];
+  const namedRoots = new Map<number, GroupNode>();
+  const nodes = new Map<string, GroupNode>();
+  for (const row of [...withEnvironment, ...others]) {
+    const match = matchRepositoryGroup(patterns, row.name);
+    if (!match) {
+      if (row.environment) top.push(row);
+      continue;
+    }
+    matched = true;
+    const { pattern } = match;
+    const prefix = `group:${ownerKey}:${pattern.name !== undefined ? String(pattern.index) : '-'}:`;
+    let children = top;
+    if (pattern.name !== undefined) {
+      let root = namedRoots.get(pattern.index);
+      if (!root) {
+        root = {
+          kind: 'group',
+          id: prefix,
+          owner,
+          level: 0,
+          label: pattern.name,
+          tooltip: pattern.source,
+          expanded: true,
+          children: [],
+        };
+        namedRoots.set(pattern.index, root);
+      }
+      children = root.children;
+    }
+    const path: string[] = [];
+    const isCurrent = currentEnvironmentId !== null && row.environment?.id === currentEnvironmentId;
+    for (const value of match.levels) {
+      path.push(encodeURIComponent(value));
+      const id = prefix + path.join('/');
+      let node = nodes.get(id);
+      if (!node) {
+        node = { kind: 'group', id, owner, level: path.length, label: value, expanded: false, children: [] };
+        nodes.set(id, node);
+        children.push(node);
+      }
+      if (isCurrent) node.expanded = true;
+      children = node.children;
+    }
+    children.push(match.label === row.label ? row : { ...row, label: match.label });
+  }
+  if (!matched) return undefined;
+  const roots = [...namedRoots.entries()].sort(([a], [b]) => a - b).map(([, root]) => root);
+  for (const root of roots) root.children = sortGroupChildren(root.children);
+  return [...roots, ...sortGroupChildren(top)];
+}
+
+/** Group nodes first, in alphabetical order; then the rows, by label, then by repository and ID. Sorts all levels. */
+function sortGroupChildren(children: ReadonlyArray<GroupNode | RepositoryRow>): Array<GroupNode | RepositoryRow> {
+  const groupNodes: GroupNode[] = [];
+  const rows: RepositoryRow[] = [];
+  for (const child of children) {
+    if (child.kind === 'group') {
+      child.children = sortGroupChildren(child.children);
+      groupNodes.push(child);
+    } else {
+      rows.push(child);
+    }
+  }
+  groupNodes.sort((a, b) => compareNames(a.label, b.label) || compareNames(a.id, b.id));
+  rows.sort((a, b) => compareNames(a.label, b.label) || compareNames(a.repository, b.repository) || compareNames(a.id, b.id));
+  return [...groupNodes, ...rows];
 }
 
 /**
@@ -395,14 +530,16 @@ export function rootNodes(
   return [...rows, ...groups];
 }
 
-/** All repository rows of the model, in display order. */
+/** All repository rows of the model, in display order, also those inside the nodes of `repositoryGroups`. */
 export function repositoryRows(groups: readonly OwnerGroup[]): RepositoryRow[] {
   const rows: RepositoryRow[] = [];
-  for (const group of groups) {
-    for (const child of group.children) {
+  const walk = (children: ReadonlyArray<RepositoryRow | HintRow | GroupNode>): void => {
+    for (const child of children) {
       if (child.kind === 'repository') rows.push(child);
+      else if (child.kind === 'group') walk(child.children);
     }
-  }
+  };
+  for (const group of groups) walk(group.children);
   return rows;
 }
 

@@ -506,6 +506,42 @@
           "default": [],
           "scope": "application",
           "markdownDescription": "Repositories (`owner/name`) whose host access checks are off. Their configuration, Features, and base image may then use your computer: its files (bind mounts), the Docker socket (full control of Docker and of every other environment), privileged mode, devices and GPUs, published ports on all network addresses, and the volumes of other programs. The checks of account separation, of the GitHub account of the environment, and of options that Dev Environments does not support stay on. Empty: the checks are on for every repository. Only the user settings count. Use **Turn Off Host Access Checks…** in the context menu of a repository."
+        },
+        "devEnvLauncher.repositoryGroups": {
+          "type": "array",
+          "scope": "application",
+          "default": [],
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "A regular expression (JavaScript syntax) for the repository name without the owner."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "pattern"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of a node that holds the groups of this regular expression. Without a name, its groups are shown directly under the owner."
+                  },
+                  "pattern": {
+                    "type": "string",
+                    "description": "A regular expression (JavaScript syntax) for the repository name without the owner."
+                  },
+                  "flags": {
+                    "type": "string",
+                    "pattern": "^[ius]*$",
+                    "description": "Flags of the regular expression: i (ignore case), u (Unicode), s (dot matches line breaks)."
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "markdownDescription": "Regular expressions that filter and group the repositories in the sidebar. Each one is matched against the repository name without the owner. In each owner where at least one repository matches, the sidebar hides the repositories that match none (repositories with an environment are always shown); an owner without a match keeps its plain list. Capturing groups become levels of the tree: the first group is the top level, the last group is the label of the repository. A repository goes under the first regular expression that matches. An entry with a `name` gets its own node with that name. Example: `^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`. Only the user settings can set this list."
         }
       }
     }

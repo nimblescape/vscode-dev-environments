@@ -22,11 +22,13 @@ import {
   stateText,
   TreeTexts,
   type EnvironmentRuntime,
+  type GroupNode,
   type HintRow,
   type OwnerGroup,
   type RepositoryRow,
   type TreeInput,
 } from './treeModel';
+import { parseRepositoryGroups } from './repositoryGroups';
 
 const T0 = Date.parse('2026-09-24T17:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -867,5 +869,389 @@ describe('the switch of the host access checks in the rows (concept section 9 "H
     // The when clauses of package.json tell the two flags apart.
     expect(/hostAccessChecked/.test('hostAccessUnrestricted')).toBe(false);
     expect(/hostAccessUnrestricted/.test('hostAccessChecked')).toBe(false);
+  });
+});
+
+describe('setting repositoryGroups (unit 9)', () => {
+  const EXAMPLE = String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`;
+  const patterns = (...entries: unknown[]) => parseRepositoryGroups(entries).patterns;
+
+  type Shape = string | [string, Shape[]];
+  /** The tree as labels: a row is its label, a node is [label, children]; hints are `hint:<organization>`. */
+  function shape(children: ReadonlyArray<OwnerGroup['children'][number]>): Shape[] {
+    return children.map((child) => {
+      if (child.kind === 'group') return [child.label, shape(child.children)];
+      if (child.kind === 'hint') return `hint:${child.organization}`;
+      return child.label;
+    });
+  }
+  function tree(groups: OwnerGroup[]): Shape[] {
+    return groups.map((group) => [group.owner, shape(group.children)]);
+  }
+  function allNodes(groups: OwnerGroup[]): Array<{ id: string; kind: string }> {
+    const nodes: Array<{ id: string; kind: string }> = [];
+    const walk = (children: ReadonlyArray<OwnerGroup['children'][number]>) => {
+      for (const child of children) {
+        nodes.push(child);
+        if (child.kind === 'group') walk(child.children);
+      }
+    };
+    for (const group of groups) {
+      nodes.push(group);
+      walk(group.children);
+    }
+    return nodes;
+  }
+  function node(groups: OwnerGroup[], id: string): GroupNode {
+    const found = allNodes(groups).find((candidate) => candidate.id === id);
+    if (!found || found.kind !== 'group') throw new Error(`No group node ${id}`);
+    return found as GroupNode;
+  }
+
+  const STUDENTS = [
+    repo('school/2026-3cWI-SWP-module-oop-felix-he021'),
+    repo('school/2025-3bWI-SWP-module-oop-hailo'),
+    repo('school/2026-3cWI-SWP-module-oop-EnesHA81'),
+  ];
+
+  it('shows the example of the user: the first group is the top level under the owner, the last group labels the row', () => {
+    const groups = buildTreeModel(input({ discovery: discovery(STUDENTS), repositoryGroups: patterns(EXAMPLE) }));
+    expect(tree(groups)).toEqual([
+      [
+        'school',
+        [
+          ['2025-3bWI-SWP', [['module-oop', ['hailo']]]],
+          ['2026-3cWI-SWP', [['module-oop', ['EnesHA81', 'felix-he021']]]],
+        ],
+      ],
+    ]);
+    expect(row(groups, 'school/2026-3cWI-SWP-module-oop-EnesHA81').label).toBe('EnesHA81');
+    expect(node(groups, 'group:school:-:2026-3cWI-SWP')).toMatchObject({ level: 1, owner: 'school', expanded: false });
+    expect(node(groups, 'group:school:-:2026-3cWI-SWP/module-oop')).toMatchObject({ level: 2, label: 'module-oop' });
+  });
+
+  it('gives an entry with a name its own root node, expanded, with the pattern as tooltip', () => {
+    const groups = buildTreeModel(
+      input({ discovery: discovery(STUDENTS), repositoryGroups: patterns({ name: 'Courses', pattern: EXAMPLE }) }),
+    );
+    expect(tree(groups)).toEqual([
+      [
+        'school',
+        [
+          [
+            'Courses',
+            [
+              ['2025-3bWI-SWP', [['module-oop', ['hailo']]]],
+              ['2026-3cWI-SWP', [['module-oop', ['EnesHA81', 'felix-he021']]]],
+            ],
+          ],
+        ],
+      ],
+    ]);
+    expect(node(groups, 'group:school:0:')).toMatchObject({ level: 0, label: 'Courses', tooltip: EXAMPLE, expanded: true });
+    expect(node(groups, 'group:school:0:2025-3bWI-SWP/module-oop').children).toHaveLength(1);
+  });
+
+  it('keeps the row fields except the label, with owner/name in the tooltip', () => {
+    const plain = buildTreeModel(input({ discovery: discovery(STUDENTS), environments: [environment('e1', STUDENTS[0].nameWithOwner)] }));
+    const grouped = buildTreeModel(
+      input({
+        discovery: discovery(STUDENTS),
+        environments: [environment('e1', STUDENTS[0].nameWithOwner)],
+        repositoryGroups: patterns(EXAMPLE),
+      }),
+    );
+    for (const before of rows(plain)) {
+      const after = row(grouped, before.repository);
+      expect({ ...after, label: before.label }).toEqual(before);
+      expect(after.tooltip.split('\n')[0]).toBe(before.repository);
+    }
+    expect(row(grouped, STUDENTS[0].nameWithOwner)).toMatchObject({
+      id: 'repo:school/2026-3cwi-swp-module-oop-felix-he021',
+      label: 'felix-he021',
+      state: 'stopped',
+    });
+  });
+
+  it('merges equal label paths of unnamed patterns into one node; a repository goes under the first matching pattern', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('o/web-shop'), repo('o/web-blog'), repo('o/api-core'), repo('o/lib-x')]),
+        repositoryGroups: patterns('^(web)-(shop)$', '^(web|api)-(.+)$', { name: 'Libraries', pattern: '^lib-(.+)$' }, '^(web)-(.+)$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([['o', [['Libraries', ['x']], ['api', ['core']], ['web', ['blog', 'shop']]]]]);
+    expect(allNodes(groups).filter((entry) => entry.id === 'group:o:-:web')).toHaveLength(1);
+  });
+
+  it('does not merge a named root with the nodes of other patterns', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('o/web-shop'), repo('o/web-blog')]),
+        repositoryGroups: patterns({ name: 'Shop', pattern: '^(web)-(shop)$' }, '^(web)-(.+)$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([['o', [['Shop', [['web', ['shop']]]], ['web', ['blog']]]]]);
+    expect(node(groups, 'group:o:0:web').label).toBe('web');
+    expect(node(groups, 'group:o:-:web').label).toBe('web');
+  });
+
+  it('filters: hides repositories without environment that match no pattern in an owner with a match', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('a/web-shop'), repo('a/other'), repo('b/other')]),
+        repositoryGroups: patterns('^(web)-(.+)$'),
+      }),
+    );
+    // b has no match: its list is the plain list of today.
+    expect(tree(groups)).toEqual([
+      ['a', [['web', ['shop']]]],
+      ['b', ['other']],
+    ]);
+  });
+
+  describe('patterns apply per owner group', () => {
+    const hint = (organization: string) => ({ organization, kind: 'saml' as const, url: `https://github.com/orgs/${organization}/sso` });
+
+    it('groups an organization with a match and hides its repositories that match no pattern', () => {
+      const groups = buildTreeModel(
+        input({
+          discovery: discovery([repo('a/web-x'), repo('a/other'), repo('a/more')], { hints: [hint('a')] }),
+          repositoryGroups: patterns('^(web)-(.+)$'),
+        }),
+      );
+      expect(tree(groups)).toEqual([['a', ['hint:a', ['web', ['x']]]]]);
+    });
+
+    it('keeps the plain list of today, with its hints, for an organization without any match', () => {
+      const repositories = [repo('b/zeta'), repo('b/Alpha'), repo('b/other')];
+      const environments = [environment('e1', 'b/zeta'), environment('e2', 'b/gone')];
+      const today = buildTreeModel(input({ discovery: discovery(repositories, { hints: [hint('b')] }), environments }));
+      const grouped = buildTreeModel(
+        input({ discovery: discovery(repositories, { hints: [hint('b')] }), environments, repositoryGroups: patterns('^web-') }),
+      );
+      expect(grouped).toEqual(today);
+      expect(tree(grouped)).toEqual([['b', ['hint:b', 'Alpha', 'gone', 'other', 'zeta']]]);
+    });
+
+    it('never hides an organization because of the patterns, also one with only a hint', () => {
+      const data = discovery([repo('a/web-x')], { hints: [hint('c')] });
+      const groups = buildTreeModel(input({ discovery: data, repositoryGroups: patterns('^(web)-(.+)$') }));
+      expect(tree(groups)).toEqual([
+        ['a', [['web', ['x']]]],
+        ['c', ['hint:c']],
+      ]);
+    });
+
+    it('treats each organization on its own in a setting with several patterns', () => {
+      const groups = buildTreeModel(
+        input({
+          discovery: discovery([
+            repo('a/web-shop'),
+            repo('a/lib-core'),
+            repo('a/misc'),
+            repo('b/lib-util'),
+            repo('b/tools'),
+            repo('c/misc'),
+            repo('c/tools'),
+          ]),
+          environments: [environment('e1', 'a/misc'), environment('e2', 'c/tools')],
+          repositoryGroups: patterns('^(web)-(.+)$', { name: 'Libraries', pattern: '^lib-(.+)$' }),
+        }),
+      );
+      expect(tree(groups)).toEqual([
+        ['a', [['Libraries', ['core']], ['web', ['shop']], 'misc']],
+        ['b', [['Libraries', ['util']]]],
+        ['c', ['misc', 'tools']],
+      ]);
+      expect(row(groups, 'a/misc').environment?.id).toBe('e1');
+      expect(findRowByRepository(groups, 'b/tools')).toBeUndefined();
+    });
+
+    it('groups an organization whose only match is a repository with an environment', () => {
+      const groups = buildTreeModel(
+        input({
+          discovery: discovery([repo('a/other')]),
+          environments: [environment('e1', 'a/web-x')],
+          repositoryGroups: patterns('^(web)-(.+)$'),
+        }),
+      );
+      expect(tree(groups)).toEqual([['a', [['web', ['x']]]]]);
+    });
+  });
+
+  it('lists repositories with an environment that match no pattern directly under the owner, after the nodes', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('a/web-shop'), repo('a/zeta'), repo('a/Beta'), repo('a/other')]),
+        environments: [environment('e1', 'a/zeta'), environment('e2', 'a/Beta'), environment('e3', 'a/gone')],
+        repositoryGroups: patterns({ name: 'Named', pattern: '^web-shop$' }, '^(web)-(.+)$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([['a', [['Named', ['web-shop']], 'Beta', 'gone', 'zeta']]]);
+    expect(row(groups, 'a/gone').notOnGitHub).toBe(true);
+  });
+
+  it('puts hints first, then the named roots in the order of the setting, then the nodes, then the rows', () => {
+    const hints = [{ organization: 'a', kind: 'saml' as const, url: 'https://github.com/orgs/a/sso' }];
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('a/z-1'), repo('a/y-1'), repo('a/b-1'), repo('a/a-1'), repo('a/solo'), repo('a/keep')], { hints }),
+        environments: [environment('e1', 'a/keep')],
+        repositoryGroups: patterns({ name: 'Zulu', pattern: '^z-' }, { name: 'Alpha', pattern: '^y-' }, '^(\\w)-(\\d)$', '^solo$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([
+      ['a', ['hint:a', ['Zulu', ['z-1']], ['Alpha', ['y-1']], ['a', ['1']], ['b', ['1']], 'keep', 'solo']],
+    ]);
+  });
+
+  it('shows a named root only in the owner groups where a repository matches it', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('a/lib-x'), repo('b/web-y')]),
+        repositoryGroups: patterns({ name: 'Libraries', pattern: '^lib-(.+)$' }, { name: 'Web', pattern: '^web-(.+)$' }),
+      }),
+    );
+    expect(tree(groups)).toEqual([
+      ['a', [['Libraries', ['x']]]],
+      ['b', [['Web', ['y']]]],
+    ]);
+    expect(node(groups, 'group:a:0:').id).not.toBe(node(groups, 'group:b:1:').id);
+  });
+
+  it('sorts at each level: nodes first in natural, case-insensitive order, then rows by label and repository', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([
+          repo('o/c10-b'),
+          repo('o/zz'),
+          repo('o/c2-b'),
+          repo('o/C1-a'),
+          repo('o/c2-A'),
+          repo('o/c2'),
+          repo('o/aa'),
+          repo('p/c2-a'),
+        ]),
+        repositoryGroups: patterns({ pattern: '^(c\\d+)(?:-(\\w))?$', flags: 'i' }, '^(?:aa|zz)$'),
+      }),
+    );
+    // o/c2: the last group did not take part, so the row keeps its name under the node of its first group.
+    expect(tree(groups)).toEqual([
+      ['o', [['C1', ['a']], ['c2', ['A', 'b', 'c2']], ['c10', ['b']], 'aa', 'zz']],
+      ['p', [['c2', ['a']]]],
+    ]);
+  });
+
+  it('breaks ties between rows with the same label by the repository name', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('o/y-x-same'), repo('o/a-x-same')]),
+        repositoryGroups: patterns('^\\w-(x)-(same)$'),
+      }),
+    );
+    expect(rows(groups).map((entry) => entry.repository)).toEqual(['o/a-x-same', 'o/y-x-same']);
+  });
+
+  it('skips a level that did not take part or is empty (the row moves up one level)', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('o/2026-x-a'), repo('o/x-b')]),
+        repositoryGroups: patterns('^(?:(\\d{4})-)?(\\w+)-(\\w+)$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([['o', [['2026', [['x', ['a']]]], ['x', ['b']]]]]);
+  });
+
+  it('uses unique, stable IDs with URI-encoded level values', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('Org/a b-x'), repo('Org/a%b-y'), repo('org2/a b-x')]),
+        repositoryGroups: patterns('^(.+)-(.+)$'),
+      }),
+    );
+    const ids = allNodes(groups).map((entry) => entry.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(
+      expect.arrayContaining(['owner:org', 'group:org:-:a%20b', 'group:org:-:a%25b', 'group:org2:-:a%20b', 'repo:org/a b-x']),
+    );
+    // The same input gives the same IDs.
+    const again = buildTreeModel(
+      input({
+        discovery: discovery([repo('Org/a b-x'), repo('Org/a%b-y'), repo('org2/a b-x')]),
+        repositoryGroups: patterns('^(.+)-(.+)$'),
+      }),
+    );
+    expect(allNodes(again).map((entry) => entry.id)).toEqual(ids);
+  });
+
+  it('expands the nodes that hold the row of the environment of this window, and collapses the others', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery(STUDENTS),
+        environments: [environment('e1', STUDENTS[1].nameWithOwner), environment('e2', STUDENTS[0].nameWithOwner)],
+        currentEnvironmentId: 'e1',
+        repositoryGroups: patterns({ name: 'Courses', pattern: EXAMPLE }),
+      }),
+    );
+    expect(node(groups, 'group:school:0:').expanded).toBe(true);
+    expect(node(groups, 'group:school:0:2025-3bWI-SWP').expanded).toBe(true);
+    expect(node(groups, 'group:school:0:2025-3bWI-SWP/module-oop').expanded).toBe(true);
+    expect(node(groups, 'group:school:0:2026-3cWI-SWP').expanded).toBe(false);
+    expect(node(groups, 'group:school:0:2026-3cWI-SWP/module-oop').expanded).toBe(false);
+  });
+
+  it('applies the owners, archived, and forks filters first', () => {
+    const groups = buildTreeModel(
+      input({
+        settings: { owners: ['a'], includeArchived: false, includeForks: false },
+        discovery: discovery([
+          repo('a/web-shop'),
+          repo('a/web-old', { isArchived: true }),
+          repo('a/web-fork', { isFork: true }),
+          repo('b/web-x'),
+        ]),
+        repositoryGroups: patterns('^(web)-(.+)$'),
+      }),
+    );
+    expect(tree(groups)).toEqual([['a', [['web', ['shop']]]]]);
+  });
+
+  it('finds the nested rows: repositoryRows, findRowByRepository, findRowByEnvironmentId, recentEnvironments', () => {
+    const environments = [
+      environment('e1', STUDENTS[1].nameWithOwner, { lastUsedAt: iso(T0 + 1000) }),
+      environment('e2', 'other/kept'),
+    ];
+    const groups = buildTreeModel(
+      input({ discovery: discovery(STUDENTS), environments, repositoryGroups: patterns({ name: 'C', pattern: EXAMPLE }) }),
+    );
+    // Owner groups in alphabetical order (other, school), then the rows in display order.
+    expect(rows(groups).map((entry) => entry.label)).toEqual(['kept', 'hailo', 'EnesHA81', 'felix-he021']);
+    expect(findRowByEnvironmentId(groups, 'e1')?.label).toBe('hailo');
+    expect(findRowByRepository(groups, STUDENTS[0].nameWithOwner.toUpperCase())?.label).toBe('felix-he021');
+    expect(findRowByRepository(groups, 'school/none')).toBeUndefined();
+    expect(recentEnvironments(groups, environments).map((entry) => [entry.environmentId, entry.repository, entry.state])).toEqual([
+      ['e1', STUDENTS[1].nameWithOwner, 'stopped'],
+      ['e2', 'other/kept', 'stopped'],
+    ]);
+  });
+
+  it('builds the same model as today with an empty setting, a missing one, or only invalid entries', () => {
+    const base = input({
+      discovery: discovery(STUDENTS, { hints: [{ organization: 'school', kind: 'saml', url: 'https://github.com/orgs/school/sso' }] }),
+      environments: [environment('e1', STUDENTS[0].nameWithOwner), environment('e2', 'x/y')],
+    });
+    const today = JSON.stringify(buildTreeModel(base));
+    expect(JSON.stringify(buildTreeModel({ ...base, repositoryGroups: [] }))).toBe(today);
+    expect(JSON.stringify(buildTreeModel({ ...base, repositoryGroups: patterns('(', 3, { name: 'x' }) }))).toBe(today);
+  });
+
+  it('handles thousands of repositories', () => {
+    const many = Array.from({ length: 5000 }, (_, i) => repo(`o/${2020 + (i % 7)}-c${i % 13}-SWP-module-m${i % 5}-student${i}`));
+    const started = Date.now();
+    const groups = buildTreeModel(input({ discovery: discovery(many), repositoryGroups: patterns(EXAMPLE) }));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(rows(groups)).toHaveLength(5000);
+    expect(groups[0].children).toHaveLength(7 * 13);
   });
 });
