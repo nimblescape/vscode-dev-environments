@@ -13,6 +13,7 @@ import {
   INITIAL_DOCKER_SETUP_STATE,
   INSTALL_WATCH_TIMEOUT_MS,
   WINGET_INSTALL_COMMAND,
+  brewCaskroomFolder,
   changedContextValues,
   dockerContextValues,
   dockerDesktopDownloadUrl,
@@ -327,6 +328,75 @@ describe('the install terminal', () => {
     const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/octo/homebrew/bin/brew' });
     expect(plan.kind === 'terminal' && plan.commands).toEqual(['/Users/octo/homebrew/bin/brew install --cask docker-desktop']);
     expect(installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/o c/brew' }).kind).toBe('download');
+  });
+});
+
+describe('installPlan on macOS: Homebrew still records docker-desktop', () => {
+  const brewPath = '/opt/homebrew/bin/brew';
+
+  it('removes the stale record first, then installs, when Docker.app is gone', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded: true, dockerAppPresent: false });
+    expect(plan).toEqual({
+      kind: 'terminal',
+      commands: ['/opt/homebrew/bin/brew uninstall --cask --force docker-desktop', '/opt/homebrew/bin/brew install --cask docker-desktop'],
+      needsAdmin: true,
+      description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+    });
+    // The install runs only when the uninstall succeeded.
+    expect(plan.kind === 'terminal' && terminalLines(plan.commands, 'darwin')).toEqual([
+      '/opt/homebrew/bin/brew uninstall --cask --force docker-desktop && /opt/homebrew/bin/brew install --cask docker-desktop',
+    ]);
+  });
+
+  it('uses the plain brew without a path', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewCaskRecorded: true, dockerAppPresent: false });
+    expect(plan.kind === 'terminal' && plan.commands).toEqual(['brew uninstall --cask --force docker-desktop', BREW_INSTALL_COMMAND]);
+  });
+
+  it('never zaps: that would delete the Docker volumes in ~/Library/Containers/com.docker.docker', () => {
+    for (const brewCaskRecorded of [true, false]) {
+      for (const dockerAppPresent of [true, false]) {
+        const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded, dockerAppPresent });
+        if (plan.kind !== 'terminal') throw new Error('terminal plan expected');
+        for (const command of plan.commands) expect(command).not.toContain('zap');
+      }
+    }
+  });
+
+  it.each<[string, boolean | undefined, boolean | undefined]>([
+    ['recorded and Docker.app present (Homebrew upgrades normally)', true, true],
+    ['not recorded, Docker.app gone', false, false],
+    ['not recorded, Docker.app present', false, true],
+    ['unknown', undefined, undefined],
+  ])('installs plainly when %s', (_name, brewCaskRecorded, dockerAppPresent) => {
+    expect(installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath, brewCaskRecorded, dockerAppPresent })).toEqual({
+      kind: 'terminal',
+      commands: ['/opt/homebrew/bin/brew install --cask docker-desktop'],
+      needsAdmin: true,
+      description: DockerSetupTexts.descriptionBrew,
+    });
+  });
+
+  it('keeps the download for an unusual brew path, also with a stale record', () => {
+    expect(
+      installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewPath: '/Users/o c/brew', brewCaskRecorded: true, dockerAppPresent: false }).kind,
+    ).toBe('download');
+  });
+
+  it('says in the confirmation that the old entry is removed and the Docker data stays', () => {
+    const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewCaskRecorded: true, dockerAppPresent: false });
+    expect(installConfirmation(plan)?.detail).toBe(
+      `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}\n\n${DockerSetupTexts.confirmCommands}\n\n` +
+        `brew uninstall --cask --force docker-desktop\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}`,
+    );
+  });
+
+  it.each([
+    ['/opt/homebrew/bin/brew', '/opt/homebrew/Caskroom/docker-desktop'],
+    ['/usr/local/bin/brew', '/usr/local/Caskroom/docker-desktop'],
+    ['/Users/octo/homebrew/bin/brew', '/Users/octo/homebrew/Caskroom/docker-desktop'],
+  ])('looks the cask up in the prefix of %s', (brew, folder) => {
+    expect(brewCaskroomFolder(brew)).toBe(folder);
   });
 });
 
