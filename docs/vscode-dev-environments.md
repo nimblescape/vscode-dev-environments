@@ -780,7 +780,7 @@ The age condition has a reason. The VS Code command **Close Remote Connection** 
 
 1. The user selects another environment in the status bar, the switcher, or the sidebar.
 2. The extension runs the open pipeline for the target environment until the container runs, including the image check. The current window stays connected during this time and shows the progress.
-3. The extension replaces the folder of the current window with the folder URI of the target environment (`vscode.openFolder` with `forceNewWindow: false`), or, for **Start in New Window** and with the setting `devEnvLauncher.openInNewWindow`, opens it in a new window (`forceNewWindow: true`). VS Code asks about unsaved files in the usual way. **Switch branch…** and **Select configuration…** always use the current window.
+3. The extension replaces the folder of the current window with the folder URI of the target environment (`vscode.openFolder` with `forceNewWindow: false`), or, for **Start in New Window** and with the setting `devEnvLauncher.openInNewWindow` (except from an empty window), opens it in a new window (`forceNewWindow: true`). VS Code asks about unsaved files in the usual way. **Switch branch…** and **Select configuration…** always use the current window.
 4. The Session Monitor stops the previous environment after the waiting time (see [7.9](#79-stop-on-close-and-crash-handling)).
 
 If the target environment is open in another window already, VS Code shows that window instead of opening it a second time (to verify in [V-2](#11-verification-before-implementation)). The main process of VS Code looks for a window with the same folder URI before it opens a window, also with `forceNewWindow: true`, so this holds for **Start in New Window** too.

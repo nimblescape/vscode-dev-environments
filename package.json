@@ -512,7 +512,7 @@
           "type": "boolean",
           "default": false,
           "scope": "application",
-          "markdownDescription": "**Start** opens the environment in a new window, and the current window keeps its environment. The context menu of a repository then offers **Start in Current Window**. If false, **Start** connects the current window, and the context menu offers **Start in New Window**. An environment that is open in another window is never opened a second time: that window is shown. Only the user settings count."
+          "markdownDescription": "**Start** opens the environment in a new window, and the current window keeps its environment. **Switch Environment…** does the same. From an empty window, **Start** uses that window. The context menu of a repository then offers **Start in Current Window**. If false, **Start** connects the current window, and the context menu offers **Start in New Window**. An environment that is open in another window is never opened a second time: that window is shown. Only the user settings count."
         },
         "devEnvLauncher.stopOnClose": {
           "type": "boolean",
