@@ -96,4 +96,36 @@ describe('decideReopen', () => {
   it('reopens a record just older than 30 seconds', () => {
     expect(decideReopen({ ...base, record: { environmentId: 'e1', closedAt: iso(NOW - REOPEN_MIN_AGE_MS - 1) } }).reopen).toBe(true);
   });
+
+  describe('in an Extension Development Host (a debug run)', () => {
+    const development: ReopenInput = { ...base, development: true };
+
+    it('reopens right after the previous debug run closed the window', () => {
+      expect(decideReopen({ ...development, record: { environmentId: 'e1', closedAt: iso(NOW - 5_000) } })).toEqual({ reopen: true, environmentId: 'e1' });
+    });
+
+    it('reopens while the window with the source code is open (a window without an environment)', () => {
+      expect(decideReopen({ ...development, otherActiveWindows: 1, otherConnectedWindows: 0 })).toEqual({ reopen: true, environmentId: 'e1' });
+    });
+
+    it('does not reopen while another window is connected to an environment', () => {
+      expect(decideReopen({ ...development, otherActiveWindows: 2, otherConnectedWindows: 1 }).reopen).toBe(false);
+    });
+
+    it('counts all other windows when it does not know which are connected', () => {
+      expect(decideReopen({ ...development, otherActiveWindows: 1 }).reopen).toBe(false);
+    });
+
+    it.each<[string, Partial<ReopenInput>]>([
+      ['the setting is off', { settings: { reopenLastOnStartup: false } }],
+      ['the window is not empty', { emptyWindow: false }],
+      ['an operation is pending', { pendingOperations: 1 }],
+      ['no reopen record exists', { record: undefined }],
+      ['the environment was deleted', { environmentIds: new Set(['e2']) }],
+      ['the record time is invalid', { record: { environmentId: 'e1', closedAt: 'yesterday' } }],
+      ['the record time is in the future', { record: { environmentId: 'e1', closedAt: iso(NOW + 60_000) } }],
+    ])('still does not reopen when %s', (_name, overrides) => {
+      expect(decideReopen({ ...development, ...overrides }).reopen).toBe(false);
+    });
+  });
 });

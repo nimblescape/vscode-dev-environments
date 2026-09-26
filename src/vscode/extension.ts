@@ -243,6 +243,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     settings: getSettings,
     dockerSetup: setup,
     viewVisible: () => view.visible,
+    development: context.extensionMode === vscode.ExtensionMode.Development,
   });
   context.subscriptions.push(
     sidebar,
