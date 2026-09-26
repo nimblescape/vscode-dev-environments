@@ -103,6 +103,7 @@ npm run build         # bundles dist/extension.js and dist/sessionMonitor.js
 npm test              # unit tests, without VS Code and without Docker
 npm run test:docker   # integration tests against the running Docker engine
 npm run package       # creates the .vsix file
+npm run install-local # creates the .vsix file and installs it into VS Code (every window, also new ones of a debug run)
 ```
 
 © 2026 Hannes Stauss (scalarion@nimblescape.com) · [MIT License](https://github.com/nimblescape/vscode-dev-environments/blob/main/LICENSE).

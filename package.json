@@ -617,7 +617,8 @@
     "test": "vitest run",
     "test:docker": "vitest run --config vitest.docker.config.ts",
     "vscode:prepublish": "node esbuild.mjs --production",
-    "package": "vsce package --no-dependencies --no-rewrite-relative-links"
+    "package": "vsce package --no-dependencies --no-rewrite-relative-links",
+    "install-local": "node scripts/install-local.mjs"
   },
   "devDependencies": {
     "@devcontainers/cli": "0.89.0",
