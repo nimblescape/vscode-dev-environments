@@ -348,6 +348,7 @@ export class Sidebar implements vscode.Disposable {
     const started = this.clock.now();
     const groups = buildTreeModel({ ...input, repositoryGroups });
     this.warnIfGroupingIsSlow(repositoryGroups, this.clock.now() - started);
+    this.logGroupFailures(repositoryGroups);
     this.groups = groups;
     // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
     // shall not be shown, instead, the side view shall show the install docker wizard". The view gets an empty model, so
@@ -373,6 +374,17 @@ export class Sidebar implements vscode.Disposable {
       });
     }
     return patterns;
+  }
+
+  /** Logs once per window session each entry that threw while it was matched (matchRepositoryGroup skipped it). */
+  private logGroupFailures(patterns: readonly RepositoryGroupPattern[]): void {
+    for (const pattern of patterns) {
+      if (pattern.failure === undefined) continue;
+      const message = RepositoryGroupTexts.failed(pattern.source, pattern.failure);
+      if (this.shownGroupProblems.has(message)) continue;
+      this.shownGroupProblems.add(message);
+      this.deps.logger.warn(message);
+    }
   }
 
   /**

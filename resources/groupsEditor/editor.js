@@ -15,12 +15,34 @@
     { flag: 's', label: 's', title: 'Dot matches line breaks' },
   ];
   const UPDATE_DELAY_MS = 150;
+  /**
+   * EditorLimits of repositoryGroupsEditorModel.ts: the extension refuses a message over them. The page checks them
+   * itself, so a draft over them (for example loaded from settings.json) is named at its entry and never sent.
+   */
+  const MAX_ENTRIES = 200;
+  const MAX_NAME = 200;
+  const MAX_PATTERN = 5000;
+  const MAX_TEST_NAME = 140;
+  const TEST_PAUSED = 'The test is paused until the entries are within the limits.';
 
-  /** @type {{name: string, pattern: string, flags: string, origin?: number}[]} */
+  /** @type {{name: string, pattern: string, flags: string}[]} */
   let entries = [];
   let seq = 0;
+  /** The load of the extension that the entries come from; sent back with each update. */
+  let generation = 0;
   let timer = undefined;
+  /** The `seq` of the Save that runs: the editor is read-only until its state (`saving: false`) arrives. */
+  let savingSeq = undefined;
+  /** Load settings.json was pressed: the editor is read-only until the load arrives. */
+  let reloading = false;
+  /**
+   * The last load or state of the extension said that a Save runs (for example one of a page before this one): a page
+   * that starts during Save is read-only from its load on.
+   */
+  let extensionSaving = false;
   let lastState = undefined;
+  /** The first load sets the test field (a page that starts again); later loads keep what the user typed. */
+  let firstLoad = true;
   /** Open state of the preview nodes that the user changed, by owner and label path. */
   const openNodes = new Map();
 
@@ -44,18 +66,48 @@
   }
 
   function entriesForMessage() {
-    return entries.map((entry) => {
-      const item = { name: entry.name, pattern: entry.pattern, flags: entry.flags };
-      if (typeof entry.origin === 'number') item.origin = entry.origin;
-      return item;
-    });
+    return entries.map((entry) => ({ name: entry.name, pattern: entry.pattern, flags: entry.flags }));
+  }
+
+  function testNameForMessage() {
+    return String($('test-name').value).slice(0, MAX_TEST_NAME);
+  }
+
+  /** The error of an entry over the limits of the extension, or undefined. */
+  function limitError(entry) {
+    if (entry.pattern.length > MAX_PATTERN) return `The regular expression is longer than ${MAX_PATTERN} characters.`;
+    if (entry.name.length > MAX_NAME) return `The name is longer than ${MAX_NAME} characters.`;
+    return undefined;
+  }
+
+  /**
+   * Why the extension would refuse the draft (entries over its limits), or undefined. The draft stays in the page, but it
+   * is not sent: the preview keeps the entries before, and Save is off, until it is corrected.
+   */
+  function limitProblem() {
+    if (entries.length > MAX_ENTRIES) {
+      return `The setting has ${entries.length} entries; the editor takes at most ${MAX_ENTRIES}. Remove entries: until then, the preview shows the entries before, and Save is off. Your edits stay here.`;
+    }
+    const index = entries.findIndex((entry) => limitError(entry) !== undefined);
+    if (index < 0) return undefined;
+    return `Entry ${index + 1} is too long for the editor. Shorten it: until then, the preview shows the entries before, and Save is off. Your edits stay here.`;
+  }
+
+  /** A draft over the limits is not sent, so the test of the extension waits for it: the page says so at the test. */
+  function showTestPaused() {
+    $('test-paused').textContent = limitProblem() !== undefined ? TEST_PAUSED : '';
   }
 
   function sendUpdate() {
     clearTimeout(timer);
     timer = undefined;
+    showTestPaused();
+    if (limitProblem() !== undefined) {
+      showLimits();
+      return;
+    }
     seq += 1;
-    send({ type: 'update', seq, entries: entriesForMessage(), testName: $('test-name').value });
+    send({ type: 'update', seq, generation, entries: entriesForMessage(), testName: testNameForMessage() });
   }
 
   function scheduleUpdate() {
@@ -74,7 +126,11 @@
   function renderEntries(focus) {
     list.replaceChildren(...entries.map((entry, index) => entryRow(entry, index)));
     $('no-entries').hidden = entries.length > 0;
-    if (lastState) applyChecks(lastState);
+    $('add').disabled = entries.length >= MAX_ENTRIES;
+    $('entries-full').hidden = entries.length < MAX_ENTRIES;
+    applyChecks(lastState);
+    showTestPaused();
+    if (limitProblem() !== undefined) showLimits();
     if (focus) {
       const target = document.getElementById(focus);
       if (target && !target.disabled) target.focus();
@@ -168,26 +224,54 @@
   }
 
   $('add').addEventListener('click', () => {
+    if (entries.length >= MAX_ENTRIES) return;
     entries.push({ name: '', pattern: '', flags: '' });
     renderEntries(`entry-${entries.length - 1}-pattern`);
     sendUpdate();
   });
 
+  // While Save waits for the check or for an answer, the extension takes no edits: the form is read-only until then.
+  // The same holds from Load settings.json until its load.
+  function updateForm() {
+    $('form').disabled = savingSeq !== undefined || reloading || extensionSaving;
+  }
+
+  function setSaving(value) {
+    savingSeq = value;
+    updateForm();
+  }
+
   $('save').addEventListener('click', () => {
+    if (limitProblem() !== undefined) return;
     clearTimeout(timer);
     timer = undefined;
     seq += 1;
-    send({ type: 'save', seq, entries: entriesForMessage() });
+    setSaving(seq);
+    // A test name that still waits for its delay goes with Save.
+    send({ type: 'save', seq, generation, entries: entriesForMessage(), testName: testNameForMessage() });
   });
   $('cancel').addEventListener('click', () => send({ type: 'cancel' }));
-  $('reload').addEventListener('click', () => send({ type: 'reload' }));
+  $('reload').addEventListener('click', () => {
+    // Load settings.json drops the draft: a keystroke that still waits is dropped with it, not sent after the load.
+    clearTimeout(timer);
+    timer = undefined;
+    reloading = true;
+    updateForm();
+    send({ type: 'reload', testName: testNameForMessage() });
+  });
   $('test-name').addEventListener('input', scheduleUpdate);
 
   // ---- State from the extension ------------------------------------------------------------------------------
 
+  /**
+   * The checks of the extension at their entries. With a draft over the limits, the checks of the extension are for the
+   * entries it has (not this draft): only the entries over the limits get an error.
+   */
   function applyChecks(state) {
-    entries.forEach((_entry, index) => {
-      const check = state.checks[index] || {};
+    const problem = limitProblem() !== undefined;
+    entries.forEach((entry, index) => {
+      const limit = limitError(entry);
+      const check = limit !== undefined ? { error: limit } : problem || !state ? {} : state.checks[index] || {};
       const error = document.getElementById(`entry-${index}-error`);
       const note = document.getElementById(`entry-${index}-note`);
       const pattern = document.getElementById(`entry-${index}-pattern`);
@@ -197,16 +281,29 @@
     });
   }
 
+  /** A draft over the limits: Save is off, and the status says why (the draft is not sent). */
+  function showLimits() {
+    applyChecks(lastState);
+    $('save').disabled = true;
+    $('status').textContent = limitProblem();
+  }
+
   function applyState(state) {
+    extensionSaving = state.saving === true;
+    updateForm();
+    if (savingSeq !== undefined && state.seq >= savingSeq && !state.saving) setSaving(undefined);
+    // settings.json changed the setting: the banner offers Load settings.json; the draft stays as it is.
+    $('changed').hidden = !state.changedOutside;
     // An answer to an older update: the entries changed since; the next answer follows.
     if (state.seq < seq && state.checks.length !== entries.length) return;
     lastState = state;
     applyChecks(state);
     $('save').disabled = !state.canSave || !state.dirty;
-    $('changed').hidden = !state.changedOutside;
     $('status').textContent = state.status || (state.dirty ? 'Not saved.' : '');
     renderTest(state.test);
+    showTestPaused();
     renderPreview(state.preview);
+    if (limitProblem() !== undefined) showLimits();
   }
 
   function renderTest(test) {
@@ -224,6 +321,12 @@
 
   function renderPreview(preview) {
     const box = $('preview');
+    if (preview.tooSlow) {
+      box.replaceChildren(
+        el('p', { className: 'error', text: 'The preview was stopped: the regular expressions took more than 1 second for the repository names of the view.' }),
+      );
+      return;
+    }
     if (!preview.loaded) {
       box.replaceChildren(el('p', { className: 'muted', text: 'No repositories are loaded in the Dev Environments view yet. Open the view and sign in to see a preview.' }));
       return;
@@ -311,6 +414,28 @@
     return (node.children || []).reduce((sum, child) => sum + countRows(child), 0);
   }
 
+  function load(message) {
+    clearTimeout(timer);
+    timer = undefined;
+    // The load replaces the draft (only at the start, after Save, after Load settings.json, and for a stale draft that
+    // the extension gives back; never on its own for a change of settings.json). A page that starts again continues from the `seq` of the extension, so its edits and its Save count as newer than the states before.
+    if (typeof message.seq === 'number' && message.seq > seq) seq = message.seq;
+    entries = message.entries.map((entry) => ({
+      name: String(entry.name),
+      pattern: String(entry.pattern),
+      flags: normalizeFlags(String(entry.flags)),
+    }));
+    lastState = undefined;
+    // A page that starts during Save takes no edits until the state after that Save.
+    extensionSaving = message.saving === true;
+    if (typeof message.generation === 'number') generation = message.generation;
+    // The test field keeps what the user typed; only a page that starts again takes the test name of the extension.
+    if (firstLoad && typeof message.testName === 'string') $('test-name').value = message.testName;
+    firstLoad = false;
+    renderNotices(Array.isArray(message.notices) ? message.notices.map(String) : []);
+    renderEntries();
+  }
+
   function renderNotices(notices) {
     $('notices').replaceChildren(...notices.map((text) => el('p', { className: 'notice', text })));
   }
@@ -319,16 +444,9 @@
     const message = event.data;
     if (!message || typeof message !== 'object') return;
     if (message.type === 'load' && Array.isArray(message.entries)) {
-      clearTimeout(timer);
-      timer = undefined;
-      entries = message.entries.map((entry) => {
-        const item = { name: String(entry.name), pattern: String(entry.pattern), flags: normalizeFlags(String(entry.flags)) };
-        if (typeof entry.origin === 'number') item.origin = entry.origin;
-        return item;
-      });
-      lastState = undefined;
-      renderNotices(Array.isArray(message.notices) ? message.notices.map(String) : []);
-      renderEntries();
+      load(message);
+      reloading = false;
+      updateForm();
     } else if (message.type === 'state') {
       applyState(message);
     }

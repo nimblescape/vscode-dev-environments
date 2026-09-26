@@ -39,6 +39,7 @@ import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
+import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
@@ -240,6 +241,7 @@ async function activateExtension(
     logger,
     groupingInput: () => sidebar.groupingInput(),
     onDidRender: sidebar.onDidRender,
+    previewRunner: new PreviewWorkerRunner(context.asAbsolutePath(path.join('dist', 'groupsPreviewWorker.js'))),
   });
   context.subscriptions.push(repositoryGroupsEditor);
   const controller = new Controller({
