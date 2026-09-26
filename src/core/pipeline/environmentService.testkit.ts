@@ -80,6 +80,7 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

@@ -21,6 +21,9 @@ export const Commands = {
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devEnvironments.selectOwnersFiltered',
   installDocker: 'devEnvironments.installDocker',
+  // The switch of the host access checks of a repository (row context menu only, hidden in the Command Palette).
+  turnOffHostAccessChecks: 'devEnvironments.turnOffHostAccessChecks',
+  turnOnHostAccessChecks: 'devEnvironments.turnOnHostAccessChecks',
   // The buttons of the walkthrough "Set up Docker for Dev Environments" (hidden in the Command Palette).
   dockerSetupInstall: 'devEnvironments.dockerSetup.install',
   dockerSetupStart: 'devEnvironments.dockerSetup.start',

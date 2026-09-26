@@ -12,11 +12,12 @@ import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
 import { Actions, Messages, formatChanges } from '../core/messages';
 import type { WorkspaceHelper } from '../core/helper/workspaceHelper';
+import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
-import { containerIsCurrent } from '../core/pipeline/pipelineRules';
+import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -50,6 +51,7 @@ import { selectOwners } from './ownerSelector';
 import type { VsCodePipelineUi } from './pipelineUi';
 import { runWithProgress, type BusyChange } from './progress';
 import type { SessionCoordinator } from './sessionCoordinator';
+import { SETTINGS_SECTION, hostAccessChecksOffValue } from './settings';
 import type { Sidebar } from './sidebar';
 import type { EnvironmentStatusBar } from './statusBar';
 import { pickRepository, showSwitcher } from './switcher';
@@ -239,7 +241,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 18 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 20 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -257,6 +259,8 @@ export class Controller implements vscode.Disposable {
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
       installDocker: () => this.deps.dockerSetup.openWizard(),
+      turnOffHostAccessChecks: (argument) => this.turnOffHostAccessChecks(parseCommandArgument(argument)),
+      turnOnHostAccessChecks: (argument) => this.turnOnHostAccessChecks(parseCommandArgument(argument)),
       dockerSetupInstall: () => this.deps.dockerSetup.install(),
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
@@ -398,10 +402,13 @@ export class Controller implements vscode.Disposable {
         if (await this.leaveDeletedEnvironment(environment.id)) return;
         // Concept section 9: the pipeline did not make the container of an older version again (for example the host
         // access policy refused the configuration, or the user cancelled). That container uses the Git of the computer,
-        // so the window must not attach to it. A current container stays: it passed the policy when it was made.
-        if (this.current?.environment.id === environment.id && (await this.containerOutdated(environment.id))) {
-          this.logger.info(`The container of ${repository} is of an older version and was not made again. The window closes its remote connection.`);
-          await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+        // so the window must not attach to it. A current container stays: it passed the policy when it was made. So does a
+        // container that was made while the host access checks were off, when they are on now and the pipeline refused
+        // the configuration: it must not be used as it is.
+        const outdated = this.current?.environment.id === environment.id ? await this.containerOutdated(environment) : undefined;
+        if (outdated) {
+          this.logger.info(`${this.outdatedTexts(outdated, repository).log} It was not made again.`);
+          await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
             environmentId: environment.id,
             containerName,
             volumeName: environment.volumeName,
@@ -782,6 +789,64 @@ export class Controller implements vscode.Disposable {
     await this.startTarget(await this.repositoryTargetFor(info.nameWithOwner, 'token'));
   }
 
+  /**
+   * Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26): after a modal warning that
+   * names what the configuration of the repository can then use, the repository joins the user setting
+   * devEnvLauncher.hostAccessChecksOff. The next open of its environment applies it.
+   */
+  async turnOffHostAccessChecks(argument: CommandArgument): Promise<void> {
+    const repository = await this.hostAccessRepository(argument);
+    if (!repository) return;
+    if (hostAccessChecks(repository, this.deps.settings()) === 'off') {
+      this.inform(Messages.hostAccessChecksTurnedOff(repository));
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      Messages.hostAccessChecksOffConfirm(repository),
+      { modal: true, detail: Messages.hostAccessChecksOffDetail },
+      Actions.turnOffChecks,
+    );
+    if (choice !== Actions.turnOffChecks) return;
+    await this.writeHostAccessChecks(repository, 'off');
+    this.logger.warn(`The host access checks were turned off for ${repository}. They apply from the next open of its environment.`);
+    this.inform(Messages.hostAccessChecksTurnedOff(repository));
+  }
+
+  /**
+   * Turn On Host Access Checks: the repository leaves the user setting devEnvLauncher.hostAccessChecksOff (no question).
+   * At the next open, the checks run again, and a container that was created without them is created again when the
+   * configuration passes them (containerIsCurrent).
+   */
+  async turnOnHostAccessChecks(argument: CommandArgument): Promise<void> {
+    const repository = await this.hostAccessRepository(argument);
+    if (!repository) return;
+    await this.writeHostAccessChecks(repository, 'on');
+    this.logger.info(`The host access checks were turned on again for ${repository}. They apply from the next open of its environment.`);
+    this.inform(Messages.hostAccessChecksTurnedOn(repository));
+  }
+
+  /** The repository of a row or an environment for the switch of the host access checks; none without an argument. */
+  private async hostAccessRepository(argument: CommandArgument): Promise<string | undefined> {
+    if (argument.kind === 'row') return argument.repository;
+    if (argument.kind === 'environment') {
+      const environment = await this.deps.registry.get(argument.environmentId);
+      if (!environment) this.inform(PipelineTexts.environmentMissing);
+      return environment ? this.displayName({ repository: environment.repository }) : undefined;
+    }
+    this.logger.info('The switch of the host access checks needs a repository row.');
+    return undefined;
+  }
+
+  /**
+   * Writes the switch of `repository` into the user setting devEnvLauncher.hostAccessChecksOff (ConfigurationTarget.Global:
+   * the setting has the scope `application`, so no workspace or folder can turn a check off). The other entries stay.
+   */
+  private async writeHostAccessChecks(repository: string, checks: HostAccessChecks): Promise<void> {
+    const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);
+    const entries = withHostAccessChecks(hostAccessChecksOffValue(configuration), repository, checks);
+    await configuration.update(HOST_ACCESS_CHECKS_OFF_SETTING, entries.length > 0 ? entries : undefined, vscode.ConfigurationTarget.Global);
+  }
+
   /** Select Organizations… (concept 6.2, 8): writes the setting `owners`, the scan scope of the list. */
   async selectOwners(): Promise<void> {
     await selectOwners({
@@ -828,9 +893,11 @@ export class Controller implements vscode.Disposable {
         if (await this.containerRuns(containerName)) {
           // Concept section 9: a container of an older version uses the Git of the computer. The pipeline must not
           // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
-          if (await this.containerOutdated(environment.id)) {
-            this.logger.info(`The container of ${repository} is of an older version. The window closes its remote connection.`);
-            await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+          // The same for a container made while the host access checks were off, when they are on now.
+          const outdated = await this.containerOutdated(environment);
+          if (outdated) {
+            this.logger.info(this.outdatedTexts(outdated, repository).log);
+            await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
               environmentId: environment.id,
               containerName,
               volumeName: environment.volumeName,
@@ -1396,11 +1463,13 @@ export class Controller implements vscode.Disposable {
     if (!restored) return;
     const environment = await this.ownWindowEnvironment(restored, containerName);
     if (!environment || this.current) return;
-    // No pipeline runs here, so a container of an older version is not made again: the window leaves it (section 9).
-    if (await this.containerOutdated(environment.id)) {
+    // No pipeline runs here, so a container of an older version is not made again: the window leaves it (section 9), and
+    // so it does a container made while the host access checks were off, when they are on now.
+    const outdated = await this.containerOutdated(environment);
+    if (outdated) {
       const repository = this.displayName({ repository: environment.repository });
-      this.logger.info(`The container of ${repository} is of an older version. The window closes its remote connection.`);
-      await this.leaveEnvironment(ControllerTexts.outdatedContainerClosed(repository), {
+      this.logger.info(this.outdatedTexts(outdated, repository).log);
+      await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
         environmentId: environment.id,
         containerName,
         volumeName: environment.volumeName,
@@ -1626,18 +1695,36 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * True when the container of the environment exists and was made by an older version of the extension (concept
-   * section 9: it uses the Git of the computer). False when Docker cannot be asked. Never throws.
+   * Why the container of the environment exists but must not be used as it is (concept section 9): `version`, it was
+   * made by an older version of the extension (it uses the Git of the computer); `hostAccess`, it was made while the
+   * host access checks of the repository were off, and they are on now (containerIsCurrent). `undefined` otherwise, and
+   * when Docker cannot be asked. Never throws.
    */
-  private async containerOutdated(environmentId: string): Promise<boolean> {
-    if (!this.deps.docker.isInstalled()) return false;
+  private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
+    if (!this.deps.docker.isInstalled()) return undefined;
     try {
-      const container = await this.deps.docker.findContainer(environmentId);
-      return container !== undefined && !containerIsCurrent(container.labels);
+      const container = await this.deps.docker.findContainer(environment.id);
+      if (container === undefined) return undefined;
+      const checks = hostAccessChecks(environment.repository, this.deps.settings());
+      if (containerIsCurrent(container.labels, true, checks)) return undefined;
+      return containerIsCurrent(container.labels, true, 'off') && isUnrestrictedContainer(container.labels) ? 'hostAccess' : 'version';
     } catch (error) {
-      this.logger.info(`The container of the environment ${environmentId} could not be read: ${errorMessage(error)}`);
-      return false;
+      this.logger.info(`The container of the environment ${environment.id} could not be read: ${errorMessage(error)}`);
+      return undefined;
     }
+  }
+
+  /** The message and the log line when the window leaves a container for the reason of containerOutdated. */
+  private outdatedTexts(reason: 'version' | 'hostAccess', repository: string): { message: string; log: string } {
+    return reason === 'hostAccess'
+      ? {
+          message: ControllerTexts.unrestrictedContainerClosed(repository),
+          log: `The container of ${repository} was made while the host access checks were off, and they are on now. The window closes its remote connection.`,
+        }
+      : {
+          message: ControllerTexts.outdatedContainerClosed(repository),
+          log: `The container of ${repository} is of an older version. The window closes its remote connection.`,
+        };
   }
 
   /** Concept 6.3 "Connection lost": the container of this window does not run (for example after a Docker restart). */

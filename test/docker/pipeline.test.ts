@@ -101,6 +101,7 @@ const settings: ExtensionSettings = {
   includeArchived: false,
   includeForks: false,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 describe('open pipeline on a seeded environment', () => {
@@ -873,6 +874,48 @@ describe('open pipeline on a seeded environment', () => {
       await docker.stopContainer(name);
       expect(cli.container(name)?.State.Running).toBe(false);
     } finally {
+      await registry.remove(id);
+      cli.run(['rm', '-f', name]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      cli.run(['volume', 'rm', name]);
+    }
+  });
+
+  it('host access checks off for the repository (unit 10): a configuration with privileged: true starts; with the checks on again it is refused and not started', async () => {
+    const id = newEnvironmentId();
+    const repository = 'devenv-test/privileged';
+    const name = resourceName(repository, id);
+    const config = JSON.stringify({
+      name: 'Privileged',
+      build: { dockerfile: 'Dockerfile' },
+      privileged: true,
+      runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
+    });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/privileged', config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    // The setting names the repository in another case: compared without case.
+    settings.hostAccessChecksOff = ['DevEnv-Test/Privileged'];
+    try {
+      await timings.measure('first open with privileged: true, checks off', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      const container = cli.container(name);
+      expect(container?.State.Running).toBe(true);
+      expect(container?.HostConfig.Privileged).toBe(true);
+      expect(container?.Config.Labels?.['devenv.host-access']).toBe('unrestricted');
+      expect(fs.readFileSync(log.file, 'utf8')).toContain(`The host access checks are off for ${repository}`);
+
+      // Checks on again: the open stops with the normal refusal, and the container is not started.
+      settings.hostAccessChecksOff = [];
+      await docker.stopContainer(name);
+      const error = await online.openEnvironment(id, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'hostAccess' });
+      expect((error as Error).message).toContain('privileged mode');
+      expect(cli.container(name)?.State.Running).toBe(false);
+    } finally {
+      settings.hostAccessChecksOff = [];
       await registry.remove(id);
       cli.run(['rm', '-f', name]);
       for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);

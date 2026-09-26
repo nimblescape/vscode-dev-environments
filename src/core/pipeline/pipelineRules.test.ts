@@ -19,6 +19,7 @@ import {
   isNetworkFailure,
   isRefusedUpdate,
   isRepositoryName,
+  isUnrestrictedContainer,
   isRootUser,
   lifecycleHookFailure,
   lifecycleHookName,
@@ -75,6 +76,52 @@ describe('containerIsCurrent (concept section 9: containers of an older setup ar
     expect(containerIsCurrent(provisional, false)).toBe(true);
     expect(containerIsCurrent({ 'devenv.container-version': '4' }, false)).toBe(true);
     expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
+  });
+});
+
+describe('containerIsCurrent and the switch of the host access checks (concept section 9 "Host access")', () => {
+  const unrestricted = { 'devenv.container-version': '4', 'devenv.host-access': 'unrestricted' };
+
+  it.each<[string, Record<string, string>, 'on' | 'off', boolean, boolean]>([
+    // [name, labels, switch, current with the configuration known, current without it]
+    ['a container of the checks-off time, checks on', unrestricted, 'on', false, false],
+    ['a container of the checks-off time, checks off', unrestricted, 'off', true, true],
+    ['a container with the checks, checks on', { 'devenv.container-version': '4' }, 'on', true, true],
+    ['a container with the checks, checks off (it has less access)', { 'devenv.container-version': '4' }, 'off', true, true],
+    ['another value of the label, checks on', { 'devenv.container-version': '4', 'devenv.host-access': 'other' }, 'on', true, true],
+    ['an older version of the checks-off time, checks off', { 'devenv.container-version': '3', 'devenv.host-access': 'unrestricted' }, 'off', false, false],
+    ['a container of the checks-off time without the configuration, checks off', { ...unrestricted, 'devenv.container-config': 'unknown' }, 'off', false, true],
+  ])('%s', (_name, labels, checks, current, currentWithoutConfiguration) => {
+    expect(containerIsCurrent(labels, true, checks)).toBe(current);
+    expect(containerIsCurrent(labels, false, checks)).toBe(currentWithoutConfiguration);
+  });
+
+  it('treats the checks as on by default', () => {
+    expect(containerIsCurrent(unrestricted)).toBe(false);
+    expect(isUnrestrictedContainer(unrestricted)).toBe(true);
+    expect(isUnrestrictedContainer({ 'devenv.container-version': '4' })).toBe(false);
+    expect(isUnrestrictedContainer({ 'devenv.host-access': 'Unrestricted' })).toBe(false);
+  });
+});
+
+describe('a refused update and the switch of the host access checks', () => {
+  const key = { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:x', images: { a: 'sha256:1' }, features: {} };
+
+  it('matches only an update with the same state of the switch (absent: on)', () => {
+    const refusedOn = { ...key, items: 'privileged mode' };
+    const refusedOff = { ...key, items: 'variable GH_TOKEN in containerEnv', hostAccessChecks: 'off' as const };
+    expect(isRefusedUpdate(refusedOn, key)).toBe(true);
+    expect(isRefusedUpdate(refusedOn, { ...key, hostAccessChecks: 'off' })).toBe(false);
+    expect(isRefusedUpdate(refusedOff, { ...key, hostAccessChecks: 'off' })).toBe(true);
+    expect(isRefusedUpdate(refusedOff, key)).toBe(false);
+  });
+
+  it('reads the state of the switch of a stored refusal, and drops a record with an invalid one', () => {
+    const refused = { ...key, items: 'x', hostAccessChecks: 'off' };
+    expect(refusedUpdateOf({ refusedUpdate: refused })).toEqual(refused);
+    expect(refusedUpdateOf({ refusedUpdate: { ...key, items: 'x' } })).toEqual({ ...key, items: 'x' });
+    expect(refusedUpdateOf({ refusedUpdate: { ...key, items: 'x', hostAccessChecks: 'on' } })).toBeUndefined();
+    expect(refusedUpdateOf({ refusedUpdate: { ...key, items: 'x', hostAccessChecks: true } })).toBeUndefined();
   });
 });
 

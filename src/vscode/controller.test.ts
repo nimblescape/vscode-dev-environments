@@ -53,6 +53,7 @@ const SETTINGS: ExtensionSettings = {
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 function environment(overrides: Partial<Environment> = {}): Environment {
@@ -505,7 +506,8 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    expect(declared).toHaveLength(18);
+    // 20 since unit 10: Turn Off Host Access Checks… and Turn On Host Access Checks (the switch per repository).
+    expect(declared).toHaveLength(20);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -2606,5 +2608,118 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.auth.getSession).not.toHaveBeenCalledWith({ interactive: true });
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([ControllerTexts.ownerNotConfirmedConnection('acme/api')]);
+  });
+});
+
+describe('the switch of the host access checks (concept section 9 "Host access", unit 10)', () => {
+  /** The user settings of the section devEnvLauncher: `globalValue` of hostAccessChecksOff, and the writes. */
+  function userSettings(globalValue?: unknown): { update: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> } {
+    const configuration = {
+      inspect: vi.fn(() => ({ key: `${SETTINGS_SECTION}.hostAccessChecksOff`, globalValue, workspaceValue: ['acme/api'] })),
+      update: vi.fn(async () => undefined),
+    };
+    fakeVscode.workspace.getConfiguration.mockReturnValue(configuration);
+    return configuration;
+  }
+
+  it('Turn Off Host Access Checks… asks with a modal warning that names what becomes possible, then writes the user setting', async () => {
+    const settings = userSettings(['me/dotfiles']);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.turnOffChecks);
+    await run('turnOffHostAccessChecks', row('acme/api'));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toEqual([
+      Messages.hostAccessChecksOffConfirm('acme/api'),
+      { modal: true, detail: Messages.hostAccessChecksOffDetail },
+      Actions.turnOffChecks,
+    ]);
+    for (const possible of ['bind mounts', 'Docker socket', 'privileged mode', 'devices and GPUs', 'all network addresses', 'volumes of other programs']) {
+      expect(Messages.hostAccessChecksOffDetail).toContain(possible);
+    }
+    expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
+    // Only the user value counts (the workspace value is not copied).
+    expect(settings.update).toHaveBeenCalledWith('hostAccessChecksOff', ['me/dotfiles', 'acme/api'], fakeVscode.ConfigurationTarget.Global);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.hostAccessChecksTurnedOff('acme/api'));
+  });
+
+  it('Turn Off Host Access Checks… changes nothing when the warning is dismissed', async () => {
+    const settings = userSettings(undefined);
+    await run('turnOffHostAccessChecks', row('acme/api'));
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(settings.update).not.toHaveBeenCalled();
+  });
+
+  it('Turn Off Host Access Checks… asks nothing when the checks are off already', async () => {
+    const settings = userSettings(['acme/api']);
+    h.settings.hostAccessChecksOff = ['acme/api'];
+    await run('turnOffHostAccessChecks', row('acme/api'));
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(settings.update).not.toHaveBeenCalled();
+  });
+
+  it('Turn On Host Access Checks writes the user setting without a question', async () => {
+    const settings = userSettings(['ACME/api', 'me/dotfiles']);
+    h.settings.hostAccessChecksOff = ['ACME/api', 'me/dotfiles'];
+    await run('turnOnHostAccessChecks', row('acme/api'));
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(settings.update).toHaveBeenCalledWith('hostAccessChecksOff', ['me/dotfiles'], fakeVscode.ConfigurationTarget.Global);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.hostAccessChecksTurnedOn('acme/api'));
+
+    // The last entry: the user value is removed.
+    const last = userSettings(['acme/api']);
+    await run('turnOnHostAccessChecks', row('acme/api', environment()));
+    expect(last.update).toHaveBeenCalledWith('hostAccessChecksOff', undefined, fakeVscode.ConfigurationTarget.Global);
+  });
+
+  it('needs a row: without an argument, nothing is written', async () => {
+    const settings = userSettings(undefined);
+    await run('turnOffHostAccessChecks');
+    await run('turnOnHostAccessChecks');
+    expect(settings.update).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('offers the commands in the context menu of repository rows only by their flags, and not in the Command Palette', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        menus: Record<string, Array<{ command?: string; when?: string }>>;
+        configuration: { properties: Record<string, { scope?: string; default?: unknown }> };
+      };
+    };
+    const menus = manifest.contributes.menus;
+    const when = (menu: string, command: string) => menus[menu].filter((item) => item.command === command).map((item) => item.when);
+    expect(when('view/item/context', Commands.turnOffHostAccessChecks)).toEqual(['view == devEnvironments.repositories && viewItem =~ /hostAccessChecked/']);
+    expect(when('view/item/context', Commands.turnOnHostAccessChecks)).toEqual(['view == devEnvironments.repositories && viewItem =~ /hostAccessUnrestricted/']);
+    expect(when('devEnvironments.more', Commands.turnOffHostAccessChecks)).toEqual(['viewItem =~ /hostAccessChecked/']);
+    expect(when('devEnvironments.more', Commands.turnOnHostAccessChecks)).toEqual(['viewItem =~ /hostAccessUnrestricted/']);
+    expect(when('commandPalette', Commands.turnOffHostAccessChecks)).toEqual(['false']);
+    expect(when('commandPalette', Commands.turnOnHostAccessChecks)).toEqual(['false']);
+    // A workspace or folder setting cannot turn a check off.
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.hostAccessChecksOff`]).toMatchObject({ scope: 'application', default: [] });
+  });
+
+  const unrestricted: ContainerInfo = {
+    ...containerInfo(String(CONTAINER_VERSION)),
+    labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devenv.host-access': 'unrestricted' },
+  };
+
+  it('role A: closes the connection to a container of the checks-off time when the checks are on and the pipeline refused', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    h.docker.findContainer.mockResolvedValue(unrestricted);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    expect(warningMessages()).toContain(ControllerTexts.unrestrictedContainerClosed('acme/api'));
+    expect(warningMessages()).not.toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+  });
+
+  it('role A: keeps a container of the checks-off time while the checks stay off', async () => {
+    h.settings.hostAccessChecksOff = ['acme/api'];
+    const env = environment();
+    await h.registry.add(env);
+    h.docker.findContainer.mockResolvedValue(unrestricted);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('variable GH_TOKEN in containerEnv')));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
   });
 });
