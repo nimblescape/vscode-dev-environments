@@ -14,10 +14,10 @@ import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import {
   acquireMonitorLock,
-  clearMonitorExitRequest,
-  readMonitorExitRequest,
+  isMonitorExitRequested,
   refreshMonitorLock,
   releaseMonitorLock,
+  removeLeftoverExitRequest,
   waitForRetiringMonitor,
   writeMonitorVersion,
   MONITOR_PROTOCOL_VERSION,
@@ -48,6 +48,10 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
 
   const paths = new StoragePaths(root);
   const logger = new FileLogger(paths.monitorLog);
+  // Only an exit request written after this time ends this monitor: a leftover request may name its process ID.
+  const startedAt = Date.now();
+  // A request that does not name a live monitor of an older version is left over (round-2 review finding 2 of PR #26).
+  removeLeftoverExitRequest(paths.monitorLock, paths.monitorVersion, paths.monitorExit);
   // A window asked an older monitor to exit and started this one: it finishes its current step first.
   if (!(await waitForRetiringMonitor(paths.monitorLock, paths.monitorExit, { timeoutMs: RETIRING_MONITOR_WAIT_MS }))) {
     logger.info('The older Session Monitor did not end in time.');
@@ -60,16 +64,15 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
     return 1;
   }
   if (!acquired) return 0;
+  // The older monitor has ended: its request is left over. Before the version is written, so that no request of a
+  // window that has read this version is removed.
+  removeLeftoverExitRequest(paths.monitorLock, paths.monitorVersion, paths.monitorExit);
   try {
-    // Right after the lock: a window that finds the lock without the version of its process ID asks it to exit.
     writeMonitorVersion(paths.monitorVersion);
   } catch (error) {
-    logger.error('The version file of the Session Monitor could not be written.', error);
-    releaseMonitorLock(paths.monitorLock);
-    return 1;
+    // Without its version a window leaves this monitor alone (unknown version); it still does its work.
+    logger.error('The version file of the Session Monitor could not be written. It keeps running.', error);
   }
-  // The request named the older monitor, which has ended.
-  clearMonitorExitRequest(paths.monitorExit);
 
   const release = (): void => releaseMonitorLock(paths.monitorLock);
   process.once('exit', release);
@@ -81,7 +84,7 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
   // Checked in every tick (refreshLock): a window of a newer version asks this monitor to exit. It ends after its
   // current step, so a `docker stop` that has started is finished; it keeps the lock until then.
   const checkExitRequest = (): void => {
-    if (exitRequested || readMonitorExitRequest(paths.monitorExit) !== process.pid) return;
+    if (exitRequested || !isMonitorExitRequested(paths.monitorExit, process.pid, startedAt)) return;
     exitRequested = true;
     logger.info('A window of a newer version asked this Session Monitor to exit.');
     loop.stop();

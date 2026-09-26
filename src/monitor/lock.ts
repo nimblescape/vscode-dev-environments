@@ -7,6 +7,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { writeJsonAtomicSync } from '../core/storage/atomicJson';
+import { readJsonTolerantSync, retryTransientSync } from '../core/storage/paths';
 
 /**
  * A lock file that was not refreshed for this time counts as stale, also when its process ID belongs to a live process.
@@ -16,21 +18,16 @@ import * as path from 'path';
 export const MONITOR_LOCK_STALE_MS = 120_000;
 
 /**
- * Protocol version of the Session Monitor (review finding F2 of PR #26). A window that finds a live monitor of an older
- * version, or one without a version, asks it to exit and starts the current one, which waits for it
- * (`waitForRetiringMonitor`). Bump it whenever a monitor of the previous version would decide wrongly with the files
- * that a window of this version writes.
+ * Protocol version of the Session Monitor (review finding F2 of PR #26). A window that finds a live monitor of a known,
+ * older version asks it to exit (monitor.exit) and starts the current one, which waits for it (`waitForRetiringMonitor`).
+ * A monitor whose version is unknown (no version file, or the file cannot be read) is left alone. Bump the version
+ * whenever a monitor of the previous version would decide wrongly with the files that a window of this version writes.
  *
- * - 1 (no version file): monitors before Keep Running When Closed; they would stop kept environments.
+ * - 1 (no version file): monitors before Keep Running When Closed; they would stop kept environments. The extension was
+ *   not published with them, so no window asks them to exit: after an update from such a version, restart VS Code once.
  * - 2: knows `keepRunning` of the registry, writes monitor.version, and ends on a request in monitor.exit.
  */
 export const MONITOR_PROTOCOL_VERSION = 2;
-
-/**
- * A lock without a version file of its process ID that is younger than this is not treated as older: a new monitor
- * writes its version right after it takes the lock.
- */
-export const MONITOR_VERSION_GRACE_MS = 1_000;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */
 const INCOMPLETE_LOCK_MS = 5_000;
@@ -130,10 +127,9 @@ export function isMonitorRunning(
   return lock !== undefined && !isStale(lock, isAlive, options.staleMs ?? MONITOR_LOCK_STALE_MS);
 }
 
-/** A live, fresh monitor (see `isMonitorRunning`): its process ID and the time since its lock was last refreshed. */
+/** A live, fresh monitor (see `isMonitorRunning`): its process ID. */
 export interface RunningMonitor {
   pid: number;
-  lockAgeMs: number;
 }
 
 /** The monitor that holds a live and fresh lock, or `undefined` (see `isMonitorRunning`). */
@@ -144,47 +140,84 @@ export function runningMonitor(
 ): RunningMonitor | undefined {
   const lock = inspect(lockFile);
   if (!lock || lock.pid === undefined || isStale(lock, isAlive, options.staleMs ?? MONITOR_LOCK_STALE_MS)) return undefined;
-  return { pid: lock.pid, lockAgeMs: Math.abs(Date.now() - lock.mtimeMs) };
+  return { pid: lock.pid };
 }
 
 /**
- * Writes monitor.version for the monitor `pid` (a JSON object `{ pid, version }`), atomically. The file is separate from
- * monitor.lock because monitors and windows of older versions accept only a bare process ID in the lock file. Throws for
- * file system errors.
+ * Writes monitor.version for the monitor `pid` (a JSON object `{ pid, version }`), atomically, and retries transient
+ * file errors (Windows). The file is separate from monitor.lock because monitors and windows of version 1 accept only a
+ * bare process ID in the lock file. Throws for file system errors.
  */
 export function writeMonitorVersion(versionFile: string, pid: number = process.pid, version = MONITOR_PROTOCOL_VERSION): void {
-  writeJsonAtomic(versionFile, { pid, version });
+  retryTransientSync(() => writeJsonAtomicSync(versionFile, { pid, version }));
 }
 
 /**
- * The protocol version of the monitor `pid`, or `undefined` when monitor.version is missing, not valid, or written by
- * another process (a monitor of version 1, which writes no version file, holds the lock then).
+ * The protocol version of the monitor `pid`, or `undefined` (unknown) when monitor.version is missing, cannot be read,
+ * is not valid, or was written by another process. Unknown is never "older": a window leaves such a monitor alone.
  */
 export function readMonitorVersion(versionFile: string, pid: number): number | undefined {
-  const value = readJson(versionFile);
+  const value = readJsonObject(versionFile);
   return value?.pid === pid && typeof value.version === 'number' && Number.isInteger(value.version) && value.version > 0
     ? value.version
     : undefined;
 }
 
-/** Asks the monitor `pid` to exit: monitor.exit names it (a JSON object `{ pid, requestedAt }`). Throws for file errors. */
+/**
+ * Asks the monitor `pid` to exit: monitor.exit names it (a JSON object `{ pid, requestedAt }`). The monitor honours it
+ * only when `requestedAt` is later than its own start (`isMonitorExitRequested`). Throws for file errors.
+ */
 export function requestMonitorExit(exitFile: string, pid: number, requestedAt: Date = new Date()): void {
-  writeJsonAtomic(exitFile, { pid, requestedAt: requestedAt.toISOString() });
+  retryTransientSync(() => writeJsonAtomicSync(exitFile, { pid, requestedAt: requestedAt.toISOString() }));
 }
 
-/** The process ID that monitor.exit asks to exit, or `undefined`. */
-export function readMonitorExitRequest(exitFile: string): number | undefined {
-  const pid = readJson(exitFile)?.pid;
-  return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pid <= MAX_PID ? pid : undefined;
+/** A request in monitor.exit: the process ID it names, and the time of the request in milliseconds. */
+export interface MonitorExitRequest {
+  pid: number;
+  requestedAt: number;
 }
 
-/** Removes monitor.exit unless it names `pid` (a request for another, older monitor that has ended). Never throws. */
-export function clearMonitorExitRequest(exitFile: string, pid: number = process.pid): void {
-  if (readMonitorExitRequest(exitFile) === pid) return;
+/** The request in monitor.exit, or `undefined` if the file is missing, cannot be read, or is not valid. */
+export function readMonitorExitRequest(exitFile: string): MonitorExitRequest | undefined {
+  const value = readJsonObject(exitFile);
+  const pid = value?.pid;
+  const requestedAt = typeof value?.requestedAt === 'string' ? Date.parse(value.requestedAt) : NaN;
+  return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && pid <= MAX_PID && Number.isFinite(requestedAt)
+    ? { pid, requestedAt }
+    : undefined;
+}
+
+/**
+ * For the running monitor `pid` that started at `startedAt` (milliseconds): monitor.exit names it, and the request was
+ * written after its start. A leftover request for an earlier process with the same ID does not end it (review finding
+ * R2-2 of PR #26).
+ */
+export function isMonitorExitRequested(exitFile: string, pid: number, startedAt: number): boolean {
+  const request = readMonitorExitRequest(exitFile);
+  return request !== undefined && request.pid === pid && request.requestedAt > startedAt;
+}
+
+/**
+ * For a monitor that starts: removes monitor.exit unless it names the live monitor that holds the lock and has a known,
+ * older protocol version (a request that `waitForRetiringMonitor` waits for). Any other request is left over, for
+ * example for a monitor that has ended, whose process ID a new monitor may get. Never throws.
+ */
+export function removeLeftoverExitRequest(
+  lockFile: string,
+  versionFile: string,
+  exitFile: string,
+  isAlive: (pid: number) => boolean = isProcessAlive,
+): void {
+  const request = readMonitorExitRequest(exitFile);
+  if (request) {
+    const monitor = runningMonitor(lockFile, isAlive);
+    const version = monitor?.pid === request.pid ? readMonitorVersion(versionFile, request.pid) : undefined;
+    if (version !== undefined && version < MONITOR_PROTOCOL_VERSION) return;
+  }
   try {
-    fs.rmSync(exitFile, { force: true });
+    retryTransientSync(() => fs.rmSync(exitFile, { force: true }));
   } catch {
-    // A leftover request names a process that has ended; only a reused process ID would read it.
+    // The request stays; a monitor honours it only when it was written after its start.
   }
 }
 
@@ -201,7 +234,7 @@ export async function waitForRetiringMonitor(
   const until = Date.now() + options.timeoutMs;
   for (;;) {
     const monitor = runningMonitor(lockFile, options.isAlive ?? isProcessAlive, { staleMs: options.staleMs });
-    if (!monitor || readMonitorExitRequest(exitFile) !== monitor.pid) return true;
+    if (!monitor || readMonitorExitRequest(exitFile)?.pid !== monitor.pid) return true;
     if (Date.now() >= until) return false;
     await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 250));
   }
@@ -305,22 +338,8 @@ function touch(lockFile: string): void {
   }
 }
 
-function readJson(file: string): Record<string, unknown> | undefined {
-  try {
-    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function writeJsonAtomic(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, 'utf8');
-    fs.renameSync(temp, file);
-  } finally {
-    fs.rmSync(temp, { force: true });
-  }
+function readJsonObject(file: string): Record<string, unknown> | undefined {
+  // Retries transient errors (Windows); a file that cannot be read gives undefined.
+  const value = readJsonTolerantSync(file);
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }

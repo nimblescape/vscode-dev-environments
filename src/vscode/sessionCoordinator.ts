@@ -22,7 +22,6 @@ import {
   isMonitorRunning,
   isProcessAlive,
   MONITOR_PROTOCOL_VERSION,
-  MONITOR_VERSION_GRACE_MS,
   readMonitorVersion,
   requestMonitorExit,
   runningMonitor,
@@ -62,8 +61,6 @@ export interface SessionCoordinatorDeps {
   isAlive?: (pid: number) => boolean;
   /** Default: `child_process.spawn`. */
   spawnProcess?: SpawnFunction;
-  /** Sends SIGTERM to a monitor of version 1, which knows no monitor.exit. Default: `process.kill`. */
-  signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
   /** Default: `process.execPath` (the VS Code executable; it runs as Node.js with ELECTRON_RUN_AS_NODE=1). */
   execPath?: string;
   /** Default: HEARTBEAT_INTERVAL_MS. */
@@ -114,7 +111,6 @@ export class SessionCoordinator implements vscode.Disposable {
   private readonly pid: number;
   private readonly isAlive: (pid: number) => boolean;
   private readonly spawnProcess: SpawnFunction;
-  private readonly signalProcess: (pid: number, signal: NodeJS.Signals) => void;
   private readonly execPath: string;
   private readonly heartbeatMs: number;
   private readonly heartbeatEmitter: Emitter<void>;
@@ -139,7 +135,6 @@ export class SessionCoordinator implements vscode.Disposable {
     this.pid = deps.pid ?? process.pid;
     this.isAlive = deps.isAlive ?? isProcessAlive;
     this.spawnProcess = deps.spawnProcess ?? ((command, args, options) => spawn(command, [...args], options));
-    this.signalProcess = deps.signalProcess ?? ((pid, signal) => void process.kill(pid, signal));
     this.execPath = deps.execPath ?? process.execPath;
     this.heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
     this.heartbeatEmitter = new Emitter<void>(deps.logger);
@@ -372,21 +367,20 @@ export class SessionCoordinator implements vscode.Disposable {
   }
 
   /**
-   * Synchronous, for deactivateSync(). Returns true if a monitor process was started. A live monitor of an older protocol
-   * version (MONITOR_PROTOCOL_VERSION; for example one without Keep Running When Closed, which would stop kept
-   * environments) is asked to exit, and the current monitor is started; it waits until the older one has ended.
+   * Synchronous, for deactivateSync(). Returns true if a monitor process was started. A live monitor of a known, older
+   * protocol version (MONITOR_PROTOCOL_VERSION) is asked to exit, and the current monitor is started; it waits until the
+   * older one has ended. A monitor whose version is unknown (no version file, or it cannot be read) is left alone this
+   * time: a failed read is never taken for an older version.
    */
   private ensureMonitorRunningSync(): boolean {
     try {
-      let older: { pid: number; version: number | undefined } | undefined;
+      let older: { pid: number; version: number } | undefined;
       if (isMonitorRunning(this.paths.monitorLock, this.isAlive)) {
         const monitor = runningMonitor(this.paths.monitorLock, this.isAlive);
         // A lock without a valid process ID yet: its creator is still writing it.
         if (!monitor) return false;
         const version = readMonitorVersion(this.paths.monitorVersion, monitor.pid);
-        if (version !== undefined && version >= MONITOR_PROTOCOL_VERSION) return false;
-        // A monitor that has just taken the lock writes its version right after it.
-        if (version === undefined && monitor.lockAgeMs < MONITOR_VERSION_GRACE_MS) return false;
+        if (version === undefined || version >= MONITOR_PROTOCOL_VERSION) return false;
         older = { pid: monitor.pid, version };
       }
       const now = this.clock.now();
@@ -404,26 +398,17 @@ export class SessionCoordinator implements vscode.Disposable {
   }
 
   /**
-   * Asks an older monitor to exit, never forces it: monitor.exit names it, and a monitor of version 2 or later ends after
-   * its current step (a `docker stop` that has started is finished). A monitor of version 1 knows no monitor.exit and
-   * gets SIGTERM; its handler ends it after at most 3 seconds, and a stop that it had started is then not completed.
+   * Asks an older monitor to exit, never forces it and sends it no signal: monitor.exit names it, and the monitor ends
+   * after its current step (a `docker stop` that has started is finished).
    */
-  private retireMonitor(pid: number, version: number | undefined): void {
-    const known = version === undefined ? 'without a version' : `version ${version}`;
+  private retireMonitor(pid: number, version: number): void {
     this.logger.info(
-      `Asked the Session Monitor (process ${pid}) to exit: it has protocol ${known}, older than ${MONITOR_PROTOCOL_VERSION}.`,
+      `Asked the Session Monitor (process ${pid}) to exit: it has protocol version ${version}, older than ${MONITOR_PROTOCOL_VERSION}.`,
     );
     try {
       requestMonitorExit(this.paths.monitorExit, pid);
     } catch (error) {
       this.logger.warn(`The exit request for the Session Monitor could not be written. ${errorMessage(error)}`);
-    }
-    if (version !== undefined) return;
-    try {
-      this.signalProcess(pid, 'SIGTERM');
-    } catch (error) {
-      // For example ESRCH: it has just ended.
-      this.logger.info(`The Session Monitor (process ${pid}) could not be signalled. ${errorMessage(error)}`);
     }
   }
 

@@ -6,10 +6,10 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireMonitorLock,
-  clearMonitorExitRequest,
+  isMonitorExitRequested,
   isMonitorRunning,
   isProcessAlive,
   MONITOR_LOCK_STALE_MS,
@@ -19,6 +19,7 @@ import {
   readMonitorVersion,
   refreshMonitorLock,
   releaseMonitorLock,
+  removeLeftoverExitRequest,
   requestMonitorExit,
   runningMonitor,
   waitForRetiringMonitor,
@@ -27,6 +28,29 @@ import {
 
 const alive = () => true;
 const dead = () => false;
+
+// Transient file errors of Windows (round-2 review finding 3 of PR #26): a test sets a hook that may throw before the
+// real call. The namespace of 'fs' cannot be spied on in ESM, so the module is mocked with pass-through functions.
+const fsHooks: { readFileSync?: (file: unknown) => void; renameSync?: (from: unknown) => void } = {};
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  const readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
+    fsHooks.readFileSync?.(args[0]);
+    return actual.readFileSync(...args);
+  }) as typeof actual.readFileSync;
+  const renameSync = (...args: Parameters<typeof actual.renameSync>): void => {
+    fsHooks.renameSync?.(args[0]);
+    actual.renameSync(...args);
+  };
+  const mocked = { ...actual, readFileSync, renameSync };
+  return { ...mocked, default: mocked };
+});
+
+function fsError(code: string): NodeJS.ErrnoException {
+  const error = new Error(code) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
 
 function setAge(file: string, ageMs: number): void {
   const time = new Date(Date.now() - ageMs);
@@ -239,26 +263,126 @@ describe('monitor protocol version and exit request', () => {
     }
   });
 
-  it('writes, reads, and clears an exit request; a monitor keeps the request that names itself', () => {
+  it('writes and reads an exit request with its time', () => {
     expect(readMonitorExitRequest(exitFile)).toBeUndefined();
     requestMonitorExit(exitFile, 1111, new Date('2026-09-26T10:00:00.000Z'));
     expect(JSON.parse(fs.readFileSync(exitFile, 'utf8'))).toEqual({ pid: 1111, requestedAt: '2026-09-26T10:00:00.000Z' });
-    expect(readMonitorExitRequest(exitFile)).toBe(1111);
-    clearMonitorExitRequest(exitFile, 1111);
-    expect(readMonitorExitRequest(exitFile)).toBe(1111);
-    clearMonitorExitRequest(exitFile, 2222);
-    expect(fs.existsSync(exitFile)).toBe(false);
-    fs.writeFileSync(exitFile, '{"pid":-1}');
-    expect(readMonitorExitRequest(exitFile)).toBeUndefined();
+    expect(readMonitorExitRequest(exitFile)).toEqual({ pid: 1111, requestedAt: Date.parse('2026-09-26T10:00:00.000Z') });
+    expect(fs.readdirSync(dir)).toEqual(['monitor.exit']);
+    for (const text of ['{"pid":-1,"requestedAt":"2026-09-26T10:00:00.000Z"}', '{"pid":1111}', '{"pid":1111,"requestedAt":"soon"}', '[]']) {
+      fs.writeFileSync(exitFile, text);
+      expect(readMonitorExitRequest(exitFile)).toBeUndefined();
+    }
   });
 
-  it('gives the running monitor with its process ID and the age of its lock', () => {
+  // Round-2 review finding 2 of PR #26: a leftover request must not end a new monitor that got the same process ID.
+  it('honours a request only when it names the monitor and was written after its start', () => {
+    const startedAt = Date.parse('2026-09-26T10:00:00.000Z');
+    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
+    requestMonitorExit(exitFile, 1111, new Date(startedAt - 60_000));
+    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
+    requestMonitorExit(exitFile, 1111, new Date(startedAt));
+    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
+    requestMonitorExit(exitFile, 2222, new Date(startedAt + 1_000));
+    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(false);
+    requestMonitorExit(exitFile, 1111, new Date(startedAt + 1_000));
+    expect(isMonitorExitRequested(exitFile, 1111, startedAt)).toBe(true);
+  });
+
+  it('removes a leftover exit request at the start of a monitor, but keeps one for a live monitor of an older version', () => {
+    const request = (): void => requestMonitorExit(exitFile, 1111);
+    // No lock: the monitor that the request names has ended.
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // The lock holds a dead process.
+    fs.writeFileSync(lockFile, '1111\n');
+    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, dead);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // Another process holds the lock.
+    fs.writeFileSync(lockFile, '2222\n');
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // The live lock holder has the current version, or an unknown one.
+    fs.writeFileSync(lockFile, '1111\n');
+    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION);
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    fs.rmSync(versionFile);
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // An invalid request.
+    fs.writeFileSync(exitFile, 'x');
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(fs.existsSync(exitFile)).toBe(false);
+    // The live lock holder has an older version: the new monitor waits for it.
+    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
+    request();
+    removeLeftoverExitRequest(lockFile, versionFile, exitFile, alive);
+    expect(readMonitorExitRequest(exitFile)?.pid).toBe(1111);
+  });
+
+  // Round-2 review finding 3 of PR #26: transient file errors of Windows (a virus scanner holds the file).
+  it('retries transient errors when it reads the version, and an unreadable version is unknown, never older', () => {
+    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
+    let failures = 0;
+    fsHooks.readFileSync = (file) => {
+      if (file === versionFile && failures < 2) {
+        failures++;
+        throw fsError('EBUSY');
+      }
+    };
+    try {
+      expect(readMonitorVersion(versionFile, 1111)).toBe(MONITOR_PROTOCOL_VERSION - 1);
+      expect(failures).toBe(2);
+      fsHooks.readFileSync = (file) => {
+        if (file === versionFile) throw fsError('EBUSY');
+      };
+      expect(readMonitorVersion(versionFile, 1111)).toBeUndefined();
+    } finally {
+      delete fsHooks.readFileSync;
+    }
+    // A file that cannot be read at all (here a folder) is unknown as well.
+    fs.rmSync(versionFile);
+    fs.mkdirSync(versionFile);
+    expect(readMonitorVersion(versionFile, 1111)).toBeUndefined();
+  });
+
+  it('retries transient errors when it writes the version or an exit request', () => {
+    let failures = 0;
+    fsHooks.renameSync = () => {
+      if (failures < 2) {
+        failures++;
+        throw fsError('EPERM');
+      }
+    };
+    try {
+      writeMonitorVersion(versionFile, 1111);
+      expect(readMonitorVersion(versionFile, 1111)).toBe(MONITOR_PROTOCOL_VERSION);
+      expect(failures).toBe(2);
+      failures = 0;
+      requestMonitorExit(exitFile, 1111);
+      expect(readMonitorExitRequest(exitFile)?.pid).toBe(1111);
+      expect(failures).toBe(2);
+    } finally {
+      delete fsHooks.renameSync;
+    }
+    expect(fs.readdirSync(dir).sort()).toEqual(['monitor.exit', 'monitor.version']);
+  });
+
+  it('gives the running monitor with its process ID', () => {
     expect(runningMonitor(lockFile, alive)).toBeUndefined();
     expect(acquireMonitorLock(lockFile, 1111, alive)).toBe(true);
     setAge(lockFile, 3_000);
-    const monitor = runningMonitor(lockFile, alive);
-    expect(monitor?.pid).toBe(1111);
-    expect(monitor?.lockAgeMs).toBeGreaterThanOrEqual(2_900);
+    expect(runningMonitor(lockFile, alive)).toEqual({ pid: 1111 });
+    setAge(lockFile, MONITOR_LOCK_STALE_MS + 1_000);
+    expect(runningMonitor(lockFile, alive)).toBeUndefined();
+    setAge(lockFile, 3_000);
     expect(runningMonitor(lockFile, dead)).toBeUndefined();
     // A lock without a valid process ID yet is not a running monitor with a process ID.
     fs.writeFileSync(lockFile, '');

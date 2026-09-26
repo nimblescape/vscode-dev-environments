@@ -126,6 +126,8 @@ describe('sessionMonitor bundle', () => {
       const olderExit = exitOf(older);
       const lock = path.join(root, 'monitor.lock');
       fs.writeFileSync(lock, `${older.pid}\n`);
+      // Of a known, older version: a request for a monitor without a version is left over (round-2 review of PR #26).
+      fs.writeFileSync(path.join(root, 'monitor.version'), JSON.stringify({ pid: older.pid, version: 1 }));
       fs.writeFileSync(path.join(root, 'monitor.exit'), JSON.stringify({ pid: older.pid, requestedAt: new Date().toISOString() }));
       const child = start([root]);
       const exit = exitOf(child);
@@ -143,6 +145,61 @@ describe('sessionMonitor bundle', () => {
         expect(fs.existsSync(path.join(root, 'monitor.exit'))).toBe(false);
       } finally {
         older.kill('SIGKILL');
+        child.kill('SIGTERM');
+      }
+      expect(await exit).toBe(0);
+    },
+    20_000,
+  );
+
+  // Round-2 review finding 2 of PR #26: a leftover exit request that names the process ID of a new, current monitor
+  // does not end it; only a request written after its start does.
+  it.skipIf(process.platform === 'win32')(
+    'is not ended by a leftover exit request that names its process ID',
+    async () => {
+      const root = storageRoot();
+      writeLiveWindow(root);
+      const exitFile = path.join(root, 'monitor.exit');
+      const child = start([root]);
+      const exit = exitOf(child);
+      const leftover = JSON.stringify({ pid: child.pid, requestedAt: new Date(Date.now() - 60_000).toISOString() });
+      try {
+        // Written as early as possible: the monitor removes it at its start, or it is older than the start.
+        fs.writeFileSync(exitFile, leftover);
+        await waitFor(() => readLog(root).includes('Session Monitor started'));
+        // Also a leftover written after the start (older than the start) does not end it in the next ticks.
+        fs.writeFileSync(exitFile, leftover);
+        await new Promise((resolve) => setTimeout(resolve, 6_000));
+        expect(child.exitCode).toBeNull();
+        expect(readLog(root)).not.toContain('asked this Session Monitor to exit');
+        // A request of a window after the start ends it.
+        fs.writeFileSync(exitFile, JSON.stringify({ pid: child.pid, requestedAt: new Date().toISOString() }));
+        expect(await exit).toBe(0);
+        expect(readLog(root)).toContain('A window of a newer version asked this Session Monitor to exit.');
+      } finally {
+        child.kill('SIGTERM');
+      }
+    },
+    25_000,
+  );
+
+  // Round-2 review finding 3 of PR #26: a failed write of the version file does not end the new monitor.
+  it.skipIf(process.platform === 'win32')(
+    'keeps running when its version file cannot be written',
+    async () => {
+      const root = storageRoot();
+      writeLiveWindow(root);
+      // A folder in place of the file: the rename of the atomic write fails.
+      fs.mkdirSync(path.join(root, 'monitor.version'));
+      const child = start([root]);
+      const exit = exitOf(child);
+      try {
+        await waitFor(() => readLog(root).includes('Session Monitor started'));
+        expect(readLog(root)).toContain('The version file of the Session Monitor could not be written. It keeps running.');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(child.exitCode).toBeNull();
+        expect(fs.readFileSync(path.join(root, 'monitor.lock'), 'utf8').trim()).toBe(String(child.pid));
+      } finally {
         child.kill('SIGTERM');
       }
       expect(await exit).toBe(0);

@@ -1313,12 +1313,12 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(rowStateText('running', true)).toBe('Running · kept');
     expect(rowStateText('connected', true)).toBe('Connected · kept');
     expect(rowStateText('connectedOtherWindow', true)).toBe('Connected · other window · kept');
-    // Review finding F4 of PR #26: also "Stopped · kept" (below); the other states without a container that runs show
-    // no suffix.
+    // Review finding F4 of PR #26: also "Stopped · kept" (below). Round-2 review of PR #26: in every state, as the menu
+    // offers Stop When Closed in every state (below).
     for (const state of ['updating', 'noContainer', 'filesMissing'] as EnvironmentState[]) {
-      expect(rowStateText(state, true)).toBe(stateText(state));
+      expect(rowStateText(state, true)).toBe(`${stateText(state)} · kept`);
     }
-    for (const state of ['running', 'connected', 'connectedOtherWindow', 'stopped'] as EnvironmentState[]) {
+    for (const state of ['running', 'connected', 'connectedOtherWindow', 'stopped', 'updating', 'noContainer', 'filesMissing'] as EnvironmentState[]) {
       expect(rowStateText(state, false)).toBe(stateText(state));
     }
   });
@@ -1390,6 +1390,39 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(web.description).toBe('main   Stopped · kept');
     expect(web.tooltip.split('\n')).toContain(TreeTexts.kept);
     expect(flags(web.contextValue)).toContain('kept');
+  });
+
+  // Round-2 review of PR #26 (nit): the row text matches the menu, which offers Stop When Closed for a kept environment
+  // in every state, also without a container and while it is updating.
+  it('shows " · kept" also without a container and while updating, as the menu offers Stop When Closed there', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web'), repo('acme/lib')]),
+        environments: [
+          environment('e1', 'acme/api', { keepRunning: true }),
+          environment('e2', 'acme/web', { keepRunning: true }),
+          environment('e3', 'acme/lib'),
+        ],
+        runtime: new Map<string, EnvironmentRuntime>([
+          ['e1', { container: 'missing', volume: true }],
+          ['e2', { container: 'running', volume: true }],
+          ['e3', { container: 'missing', volume: true }],
+        ]),
+        busyEnvironmentIds: new Set(['e2']),
+      }),
+    );
+    const api = row(groups, 'acme/api');
+    expect(api.state).toBe('noContainer');
+    expect(api.description).toContain('No container · kept');
+    expect(api.tooltip.split('\n')).toEqual(expect.arrayContaining([expect.stringMatching(/^No container · kept/), TreeTexts.kept]));
+    expect(flags(api.contextValue)).toContain('kept');
+    const web = row(groups, 'acme/web');
+    expect(web.state).toBe('updating');
+    expect(web.description).toContain('Updating · kept');
+    expect(flags(web.contextValue)).toContain('kept');
+    const lib = row(groups, 'acme/lib');
+    expect(lib.description).not.toContain('kept');
+    expect(flags(lib.contextValue)).toContain('canKeepRunning');
   });
 
   it('adds the flag only for a row with an environment', () => {
