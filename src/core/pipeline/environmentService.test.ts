@@ -10,7 +10,7 @@ import { devContainersSettings } from '../devContainers';
 import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
-import { runArgsProblems } from '../helper/hostAccess';
+import { hostAccessProblems } from '../helper/hostAccess';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
 import type { EnsureImageOptions } from '../helper/workspaceHelper';
@@ -52,6 +52,8 @@ import {
   imageConfigWithUser,
   seedEnvironment,
   type Harness,
+  type SeedOptions,
+  CLEARED_COMPOSE_LABELS,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 
@@ -156,7 +158,8 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', name, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
     // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
@@ -2512,7 +2515,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     for (const env of [override.containerEnv, override.remoteEnv]) {
       for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
     }
-    expect((override.runArgs as string[]).slice(-6)).toEqual(['--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    expect((override.runArgs as string[]).slice(-10)).toEqual(['--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('starts a current container as it is', async () => {
@@ -2521,6 +2525,18 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(false);
     expect(h.progress.details).not.toContain(Messages.containerRecreated);
+  });
+
+  it('does not take a single container with the label of the project from its image for a container of Compose (review round 2, D2-4)', async () => {
+    // An image that Compose built for the project of the environment gave the container its labels (no number of a
+    // container, which only Compose sets on the containers that it creates).
+    await seedEnvironment(h, {
+      container: 'stopped',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app' },
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.logger.infos.some((line) => line.includes('was created for a Docker Compose configuration'))).toBe(false);
   });
 
   it('says so when a build replaces an old container, and names only the newer image for an update', async () => {
@@ -2716,6 +2732,12 @@ describe('the Git version of a new container (concept section 9 "Git inside the 
 });
 
 describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () => {
+  // Review round 2 (S2-01): the Dockerfile that a configuration names must be readable (else it is refused as not
+  // supported); these configurations name `Dockerfile` next to the configuration.
+  beforeEach(() => {
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\n' };
+  });
+
   it.each<[string, 'on' | 'off']>([
     ['on', 'on'],
     ['off', 'off'],
@@ -2752,6 +2774,45 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.helper.builds).toEqual([]);
   });
 
+  it('checks the Dockerfile at the path that the resolved configuration names (review round 2, S2-01)', async () => {
+    // The text names the Dockerfile with a variable of the computer; the CLI resolves it (here to its default).
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
+    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
+    expect(h.helper.builds).toEqual([]);
+    // Its FROM images are the references of the image check too.
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM node:24\n' };
+    await h.service.open(TARGET, options());
+    expect(h.checker.calls.at(-1)?.images).toEqual(['node:24']);
+  });
+
+  it('refuses a configured Dockerfile that cannot be read (review round 2, S2-01)', async () => {
+    h.helper.config = { build: { dockerfile: 'missing.Dockerfile' } };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.unsupportedOptions('Dockerfile missing.Dockerfile (it could not be read, so its images cannot be checked)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses an image that Docker would find by the prefix of its ID, and allows an image named with hexadecimal characters (review round 2, S2-05)', async () => {
+    // `a1b2c3d4` is no name of a local image: Docker takes it for the prefix of the ID of devenv-7c1d2e3f:2.
+    h.docker.images.add('a1b2c3d4');
+    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+    h.helper.config = { image: 'a1b2c3d4' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('image a1b2c3d4 (an image ID; name the image)'));
+    // In the Dockerfile too.
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine\nCOPY --from=a1b2c3d4 /a /a\n' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('COPY --from image a1b2c3d4 (an image ID; name the image)'));
+    expect(h.helper.builds).toEqual([]);
+    // An image whose name is `a1b2c3d4`: Docker names it by that name.
+    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['a1b2c3d4:latest'], repoDigests: [] });
+    h.helper.config = { image: 'a1b2c3d4' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
   it('refuses the Compose network of another environment in runArgs, by its name and by its labels (S3)', async () => {
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
@@ -2759,6 +2820,59 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=backend'] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a network of another environment that runArgs name by its ID or a prefix of it (review round 2, S2-04)', async () => {
+    h.docker.networks.set('devenv-7c1d2e3f_default', {});
+    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    h.docker.networks.set('mine', {});
+    h.docker.networkIds.set('mine', `f00dcafe${'1'.repeat(56)}`);
+    for (const reference of ['f00dbabe', `f00dbabe${'0'.repeat(56)}`]) {
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', reference] };
+      expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(`network ${reference} of another environment`));
+    }
+    // By its containers: a network of the computer with a container of an environment of another account.
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    h.docker.networkContainers.set('mine', [other.id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=f00dcafe'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network f00dcafe of another environment'));
+    expect(h.helper.builds).toEqual([]);
+    // A prefix that two networks share names none (Docker refuses it too).
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=f00d'] };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows a network of the user with a container of another environment of the same owner (review round 2, P2-2)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    h.docker.networks.set('devnet', {});
+    h.docker.networkContainers.set('devnet', [h.docker.containersOf(OTHER_ID)[0].id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devnet'] };
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it.each<[string, SeedOptions | undefined]>([
+    ['another owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: OTHER_ACCOUNT }],
+    ['an entry without owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: null }],
+    ['no entry', undefined],
+  ])('refuses a network of the user with a container of an environment of %s (review round 2, P2-2)', async (_name, seed) => {
+    if (seed) await seedEnvironment(h, seed);
+    else h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-web-7c1d2e3f', state: 'running', image: 'x' });
+    h.docker.networks.set('devnet', {});
+    h.docker.networkContainers.set('devnet', [h.docker.containersOf(OTHER_ID)[0].id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devnet'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devnet of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses the Compose network of another environment of the same owner by its name and labels (review round 2, P2-2)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'backend'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
   });
 
   it('refuses a label of Docker Compose in runArgs (D3)', async () => {
@@ -2772,6 +2886,24 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${IMAGE_1}`));
     expect(h.helper.ups).toEqual([]);
+  });
+
+  it('opens an environment image with the labels of another Compose project, and sets them empty on the container (review round 2, D2-1)', async () => {
+    await seedEnvironment(h, { container: null });
+    // An image that Docker Compose built for the project `app` of the user, inherited through FROM.
+    h.docker.imageConfigs.set(IMAGE_1, {
+      User: '',
+      Labels: { 'com.docker.compose.project': 'app', 'com.docker.compose.service': 'web', 'devcontainer.metadata': '[]' },
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+    const runArgs = h.helper.ups[0].override.runArgs as string[];
+    expect(runArgs).toEqual(expect.arrayContaining([...CLEARED_COMPOSE_LABELS]));
+    // Docker gives the container the labels of runArgs after those of the image: `docker compose -p app down` does not
+    // find it.
+    const [container] = h.docker.containersOf(ENV_ID);
+    expect(container.labels['com.docker.compose.project']).toBe('');
+    expect(container.labels['com.docker.compose.service']).toBe('');
   });
 
   it('finds a container whose image gave it the label of a Compose service, and creates it again once the checks are on (D2)', async () => {
@@ -2835,7 +2967,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     }
     // What Docker gets passes the policy as a whole: the extension's --label and --name included.
     const given = h.helper.ups[0].override.runArgs as string[];
-    expect(runArgsProblems(given, NAME)).toEqual([]);
+    // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
+    expect(hostAccessProblems({ config: { runArgs: given }, ownVolume: NAME, overrideConfiguration: true })).toEqual([]);
     expect(given.slice(-4)).toEqual(['--name', NAME, '--hostname', 'api']);
     expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
   });
@@ -2860,14 +2993,16 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       return;
     }
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
     await seedEnvironment(h, { container: null });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {

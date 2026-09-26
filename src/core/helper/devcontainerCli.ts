@@ -8,6 +8,7 @@ import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
 import type { HostAccessChecks } from '../hostAccessChecks';
 import {
+  COMPOSE_CLEARED_LABELS,
   CONTAINER_VERSION_LABEL,
   containerHostname,
   HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
@@ -181,7 +182,8 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
 /**
  * Override configuration for `up` (implementation notes 8, concept 7.6): only image, workspaceMount, workspaceFolder,
  * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
- * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>` and
+ * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>`, the labels
+ * `com.docker.compose.project` and `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and
  * `--name <container name>`, and `--hostname <repository name>` (containerHostname) unless the runArgs decide the host
  * name themselves, runArgsDecideHostname), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
  * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
@@ -202,6 +204,8 @@ export function buildOverrideConfig(p: {
 }): Record<string, unknown> {
   const checksOn = p.hostAccessChecks !== 'off';
   const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
+  // Review round 2 (D2-1): the labels of Docker Compose empty, whatever the image inherited.
+  for (const label of COMPOSE_CLEARED_LABELS) labels.push('--label', label);
   const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);
   // Without it, Docker names the host after the container ID, and the shell prompt shows that ID.
   const hostname = runArgsDecideHostname(repositoryRunArgs) ? [] : ['--hostname', containerHostname(p.repositoryName)];

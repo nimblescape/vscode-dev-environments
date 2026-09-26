@@ -23,6 +23,14 @@ export const VOLUME_KIND_ADDITIONAL = 'additional';
  */
 export const VOLUME_KIND_COMPOSE = 'compose';
 /**
+ * Volume label (review round 2, D2-3), with the value SERVICE_DATA: a volume that the extension created before `up` for
+ * a service of Docker Compose other than the dev service (it holds the data of that service, for example of a
+ * database), whatever its devenv.volume. Delete lists such a volume in the question about the data of the services,
+ * none ticked, also after a lost registry (reconcileFromVolumes restores Environment.serviceVolumes from it).
+ */
+export const LABEL_SERVICE_DATA = 'devenv.service-data';
+export const SERVICE_DATA = 'true';
+/**
  * Container label of the containers of a Compose environment other than the dev container: the name of their service.
  * They carry devenv.environment-id too, so Stop, the Session Monitor, and Delete find them; the lookup of the dev
  * container skips them.
@@ -59,6 +67,19 @@ export const LABEL_HOST_ACCESS = 'devenv.host-access';
 export const HOST_ACCESS_UNRESTRICTED = 'unrestricted';
 /** `--label` value of the override configuration of a container created while the host access checks were off. */
 export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCESS_UNRESTRICTED}`;
+/**
+ * devenv.host-access of a container of Docker Compose that was created while the host access checks were on (review
+ * round 2, D2-2): the model sets the label on every service explicitly, so that a label of the image (for example of a
+ * side service that Compose builds during `up`) cannot decide it.
+ */
+export const HOST_ACCESS_CHECKED = 'checked';
+/**
+ * `--label` values of the override configuration of a single container (review round 2, D2-1): the labels by which Docker
+ * Compose finds the containers of a project, with empty values, so that labels that the image inherited (for example of
+ * an image that Compose built for another project) cannot make `docker compose -p <project> down` of the user remove the
+ * dev container.
+ */
+export const COMPOSE_CLEARED_LABELS: readonly string[] = ['com.docker.compose.project=', 'com.docker.compose.service='];
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';

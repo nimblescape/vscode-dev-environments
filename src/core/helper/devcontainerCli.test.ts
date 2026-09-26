@@ -196,7 +196,8 @@ describe('buildOverrideConfig', () => {
       image: 'devenv-3f2a9c1e:2',
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
-      runArgs: ['--label', 'devenv.container-version=4', '--name', 'devenv-acme-api-3f2a9c1e', '--hostname', 'api'],
+      // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
+      runArgs: ['--label', 'devenv.container-version=4', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service=', '--name', 'devenv-acme-api-3f2a9c1e', '--hostname', 'api'],
       containerEnv: containerEnvironment(),
       remoteEnv: remoteEnvironment(),
       customizations: { vscode: { settings: devContainersSettings() } },
@@ -266,6 +267,11 @@ describe('buildOverrideConfig', () => {
       '127.0.0.1:8080:80',
       '--label',
       'devenv.container-version=4',
+      // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
       '--name',
       'devenv-acme-api-3f2a9c1e',
     ]);
@@ -295,6 +301,11 @@ describe('buildOverrideConfig', () => {
       ...shifting,
       '--label',
       'devenv.container-version=4',
+      // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
       '--name',
       'devenv-acme-api-3f2a9c1e',
       '--hostname',

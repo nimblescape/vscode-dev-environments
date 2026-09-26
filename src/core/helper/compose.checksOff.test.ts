@@ -84,10 +84,14 @@ describe('composeUpModel with the host access checks off', () => {
     expect(off.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
     const built = composeBuildModel(model(), params({ hostAccessChecks: 'off' })).model;
     expect(built.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
+    // Review round 2 (D2-2): changed expectation, with the checks on every service gets devenv.host-access=checked (before:
+    // no label), so that a label of an image cannot decide it.
     for (const checks of [undefined, 'on'] as const) {
       const on = composeUpModel(model(), params({ hostAccessChecks: checks })).model;
-      expect(on.services.app.labels).not.toHaveProperty(LABEL_HOST_ACCESS);
-      expect(on.services.db.labels).not.toHaveProperty(LABEL_HOST_ACCESS);
+      expect(on.services.app.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });
+      expect(on.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });
+      const builtOn = composeBuildModel(model(), params({ hostAccessChecks: checks })).model;
+      expect(builtOn.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });
     }
   });
 

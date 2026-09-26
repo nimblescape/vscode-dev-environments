@@ -409,6 +409,9 @@ describe('open pipeline on a seeded environment', () => {
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
     expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
+    // Review round 2 (D2-1): Docker accepts the labels of Docker Compose with empty values, so an image cannot give the
+    // container the project of another Compose configuration.
+    expect(cli.container(containerName)?.Config.Labels).toMatchObject({ 'com.docker.compose.project': '', 'com.docker.compose.service': '' });
     const env = containerEnv();
     expect(env).toMatchObject({
       GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',

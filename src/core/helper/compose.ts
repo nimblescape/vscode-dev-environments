@@ -16,6 +16,7 @@ import { extractBaseImages } from '../imageCheck/dockerfile';
 import { hasDigest, isOciFeatureReference } from '../imageCheck/reference';
 import {
   CONTAINER_VERSION,
+  HOST_ACCESS_CHECKED,
   HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
@@ -608,7 +609,8 @@ export interface ComposeRewriteParams {
   /**
    * The switch of the host access checks of the repository (../hostAccessChecks.ts), as the check used it. `off`: the
    * published ports keep the address that the model gives them, the mounts that only the class `computer` refuses stay
-   * as they are, and every container gets the label devenv.host-access=unrestricted (containerIsCurrent). Default `on`.
+   * as they are, and every container gets the label devenv.host-access=unrestricted (containerIsCurrent); with the checks
+   * on, `checked`. Default `on`.
    */
   hostAccessChecks?: HostAccessChecks;
 }
@@ -694,8 +696,10 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     labels[LABEL_ENVIRONMENT_ID] = p.environmentId;
     if (isDev) labels[LABEL_CONTAINER_VERSION] = String(CONTAINER_VERSION);
     else labels[LABEL_COMPOSE_SERVICE] = name;
-    // Created while the host access checks were off: not current once they are on again (containerIsCurrent).
-    if (!checksOn) labels[LABEL_HOST_ACCESS] = HOST_ACCESS_UNRESTRICTED;
+    // Created while the host access checks were off: not current once they are on again (containerIsCurrent). Set on
+    // every service either way (review round 2, D2-2), so that a label of an image that Compose builds or pulls during
+    // `up` (not checked before) cannot make a container look unrestricted, or restricted.
+    labels[LABEL_HOST_ACCESS] = checksOn ? HOST_ACCESS_CHECKED : HOST_ACCESS_UNRESTRICTED;
     service.labels = labels;
     // Names: the dev container has the name of the environment; the others the default names of Compose (a fixed name
     // would collide between two environments of one repository).
@@ -790,8 +794,9 @@ function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
  *   it (serviceDecidesHostname);
  * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY) and the
  *   volumes of `mountVolumeSources`;
- * - with the host access checks off (`hostAccessChecks`): the label devenv.host-access=unrestricted on every service,
- *   the published ports as the model has them, and the mounts that only the class `computer` refuses unchanged;
+ * - the label devenv.host-access on every service: `checked`, or with the host access checks off (`hostAccessChecks`)
+ *   `unrestricted` (review round 2, D2-2); with the checks off also the published ports as the model has them, and the
+ *   mounts that only the class `computer` refuses unchanged;
  * - each text escaped (`$$`) when the output of `docker compose config` does not escape it.
  * `network_mode: service:<name>` stays as it is: the check allows only a service of the same model, which Compose
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check

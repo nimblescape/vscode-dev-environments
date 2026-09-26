@@ -437,15 +437,20 @@ export class WorkspaceHelper {
     }
   }
 
-  /** devcontainer.json and its Dockerfile (if any) from the volume. `undefined` if the configuration file does not exist. */
+  /**
+   * devcontainer.json and its Dockerfile (if any) from the volume. `undefined` if the configuration file does not exist.
+   * `dockerfile`: the Dockerfile that the configuration names after the Dev Container CLI resolved its variables (review
+   * round 2, S2-01), read in place of the one that the text names.
+   */
   async readConfigFiles(p: {
     volumeName: string;
     repository: string;
     configPath: string;
+    dockerfile?: string;
     signal?: AbortSignal;
   }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string } | undefined> {
     const folder = this.repositoryFolder(p.repository);
-    const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath)), {
+    const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
       docker: false,
       network: false,
       signal: p.signal,

@@ -14,9 +14,10 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { extractBaseImages } from '../imageCheck/dockerfile';
+import { extractImageReferences, type ImageReferenceKind } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
+  COMPOSE_CLEARED_LABELS,
   CONFIG_FOLDER,
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -81,16 +82,41 @@ export interface HostAccessInput {
   configFolder?: string;
   /** The folder of the repository in the workspace helper (for example `/workspaces/api`), for isHelperPath. */
   repositoryFolder?: string;
-  /** The Dockerfile of a single container (its FROM images: imageReferenceFinding). */
+  /**
+   * The Dockerfile of a single container, read at the path that the configuration names after the CLI resolved its
+   * variables (review round 2, S2-01): the images that it names (dockerfileImageFindings).
+   */
   dockerfileText?: string;
+  /**
+   * The Dockerfile that the configuration of a single container names, when it could not be read (review round 2,
+   * S2-01): refused as not supported, because the images that it names would escape the checks.
+   */
+  dockerfileUnreadable?: string;
+  /**
+   * `config` is the override configuration of `up` (the final check of its runArgs, review round 2, D2-1): its runArgs
+   * may carry the labels of Docker Compose with empty values that the override configuration adds (COMPOSE_CLEARED_LABELS).
+   * The runArgs of the repository configuration may not.
+   */
+  overrideConfiguration?: boolean;
 }
 
-/** What the check knows of an existing network (HostAccessInput.networks). */
+/**
+ * What the check knows of an existing network (HostAccessInput.networks), by the reference that the configuration writes
+ * (its name, its ID, or a unique prefix of its ID, as Docker resolves it; review round 2, S2-04).
+ */
 export interface NetworkState {
+  /** The name of the network that the reference resolves to; the rules on names apply to it too. */
+  name?: string;
   /** The labels of the network (`docker network inspect`). */
   labels: Readonly<Record<string, string>>;
   /** The label devenv.environment-id of each container attached to the network that has it. */
   environments: readonly string[];
+  /**
+   * Of `environments`, those of registry entries of the owner of the checked environment (review round 2, P2-2): the
+   * environments of one account may share a network of their own (as they share additional volumes). An environment
+   * of another owner, of an entry without owner, or without an entry stays another environment's.
+   */
+  sameOwnerEnvironments?: readonly string[];
 }
 
 /**
@@ -418,9 +444,12 @@ function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[
   for (const source of [input.config, input.merged]) {
     if (!source) continue;
     if (Array.isArray(source.runArgs)) {
-      add(runArgsFindings(source.runArgs, volumes));
+      // The labels of Docker Compose with empty values: only those that the override configuration adds (D2-1), which the
+      // merged configuration of an existing container holds too.
+      const cleared = source === input.merged || input.overrideConfiguration === true;
+      add(runArgsFindings(source.runArgs, volumes, cleared));
       // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
-      add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes));
+      add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared));
     }
     if (source.appPort !== undefined) add(appPortProblems(source.appPort));
     const build = isRecord(source.build) ? source.build : undefined;
@@ -466,12 +495,84 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
       for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
     }
     const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
-    for (const image of extractBaseImages(input.dockerfileText, args, { target })) {
-      const finding = imageReferenceFinding(image, 'FROM image');
-      if (finding) problems.push(finding);
-    }
+    problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
+  } else if (input.dockerfileUnreadable !== undefined) {
+    problems.push(unsupported(`Dockerfile ${input.dockerfileUnreadable} (it could not be read, so its images cannot be checked)`));
   }
   return problems;
+}
+
+/** An image reference of a configuration, and how an item names it (for example `FROM image`). */
+export interface NamedImageReference {
+  reference: string;
+  what: string;
+}
+
+/**
+ * The image references that a Dockerfile names without a variable that is not resolved (extractImageReferences), for
+ * the question whether Docker takes one of them for an image ID (resolvedByImageId, review round 2, S2-05).
+ */
+export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, target?: string): NamedImageReference[] {
+  return extractImageReferences(text, { ...args }, target !== undefined ? { target } : {})
+    .filter(({ reference }) => !reference.includes('$'))
+    .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
+}
+
+/**
+ * The image references of a single container (review round 2, S2-05): `image`, the images of its Dockerfile
+ * (dockerfileImageReferences, with `build.args` and `build.target`), and the images of `--build-context` of
+ * `build.options`.
+ */
+export function singleImageReferences(config: Readonly<Record<string, unknown>>, dockerfileText: string | undefined): NamedImageReference[] {
+  const references: NamedImageReference[] = [];
+  if (typeof config.image === 'string' && config.image.trim() !== '') references.push({ reference: config.image.trim(), what: 'image' });
+  const build = isRecord(config.build) ? config.build : {};
+  if (dockerfileText !== undefined) {
+    const args: Record<string, string> = {};
+    if (isRecord(build.args)) for (const [name, value] of Object.entries(build.args)) if (typeof value === 'string') args[name] = value;
+    const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+    references.push(...dockerfileImageReferences(dockerfileText, args, target));
+  }
+  if (Array.isArray(build.options)) {
+    for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
+      if (flag.name !== '--build-context' || flag.value === undefined) continue;
+      const image = /^docker-image:\/\/(.*)$/i.exec(flag.value.slice(flag.value.indexOf('=') + 1).trim());
+      if (image) references.push({ reference: image[1].trim(), what: 'build option --build-context image' });
+    }
+  }
+  return references;
+}
+
+/** How an item names an image of a Dockerfile, by where the Dockerfile names it. */
+const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
+  FROM: 'FROM image',
+  'COPY --from': 'COPY --from image',
+  'RUN --mount from': 'RUN --mount image',
+  syntax: 'syntax image',
+};
+
+/**
+ * The images that a Dockerfile names (extractImageReferences: FROM, `COPY --from`, `RUN --mount=…,from=`, and the
+ * directive `# syntax=`) that a configuration may not use (imageReferenceFinding, D-17, review round 2, S2-02). A
+ * reference whose variable could not be resolved is refused when the text before its first `$` already names an image of
+ * the namespace of Dev Environments (for example `devenv-$SUFFIX`); any other one cannot be told apart and is left.
+ */
+export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, target?: string): HostAccessFinding[] {
+  const findings: HostAccessFinding[] = [];
+  for (const { reference, kind } of extractImageReferences(text, { ...args }, target !== undefined ? { target } : {})) {
+    const what = DOCKERFILE_IMAGE_WHAT[kind];
+    const dollar = reference.indexOf('$');
+    if (dollar < 0) {
+      const finding = imageReferenceFinding(reference, what);
+      if (finding) findings.push(finding);
+      continue;
+    }
+    const prefix = reference.slice(0, dollar).trim();
+    if (prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) {
+      findings.push({ item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' });
+    }
+  }
+  return findings;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -497,8 +598,12 @@ export function isHelperPath(file: string, repositoryFolder: string): boolean {
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }
 
-/** An image ID in place of a name: `sha256:<hex>`, or 64 or 12 hexadecimal characters alone. */
-const IMAGE_ID = /^(sha256:[0-9a-f]{1,64}|[0-9a-f]{64}|[0-9a-f]{12})$/i;
+/**
+ * An image ID in place of a name by its form alone: `sha256:<hex>`, or 64 hexadecimal characters. A shorter prefix of an
+ * ID looks like a name (for example `a1b2c3d4`, which may also be the name of an image): the pipeline asks Docker which
+ * image such a reference names (resolvedByImageId, review round 2, S2-05).
+ */
+const IMAGE_ID = /^(sha256:[0-9a-f]{1,64}|[0-9a-f]{64})$/i;
 
 /**
  * The repository of an image reference as Docker names it locally: Docker Hub's names without the registry and
@@ -526,14 +631,54 @@ export function localImageRepository(reference: string): string {
  */
 export function imageReferenceFinding(reference: string, what = 'image'): HostAccessFinding | undefined {
   const text = reference.trim();
-  if (IMAGE_ID.test(text)) return { item: `${what} ${text} (an image ID; name the image)`, class: 'unsupported' };
+  if (IMAGE_ID.test(text)) return { item: imageIdItem(text, what), class: 'unsupported' };
   if (/^devenv-/.test(localImageRepository(text))) return { item: `${what} ${text} of another environment`, class: 'protected' };
   return undefined;
+}
+
+/**
+ * Whether Docker took `reference` for the ID (or a prefix of the ID) of the image that it inspected, not for its name
+ * (review round 2, S2-05): neither the tags nor the digests of the image (`RepoTags`, `RepoDigests` of
+ * `docker image inspect`) name it. Compared normalized (parseImageReference: `postgres` is
+ * `docker.io/library/postgres:latest`); a reference with a digest by its digest. `false` for a reference that is no
+ * image name (it cannot be compared).
+ */
+export function resolvedByImageId(reference: string, repoTags: readonly string[], repoDigests: readonly string[]): boolean {
+  const parsed = parseImageReference(reference);
+  if (!parsed) return false;
+  const repository = `${parsed.registry}/${parsed.repository}`;
+  const matches = (other: string, byDigest: boolean): boolean => {
+    const name = parseImageReference(other);
+    if (!name || `${name.registry}/${name.repository}` !== repository) return false;
+    return byDigest ? name.digest === parsed.digest : name.tag === parsed.tag;
+  };
+  return parsed.digest !== undefined ? !repoDigests.some((other) => matches(other, true)) : !repoTags.some((other) => matches(other, false));
+}
+
+/** The item of an image reference that Docker resolved by the ID of the image (resolvedByImageId): not supported. */
+export function imageIdItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (an image ID; name the image)`;
 }
 
 /** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
 export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
   return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);
+}
+
+/**
+ * The network that a reference of a configuration names, of the networks that `docker network inspect <references>`
+ * printed (review round 2, S2-04), as Docker resolves it: its full ID, else its name, else a unique prefix of its ID.
+ * `undefined` when none matches (or the prefix is not unique).
+ */
+export function resolveNetworkReference<T extends { name: string; id: string }>(reference: string, networks: readonly T[]): T | undefined {
+  const text = reference.trim();
+  if (text === '') return undefined;
+  const byId = networks.find((network) => network.id !== '' && network.id === text);
+  if (byId) return byId;
+  const byName = networks.find((network) => network.name === text);
+  if (byName) return byName;
+  const byPrefix = networks.filter((network) => network.id !== '' && network.id.startsWith(text));
+  return new Set(byPrefix.map((network) => network.id)).size === 1 ? byPrefix[0] : undefined;
 }
 
 /** Label that Docker Compose gives each container, network, and volume of a project. */
@@ -543,17 +688,23 @@ export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
  * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass
  * `protected`): named like the Compose project of another environment (isOtherEnvironmentProjectName), labelled by
  * Docker Compose for the project of another environment (`devenv-<8 hex>`), or with a container of another environment
- * attached (label devenv.environment-id). `environmentId`: the environment that is checked (its own project and
- * containers); without it, every such network counts as another environment's. `undefined` for any other network.
+ * attached (label devenv.environment-id) that is not an environment of the same owner (NetworkState.sameOwnerEnvironments,
+ * review round 2, P2-2). The name rules apply to the written reference and to the name of the network that it resolves
+ * to (NetworkState.name). `environmentId`: the environment that is checked (its own project and containers); without it,
+ * every such network counts as another environment's. `undefined` for any other network.
  */
 export function foreignNetworkItem(name: string, state: NetworkState | undefined, environmentId: string | undefined): string | undefined {
   const project = environmentId === undefined ? '' : composeProjectName(environmentId);
   const item = `network ${name} of another environment`;
   if (isOtherEnvironmentProjectName(name, project)) return item;
   if (!state) return undefined;
+  // The network that the reference names (for example by its ID): its own name counts too (S2-04).
+  if (state.name !== undefined && isOtherEnvironmentProjectName(state.name, project)) return item;
   const owner = state.labels[COMPOSE_PROJECT_LABEL];
   if (owner !== undefined && /^devenv-[0-9a-f]{8}$/i.test(owner) && owner !== project) return item;
-  if (state.environments.some((id) => id !== environmentId)) return item;
+  // A container of another environment: only of the same owner may share the network (P2-2).
+  const sameOwner = state.sameOwnerEnvironments ?? [];
+  if (state.environments.some((id) => id !== environmentId && !sameOwner.includes(id))) return item;
   return undefined;
 }
 
@@ -563,21 +714,17 @@ export function foreignNetworkItem(name: string, state: NetworkState | undefined
  * except `devcontainer.metadata`, the only label that the Dev Container CLI puts on the images that it builds (CLI
  * 0.89.0: `var EI="devcontainer.metadata"`; `devcontainer.local_folder` and `devcontainer.config_file` are labels of
  * containers). For example `LABEL devenv.compose-service=x` in a Dockerfile would hide the container from the lookups
- * of the extension. Of the labels of Docker Compose, only `com.docker.compose.project` with another value than
- * `ownProject` (the Compose project of the environment) is refused: Compose puts `com.docker.compose.project`,
- * `.service`, and `.version` on each image that it builds for the project, and a container of the environment with
- * the label of another project could be removed by the Delete of that project. Refused whatever the switch says
- * (HostAccessClass `protected`).
+ * of the extension. Refused whatever the switch says (HostAccessClass `protected`).
+ * The labels of Docker Compose (`com.docker.compose.…`) are not refused (review round 2, D2-1): Compose puts them on
+ * each image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
+ * containers that it creates; the override configuration of a single container sets them empty (COMPOSE_CLEARED_LABELS),
+ * so that such an image does not make `docker compose -p <project> down` remove the dev container.
  */
-export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>, ownProject?: string): string[] {
-  return Object.entries(labels)
-    .filter(([rawKey, value]) => {
-      const key = rawKey.trim();
-      if (key === 'devcontainer.metadata') return false;
-      if (RESERVED_LABEL.test(key)) return true;
-      return key.toLowerCase() === COMPOSE_PROJECT_LABEL && String(value).trim() !== ownProject;
-    })
-    .map(([key]) => `label ${key.trim()} of the image ${image}`);
+export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
+  return Object.keys(labels)
+    .map((key) => key.trim())
+    .filter((key) => key !== 'devcontainer.metadata' && RESERVED_LABEL.test(key))
+    .map((key) => `label ${key} of the image ${image}`);
 }
 
 /** The repository configuration, the merged configuration, and the entries of the image metadata that are objects. */
@@ -1408,7 +1555,11 @@ export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, 
   return uniqueItems(runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
 }
 
-function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext): Problem[] {
+/**
+ * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
+ * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there.
+ */
+function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
   const problems: Problem[] = [];
   for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     const rule = flag.rule;
@@ -1416,6 +1567,8 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext): P
     const last = flag.index === runArgs.length - 1 && flag.value === undefined;
     if (last && rule !== undefined && (rule.kind === 'allow' || rule.kind === 'check') && takesValue(rule)) {
       problems.push(unsupported(`${flag.raw} without a value`));
+    } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && COMPOSE_CLEARED_LABELS.includes(flag.value)) {
+      continue;
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
     } else if (flag.name === '--mount') {
@@ -1445,7 +1598,10 @@ function buildOptionFindings(options: readonly unknown[]): Problem[] {
 
 /**
  * `--build-context name=value`: an image or a URL is allowed, a folder of the computer is not; the image of another
- * environment or an image ID stays refused (imageReferenceFinding).
+ * environment or an image ID stays refused (imageReferenceFinding). The build client reads a folder (also of
+ * `oci-layout://`) in the workspace helper (review round 2, S2-03): a path of the workspace helper (isHelperPath; the
+ * workspace volume holds only the repository besides the folder with the token) or a relative path (resolved against
+ * the working folder of the build in the helper, which the check does not know) stays refused whatever the switch says.
  */
 function buildContextProblems(value: string): Problem[] {
   const index = value.indexOf('=');
@@ -1456,7 +1612,31 @@ function buildContextProblems(value: string): Problem[] {
     return finding ? [finding] : [];
   }
   if (/^https?:\/\//i.test(source)) return [];
-  return [access(`build option --build-context=${value}`)];
+  const item = `build option --build-context=${value}`;
+  const folder = localContextPath(source);
+  if (folder === undefined) return [access(item)];
+  if (!folder.startsWith('/')) return [guarded(item)];
+  if (isHelperPath(folder, WORKSPACES_ROOT)) return [guarded(item)];
+  return [access(item)];
+}
+
+/**
+ * The folder of a local build context (`--build-context`, `additional_contexts`): the path itself, or the path of an
+ * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` for other kinds of source (for example `service:…` of
+ * Docker Compose, or another scheme).
+ */
+export function localContextPath(source: string): string | undefined {
+  const text = source.trim();
+  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
+  if (oci) {
+    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
+    const last = folder.lastIndexOf('/');
+    const colon = folder.indexOf(':', last + 1);
+    if (colon >= 0) folder = folder.slice(0, colon);
+    return folder;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text)) return undefined;
+  return text;
 }
 
 /**

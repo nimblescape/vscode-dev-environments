@@ -487,9 +487,16 @@ describe('Docker Compose rules (unit 6)', () => {
   });
 
   it('isComposeContainer: only a container of the project of the environment', () => {
-    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e' }, 'devenv-3f2a9c1e')).toBe(true);
-    expect(isComposeContainer({ 'com.docker.compose.project': 'api_devcontainer' }, 'devenv-3f2a9c1e')).toBe(false);
+    // Review round 2 (D2-4): changed input, a container of Compose also has a label that only containers have.
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.config-hash': 'x' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'api_devcontainer', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(false);
     expect(isComposeContainer({}, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('isComposeContainer: not by the labels that an image of the project gave a single container (review round 2, D2-4)', () => {
+    const fromImage = { 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(isComposeContainer(fromImage, 'devenv-3f2a9c1e')).toBe(false);
   });
 
   it('composeContainerOrder: the services start first and stop last', () => {

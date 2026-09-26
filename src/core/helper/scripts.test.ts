@@ -414,6 +414,37 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     return JSON.parse(lines[0]);
   }
 
+  it('prints the real paths of additional contexts, SSH keys, and the files of build secrets (review round 2, S2-03)', () => {
+    const { dir, repo, env } = setup();
+    fs.mkdirSync(path.join(repo, 'layout'));
+    fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'ctx-link'));
+    write(path.join(repo, 'key'), 'key');
+    const model = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        tool: {
+          build: {
+            context: repo,
+            dockerfile_inline: 'FROM alpine',
+            additional_contexts: { a: `${repo}/ctx-link`, b: `oci-layout://${repo}/layout:1`, c: 'docker-image://alpine', d: 'https://example.com/x.git' },
+            ssh: [`deploy=${repo}/key`, 'default'],
+            secrets: [{ source: 'npm', target: 'npm' }, 'env-only'],
+          },
+        },
+      },
+      secrets: { npm: { file: `${repo}/secret-link` }, 'env-only': { environment: 'X' } },
+    };
+    fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, 'secret-link'));
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as { realPaths: Record<string, string | null> };
+    expect(output.realPaths).toMatchObject({
+      [`${repo}/ctx-link`]: fs.realpathSync(path.join(dir, 'outside')),
+      [`${repo}/layout`]: fs.realpathSync(path.join(repo, 'layout')),
+      [`${repo}/key`]: fs.realpathSync(path.join(repo, 'key')),
+      [`${repo}/secret-link`]: fs.realpathSync(path.join(dir, 'secret.txt')),
+    });
+    expect(Object.keys(output.realPaths).some((key) => key.includes('alpine') || key.includes('example.com'))).toBe(false);
+  });
+
   it('prints the model of all profiles, the Dockerfiles in the repository, and the real paths', () => {
     const { dir, repo, argsFile, env } = setup();
     const files = [path.join(repo, 'compose.yml'), path.join(repo, '.devcontainer', 'compose.yml')];
@@ -1083,6 +1114,24 @@ describe('READ_FILES_SCRIPT', () => {
     write(path.join(repo, 'b', 'devcontainer.json'), '{ "build": { "dockerfile": "${localEnv:X}/Dockerfile" } }');
     expect(read(repo, 'a/devcontainer.json')).toEqual({ configText: '{ "build": { "dockerfile": "../../secret" } }' });
     expect(read(repo, 'b/devcontainer.json')).not.toHaveProperty('dockerfilePath');
+  });
+
+  it('reads the Dockerfile that the resolved configuration names in place of the one of the text (review round 2, S2-01)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    write(path.join(root, 'secret'), 'secret');
+    write(path.join(repo, '.devcontainer', 'devcontainer.json'), '{ "build": { "dockerfile": "${localEnv:X:Dockerfile}" } }');
+    write(path.join(repo, '.devcontainer', 'Dockerfile'), 'FROM node:24\n');
+    const run = (dockerfile: string) => {
+      const result = runNode(readFilesCommand(repo, '.devcontainer/devcontainer.json', dockerfile));
+      expect(result.status).toBe(0);
+      return JSON.parse(result.stdout) as Record<string, unknown>;
+    };
+    expect(run('Dockerfile')).toMatchObject({ dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: 'FROM node:24\n' });
+    expect(run(`${repo}/.devcontainer/Dockerfile`)).toMatchObject({ dockerfileText: 'FROM node:24\n' });
+    // Still only in the repository.
+    expect(run('../../secret')).not.toHaveProperty('dockerfileText');
+    expect(readFilesCommand(repo, 'x', '')).toHaveLength(5);
   });
 
   it('fails for a configuration path outside of the repository', () => {

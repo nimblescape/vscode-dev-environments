@@ -101,7 +101,14 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['build --allow', input(build('--allow', 'security.insecure')), 'build option --allow', 'computer'],
   ['build --output', input(build('--output', 'type=local,dest=/Users/x')), 'build option --output', 'computer'],
   ['build -o', input(build('-o', '/Users/x')), 'build option -o', 'computer'],
-  ['build --build-context with a folder', input(build('--build-context', 'src=../other')), 'build option --build-context=src=../other', 'computer'],
+  // Review round 2 (S2-03 addendum): changed expectation, a relative folder is resolved in the workspace helper against a
+  // working folder that the check does not know: stays refused.
+  ['build --build-context with a folder', input(build('--build-context', 'src=../other')), 'build option --build-context=src=../other', 'protected'],
+  ['build --build-context with a folder of the computer', input(build('--build-context', 'src=/Users/x/other')), 'build option --build-context=src=/Users/x/other', 'computer'],
+  ['build --build-context with the cache volume of the helper', input(build('--build-context', 'src=/devenv-cache')), 'build option --build-context=src=/devenv-cache', 'protected'],
+  ['build --build-context with the folder of the token', input(build('--build-context', 'src=/workspaces/.devenv+')), 'build option --build-context=src=/workspaces/.devenv+', 'protected'],
+  ['build --build-context with an OCI layout in the cache volume', input(build('--build-context', 'src=oci-layout:///devenv-cache/x:1@sha256:' + 'a'.repeat(64))), `build option --build-context=src=oci-layout:///devenv-cache/x:1@sha256:${'a'.repeat(64)}`, 'protected'],
+  ['build --build-context with an OCI layout of the computer', input(build('--build-context', 'src=oci-layout:///Users/x/layout')), 'build option --build-context=src=oci-layout:///Users/x/layout', 'computer'],
 
   // Account separation.
   ['the workspace volume of another environment', input(mount('source=devenv-acme-web-11111111,target=/w,type=volume')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
@@ -242,9 +249,11 @@ describe('the override configuration with the checks off', () => {
   it('adds the label devenv.host-access=unrestricted and keeps appPort as the configuration writes it', () => {
     const common = { environmentImage: 'devenv-3f2a9c1e:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['-p', '80'] };
     const on = buildOverrideConfig({ ...common, appPort: [3000, '0.0.0.0:5000:5000'] as Array<number | string> });
-    expect(on.runArgs).toEqual(['-p', '127.0.0.1::80', '--label', CONTAINER_VERSION_LABEL, '--name', OWN, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
+    const cleared = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
+    expect(on.runArgs).toEqual(['-p', '127.0.0.1::80', '--label', CONTAINER_VERSION_LABEL, ...cleared, '--name', OWN, '--hostname', 'api']);
     const off = buildOverrideConfig({ ...common, appPort: [3000, '5000:5000'], hostAccessChecks: 'off' });
-    expect(off.runArgs).toEqual(['-p', '80', '--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL, '--name', OWN, '--hostname', 'api']);
+    expect(off.runArgs).toEqual(['-p', '80', '--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL, ...cleared, '--name', OWN, '--hostname', 'api']);
     expect(off.appPort).toEqual([3000, '5000:5000']);
     expect(buildOverrideConfig({ ...common, appPort: 3000, hostAccessChecks: 'off' }).appPort).toBe(3000);
     expect(buildOverrideConfig({ ...common, hostAccessChecks: 'off' })).not.toHaveProperty('appPort');

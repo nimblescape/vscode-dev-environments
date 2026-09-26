@@ -390,11 +390,13 @@ process.stdout.write(JSON.stringify(found) + '\n');
 `;
 
 /**
- * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it.
+ * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it, `argv[3]`
+ * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
+ * round 2, S2-01), in place of `build.dockerfile` of the text.
  * Prints one JSON line: `null` if the configuration file does not exist, otherwise
  * `{ configText, dockerfilePath?, dockerfileText? }`. `build.dockerfile` (or the old `dockerFile`) is resolved
  * relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
- * Paths outside of the repository folder are not read.
+ * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved.
  */
 export const READ_FILES_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -470,7 +472,7 @@ const main = () => {
   }
   if (!config || typeof config !== 'object') return result;
   const build = config.build && typeof config.build === 'object' ? config.build : {};
-  const dockerfile = typeof build.dockerfile === 'string' ? build.dockerfile : config.dockerFile;
+  const dockerfile = process.argv[3] ? process.argv[3] : typeof build.dockerfile === 'string' ? build.dockerfile : config.dockerFile;
   if (typeof dockerfile !== 'string' || dockerfile === '' || dockerfile.includes('$' + '{')) return result;
   const dockerfileFile = path.posix.resolve(path.posix.dirname(configFile), dockerfile);
   if (!inside(dockerfileFile) || dockerfileFile === root) return result;
@@ -593,7 +595,8 @@ if (process.exitCode === undefined) {
  *   is in the repository folder, also after links, or when it is outside of it and no path of the workspace helper
  *   (isHelperPath of hostAccess.ts, the same paths here), also after links);
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
- *   build of the model (`null` when it does not exist);
+ *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
+ *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
  * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
  *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
  *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
@@ -633,6 +636,26 @@ const isHelperPath = (file) => {
   if (['/devenv-cache', '/workspaces/.devenv+'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
+// The folder of a local additional context (localContextPath of hostAccess.ts): the path, or the path of an OCI layout.
+const localFolder = (source) => {
+  const text = String(source).trim();
+  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
+  if (oci) {
+    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
+    const colon = folder.indexOf(':', folder.lastIndexOf('/') + 1);
+    return colon >= 0 ? folder.slice(0, colon) : folder;
+  }
+  return /^[a-z][a-z0-9+.-]*:/i.test(text) ? undefined : text;
+};
+// The key files of build.ssh: 'id=path[,path]', { id, path }, or a map.
+const sshFiles = (ssh) => {
+  const values = isObject(ssh) ? Object.values(ssh) : (Array.isArray(ssh) ? ssh : []).map((entry) => {
+    if (isObject(entry)) return entry.path;
+    const text = String(entry);
+    return text.includes('=') ? text.slice(text.indexOf('=') + 1) : undefined;
+  });
+  return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
+};
 const readDockerfile = (file) => {
   const real = realPath(file);
   if (real === null) return undefined;
@@ -669,6 +692,17 @@ const main = () => {
     if (isObject(build)) {
       const local = typeof build.context === 'string' && build.context.startsWith('/');
       if (local) realPaths[build.context] = realPath(build.context);
+      // Review round 2 (S2-03): the other files and folders that the build client reads in the helper.
+      for (const source of Object.values(isObject(build.additional_contexts) ? build.additional_contexts : {})) {
+        const folder = localFolder(source);
+        if (folder !== undefined && folder.startsWith('/')) realPaths[folder] = realPath(folder);
+      }
+      for (const file of sshFiles(build.ssh)) if (file.startsWith('/')) realPaths[file] = realPath(file);
+      for (const entry of Array.isArray(build.secrets) ? build.secrets : []) {
+        const secretName = typeof entry === 'string' ? entry : isObject(entry) ? entry.source : undefined;
+        const secret = isObject(model.secrets) && typeof secretName === 'string' ? model.secrets[secretName] : undefined;
+        if (isObject(secret) && typeof secret.file === 'string' && secret.file.startsWith('/')) realPaths[secret.file] = realPath(secret.file);
+      }
       if (typeof build.dockerfile_inline === 'string') {
         dockerfiles[name] = build.dockerfile_inline;
       } else if (local) {
@@ -747,8 +781,9 @@ export function listConfigsCommand(repoFolder: string): string[] {
   return ['node', '-e', LIST_CONFIGS_SCRIPT, repoFolder];
 }
 
-export function readFilesCommand(repoFolder: string, configPath: string): string[] {
-  return ['node', '-e', READ_FILES_SCRIPT, repoFolder, configPath];
+/** `dockerfile`: the Dockerfile that the resolved configuration names (READ_FILES_SCRIPT, `argv[3]`). */
+export function readFilesCommand(repoFolder: string, configPath: string, dockerfile?: string): string[] {
+  return ['node', '-e', READ_FILES_SCRIPT, repoFolder, configPath, ...(dockerfile !== undefined && dockerfile !== '' ? [dockerfile] : [])];
 }
 
 /** `sh -c` command for `devcontainer up`: the override configuration is expected on stdin. */

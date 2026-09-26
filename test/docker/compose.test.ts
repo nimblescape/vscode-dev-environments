@@ -285,6 +285,15 @@ ${extra}volumes:
     for (const binding of ports) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
     expect(details?.Mounts.find((mount) => mount.Destination === '/data')).toMatchObject({ Type: 'volume', Name: `${app.project}_dbdata` });
     expect(cli.volume(`${app.project}_dbdata`)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // Review round 2 (D2-3): the data volume of db carries the label of the data of a service; the cache of the dev
+    // service does not.
+    expect(cli.volume(`${app.project}_dbdata`)?.Labels?.['devenv.service-data']).toBe('true');
+    expect(cli.volume(`${app.project}_cache`)?.Labels?.['devenv.service-data']).toBeUndefined();
+    // Review round 2 (D2-2): every container gets devenv.host-access=checked from the model, whatever its image says.
+    expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
+    expect(details?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
+    // Review round 2 (D2-4): Compose puts labels on its containers that images never have (isComposeContainer).
+    expect(dev?.Config.Labels?.['com.docker.compose.container-number']).toBeDefined();
 
     // Repository files from the workspace volume (volume.subpath): a folder and a single file, read-only.
     expect(details?.Mounts.find((mount) => mount.Destination === '/init/seed')).toMatchObject({ Type: 'volume', Name: app.name });

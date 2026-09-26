@@ -66,6 +66,11 @@ export const OTHER_ACCOUNT: GitHubAccount = { id: '2002', login: 'someone' };
 export const WINDOW_ID = 'window-1';
 export const PID = 4242;
 export const T0 = Date.parse('2026-09-24T15:40:00.000Z');
+/**
+ * The labels of Docker Compose with empty values that the override configuration of a single container adds after its
+ * own labels (review round 2, D2-1): the expectations of the runArgs name them.
+ */
+export const CLEARED_COMPOSE_LABELS: readonly string[] = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
 
 export const DEFAULT_CONFIG_TEXT = `{
   // test configuration
@@ -134,11 +139,26 @@ export class FakeDocker implements EnvironmentDocker {
   /** The names of each `docker network inspect` (inspectNetworks). */
   readonly networkInspections: string[][] = [];
 
+  /** The ID of each network of `networks` by name. Default: `<name>-id` (hexadecimal enough for a test). */
+  readonly networkIds = new Map<string, string>();
+
+  networkId(name: string): string {
+    return this.networkIds.get(name) ?? `${name}-id`;
+  }
+
+  /** Like `docker network inspect`: each reference by its full ID, its name, or a unique prefix of its ID. */
   async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
     this.networkInspections.push([...names]);
-    return [...new Set(names)]
-      .filter((name) => this.networks.has(name))
-      .map((name) => ({ name, labels: { ...this.networks.get(name) }, containers: [...(this.networkContainers.get(name) ?? [])] }));
+    const found = new Map<string, NetworkInfo>();
+    for (const reference of new Set(names)) {
+      const all = [...this.networks.keys()];
+      const byId = all.find((name) => this.networkId(name) === reference);
+      const prefixed = all.filter((name) => this.networkId(name).startsWith(reference));
+      const name = byId ?? (this.networks.has(reference) ? reference : prefixed.length === 1 ? prefixed[0] : undefined);
+      if (name === undefined) continue;
+      found.set(name, { name, id: this.networkId(name), labels: { ...this.networks.get(name) }, containers: [...(this.networkContainers.get(name) ?? [])] });
+    }
+    return [...found.values()];
   }
 
   async removeNetwork(name: string): Promise<void> {
@@ -253,6 +273,14 @@ export class FakeDocker implements EnvironmentDocker {
   async inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]> {
     this.volumeInspections.push([...names]);
     return [...new Set(names)].filter((name) => this.volumes.has(name)).map((name) => ({ name, labels: { ...this.volumes.get(name) } }));
+  }
+
+  /** The tags and digests of an image (imageNames), where they differ from the reference itself (an ID prefix). */
+  readonly imageRepoNames = new Map<string, { repoTags: string[]; repoDigests: string[] }>();
+
+  async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
+    if (!this.images.has(reference)) return undefined;
+    return this.imageRepoNames.get(reference) ?? (reference.includes('@') ? { repoTags: [], repoDigests: [reference] } : { repoTags: [reference], repoDigests: [] });
   }
 
   async imageExists(reference: string): Promise<boolean> {
@@ -452,10 +480,36 @@ export class FakeHelper implements EnvironmentHelper {
     if (this.cloneError) throw this.cloneError;
   }
 
-  async readConfigFiles(p: { volumeName: string; configPath: string }): Promise<FakeFiles | undefined> {
+  /**
+   * Dockerfiles of the repository by their path relative to it, for a readConfigFiles with `dockerfile` (the path that
+   * the resolved configuration names, review round 2, S2-01). Default: the Dockerfiles of `files`.
+   */
+  dockerfiles: Record<string, string> | undefined;
+  /** Each `dockerfile` of readConfigFiles. */
+  readonly dockerfileReads: string[] = [];
+
+  async readConfigFiles(p: { volumeName: string; configPath: string; dockerfile?: string }): Promise<FakeFiles | undefined> {
     this.mount(p.volumeName);
     this.calls.push(`readConfigFiles ${p.configPath}`);
-    return Object.prototype.hasOwnProperty.call(this.files, p.configPath) ? { ...this.files[p.configPath] } : undefined;
+    if (!Object.prototype.hasOwnProperty.call(this.files, p.configPath)) return undefined;
+    const files = { ...this.files[p.configPath] };
+    if (p.dockerfile === undefined) return files;
+    // As READ_FILES_SCRIPT: the path against the folder of the configuration, only in the repository.
+    this.dockerfileReads.push(p.dockerfile);
+    const root = '/r';
+    const file = path.posix.resolve(root, path.posix.dirname(p.configPath), p.dockerfile);
+    const result: FakeFiles = { configText: files.configText };
+    if (!file.startsWith(`${root}/`)) return result;
+    result.dockerfilePath = path.posix.relative(root, file);
+    const known =
+      this.dockerfiles ??
+      Object.fromEntries(
+        Object.values(this.files)
+          .filter((entry) => entry.dockerfilePath !== undefined && entry.dockerfileText !== undefined)
+          .map((entry) => [entry.dockerfilePath as string, entry.dockerfileText as string]),
+      );
+    if (Object.prototype.hasOwnProperty.call(known, result.dockerfilePath)) result.dockerfileText = known[result.dockerfilePath];
+    return result;
   }
 
   async listConfigurations(p: { volumeName: string }): Promise<string[]> {
@@ -639,7 +693,16 @@ export class FakeHelper implements EnvironmentHelper {
         name: containerName,
         state: 'running',
         image: serviceImage,
-        labels: { ...(labels as Record<string, string>), 'com.docker.compose.project': project, 'com.docker.compose.service': name },
+        // Compose's labels of a container (the container number only on containers, not on images: isComposeContainer).
+        // Like `docker run`: the labels of the image, then those of the model.
+        labels: {
+          ...(this.docker.imageConfigs.get(serviceImage)?.Labels ?? {}),
+          ...(labels as Record<string, string>),
+          'com.docker.compose.project': project,
+          'com.docker.compose.service': name,
+          'com.docker.compose.container-number': '1',
+          'com.docker.compose.config-hash': 'hash',
+        },
       });
       if (volumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes });
       return created;

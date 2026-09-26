@@ -551,14 +551,15 @@ describe('volumes', () => {
         'Error response from daemon: network gone not found',
         1,
         inspectOutput([
-          { Name: 'backend', Labels: { 'com.docker.compose.project': 'devenv-11111111' }, Containers: { c1: { Name: 'x' }, c2: { Name: 'y' } } },
+          { Name: 'backend', Id: 'a1b2', Labels: { 'com.docker.compose.project': 'devenv-11111111' }, Containers: { c1: { Name: 'x' }, c2: { Name: 'y' } } },
           { Name: 'shared', Labels: null, Containers: {} },
         ]),
       ),
     );
+    // Review round 2 (S2-04): changed expectation, with the ID of each network (empty when Docker prints none).
     expect(await docker.inspectNetworks(['backend', 'shared', 'gone', 'backend'])).toEqual([
-      { name: 'backend', labels: { 'com.docker.compose.project': 'devenv-11111111' }, containers: ['c1', 'c2'] },
-      { name: 'shared', labels: {}, containers: [] },
+      { name: 'backend', id: 'a1b2', labels: { 'com.docker.compose.project': 'devenv-11111111' }, containers: ['c1', 'c2'] },
+      { name: 'shared', id: '', labels: {}, containers: [] },
     ]);
     expect(runner.calls.map((call) => call.args)).toEqual([['network', 'inspect', 'backend', 'shared', 'gone']]);
   });
@@ -698,6 +699,23 @@ describe('images', () => {
     expect(await docker.imageId('gone:1')).toBeUndefined();
     await expect(docker.imageId('odd:1')).rejects.toBeInstanceOf(CommandError);
     await expect(docker.imageId('other:1')).rejects.toBeInstanceOf(CommandError);
+  });
+
+  it('imageNames returns the tags and digests of an image, undefined for a missing image (review round 2, S2-05)', async () => {
+    const { docker, runner } = adapter((call) => {
+      const ref = call.args[call.args.length - 1];
+      if (ref === 'a1b2c3d4') return ok('{"repoTags":["postgres:16"],"repoDigests":["postgres@sha256:' + 'e'.repeat(64) + '"]}\n');
+      if (ref === 'dangling') return ok('{"repoTags":null,"repoDigests":[]}\n');
+      if (ref === 'gone') return fail('Error response from daemon: No such image: gone');
+      if (ref === 'odd') return ok('\n');
+      return fail('Cannot connect to the Docker daemon');
+    });
+    expect(await docker.imageNames('a1b2c3d4')).toEqual({ repoTags: ['postgres:16'], repoDigests: [`postgres@sha256:${'e'.repeat(64)}`] });
+    expect(runner.calls[0].args).toEqual(['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', 'a1b2c3d4']);
+    expect(await docker.imageNames('dangling')).toEqual({ repoTags: [], repoDigests: [] });
+    expect(await docker.imageNames('gone')).toBeUndefined();
+    await expect(docker.imageNames('odd')).rejects.toBeInstanceOf(CommandError);
+    await expect(docker.imageNames('other')).rejects.toBeInstanceOf(CommandError);
   });
 
   it('listImagesByLabel lists the images with the label, one entry per ID, dangling ones without tags', async () => {

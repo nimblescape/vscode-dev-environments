@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { extractBaseImages } from './dockerfile';
+import { extractBaseImages, extractImageReferences } from './dockerfile';
 
 describe('extractBaseImages', () => {
   it('returns the image of a single FROM', () => {
@@ -195,5 +195,65 @@ describe('extractBaseImages', () => {
   it('returns an empty list for an empty file or a FROM without image', () => {
     expect(extractBaseImages('')).toEqual([]);
     expect(extractBaseImages('FROM\nFROM --platform=linux/amd64\n')).toEqual([]);
+  });
+});
+
+describe('extractImageReferences (review round 2, S2-02)', () => {
+  const refs = (text: string, args?: Record<string, string>, target?: string) =>
+    extractImageReferences(text, args, target !== undefined ? { target } : {}).map((ref) => `${ref.kind} ${ref.reference}`);
+
+  it('names FROM, COPY --from, RUN --mount from, and the syntax directive', () => {
+    const text = [
+      '# syntax=docker/dockerfile:1.7',
+      'FROM alpine:3.22 AS base',
+      'COPY --from=devenv-11111111:2 /x /x',
+      'COPY --chown=1000 --from=ghcr.io/acme/tools:1 /t /t',
+      'RUN --mount=type=bind,from=devenv-22222222,source=/a,target=/a --mount=type=cache,target=/c true',
+      'RUN --mount type=cache,from=cache-image,target=/c true',
+      'ADD --chown=1 https://example.com/x /x',
+    ].join('\n');
+    expect(refs(text)).toEqual([
+      'syntax docker/dockerfile:1.7',
+      'FROM alpine:3.22',
+      'COPY --from devenv-11111111:2',
+      'COPY --from ghcr.io/acme/tools:1',
+      'RUN --mount from devenv-22222222',
+      'RUN --mount from cache-image',
+    ]);
+  });
+
+  it('leaves out stage names (of the whole file, any case), stage indexes, and scratch', () => {
+    const text = ['FROM scratch AS Empty', 'FROM alpine AS build', 'COPY --from=0 /a /a', 'COPY --from=BUILD /b /b', 'COPY --from=later /c /c', 'RUN --mount=from=empty,target=/e true', 'FROM debian AS later'].join('\n');
+    expect(refs(text)).toEqual(['FROM alpine', 'FROM debian']);
+  });
+
+  it('resolves the ARGs and ENVs of the stage and the build arguments, and keeps an unresolved variable with its $', () => {
+    const text = [
+      'ARG TAG=2',
+      'FROM alpine',
+      'ARG TAG',
+      'ARG SOURCE=devenv-11111111',
+      'ENV OTHER=devenv-33333333',
+      'COPY --from=${SOURCE}:${TAG} /a /a',
+      'COPY --from=$OTHER /b /b',
+      'COPY --from=devenv-$UNKNOWN /c /c',
+      'ARG TARGETARCH',
+      'RUN --mount=from=tools-$TARGETARCH,target=/t true',
+      'FROM devenv-${TARGETVARIANT}',
+    ].join('\n');
+    expect(refs(text)).toEqual([
+      'FROM alpine',
+      'COPY --from devenv-11111111:2',
+      'COPY --from devenv-33333333',
+      'COPY --from devenv-$UNKNOWN',
+      'RUN --mount from tools-$TARGETARCH',
+      'FROM devenv-${TARGETVARIANT}',
+    ]);
+    expect(refs(text, { SOURCE: 'devenv-44444444' })).toContain('COPY --from devenv-44444444:2');
+  });
+
+  it('stops after the target stage, as extractBaseImages', () => {
+    const text = ['FROM alpine AS one', 'COPY --from=devenv-1 /a /a', 'FROM debian AS two', 'COPY --from=devenv-2 /b /b'].join('\n');
+    expect(refs(text, undefined, 'one')).toEqual(['FROM alpine', 'COPY --from devenv-1']);
   });
 });

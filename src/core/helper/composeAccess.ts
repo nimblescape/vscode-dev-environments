@@ -12,7 +12,6 @@
 // setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { extractBaseImages } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
 import {
   composeNetworkNames,
@@ -32,15 +31,19 @@ import {
   RESERVED_LABEL,
   RESTART_POLICY,
   capabilityProblems,
+  dockerfileImageFindings,
+  dockerfileImageReferences,
   foreignNetworkItem,
   imageReferenceFinding,
   isHelperPath,
+  localContextPath,
   refusedVariableItem,
   securityOptionProblems,
   volumeNameFindings,
   type HostAccessClass,
   type HostAccessFinding,
   type HostAccessReport,
+  type NamedImageReference,
   type VolumeInput,
 } from './hostAccess';
 
@@ -472,7 +475,7 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
       problems.push(unsupported(`Dockerfile ${file} (it could not be read, so its images cannot be checked)`));
     }
   }
-  // The images that the build starts from (FROM of the Dockerfile or of `dockerfile_inline`).
+  // The images that the build uses (FROM and the others of the Dockerfile or of `dockerfile_inline`).
   const text = ctx.input.dockerfiles?.[ctx.name];
   if (text !== undefined && !remote) {
     const args: Record<string, string> = {};
@@ -482,7 +485,8 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
       }
     }
     const target = typeof value.target === 'string' && value.target !== '' ? value.target : undefined;
-    for (const image of extractBaseImages(text, args, { target })) problems.push(...imageProblems(image, 'FROM image'));
+    // Every image that the Dockerfile names: FROM, COPY --from, RUN --mount from, `# syntax` (review round 2, S2-02).
+    problems.push(...dockerfileImageFindings(text, args, target));
   }
   problems.push(...labelProblems(value.labels, 'build '));
   for (const [key, setting] of Object.entries(value)) {
@@ -490,6 +494,8 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
     if (['ssh', 'secrets', 'entitlements', 'privileged'].includes(key)) problems.push(access(`build ${key}`));
     else problems.push(unsupported(`build ${key}`));
   }
+  // Review round 2 (S2-03): the files of `ssh` and `secrets` are read by the build client in the workspace helper.
+  problems.push(...buildSshProblems(value.ssh, ctx), ...buildSecretProblems(value.secrets, ctx));
   for (const entry of listOf(value.cache_from)) {
     const text = String(entry).trim();
     if (text.includes('=') ? !/^type=registry(,|$)/.test(text) : text === '') problems.push(unsupported(`build cache_from ${text}`));
@@ -498,10 +504,62 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
     for (const [name, source] of Object.entries(value.additional_contexts)) {
       const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
       if (image) problems.push(...imageProblems(image[1], `build additional_contexts ${name} image`));
-      else if (!/^https?:\/\//i.test(String(source))) problems.push(access(`build additional_contexts ${name}=${String(source)}`));
+      else if (!/^https?:\/\//i.test(String(source))) {
+        const item = `build additional_contexts ${name}=${String(source)}`;
+        // Review round 2 (S2-03): a folder (also of `oci-layout://`) is read by the build client in the workspace helper.
+        const folder = localContextPath(String(source));
+        problems.push(access(item), ...(folder === undefined ? [] : helperInputProblems(item, folder, ctx)));
+      }
     }
   } else if (!isUnset(value.additional_contexts)) {
     problems.push(unsupported('build additional_contexts'));
+  }
+  return problems;
+}
+
+/**
+ * A file or folder that the build client reads in the workspace helper besides the context and the Dockerfile (review
+ * round 2, S2-03: a local additional context, the file of a build secret, an SSH key): refused whatever the switch says
+ * when it is a path of the workspace helper or leads there through a link (localPathProblems), or when it is relative
+ * (the folder that it is resolved against is not clear). Otherwise nothing: the rule of the setting itself decides (the
+ * class `computer`).
+ */
+function helperInputProblems(item: string, file: string, ctx: ServiceContext): Problem[] {
+  if (!file.startsWith('/')) return [guarded(`${item} (a relative path)`)];
+  return localPathProblems(item, file, ctx).filter((problem) => problem.class !== 'computer');
+}
+
+/**
+ * `build.ssh`: each key file (`id=<path>`, `{ id, path }`, or a map); `default` alone is the SSH agent (the rule of
+ * `ssh`).
+ */
+function buildSshProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  const entries: Array<[string, unknown]> = isRecord(value)
+    ? Object.entries(value)
+    : listOf(value).map((entry): [string, unknown] => {
+        if (isRecord(entry)) return [String(entry.id ?? ''), entry.path];
+        const text = String(entry);
+        const index = text.indexOf('=');
+        return index < 0 ? [text, undefined] : [text.slice(0, index), text.slice(index + 1)];
+      });
+  const problems: Problem[] = [];
+  for (const [id, paths] of entries) {
+    for (const file of String(paths ?? '').split(',').map((part) => part.trim()).filter((part) => part !== '')) {
+      problems.push(...helperInputProblems(`build ssh ${id}=${file}`, file, ctx));
+    }
+  }
+  return problems;
+}
+
+/** `build.secrets`: the `file` of each top-level secret that it names (a secret of `environment` is no file). */
+function buildSecretProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  const secrets = isRecord(ctx.input.model.secrets) ? ctx.input.model.secrets : {};
+  const problems: Problem[] = [];
+  for (const entry of listOf(value)) {
+    const name = typeof entry === 'string' ? entry : isRecord(entry) && typeof entry.source === 'string' ? entry.source : undefined;
+    if (name === undefined) continue;
+    const secret = secrets[name];
+    if (isRecord(secret) && typeof secret.file === 'string') problems.push(...helperInputProblems(`build secret ${name} file ${secret.file}`, secret.file, ctx));
   }
   return problems;
 }
@@ -689,6 +747,43 @@ function composeFindings(input: ComposeAccessInput): Problem[] {
     for (const problem of serviceProblems(service, ctx)) problems.push({ ...problem, item: `service ${name}: ${problem.item}` });
   }
   return findings(problems);
+}
+
+/**
+ * The image references of the merged model (review round 2, S2-05), for the question whether Docker takes one of them
+ * for an image ID (resolvedByImageId): the `image` of each service without a build, the images of the Dockerfile of each
+ * service with a local build (`dockerfiles`, with `build.args` and `build.target`), and the images of
+ * `additional_contexts`. Each named with its service, as composeAccessReport names its items.
+ */
+export function composeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
+  const references: NamedImageReference[] = [];
+  for (const [name, service] of Object.entries(isRecord(model.services) ? model.services : {})) {
+    if (!isRecord(service)) continue;
+    const at = `service ${name}: `;
+    const build = isRecord(service.build) ? service.build : undefined;
+    if (!build) {
+      if (typeof service.image === 'string' && service.image.trim() !== '') references.push({ reference: service.image.trim(), what: `${at}image` });
+      continue;
+    }
+    const text = dockerfiles[name];
+    if (text !== undefined) {
+      const args: Record<string, string> = {};
+      if (isRecord(build.args)) {
+        for (const [arg, setting] of Object.entries(build.args)) {
+          if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
+        }
+      }
+      const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+      for (const reference of dockerfileImageReferences(text, args, target)) references.push({ ...reference, what: `${at}${reference.what}` });
+    }
+    if (isRecord(build.additional_contexts)) {
+      for (const [key, source] of Object.entries(build.additional_contexts)) {
+        const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
+        if (image) references.push({ reference: image[1].trim(), what: `${at}build additional_contexts ${key} image` });
+      }
+    }
+  }
+  return references;
 }
 
 /**

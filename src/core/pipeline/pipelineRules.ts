@@ -434,10 +434,19 @@ export function composeConfigurationChange(
   return compose.version === current.version ? 'changed' : 'rebaseline';
 }
 
-/** A container that Docker Compose created for the project `project` (the dev container or another service). */
+/**
+ * A container that Docker Compose created for the project `project` (the dev container or another service): the label
+ * of the project together with a label that Compose puts only on containers, never on images (the number of the
+ * container, or the hash of its configuration). Review round 2 (D2-4): the label of the project alone can come from the
+ * image (a single container created from an image that Compose built for the project).
+ */
 export function isComposeContainer(labels: Readonly<Record<string, string>>, project: string): boolean {
-  return labels[COMPOSE_PROJECT_LABEL] === project;
+  return labels[COMPOSE_PROJECT_LABEL] === project && (labels[COMPOSE_CONTAINER_NUMBER_LABEL] !== undefined || labels[COMPOSE_CONFIG_HASH_LABEL] !== undefined);
 }
+
+/** Labels that Docker Compose puts on the containers that it creates (not on images): isComposeContainer. */
+export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-number';
+export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
 
 /**
  * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the

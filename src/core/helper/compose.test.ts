@@ -389,7 +389,8 @@ describe('composeUpModel', () => {
           command: ['sleep', 'infinity'],
           networks: { default: null },
           environment: { POSTGRES_HOST: 'db' },
-          labels: { 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION) },
+          // Review round 2 (D2-2): changed expectation, devenv.host-access set on every service.
+          labels: { 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION), 'devenv.host-access': 'checked' },
           volumes: [{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' }],
           // Package C of unit 6: the dev container is named after the repository, as a single container (containerHostname).
           hostname: 'api',
@@ -398,7 +399,7 @@ describe('composeUpModel', () => {
           image: 'postgres:16',
           pull_policy: 'missing',
           restart: 'unless-stopped',
-          labels: { 'devenv.environment-id': ID, 'devenv.compose-service': 'db' },
+          labels: { 'devenv.environment-id': ID, 'devenv.compose-service': 'db', 'devenv.host-access': 'checked' },
           ports: [{ mode: 'ingress', target: 5432, published: '5432', protocol: 'tcp', host_ip: '127.0.0.1' }],
           volumes: [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data', volume: {} }],
           networks: { default: null },
@@ -431,8 +432,9 @@ describe('composeUpModel', () => {
     model.services.app.labels = { team: 'a', 'devenv.environment-id': 'forged' };
     model.services.db.labels = ['tier=data', 'devenv.compose-service=app'];
     const result = up(model).model;
-    expect(result.services.app.labels).toEqual({ team: 'a', 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION) });
-    expect(result.services.db.labels).toEqual({ tier: 'data', 'devenv.environment-id': ID, 'devenv.compose-service': 'db' });
+    // Review round 2 (D2-2): changed expectation, devenv.host-access set on every service.
+    expect(result.services.app.labels).toEqual({ team: 'a', 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION), 'devenv.host-access': 'checked' });
+    expect(result.services.db.labels).toEqual({ tier: 'data', 'devenv.environment-id': ID, 'devenv.compose-service': 'db', 'devenv.host-access': 'checked' });
   });
 
   it('gives the dev container the name of the environment, and logs a different name of the repository', () => {

@@ -64,7 +64,9 @@ const FOLDER = '/workspaces/api';
 const DB_IMAGE = 'postgres:16';
 const DB_DIGEST = `sha256:${'d'.repeat(64)}`;
 const DB_DIGEST_NEW = `sha256:${'e'.repeat(64)}`;
-const COMPOSE_LABELS = { 'com.docker.compose.project': PROJECT };
+// Compose puts the project and, on containers only, the number of the container and the hash of its configuration
+// (review round 2, D2-4: isComposeContainer needs one of them).
+const COMPOSE_LABELS = { 'com.docker.compose.project': PROJECT, 'com.docker.compose.container-number': '1' };
 
 const CONFIG_TEXT = `{
   // A Docker Compose configuration like the templates "… & Postgres"
@@ -274,7 +276,8 @@ describe('first open of a Docker Compose configuration', () => {
 
     // The volumes are created before `up` with the labels of the environment: the project volume as service data.
     const labels = { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id };
-    expect(h.docker.volumes.get(`${PROJECT}_pgdata`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // Review round 2 (D2-3): changed expectation, the volume of the service db is labelled as its data.
+    expect(h.docker.volumes.get(`${PROJECT}_pgdata`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE, 'devenv.service-data': 'true' });
     // D-7 (package C of unit 6): the volume of a `mounts` entry is a volume of the project too (`<project>_cache`), so it
     // is `compose` (never shared with another environment), not `additional`.
     expect(h.docker.volumes.get(`${PROJECT}_cache`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
@@ -412,6 +415,24 @@ describe('first open of a Docker Compose configuration', () => {
     expect(h.helper.builds).toEqual([]);
   });
 
+  it('refuses a network of another environment that network_mode names by a prefix of its ID (review round 2, S2-04)', async () => {
+    useCompose(h, output((m) => (m.services.db.network_mode = 'f00dbabe')));
+    h.docker.networks.set('devenv-7c1d2e3f_default', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('service db: network f00dbabe of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('allows an external network with a container of another environment of the same owner (review round 2, P2-2)', async () => {
+    useCompose(h, output((m) => (m.networks = { ...m.networks, shared: { name: 'shared', external: true } })));
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    h.docker.networks.set('shared', {});
+    h.docker.networkContainers.set('shared', [h.docker.containersOf(OTHER_ID)[0].id]);
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
   it('refuses a local build whose Dockerfile links out of the repository, before any build (review round 1, S1)', async () => {
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
@@ -429,6 +450,22 @@ describe('first open of a Docker Compose configuration', () => {
     });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment'));
+  });
+
+  it('refuses the image of a side service that Docker would find by the prefix of its ID (review round 2, S2-05)', async () => {
+    useCompose(h, output((m) => (m.services.db.image = 'a1b2c3')));
+    h.docker.images.add('a1b2c3');
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.unsupportedOptions('service db: image a1b2c3 (an image ID; name the image)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('uses the image of a side service that Docker Compose built for another project (review round 2, D2-1)', async () => {
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'com.docker.compose.project': 'app', 'com.docker.compose.service': 'db' } });
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
   });
 
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
@@ -681,6 +718,22 @@ describe('existing Docker Compose environment', () => {
     expect(h.progress.details).toContain(Messages.containerComposeCreated);
   });
 
+  it('does not start the single container from its image when up of the new Compose configuration fails (review round 2, D2-4)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('now uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${single.name}`);
+    // No `up` of the other kind (a single container from the old image, or Compose from it).
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(h.docker.images.has(IMAGE_1)).toBe(true);
+  });
+
   it('starts the single container as it is on "Rebuild later" when the configuration became a Compose configuration (review round 1, P-1)', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     h.docker.images.add(DB_IMAGE);
@@ -790,11 +843,30 @@ describe('Docker Compose with the host access checks off for the repository', ()
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
     const m = upModel();
-    expect(m.services.app.labels).not.toHaveProperty(LABEL_HOST_ACCESS);
-    expect(m.services.db.labels).not.toHaveProperty(LABEL_HOST_ACCESS);
+    // Review round 2 (D2-2): changed expectation, `checked` on every service (before: no label).
+    expect(m.services.app.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });
+    expect(m.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });
     expect(m.services.db.ports).toEqual([expect.objectContaining({ host_ip: '127.0.0.1' })]);
-    expect(devContainer()?.labels[LABEL_HOST_ACCESS]).toBeUndefined();
+    expect(devContainer()?.labels[LABEL_HOST_ACCESS]).toBe('checked');
     expect(h.progress.details).toContain(Messages.containerHostAccessChecksOn);
+  });
+
+  it('does not take a side service for unrestricted when the image that Compose built has the label (review round 2, D2-2)', async () => {
+    useCompose(h, {
+      ...output((m) => (m.services.tool = { build: { context: FOLDER, dockerfile: 'tool.Dockerfile' } })),
+      dockerfiles: { tool: 'FROM alpine:3.22\nLABEL devenv.host-access=unrestricted\n' },
+      realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql`, [FOLDER]: FOLDER, [`${FOLDER}/tool.Dockerfile`]: `${FOLDER}/tool.Dockerfile` },
+    });
+    // The image that Compose builds during `up` (not checked before it): its label would reach the container.
+    h.docker.images.add(`${PROJECT}-tool`);
+    h.docker.imageConfigs.set(`${PROJECT}-tool`, { Labels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
+    await h.service.open(TARGET, options());
+    const tool = h.docker.containersOf(ENV_ID).find((c) => c.labels[LABEL_COMPOSE_SERVICE] === 'tool');
+    expect(tool?.labels[LABEL_HOST_ACCESS]).toBe('checked');
+    // The next open finds the containers current: nothing is created again.
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.progress.details).not.toContain(Messages.containerHostAccessChecksOn);
   });
 
   it('creates the containers again when only a side service has the label', async () => {
@@ -860,6 +932,8 @@ describe('Delete of a Docker Compose environment', () => {
     );
     await h.service.open(TARGET, options());
     expect(h.docker.volumes.get('myapp-db')?.[LABEL_VOLUME]).toBe(VOLUME_KIND_ADDITIONAL);
+    // Review round 2 (D2-3): and the label of the data of a service.
+    expect(h.docker.volumes.get('myapp-db')?.['devenv.service-data']).toBe('true');
     expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
@@ -958,13 +1032,29 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.helper.ups[0].override).toHaveProperty('runArgs');
     const containers = h.docker.containersOf(ENV_ID);
     expect(containers).toHaveLength(1);
-    expect(containers[0].labels['com.docker.compose.project']).toBeUndefined();
+    // Review round 2 (D2-1): changed expectation, the override configuration sets the label empty (before: not set).
+    expect(containers[0].labels['com.docker.compose.project']).toBe('');
+    expect(containers[0].labels['com.docker.compose.service']).toBe('');
     // The side service went before `up`, which finds the container by the ID label; the network after it.
     expect(h.docker.log.indexOf(`rm ${db}`)).toBeLessThan(h.docker.log.indexOf(`network rm ${PROJECT}_default`));
     expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(false);
     expect(h.progress.details).toContain(Messages.containerComposeReplaced);
     // The merged configuration of the container of Compose is not checked (the CLI could read another service).
     expect(h.logger.infos.some((line) => line.includes('was created for a Docker Compose configuration. Its merged configuration is not checked'))).toBe(true);
+  });
+
+  it('does not start the old image of Docker Compose as a single container when up fails (review round 2, D2-4)', async () => {
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('up failed') : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${db?.name} of the service db`);
+    // Before (D2-4): a single container from the image of the Compose dev service, which inherits the label of the
+    // project and was then taken for a container of Compose.
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 
   it('starts the containers of Docker Compose with docker start on "Rebuild later" (review round 1, P-1)', async () => {
@@ -999,6 +1089,38 @@ describe('a Docker Compose environment whose configuration became a single conta
 });
 
 describe('restore of a Docker Compose environment after a lost registry', () => {
+  /** The workspace volume of the environment and a volume of its own with `labels`, which no container mounts. */
+  function seedVolumes(volumes: Record<string, Record<string, string>>): void {
+    h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    for (const [name, labels] of Object.entries(volumes)) h.docker.volumes.set(name, labels);
+  }
+
+  it('restores the volumes of the services from their label, and asks about them at Delete (review round 2, D2-3)', async () => {
+    // A volume with `name:` of the model (label `additional`) that the database used; no container mounts it now.
+    seedVolumes({
+      'myapp-db': { ...volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'devenv.service-data': 'true' },
+      'shared-tools': volumeLabelsOf(VOLUME_KIND_ADDITIONAL),
+    });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db']);
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['shared-tools']);
+  });
+
+  it('asks about every volume of a restored entry whose volumes have no label of the data of a service (review round 2, D2-3)', async () => {
+    // Created by a version before the label: whether a service used it is not known.
+    seedVolumes({ 'myapp-db': volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'shared-tools': volumeLabelsOf(VOLUME_KIND_ADDITIONAL) });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
+    // Once the entry has a build record (its next open), the volumes are known by their use again.
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.buildRecord = { builtAt: '2026-09-24T15:40:00.000Z', environmentImage: IMAGE_1, buildNumber: 1, configPath: DEFAULT_CONFIG_PATH, configHash: HASH, images: {}, features: {} };
+    });
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
+  });
+
   it('restores the entry with the volumes of the project, finds both containers, and asks about the data at Delete', async () => {
     h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set(`${PROJECT}_pgdata`, volumeLabelsOf(VOLUME_KIND_COMPOSE));

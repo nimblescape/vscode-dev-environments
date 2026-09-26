@@ -47,6 +47,8 @@ export interface VolumeInfo {
 /** A network of `docker network inspect`. */
 export interface NetworkInfo {
   name: string;
+  /** The full ID of the network (review round 2, S2-04: a configuration may name a network by its ID or a prefix). */
+  id: string;
   labels: Record<string, string>;
   /** The IDs of the containers attached to it. */
   containers: string[];
@@ -225,7 +227,7 @@ function toVolumeInfo(value: unknown): VolumeInfo | undefined {
 function toNetworkInfo(value: unknown): NetworkInfo | undefined {
   if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
   const containers = isRecord(value.Containers) ? Object.keys(value.Containers) : [];
-  return { name: value.Name, labels: toLabels(value.Labels), containers };
+  return { name: value.Name, id: typeof value.Id === 'string' ? value.Id : '', labels: toLabels(value.Labels), containers };
 }
 
 /**
@@ -684,6 +686,24 @@ export class ContainerAdapter {
     const id = parseJsonOutput(result.stdout);
     if (typeof id !== 'string' || id === '') throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
     return id;
+  }
+
+  /**
+   * The names of the local image that `reference` names (`RepoTags` and `RepoDigests` of `docker image inspect`), or
+   * `undefined` if it does not exist (review round 2, S2-05: whether Docker took the reference for an image ID,
+   * resolvedByImageId). Throws CommandError for other errors.
+   */
+  async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
+    const args = ['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', reference];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) {
+      if (this.isMissing(result, 'image')) return undefined;
+      throw this.commandError(args, result);
+    }
+    const value = parseJsonOutput(result.stdout);
+    if (!isRecord(value)) throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
+    const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
+    return { repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) };
   }
 
   /**
