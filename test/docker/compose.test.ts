@@ -21,6 +21,7 @@ import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,
+  HOST_ACCESS_CHECKED,
   HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
   LABEL_ENVIRONMENT_ID,
@@ -378,11 +379,13 @@ ${extra}volumes:
     expect(ports.length).toBeGreaterThan(0);
     expect(ports.some((binding) => !binding.startsWith('127.0.0.1:'))).toBe(true);
 
-    // With the checks on again, the next open creates the containers again without the label, the port on 127.0.0.1.
+    // With the checks on again, the next open creates the containers again with devenv.host-access=checked (review
+    // round 2, D2-2: the model sets the label on every service, so an image label cannot claim "unrestricted"), the
+    // port on 127.0.0.1.
     await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
-    expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBeUndefined();
+    expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
     const again = dbContainer(unrestricted);
-    expect(cli.container(again)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBeUndefined();
+    expect(cli.container(again)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
     for (const binding of cli.lines(['port', again, '5432/tcp'])) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
 
     await service.delete(unrestricted.id, {
