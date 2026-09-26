@@ -28,6 +28,7 @@ Git on your computer is not needed.
    - **Start in New Window** (context menu of a repository, and **⋯**): the same, but a new window connects. The current window keeps its environment. If another window has the environment open already, that window comes to the front; an environment is never open in two windows.
    - **Stop**: stops the container at once. Your files are kept.
    - **Delete**: removes the container and the volume with the repository, after you confirm it. If the volume has uncommitted changes, unpushed commits, or stashes, the confirmation shows them.
+   - **Keep Running When Closed** (context menu of a repository with an environment, and **⋯**): the environment keeps running when no window uses it, for example for a server or an AI agent that works on after you close the window or quit VS Code. The row then shows `Running · kept`. Only **Stop** or **Delete** stops it; after a **Stop** it is still kept. **Stop When Closed** switches back: the container stops again after the waiting time. The choice is stored with the environment and survives restarts. Both commands are also in the Command Palette, with a list of your environments.
    - **⋯**: Switch Branch…, Select Configuration… (only for repositories with several configurations), Rebuild, and Show on GitHub.
 4. To go to another environment, use **Dev Environments: Switch Environment…** (`Ctrl+Alt+E`, on macOS `Cmd+Alt+E`), or select the status bar item. The same window connects to the other environment. **Dev Environments: Switch Environment in New Window…** opens the selected environment in a new window.
 
@@ -55,7 +56,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 |---|---|---|
 | `devEnvLauncher.reopenLastOnStartup` | `true` | Open the last used environment when VS Code starts. |
 | `devEnvLauncher.openInNewWindow` | `false` | If `true`, **Start** and **Switch Environment…** open the environment in a new window, and the current window keeps its environment. The context menu then offers **Start in Current Window**, and the Command Palette **Switch Environment in Current Window…**. From an empty window, **Start** uses that window. Only the user settings count. |
-| `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it. If `false`, the container keeps running. |
+| `devEnvLauncher.stopOnClose` | `true` | Stop an environment when no window uses it (window closed, VS Code quit, or **Close Remote Connection**), after the waiting time. If `false`, all environments keep running. To keep only some environments running, use **Keep Running When Closed** on them. |
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time in seconds before a stop. It prevents a stop during a window reload. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection. |
 | `devEnvLauncher.respectShutdownActionNone` | `false` | If `true`, a repository with `"shutdownAction": "none"` keeps its container running after close. |
@@ -71,7 +72,11 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - Each entry has an optional name, the regular expression, and the flags `i` (ignore case), `u` (Unicode), and `s` (dot matches line breaks). Add, remove, and move entries with the buttons; an entry that is not valid shows its error at once.
 - The preview shows, for the repositories that the view has loaded, how many repositories each entry takes, the resulting tree of each owner, and which repositories would be hidden. Repositories with an environment are always shown.
 - Type a repository name in **Test a Repository Name** to see which entry matches it and where its row goes.
-- **Save** writes the user settings and changes only this setting in `settings.json`; your other settings and comments stay. If you changed the setting in `settings.json` while the editor was open, Save keeps that change and adds yours; it asks only about an entry that both changed differently. **Cancel**, or closing the tab, discards your changes.
+- The preview and the test stop after 1 second: a regular expression that takes longer for your repository names is marked as too slow and cannot be saved, because the view would become slow with it. If the check fails, Save is not possible either.
+- **Save** writes only this one setting in your user `settings.json`: it replaces the value of `devEnvLauncher.repositoryGroups` with the entries of the editor, and your other settings and comments stay as they are.
+- If this setting changes in `settings.json` while the editor is open, the editor says so: "settings.json changed this setting." with **Load settings.json**. The entries in the editor stay until you choose; the editor never replaces them on its own.
+- If you save after such a change, the editor shows the current list of `settings.json` and asks: **Load settings.json** shows that list and drops your unsaved edits; **Save Mine** replaces that one value with your entries; **Cancel** changes nothing and keeps your edits. Entries are never merged one by one. If `settings.json` changes again while this question is open, it asks again. If the value in `settings.json` is not a list, Save asks the same way before it replaces it.
+- **Cancel**, or closing the tab, discards your changes; a Save that is still waiting then writes nothing.
 
 ## Known limits
 
@@ -110,8 +115,8 @@ npm run build         # bundles dist/extension.js and dist/sessionMonitor.js
 npm test              # unit tests, without VS Code and without Docker
 npm run test:docker   # integration tests against the running Docker engine
 npm run package       # creates the .vsix file
-npm run install-local # creates the .vsix file and installs it into the VS Code profile this folder is open in
-                      # (every window, also new ones of a debug run); -- --profile <name> names another profile
+npm run install-local # creates the .vsix file and installs it into every VS Code profile
+                      # (every window, also new ones of a debug run); -- --profile <name> installs into one profile
 ```
 
 © 2026 Hannes Stauss (scalarion@nimblescape.com) · [MIT License](https://github.com/nimblescape/vscode-dev-environments/blob/main/LICENSE).

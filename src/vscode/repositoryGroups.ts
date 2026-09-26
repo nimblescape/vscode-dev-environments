@@ -21,6 +21,11 @@ export interface RepositoryGroupPattern {
   /** The pattern text as the user wrote it. */
   source: string;
   regex: RegExp;
+  /**
+   * Set by matchRepositoryGroup when the regular expression threw while it was matched (for example a RangeError when
+   * the stack overflows): the error, so the sidebar can log it once. The entry did not match that name.
+   */
+  failure?: string;
 }
 
 /** A problem with one entry of the setting; the sidebar shows each distinct message once per session. */
@@ -45,6 +50,8 @@ export const RepositoryGroupTexts = {
     `The repository group ${entry} in the setting devEnvLauncher.repositoryGroups is ignored: its regular expression is not valid (${error}).`,
   ignoredFlags: (entry: string, flags: string) =>
     `The repository group ${entry} in the setting devEnvLauncher.repositoryGroups uses the flags "${flags}", which are ignored. Only the flags i, u, and s are allowed.`,
+  failed: (source: string, error: string) =>
+    `The repository group ${JSON.stringify(source)} in the setting devEnvLauncher.repositoryGroups failed while it was matched (${error}). It does not match the names for which it fails.`,
   slow: (milliseconds: number) =>
     `Grouping the repositories took ${milliseconds} ms. A regular expression in the setting devEnvLauncher.repositoryGroups may be slow, for example one with a nested repetition such as (a+)+. If VS Code stops responding, remove that entry from your settings.json.`,
 } as const;
@@ -121,14 +128,22 @@ export interface RepositoryGroupMatch {
 /**
  * The first pattern that matches the repository name (without owner), or `undefined`. With n ≥ 1 capturing groups,
  * groups 1..n-1 are the levels and group n is the label; with none, the row has no level and keeps its name. A group
- * that did not take part or is empty is skipped (the row moves up one level); an empty last group gives the name.
+ * that did not take part or is empty is skipped (the row moves up one level); an empty last group gives the name. A
+ * pattern that throws while it is matched (a RangeError when the stack overflows) does not match that name; the error is
+ * kept in its `failure`.
  */
 export function matchRepositoryGroup(
   patterns: readonly RepositoryGroupPattern[],
   name: string,
 ): RepositoryGroupMatch | undefined {
   for (const pattern of patterns) {
-    const match = pattern.regex.exec(name);
+    let match: RegExpExecArray | null;
+    try {
+      match = pattern.regex.exec(name);
+    } catch (error) {
+      pattern.failure ??= error instanceof Error ? error.message : String(error);
+      continue;
+    }
     if (!match) continue;
     const groups = match.slice(1);
     const last = groups.pop();

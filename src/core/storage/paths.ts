@@ -58,6 +58,10 @@ export class StoragePaths {
   readonly monitorSettings: string;
   /** Process ID of the running Session Monitor. */
   readonly monitorLock: string;
+  /** Protocol version of the running Session Monitor, `{ pid, version }` (see MONITOR_PROTOCOL_VERSION). */
+  readonly monitorVersion: string;
+  /** A window's request to an older Session Monitor to exit, `{ pid, requestedAt }`. */
+  readonly monitorExit: string;
   /** Log file of the Session Monitor. */
   readonly monitorLog: string;
   /** State of the workspace helper images: base image digests, last check, last use, last cleanup. */
@@ -73,6 +77,8 @@ export class StoragePaths {
     this.reopen = path.join(root, 'reopen.json');
     this.monitorSettings = path.join(root, 'monitor.json');
     this.monitorLock = path.join(root, 'monitor.lock');
+    this.monitorVersion = path.join(root, 'monitor.version');
+    this.monitorExit = path.join(root, 'monitor.exit');
     this.monitorLog = path.join(root, 'monitor.log');
     this.helperState = path.join(root, 'helper.json');
   }

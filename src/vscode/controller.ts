@@ -255,7 +255,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 25 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 27 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -280,6 +280,8 @@ export class Controller implements vscode.Disposable {
       editRepositoryGroups: () => this.deps.repositoryGroupsEditor.open(),
       turnOffHostAccessChecks: (argument) => this.turnOffHostAccessChecks(parseCommandArgument(argument)),
       turnOnHostAccessChecks: (argument) => this.turnOnHostAccessChecks(parseCommandArgument(argument)),
+      keepRunning: (argument) => this.setKeepRunning(parseCommandArgument(argument), true),
+      stopWhenClosed: (argument) => this.setKeepRunning(parseCommandArgument(argument), false),
       dockerSetupInstall: () => this.deps.dockerSetup.install(),
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
@@ -452,8 +454,14 @@ export class Controller implements vscode.Disposable {
   /**
    * Role B: an empty window. First the pending operations that a window left when it closed its remote connection
    * (concept 7.14), oldest first; then the reopen rule (concept 7.10 #2, decision D-5 option a).
+   *
+   * `activatedAt`: the time at which the window's activation began (`activate()` passes it), taken before any await.
+   * The age of the reopen record is measured at this time, not at the check: the awaits (the window status, the stale
+   * claims, the operations, the GitHub account) and the pause of REOPEN_CHECK_DELAY_MS take several seconds, and a Close
+   * Remote Connection whose empty window activates 2 to 3 seconds later must still count as younger than
+   * REOPEN_MIN_AGE_MS (review finding F1 of PR #26).
    */
-  async runEmptyWindowTasks(): Promise<void> {
+  async runEmptyWindowTasks(activatedAt: number = this.clock.now()): Promise<void> {
     await this.ready;
     const { sessionFiles, coordinator, registry, connection } = this.deps;
     await sessionFiles
@@ -503,7 +511,8 @@ export class Controller implements vscode.Disposable {
       record,
       // Concept 7.5: only an environment of the signed-in account is opened again.
       environmentIds: new Set(availableEnvironments(environments, account).map((environment) => environment.id)),
-      now: this.clock.now(),
+      // The age of the record at activation (see `activatedAt`), not after the awaits and the pause.
+      now: activatedAt,
       development: this.deps.development,
     });
     if (!decision.reopen) {
@@ -563,6 +572,35 @@ export class Controller implements vscode.Disposable {
       return;
     }
     await this.stopNow(target, environment);
+  }
+
+  /**
+   * Keep Running When Closed (`keep`) and Stop When Closed (concept 7.9; user decision 2026-09-26, "go with the proposal
+   * for closing"): writes the switch `keepRunning` of the environment into the registry (under its lock) and renders the
+   * sidebar. The Session Monitor never stops a kept environment; Stop and Delete still do, and Stop keeps the switch.
+   * Nothing is started or stopped here: a kept environment whose container is stopped stays stopped, and one that is not
+   * kept any more stops after the waiting time once no window uses it.
+   */
+  async setKeepRunning(argument: CommandArgument, keep: boolean): Promise<void> {
+    const placeholder = keep ? ControllerTexts.selectEnvironmentToKeepRunning : ControllerTexts.selectEnvironmentToStopWhenClosed;
+    const target = await this.resolveTarget(argument, 'environment', placeholder);
+    const environment = this.requireEnvironment(target);
+    if (!target || !environment) return;
+    const repository = this.displayName(target);
+    const updated = await this.deps.registry.updateEnvironment(environment.id, (current) => {
+      if (keep) current.keepRunning = true;
+      else delete current.keepRunning;
+    });
+    if (!updated) {
+      this.inform(PipelineTexts.environmentMissing);
+      return;
+    }
+    this.logger.info(keep ? `${repository} keeps running when no window uses it.` : `${repository} stops when no window uses it.`);
+    await this.renderQuietly();
+    // With the setting stopOnClose off, every environment keeps running already; say so instead of a promise that the
+    // environment stops.
+    if (!keep && this.deps.settings().stopOnClose === false) this.inform(ControllerTexts.keepAllRunning);
+    else this.inform(keep ? ControllerTexts.keptRunning(repository) : ControllerTexts.stopsWhenClosed(repository));
   }
 
   /** Delete (concept 6.2, 7.14): safety check, confirmation, then the removal. */

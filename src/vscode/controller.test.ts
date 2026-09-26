@@ -29,6 +29,7 @@ import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
+import { contextValue as treeContextValue, rowActions } from './treeModel';
 import { EventEmitter, fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
@@ -247,6 +248,8 @@ interface Harness {
   progressTitles: string[];
   alive: Set<number>;
   settings: ExtensionSettings;
+  /** The clock of the controller, the registry and the session files; a test may replace `now`. */
+  clock: { now: () => number };
 }
 
 function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number; disconnectAnswerMs?: number } = {}): Harness {
@@ -423,6 +426,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     progressTitles,
     alive,
     settings,
+    clock,
   };
 }
 
@@ -546,7 +550,9 @@ describe('Controller commands', () => {
     // 24 since unit 14 (spec: open in a new window): Start in New Window, Start in Current Window, and the switcher for
     // a new window and for the current window.
     // 25 since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups….
-    expect(declared).toHaveLength(25);
+    // 27 since unit 26 (user decision 2026-09-26, "go with the proposal for closing"): Keep Running When Closed and
+    // Stop When Closed.
+    expect(declared).toHaveLength(27);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -945,6 +951,100 @@ describe('Stop', () => {
   it('says that a repository without environment has nothing to stop', async () => {
     await run('stop', row('acme/web'));
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.noEnvironment('acme/web'));
+  });
+});
+
+// User decision 2026-09-26, "go with the proposal for closing": Keep Running When Closed per environment, stored in the
+// registry. The Session Monitor never stops a kept environment; only the user's Stop or Delete does.
+describe('Keep Running When Closed and Stop When Closed (unit 26)', () => {
+  it('Keep Running When Closed writes the switch into the registry, renders the sidebar, and says so', async () => {
+    await h.registry.add(environment());
+    await run('keepRunning', row('acme/api', environment()));
+    expect((await h.registry.get(ENV_ID))?.keepRunning).toBe(true);
+    expect(h.sidebar.render).toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.keptRunning('acme/api'));
+    expect(h.service.stop).not.toHaveBeenCalled();
+  });
+
+  it('Stop When Closed removes the switch, renders the sidebar, and says so', async () => {
+    await h.registry.add(environment({ keepRunning: true }));
+    await run('stopWhenClosed', row('acme/api', environment({ keepRunning: true })));
+    const stored = await h.registry.get(ENV_ID);
+    expect(stored).toBeDefined();
+    expect(stored).not.toHaveProperty('keepRunning');
+    expect(h.sidebar.render).toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.stopsWhenClosed('acme/api'));
+    expect(h.service.stop).not.toHaveBeenCalled();
+  });
+
+  it('Stop When Closed says that all environments keep running while the setting stopOnClose is off', async () => {
+    await h.registry.add(environment({ keepRunning: true }));
+    h.settings.stopOnClose = false;
+    await run('stopWhenClosed', row('acme/api', environment({ keepRunning: true })));
+    expect((await h.registry.get(ENV_ID))?.keepRunning).toBeUndefined();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.keepAllRunning);
+  });
+
+  it('Stop still stops a kept environment, and the switch stays set', async () => {
+    await h.registry.add(environment({ keepRunning: true }));
+    await run('stop', row('acme/api', environment({ keepRunning: true })));
+    expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
+    expect((await h.registry.get(ENV_ID))?.keepRunning).toBe(true);
+  });
+
+  it('says that a repository without environment has nothing to keep running, and changes nothing', async () => {
+    await run('keepRunning', row('acme/web'));
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.noEnvironment('acme/web'));
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  it('offers exactly one of the two commands in the context menu, by the flag of the row, and both with a picker in the Command Palette', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        commands: Array<{ command: string; title: string }>;
+        menus: Record<string, Array<{ command?: string; when?: string }>>;
+      };
+    };
+    const title = (command: string) => manifest.contributes.commands.find((entry) => entry.command === command)?.title;
+    expect(title(Commands.keepRunning)).toBe('Keep Running When Closed');
+    expect(title(Commands.stopWhenClosed)).toBe('Stop When Closed');
+    const menus = manifest.contributes.menus;
+    const when = (menu: string, command: string) => menus[menu].filter((item) => item.command === command).map((item) => item.when);
+    expect(when('view/item/context', Commands.keepRunning)).toEqual(['view == devEnvironments.repositories && viewItem =~ /;canKeepRunning(;|$)/']);
+    expect(when('view/item/context', Commands.stopWhenClosed)).toEqual(['view == devEnvironments.repositories && viewItem =~ /;kept(;|$)/']);
+    expect(when('devEnvironments.more', Commands.keepRunning)).toEqual(['viewItem =~ /;canKeepRunning(;|$)/']);
+    expect(when('devEnvironments.more', Commands.stopWhenClosed)).toEqual(['viewItem =~ /;kept(;|$)/']);
+    // Like Stop: in the Command Palette, with a picker of the environments.
+    expect(when('commandPalette', Commands.keepRunning)).toEqual([]);
+    expect(when('commandPalette', Commands.stopWhenClosed)).toEqual([]);
+    expect(when('commandPalette', Commands.stop)).toEqual([]);
+
+    // The when clauses against the contextValue of rows (treeModel.contextValue): exactly one of the two matches a row with
+    // an environment, and none a row without one.
+    const matches = (clause: string, value: string) => new RegExp(clause.match(/viewItem =~ \/(.*)\/$/)![1]).test(value);
+    const keepClause = when('devEnvironments.more', Commands.keepRunning)[0]!;
+    const stopClause = when('devEnvironments.more', Commands.stopWhenClosed)[0]!;
+    const actions = rowActions('running', undefined);
+    const notKept = treeContextValue(actions, 'on', false);
+    const kept = treeContextValue(actions, 'on', true);
+    const none = treeContextValue(rowActions(undefined, undefined), 'on');
+    expect([matches(keepClause, notKept), matches(stopClause, notKept)]).toEqual([true, false]);
+    expect([matches(keepClause, kept), matches(stopClause, kept)]).toEqual([false, true]);
+    expect([matches(keepClause, none), matches(stopClause, none)]).toEqual([false, false]);
+  });
+
+  it('picks the environment in the Command Palette, as Stop does', async () => {
+    await h.registry.add(environment());
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown) => {
+      const list = (await items) as Array<{ environmentId?: string }>;
+      return list[0];
+    });
+    await run('keepRunning');
+    expect(fakeVscode.window.showQuickPick).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ placeHolder: ControllerTexts.selectEnvironmentToKeepRunning }),
+    );
+    expect((await h.registry.get(ENV_ID))?.keepRunning).toBe(true);
   });
 });
 
@@ -1577,7 +1677,7 @@ describe('Window roles', () => {
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readReopen()).toEqual({ environmentId: ENV_ID, closedAt: iso(NOW - 5000) });
 
-    // The next start of VS Code, later: the record is older than 30 seconds.
+    // The next start of VS Code, later: the record is older than 5 seconds (REOPEN_MIN_AGE_MS).
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
     await h.controller.runEmptyWindowTasks();
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
@@ -1672,10 +1772,60 @@ describe('Window roles', () => {
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
+  // User decision 2026-09-26, "go with the proposal for closing": a reopen from the macOS Dock a few seconds after the
+  // quit was blocked by the 30-second rule. With the 5-second guard, 6 seconds reopen and 4 seconds do not.
+  it('role B: reopens a record older than 5 seconds, and not one of 4 seconds', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 4_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 6_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+  });
+
+  // Review finding F1: the age of the reopen record is measured at activation, not after the awaits (ready, the stale
+  // claims, the operations, the GitHub account) and the pause of REOPEN_CHECK_DELAY_MS. Otherwise a Close Remote
+  // Connection whose empty window activates 3 seconds later is checked at about 6 seconds and reconnects.
+  it('role B: measures the age of the reopen record at activation, not after the awaits and the pause', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    let now = NOW;
+    h.clock.now = () => now;
+    const advancing = (): void => {
+      // The status file (ready), the GitHub account, and the pause before the check each take time.
+      h.controller.setReady(Promise.resolve().then(() => (now += 500)));
+      h.auth.getAccount.mockImplementationOnce(async () => {
+        now += 1_000;
+        return ACCOUNT;
+      });
+      h.coordinator.otherActiveWindows.mockImplementationOnce(async () => {
+        now += 1_500;
+        return [];
+      });
+    };
+
+    // 3 seconds old at activation (Close Remote Connection), 6 seconds old at the check: no reopen.
+    advancing();
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 3_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(now - Date.parse((await h.sessionFiles.readReopen())!.closedAt)).toBe(6_000);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+
+    // 6 seconds old at activation: a reopen.
+    advancing();
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 6_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+  });
+
   it('role B: does not reopen after Close Remote Connection, with another window, or when the setting is off', async () => {
     await h.registry.add(environment());
     h.connection.isEmptyWindow.mockReturnValue(true);
-    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 10_000) });
+    // Close Remote Connection brings up the empty window within 1 to 3 seconds. The guard is 5 seconds since the user
+    // decision 2026-09-26, "go with the proposal for closing" (it was 30 seconds, and this record was 10 seconds old).
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 3_000) });
     await h.controller.runEmptyWindowTasks();
 
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });

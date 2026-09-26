@@ -58,6 +58,8 @@ describe('StoragePaths', () => {
     expect(paths.reopen).toBe(path.join(root, 'reopen.json'));
     expect(paths.monitorSettings).toBe(path.join(root, 'monitor.json'));
     expect(paths.monitorLock).toBe(path.join(root, 'monitor.lock'));
+    expect(paths.monitorVersion).toBe(path.join(root, 'monitor.version'));
+    expect(paths.monitorExit).toBe(path.join(root, 'monitor.exit'));
     expect(paths.monitorLog).toBe(path.join(root, 'monitor.log'));
     expect(paths.helperState).toBe(path.join(root, 'helper.json'));
     expect(paths.sessionFile(WINDOW_ID)).toBe(path.join(root, 'sessions', `${WINDOW_ID}.json`));

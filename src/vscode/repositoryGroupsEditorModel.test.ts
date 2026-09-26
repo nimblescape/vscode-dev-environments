@@ -10,16 +10,24 @@ import {
   GroupsEditorTexts,
   buildGroupsPreview,
   canSave,
+  capturingGroups,
   checkEntries,
   editorHtml,
   editorState,
   entriesFromSetting,
-  mergeRepositoryGroups,
+  describeSettingEntry,
+  describeSettingList,
+  MAX_SHOWN_ENTRY,
+  MAX_SHOWN_LINES,
   parseEditorRequest,
+  refusedRequestSeq,
   sameSettingValue,
   testRepositoryName,
   toSettingValue,
+  cloneableInput,
+  runPreviewJob,
   type EditorEntry,
+  type PreviewJobMessage,
   type PreviewNode,
 } from './repositoryGroupsEditorModel';
 import { buildTreeModel, type GroupNode, type HintRow, type RepositoryRow, type TreeInput } from './treeModel';
@@ -61,6 +69,8 @@ function discovery(repositories: RepositoryInfo[]): DiscoveryData {
   return { version: 1, fetchedAt: T0, viewerLogin: 'me', organizations: [], repositories, hints: [] };
 }
 
+const input_ = (overrides: Partial<TreeInput> = {}): TreeInput => input(overrides);
+
 function input(overrides: Partial<TreeInput> = {}): TreeInput {
   return {
     discovery: undefined,
@@ -90,12 +100,12 @@ describe('serialization of the entries', () => {
     ).toEqual(['^a', { name: 'Courses', pattern: '^b' }, { pattern: '^c', flags: 'is' }, { name: 'Named', pattern: '^d', flags: 'ius' }, '^e']);
   });
 
-  it('reads what it writes (round trip), with the index in the setting as origin', () => {
+  it('reads what it writes (round trip)', () => {
     const entries = [entry('^a'), entry('^b', 'Courses'), entry('^c', '', 'is'), entry(EXAMPLE, 'Students', 'u')];
     const value = toSettingValue(entries);
     const { entries: loaded, notices } = entriesFromSetting(value);
     expect(notices).toEqual([]);
-    expect(loaded).toEqual(entries.map((item, origin) => ({ ...item, origin })));
+    expect(loaded).toEqual(entries);
     expect(toSettingValue(loaded)).toEqual(value);
     // The value survives the JSON of settings.json.
     expect(toSettingValue(entriesFromSetting(JSON.parse(JSON.stringify(value))).entries)).toEqual(value);
@@ -109,9 +119,9 @@ describe('serialization of the entries', () => {
   it('leaves out entries of the wrong type and other flags, each with a notice, and keeps invalid patterns', () => {
     const { entries, notices } = entriesFromSetting([3, '(', { pattern: '^a', flags: 'gi' }, { name: 1, pattern: '^b' }, '']);
     expect(entries).toEqual([
-      { name: '', pattern: '(', flags: '', origin: 1 },
-      { name: '', pattern: '^a', flags: 'i', origin: 2 },
-      { name: '', pattern: '', flags: '', origin: 4 },
+      { name: '', pattern: '(', flags: '' },
+      { name: '', pattern: '^a', flags: 'i' },
+      { name: '', pattern: '', flags: '' },
     ]);
     expect(notices).toEqual([
       GroupsEditorTexts.wrongTypeLeftOut(1),
@@ -155,6 +165,25 @@ describe('checks of the entries', () => {
     ]);
     expect(canSave(checks)).toBe(true);
     expect(GroupsEditorTexts.levels(3)).toBe('3 capturing groups: 2 levels, then the label of the row.');
+  });
+
+  // Review round 2 of PR #21, W2: the capturing groups are counted in the source; no regular expression of the draft
+  // runs in the extension host.
+  it('counts the capturing groups without running the regular expression', () => {
+    const count = (pattern: string) => capturingGroups(pattern);
+    expect(count('^a')).toBe(0);
+    expect(count('^(a)(?:b)(?<name>c)(?=d)(?!e)(?<=f)(?<!g)$')).toBe(2);
+    expect(count(String.raw`\(a\)[(](b)[\](]`)).toBe(1);
+    expect(count(String.raw`[\]()](x)`)).toBe(1);
+    expect(count(EXAMPLE)).toBe(3);
+    // This one takes seconds when it runs on the empty text.
+    const started = Date.now();
+    expect(checkEntries([entry(String.raw`(?:(|)\1){26}x`)])).toEqual([{ note: GroupsEditorTexts.oneCapturingGroup }]);
+    expect(Date.now() - started).toBeLessThan(500);
+    // The count equals the one of the regular expression.
+    for (const pattern of ['^(a)|(b)$', String.raw`(\()(?<n>[)(])`, EXAMPLE, '(?:x)', '((a)(b))']) {
+      expect(count(pattern)).toBe((new RegExp(`${pattern}|`).exec('')?.length ?? 1) - 1);
+    }
   });
 
   it('refuses a name or a pattern over the limits', () => {
@@ -279,20 +308,55 @@ describe('test of a repository name', () => {
 });
 
 describe('messages of the webview', () => {
-  const context = { baseLength: 2 };
+  const context = { generation: 5 };
   const valid = { name: 'A', pattern: '^a', flags: 'is' };
 
   it('accepts exactly the messages of the editor', () => {
     expect(parseEditorRequest({ type: 'ready' }, context)).toEqual({ type: 'ready' });
-    expect(parseEditorRequest({ type: 'reload' }, context)).toEqual({ type: 'reload' });
+    expect(parseEditorRequest({ type: 'reload', testName: 'x' }, context)).toEqual({ type: 'reload', testName: 'x' });
     expect(parseEditorRequest({ type: 'cancel' }, context)).toEqual({ type: 'cancel' });
-    expect(parseEditorRequest({ type: 'update', seq: 3, entries: [valid, { ...valid, origin: 1 }], testName: 'x' }, context)).toEqual({
+    expect(parseEditorRequest({ type: 'update', seq: 3, generation: 5, entries: [valid, valid], testName: 'x' }, context)).toEqual({
       type: 'update',
       seq: 3,
-      entries: [valid, { ...valid, origin: 1 }],
+      generation: 5,
+      entries: [valid, valid],
       testName: 'x',
     });
-    expect(parseEditorRequest({ type: 'save', seq: 0, entries: [] }, context)).toEqual({ type: 'save', seq: 0, entries: [] });
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 5, entries: [], testName: '' }, context)).toEqual({
+      type: 'save',
+      seq: 0,
+      generation: 5,
+      entries: [],
+      testName: '',
+    });
+    // An update of an earlier load: its entries were edited from another value.
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [valid], testName: 'y' }, context)).toEqual({
+      type: 'stale',
+      seq: 0,
+      generation: 4,
+      entries: [valid],
+      testName: 'y',
+    });
+    expect(parseEditorRequest({ type: 'update', seq: 2, generation: 6, entries: [valid], testName: 'x' }, context)).toEqual({
+      type: 'stale',
+      seq: 2,
+      generation: 6,
+      entries: [valid],
+      testName: 'x',
+    });
+  });
+
+  it('reads the seq of a refused message only when it is a valid one', () => {
+    expect(refusedRequestSeq({ type: 'save', seq: 4, generation: 5, entries: 'x' })).toBe(4);
+    for (const raw of [{ type: 'save', seq: -1 }, { type: 'save', seq: 1.5 }, { type: 'save', seq: '4' }, [4], null, 'save']) {
+      expect(refusedRequestSeq(raw)).toBeUndefined();
+    }
+  });
+
+  it('checks a stale update or Save as strictly as a current one', () => {
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [{ ...valid, flags: 'g' }], testName: '' }, context)).toBeUndefined();
+    expect(parseEditorRequest({ type: 'save', seq: 0, generation: 4, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }, context)).toBeUndefined();
+    expect(parseEditorRequest({ type: 'update', seq: 0, generation: 4, entries: [], testName: 1 }, context)).toBeUndefined();
   });
 
   it.each<[string, unknown]>([
@@ -301,52 +365,83 @@ describe('messages of the webview', () => {
     ['null', null],
     ['an unknown type', { type: 'write' }],
     ['an extra property', { type: 'ready', extra: 1 }],
-    ['a missing property', { type: 'update', seq: 1, entries: [] }],
-    ['a sequence that is no whole number', { type: 'save', seq: 1.5, entries: [] }],
-    ['a negative sequence', { type: 'save', seq: -1, entries: [] }],
-    ['entries that are no list', { type: 'save', seq: 1, entries: {} }],
-    ['an entry that is a string', { type: 'save', seq: 1, entries: ['^a'] }],
-    ['an entry with an extra property', { type: 'save', seq: 1, entries: [{ ...valid, regex: '^a' }] }],
-    ['an entry without flags', { type: 'save', seq: 1, entries: [{ name: '', pattern: '^a' }] }],
-    ['a pattern that is no text', { type: 'save', seq: 1, entries: [{ ...valid, pattern: 1 }] }],
-    ['the flag g', { type: 'save', seq: 1, entries: [{ ...valid, flags: 'g' }] }],
-    ['a repeated flag', { type: 'save', seq: 1, entries: [{ ...valid, flags: 'ii' }] }],
-    ['an origin outside the loaded value', { type: 'save', seq: 1, entries: [{ ...valid, origin: 2 }] }],
-    ['an origin twice', { type: 'save', seq: 1, entries: [{ ...valid, origin: 0 }, { ...valid, origin: 0 }] }],
-    ['an origin that is no whole number', { type: 'save', seq: 1, entries: [{ ...valid, origin: '0' }] }],
-    ['a pattern over the limit', { type: 'save', seq: 1, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }] }],
-    ['a name over the limit', { type: 'save', seq: 1, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }] }],
-    ['too many entries', { type: 'save', seq: 1, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid) }],
-    ['a test name over the limit', { type: 'update', seq: 1, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a missing property', { type: 'update', seq: 1, generation: 5, entries: [] }],
+    // Round 7 of PR #21: the offer of settings.json and its answer are gone (no automatic reload, orchestrator decision).
+    ['an accept (removed in review round 7)', { type: 'accept', generation: 7 }],
+    // Round 7 of PR #21, F2: Save and Load settings.json carry the test name, checked like that of an update.
+    ['a Save without a test name', { type: 'save', seq: 1, generation: 5, entries: [] }],
+    ['a Load settings.json without a test name', { type: 'reload' }],
+    ['a test name of Save over the limit', { type: 'save', seq: 1, generation: 5, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a test name of Load settings.json over the limit', { type: 'reload', testName: 'a'.repeat(EditorLimits.testName + 1) }],
+    ['a test name of Load settings.json that is no text', { type: 'reload', testName: 1 }],
+    ['a missing generation', { type: 'save', seq: 1, entries: [], testName: '' }],
+    ['a generation that is no number', { type: 'save', seq: 1, generation: '5', entries: [], testName: '' }],
+    ['a sequence that is no whole number', { type: 'save', seq: 1.5, generation: 5, entries: [], testName: '' }],
+    ['a negative sequence', { type: 'save', seq: -1, generation: 5, entries: [], testName: '' }],
+    ['entries that are no list', { type: 'save', seq: 1, generation: 5, entries: {}, testName: '' }],
+    ['an entry that is a string', { type: 'save', seq: 1, generation: 5, entries: ['^a'], testName: '' }],
+    ['an entry with an extra property', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, regex: '^a' }], testName: '' }],
+    ['an entry without flags', { type: 'save', seq: 1, generation: 5, entries: [{ name: '', pattern: '^a' }], testName: '' }],
+    ['a pattern that is no text', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 1 }], testName: '' }],
+    ['the flag g', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'g' }], testName: '' }],
+    ['a repeated flag', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'ii' }], testName: '' }],
+    // The merge that used an origin is gone (user decision A, 2026-09-26): an entry has no other property.
+    ['an entry with an origin', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, origin: 0 }], testName: '' }],
+    ['a pattern over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, pattern: 'a'.repeat(EditorLimits.pattern + 1) }], testName: '' }],
+    ['a name over the limit', { type: 'save', seq: 1, generation: 5, entries: [{ ...valid, name: 'a'.repeat(EditorLimits.name + 1) }], testName: '' }],
+    ['too many entries', { type: 'save', seq: 1, generation: 5, entries: Array.from({ length: EditorLimits.entries + 1 }, () => valid), testName: '' }],
+    ['a test name over the limit', { type: 'update', seq: 1, generation: 5, entries: [], testName: 'a'.repeat(EditorLimits.testName + 1) }],
     ['an object with another prototype', Object.assign(Object.create({ polluted: true }) as object, { type: 'ready' })],
   ])('refuses %s', (_case, raw) => {
     expect(parseEditorRequest(raw, context)).toBeUndefined();
   });
 
   it('sorts the flags of an entry', () => {
-    const request = parseEditorRequest({ type: 'save', seq: 1, entries: [{ ...valid, flags: 'si' }] }, context);
-    expect(request).toEqual({ type: 'save', seq: 1, entries: [{ ...valid, flags: 'is' }] });
+    const request = parseEditorRequest({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'si' }], testName: '' }, context);
+    expect(request).toEqual({ type: 'save', seq: 1, generation: 5, entries: [{ ...valid, flags: 'is' }], testName: '' });
   });
 });
 
 describe('state and HTML of the webview', () => {
-  it('computes the checks, the dirty flag, and the test for the webview', () => {
+  it('computes the checks, the dirty flag, the preview, and the test of a preview job for the webview', () => {
     const loaded = entriesFromSetting([EXAMPLE]).entries;
+    const test = testRepositoryName(loaded, 'x');
     const state = editorState({
       seq: 4,
       entries: [...loaded, entry('(')],
       loaded,
-      testName: 'x',
-      input: undefined,
+      run: { preview: { loaded: false, owners: [], truncated: 0 }, ...(test ? { test } : {}) },
       changedOutside: true,
     });
     expect(state).toMatchObject({ type: 'state', seq: 4, canSave: false, dirty: true, changedOutside: true });
     expect(state.checks).toHaveLength(2);
     expect(state.test?.matched).toBe(false);
-    expect(editorState({ seq: 0, entries: loaded, loaded, testName: '', input: undefined, changedOutside: false })).toMatchObject({
+    expect(editorState({ seq: 0, entries: loaded, loaded, run: undefined, changedOutside: false })).toMatchObject({
       canSave: true,
       dirty: false,
+      preview: { loaded: false },
     });
+  });
+
+  it('names the entry that was too slow, and keeps Save off', () => {
+    const entries = [entry('^a-(.+)$'), entry(String.raw`^(\w+)+$`)];
+    const state = editorState({ seq: 1, entries, loaded: [], run: { previewTooSlow: true, slowEntry: 1 }, changedOutside: false });
+    expect(state.checks[0]).toEqual({ note: GroupsEditorTexts.oneCapturingGroup });
+    expect(state.checks[1]).toEqual({ error: GroupsEditorTexts.entryTooSlow });
+    expect(state.canSave).toBe(false);
+    expect(state.preview).toEqual({ loaded: true, owners: [], truncated: 0, tooSlow: true });
+    const slowTest = editorState({ seq: 1, entries, loaded: [], run: { preview: buildGroupsPreview(undefined, entries), testTooSlow: true }, changedOutside: false });
+    expect(slowTest.test).toEqual({ matched: false, text: GroupsEditorTexts.testTooSlow, path: [] });
+    expect(slowTest.canSave).toBe(true);
+  });
+
+  // Review round 2 of PR #21, W1: a failed run of the worker keeps Save off, as a stopped one does.
+  it('keeps Save off when the worker failed', () => {
+    const entries = [entry('^a-(.+)$')];
+    expect(editorState({ seq: 1, entries, loaded: [], run: { failed: true }, changedOutside: false }).canSave).toBe(false);
+    expect(editorState({ seq: 1, entries, loaded: [], run: { preview: buildGroupsPreview(undefined, entries) }, changedOutside: false }).canSave).toBe(
+      true,
+    );
   });
 
   it('has a strict Content Security Policy: nothing by default, the script only with the nonce, no remote content', () => {
@@ -366,108 +461,79 @@ describe('state and HTML of the webview', () => {
     expect(scripts).toEqual(['<script nonce="N0nce+/=" src="vscode-webview://abc/editor.js">']);
     expect(html).toContain('<label for="test-name">');
   });
+
+  // Review round 8 of PR #21, finding 5: the page names a paused test next to the test result.
+  it('has a place for the note of a paused test next to the test result', () => {
+    const html = editorHtml({ cspSource: 'c', nonce: 'n', scriptUri: 's', styleUri: 't' });
+    expect(html).toContain('<div id="test-result" role="status" aria-live="polite"></div>\n<p id="test-paused" class="muted" aria-live="polite"></p>');
+  });
+
+  // Review round 8 of PR #21, finding 4: since round 7, only a load after Save (not settings.json) makes an update stale.
+  it('names the cause of a stale draft that it has now', () => {
+    expect(GroupsEditorTexts.staleKept).toBe('The editor had changed meanwhile; your edits are kept, press Save again.');
+  });
 });
 
-describe('merge at Save (3-way)', () => {
-  const BASE = ['^a', '^b', '^c'];
-  const loaded = () => entriesFromSetting(BASE).entries;
-  const merge = (ours: EditorEntry[], theirs: unknown, choices?: Map<number, 'mine' | 'theirs'>) =>
-    mergeRepositoryGroups(BASE, ours, theirs, choices);
-
-  it('changes nothing when neither side changed', () => {
-    expect(merge(loaded(), [...BASE])).toEqual({ status: 'merged', value: BASE, conflicts: [] });
+describe('text of settings.json in the question of Save', () => {
+  it('shows the list one entry per line', () => {
+    expect(describeSettingList(['^a', { name: 'B', pattern: '^b' }])).toBe('\n1. "^a"\n2. {"name":"B","pattern":"^b"}');
+    expect(describeSettingList([])).toBe('(no entries)');
+    expect(describeSettingList(undefined)).toBe('(no entries)');
   });
 
-  it('applies the changes of the editor alone: edit, removal, addition, and move', () => {
-    const [a, b, c] = loaded();
-    expect(merge([{ ...b, pattern: '^B' }, a, entry('^d', 'D')], [...BASE])).toEqual({
-      status: 'merged',
-      value: ['^B', '^a', { name: 'D', pattern: '^d' }],
-      conflicts: [],
-    });
-    expect(c.origin).toBe(2);
+  it('cuts each long entry, and never hides the whole list', () => {
+    const long = 'a'.repeat(5000);
+    const text = describeSettingList([long, long, '^short']);
+    const lines = text.split('\n').filter((line) => line !== '');
+    expect(lines[0]).toBe(`1. "${'a'.repeat(MAX_SHOWN_ENTRY - 1)}… (5002 characters)`);
+    // Each entry is cut, so all three fit.
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toBe('3. "^short"');
+    expect(describeSettingEntry(long).length).toBeLessThan(MAX_SHOWN_ENTRY + 30);
   });
 
-  it('keeps the changes of settings.json alone', () => {
-    const theirs = ['^x', '^a', { name: 'B', pattern: '^b' }, '^c', '^y'];
-    expect(merge(loaded(), theirs)).toEqual({ status: 'merged', value: theirs, conflicts: [] });
-    expect(merge(loaded(), undefined)).toEqual({ status: 'merged', value: [], conflicts: [] });
+  it('counts the entries after MAX_SHOWN_LINES', () => {
+    const value = Array.from({ length: MAX_SHOWN_LINES + 5 }, (_, index) => `^e${index}`);
+    const lines = describeSettingList(value).split('\n').filter((line) => line !== '');
+    expect(lines).toHaveLength(MAX_SHOWN_LINES + 1);
+    expect(lines[MAX_SHOWN_LINES]).toBe('… and 5 more entries');
   });
 
-  it('merges changes of different entries on both sides', () => {
-    const [a, b, c] = loaded();
-    const ours = [{ ...a, pattern: '^A' }, b, c, entry('^mine')];
-    const theirs = ['^theirs', '^a', '^b', '^C'];
-    expect(merge(ours, theirs)).toEqual({
-      status: 'merged',
-      value: ['^theirs', '^A', '^b', '^C', '^mine'],
-      conflicts: [],
-    });
-    // A removal in the editor and an edit of another entry in settings.json.
-    expect(merge([a, c], ['^a', '^b', '^C2'])).toEqual({ status: 'merged', value: ['^a', '^C2'], conflicts: [] });
-    // An addition in the editor stays after its predecessor when settings.json removed an entry.
-    expect(merge([a, b, entry('^new'), c], ['^a', '^c'])).toEqual({ status: 'merged', value: ['^a', '^new', '^c'], conflicts: [] });
+  it('describes a value that is not a list, cut as well', () => {
+    expect(describeSettingList({ pattern: '^x' })).toBe('{"pattern":"^x"}');
+    expect(describeSettingEntry(42)).toBe('42');
+    expect(describeSettingEntry({ pattern: 'x'.repeat(1000) })).toMatch(/… \(1014 characters\)$/);
+  });
+});
+
+describe('preview job (worker thread)', () => {
+  it('reports each entry before it runs on the names, then the preview, then the test', () => {
+    const messages: PreviewJobMessage[] = [];
+    const entries = [entry('^x-'), entry('('), entry(EXAMPLE)];
+    const input = cloneableInput(
+      input_({ discovery: discovery([repo('school/2025-3bWI-SWP-module-oop-hailo')]), formatTime: () => 'never cloned' }),
+    );
+    expect(input && 'formatTime' in input).toBe(false);
+    runPreviewJob({ id: 7, entries, testName: 'school/2026-3cWI-SWP-module-oop-EnesHA81', input }, (message) => messages.push(message));
+    expect(messages.map((message) => [message.type, message.type === 'probe' ? message.entryIndex : undefined])).toEqual([
+      ['probe', 0],
+      ['probe', 2],
+      ['preview', undefined],
+      ['test', undefined],
+    ]);
+    expect(messages.every((message) => message.id === 7)).toBe(true);
+    expect(messages[2]).toMatchObject({ preview: { loaded: true, owners: [{ owner: 'school', counts: [0, 0, 1] }] } });
+    expect(messages[3]).toMatchObject({ test: { matched: true, path: ['school', '2026-3cWI-SWP', 'module-oop', 'EnesHA81'] } });
+    // The messages can be sent to another thread (structured clone).
+    expect(structuredClone(messages)).toEqual(messages);
   });
 
-  it('is no conflict when both sides changed an entry in the same way', () => {
-    const [a, b, c] = loaded();
-    expect(merge([a, { ...b, name: 'B' }, c], ['^a', { pattern: '^b', name: 'B' }, '^c'])).toEqual({
-      status: 'merged',
-      value: ['^a', { pattern: '^b', name: 'B' }, '^c'],
-      conflicts: [],
-    });
-    // The same addition on both sides is written once.
-    expect(merge([a, b, c, entry('^d')], ['^a', '^b', '^c', '^d'])).toMatchObject({ value: ['^a', '^b', '^c', '^d'] });
-  });
-
-  it('asks about an entry changed differently on both sides, and only about that entry', () => {
-    const [a, b, c] = loaded();
-    const ours = [{ ...a, pattern: '^A' }, { ...b, pattern: '^B1' }, c];
-    const theirs = ['^a', '^B2', '^c', '^t'];
-    const outcome = merge(ours, theirs);
-    expect(outcome).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B1', theirs: '^B2' }] });
-    expect(merge(ours, theirs, new Map([[1, 'mine']]))).toMatchObject({ status: 'merged', value: ['^A', '^B1', '^c', '^t'] });
-    expect(merge(ours, theirs, new Map([[1, 'theirs']]))).toMatchObject({ status: 'merged', value: ['^A', '^B2', '^c', '^t'] });
-  });
-
-  it('asks when the editor edits an entry that settings.json removed', () => {
-    const [a, b, c] = loaded();
-    const ours = [a, { ...b, pattern: '^B' }, c];
-    const theirs = ['^a', '^c'];
-    expect(merge(ours, theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B' }] });
-    expect(merge(ours, theirs, new Map([[1, 'mine']]))).toMatchObject({ status: 'merged', value: ['^a', '^B', '^c'] });
-    expect(merge(ours, theirs, new Map([[1, 'theirs']]))).toMatchObject({ status: 'merged', value: ['^a', '^c'] });
-    // And the other way: removed in the editor, edited in settings.json.
-    expect(merge([a, c], ['^a', '^B2', '^c'])).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', theirs: '^B2' }] });
-  });
-
-  it('merges a move on one side with an edit on the other', () => {
-    const [a, b, c] = loaded();
-    // Moved in the editor, edited in settings.json.
-    expect(merge([c, a, b], ['^A', '^b', '^c'])).toEqual({ status: 'merged', value: ['^c', '^A', '^b'], conflicts: [] });
-    // Moved in settings.json, edited in the editor.
-    expect(merge([{ ...a, pattern: '^A' }, b, c], ['^c', '^a', '^b'])).toEqual({
-      status: 'merged',
-      value: ['^c', '^A', '^b'],
-      conflicts: [],
-    });
-  });
-
-  it('matches objects of settings.json to the loaded entries by pattern or name when they were edited', () => {
-    const base = [{ name: 'Courses', pattern: '^c-(.+)$' }, '^x'];
-    const ours = entriesFromSetting(base).entries;
-    ours[1] = { ...ours[1], pattern: '^X' };
-    const theirs = ['^new', { name: 'Courses', pattern: '^c-(.+)$', flags: 'i' }, '^x'];
-    expect(mergeRepositoryGroups(base, ours, theirs)).toEqual({
-      status: 'merged',
-      value: ['^new', { name: 'Courses', pattern: '^c-(.+)$', flags: 'i' }, '^X'],
-      conflicts: [],
-    });
-  });
-
-  it('removes the entries of the wrong type that the editor could not show, unless settings.json changed them', () => {
-    const base = [3, '^a'];
-    const ours = entriesFromSetting(base).entries;
-    expect(mergeRepositoryGroups(base, ours, [3, '^a'])).toEqual({ status: 'merged', value: ['^a'], conflicts: [] });
+  it('without a render of the sidebar, runs no entry and reports no preview', () => {
+    const messages: PreviewJobMessage[] = [];
+    runPreviewJob({ id: 1, entries: [entry(EXAMPLE)], testName: '', input: undefined }, (message) => messages.push(message));
+    expect(messages).toEqual([
+      { type: 'preview', id: 1, preview: { loaded: false, owners: [], truncated: 0 } },
+      { type: 'test', id: 1 },
+    ]);
   });
 });

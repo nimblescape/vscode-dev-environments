@@ -29,6 +29,8 @@ export const TreeTexts = {
   noEnvironment: 'No environment yet. Start creates it on the default branch.',
   notListedOnGitHub: 'GitHub does not list this repository.',
   archived: 'Archived repository',
+  /** Tooltip line of a kept environment (Keep Running When Closed, user decision 2026-09-26). */
+  kept: 'Keeps running when closed: stop it yourself.',
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
   signIn: 'Sign in with GitHub',
   signInTooltip: 'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
@@ -125,8 +127,9 @@ export interface RepositoryRow {
   /** Includes the time of the last use. */
   tooltip: string;
   /**
-   * `repository;canStart;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked`, only the flags that apply
-   * (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are off.
+   * `repository;canStart;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked;canKeepRunning`, only the
+   * flags that apply (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are
+   * off; `kept` in place of `canKeepRunning` for a kept environment; neither without an environment.
    */
   contextValue: string;
 }
@@ -209,7 +212,8 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
   connected: { id: 'circle-filled', color: 'charts.green' },
   connectedOtherWindow: { id: 'window', color: 'charts.green' },
-  running: { id: 'vm-running', color: 'charts.green' },
+  // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
+  running: { id: 'play-circle', color: 'charts.green' },
   stopped: { id: 'circle-outline' },
   updating: { id: 'sync~spin' },
   // A dashed circle (◌) is not available as a codicon.
@@ -229,6 +233,18 @@ export function stateIcon(state: EnvironmentState): StateIcon {
 /** State text of concept 6.2, for example `Connected · other window`. */
 export function stateText(state: EnvironmentState): string {
   return StateTexts[state];
+}
+
+/**
+ * State text of a row: the text of the state, with the suffix ` · kept` for a kept environment (Keep Running When
+ * Closed), for example `Running · kept`, `Connected · kept` (user decision 2026-09-26, "go with the proposal for
+ * closing"), or `Stopped · kept` (review finding F4 of PR #26: the user sees that the next start keeps it running). The
+ * suffix shows in every state, as the menu offers Stop When Closed in every state (round-2 review of PR #26), also
+ * `No container · kept` and `Updating · kept`. A tree item has one icon only, so the icon stays the one of the state,
+ * and the text marks the kept environment.
+ */
+export function rowStateText(state: EnvironmentState, kept: boolean): string {
+  return kept ? `${stateText(state)} · ${StateTexts.kept}` : stateText(state);
 }
 
 type StateInput = Pick<TreeInput, 'runtime' | 'currentEnvironmentId' | 'otherWindowEnvironmentIds' | 'busyEnvironmentIds'>;
@@ -290,9 +306,11 @@ export function rowActions(
 /**
  * `contextValue` of a repository row; the `when` clauses in package.json match these flags. `checks`: the switch of the
  * host access checks of the repository, the flag `hostAccessChecked` (Turn Off Host Access Checks…) or
- * `hostAccessUnrestricted` (Turn On Host Access Checks); none without it.
+ * `hostAccessUnrestricted` (Turn On Host Access Checks); none without it. `kept`: the switch Keep Running When Closed of
+ * the environment, the flag `kept` (Stop When Closed) or `canKeepRunning` (Keep Running When Closed); none for a row
+ * without environment.
  */
-export function contextValue(actions: RowActions, checks?: HostAccessChecks): string {
+export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean): string {
   const flags = ['repository'];
   if (actions.canStart) flags.push('canStart');
   if (actions.canStop) flags.push('canStop');
@@ -302,6 +320,8 @@ export function contextValue(actions: RowActions, checks?: HostAccessChecks): st
   if (actions.onGitHub) flags.push('onGitHub');
   if (checks === 'on') flags.push('hostAccessChecked');
   if (checks === 'off') flags.push('hostAccessUnrestricted');
+  if (kept === true) flags.push('kept');
+  if (kept === false) flags.push('canKeepRunning');
   return flags.join(';');
 }
 
@@ -615,13 +635,15 @@ function environmentRow(
   const checks: HostAccessChecks = hostAccessChecks(environment.repository, input.settings);
   const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   const left = [branch, configuration !== undefined ? `(${configuration})` : undefined].filter(isText).join(' ');
-  const right = [stateText(state), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
+  const kept = environment.keepRunning === true;
+  const right = [rowStateText(state, kept), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
   const description = [left, right].filter(isText).join('   ');
 
   const formatTime = input.formatTime ?? defaultFormatTime;
   const tooltip = [
     repository,
-    [stateText(state), changes].filter(isText).join(' · '),
+    [rowStateText(state, kept), changes].filter(isText).join(' · '),
+    kept ? TreeTexts.kept : undefined,
     branch !== undefined ? TreeTexts.branch(branch) : undefined,
     configuration !== undefined ? TreeTexts.configuration(configuration) : undefined,
     timeValue(environment.lastUsedAt) > 0 ? TreeTexts.lastUsed(formatTime(environment.lastUsedAt)) : undefined,
@@ -649,7 +671,7 @@ function environmentRow(
     label: name,
     description,
     tooltip,
-    contextValue: contextValue(actions, checks),
+    contextValue: contextValue(actions, checks, kept),
   };
 }
 

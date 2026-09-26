@@ -264,6 +264,7 @@ export class MonitorLoop {
         id: environment.id,
         busy: this.isBusy(environment, now, statuses, grace),
         shutdownActionNone: environment.shutdownActionNone === true,
+        keepRunning: environment.keepRunning === true,
       })),
       windows: statuses.map((status) => ({ status, alive: this.isAlive(status.pid) })),
       pendings,
@@ -402,6 +403,12 @@ export class MonitorLoop {
       this.deps.logger.info(`${label} is in use again. Its container is not stopped.`);
       return undefined;
     }
+    // The user chose Keep Running When Closed while the stop was under way (user decision 2026-09-26, "go with the
+    // proposal for closing"): only the user's Stop or Delete stops a kept environment.
+    if (environment.keepRunning === true) {
+      this.deps.logger.info(`${label} keeps running when closed. Its container is not stopped.`);
+      return undefined;
+    }
     return { environment, label };
   }
 
@@ -469,9 +476,13 @@ export class MonitorLoop {
         this.deps.logger.info(`${names.get(id) ?? id} runs, and no window uses it. It stops in ${seconds} seconds.`);
       }
     }
+    const kept = new Set(snapshot.monitorEnvironments.filter((environment) => environment.keepRunning).map((environment) => environment.id));
     for (const id of Object.keys(before)) {
-      if (!(id in after) && decision.inUse.has(id)) {
+      if (id in after) continue;
+      if (decision.inUse.has(id)) {
         this.deps.logger.info(`${names.get(id) ?? id} is in use again. The waiting time ends.`);
+      } else if (kept.has(id)) {
+        this.deps.logger.info(`${names.get(id) ?? id} keeps running when closed. The waiting time ends.`);
       }
     }
   }

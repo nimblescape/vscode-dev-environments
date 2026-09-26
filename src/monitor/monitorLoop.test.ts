@@ -431,6 +431,34 @@ describe('MonitorLoop.tick', () => {
     expect(h.logger.lines.some((line) => line.includes('acme/api is in use again. Its container is not stopped.'))).toBe(true);
   });
 
+  // User decision 2026-09-26, "go with the proposal for closing": Keep Running When Closed, stored in the registry.
+  it('never stops a kept environment: no Docker call, and the monitor ends while its container runs', async () => {
+    await closedWindowScenario(h, { keepRunning: true });
+    const results = await runUntil(h, T0 + 10 * WAITING_MS);
+    expect(results[0]?.end).toBe('idle');
+    expect(h.docker.count('stop')).toBe(0);
+    expect(h.docker.calls).toEqual([]);
+  });
+
+  it('does not stop when the environment becomes kept after the decision', async () => {
+    await closedWindowScenario(h);
+    await runUntil(h, T0 + WAITING_MS);
+    h.docker.listHook = async () => {
+      await h.registry.updateEnvironment(ID_A, (environment) => {
+        environment.keepRunning = true;
+      });
+    };
+    const result = await step(h);
+    expect(result.decision?.stop).toEqual([ID_A]);
+    expect(result.stopped).toEqual([]);
+    expect(h.docker.count('stop')).toBe(0);
+    expect(h.logger.lines).toContain('info acme/api keeps running when closed. Its container is not stopped.');
+    h.docker.listHook = undefined;
+    await step(h);
+    expect(h.logger.lines).toContain('info acme/api keeps running when closed. The waiting time ends.');
+    expect(h.docker.count('stop')).toBe(0);
+  });
+
   it('does not stop when a window connects while the Git state is read', async () => {
     await closedWindowScenario(h);
     await runUntil(h, T0 + WAITING_MS);

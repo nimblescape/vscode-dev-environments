@@ -39,6 +39,7 @@ import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
+import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
@@ -54,10 +55,12 @@ const FOCUS_REFRESH_INTERVAL_MS = 15_000;
 let coordinator: SessionCoordinator | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Concept 7.10: the reopen rule measures the age of the reopen record at this time, before any await.
+  const activatedAt = systemClock.now();
   const logger = new OutputChannelLogger();
   context.subscriptions.push(logger);
   try {
-    await activateExtension(context, logger);
+    await activateExtension(context, logger, activatedAt);
   } catch (error) {
     logger.error('Dev Environments could not be started.', error);
     throw error;
@@ -73,7 +76,11 @@ export function deactivate(): void {
   }
 }
 
-async function activateExtension(context: vscode.ExtensionContext, logger: OutputChannelLogger): Promise<void> {
+async function activateExtension(
+  context: vscode.ExtensionContext,
+  logger: OutputChannelLogger,
+  activatedAt: number,
+): Promise<void> {
   const platform = process.platform;
   const env = process.env;
   const paths = new StoragePaths(context.globalStorageUri.fsPath);
@@ -234,6 +241,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     logger,
     groupingInput: () => sidebar.groupingInput(),
     onDidRender: sidebar.onDidRender,
+    previewRunner: new PreviewWorkerRunner(context.asAbsolutePath(path.join('dist', 'groupsPreviewWorker.js'))),
   });
   context.subscriptions.push(repositoryGroupsEditor);
   const controller = new Controller({
@@ -343,7 +351,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   }
   background(started, 'start the window session');
   // Role B: pending operations, then the reopen rule. Role C (a local folder or another remote): nothing else.
-  if (connection.isEmptyWindow()) background(controller.runEmptyWindowTasks(), 'run the tasks of the empty window');
+  if (connection.isEmptyWindow()) background(controller.runEmptyWindowTasks(activatedAt), 'run the tasks of the empty window');
 }
 
 /**
