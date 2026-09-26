@@ -786,7 +786,7 @@ function volumeNameProblems(name: string, volumes: VolumeContext): Problem[] {
  * used.
  */
 export function volumeNameItems(name: string, input: VolumeInput): string[] {
-  return volumeNameProblems(name, volumeContext(input));
+  return volumeNameProblems(name, volumeContext(input)).map((problem) => problem.item);
 }
 
 /**
