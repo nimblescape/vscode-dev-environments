@@ -123,6 +123,8 @@ export interface ControllerDeps {
   dockerSetup: Pick<DockerSetup, 'openWizard' | 'install' | 'start' | 'installWsl'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
   viewVisible: () => boolean;
+  /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
+  development?: boolean;
   clock?: Clock;
   /** For tests. Default: `isProcessAlive`. */
   isAlive?: (pid: number) => boolean;
@@ -484,6 +486,7 @@ export class Controller implements vscode.Disposable {
       // Concept 7.5: only an environment of the signed-in account is opened again.
       environmentIds: new Set(availableEnvironments(environments, account).map((environment) => environment.id)),
       now: this.clock.now(),
+      development: this.deps.development,
     });
     if (!decision.reopen) {
       this.logger.info(`The last environment is not opened: ${decision.reason}.`);

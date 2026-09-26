@@ -755,6 +755,8 @@ Two mechanisms work together:
    - No operation is pending, for example a rebuild (see [7.14](#714-rebuild-and-delete)).
    - A reopen record exists, and it is older than 30 seconds.
 
+   In an Extension Development Host (a debug run of the extension, `ExtensionMode.Development`), the conditions about other windows and the 30 seconds do not apply: a new debug run starts within seconds after the previous one closed its window, and the window with the source code stays open.
+
    A notification "Opening acme-university/api… [Cancel]" lets the user stay in the empty window.
 
 **Reopen record.** Each window that is connected to an environment writes the reopen record in `deactivate()`, together with the state `closing`:

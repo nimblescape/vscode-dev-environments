@@ -55,6 +55,12 @@ export interface ReopenInput {
   /** IDs of the environments in the registry that the signed-in account may use (concept 7.5). */
   environmentIds: ReadonlySet<string>;
   now: number;
+  /**
+   * The window is an Extension Development Host (a debug run of this extension, ExtensionMode.Development). A new debug
+   * run follows the end of the previous one within seconds, and the window with the source code stays open: the
+   * 30-second rule and the other windows do not apply there.
+   */
+  development?: boolean;
 }
 
 export type ReopenDecision = { reopen: true; environmentId: string } | { reopen: false; reason: string };
@@ -63,7 +69,7 @@ export type ReopenDecision = { reopen: true; environmentId: string } | { reopen:
 export function decideReopen(input: ReopenInput): ReopenDecision {
   if (!input.settings.reopenLastOnStartup) return { reopen: false, reason: 'the setting reopenLastOnStartup is off' };
   if (!input.emptyWindow) return { reopen: false, reason: 'the window is not empty' };
-  if (input.otherActiveWindows > 0) return { reopen: false, reason: 'another window is open' };
+  if (input.otherActiveWindows > 0 && !input.development) return { reopen: false, reason: 'another window is open' };
   if (input.pendingOperations > 0) return { reopen: false, reason: 'an operation is pending' };
   const record = input.record;
   if (!record) return { reopen: false, reason: 'no environment was open before' };
@@ -72,7 +78,7 @@ export function decideReopen(input: ReopenInput): ReopenDecision {
   }
   const closedAt = Date.parse(record.closedAt);
   // A time in the future (clock change) does not count as old.
-  if (!Number.isFinite(closedAt) || input.now - closedAt <= REOPEN_MIN_AGE_MS) {
+  if (!Number.isFinite(closedAt) || (input.now - closedAt <= REOPEN_MIN_AGE_MS && !input.development)) {
     return { reopen: false, reason: 'the last environment was closed less than 30 seconds ago' };
   }
   return { reopen: true, environmentId: record.environmentId };
