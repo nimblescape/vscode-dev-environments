@@ -6,7 +6,8 @@
 import { CommandError } from '../errors';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
-import { CONTAINER_VERSION_LABEL, WORKSPACES_ROOT } from '../names';
+import type { HostAccessChecks } from '../hostAccessChecks';
+import { CONTAINER_VERSION_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL, WORKSPACES_ROOT } from '../names';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { loopbackAppPorts, overrideRunArgs, withoutNameArgs } from './hostAccess';
 
@@ -178,6 +179,9 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
  * `--name <container name>`), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
  * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
  * (ATTACHED_SHUTDOWN_ACTION, ../devContainers.ts).
+ * `hostAccessChecks` `off` (the switch of the repository, ../hostAccessChecks.ts): the published ports of runArgs and
+ * appPort keep the address that the configuration gives them (appPort as the configuration writes it), and runArgs get
+ * `--label devenv.host-access=unrestricted`, so that the container is created again once the checks are on.
  * `initializeCommand` is never passed: the host access policy refuses a configuration with one.
  */
 export function buildOverrideConfig(p: {
@@ -187,15 +191,18 @@ export function buildOverrideConfig(p: {
   containerName: string;
   runArgs?: string[];
   appPort?: DevcontainerConfig['appPort'];
+  hostAccessChecks?: HostAccessChecks;
 }): Record<string, unknown> {
+  const checksOn = p.hostAccessChecks !== 'off';
+  const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
   const override: Record<string, unknown> = {
     image: p.environmentImage,
     workspaceMount: `source=${p.volumeName},target=${WORKSPACES_ROOT},type=volume`,
     workspaceFolder: `${WORKSPACES_ROOT}/${p.repositoryName}`,
-    runArgs: [...overrideRunArgs(p.runArgs), '--label', CONTAINER_VERSION_LABEL, '--name', p.containerName],
+    runArgs: [...overrideRunArgs(p.runArgs, checksOn), ...labels, '--name', p.containerName],
   };
-  const appPort = loopbackAppPorts(p.appPort);
-  if (appPort !== undefined) override.appPort = appPort;
+  const appPort = checksOn ? loopbackAppPorts(p.appPort) : p.appPort;
+  if (appPort !== undefined && appPort !== null) override.appPort = appPort;
   // Merged over the containerEnv, remoteEnv, and settings of the image metadata; these values win. The settings only add
   // to the customizations of the image metadata (its extensions and other settings stay).
   override.containerEnv = containerEnvironment();

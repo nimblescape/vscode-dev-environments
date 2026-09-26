@@ -22,6 +22,7 @@ import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { isProcessAlive } from '../monitor/lock';
 import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
+import { RepositoryGroupTexts, parseRepositoryGroups, type RepositoryGroupPattern } from './repositoryGroups';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import { CoalescingTask, mapLimit } from './tasks';
@@ -38,6 +39,9 @@ export const LOADED_CONTEXT_KEY = 'devEnvironments.loaded';
 export const LOAD_FAILED_CONTEXT_KEY = 'devEnvironments.loadFailed';
 /** Branches of running containers are read with at most this many `docker exec` calls at a time. */
 const BRANCH_READ_CONCURRENCY = 4;
+
+/** Duration of one render with repository groups after which the view names the setting (warnIfGroupingIsSlow). */
+export const SLOW_GROUPING_MS = 200;
 
 export interface SidebarDeps {
   logger: Logger;
@@ -82,6 +86,9 @@ export class Sidebar implements vscode.Disposable {
   /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
   private accountChanges = 0;
   private disposed = false;
+  /** Problems of the setting repositoryGroups that were shown: each distinct one once per window session. */
+  private readonly shownGroupProblems = new Set<string>();
+  private slowGroupingWarned = false;
   private readonly renderTask = new CoalescingTask(() => this.renderNow());
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
   private readonly discoveryTask = new CoalescingTask(() => this.refreshDiscoveryNow());
@@ -295,6 +302,8 @@ export class Sidebar implements vscode.Disposable {
     const account = this.account;
     // Only the environments of the signed-in account; hidden ones are not counted or named anywhere (concept 7.5).
     const environments = availableEnvironments(entries, account);
+    const repositoryGroups = this.repositoryGroups();
+    const started = this.clock.now();
     const groups = buildTreeModel({
       discovery: this.data ?? this.shownPartial(),
       settings: this.deps.settings(),
@@ -310,9 +319,43 @@ export class Sidebar implements vscode.Disposable {
       liveBranches: this.liveBranches,
       signedIn: this.signedIn,
       repositoryLookups: this.lookups,
+      repositoryGroups,
       formatTime,
     });
+    this.warnIfGroupingIsSlow(repositoryGroups, this.clock.now() - started);
     this.deps.tree.setModel(groups, { signedIn: this.signedIn, dockerMissing: this.deps.dockerMissing?.() ?? false });
+  }
+
+  /**
+   * The valid entries of the setting repositoryGroups, compiled once for this model. An entry that is not valid is left
+   * out; its problem is logged and shown once per window session.
+   */
+  private repositoryGroups(): RepositoryGroupPattern[] {
+    const { patterns, problems } = parseRepositoryGroups(this.deps.settings().repositoryGroups);
+    for (const { message } of problems) {
+      if (this.shownGroupProblems.has(message)) continue;
+      this.shownGroupProblems.add(message);
+      this.deps.logger.warn(message);
+      vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => {
+        this.deps.logger.warn(`A warning could not be shown: ${errorMessage(error)}`);
+      });
+    }
+    return patterns;
+  }
+
+  /**
+   * The patterns of repositoryGroups run synchronously at each render of the view; a pattern with a nested repetition such
+   * as `(a+)+` can take very long for some names. A render that takes SLOW_GROUPING_MS or more with patterns is named
+   * once per window session, so the user can find the cause.
+   */
+  private warnIfGroupingIsSlow(patterns: readonly RepositoryGroupPattern[], elapsedMs: number): void {
+    if (patterns.length === 0 || elapsedMs < SLOW_GROUPING_MS || this.slowGroupingWarned) return;
+    this.slowGroupingWarned = true;
+    const message = RepositoryGroupTexts.slow(Math.round(elapsedMs));
+    this.deps.logger.warn(message);
+    vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => {
+      this.deps.logger.warn(`A warning could not be shown: ${errorMessage(error)}`);
+    });
   }
 
   private async refreshStatesNow(): Promise<void> {

@@ -46,6 +46,12 @@ export const ControllerTexts = {
   /** Concept section 9: a container of an older version uses the Git of the computer. */
   outdatedContainerClosed: (repository: string) =>
     `The container of ${repository} was made by an older version of Dev Environments and cannot be used. This window closes its connection. Start ${repository} again to make a new container.`,
+  /**
+   * Concept section 9 "Host access": a container that was made while the host access checks of the repository were off,
+   * and they are on now.
+   */
+  unrestrictedContainerClosed: (repository: string) =>
+    `The container of ${repository} was made while the host access checks were off. They are on now, so it cannot be used. This window closes its connection. Start ${repository} again to make a new container with the checks.`,
   noEnvironments: 'There is no environment yet. Start a repository to create one.',
   noRepositories: 'No repository is available. Sign in with GitHub, or refresh the list.',
   branchesUnavailable: 'The branches could not be loaded. Type the name of a branch.',

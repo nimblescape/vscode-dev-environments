@@ -61,6 +61,39 @@ export const Messages = {
   /** A container that was created while the configuration could not be read is created again with it. */
   containerConfigApplied:
     'The configuration of the environment can be read again, so the container is set up again with it. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * Concept section 9 "Host access": a container that was created while the host access checks were off for the
+   * repository is created again once they are on (and the configuration passes them).
+   */
+  containerHostAccessChecksOn:
+    'The host access checks are on again for this repository, so the container is set up again with them. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * The modal question of Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26), with
+   * what the configuration of the repository can then use (hostAccessChecksOffDetail).
+   */
+  hostAccessChecksOffConfirm: (repository: string) =>
+    `Turn off the host access checks for ${repository}? Only do this for a repository that you trust.`,
+  hostAccessChecksOffDetail:
+    'The configuration of the repository, its Features, and its base image can then use your computer:\n' +
+    '• the files and folders of your computer (bind mounts)\n' +
+    '• the Docker socket, which gives full control of Docker and of every other environment, also of other GitHub accounts\n' +
+    '• privileged mode, extra capabilities, and security options\n' +
+    '• devices and GPUs of your computer\n' +
+    '• published ports on all network addresses, so that other computers of the network can reach them\n' +
+    '• the volumes of other programs, for example of Docker Compose or of the Dev Containers extension\n\n' +
+    'Still checked: the volumes of your other environments and of other GitHub accounts, the GitHub account of the environment, and options that Dev Environments does not support. The change applies when the container of the environment is created next, for example with Rebuild. An existing container keeps its current settings, such as ports that are bound to this computer only.',
+  /** After Turn Off Host Access Checks… */
+  hostAccessChecksTurnedOff: (repository: string) =>
+    `The host access checks are off for ${repository}. They apply again when you turn them on. The change applies when the container of the environment is created next, for example with Rebuild; an existing container keeps its current settings, such as ports that are bound to this computer only.`,
+  /** After Turn On Host Access Checks. */
+  hostAccessChecksTurnedOn: (repository: string) =>
+    `The host access checks are on again for ${repository}. At the next start, a container that was made without them is set up again, if the configuration passes the checks. Your files in the repository are kept. Files in other folders of that container, for example in the home folder, are removed; copy them out before you start it again.`,
+  /** The warning in the tooltip of a repository row whose host access checks are off. */
+  hostAccessUnrestrictedTooltip:
+    'Warning: the host access checks are off for this repository. Its configuration can use the files, devices, and Docker of your computer.',
+  /** Entries of the setting devEnvLauncher.hostAccessChecksOff that are no repository name (`owner/name`). */
+  hostAccessChecksOffInvalid: (entries: string) =>
+    `The setting devEnvLauncher.hostAccessChecksOff has entries that are not a repository name like owner/name. They are ignored: ${entries}`,
   /** Concept section 9: Git before 2.9 does not remove the forwarding credential helper with an empty helper. */
   oldGit: (version: string) =>
     `Git ${version} in the environment is older than version 2.9. It may use the Git credentials of your computer instead of the GitHub account of the environment. Use an image with a newer Git.`,
@@ -134,6 +167,8 @@ export const Actions = {
   continue: 'Continue',
   assign: 'Assign',
   notNow: 'Not now',
+  /** The button of the modal question of Turn Off Host Access Checks…. */
+  turnOffChecks: 'Turn Off Checks',
 } as const;
 
 export const StateTexts = {
@@ -145,6 +180,8 @@ export const StateTexts = {
   noContainer: 'No container',
   filesMissing: 'Files missing',
   notOnGitHub: 'not on GitHub',
+  /** The marker of a repository whose host access checks are off (concept section 9 "Host access"). */
+  hostAccessUnrestricted: 'host access unrestricted',
 } as const;
 
 /** Formats the change counts of a Git summary, for example `2 uncommitted · 3 unpushed`. Empty when there are no changes. */

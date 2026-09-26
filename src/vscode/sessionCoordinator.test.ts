@@ -34,6 +34,7 @@ const SETTINGS: ExtensionSettings = {
   includeArchived: false,
   includeForks: true,
   refreshIntervalMinutes: 60,
+  hostAccessChecksOff: [],
 };
 
 interface SpawnCall {

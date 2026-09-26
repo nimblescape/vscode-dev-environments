@@ -40,7 +40,7 @@ import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { SessionCoordinator } from './sessionCoordinator';
-import { affectsSettings, readSettings } from './settings';
+import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
 import { Sidebar } from './sidebar';
 import { EnvironmentStatusBar } from './statusBar';
 import { Throttle } from './tasks';
@@ -83,6 +83,8 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
   }
   let settings: ExtensionSettings = readSettings();
   const getSettings = (): ExtensionSettings => settings;
+  // Invalid entries of devEnvLauncher.hostAccessChecksOff are ignored, with one warning (again only when they change).
+  let invalidHostAccessEntries = warnInvalidHostAccessChecksOff(logger, '');
 
   const runner = new NodeProcessRunner();
   const dockerPath = findDockerCli(env, platform);
@@ -294,6 +296,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
       if (!affectsSettings(event)) return;
       const previous = settings;
       settings = readSettings();
+      invalidHostAccessEntries = warnInvalidHostAccessChecksOff(logger, invalidHostAccessEntries);
       updateOwnersContextKey(settings.owners, logger);
       // Concept 7.4: another scan scope loads the list again at once.
       if (!sameScope(previous.owners, settings.owners)) {

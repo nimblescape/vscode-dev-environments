@@ -8,7 +8,15 @@ import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { runArgsUser } from '../helper/hostAccess';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import { CONTAINER_CONFIG_UNKNOWN, CONTAINER_VERSION, LABEL_CONTAINER_CONFIG, LABEL_CONTAINER_VERSION } from '../names';
+import type { HostAccessChecks } from '../hostAccessChecks';
+import {
+  CONTAINER_CONFIG_UNKNOWN,
+  CONTAINER_VERSION,
+  HOST_ACCESS_UNRESTRICTED,
+  LABEL_CONTAINER_CONFIG,
+  LABEL_CONTAINER_VERSION,
+  LABEL_HOST_ACCESS,
+} from '../names';
 import type { DevcontainerResult, RefusedUpdate } from '../types';
 
 export type { RefusedUpdate };
@@ -24,12 +32,26 @@ export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
  * (label devenv.container-config=unknown) is not current either: it lacks the runArgs and appPort of the configuration.
  * While the configuration cannot be read, such a container is current, so it is only started and not created again at
  * every open.
+ * `hostAccessChecks`: the switch of the repository now (hostAccessChecks in ../hostAccessChecks.ts). While the checks
+ * are on, a container that was created while they were off (label devenv.host-access=unrestricted,
+ * isUnrestrictedContainer) is not current: the pipeline creates it again once the checks pass, and never starts it as
+ * it is. While they are off, the label does not matter: a container created with the checks on has less access.
  */
-export function containerIsCurrent(labels: Readonly<Record<string, string>>, configKnown = true): boolean {
+export function containerIsCurrent(
+  labels: Readonly<Record<string, string>>,
+  configKnown = true,
+  hostAccessChecks: HostAccessChecks = 'on',
+): boolean {
   const text = labels[LABEL_CONTAINER_VERSION];
   const version = text !== undefined && /^\d{1,6}$/.test(text) ? Number(text) : 0;
   if (version < CONTAINER_VERSION) return false;
+  if (hostAccessChecks === 'on' && isUnrestrictedContainer(labels)) return false;
   return !configKnown || labels[LABEL_CONTAINER_CONFIG] !== CONTAINER_CONFIG_UNKNOWN;
+}
+
+/** True for a container that was created while the host access checks were off (label devenv.host-access=unrestricted). */
+export function isUnrestrictedContainer(labels: Readonly<Record<string, string>>): boolean {
+  return labels[LABEL_HOST_ACCESS] === HOST_ACCESS_UNRESTRICTED;
 }
 
 /** The field `refusedUpdate` of a registry entry, when it is valid. */
@@ -41,17 +63,31 @@ export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
     typeof value.configHash !== 'string' ||
     !isStringRecord(value.images) ||
     !isStringRecord(value.features) ||
-    typeof value.items !== 'string'
+    typeof value.items !== 'string' ||
+    (value.hostAccessChecks !== undefined && value.hostAccessChecks !== 'off')
   ) {
     return undefined;
   }
-  return { configPath: value.configPath, configHash: value.configHash, images: value.images, features: value.features, items: value.items };
+  const refused: RefusedUpdate = {
+    configPath: value.configPath,
+    configHash: value.configHash,
+    images: value.images,
+    features: value.features,
+    items: value.items,
+  };
+  if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
+  return refused;
 }
 
-/** True if `update` is the refused update `refused`: same configuration, same digests (ignoring the case). */
+/**
+ * True if `update` is the refused update `refused`: same configuration, same digests (ignoring the case), and the same
+ * state of the host access checks (absent: on). A refusal while the checks were on does not block the update once they
+ * are off for the repository, and a refusal while they were off does not block it once they are on again.
+ */
 export function isRefusedUpdate(refused: RefusedUpdate | undefined, update: Omit<RefusedUpdate, 'items'>): boolean {
   return (
     refused !== undefined &&
+    (refused.hostAccessChecks ?? 'on') === (update.hostAccessChecks ?? 'on') &&
     refused.configPath === update.configPath &&
     refused.configHash === update.configHash &&
     sameDigests(refused.images, update.images) &&

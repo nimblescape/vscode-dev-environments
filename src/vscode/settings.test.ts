@@ -3,11 +3,21 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import type { ExtensionSettings } from '../core/types';
-import { DEFAULT_SETTINGS, MAX_REFRESH_INTERVAL_MINUTES, normalizeSettings, readSettings, SETTINGS_SECTION } from './settings';
+import { Messages } from '../core/messages';
+import {
+  DEFAULT_SETTINGS,
+  MAX_REFRESH_INTERVAL_MINUTES,
+  normalizeSettings,
+  readSettings,
+  SETTINGS_SECTION,
+  warnInvalidHostAccessChecksOff,
+} from './settings';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 describe('settings (concept section 8)', () => {
@@ -24,12 +34,17 @@ describe('settings (concept section 8)', () => {
       includeArchived: false,
       includeForks: true,
       refreshIntervalMinutes: 60,
+      // Unit 10: no repository has its host access checks off by default.
+      hostAccessChecksOff: [],
+      // Unit 9 (setting repositoryGroups, concept 8): a new setting with the default [].
+      repositoryGroups: [],
     });
   });
 
   it('reads the section devEnvLauncher', () => {
     const values: Partial<Record<keyof ExtensionSettings, unknown>> = { stopOnClose: false, owners: ['acme'] };
-    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: (key: keyof ExtensionSettings) => values[key] });
+    // `inspect`: devEnvLauncher.hostAccessChecksOff is read from the user settings only (unit 10); it has no user value here.
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: (key: keyof ExtensionSettings) => values[key], inspect: () => undefined });
     expect(readSettings()).toEqual({ ...DEFAULT_SETTINGS, stopOnClose: false, owners: ['acme'] });
     expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
     expect(SETTINGS_SECTION).toBe('devEnvLauncher');
@@ -52,6 +67,22 @@ describe('settings (concept section 8)', () => {
     expect(normalizeSettings((key) => (key === 'owners' ? 'acme' : undefined)).owners).toEqual([]);
   });
 
+  it('reads the entries of repositoryGroups as they are, and replaces a value that is not a list with []', () => {
+    const entries = ['^a', { name: 'B', pattern: '^b', flags: 'i' }, 3];
+    expect(normalizeSettings((key) => (key === 'repositoryGroups' ? entries : undefined)).repositoryGroups).toEqual(entries);
+    for (const value of ['^a', null, 3, { pattern: '^a' }]) {
+      expect(normalizeSettings((key) => (key === 'repositoryGroups' ? value : undefined)).repositoryGroups).toEqual([]);
+    }
+  });
+
+  it('declares repositoryGroups with the scope application, so a workspace cannot set regular expressions', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { scope?: string; default?: unknown }> } };
+    };
+    const setting = manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.repositoryGroups`];
+    expect(setting).toMatchObject({ scope: 'application', default: [] });
+  });
+
   it('clamps the waiting time and the refresh interval', () => {
     const settings = (raw: Record<string, unknown>) => normalizeSettings((key) => raw[key]);
     expect(settings({ waitingTimeSeconds: -5 }).waitingTimeSeconds).toBe(0);
@@ -61,5 +92,37 @@ describe('settings (concept section 8)', () => {
     // A timer with a longer delay would fire every millisecond.
     expect(settings({ refreshIntervalMinutes: 1_000_000 }).refreshIntervalMinutes).toBe(MAX_REFRESH_INTERVAL_MINUTES);
     expect(MAX_REFRESH_INTERVAL_MINUTES * 60_000).toBeLessThanOrEqual(2 ** 31 - 1);
+  });
+
+  it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {
+    const get = vi.fn((key: string) => (key === 'hostAccessChecksOff' ? ['from/workspace'] : undefined));
+    const inspect = vi.fn((): { globalValue?: string[]; workspaceValue: string[] } => ({
+      globalValue: [' acme/api ', 'not a name', 'me/web'],
+      workspaceValue: ['evil/repo'],
+    }));
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get, inspect });
+    expect(readSettings().hostAccessChecksOff).toEqual(['acme/api', 'me/web']);
+    expect(inspect).toHaveBeenCalledWith('hostAccessChecksOff');
+    expect(get).not.toHaveBeenCalledWith('hostAccessChecksOff');
+    // Without a user value, every check is on.
+    inspect.mockReturnValue({ globalValue: undefined, workspaceValue: ['evil/repo'] });
+    expect(readSettings().hostAccessChecksOff).toEqual([]);
+    expect(normalizeSettings((key) => (key === 'hostAccessChecksOff' ? 'acme/api' : undefined)).hostAccessChecksOff).toEqual([]);
+  });
+
+  it('warns once about the invalid entries of hostAccessChecksOff, and again only when they change', () => {
+    const inspect = vi.fn((): { globalValue: unknown[] } => ({ globalValue: ['acme/api', 'acme', 3] }));
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: () => undefined, inspect });
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    const warned = warnInvalidHostAccessChecksOff(logger, '');
+    expect(warned).toBe('acme, 3');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.hostAccessChecksOffInvalid('acme, 3'));
+    expect(logger.warn).toHaveBeenCalledWith(Messages.hostAccessChecksOffInvalid('acme, 3'));
+    expect(warnInvalidHostAccessChecksOff(logger, warned)).toBe(warned);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    inspect.mockReturnValue({ globalValue: ['acme/api'] });
+    expect(warnInvalidHostAccessChecksOff(logger, warned)).toBe('');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
   });
 });

@@ -26,6 +26,7 @@ import {
   type HostAccessReport,
 } from '../helper/hostAccess';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
+import { hostAccessChecks, type HostAccessChecks } from '../hostAccessChecks';
 import type { WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   collectReferences,
@@ -101,6 +102,7 @@ import {
   isRefusedUpdate,
   isRepositoryName,
   isRootUser,
+  isUnrestrictedContainer,
   lifecycleHookFailure,
   lifecycleHookName,
   needsBuild,
@@ -354,6 +356,11 @@ interface PipelineContext {
    * runs while Docker starts and the image check runs. Never rejects.
    */
   identity: Promise<GitIdentity>;
+  /**
+   * The switch of the host access checks for the repository, read from the settings at the start of this open
+   * (hostAccessChecks, concept section 9 "Host access"). `off` lifts the refusals of access to the computer.
+   */
+  hostAccessChecks: HostAccessChecks;
 }
 
 /** A token together with the account of its session. */
@@ -760,6 +767,7 @@ export class EnvironmentService {
       session,
       gitPrepared: false,
       identity,
+      hostAccessChecks: this.hostAccessChecksFor(environment.repository),
     };
     try {
       steps.step('downloadingRepository');
@@ -825,6 +833,7 @@ export class EnvironmentService {
         session,
         gitPrepared: false,
         identity,
+        hostAccessChecks: this.hostAccessChecksFor(env.repository),
       };
       if (!(await this.deps.docker.volumeExists(env.volumeName))) {
         await this.recoverMissingFiles(ctx, defaultBranch, options.progress);
@@ -982,7 +991,7 @@ export class EnvironmentService {
     // configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
     let loaded: LoadedConfiguration | undefined;
     try {
-      loaded = await this.loadConfiguration(ctx, imagePresent);
+      loaded = await this.loadConfiguration(ctx, imagePresent, container);
     } catch (error) {
       const usable = container !== undefined || imagePresent;
       if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) {
@@ -996,7 +1005,7 @@ export class EnvironmentService {
     if (loaded) {
       await this.saveConfiguration(ctx, loaded, record);
       // A container of an older setup is created again (concept section 9); it does not count as a working container.
-      const currentContainer = container !== undefined && containerIsCurrent(container.labels);
+      const currentContainer = container !== undefined && containerIsCurrent(container.labels, true, ctx.hostAccessChecks);
       const plan = await this.planUpdate(ctx, loaded, record, imagePresent, currentContainer);
       if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
     }
@@ -1004,8 +1013,15 @@ export class EnvironmentService {
     return this.finish(ctx, outcome, loaded);
   }
 
-  /** Step 5: reads the configuration from the volume. */
-  private async loadConfiguration(ctx: PipelineContext, imagePresent: boolean): Promise<LoadedConfiguration> {
+  /**
+   * Step 5: reads the configuration from the volume. `container`: the container of the environment, if it exists (the
+   * CLI merges its metadata into the merged configuration).
+   */
+  private async loadConfiguration(
+    ctx: PipelineContext,
+    imagePresent: boolean,
+    container: ContainerInfo | undefined,
+  ): Promise<LoadedConfiguration> {
     const { helper } = this.deps;
     const env = ctx.env;
     // Reading the configuration is the first part of the image check (concept 6.5 step 3). Without a likely check, no
@@ -1029,7 +1045,7 @@ export class EnvironmentService {
     if (problems.compose) throw new UserFacingError('composeNotSupported', Messages.composeNotSupported);
 
     await this.requireVolume(env);
-    const { config, merged } = await helper.readConfiguration({
+    const read = await helper.readConfiguration({
       volumeName: env.volumeName,
       repository: env.repository,
       configPath,
@@ -1037,9 +1053,21 @@ export class EnvironmentService {
       onOutput: this.output,
       signal: ctx.signal,
     });
+    const config = read.config;
+    let merged = read.merged;
+    // The CLI merges the metadata of an existing container. A container created while the host access checks were off
+    // holds what they allowed then (for example `privileged` of a configuration that has changed since); with the checks
+    // on, it is not current and is created again (containerIsCurrent), and the image metadata of the new container is
+    // checked before `up` (checkImageHostAccess). So its merged configuration does not block the open.
+    if (merged !== undefined && ctx.hostAccessChecks === 'on' && container !== undefined && isUnrestrictedContainer(container.labels)) {
+      this.logger.info(
+        `The container ${container.name} was created while the host access checks were off. Its merged configuration is not checked; the image metadata is checked before the container is created again.`,
+      );
+      merged = undefined;
+    }
     // Concept section 9 "Host access": checked before any build or container start.
     const checked = await this.hostAccessInput(env, { config, merged });
-    const report = hostAccessReport(checked);
+    const report = hostAccessReport(checked, ctx.hostAccessChecks === 'on');
     if (isRefused(report)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
       throw new HostAccessError(report);
@@ -1155,7 +1183,7 @@ export class EnvironmentService {
       imagePresent &&
       check.kind === 'checked' &&
       !check.upToDate &&
-      isRefusedUpdate(refused, this.updateKey(loaded, record, check.outcome));
+      isRefusedUpdate(refused, this.updateKey(ctx, loaded, record, check.outcome));
     if (refusedAgain && refused && check.kind === 'checked') {
       this.logger.info(`The update of ${ctx.env.repository} was refused by the host access policy (${refused.items}). The existing environment is used.`);
       this.deps.ui.warn(Messages.updateRefused(refused.items));
@@ -1215,12 +1243,19 @@ export class EnvironmentService {
   }
 
   /** What identifies an update (RefusedUpdate): the configuration and the digests that the new build record would get. */
-  private updateKey(loaded: LoadedConfiguration, record: BuildRecord | undefined, outcome: CheckedOutcome): Omit<RefusedUpdate, 'items'> {
+  private updateKey(
+    ctx: PipelineContext,
+    loaded: LoadedConfiguration,
+    record: BuildRecord | undefined,
+    outcome: CheckedOutcome,
+  ): Omit<RefusedUpdate, 'items'> {
     return {
       configPath: loaded.configPath,
       configHash: loaded.configHash,
       images: recordDigests(loaded.references.images, outcome.images, record?.images),
       features: recordDigests(loaded.references.features, outcome.features, record?.features),
+      // The switch of the host access checks is part of the update: a refusal with one state does not block the other.
+      ...(ctx.hostAccessChecks === 'off' ? { hostAccessChecks: 'off' as const } : {}),
     };
   }
 
@@ -1242,7 +1277,8 @@ export class EnvironmentService {
     // A container of an older setup is no fallback by itself: it must be created again, from an image that exists.
     const containerUsable =
       container !== undefined &&
-      (containerIsCurrent(container.labels) || (await this.deps.docker.imageExists(container.image).catch(() => false)));
+      (containerIsCurrent(container.labels, true, ctx.hostAccessChecks) ||
+        (await this.deps.docker.imageExists(container.image).catch(() => false)));
     const canFallBack = containerUsable || oldImageUsable;
     // An update that only follows newer digests keeps the old environment when a download fails. Otherwise a build is
     // needed anyway, and an image that exists locally is good enough when its download fails.
@@ -1291,7 +1327,9 @@ export class EnvironmentService {
     // Concept 7.7 step 3: replace the container, with the same workspace volume.
     ctx.steps.step('starting');
     // A newer image names the replacement already (Messages.newerImage); otherwise the user learns it here.
-    if (container !== undefined && !containerIsCurrent(container.labels) && !plan.updateAvailable) this.announceRecreation(ctx, container);
+    if (container !== undefined && !containerIsCurrent(container.labels, true, ctx.hostAccessChecks) && !plan.updateAvailable) {
+      this.announceRecreation(ctx, container);
+    }
     let result: DevcontainerResult;
     try {
       result = await this.runUp(ctx, imageName, loaded.config, container !== undefined, true);
@@ -1319,7 +1357,8 @@ export class EnvironmentService {
       this.deps.ui.warn(Messages.buildFailed);
       // The old container is started when it still exists; a missing or half-created one is replaced.
       const survivor = await this.deps.docker.findContainer(env.id).catch(() => undefined);
-      const keep = survivor !== undefined && survivor.image === previousImage && containerIsCurrent(survivor.labels);
+      const keep =
+        survivor !== undefined && survivor.image === previousImage && containerIsCurrent(survivor.labels, true, ctx.hostAccessChecks);
       this.logger.info(
         keep
           ? `The previous container ${survivor.name} is started again.`
@@ -1372,7 +1411,7 @@ export class EnvironmentService {
     this.logger.info(`The existing environment of ${ctx.env.repository} is started without the update. A changed digest or configuration tries it again.`);
     this.deps.ui.warn(Messages.updateRefused(items));
     if (check.kind !== 'checked') return;
-    const refusedUpdate: RefusedUpdate = { ...this.updateKey(loaded, record, check.outcome), items };
+    const refusedUpdate: RefusedUpdate = { ...this.updateKey(ctx, loaded, record, check.outcome), items };
     await this.updateEntry(ctx, (entry) => {
       entry.refusedUpdate = refusedUpdate;
     });
@@ -1464,8 +1503,10 @@ export class EnvironmentService {
     // Concept section 9: a container of an older setup, without the variables of container-only Git, is created again
     // from its environment image, like a missing one. The volume stays. So is a container that was created without the
     // configuration (it could not be read then), once the configuration can be read: it lacks its runArgs and appPort.
+    // So is a container that was created while the host access checks were off, once they are on again: it is created
+    // again when the checks pass (the image metadata before `up`), and never started as it is.
     const configKnown = loaded !== undefined;
-    const outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown);
+    const outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks);
     if (container?.state === 'running' && !outdated) {
       this.logger.info(`The container ${container.name} runs already.`);
       await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
@@ -1486,9 +1527,11 @@ export class EnvironmentService {
     if (!image) throw new UserFacingError('buildFailed', Messages.buildFailed, 'There is no environment image.');
     if (outdated && container) {
       this.logger.info(
-        containerIsCurrent(container.labels, false)
-          ? `The container ${container.name} was created without the configuration, which can be read now. It is created again from ${image}; the files in the volume are kept.`
-          : `The container ${container.name} was created by an older version of Dev Environments. It is created again from ${image}; the files in the volume are kept.`,
+        this.recreatedForHostAccess(ctx, container)
+          ? `The container ${container.name} was created while the host access checks were off. They are on now: it is created again from ${image}; the files in the volume are kept.`
+          : containerIsCurrent(container.labels, false, ctx.hostAccessChecks)
+            ? `The container ${container.name} was created without the configuration, which can be read now. It is created again from ${image}; the files in the volume are kept.`
+            : `The container ${container.name} was created by an older version of Dev Environments. It is created again from ${image}; the files in the volume are kept.`,
       );
       this.announceRecreation(ctx, container);
     }
@@ -1513,9 +1556,39 @@ export class EnvironmentService {
    * workspace volume, for example the home folder, are lost. The progress says so, as it names a newer image (concept 6.5).
    */
   private announceRecreation(ctx: PipelineContext, container: ContainerInfo): void {
+    if (this.recreatedForHostAccess(ctx, container)) {
+      ctx.steps.detail(Messages.containerHostAccessChecksOn);
+      return;
+    }
     // Current apart from the configuration: it was created while the configuration could not be read.
-    const withoutConfiguration = containerIsCurrent(container.labels, false);
+    const withoutConfiguration = containerIsCurrent(container.labels, false, ctx.hostAccessChecks);
     ctx.steps.detail(withoutConfiguration ? Messages.containerConfigApplied : Messages.containerRecreated);
+  }
+
+  /**
+   * True when the container is created again only because it was created while the host access checks were off, and
+   * they are on now (a container of the current version otherwise).
+   */
+  private recreatedForHostAccess(ctx: PipelineContext, container: ContainerInfo): boolean {
+    return (
+      ctx.hostAccessChecks === 'on' &&
+      isUnrestrictedContainer(container.labels) &&
+      containerIsCurrent(container.labels, false, 'off')
+    );
+  }
+
+  /**
+   * The switch of the host access checks for `repository`, read from the settings at each open (hostAccessChecks). The
+   * log states it when the checks are off.
+   */
+  private hostAccessChecksFor(repository: string): HostAccessChecks {
+    const checks = hostAccessChecks(repository, this.deps.settings());
+    if (checks === 'off') {
+      this.logger.warn(
+        `The host access checks are off for ${repository} (setting devEnvLauncher.hostAccessChecksOff): its configuration may use files, devices, and Docker of the computer. Account separation, the identity of the owner account, and the options that Dev Environments does not support are still checked.`,
+      );
+    }
+    return checks;
   }
 
   /** Without the workspace helper, a stopped container still starts with `docker start` (offline after an extension update). */
@@ -1554,6 +1627,7 @@ export class EnvironmentService {
       const list = removed.map((entry) => `${entry.arg} (${entry.reason})`).join(', ');
       this.logger.info(`Removed from the runArgs of ${env.repository}: ${list}.`);
     }
+    const checksOn = ctx.hostAccessChecks === 'on';
     const override = buildOverrideConfig({
       environmentImage: image,
       volumeName: env.volumeName,
@@ -1561,10 +1635,11 @@ export class EnvironmentService {
       containerName: env.containerName,
       runArgs,
       appPort: config?.appPort,
+      hostAccessChecks: ctx.hostAccessChecks,
     });
     // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
     // pass the policy too (the check of the configuration covers them as the repository wrote them).
-    const finalRunArgs = hostAccessReport(await this.hostAccessInput(env, { config: { runArgs: override.runArgs } }));
+    const finalRunArgs = hostAccessReport(await this.hostAccessInput(env, { config: { runArgs: override.runArgs } }), checksOn);
     // What Docker gets: its last --user decides the user of the container (imageRemoteUser).
     const dockerRunArgs = stringList(override.runArgs) ?? [];
     if (isRefused(finalRunArgs)) {
@@ -1779,7 +1854,8 @@ export class EnvironmentService {
       }
     }
     const checked = await this.hostAccessInput(ctx.env, { metadata });
-    const report = hostAccessReport(checked);
+    // The same switch as the check of the configuration (read at the start of this open).
+    const report = hostAccessReport(checked, ctx.hostAccessChecks === 'on');
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);

@@ -50,6 +50,15 @@ export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
 export const CONTAINER_VERSION_LABEL = `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`;
 /** `--label` value of the override configuration of a container created without the configuration of the repository. */
 export const CONTAINER_CONFIG_UNKNOWN_LABEL = `${LABEL_CONTAINER_CONFIG}=${CONTAINER_CONFIG_UNKNOWN}`;
+/**
+ * Container label of a container that was created while the host access checks were off for its repository (setting
+ * devEnvLauncher.hostAccessChecksOff, concept section 9 "Host access"), with the value HOST_ACCESS_UNRESTRICTED. Once the
+ * checks are on again, such a container is not current (containerIsCurrent): it is created again after the checks pass.
+ */
+export const LABEL_HOST_ACCESS = 'devenv.host-access';
+export const HOST_ACCESS_UNRESTRICTED = 'unrestricted';
+/** `--label` value of the override configuration of a container created while the host access checks were off. */
+export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCESS_UNRESTRICTED}`;
 export const LABEL_HELPER = 'devenv.helper';
 export const LABEL_HELPER_RUN = 'devenv.helper-run';
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';

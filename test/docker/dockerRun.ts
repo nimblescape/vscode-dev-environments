@@ -144,7 +144,7 @@ export interface ContainerDetails {
   Name: string;
   State: { Status: string; Running: boolean };
   Config: { Image: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean };
-  HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null };
+  HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null; Privileged?: boolean };
   Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
 }
 
