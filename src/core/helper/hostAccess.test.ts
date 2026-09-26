@@ -19,6 +19,7 @@ import {
   hostAccessProblems,
   hostAccessReport,
   isLoopbackAddress,
+  isOwnVolume,
   loopbackAppPorts,
   loopbackRunArgs,
   mountedVolumeNames,
@@ -64,8 +65,9 @@ describe('host access policy: mounts (concept section 9 "Host access")', () => {
     // volumes named with a hash.
     ['the cache volume of the Dev Containers extension', 'source=vscode,target=/vscode,type=volume', ['volume vscode of the Dev Containers extension']],
     ['the cache volume of the Dev Containers extension as an object', { type: 'volume', source: 'vscode', target: '/v' }, ['volume vscode of the Dev Containers extension']],
-    ['a clone volume of the Dev Containers extension (SHA-256)', `source=api-${'5e'.repeat(32)},target=/x,type=volume`, [`volume api-${'5e'.repeat(32)} of the Dev Containers extension`]],
-    ['a clone volume of the Dev Containers extension (MD5)', `source=vsc-api-${'0f'.repeat(16)},target=/x`, [`volume vsc-api-${'0f'.repeat(16)} of the Dev Containers extension`]],
+    // A name that ends in a hash is decided by the volume, when it exists (see "volumes named like a clone volume").
+    ['a name like a clone volume of the Dev Containers extension (SHA-256) that does not exist', `source=api-${'5e'.repeat(32)},target=/x,type=volume`, []],
+    ['a name like a clone volume of the Dev Containers extension (MD5) that does not exist', `source=vsc-api-${'0f'.repeat(16)},target=/x`, []],
     ['the proposed name of a named clone volume of the Dev Containers extension', 'source=vsc-remote-containers,target=/x,type=volume', ['volume vsc-remote-containers of the Dev Containers extension']],
     ['volumes whose names only look similar', 'source=vscode-extensions,target=/x,type=volume', []],
     ['a hash of another length (SHA-1)', `source=api-${'a'.repeat(40)},target=/x,type=volume`, []],
@@ -108,6 +110,23 @@ describe('host access policy: runArgs', () => {
     ],
     ['--mount with a line break', ['--mount', 'type=bind,src=/,dst=/host\n,type=volume,src=v'], ['mount "type=bind,src=/,dst=/host\\n,type=volume,src=v"']],
     ['DNS and hosts', ['--add-host', 'host.docker.internal:host-gateway', '--dns=1.1.1.1', '--dns-search', 'corp', '--dns-option=ndots:1'], []],
+    [
+      'each known DNS, memory, and health check flag, with its value next or after =',
+      [
+        '--dns', '1.1.1.1', '--dns=8.8.8.8', '--dns-option', 'ndots:2', '--dns-option=timeout:1', '--dns-opt', 'rotate', '--dns-opt=attempts:2',
+        '--dns-search', 'corp', '--dns-search=example.com',
+        '--memory', '4g', '--memory=2g', '--memory-reservation', '1g', '--memory-reservation=512m', '--memory-swap', '5g', '--memory-swap=-1',
+        '--memory-swappiness', '10', '--memory-swappiness=0',
+        '--health-cmd', 'true', '--health-cmd=true', '--health-interval', '30s', '--health-interval=10s', '--health-retries', '3', '--health-retries=5',
+        '--health-start-period', '5s', '--health-start-period=1s', '--health-start-interval', '1s', '--health-start-interval=2s',
+        '--health-timeout', '2s', '--health-timeout=3s', '--no-healthcheck',
+      ],
+      [],
+    ],
+    // An unknown flag that starts like a known one does not take the next argument as its value: `--privileged` is seen.
+    ['an unknown flag that starts like --dns', ['--dns-foo', '--privileged'], ['--dns-foo', 'privileged mode']],
+    ['unknown flags that start like --memory and --health-', ['--memory-foo', '-v', '/:/host', '--health-foo=1', '--healthcheck'], ['--memory-foo', 'bind mount /', '--health-foo', '--healthcheck']],
+    ['a value of a known flag that looks like a flag stays its value', ['--dns-search', '--privileged'], []],
     ['init, labels, hostname, name', ['--init', '--label', 'a=b', '-l', 'c=d', '--hostname', 'h', '-h', 'h2', '--name', 'x'], []],
     ['environment variables', ['--env', 'A=1', '-e', 'B=2', '-eC=3', '-e=D=4', '--env-file', '/workspaces/api/.env'], []],
     ['limits', ['--shm-size=1g', '--ulimit', 'nofile=1024', '--memory', '4g', '-m', '2g', '--memory-swap=5g', '--cpus', '2'], []],
@@ -652,6 +671,66 @@ describe('volumes of environments of other accounts (restrictions summary, findi
 
   it('allows the own workspace volume, also when the registry names it for another account', () => {
     expect(hostAccessProblems({ config: { mounts: [`source=${OWN},target=/o,type=volume`] }, ownVolume: OWN, foreignVolumes: [OWN] })).toEqual([]);
+  });
+});
+
+describe('volumes named like a clone volume of the Dev Containers extension (a name that ends in a hash)', () => {
+  const SHA = `api-${'5e'.repeat(32)}`;
+  const MD5 = `vsc-api-${'0f'.repeat(16)}`;
+  const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const OWN_LABELS = { 'devenv.environment-id': ENVIRONMENT.id, 'devenv.owner-id': '1001', 'devenv.repository': 'acme/api', 'devenv.volume': 'additional' };
+
+  it.each<[string, Record<string, Record<string, string>>, string[]]>([
+    ['they do not exist yet (the pipeline creates them with its labels)', {}, []],
+    ['they exist without labels (older versions of the Dev Containers extension)', { [SHA]: {}, [MD5]: {} }, [`volume ${SHA} of another program`, `volume ${MD5} of another program`]],
+    ['they exist with the labels of the Dev Containers extension', { [SHA]: { 'vsch.local.repository': 'x' }, [MD5]: { 'dev.container.volume': 'true' } }, [`volume ${SHA} of the Dev Containers extension`, `volume ${MD5} of the Dev Containers extension`]],
+    ['they exist with other labels', { [SHA]: { 'com.example': 'x' } }, [`volume ${SHA} of another program`]],
+    ['they are the own volumes of the environment', { [SHA]: OWN_LABELS, [MD5]: OWN_LABELS }, []],
+  ])('%s', (_name, volumeLabels, expected) => {
+    const config = { mounts: [`source=${SHA},target=/s,type=volume`], runArgs: ['-v', `${MD5}:/m`] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels, environment: ENVIRONMENT })).toEqual(expected);
+  });
+});
+
+describe('volumes with the labels of Dev Environments', () => {
+  const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const FORMER = 'e0000009-0000-4000-8000-000000000009';
+  const labels = (id: string, owner?: string, kind: string | null = 'additional'): Record<string, string> => ({
+    'devenv.environment-id': id,
+    'devenv.repository': 'acme/api',
+    ...(owner === undefined ? {} : { 'devenv.owner-id': owner }),
+    ...(kind === null ? {} : { 'devenv.volume': kind }),
+  });
+
+  it.each<[string, Record<string, string>, readonly string[], string[]]>([
+    ['its own volume', labels(ENVIRONMENT.id, '1001'), [ENVIRONMENT.id], []],
+    ['its own volume without an owner label (an entry of an older version)', labels(ENVIRONMENT.id), [ENVIRONMENT.id], []],
+    ['its own ID with the owner label of another account', labels(ENVIRONMENT.id, '2002'), [ENVIRONMENT.id], ['volume data of another environment']],
+    ['a volume of another environment in the registry, also of the same owner', labels(FORMER, '1001'), [ENVIRONMENT.id, FORMER], ['volume data of another environment']],
+    ['a volume that the Delete of an environment of the same owner kept', labels(FORMER, '1001'), [ENVIRONMENT.id], []],
+    ['a volume that the Delete of an environment of another owner kept', labels(FORMER, '2002'), [ENVIRONMENT.id], ['volume data of another environment']],
+    ['a volume of a deleted environment without an owner label', labels(FORMER), [ENVIRONMENT.id], ['volume data of another environment']],
+    ['a volume of a deleted environment that is no additional volume', labels(FORMER, '1001', null), [ENVIRONMENT.id], ['volume data of another environment']],
+  ])('%s', (_name, volumeLabels, environmentIds, expected) => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: volumeLabels }, environment: ENVIRONMENT, environmentIds })).toEqual(expected);
+  });
+
+  it('refuses every volume with devenv.environment-id when the environment is not known', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: labels(ENVIRONMENT.id, '1001') } })).toEqual(['volume data of another environment']);
+  });
+
+  it.each<[string, Record<string, string>, string | undefined, boolean]>([
+    ['the ID and the owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '1' }, '1', true],
+    ['the ID without an owner label', { 'devenv.environment-id': 'a' }, '1', true],
+    ['the ID of an environment without owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '1' }, undefined, true],
+    ['another owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '2' }, '1', false],
+    ['another ID', { 'devenv.environment-id': 'b', 'devenv.owner-id': '1' }, '1', false],
+    ['no labels', {}, '1', false],
+    ['labels of another program', { 'com.docker.compose.project': 'a' }, '1', false],
+  ])('isOwnVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isOwnVolume(volumeLabels, 'a', ownerId)).toBe(expected);
   });
 });
 

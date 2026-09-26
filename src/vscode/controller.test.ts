@@ -202,6 +202,7 @@ interface Harness {
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
+    removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
   };
   connection: {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
@@ -271,6 +272,8 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     listConfigurations: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
     reconcileFromVolumes: vi.fn(async () => 0),
+    // By default, Delete could remove every recorded volume (their labels make them the environment's own).
+    removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
   };
   const connection: Harness['connection'] = {
     open: vi.fn(async () => {}),
@@ -858,6 +861,24 @@ describe('Delete', () => {
       Actions.deleteAnyway,
     ]);
     expect(calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+  });
+
+  it('offers only the additional volumes that Delete would remove, and asks nothing when there are none', async () => {
+    await h.registry.add(environment({ additionalVolumes: ['api-db', 'legacy-cache'] }));
+    h.service.removableAdditionalVolumes.mockResolvedValueOnce(['api-db']);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete).mockResolvedValueOnce(Actions.remove);
+    await run('delete', row('acme/api', environment()));
+    expect(h.service.removableAdditionalVolumes).toHaveBeenCalledWith(ENV_ID);
+    expect(fakeVscode.window.showWarningMessage.mock.calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+
+    fakeVscode.window.showWarningMessage.mockReset();
+    h.service.delete.mockClear();
+    h.service.removableAdditionalVolumes.mockResolvedValueOnce([]);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 

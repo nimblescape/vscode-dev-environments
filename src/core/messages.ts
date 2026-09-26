@@ -24,6 +24,9 @@ export const Messages = {
   registryUnreachable:
     'No connection to the image registry. The update check was skipped. The environment uses the local image.',
   firstOpenOffline: 'This repository cannot be opened without internet access.',
+  /** The pull of an image needs the GitHub sign-in, and the connection to the Docker engine is neither local nor encrypted. */
+  unencryptedDockerConnection:
+    'The image of this environment can only be downloaded with your GitHub sign-in. The connection to Docker is not encrypted, so Dev Environments does not send the sign-in. Use a local Docker, or connect to Docker over SSH or TLS.',
   registrySignIn: (registry: string) => `The registry ${registry} requires a sign-in.`,
   organizationNotAuthorized: (organization: string) =>
     `Access to the organization ${organization} is not authorized.`,

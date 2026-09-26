@@ -18,6 +18,8 @@ import {
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  LABEL_VOLUME,
+  VOLUME_KIND_ADDITIONAL,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -253,6 +255,20 @@ export class FakeDocker implements EnvironmentDocker {
   containersOf(environmentId: string): ContainerInfo[] {
     return [...this.containers.values()].filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId);
   }
+}
+
+/**
+ * Labels of an additional volume that the pipeline created for the environment `id` (additionalVolumeLabels): only
+ * these make a volume the environment's own. `owner` null: an entry of an older version without owner.
+ */
+export function additionalVolumeLabels(
+  id: string = ENV_ID,
+  owner: GitHubAccount | null = ACCOUNT,
+  repository: string = REPO,
+): Record<string, string> {
+  const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL };
+  if (owner) labels[LABEL_OWNER_ID] = owner.id;
+  return labels;
 }
 
 /**

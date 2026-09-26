@@ -569,7 +569,9 @@ export class Controller implements vscode.Disposable {
           if (choice !== Actions.delete) return;
         }
         const confirmed = (await this.deps.registry.get(environment.id)) ?? environment;
-        const volumes = confirmed.additionalVolumes ?? [];
+        // Only the volumes that Delete would remove (their labels make them the environment's own); the others are kept
+        // anyway, with a line in the log, so the question does not offer them.
+        const volumes = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableAdditionalVolumes(confirmed.id) : [];
         let additionalVolumesToRemove: string[] = [];
         if (volumes.length > 0) {
           const choice = await vscode.window.showWarningMessage(

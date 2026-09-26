@@ -98,6 +98,7 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   filesMissing: ['showDetails'],
   signInRequired: ['signIn'],
   hostAccess: ['showDetails'],
+  unencryptedDockerConnection: ['showDetails'],
   otherAccount: [],
   // An entry of an older version that the claim did not assign yet (concept 7.5): a later try can assign it.
   environmentUnassigned: 'retry',
@@ -111,6 +112,7 @@ const WARNINGS = new Set<UserErrorCode>([
   'gitSwitchFailed',
   'signInRequired',
   'hostAccess',
+  'unencryptedDockerConnection',
   'otherAccount',
   'environmentUnassigned',
 ]);

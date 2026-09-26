@@ -11,6 +11,8 @@ import {
   containerIsCurrent,
   digestReference,
   errorDetail,
+  configRemoteUser,
+  containerUserName,
   imageRemoteUser,
   imagesToPull,
   isGitHubTokenRejected,
@@ -270,6 +272,54 @@ describe('imageRemoteUser', () => {
     expect(imageRemoteUser({ User: 'node', Labels: null })).toBe('node');
     expect(imageRemoteUser({ User: '', Labels: { 'devcontainer.metadata': 'not json' } })).toBe('root');
     expect(imageRemoteUser(undefined)).toBe('root');
+  });
+
+  // Dev Container CLI 0.89.0: `docker run -u <containerUser> …runArgs`, so the last --user of the runArgs is the user of
+  // the container; remoteUser = last remoteUser, else that user, else root; `user:group` → user; `0` → root.
+  it.each<[string, unknown, readonly unknown[] | undefined, string]>([
+    ['runArgs --user with a root image', { User: 'root', Labels: {} }, ['--user', 'node'], 'node'],
+    ['runArgs --user= with an image without a user', { User: '', Labels: {} }, ['--user=node'], 'node'],
+    ['runArgs -u before containerUser of the metadata', metadata([{ containerUser: 'app' }]), ['-u', 'dev'], 'dev'],
+    ['the last --user of the runArgs wins, as in docker run', { User: 'root' }, ['-u', 'a', '--init', '--user', 'b', '-uc'], 'c'],
+    ['remoteUser of the metadata wins over runArgs --user', metadata([{ remoteUser: 'vscode' }]), ['--user', 'node'], 'vscode'],
+    ['a --user that is the value of another flag does not count', { User: 'node' }, ['--label', '--user'], 'node'],
+    ['an empty last --user leaves the user of the image', { User: 'node' }, ['--user', 'x', '--user='], 'node'],
+    ['user:group of the runArgs', { User: 'root' }, ['--user', 'node:staff'], 'node'],
+    ['user:group of the remoteUser', metadata([{ remoteUser: '1000:1000' }]), undefined, '1000'],
+    ['user:group of containerUser', metadata([{ containerUser: 'app:app' }]), [], 'app'],
+    ['numeric 0 of the runArgs is root', { User: 'node' }, ['--user', '0'], 'root'],
+    ['numeric 0:0 of the image is root', { User: '0:0' }, undefined, 'root'],
+    ['numeric 0 of the remoteUser is root', metadata([{ remoteUser: '0' }]), undefined, 'root'],
+    ['numeric users other than 0 stay', { User: 'root' }, ['-u', '1000'], '1000'],
+  ])('%s', (_name, config, runArgs, expected) => {
+    expect(imageRemoteUser(config, runArgs)).toBe(expected);
+  });
+});
+
+describe('configRemoteUser', () => {
+  it.each<[string, { remoteUser?: unknown; containerUser?: unknown } | undefined, readonly unknown[] | undefined, string | undefined]>([
+    ['remoteUser first', { remoteUser: 'vscode', containerUser: 'app' }, ['--user', 'node'], 'vscode'],
+    ['then runArgs --user', { containerUser: 'app' }, ['--user', 'node'], 'node'],
+    ['then containerUser', { containerUser: 'app:app' }, [], 'app'],
+    ['0 is root', { remoteUser: '0' }, undefined, 'root'],
+    ['none', {}, undefined, undefined],
+    ['no configuration', undefined, undefined, undefined],
+  ])('%s', (_name, config, runArgs, expected) => {
+    expect(configRemoteUser(config, runArgs)).toBe(expected);
+  });
+});
+
+describe('containerUserName', () => {
+  it.each([
+    ['node', 'node'],
+    ['node:staff', 'node'],
+    ['0', 'root'],
+    ['0:0', 'root'],
+    ['1000:1000', '1000'],
+    [':1000', 'root'],
+    ['root', 'root'],
+  ])('%s → %s', (user, expected) => {
+    expect(containerUserName(user)).toBe(expected);
   });
 });
 

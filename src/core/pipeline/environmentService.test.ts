@@ -41,6 +41,7 @@ import {
   T0,
   TOKEN,
   WINDOW_ID,
+  additionalVolumeLabels,
   checked,
   createHarness,
   imageConfigWithUser,
@@ -352,6 +353,21 @@ describe('open: first open', () => {
     expect(run.args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     // The fix after up stays, for files that up itself creates as root.
     expect(h.docker.execs.some((e) => e.user === 'root')).toBe(true);
+  });
+
+  it('gives the cloned files to the user of --user in runArgs when no remoteUser is set (rule of the Dev Container CLI)', async () => {
+    const { remoteUser: _remoteUser, ...config } = h.helper.config;
+    h.helper.config = { ...config, runArgs: ['--user', 'node:staff'] };
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      h.docker.imageConfigs.set(p.imageName, { User: 'root', Labels: { 'devcontainer.metadata': JSON.stringify([{ id: 'base' }]) } });
+      return result;
+    };
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['--user', 'node:staff']));
+    expect(h.docker.runs).toHaveLength(1);
+    expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'node']);
   });
 
   it('continues when the files cannot be given to the remote user before up', async () => {
@@ -1645,6 +1661,34 @@ describe('open: private image on ghcr.io', () => {
     expect([...h.logger.infos, ...h.logger.warnings].join('\n')).not.toContain(SESSION.password);
   });
 
+  const UNENCRYPTED = () =>
+    new UserFacingError('unencryptedDockerConnection', Messages.unencryptedDockerConnection, 'The Docker endpoint tcp://10.0.0.5:2375 is not encrypted.');
+
+  it('downloads without the GitHub sign-in when the connection to Docker is not encrypted (a public image)', async () => {
+    h = recreate({ pullCredentials: async () => ({ ...SESSION }) });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${PRIVATE_IMAGE}" }` };
+    h.helper.config = { image: PRIVATE_IMAGE };
+    h.checker.outcome = checked({ [PRIVATE_IMAGE]: DIGEST_NEW });
+    h.docker.pullError = (_reference, credentials) => (credentials ? UNENCRYPTED() : undefined);
+    await h.service.open(TARGET, options());
+    expect(h.docker.pulls).toEqual([{ reference: PRIVATE_IMAGE, credentials: SESSION }, { reference: PRIVATE_IMAGE }]);
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.logger.warnings.some((w) => w.includes('tcp://10.0.0.5:2375') && w.includes('without the GitHub sign-in'))).toBe(true);
+  });
+
+  it('names the unencrypted connection when the image also fails without the sign-in', async () => {
+    h = recreate({ pullCredentials: async () => ({ ...SESSION }) });
+    usePrivateImage();
+    h.docker.pullError = (_reference, credentials) =>
+      credentials ? UNENCRYPTED() : new CommandError('docker pull', 1, '', 'Error response from daemon: denied');
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('unencryptedDockerConnection');
+    expect(error.message).toBe(Messages.unencryptedDockerConnection);
+    expect(error.detail).toContain('denied');
+    expect(h.docker.pulls).toEqual([{ reference: PRIVATE_IMAGE, credentials: SESSION }, { reference: PRIVATE_IMAGE }]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
   it('pulls with the credentials of Docker when there are no others', async () => {
     h = recreate({ pullCredentials: async () => undefined });
     await h.service.open(TARGET, options());
@@ -1730,8 +1774,8 @@ describe('delete', () => {
       extra: { additionalVolumes: ['shared-cache'] },
     });
     h.docker.images.add(environmentImageName(ENV_ID, 3));
-    h.docker.volumes.set('api-data', {});
-    h.docker.volumes.set('shared-cache', {});
+    h.docker.volumes.set('api-data', additionalVolumeLabels());
+    h.docker.volumes.set('shared-cache', additionalVolumeLabels());
     await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
     await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'delete', requestedAt: new Date(0).toISOString(), requestedBy: WINDOW_ID, reason: 'manual' });
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: new Date(0).toISOString() });
@@ -1756,9 +1800,9 @@ describe('delete', () => {
   it('removes only the confirmed additional volumes, and keeps a volume that another program created under a recorded name', async () => {
     // `late` was recorded after the question (for example by a rebuild in another window); `db` now belongs to Compose.
     await seedEnvironment(h, { extra: { additionalVolumes: ['api-data', 'db', 'late'] } });
-    h.docker.volumes.set('api-data', {});
+    h.docker.volumes.set('api-data', additionalVolumeLabels());
     h.docker.volumes.set('db', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' });
-    h.docker.volumes.set('late', {});
+    h.docker.volumes.set('late', additionalVolumeLabels());
     await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-data', 'db', 'gone'] }));
     expect(h.docker.volumes.has('api-data')).toBe(false);
     expect(h.docker.volumes.has('db')).toBe(true);
@@ -1769,10 +1813,46 @@ describe('delete', () => {
   it('keeps a recorded volume that the policy gives to something else by its name, also when the user confirmed it', async () => {
     await seedEnvironment(h, { extra: { additionalVolumes: ['vscode', 'api-data'] } });
     h.docker.volumes.set('vscode', {});
-    h.docker.volumes.set('api-data', {});
+    h.docker.volumes.set('api-data', additionalVolumeLabels());
     await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['vscode', 'api-data'] }));
     expect(h.docker.volumes.has('vscode')).toBe(true);
     expect(h.docker.volumes.has('api-data')).toBe(false);
+  });
+
+  it('removes only volumes whose labels make them its own, and names why it keeps each other one', async () => {
+    await seedEnvironment(h, { extra: { additionalVolumes: ['own', 'legacy', 'other-env', 'other-owner', 'no-owner'] } });
+    h.docker.volumes.set('own', additionalVolumeLabels());
+    // Recorded by a version before the labels: the user removes it.
+    h.docker.volumes.set('legacy', {});
+    h.docker.volumes.set('other-env', additionalVolumeLabels(OTHER_ID));
+    h.docker.volumes.set('other-owner', additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
+    // A volume without an owner label (an entry of an older version) is its own by the ID.
+    h.docker.volumes.set('no-owner', additionalVolumeLabels(ENV_ID, null));
+    await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['own', 'legacy', 'other-env', 'other-owner', 'no-owner'] }));
+    expect(h.docker.volumes.has('own')).toBe(false);
+    expect(h.docker.volumes.has('no-owner')).toBe(false);
+    expect(h.docker.volumes.has('legacy')).toBe(true);
+    expect(h.docker.volumes.has('other-env')).toBe(true);
+    expect(h.docker.volumes.has('other-owner')).toBe(true);
+    const unlabeled = 'its labels do not show that this environment created it (for example, a version of Dev Environments before these labels created it)';
+    expect(h.logger.infos).toEqual(
+      expect.arrayContaining([
+        `The volume legacy is kept, because ${unlabeled}.`,
+        'The volume other-env is kept, because another environment created it.',
+        'The volume other-owner is kept, because another environment created it.',
+      ]),
+    );
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm ') && !line.endsWith(NAME))).toEqual(['volume rm own', 'volume rm no-owner']);
+  });
+
+  it('names for the question only the volumes that Delete would remove', async () => {
+    await seedEnvironment(h, { extra: { additionalVolumes: ['own', 'legacy', 'gone', 'shared'] } });
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, extra: { additionalVolumes: ['shared'] } });
+    h.docker.volumes.set('own', additionalVolumeLabels());
+    h.docker.volumes.set('legacy', {});
+    h.docker.volumes.set('shared', additionalVolumeLabels());
+    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['own']);
+    expect(await h.service.removableAdditionalVolumes('f0000001-0000-4000-8000-000000000001')).toEqual([]);
   });
 
   it('removes the tag of an unused base image that the removal by digest keeps (classic image store)', async () => {
@@ -2015,11 +2095,10 @@ describe('reconcileFromVolumes', () => {
     expect(await h.service.reconcileFromVolumes()).toBe(0);
   });
 
-  it('restores the additional volumes from the container of the environment, so that another account cannot take them over', async () => {
+  it('restores the additional volumes by their labels, so that another account cannot take them over', async () => {
     const name = resourceName('acme/api', OTHER_ID);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api', [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
-    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
-    h.docker.containers.set(container.id, { ...container, volumes: [name, 'api-node_modules'] });
+    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, OTHER_ACCOUNT));
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
     // The first open of the signed-in account is refused the volume of the other account's restored environment.
@@ -2028,13 +2107,17 @@ describe('reconcileFromVolumes', () => {
     expect(error.message).toBe(Messages.hostAccess('volume api-node_modules of another environment'));
   });
 
-  it('restores only the named volumes of the containers of each environment: not anonymous ones, not those of other programs or environments', async () => {
+  it('restores only the volumes whose labels make them its own: not anonymous ones, not those of other programs, environments, or owners', async () => {
     const name = resourceName('acme/api', OTHER_ID);
     const anonymous = 'ab'.repeat(32);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api' });
+    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, null));
     h.docker.volumes.set(anonymous, { 'com.docker.volume.anonymous': '' });
     h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop' });
-    for (const volumes of [[name, 'api-node_modules', anonymous], [name, 'api-node_modules', 'shop_db']]) {
+    // Mounted by the container, but without the labels (a version before them, or `${devcontainerId}`).
+    h.docker.volumes.set('api-history', {});
+    h.docker.volumes.set('x-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001'));
+    for (const volumes of [[name, 'api-node_modules', anonymous, 'api-history'], [name, 'api-node_modules', 'shop_db']]) {
       const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
       h.docker.containers.set(container.id, { ...container, volumes });
     }
@@ -2057,6 +2140,7 @@ describe('reconcileFromVolumes', () => {
   it('restores no volume that the policy gives to something else by its name', async () => {
     const name = resourceName(REPO, OTHER_ID);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, null));
     const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-acme-web-12345678'];
     const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
@@ -2945,21 +3029,59 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.helper.ups).toHaveLength(1);
     });
 
-    it('are recorded from the container that `up` creates: a name with ${devcontainerId} gets its name only there', async () => {
+    it('are not recorded when only `up` names them: a name with ${devcontainerId} gets no labels (Dev Container CLI 0.89.0)', async () => {
       await seedEnvironment(h, { container: null });
       h.helper.config = { image: BASE_IMAGE, mounts: ['source=${devcontainerId}-history,target=/h,type=volume'] };
       h.helper.containerVolumes = ['0k5q7r2m-history', 'ab'.repeat(32), 'vscode'];
+      // Docker creates the volumes of the mounts at `up`, without labels.
+      const up = h.helper.up.bind(h.helper);
+      h.helper.up = async (p) => {
+        for (const volume of h.helper.containerVolumes) if (!h.docker.volumes.has(volume)) h.docker.volumes.set(volume, {});
+        return up(p);
+      };
       await h.service.openEnvironment(ENV_ID, options());
-      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
-      // Delete can remove it.
-      h.docker.volumes.set('0k5q7r2m-history', {});
+      // Not created before `up` (the name is not known then), so not labeled and not recorded.
+      expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toBeUndefined();
+      // Delete keeps it.
       await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['0k5q7r2m-history'] }));
-      expect(h.docker.volumes.has('0k5q7r2m-history')).toBe(false);
+      expect(h.docker.volumes.has('0k5q7r2m-history')).toBe(true);
+    });
+
+    it('are created with the labels of the environment before `up`, recorded, and removed by Delete', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=api-history,target=/h,type=volume'], runArgs: ['-v', 'api-cache:/c'] };
+      h.docker.volumes.set('api-existing', { 'com.example': 'x' });
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [{ type: 'volume', source: 'feature-store', target: '/f' }, 'source=api-existing,target=/e,type=volume'] }]));
+      let createdAtUp: string[] = [];
+      const up = h.helper.up.bind(h.helper);
+      h.helper.up = async (p) => {
+        createdAtUp = h.docker.log.filter((line) => line.startsWith('volume create'));
+        return up(p);
+      };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(createdAtUp).toEqual(['volume create api-history', 'volume create api-cache', 'volume create feature-store']);
+      for (const name of ['api-history', 'api-cache', 'feature-store']) expect(h.docker.volumes.get(name)).toEqual(additionalVolumeLabels());
+      // An existing volume keeps its labels and is not the environment's.
+      expect(h.docker.volumes.get('api-existing')).toEqual({ 'com.example': 'x' });
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['api-history', 'api-cache', 'feature-store']);
+      await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-history', 'api-cache', 'feature-store'] }));
+      for (const name of ['api-history', 'api-cache', 'feature-store']) expect(h.docker.volumes.has(name)).toBe(false);
+      expect(h.docker.volumes.has('api-existing')).toBe(true);
+    });
+
+    it('creates no volume when the container exists already', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=api-history,target=/h,type=volume'] };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
     });
 
     it('are recorded from a container whose `up` failed after it created the container, at once and at the next open', async () => {
       await seedEnvironment(h, { container: null });
-      h.helper.config = { image: BASE_IMAGE, mounts: ['source=${devcontainerId}-history,target=/h,type=volume'] };
+      h.helper.config = { image: BASE_IMAGE };
+      // An own volume that the container mounts, whose record was lost.
+      h.docker.volumes.set('0k5q7r2m-history', additionalVolumeLabels());
       h.helper.containerVolumes = ['0k5q7r2m-history'];
       const up = h.helper.up.bind(h.helper);
       let fail = true;
@@ -2979,9 +3101,11 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
     });
 
-    it('are recorded from the merged configuration too (a Feature of an existing container)', async () => {
+    it('are recorded from the merged configuration too (a Feature of an existing container), when their labels make them its own', async () => {
       await seedEnvironment(h);
-      h.helper.merged = { mounts: ['source=feature-cache,target=/c,type=volume'] };
+      h.helper.merged = { mounts: ['source=feature-cache,target=/c,type=volume', 'source=legacy-cache,target=/l,type=volume'] };
+      h.docker.volumes.set('feature-cache', additionalVolumeLabels());
+      h.docker.volumes.set('legacy-cache', {});
       await h.service.openEnvironment(ENV_ID, options());
       expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['feature-cache']);
     });

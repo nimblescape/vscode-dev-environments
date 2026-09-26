@@ -9,6 +9,13 @@ export const LABEL_ENVIRONMENT_ID = 'devenv.environment-id';
 export const LABEL_REPOSITORY = 'devenv.repository';
 /** Volume label: the GitHub user ID of the account that created the environment (concept 7.5). */
 export const LABEL_OWNER_ID = 'devenv.owner-id';
+/**
+ * Volume label of the additional volumes that the extension creates before `up` (the named volumes that a configuration
+ * mounts), with the value VOLUME_KIND_ADDITIONAL. Such a volume also carries devenv.environment-id, devenv.owner-id,
+ * and devenv.repository of its environment: only these labels make a volume the environment's own (isOwnVolume).
+ */
+export const LABEL_VOLUME = 'devenv.volume';
+export const VOLUME_KIND_ADDITIONAL = 'additional';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
 export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
 /**

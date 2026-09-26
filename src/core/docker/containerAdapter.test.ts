@@ -10,6 +10,7 @@ import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner
 import {
   ContainerAdapter,
   DOCKER_CLI_LOOKUP_RETRY_MS,
+  isProtectedDockerEndpoint,
   mapContainerState,
   parseJsonLines,
   registryLoginConfig,
@@ -881,10 +882,37 @@ describe('ContainerAdapter.pullImage with credentials', () => {
 
   it('keeps a DOCKER_HOST that is set, and does not read the context', async () => {
     const { runner, seen } = pullRunner();
-    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin', DOCKER_HOST: 'tcp://10.0.0.5:2375' }, silentLogger, 'linux');
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin', DOCKER_HOST: 'ssh://me@build-host' }, silentLogger, 'linux');
     await docker.pullImage('ghcr.io/acme/x', { credentials: LOGIN });
     expect(runner.calls.map((call) => call.args[0])).toEqual(['--config']);
-    expect(seen[0].env?.DOCKER_HOST).toBe('tcp://10.0.0.5:2375');
+    expect(seen[0].env?.DOCKER_HOST).toBe('ssh://me@build-host');
+  });
+
+  it('keeps a tcp DOCKER_HOST with TLS verification and its certificates', async () => {
+    const { runner, seen } = pullRunner();
+    const env = { DOCKER_HOST: 'tcp://10.0.0.5:2376', DOCKER_TLS_VERIFY: '1', DOCKER_CERT_PATH: '/home/u/certs' };
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin', ...env }, silentLogger, 'linux');
+    await docker.pullImage('ghcr.io/acme/x', { credentials: LOGIN });
+    expect(seen[0].env).toMatchObject(env);
+  });
+
+  it.each<[string, NodeJS.ProcessEnv, string | undefined]>([
+    ['a tcp DOCKER_HOST without TLS', { DOCKER_HOST: 'tcp://10.0.0.5:2375' }, undefined],
+    ['a tcp DOCKER_HOST with DOCKER_TLS_VERIFY=0', { DOCKER_HOST: 'tcp://10.0.0.5:2376', DOCKER_TLS_VERIFY: '0', DOCKER_CERT_PATH: '/c' }, undefined],
+    ['a tcp DOCKER_HOST without DOCKER_CERT_PATH', { DOCKER_HOST: 'tcp://10.0.0.5:2376', DOCKER_TLS_VERIFY: '1' }, undefined],
+    ['a tcp endpoint of the Docker context without TLS variables', { DOCKER_CONTEXT: 'remote' }, 'tcp://10.0.0.5:2376'],
+    ['an endpoint of an unknown scheme', { DOCKER_HOST: 'http://10.0.0.5:2375' }, undefined],
+  ])('does not send the credentials over %s', async (_name, env, contextHost) => {
+    const { runner, seen } = pullRunner({ contextHost });
+    const { logger, lines } = recordingLogger();
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin', ...env }, logger, 'linux');
+    const error = await docker.pullImage('ghcr.io/acme/x', { credentials: LOGIN }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(UserFacingError);
+    expect(error).toMatchObject({ code: 'unencryptedDockerConnection', message: Messages.unencryptedDockerConnection });
+    expect(seen).toEqual([]);
+    expect(runner.calls.some((call) => call.args[0] === '--config' || call.args.includes('pull'))).toBe(false);
+    expect(lines.join('\n')).not.toContain('gho_secret_token');
+    expect(String((error as UserFacingError).detail)).not.toContain('gho_secret_token');
   });
 
   it('uses the default endpoint when the context cannot be read', async () => {
@@ -909,6 +937,27 @@ describe('ContainerAdapter.pullImage with credentials', () => {
     await docker.pullImage('ubuntu:24.04', {});
     expect(runner.calls.map((call) => call.args)).toEqual([['pull', 'ubuntu:24.04']]);
     expect(runner.calls[0].options.env?.DOCKER_HOST).toBeUndefined();
+  });
+
+  it.each<[string, string | undefined, NodeJS.ProcessEnv, NodeJS.Platform, boolean]>([
+    ['the default endpoint (no DOCKER_HOST)', undefined, {}, 'linux', true],
+    ['an empty endpoint', '  ', {}, 'darwin', true],
+    ['a Unix socket', 'unix:///var/run/docker.sock', {}, 'linux', true],
+    ['a named pipe', 'npipe:////./pipe/docker_engine', {}, 'win32', true],
+    ['SSH', 'ssh://me@host:22', {}, 'darwin', true],
+    ['an upper-case scheme', 'UNIX:///var/run/docker.sock', {}, 'linux', true],
+    ['tcp with TLS verification and certificates', 'tcp://h:2376', { DOCKER_TLS_VERIFY: '1', DOCKER_CERT_PATH: '/c' }, 'linux', true],
+    ['tcp with the variables in another spelling on Windows', 'tcp://h:2376', { docker_tls_verify: 'yes', Docker_Cert_Path: 'C:\\c' }, 'win32', true],
+    ['tcp without TLS', 'tcp://h:2375', {}, 'linux', false],
+    ['tcp with DOCKER_TLS_VERIFY=0', 'tcp://h:2376', { DOCKER_TLS_VERIFY: '0', DOCKER_CERT_PATH: '/c' }, 'linux', false],
+    ['tcp with an empty DOCKER_TLS_VERIFY', 'tcp://h:2376', { DOCKER_TLS_VERIFY: '', DOCKER_CERT_PATH: '/c' }, 'linux', false],
+    ['tcp without DOCKER_CERT_PATH', 'tcp://h:2376', { DOCKER_TLS_VERIFY: '1' }, 'linux', false],
+    ['tcp with only DOCKER_TLS (no verification)', 'tcp://h:2376', { DOCKER_TLS: '1', DOCKER_CERT_PATH: '/c' }, 'linux', false],
+    ['http', 'http://h:2375', {}, 'linux', false],
+    ['fd', 'fd://', {}, 'linux', false],
+    ['a host without a scheme', 'h:2375', {}, 'linux', false],
+  ])('isProtectedDockerEndpoint: %s', (_name, host, env, platform, expected) => {
+    expect(isProtectedDockerEndpoint(host, env, platform)).toBe(expected);
   });
 
   it('registryLoginConfig encodes user and password as Docker does', () => {

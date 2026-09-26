@@ -7,7 +7,7 @@
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the
 // pipeline can run again at any time.
 import { isBusyMarkLive } from '../busy';
-import { ContainerAdapter, type ContainerInfo } from '../docker/containerAdapter';
+import { ContainerAdapter, type ContainerInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
@@ -15,8 +15,8 @@ import { checkConfiguration } from '../helper/configChecks';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
 import {
-  foreignVolumeName,
   hostAccessReport,
+  isOwnVolume,
   mountedVolumeNames,
   removedRunArgs,
   volumeLabelOwner,
@@ -42,6 +42,8 @@ import {
   LABEL_HELPER_RUN,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  LABEL_VOLUME,
+  VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
   configurationName,
   environmentImageName,
@@ -89,6 +91,7 @@ import {
   containerIsCurrent,
   digestReference,
   errorDetail,
+  configRemoteUser,
   imageRemoteUser,
   imagesToPull,
   isGitHubTokenRejected,
@@ -447,6 +450,14 @@ function volumeLabels(environment: Environment): Record<string, string> {
   // The owner comes back with the entry when the registry is lost (concept 7.5).
   if (environment.owner) labels[LABEL_OWNER_ID] = environment.owner.id;
   return labels;
+}
+
+/**
+ * Labels of an additional volume that the pipeline creates before `up`: those of the workspace volume, and
+ * devenv.volume=additional. Only these labels make a volume the environment's own (isOwnVolume).
+ */
+export function additionalVolumeLabels(environment: Environment): Record<string, string> {
+  return { ...volumeLabels(environment), [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1088,15 +1099,17 @@ export class EnvironmentService {
    * is stored.
    */
   private async saveConfiguration(ctx: PipelineContext, loaded: LoadedConfiguration, record: BuildRecord | undefined): Promise<void> {
-    const additionalVolumes = loaded.mountedVolumes.filter((name) => name !== ctx.env.volumeName);
+    // Only the volumes whose labels make them the environment's own (ownVolumes); the others are never recorded.
+    const additionalVolumes = await this.ownVolumes(loaded.mountedVolumes, ctx.env);
     const configPath = loaded.fallback && record !== undefined ? ctx.configPath : loaded.configPath;
     await this.updateEntry(ctx, (entry) => {
       entry.configPath = configPath;
       entry.shutdownActionNone = loaded.config.shutdownAction === 'none';
-      // Volumes recorded before stay: the image metadata adds its own (recordMetadataVolumes), and a volume that the
-      // environment used may still hold its data.
+      // Volumes recorded before stay: the pipeline adds those that it creates before `up` (createAdditionalVolumes), and
+      // a volume that the environment used may still hold its data.
       const recorded = entry.additionalVolumes ?? [];
-      entry.additionalVolumes = [...recorded, ...additionalVolumes.filter((name) => !recorded.includes(name))];
+      const added = additionalVolumes.filter((name) => !recorded.includes(name));
+      if (added.length > 0) entry.additionalVolumes = [...recorded, ...added];
       // A refused update of another configuration is not tried again anyway.
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
@@ -1385,13 +1398,36 @@ export class EnvironmentService {
   private async pull(ctx: PipelineContext, reference: string, tolerateFailure: boolean, stale: Set<string>): Promise<void> {
     try {
       const credentials = await this.pullCredentials(reference, ctx.signal);
-      await this.deps.docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal, ...(credentials ? { credentials } : {}) });
+      await this.pullWith(ctx, reference, credentials);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || !tolerateFailure) throw error;
       const local = await this.deps.docker.imageExists(reference).catch(() => false);
       if (!local) throw error;
       this.logger.warn(`${reference} could not be downloaded. The local image is used: ${errorMessage(error)}`);
       stale.add(reference);
+    }
+  }
+
+  /**
+   * `docker pull` of `reference`, with `credentials` when there are any. The adapter sends them only over a local or
+   * encrypted connection to Docker (UserFacingError('unencryptedDockerConnection')); then the image is downloaded
+   * without them, as Docker does with its own credentials (a public image on ghcr.io still downloads), and the GitHub
+   * sign-in is never sent. When that download fails too, the error says why the sign-in was not used.
+   */
+  private async pullWith(ctx: PipelineContext, reference: string, credentials: PullCredentials | undefined): Promise<void> {
+    const docker = this.deps.docker;
+    try {
+      await docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal, ...(credentials ? { credentials } : {}) });
+      return;
+    } catch (error) {
+      if (!credentials || !isUserFacingError(error) || error.code !== 'unencryptedDockerConnection') throw error;
+      this.logger.warn(`${error.detail ?? error.message} ${reference} is downloaded without the GitHub sign-in.`);
+      try {
+        await docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal });
+      } catch (plainError) {
+        if (this.isCancellation(plainError, ctx.signal)) throw plainError;
+        throw new UserFacingError(error.code, error.message, `${error.detail ?? ''} The download without the sign-in failed: ${errorMessage(plainError)}`.trim());
+      }
     }
   }
 
@@ -1526,6 +1562,8 @@ export class EnvironmentService {
     // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
     // pass the policy too (the check of the configuration covers them as the repository wrote them).
     const finalRunArgs = hostAccessReport(await this.hostAccessInput(env, { config: { runArgs: override.runArgs } }));
+    // What Docker gets: its last --user decides the user of the container (imageRemoteUser).
+    const dockerRunArgs = stringList(override.runArgs) ?? [];
     if (isRefused(finalRunArgs)) {
       this.logger.warn(`The runArgs of the container of ${env.repository} are refused by the host access policy: ${describeRefusal(finalRunArgs)}`);
       throw new HostAccessError(finalRunArgs);
@@ -1533,8 +1571,12 @@ export class EnvironmentService {
     // The container is in use from its start on (concept 7.9).
     await this.deps.sessionFiles.writePending(env.id, this.deps.owner.windowId);
     await this.requireVolume(env);
-    if (createsContainer) await this.checkImageHostAccess(ctx, image);
-    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image);
+    if (createsContainer) {
+      const metadataVolumes = await this.checkImageHostAccess(ctx, image);
+      const configVolumes = mountedVolumeNames({ ownVolume: env.volumeName, config: { mounts: config?.mounts, runArgs: dockerRunArgs } });
+      await this.createAdditionalVolumes(ctx, [...configVolumes, ...metadataVolumes]);
+    }
+    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
     // After the ownership fix (the files get the owner of the repository folder), and before `up`, so that the lifecycle
     // commands have the token and the Git configuration.
     await this.prepareGit(ctx);
@@ -1563,26 +1605,54 @@ export class EnvironmentService {
     // `up` may not have recorded.
     await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx));
     const failure = nonEmptyString(result.lifecycleCommandFailure);
-    return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image);
+    return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image, dockerRunArgs);
   }
 
   /** The named volumes that the container of the environment mounts join its additional volumes (ownVolumes). */
   private async recordContainerVolumes(ctx: PipelineContext): Promise<void> {
     const container = await this.deps.docker.findContainer(ctx.env.id);
-    const volumes = await this.ownVolumes(container?.volumes ?? [], ctx.env.volumeName);
-    await this.recordMetadataVolumes(ctx, volumes);
+    const volumes = await this.ownVolumes(container?.volumes ?? [], ctx.env);
+    await this.recordAdditionalVolumes(ctx, volumes);
   }
 
   /**
-   * The volumes of `names` that the pipeline records as additional volumes: not the workspace volume, and not a volume
-   * that the policy gives to something else by its name (foreignVolumeName: an anonymous volume, the helper cache, another
-   * environment, the Dev Containers extension) or by its labels (volumeLabelOwner).
+   * The volumes of `names` that the pipeline records as additional volumes of `env`: existing volumes, other than the
+   * workspace volume, whose labels make them its own (isOwnVolume: devenv.environment-id, and devenv.owner-id when both
+   * are set). Any other volume (an anonymous volume, a volume of another program or environment, a volume that a version
+   * before the labels or Docker at `up` created) is never recorded, so Delete never removes it.
    */
-  private async ownVolumes(names: readonly string[], workspaceVolume: string): Promise<string[]> {
-    const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined);
+  private async ownVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
+    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
     if (candidates.length === 0) return [];
-    const labels = new Map((await this.deps.docker.inspectVolumes(candidates)).map((volume) => [volume.name, volume.labels]));
-    return candidates.filter((name) => volumeLabelOwner(labels.get(name) ?? {}) === undefined);
+    const volumes = await this.deps.docker.inspectVolumes(candidates);
+    const own = new Set(volumes.filter((volume) => isOwnVolume(volume.labels, env.id, env.owner?.id)).map((volume) => volume.name));
+    return candidates.filter((name) => own.has(name));
+  }
+
+  /**
+   * Before `up` creates a container: each named volume that it mounts (the configuration, the `runArgs` that Docker
+   * gets, and the image metadata) and that does not exist yet is created with the labels of the environment
+   * (additionalVolumeLabels), so that it is the environment's own; then the own volumes are recorded. An existing volume
+   * keeps its labels (Docker does not change them). A name with `${devcontainerId}` is not among them: the Dev Container
+   * CLI 0.89.0 resolves it only at `up` (read-configuration substitutes it only for an existing container), so Docker
+   * creates that volume without labels, and it is never the environment's. A volume that cannot be created is logged:
+   * Docker creates it at `up` without the labels, and Delete keeps it.
+   */
+  private async createAdditionalVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
+    const env = ctx.env;
+    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
+    if (candidates.length === 0) return;
+    const existing = new Set((await this.deps.docker.inspectVolumes(candidates)).map((volume) => volume.name));
+    for (const name of candidates) {
+      if (existing.has(name)) continue;
+      this.throwIfCancelled(ctx.signal);
+      try {
+        await this.deps.docker.createVolume(name, additionalVolumeLabels(env));
+      } catch (error) {
+        this.logger.warn(`The volume ${name} could not be created with the labels of the environment. Docker creates it at the start without them, and Delete keeps it: ${errorMessage(error)}`);
+      }
+    }
+    await this.recordAdditionalVolumes(ctx, await this.ownVolumes(candidates, env));
   }
 
   /**
@@ -1615,12 +1685,13 @@ export class EnvironmentService {
     result: DevcontainerResult,
     description: string,
     image: string,
+    runArgs: readonly string[],
   ): Promise<DevcontainerResult> {
     this.logger.warn(`${description} The environment of ${ctx.env.repository} is opened anyway.`);
     this.deps.ui.warn(PipelineTexts.lifecycleCommandFailed(lifecycleHookName(description)));
     if (nonEmptyString(result.remoteUser) !== undefined) return result;
     try {
-      return { ...result, remoteUser: await this.imageUser(image, ctx.signal) };
+      return { ...result, remoteUser: await this.imageUser(image, runArgs, ctx.signal) };
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The remote user of ${image} could not be read: ${errorMessage(error)}`);
@@ -1628,9 +1699,12 @@ export class EnvironmentService {
     }
   }
 
-  /** The user that `devcontainer up` gives a container of `image` (label devcontainer.metadata, see imageRemoteUser). */
-  private async imageUser(image: string, signal: AbortSignal | undefined): Promise<string> {
-    return imageRemoteUser(await this.imageConfig(image, signal));
+  /**
+   * The user that `devcontainer up` gives a container of `image` with the `runArgs` that it passes to Docker (label
+   * devcontainer.metadata, `--user` of the runArgs, and the user of the image; see imageRemoteUser).
+   */
+  private async imageUser(image: string, runArgs: readonly string[], signal: AbortSignal | undefined): Promise<string> {
+    return imageRemoteUser(await this.imageConfig(image, signal), runArgs);
   }
 
   /** `Config` of `docker image inspect`. */
@@ -1668,16 +1742,18 @@ export class EnvironmentService {
     const foreignVolumes = [...others.flatMap((other) => other.additionalVolumes ?? []), ...kept.map((record) => record.name)].filter(
       (name) => !own.has(name),
     );
-    return { ...checked, foreignVolumes, volumeLabels };
+    const environment = { id: env.id, ...(env.owner ? { ownerId: env.owner.id } : {}) };
+    return { ...checked, foreignVolumes, volumeLabels, environment, environmentIds: file.environments.map((other) => other.id) };
   }
 
   /**
    * Concept section 9 "Host access", before every `up`: the label devcontainer.metadata of the environment image holds
    * what `up` applies from the base image, the Features, and the configuration of the build (mounts, privileged mode,
    * capabilities). It also covers a configuration that could not be read, and Features that a build added after the
-   * merged configuration was read. Throws UserFacingError('hostAccess').
+   * merged configuration was read. Throws UserFacingError('hostAccess'). Returns the named volumes that the metadata
+   * mounts.
    */
-  private async checkImageHostAccess(ctx: PipelineContext, image: string): Promise<void> {
+  private async checkImageHostAccess(ctx: PipelineContext, image: string): Promise<string[]> {
     const config = await this.imageConfig(image, ctx.signal);
     const labels = isRecord(config) && isRecord(config.Labels) ? config.Labels : {};
     const text = labels['devcontainer.metadata'];
@@ -1692,19 +1768,16 @@ export class EnvironmentService {
     }
     const checked = await this.hostAccessInput(ctx.env, { metadata });
     const report = hostAccessReport(checked);
-    if (!isRefused(report)) {
-      await this.recordMetadataVolumes(ctx, mountedVolumeNames(checked));
-      return;
-    }
+    if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);
   }
 
   /**
-   * The named volumes that the base image and the Features mount (image metadata) join the additional volumes of the
-   * entry, so that the policy refuses them to the environments of other accounts too.
+   * Own volumes (ownVolumes) join the additional volumes of the entry: Delete offers to remove them, and the policy
+   * refuses them to the environments of other accounts too.
    */
-  private async recordMetadataVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
+  private async recordAdditionalVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
     const added = names.filter((name) => name !== ctx.env.volumeName && !(ctx.env.additionalVolumes ?? []).includes(name));
     if (added.length === 0) return;
     await this.updateEntry(ctx, (entry) => {
@@ -1847,8 +1920,7 @@ export class EnvironmentService {
     const remoteUser =
       nonEmptyString(outcome.result?.remoteUser) ??
       env.remoteUser ??
-      nonEmptyString(loaded?.config.remoteUser) ??
-      nonEmptyString(loaded?.config.containerUser);
+      configRemoteUser(loaded?.config, stringList(loaded?.config.runArgs));
     const folder = repositoryFolder(env.repository);
 
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
@@ -1890,13 +1962,13 @@ export class EnvironmentService {
    * Assumption (V-10): the environment image has sh, id, find, and chown, and its label devcontainer.metadata names the
    * remote user as the Dev Container CLI resolves it.
    */
-  private async prepareOwnership(ctx: PipelineContext, image: string): Promise<void> {
+  private async prepareOwnership(ctx: PipelineContext, image: string, runArgs: readonly string[]): Promise<void> {
     ctx.ownershipPrepared = true;
     const { docker } = this.deps;
     const env = ctx.env;
     const folder = repositoryFolder(env.repository);
     try {
-      const user = await this.imageUser(image, ctx.signal);
+      const user = await this.imageUser(image, runArgs, ctx.signal);
       if (isRootUser(user)) return;
       this.logger.info(`Giving the files in ${folder} to ${user} before the container is created.`);
       const [shell, ...args] = ownershipFixCommand(folder, user);
@@ -2218,7 +2290,13 @@ export class EnvironmentService {
     const volumes = await docker.listEnvironmentVolumes();
     const now = isoTime(this.deps.clock);
     const candidates: Environment[] = [];
+    const additional: VolumeInfo[] = [];
     for (const volume of volumes) {
+      // An additional volume (devenv.volume) joins the entry of its environment below.
+      if (volume.labels[LABEL_VOLUME] !== undefined) {
+        additional.push(volume);
+        continue;
+      }
       const id = volume.labels[LABEL_ENVIRONMENT_ID];
       const repository = volume.labels[LABEL_REPOSITORY];
       if (!isStorageId(id) || !isRepositoryName(repository)) {
@@ -2246,17 +2324,13 @@ export class EnvironmentService {
       });
     }
     if (candidates.length === 0) return 0;
-    // The additional volumes are not on the workspace volume: the container of the environment, which a lost registry does
-    // not remove, still mounts them. Without them, another account's environment could take them over as its own.
-    // Only the volumes that the pipeline records (named volumes of the configuration): not a volume that the policy gives
-    // to something else by its name (an anonymous volume of the container, a volume of the Dev Containers extension, of
-    // the helper, or of another environment, foreignVolumeName) or by its labels (volumeLabelOwner).
-    const containers = await docker.listEnvironmentContainers();
+    // The additional volumes are not on the workspace volume: they are found by their labels, which make them the
+    // environment's own (isOwnVolume), as the pipeline records them. A volume without these labels is not added.
     for (const candidate of candidates) {
-      const mounted = containers
-        .filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id)
-        .flatMap((container) => container.volumes ?? []);
-      const volumes = await this.ownVolumes(mounted, candidate.volumeName);
+      const volumes = additional
+        .filter((volume) => isOwnVolume(volume.labels, candidate.id, candidate.owner?.id))
+        .map((volume) => volume.name)
+        .filter((name) => name !== candidate.volumeName);
       if (volumes.length > 0) candidate.additionalVolumes = volumes;
     }
     const skipped: string[] = [];
@@ -2476,31 +2550,67 @@ export class EnvironmentService {
   }
 
   /**
-   * Concept 7.14 Delete step 4: the additional volumes that the user confirmed (`confirmed`, as the question listed them)
-   * and that the environment still records. Kept: a volume that another environment records, and an existing volume whose
-   * labels show that another program created it (volumeLabelOwner), for example a volume of Docker Compose that took a
-   * name that the environment used before, and a volume that the Delete of an environment of another account kept.
-   * Returns the names of the removed volumes.
+   * The additional volumes that Delete of `environmentId` would remove (removableVolumes), for the question of Delete:
+   * it lists only these, and keeps the others. Empty when the environment or Docker does not answer.
    */
-  private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<string[]> {
-    const volumes = (env.additionalVolumes ?? []).filter((name) => confirmed.includes(name));
-    if (volumes.length === 0) return [];
+  async removableAdditionalVolumes(environmentId: string): Promise<string[]> {
+    const env = await this.deps.registry.get(environmentId);
+    if (!env || (env.additionalVolumes ?? []).length === 0) return [];
+    try {
+      return (await this.removableVolumes(env, env.additionalVolumes ?? [])).removable;
+    } catch (error) {
+      this.logger.warn(`The additional volumes of ${env.repository} could not be read: ${errorMessage(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Of the additional volumes `names` that `env` records, those that Delete may remove, and the reason for each other
+   * one. Removable is only an existing volume whose labels make it the environment's own (isOwnVolume) and that no other
+   * environment records and no Delete of another account kept. Kept, with its reason: every other volume, among them a
+   * volume that a version before the labels recorded (the user removes it), a volume of another program (for example of
+   * Docker Compose, which took a name that the environment used before), and a volume of another environment.
+   */
+  private async removableVolumes(env: Environment, names: readonly string[]): Promise<{ removable: string[]; kept: Array<{ name: string; reason: string }> }> {
+    const volumes = (env.additionalVolumes ?? []).filter((name) => names.includes(name) && name !== env.volumeName);
+    const result: { removable: string[]; kept: Array<{ name: string; reason: string }> } = { removable: [], kept: [] };
+    if (volumes.length === 0) return result;
     const file = await this.deps.registry.read();
     const others = file.environments.filter((other) => other.id !== env.id);
     // A volume that the Delete of an environment of another account kept holds that account's data.
     const keptByOthers = (file.keptVolumes ?? []).filter((record) => record.owner?.id !== env.owner?.id).map((record) => record.name);
     const labels = new Map((await this.deps.docker.inspectVolumes(volumes)).map((volume) => [volume.name, volume.labels]));
-    const removed: string[] = [];
     for (const name of volumes) {
+      const volumeLabelsOf = labels.get(name);
+      if (volumeLabelsOf === undefined) continue;
       if (others.some((other) => other.volumeName === name || (other.additionalVolumes ?? []).includes(name)) || keptByOthers.includes(name)) {
-        this.logger.info(`The volume ${name} is kept, because another environment uses it too.`);
-        continue;
+        result.kept.push({ name, reason: 'another environment uses it too' });
+      } else if (!isOwnVolume(volumeLabelsOf, env.id, env.owner?.id)) {
+        const owner = volumeLabelOwner(volumeLabelsOf);
+        result.kept.push({
+          name,
+          reason:
+            owner !== undefined
+              ? `${owner} created it`
+              : 'its labels do not show that this environment created it (for example, a version of Dev Environments before these labels created it)',
+        });
+      } else {
+        result.removable.push(name);
       }
-      const owner = foreignVolumeName(name) ?? volumeLabelOwner(labels.get(name) ?? {});
-      if (owner !== undefined) {
-        this.logger.info(`The volume ${name} is kept, because ${owner} created it.`);
-        continue;
-      }
+    }
+    return result;
+  }
+
+  /**
+   * Concept 7.14 Delete step 4: the additional volumes that the user confirmed (`confirmed`, as the question listed them)
+   * and that the environment still records, when removableVolumes allows it; each other one is kept with a log line
+   * that names why. Returns the names of the removed volumes.
+   */
+  private async removeAdditionalVolumes(env: Environment, confirmed: readonly string[]): Promise<string[]> {
+    const { removable, kept } = await this.removableVolumes(env, confirmed);
+    for (const { name, reason } of kept) this.logger.info(`The volume ${name} is kept, because ${reason}.`);
+    const removed: string[] = [];
+    for (const name of removable) {
       try {
         await this.deps.docker.removeVolume(name);
         removed.push(name);

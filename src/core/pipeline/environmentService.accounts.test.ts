@@ -20,6 +20,7 @@ import {
   OTHER_ID,
   REPO,
   TOKEN,
+  additionalVolumeLabels,
   createHarness,
   seedEnvironment,
   type Harness,
@@ -272,13 +273,34 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     expect(h.docker.volumes.has(DATA)).toBe(true);
   });
 
-  it('lets a new environment of the same account use the volume again', async () => {
+  it('lets a new environment of the same account use the volume again, without taking it for its own', async () => {
     await otherAccountDeletesAndKeeps();
     signIn(OTHER_ACCOUNT, OTHER_TOKEN);
     h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
     const result = await h.service.open(TARGET, options());
     expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
-    expect(result.environment.additionalVolumes).toContain(DATA);
+    expect(h.helper.ups).toHaveLength(1);
+    // Its labels name no environment (a version before the labels created it): never recorded, never removed.
+    expect(result.environment.additionalVolumes).toBeUndefined();
+  });
+
+  it('lets a new environment of the same account mount a labeled volume that its Delete kept, and refuses it to another account', async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { additionalVolumes: [DATA] } });
+    h.docker.volumes.set(DATA, additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
+    // Without the record of the Delete, the labels alone decide.
+    await h.registry.forgetKeptVolumes([DATA]);
+    signIn(ACCOUNT, TOKEN);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess(`volume ${DATA} of another environment`));
+    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
+    // The labels name the deleted environment: the new one does not take it for its own, and its Delete keeps it.
+    expect(result.environment.additionalVolumes).toBeUndefined();
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
   });
 
   it('records the volumes that the Delete after missing files keeps without asking', async () => {
@@ -307,17 +329,24 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     // docker volume prune; then an environment of ACCOUNT creates a new volume of that name.
     h.docker.volumes.delete(DATA);
     h.helper.config = { image: BASE_IMAGE, mounts: [MOUNT] };
-    await h.service.open(TARGET, options());
+    const first = await h.service.open(TARGET, options());
     expect(await h.registry.keptVolumes()).toEqual([]);
-    h.docker.volumes.set(DATA, {});
-    // The Delete of ACCOUNT keeps it; its next environment may use it, and a later Delete may remove it.
-    await h.service.delete((await h.registry.list())[0].id, { progress: h.progress, additionalVolumesToRemove: [] });
+    // The new volume of that name carries the labels of the environment of ACCOUNT, which created it before `up`.
+    expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(first.environment.id, ACCOUNT));
+    expect(first.environment.additionalVolumes).toEqual([DATA]);
+    // The Delete of ACCOUNT keeps it; its next environment may use it, but only the Delete of the environment that
+    // created it removes it: the next one keeps it, with a line in the log.
+    await h.service.delete(first.environment.id, { progress: h.progress, additionalVolumesToRemove: [] });
     expect((await h.registry.keptVolumes()).map((record) => [record.name, record.owner?.id])).toEqual([[DATA, ACCOUNT.id]]);
     const result = await h.service.open(TARGET, options());
-    expect(result.environment.additionalVolumes).toContain(DATA);
+    expect(h.helper.ups.length).toBeGreaterThan(1);
+    expect(result.environment.additionalVolumes).toBeUndefined();
+    await h.registry.updateEnvironment(result.environment.id, (entry) => {
+      entry.additionalVolumes = [DATA];
+    });
     await h.service.delete(result.environment.id, { progress: h.progress, additionalVolumesToRemove: [DATA] });
-    expect(h.docker.volumes.has(DATA)).toBe(false);
-    expect(await h.registry.keptVolumes()).toEqual([]);
+    expect(h.docker.volumes.has(DATA)).toBe(true);
+    expect(h.logger.infos.some((line) => line.startsWith(`The volume ${DATA} is kept, because another environment created it`))).toBe(true);
   });
 
   it('records no kept volume that does not exist at the Delete', async () => {
@@ -353,7 +382,7 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     await otherAccountDeletesAndKeeps();
     // An entry of one person from before the separation by account recorded the same volume.
     await seedEnvironment(h, { id: OTHER_ID, container: null, extra: { additionalVolumes: [DATA, 'web-cache'] } });
-    h.docker.volumes.set('web-cache', {});
+    h.docker.volumes.set('web-cache', additionalVolumeLabels(OTHER_ID));
     await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [DATA, 'web-cache'] });
     expect(h.docker.volumes.has(DATA)).toBe(true);
     expect(h.docker.volumes.has('web-cache')).toBe(false);
