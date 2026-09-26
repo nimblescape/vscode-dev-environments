@@ -62,7 +62,8 @@ export interface ReopenInput {
    * run follows the end of the previous one within seconds, and the window with the source code stays open: the
    * 30-second rule does not apply there, and only other windows that are connected to an environment count. Cost: a
    * "Close Remote Connection" in a debug run connects the window again once (Cancel on the progress stops it); VS Code
-   * gives no way to tell that reload from a new debug run.
+   * gives no way to tell that reload from a new debug run. A window that is still connecting has no environment in
+   * its status yet and does not count either; the busy mark of the environment keeps a second pipeline waiting.
    */
   development?: boolean;
 }
