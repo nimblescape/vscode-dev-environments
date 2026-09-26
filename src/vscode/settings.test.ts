@@ -38,6 +38,8 @@ describe('settings (concept section 8)', () => {
       hostAccessChecksOff: [],
       // Unit 9 (setting repositoryGroups, concept 8): a new setting with the default [].
       repositoryGroups: [],
+      // Unit 14 (setting openInNewWindow, concept 6.2, 8): a new setting with the default false (Start uses this window).
+      openInNewWindow: false,
     });
   });
 

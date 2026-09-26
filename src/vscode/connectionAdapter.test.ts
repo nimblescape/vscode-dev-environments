@@ -93,6 +93,22 @@ describe('ConnectionAdapter', () => {
     expect(fake.state.commands.map((call) => call[0])).toEqual([OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
   });
 
+  it('opens the folder URI of the container in a new window (Start in New Window, unit 14)', async () => {
+    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api');
+    expect(fake.state.commands).toHaveLength(1);
+    const [command, uri, options] = fake.state.commands[0] as [string, FakeUri, Record<string, unknown>];
+    expect(command).toBe(OPEN_FOLDER_COMMAND);
+    expect(uri).toMatchObject({ scheme: 'vscode-remote', authority: encodeAuthority(NAME), path: '/workspaces/api' });
+    expect(options).toEqual({ forceNewWindow: true });
+  });
+
+  it('never reloads this window for a new window, also when this window shows the same folder', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
+    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api');
+    expect(fake.state.commands.map((call) => call[0])).toEqual([OPEN_FOLDER_COMMAND]);
+  });
+
   it('closes the remote connection with the command of VS Code', async () => {
     await new ConnectionAdapter().closeRemoteConnection();
     expect(fake.state.commands).toEqual([[CLOSE_REMOTE_COMMAND]]);

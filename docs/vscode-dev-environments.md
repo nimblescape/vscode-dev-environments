@@ -223,11 +223,14 @@ States of an environment (see also [7.15](#715-environment-states)):
 
 | Action | Shown when | Effect |
 |---|---|---|
-| **Start** | The window is not connected to the environment of this repository | If the repository has no environment, the extension creates it on the default branch: it clones the repository and prepares the environment, which can take several minutes. Then it starts the container and connects the current window. **Start** never opens a new window. |
+| **Start** | The window is not connected to the environment of this repository | If the repository has no environment, the extension creates it on the default branch: it clones the repository and prepares the environment, which can take several minutes. Then it starts the container and connects the current window. With the setting `openInNewWindow` (see [section 8](#8-settings)), a new window connects instead, except from an empty window. |
+| **Start in New Window** (context menu and **⋯**; while `openInNewWindow` is on: **Start in Current Window**) | Like **Start** | The same as **Start**, but a new window connects. The current window keeps its environment, also from an empty window (the user asked for a new window). **Start in Current Window** connects the current window. |
 | **Stop** | The container runs | The container stops at once. If a window is connected, the extension closes the connection first. The workspace volume is kept. |
 | **Delete** | The repository has an environment | Safety check, then the extension removes the container and the workspace volume (see [7.14](#714-rebuild-and-delete)). The repository stays in the list if GitHub lists it. |
 
-**⋯** (menu of a row): Switch branch…, Select configuration… (only if the repository has several configurations), Rebuild, Show on GitHub, and Turn Off Host Access Checks… or, while they are off, Turn On Host Access Checks (see [section 9](#9-security-and-privacy), "Host access"). The row of a repository whose host access checks are off shows `host access unrestricted` in its description and a warning in its tooltip.
+**Which window connects.** By default, **Start** connects the current window, which leaves its previous environment. **Start in New Window** opens a new window for the environment, and the current window stays as it is: its own environment stays connected and in use. This allows several windows at the same time, each with its own environment. An environment is never open in two windows: if another window is connected to it, **Start** and **Start in New Window** show that window (VS Code brings the window that has the folder open to the front instead of opening a second one, see [7.11](#711-switching)). A **Start** of the environment of the current window only shows a message; **Reconnect** of a lost connection always uses the current window.
+
+**⋯** (menu of a row): Start in New Window (or Start in Current Window), Switch branch…, Select configuration… (only if the repository has several configurations), Rebuild, Show on GitHub, and Turn Off Host Access Checks… or, while they are off, Turn On Host Access Checks (see [section 9](#9-security-and-privacy), "Host access"). The row of a repository whose host access checks are off shows `host access unrestricted` in its description and a warning in its tooltip.
 
 - **Switch branch…** switches the branch in the environment and connects the current window (see [7.5](#75-environment-model-and-workspace-volume)). If the repository has no environment, the extension creates it on the selected branch.
 - **Select configuration…** changes the configuration of the environment and rebuilds its container (see [7.5](#75-environment-model-and-workspace-volume)).
@@ -250,7 +253,7 @@ Command **Dev Environments: Switch Environment…**. It is also available with a
 1. Recent environments with their state (see [6.2](#62-sidebar-view)).
 2. The entry **Open repository…**. It shows all discovered repositories with a text search.
 
-The selected environment opens in the current window.
+The selected environment opens in the current window. The command **Dev Environments: Switch Environment in New Window…** shows the same list, and the selected environment opens in a new window. While the setting `openInNewWindow` is on, it is the other way around: **Switch Environment…** opens a new window, and **Switch Environment in Current Window…** uses the current window.
 
 ### 6.5 Progress and errors
 
@@ -287,6 +290,7 @@ Messages name the situation and offer at most one action:
 | Flow | User action | Result |
 |---|---|---|
 | Start | Select **Start** on a repository | The window connects to the environment. |
+| Start in a new window | Select **Start in New Window** on a repository | A new window connects to the environment. The current window keeps its environment. |
 | Update | None (automatic at each connection) | If a newer image exists, the container is rebuilt with it before the window connects. The workspace volume is kept. |
 | Start without internet access | Select **Start** on a repository that has an environment | The update step is skipped. The environment starts with the local image. |
 | Switch | Select another environment in the switcher | The same window connects to the other environment. The previous environment stops. |
@@ -671,7 +675,7 @@ JSON (format to confirm in V-2):
 { "containerName": "/devenv-acme-university-api-3f2a9c1e" }
 ```
 
-- Open: VS Code command `vscode.openFolder` with this URI and the option `forceNewWindow: false`. So the environment always opens in the current window.
+- Open: VS Code command `vscode.openFolder` with this URI and the options `forceNewWindow: false` and `forceReuseWindow: true`, so the environment opens in the current window, also when the user setting `window.openFoldersInNewWindow` is `on`. **Start in New Window** (see [6.2](#62-sidebar-view)) uses the option `forceNewWindow: true` instead. In both cases, VS Code shows the window that has the folder open already instead of opening it a second time.
 - Configuration: the container has the configuration in the label `devcontainer.metadata`, from the environment image. When the Dev Containers extension attaches, it applies this configuration: VS Code extensions, settings, `remoteUser`, `forwardPorts`, and `postAttachCommand` (to verify in [V-1](#11-verification-before-implementation)).
 - Detect the environment of the current window: `vscode.env.remoteName` is `attached-container`, and the container name in the authority matches an environment of the registry.
 - This format is not a public API of the Dev Containers extension. Only the Connection Adapter creates or reads it (see [RK-1](#10-risks)).
@@ -705,7 +709,9 @@ Solution: each window reports its state in a status file, and a separate helper 
 - `environmentId` is `null` for a window that is not connected to an environment.
 - In `deactivate()`, the window changes `state` to `closing` with a synchronous file write. This takes only milliseconds.
 
-**Pending connection file.** Before the open pipeline opens the folder URI, it writes the file `<global storage>/pending/<environment-id>.json` with the current time. The window that connects deletes this file when it writes its status file. The file prevents a stop between "container is running" and "window is connected".
+**Pending connection file.** Before the open pipeline opens the folder URI, it writes the file `<global storage>/pending/<environment-id>.json` with the current time and the ID of the window that ran the pipeline. The window that connects deletes this file when it writes its status file. The file prevents a stop between "container is running" and "window is connected".
+
+**New window.** With **Start in New Window** (see [6.2](#62-sidebar-view)), the window that runs the pipeline is not the window that connects. The same files work for this case: the pipeline window writes the pending connection file with its own ID, so the container is in use from its start. The new window is attached to the container and finds the fresh pending connection file of its environment at its activation, so it does not run the pipeline a second time ([7.10](#710-reopen-last-environment) #1). It writes its status file with the environment and deletes the pending connection file. The pipeline window keeps its own status file with its own environment (or none), so it never counts the new environment as its own, and it writes the reopen record only for its own environment. When the new window closes, it writes the reopen record of its environment.
 
 **Session Monitor.** The Session Monitor is a small Node.js script that is part of the extension. The extension starts it as a separate, detached process with the Node.js runtime of VS Code (environment variable `ELECTRON_RUN_AS_NODE=1`). No separate Node.js installation is needed. Only one Session Monitor runs at a time (lock file with the process ID). After VS Code has closed, it continues to run only until the last waiting time has ended.
 
@@ -723,6 +729,7 @@ Results for typical situations:
 |---|---|---|
 | Window closed, or VS Code quit | State `closing`, process ended | Stop after the waiting time |
 | Switch to another environment in the same window | The old environment is no longer referenced. The new environment has a pending connection file. | The old environment stops after the waiting time. |
+| Start in a new window | The current window still references its environment. The new environment has a pending connection file until the new window writes its status file. | No stop of either environment |
 | Window reload | For some seconds, no window references the environment. Then the reloaded window writes a new status file. | No stop, if the reload takes less than the waiting time |
 | VS Code crash or forced termination | Process ended, no `closing` state | Stop after the waiting time |
 | Extension host does not respond | `updatedAt` older than 60 seconds | Stop after the waiting time |
@@ -747,7 +754,7 @@ Further rules:
 
 Two mechanisms work together:
 
-1. **Window restore of VS Code.** At start, VS Code restores the windows of the last session (setting `window.restoreWindows`, default `all`). A restored window attaches again to its container. At this time, Docker possibly does not run, and the container is normally stopped. Therefore, the extension also activates on `onResolveRemoteAuthority:attached-container`, before VS Code connects. During activation, it starts Docker if needed and runs the image check. If the image is current, or if no registry can be reached, it starts the container through `devcontainer up`. If a newer image exists, it updates the environment first, with its own progress notification. Then VS Code connects. This must be verified in [V-2](#11-verification-before-implementation). If it does not work, the extension starts the old container, VS Code connects, and then the extension runs the update: close the remote connection, update, and connect again. A window whose container was created by an older version of the extension (see [7.5](#75-environment-model-and-workspace-volume)) never uses it: if the open pipeline cannot create the container again (for example because the configuration is refused), the window closes its connection with a message. **Start** on such a connected container does the same instead of reporting that the window is connected.
+1. **Window restore of VS Code.** At start, VS Code restores the windows of the last session (setting `window.restoreWindows`, default `all`). A restored window attaches again to its container. At this time, Docker possibly does not run, and the container is normally stopped. Therefore, the extension also activates on `onResolveRemoteAuthority:attached-container`, before VS Code connects. During activation, it starts Docker if needed and runs the image check. If the image is current, or if no registry can be reached, it starts the container through `devcontainer up`. If a newer image exists, it updates the environment first, with its own progress notification. Then VS Code connects. This must be verified in [V-2](#11-verification-before-implementation). If it does not work, the extension starts the old container, VS Code connects, and then the extension runs the update: close the remote connection, update, and connect again. A window whose container was created by an older version of the extension (see [7.5](#75-environment-model-and-workspace-volume)) never uses it: if the open pipeline cannot create the container again (for example because the configuration is refused), the window closes its connection with a message. **Start** on such a connected container does the same instead of reporting that the window is connected. A window that a **Start** of the extension opened (in the current window or in a new window) does not run the pipeline again: it finds the fresh pending connection file of its environment (see [7.9](#79-stop-on-close-and-crash-handling)), which the pipeline wrote just before.
 2. **Empty window at start.** VS Code does not always restore the window. Example on macOS: the user closes the last window, and VS Code continues to run without a window. Later, VS Code opens a new, empty window. In this case, the extension opens the last used environment itself, if all of these conditions are true:
    - The setting `devEnvLauncher.reopenLastOnStartup` is `true` (default).
    - The window is empty (no folder is open).
@@ -765,6 +772,8 @@ Two mechanisms work together:
 { "environmentId": "3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d", "closedAt": "2026-09-24T18:02:11Z" }
 ```
 
+With several windows (see **Start in New Window** in [6.2](#62-sidebar-view)), each window writes the record of its own environment, so the record names the environment of the window that closed last.
+
 The age condition has a reason. The VS Code command **Close Remote Connection** also changes a window to an empty window. The extension then activates again within a few seconds, and the reopen record is younger than 30 seconds. So the extension does not reconnect a window that the user disconnected on purpose. The reopen rule is decision [D-5](#13-decisions).
 
 ### 7.11 Switching
@@ -774,7 +783,9 @@ The age condition has a reason. The VS Code command **Close Remote Connection** 
 3. The extension replaces the folder of the current window with the folder URI of the target environment (`vscode.openFolder` with `forceNewWindow: false`). VS Code asks about unsaved files in the usual way.
 4. The Session Monitor stops the previous environment after the waiting time (see [7.9](#79-stop-on-close-and-crash-handling)).
 
-If the target environment is open in another window already, VS Code shows that window instead of opening it a second time (to verify in [V-2](#11-verification-before-implementation)).
+If the target environment is open in another window already, VS Code shows that window instead of opening it a second time (to verify in [V-2](#11-verification-before-implementation)). The main process of VS Code looks for a window with the same folder URI before it opens a window, also with `forceNewWindow: true`, so this holds for **Start in New Window** too.
+
+**Start in New Window** (see [6.2](#62-sidebar-view)) runs steps 1 and 2 in the same way, but opens the target in a new window (`vscode.openFolder` with `forceNewWindow: true`). The current window stays connected to its environment, and nothing stops.
 
 ### 7.12 Automatic recovery
 
@@ -863,6 +874,7 @@ The prefix `devEnvLauncher` is a working name (see [D-1](#13-decisions)).
 | Setting | Default | Description |
 |---|---|---|
 | `devEnvLauncher.reopenLastOnStartup` | `true` | Open the last used environment when VS Code starts (see [7.10](#710-reopen-last-environment)) |
+| `devEnvLauncher.openInNewWindow` | `false` | If `true`, **Start** and **Switch Environment…** open the environment in a new window, and the current window keeps its environment; the row menu then offers **Start in Current Window**, and the Command Palette **Switch Environment in Current Window…**. From an empty window, **Start** uses that window; **Start in New Window** always opens a new one. If `false`, **Start** connects the current window, and the row menu offers **Start in New Window** (see [6.2](#62-sidebar-view)). Scope `application`: only the user settings count. |
 | `devEnvLauncher.stopOnClose` | `true` | Stop the environment when no window uses it (see [7.9](#79-stop-on-close-and-crash-handling)). If `false`, the container keeps running. |
 | `devEnvLauncher.waitingTimeSeconds` | `30` | Waiting time before a stop. It prevents a stop during a window reload. [V-4](#11-verification-before-implementation) measures the reload time to confirm the value. |
 | `devEnvLauncher.updateImagesOnConnect` | `true` | Check for newer images at each connection (see [7.7](#77-image-update-check)) |

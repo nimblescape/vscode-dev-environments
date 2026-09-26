@@ -179,6 +179,18 @@
         "icon": "$(play)"
       },
       {
+        "command": "devEnvironments.startInNewWindow",
+        "title": "Start in New Window",
+        "category": "Dev Environments",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "devEnvironments.startInCurrentWindow",
+        "title": "Start in Current Window",
+        "category": "Dev Environments",
+        "icon": "$(play)"
+      },
+      {
         "command": "devEnvironments.stop",
         "title": "Stop",
         "category": "Dev Environments",
@@ -213,6 +225,16 @@
       {
         "command": "devEnvironments.switchEnvironment",
         "title": "Switch Environment…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.switchEnvironmentInNewWindow",
+        "title": "Switch Environment in New Window…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.switchEnvironmentInCurrentWindow",
+        "title": "Switch Environment in Current Window…",
         "category": "Dev Environments"
       },
       {
@@ -290,6 +312,22 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "devEnvironments.startInNewWindow",
+          "when": "!config.devEnvLauncher.openInNewWindow"
+        },
+        {
+          "command": "devEnvironments.startInCurrentWindow",
+          "when": "config.devEnvLauncher.openInNewWindow"
+        },
+        {
+          "command": "devEnvironments.switchEnvironmentInNewWindow",
+          "when": "!config.devEnvLauncher.openInNewWindow"
+        },
+        {
+          "command": "devEnvironments.switchEnvironmentInCurrentWindow",
+          "when": "config.devEnvLauncher.openInNewWindow"
+        },
+        {
           "command": "devEnvironments.selectOwnersFiltered",
           "when": "false"
         },
@@ -363,6 +401,16 @@
           "group": "1_actions@1"
         },
         {
+          "command": "devEnvironments.startInNewWindow",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "devEnvironments.startInCurrentWindow",
+          "when": "view == devEnvironments.repositories && viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow",
+          "group": "1_actions@1"
+        },
+        {
           "command": "devEnvironments.stop",
           "when": "view == devEnvironments.repositories && viewItem =~ /canStop/",
           "group": "1_actions@2"
@@ -404,6 +452,16 @@
         }
       ],
       "devEnvironments.more": [
+        {
+          "command": "devEnvironments.startInNewWindow",
+          "when": "viewItem =~ /canStart/ && !config.devEnvLauncher.openInNewWindow",
+          "group": "0_start@1"
+        },
+        {
+          "command": "devEnvironments.startInCurrentWindow",
+          "when": "viewItem =~ /canStart/ && config.devEnvLauncher.openInNewWindow",
+          "group": "0_start@1"
+        },
         {
           "command": "devEnvironments.switchBranch",
           "group": "1_more@1"
@@ -449,6 +507,12 @@
           "type": "boolean",
           "default": true,
           "description": "Open the last used environment when VS Code starts."
+        },
+        "devEnvLauncher.openInNewWindow": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "**Start** opens the environment in a new window, and the current window keeps its environment. The context menu of a repository then offers **Start in Current Window**. If false, **Start** connects the current window, and the context menu offers **Start in New Window**. An environment that is open in another window is never opened a second time: that window is shown. Only the user settings count."
         },
         "devEnvLauncher.stopOnClose": {
           "type": "boolean",
