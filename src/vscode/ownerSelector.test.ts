@@ -189,6 +189,8 @@ describe('the filter icon of the view title bar', () => {
       [Commands.selectOwnersFiltered, 'navigation@0'],
       [Commands.search, 'navigation@1'],
       [Commands.refresh, 'navigation@2'],
+      // Since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups… in the "…" menu of the view.
+      [Commands.editRepositoryGroups, '1_settings@1'],
     ]);
     expect(title[0].when).toBe(`view == devEnvironments.repositories && !${OWNERS_FILTERED_CONTEXT_KEY}`);
     expect(title[1].when).toBe(`view == devEnvironments.repositories && ${OWNERS_FILTERED_CONTEXT_KEY}`);

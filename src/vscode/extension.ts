@@ -39,6 +39,7 @@ import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
+import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
 import { Sidebar } from './sidebar';
@@ -223,6 +224,13 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     dockerMissing: () => setup.dockerMissing,
   });
   setup.initialize();
+  const repositoryGroupsEditor = new RepositoryGroupsEditor({
+    extensionUri: context.extensionUri,
+    logger,
+    groupingInput: () => sidebar.groupingInput(),
+    onDidRender: sidebar.onDidRender,
+  });
+  context.subscriptions.push(repositoryGroupsEditor);
   const controller = new Controller({
     logger,
     registry,
@@ -242,6 +250,7 @@ async function activateExtension(context: vscode.ExtensionContext, logger: Outpu
     statusBar,
     settings: getSettings,
     dockerSetup: setup,
+    repositoryGroupsEditor,
     viewVisible: () => view.visible,
     development: context.extensionMode === vscode.ExtensionMode.Development,
   });

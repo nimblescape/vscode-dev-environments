@@ -27,6 +27,8 @@ export const Commands = {
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devEnvironments.selectOwnersFiltered',
   installDocker: 'devEnvironments.installDocker',
+  // The editor of the setting repositoryGroups (Command Palette, view title "…" menu, link in the setting).
+  editRepositoryGroups: 'devEnvironments.editRepositoryGroups',
   // The switch of the host access checks of a repository (row context menu only, hidden in the Command Palette).
   turnOffHostAccessChecks: 'devEnvironments.turnOffHostAccessChecks',
   turnOnHostAccessChecks: 'devEnvironments.turnOnHostAccessChecks',
