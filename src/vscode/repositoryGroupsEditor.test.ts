@@ -85,7 +85,7 @@ vi.mock('vscode', async () => {
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { PreviewRunner } from './groupsPreviewRunner';
-import { GroupsEditorTexts, runPreviewJob, type PreviewJobMessage, type PreviewRun } from './repositoryGroupsEditorModel';
+import { GroupsEditorTexts, describeSettingList, runPreviewJob, type PreviewJobMessage, type PreviewRun } from './repositoryGroupsEditorModel';
 
 /** Runs the job in this thread, as the worker does; `next` replaces the result of the next job. */
 function inlineRunner(): PreviewRunner & { next: PreviewRun | undefined; run: ReturnType<typeof vi.fn> } {
@@ -243,9 +243,11 @@ describe('RepositoryGroupsEditor', () => {
     fakeVscode.window.showWarningMessage.mockResolvedValue(GroupsEditorTexts.keepMine);
     panel.receive({ type: 'save', seq: 4, generation: gen(panel), entries });
     await flush();
+    // Patch-based Save (review round 3 of PR #21): Keep Mine adds the entry of the editor, and the entry that
+    // settings.json changed stays (was [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }]).
     expect(update).toHaveBeenCalledWith(
       'repositoryGroups',
-      [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }],
+      [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }, { name: 'Web', pattern: '^www-(.+)$' }],
       fakeVscode.ConfigurationTarget.Global,
     );
   });
@@ -278,7 +280,13 @@ describe('RepositoryGroupsEditor', () => {
     panel.receive({ type: 'update', seq: 3, generation: oldGeneration, entries: [], testName: 'school/web-shop' });
     answer(GroupsEditorTexts.keepMine);
     await flush();
-    expect(update).toHaveBeenCalledWith('repositoryGroups', [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }], fakeVscode.ConfigurationTarget.Global);
+    // Patch-based Save (review round 3 of PR #21): Keep Mine adds the entry of the editor, and the entry that
+    // settings.json changed stays (was [EXAMPLE, { name: 'Web', pattern: '^www-(.+)$' }]).
+    expect(update).toHaveBeenCalledWith(
+      'repositoryGroups',
+      [EXAMPLE, { name: 'Web', pattern: '^w-(.+)$' }, { name: 'Web', pattern: '^www-(.+)$' }],
+      fakeVscode.ConfigurationTarget.Global,
+    );
     const load = loaded(panel) as unknown as { generation: number; testName: string };
     expect(load.generation).toBe(oldGeneration + 1);
     expect(load.testName).toBe('school/web-shop');
@@ -377,12 +385,22 @@ describe('RepositoryGroupsEditor', () => {
     panel.receive({ type: 'save', seq: 1, generation: gen(panel), entries: [{ ...a, pattern: '^a-mine' }, { ...b, pattern: '^b-mine' }] });
     await flush();
     await flush();
+    // Patch-based Save (review round 3 of PR #21): each question shows the whole list of settings.json, so a change of
+    // it drops all answers and both entries are asked about again (was three questions: a, b, a); Keep Mine adds the
+    // entries of the editor, and those of settings.json stay (was ['^a-mine', '^b-mine']).
+    const first = describeSettingList(['^a-theirs', '^b-theirs']);
+    const second = describeSettingList(['^a-theirs-2', '^b-theirs']);
     expect(details).toEqual([
-      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', '"^a-theirs"'),
-      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', '"^b-theirs"'),
-      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', '"^a-theirs-2"'),
+      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', first),
+      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', first),
+      GroupsEditorTexts.conflictDetail('"^a"', '"^a-mine"', second),
+      GroupsEditorTexts.conflictDetail('"^b"', '"^b-mine"', second),
     ]);
-    expect(update).toHaveBeenCalledWith('repositoryGroups', ['^a-mine', '^b-mine'], fakeVscode.ConfigurationTarget.Global);
+    expect(update).toHaveBeenCalledWith(
+      'repositoryGroups',
+      ['^a-theirs-2', '^b-theirs', '^a-mine', '^b-mine'],
+      fakeVscode.ConfigurationTarget.Global,
+    );
   });
 
   // Review round 2 of PR #21, W7: after Cancel or a closed panel, a Save in progress writes nothing.
@@ -412,6 +430,25 @@ describe('RepositoryGroupsEditor', () => {
     answer(GroupsEditorTexts.keepMine);
     await flush();
     expect(update).not.toHaveBeenCalled();
+  });
+
+  // Review round 3 of PR #21: a run that failed because the panel was closed (the runner was disposed) is not logged.
+  it('does not log a failed preview when the panel was closed meanwhile', async () => {
+    const { panel } = await openEditor();
+    let release: (run: PreviewRun) => void = () => {};
+    runner.run.mockImplementationOnce(() => new Promise<PreviewRun>((resolve) => (release = resolve)));
+    panel.receive({ type: 'update', seq: 1, generation: gen(panel), entries: [], testName: '' });
+    await flush();
+    panel.dispose();
+    release({ failed: true });
+    await flush();
+    expect(logger.warn).not.toHaveBeenCalled();
+    // While the panel is open, a failed run is logged.
+    const second = await openEditor();
+    runner.next = { failed: true };
+    second.panel.receive({ type: 'update', seq: 1, generation: gen(second.panel), entries: [], testName: '' });
+    await flush();
+    expect(logger.warn).toHaveBeenCalledWith('The preview of the repository groups could not be made in its worker thread.');
   });
 
   // Review round 2 of PR #21, W6: the worker of the preview stops with the panel.

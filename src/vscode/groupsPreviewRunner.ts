@@ -40,8 +40,9 @@ export class PreviewWorkerRunner implements PreviewRunner {
   }
 
   /**
-   * Stops the worker: the running job and the jobs queued before this call resolve `{ failed: true }` without starting
-   * a new worker. A job run after this call starts a new one.
+   * Stops the worker. The jobs queued before this call resolve `{ failed: true }` without starting a new worker. The
+   * running job resolves with its result when the worker had already posted it; otherwise with `failed: true` (and the
+   * preview, when the worker had already posted that). A job run after this call starts a new worker.
    */
   dispose(): void {
     this.generation += 1;

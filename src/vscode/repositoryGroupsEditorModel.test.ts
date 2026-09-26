@@ -469,32 +469,34 @@ describe('merge at Save (3-way)', () => {
     const [a, b, c] = loaded();
     const ours = [{ ...a, pattern: '^A' }, { ...b, pattern: '^B1' }, c];
     const theirs = ['^a', '^B2', '^c', '^t'];
+    // Patch-based Save (review round 3 of PR #21): the question shows the whole list of settings.json, not one element
+    // of it; Keep Mine adds the entry of the editor, and the entry of settings.json stays (was ['^A', '^B1', '^c', '^t']).
     expect(merge(ours, theirs)).toEqual({
       status: 'conflicts',
-      conflicts: [{ baseIndex: 1, base: '^b', mine: '^B1', theirs: '^B2' }],
+      conflicts: [{ baseIndex: 1, base: '^b', mine: '^B1' }],
       orderConflict: false,
     });
-    expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^A', '^B1', '^c', '^t'] });
+    expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^A', '^B2', '^B1', '^c', '^t'] });
     expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: ['^A', '^B2', '^c', '^t'] });
   });
 
-  it('asks when the editor edits an entry that settings.json removed, and the other way', () => {
+  it('asks when the editor edits an entry that settings.json removed; a removal of an entry that settings.json edited finds it gone', () => {
     const [a, b, c] = loaded();
     const ours = [a, { ...b, pattern: '^B' }, c];
     const theirs = ['^a', '^c'];
     expect(merge(ours, theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', mine: '^B' }], orderConflict: false });
     expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^B', '^c'] });
     expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: ['^a', '^c'] });
-    expect(merge([a, c], ['^a', '^B2', '^c'])).toEqual({
-      status: 'conflicts',
-      conflicts: [{ baseIndex: 1, base: '^b', theirs: '^B2' }],
-      orderConflict: false,
-    });
+    // Patch-based Save (review round 3 of PR #21): the removal of the editor finds ^b gone, so nothing is left to do,
+    // and the entry of settings.json stays without a question (was a question about entry 2).
+    expect(merge([a, c], ['^a', '^B2', '^c'])).toEqual(merged(['^a', '^B2', '^c']));
   });
 
   it('merges a move on one side with an edit on the other', () => {
     const [a, b, c] = loaded();
-    expect(merge([c, a, b], ['^A', '^b', '^c'])).toEqual(merged(['^c', '^A', '^b']));
+    // Patch-based Save (review round 3 of PR #21): ^A is not an entry of the editor that Save can find, so it stays at
+    // the start, before the moved entries (was ['^c', '^A', '^b']).
+    expect(merge([c, a, b], ['^A', '^b', '^c'])).toEqual(merged(['^A', '^c', '^b']));
     expect(merge([{ ...a, pattern: '^A' }, b, c], ['^c', '^a', '^b'])).toEqual(merged(['^c', '^A', '^b']));
   });
 
@@ -530,7 +532,9 @@ describe('merge at Save (3-way)', () => {
     ours[0] = { ...ours[0], flags: 'i' };
     expect(mergeRepositoryGroups(base, ours, theirs)).toEqual({
       status: 'conflicts',
-      conflicts: [{ baseIndex: 0, base: base[0], mine: { name: 'X', pattern: '^x-(.+)$', flags: 'i' }, theirs: theirs[0] }],
+      // Patch-based Save (review round 3 of PR #21): the question shows the whole list of settings.json (was also
+      // `theirs: theirs[0]`).
+      conflicts: [{ baseIndex: 0, base: base[0], mine: { name: 'X', pattern: '^x-(.+)$', flags: 'i' } }],
       orderConflict: false,
     });
     // An unnamed entry whose pattern changed, between the same neighbors, also next to an addition.
@@ -539,7 +543,8 @@ describe('merge at Save (3-way)', () => {
     expect(merge([a, b, c, entry('^mine')], ['^a', '^b2', '^y', '^c'])).toEqual(merged(['^a', '^b2', '^y', '^c', '^mine']));
     expect(merge([a, { ...b, name: 'B' }, c], ['^a', '^b2', '^y', '^c'])).toEqual({
       status: 'conflicts',
-      conflicts: [{ baseIndex: 1, base: '^b', mine: { name: 'B', pattern: '^b' }, theirs: '^b2' }],
+      // Patch-based Save (review round 3 of PR #21): without `theirs: '^b2'`, as above.
+      conflicts: [{ baseIndex: 1, base: '^b', mine: { name: 'B', pattern: '^b' } }],
       orderConflict: false,
     });
   });
@@ -587,7 +592,17 @@ describe('merge at Save (3-way)', () => {
     it('does not take a copy that settings.json added before an entry for that entry', () => {
       const base = ['a', 'b'];
       const [a, b] = load(base);
-      expect(mergeRepositoryGroups(base, [a, { ...b, pattern: 'b2' }], ['b', 'a', 'b'])).toEqual(merged(['b', 'a', 'b2']));
+      // Patch-based Save (review round 3 of PR #21): settings.json has two copies of b and the base one, so Save cannot
+      // tell which copy the editor edited, and asks (was merged(['b', 'a', 'b2']) without a question). Keep Mine edits the
+      // copy nearest to the place of the entry.
+      const ours = [a, { ...b, pattern: 'b2' }];
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a', 'b'])).toEqual({
+        status: 'conflicts',
+        conflicts: [{ baseIndex: 1, base: 'b', mine: 'b2' }],
+        orderConflict: false,
+      });
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a', 'b'], { entries: new Map([[1, 'mine']]) })).toMatchObject({ value: ['b', 'a', 'b2'] });
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a', 'b'], { entries: new Map([[1, 'theirs']]) })).toMatchObject({ value: ['b', 'a', 'b'] });
     });
 
     it('asks nothing about the order when settings.json only added a copy', () => {
@@ -605,7 +620,16 @@ describe('merge at Save (3-way)', () => {
     it('keeps an edit of the last of two equal entries when settings.json removed the first', () => {
       const base = ['a', 'b', 'a'];
       const [a1, b, a2] = load(base);
-      expect(mergeRepositoryGroups(base, [a1, b, { ...a2, pattern: 'a2' }], ['b', 'a'])).toEqual(merged(['b', 'a2']));
+      // Patch-based Save (review round 3 of PR #21): settings.json removed one of the two copies, and Save cannot tell
+      // which one, so it asks (was merged(['b', 'a2']) without a question).
+      const ours = [a1, b, { ...a2, pattern: 'a2' }];
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a'])).toEqual({
+        status: 'conflicts',
+        conflicts: [{ baseIndex: 2, base: 'a', mine: 'a2' }],
+        orderConflict: false,
+      });
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a'], { entries: new Map([[2, 'mine']]) })).toMatchObject({ value: ['b', 'a2'] });
+      expect(mergeRepositoryGroups(base, ours, ['b', 'a'], { entries: new Map([[2, 'theirs']]) })).toMatchObject({ value: ['b', 'a'] });
     });
   });
 
@@ -623,22 +647,25 @@ describe('merge at Save (3-way)', () => {
   describe('does not guess which entry settings.json edited next to an addition', () => {
     const theirs = ['^a', '^y', '^b2', '^c'];
 
-    it('asks about the edited entry when the editor removed it, and keeps the addition', () => {
+    it('keeps the edited entry of settings.json when the editor removed it, and keeps the addition', () => {
       const [a, , c] = loaded();
-      expect(merge([a, c], theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', theirs: '^b2' }], orderConflict: false });
-      expect(merge([a, c], theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^y', '^c'] });
-      expect(merge([a, c], theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: theirs });
+      // Patch-based Save (review round 3 of PR #21): the removal finds ^b gone, so nothing is left to do; settings.json
+      // stays as it is, without a question (was a question about entry 2 whose Keep Mine gave ['^a', '^y', '^c']).
+      expect(merge([a, c], theirs)).toEqual(merged(theirs));
     });
 
     it('asks about the edited entry when the editor edited it too, and keeps the addition', () => {
       const [a, b, c] = loaded();
       const ours = [a, { ...b, pattern: '^bm' }, c];
+      // Patch-based Save (review round 3 of PR #21): the question shows the whole list (was also `theirs: '^b2'`), and
+      // Keep Mine adds the entry of the editor after the entries that settings.json has after ^a; ^b2 stays (was
+      // ['^a', '^y', '^bm', '^c']).
       expect(merge(ours, theirs)).toEqual({
         status: 'conflicts',
-        conflicts: [{ baseIndex: 1, base: '^b', mine: '^bm', theirs: '^b2' }],
+        conflicts: [{ baseIndex: 1, base: '^b', mine: '^bm' }],
         orderConflict: false,
       });
-      expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^y', '^bm', '^c'] });
+      expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^y', '^b2', '^bm', '^c'] });
       expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: theirs });
     });
 
@@ -657,7 +684,9 @@ describe('merge at Save (3-way)', () => {
         conflicts: [{ baseIndex: 1, base: '^b', mine: '^bm' }],
         orderConflict: false,
       });
-      expect(merge([a, { ...b, pattern: '^bm' }, c], other, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^bm', '^x', '^y', '^c'] });
+      // Patch-based Save (review round 3 of PR #21): after the entries that settings.json has after ^a (was
+      // ['^a', '^bm', '^x', '^y', '^c']).
+      expect(merge([a, { ...b, pattern: '^bm' }, c], other, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^x', '^y', '^bm', '^c'] });
       expect(merge([a, c], other)).toEqual(merged(other));
       expect(merge(loaded(), other)).toEqual(merged(other));
     });
@@ -675,13 +704,22 @@ describe('merge at Save (3-way)', () => {
     it('keeps the copy that the editor kept when the copies cannot be told apart', () => {
       const base = ['^d', '^d', '^e'];
       const [, d2, e] = entriesFromSetting(base).entries;
-      expect(mergeRepositoryGroups(base, [d2, { ...e, pattern: '^e2' }], ['^d', '^e'])).toEqual(merged(['^d', '^e2']));
+      // Patch-based Save (review round 3 of PR #21): settings.json has one copy of ^d less, and Save cannot tell whether
+      // it removed the same copy, so it asks (was merged(['^d', '^e2']) without a question).
+      const ours = [d2, { ...e, pattern: '^e2' }];
+      expect(mergeRepositoryGroups(base, ours, ['^d', '^e'])).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 0, base: '^d' }], orderConflict: false });
+      expect(mergeRepositoryGroups(base, ours, ['^d', '^e'], { entries: new Map([[0, 'theirs']]) })).toMatchObject({ value: ['^d', '^e2'] });
+      expect(mergeRepositoryGroups(base, ours, ['^d', '^e'], { entries: new Map([[0, 'mine']]) })).toMatchObject({ value: ['^e2'] });
     });
 
     it('still removes both copies when the sides removed different copies that can be told apart', () => {
       const base = ['^a', '^b', '^a'];
       const [, b, a2] = entriesFromSetting(base).entries;
-      expect(mergeRepositoryGroups(base, [b, a2], ['^a', '^b'])).toEqual(merged(['^b']));
+      // Patch-based Save (review round 3 of PR #21): the copies are not told apart by their places any more, so Save
+      // asks (was merged(['^b']) without a question); Keep Mine removes the copy.
+      expect(mergeRepositoryGroups(base, [b, a2], ['^a', '^b'])).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 0, base: '^a' }], orderConflict: false });
+      expect(mergeRepositoryGroups(base, [b, a2], ['^a', '^b'], { entries: new Map([[0, 'mine']]) })).toMatchObject({ value: ['^b'] });
+      expect(mergeRepositoryGroups(base, [b, a2], ['^a', '^b'], { entries: new Map([[0, 'theirs']]) })).toMatchObject({ value: ['^a', '^b'] });
     });
   });
 
@@ -740,15 +778,14 @@ describe('merge at Save (3-way)', () => {
         const ours = changeMine(entriesFromSetting(base).entries);
         const context = JSON.stringify({ base, ours, theirs });
         let outcome = mergeRepositoryGroups(base, ours, theirs);
+        // Patch-based Save (review round 3 of PR #21): Keep Mine changes only copies of a value of the base, so a value
+        // that settings.json added is kept in every case (it was: unless a Keep Mine answer showed it).
         const keptMine = new Map<string, number>();
         if (outcome.status === 'conflicts') {
           const entries = new Map<number, 'mine' | 'theirs'>();
           for (const conflict of outcome.conflicts) {
             const choice = random(2) === 0 ? 'mine' : 'theirs';
             entries.set(conflict.baseIndex, choice);
-            if (choice === 'mine' && conflict.theirs !== undefined) {
-              keptMine.set(keyOf(conflict.theirs), (keptMine.get(keyOf(conflict.theirs)) ?? 0) + 1);
-            }
           }
           outcome = mergeRepositoryGroups(base, ours, theirs, { entries, order: random(2) === 0 ? 'mine' : 'theirs' });
         }

@@ -61,9 +61,9 @@ export const GroupsEditorTexts = {
   testInvalid: 'Enter the repository name without spaces, for example 2026-3cWI-SWP-module-oop-EnesHA81 or owner/name.',
   invalidEntriesNotSaved: 'Correct the entries with an error first. Nothing was saved.',
   conflict: (position: number) =>
-    `Entry ${position} of devEnvLauncher.repositoryGroups was changed both in this editor and in settings.json. Which one do you want to keep?`,
+    `Entry ${position} of devEnvLauncher.repositoryGroups was changed in this editor, but settings.json no longer has it unchanged. Which one do you want to keep?`,
   conflictDetail: (base: string, mine: string, theirs: string) =>
-    `When the editor loaded it: ${base}\nThis editor: ${mine}\nsettings.json now: ${theirs}`,
+    `This editor: ${mine}\nsettings.json no longer has ${base} unchanged.\nsettings.json now: ${theirs}\nKeep Mine applies the change of this editor to that list; Keep settings.json leaves the list as it is.`,
   keepMine: 'Keep Mine',
   keepTheirs: 'Keep settings.json',
   saveCancelled: 'Nothing was saved.',
@@ -289,23 +289,25 @@ function isSeq(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-// ---- Merge at Save ----------------------------------------------------------------------------------------------
+// ---- Save: the changes of the editor as a patch -----------------------------------------------------------------
 
 /**
- * An element of the setting that both the editor and settings.json changed differently since the editor loaded it
- * (`mine` or `theirs` missing: removed on that side). Save asks which one to keep, for this element only.
+ * A change of the editor that Save cannot apply without a question: settings.json no longer has the entry that the
+ * editor edited or removed unchanged (it changed or removed it meanwhile, or it holds another number of equal copies,
+ * so the copy cannot be told). The question shows the current list of settings.json.
  */
 export interface MergeConflict {
   /** Index in the loaded value (the base). */
   baseIndex: number;
+  /** The entry as the editor loaded it. */
   base: unknown;
+  /** The entry of the editor; missing when the editor removed it. */
   mine?: unknown;
-  theirs?: unknown;
 }
 
 export type ConflictChoice = 'mine' | 'theirs';
 
-/** The answers to the questions of a merge: per base index, and for the order. */
+/** The answers to the questions of Save: per base index, and for the order. */
 export interface MergeChoices {
   entries?: ReadonlyMap<number, ConflictChoice>;
   order?: ConflictChoice;
@@ -314,29 +316,78 @@ export interface MergeChoices {
 }
 
 export type MergeOutcome =
+  /** `conflicts` and `orderConflict`: the questions that the choices answered. */
   | { status: 'merged'; value: unknown[]; conflicts: MergeConflict[]; orderConflict: boolean }
-  /** Questions without an answer in the choices: the entries, and whether both sides moved entries differently. */
+  /** Questions without an answer in the choices: the changes of entries, and whether both sides moved entries differently. */
   | { status: 'conflicts'; conflicts: MergeConflict[]; orderConflict: boolean }
   /** The value stored now is not a list (nor missing): Save must ask before it replaces it (`choices.replaceNotAList`). */
   | { status: 'notAList'; theirs: unknown };
 
-type SideState = { kind: 'unchanged' } | { kind: 'removed' } | { kind: 'edited'; value: unknown };
+/** An edit (`to` set) or a removal of the editor, of the base entry `baseIndex`. */
+interface EditorChange {
+  baseIndex: number;
+  /** Position of the edited entry in the editor. */
+  position?: number;
+  to?: unknown;
+  toKey?: string;
+  /**
+   * Only what loading did to the entry (flags other than i, u, and s dropped, an entry of the wrong type left out), not
+   * a change of the user: applied when the entry is found in settings.json, otherwise dropped without a question.
+   */
+  loading: boolean;
+}
 
-type Token = { kind: 'base'; index: number } | { kind: 'new'; value: unknown };
+/** One element of the stored value (settings.json) while the patch is applied. */
+interface Cell {
+  value: unknown;
+  /** The base entry that this element is (located by its value, step 1 of mergeRepositoryGroups). */
+  base?: number;
+  removed?: boolean;
+  /** An element that a Keep Mine answer already changed. */
+  taken?: boolean;
+  /** Entries of the editor inserted after this element, in order. */
+  after: Item[];
+}
+
+interface Item {
+  value: unknown;
+}
 
 /**
- * Save never overwrites a change made in settings.json meanwhile: a 3-way merge of the setting value by the identity of
- * the entries. `base` is the value that the editor loaded (when it opened, or was last saved or loaded), `ours` the
- * entries of the editor (each with the `origin` it was loaded from, none when added), and `theirs` the value stored
- * now. The elements of `theirs` are matched to the base first in order, then over the whole list (alignToBase), so an
- * entry that settings.json only moved keeps its identity. Per identity: the change of the one side that changed it wins; the same
- * change on both sides is no conflict; different changes (also removed on one side and edited on the other) are a
- * conflict, answered in `choices.entries` by base index. Additions of both sides stay, with their multiplicity (an entry
- * that both sides added once is written once). The order: the order of the side that moved entries; when both moved
- * entries differently, a question (`orderConflict`, answered in `choices.order`); otherwise the order of settings.json.
- * Whether a side moved entries is decided on the entries that both sides kept. The entries that only the other side
- * has are placed after their predecessor on that side. A stored value that is not a list is never merged: the outcome
- * `notAList` asks first, and `choices.replaceNotAList` writes the entries of the editor instead.
+ * Save never overwrites settings.json. As the user put it: "it shall not overwrite, but read the settings and insert
+ * the part that we want to change". So Save applies the changes of the editor as a patch to the value stored now; it
+ * never guesses which element of settings.json is which entry of the editor.
+ *
+ * `base` is the value that the editor loaded (when it opened, or was last saved or loaded), `ours` the entries of the
+ * editor, each with the `origin` it was loaded from (none when added), and `theirs` the value stored now. The patch is
+ * the difference of the editor to the base: an edit or a removal of a base entry, an addition after the nearest entry
+ * of the editor before it that has an origin, and a move (the entries with an origin are not in the order of the base).
+ *
+ * 1. Each base entry is located in `theirs` by its value (pattern, name, and flags as the editor compares them): the
+ *    k-th copy of a value in the base is the k-th copy in `theirs`, but only when `theirs` has as many copies as the
+ *    base; otherwise the entry is not located.
+ * 2. An edit or removal of a located entry is applied in place.
+ * 3. An edit or removal of an entry that is not located: when `theirs` made the same change (a removed value is gone
+ *    from `theirs`; for an edit, `theirs` has one copy less of the old value and one more of the new value than the
+ *    base), nothing is left to do. Otherwise it is a conflict, answered in `choices.entries` by base index: Keep Mine
+ *    applies the change to a copy of the old value that `theirs` still holds (the nearest to the place of the entry:
+ *    after the nearest located base entry before it), and otherwise inserts the new value as an addition is inserted;
+ *    Keep settings.json drops the change.
+ * 4. An addition goes after the nearest entry of the editor before it that is in the result (after the elements that
+ *    settings.json holds right after that entry and that are not located); without one, at the start when an entry of
+ *    the editor that is located follows it, otherwise at the end. An addition that `theirs` already made (it has more
+ *    copies of the value than the base, not yet used by another change) is not added twice. No question.
+ * 5. A move: when the editor has the located entries in another order than the base, and `theirs` still has them in
+ *    the order of the base, they are put into the order of the editor; each takes along the elements that follow it in
+ *    `theirs` up to the next such entry. When `theirs` has them in the order of the editor, nothing is to do. When
+ *    `theirs` moved them too, one question (`orderConflict`, answered in `choices.order`).
+ * 6. A stored value that is not a list is never patched: the outcome `notAList` asks first, and
+ *    `choices.replaceNotAList` writes the entries of the editor instead.
+ * 7. Without changes in the editor, the result is `theirs` as it is; when `theirs` equals the base, it is the entries
+ *    of the editor exactly.
+ *
+ * The time is linear in the number of entries for the lookups by value (maps), plus the number of insertions times the
+ * number of entries for their places; no two texts are compared for similarity.
  */
 export function mergeRepositoryGroups(
   baseValue: unknown,
@@ -346,299 +397,241 @@ export function mergeRepositoryGroups(
 ): MergeOutcome {
   const base = Array.isArray(baseValue) ? (baseValue as unknown[]) : [];
   if (theirsValue !== undefined && theirsValue !== null && !Array.isArray(theirsValue)) {
-    // Not a list: nothing to merge with, and never overwritten without a question.
+    // Not a list: nothing to patch, and never overwritten without a question.
     if (!choices.replaceNotAList) return { status: 'notAList', theirs: theirsValue };
     return { status: 'merged', value: toSettingValue(ours), conflicts: [], orderConflict: false };
   }
   const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
-  const baseKeys = base.map(entryKey);
-  const oursValues = toSettingValue(ours);
-  // Both sides have the same entries in the same order: nothing to merge, settings.json stays as it is (review round 2
-  // of PR #21, F2).
-  if (oursValues.length === theirs.length && oursValues.every((value, position) => entryKey(value) === entryKey(theirs[position]))) {
-    return { status: 'merged', value: [...theirs], conflicts: [], orderConflict: false };
-  }
-
-  // The editor: its entries with a valid origin are the base elements (possibly edited); the others are additions.
-  const oursTokens: Token[] = [];
-  const oursByOrigin = new Map<number, unknown>();
-  ours.forEach((entry, position) => {
-    const origin = entry.origin;
-    if (origin !== undefined && Number.isInteger(origin) && origin >= 0 && origin < base.length && !oursByOrigin.has(origin)) {
-      oursByOrigin.set(origin, oursValues[position]);
-      oursTokens.push({ kind: 'base', index: origin });
-    } else {
-      oursTokens.push({ kind: 'new', value: oursValues[position] });
-    }
-  });
-
-  // settings.json: its elements matched to the base by content, over the whole list. Of equal copies in the base, the
-  // ones that the editor kept are preferred, so a copy that both sides removed is the same copy (review round 2 of
-  // PR #21, F2).
-  const theirsOrigins = alignToBase(base, theirs, new Set(oursByOrigin.keys()));
-  const theirsByOrigin = new Map<number, unknown>();
-  const theirsTokens: Token[] = theirs.map((value, position) => {
-    const origin = theirsOrigins[position];
-    if (origin === undefined) return { kind: 'new', value };
-    theirsByOrigin.set(origin, value);
-    return { kind: 'base', index: origin };
-  });
-
-  const state = (side: Map<number, unknown>, index: number): SideState => {
-    if (!side.has(index)) return { kind: 'removed' };
-    const value = side.get(index);
-    return entryKey(value) === baseKeys[index] ? { kind: 'unchanged' } : { kind: 'edited', value };
-  };
-
-  const conflicts: MergeConflict[] = [];
-  const unresolved: MergeConflict[] = [];
-  const decided = new Map<number, { keep: true; value: unknown } | { keep: false }>();
-  base.forEach((baseEntry, index) => {
-    const mine = state(oursByOrigin, index);
-    const other = state(theirsByOrigin, index);
-    const valueOf = (side: SideState, values: Map<number, unknown>) =>
-      side.kind === 'removed' ? ({ keep: false } as const) : ({ keep: true, value: values.get(index) } as const);
-    if (mine.kind === 'unchanged') return decided.set(index, valueOf(other, theirsByOrigin));
-    if (other.kind === 'unchanged') return decided.set(index, valueOf(mine, oursByOrigin));
-    if (mine.kind === 'removed' && other.kind === 'removed') return decided.set(index, { keep: false });
-    if (mine.kind === 'edited' && other.kind === 'edited' && entryKey(mine.value) === entryKey(other.value)) {
-      return decided.set(index, { keep: true, value: other.value });
-    }
-    const conflict: MergeConflict = {
-      baseIndex: index,
-      base: baseEntry,
-      ...(mine.kind === 'edited' ? { mine: mine.value } : {}),
-      ...(other.kind === 'edited' ? { theirs: other.value } : {}),
-    };
-    conflicts.push(conflict);
-    const choice = choices.entries?.get(index);
-    if (choice === undefined) {
-      unresolved.push(conflict);
-      return decided.set(index, { keep: false });
-    }
-    return decided.set(index, choice === 'mine' ? valueOf(mine, oursByOrigin) : valueOf(other, theirsByOrigin));
-  });
-
-  // The order: of the side that moved entries; a question when both moved them differently. Whether a side moved
-  // entries is decided on the entries that both sides kept, against their order in the base: an entry that one side
-  // removed does not make a move of the other side (review round 2 of PR #21, M3).
-  const inOurs = new Set(oursByOrigin.keys());
-  const inTheirs = new Set(theirsByOrigin.keys());
-  const common = (tokens: Token[], other: Set<number>) =>
-    tokens.flatMap((token) => (token.kind === 'base' && other.has(token.index) ? [token.index] : []));
-  const oursCommon = common(oursTokens, inTheirs);
-  const theirsCommon = common(theirsTokens, inOurs);
-  const oursMoved = isReordered(oursCommon);
-  const theirsMoved = isReordered(theirsCommon);
-  let orderConflict = false;
-  let skeletonSide: ConflictChoice = oursMoved ? 'mine' : 'theirs';
-  if (oursMoved && theirsMoved) {
-    orderConflict = oursCommon.join(',') !== theirsCommon.join(',');
-    if (orderConflict) skeletonSide = choices.order ?? 'mine';
-  }
-  const orderUnresolved = orderConflict && choices.order === undefined;
-  if (unresolved.length > 0 || orderUnresolved) return { status: 'conflicts', conflicts: unresolved, orderConflict: orderUnresolved };
-
-  const kept = (token: Token) => token.kind === 'new' || decided.get(token.index)?.keep === true;
-  const [skeleton, other] = skeletonSide === 'mine' ? [oursTokens, theirsTokens] : [theirsTokens, oursTokens];
-  const merged: Token[] = skeleton.filter(kept);
-  // Additions of the skeleton side, per entry: an equal addition of the other side is the same entry.
-  const unmatchedNew = new Map<string, number>();
-  for (const token of merged) {
-    if (token.kind === 'new') unmatchedNew.set(entryKey(token.value), (unmatchedNew.get(entryKey(token.value)) ?? 0) + 1);
-  }
-  let last = -1;
-  for (const token of other) {
-    if (token.kind === 'base') {
-      const at = merged.findIndex((placed) => placed.kind === 'base' && placed.index === token.index);
-      if (at >= 0) {
-        last = at;
-        continue;
-      }
-      if (!kept(token)) continue;
-    } else {
-      const key = entryKey(token.value);
-      const left = unmatchedNew.get(key) ?? 0;
-      if (left > 0) {
-        unmatchedNew.set(key, left - 1);
-        last = merged.findIndex((placed) => placed.kind === 'new' && entryKey(placed.value) === key);
-        continue;
-      }
-    }
-    merged.splice(last + 1, 0, token);
-    last += 1;
-  }
-  const value = merged.map((token) => {
-    if (token.kind === 'new') return token.value;
-    const decision = decided.get(token.index);
-    return decision?.keep ? decision.value : undefined;
-  });
-  return { status: 'merged', value, conflicts, orderConflict };
-}
-
-/** The base indices are not in increasing order: the entries were moved. */
-function isReordered(indices: readonly number[]): boolean {
-  return indices.some((index, position) => position > 0 && index < indices[position - 1]);
-}
-
-/**
- * For each element of `theirs`, the index of the base element it stems from, or `undefined` for an addition. First the
- * equal entries in order (a longest common subsequence of both lists), so an entry that settings.json added or removed
- * next to an equal one does not look like a move (review round 2 of PR #21, M2). Then the rest over the whole list, so a
- * moved entry keeps its identity: equal entries (each base entry once, so duplicates keep their multiplicity), then
- * entries with the same pattern, then with the same name; last, the remaining entries after the same matched neighbor
- * (an entry whose pattern and name both changed, also next to an addition): in order when both sides have as many,
- * otherwise only the pairs whose patterns are clearly the most similar (`similarPairs`); the rest count as removed and
- * added, so no entry of settings.json is dropped for a wrong guess (review round 2 of PR #21, F1). Of equal copies in
- * the base, the `preferred` ones (that the editor kept) are matched first (F2).
- */
-function alignToBase(base: readonly unknown[], theirs: readonly unknown[], preferred: ReadonlySet<number>): Array<number | undefined> {
-  const origins = new Array<number | undefined>(theirs.length).fill(undefined);
-  const used = new Set<number>();
-  const pass = (same: (baseIndex: number, theirsIndex: number) => boolean) => {
-    theirs.forEach((_value, j) => {
-      if (origins[j] !== undefined) return;
-      const free = (candidate: number) => !used.has(candidate) && same(candidate, j);
-      let i = base.findIndex((_entry, candidate) => preferred.has(candidate) && free(candidate));
-      if (i < 0) i = base.findIndex((_entry, candidate) => free(candidate));
-      if (i < 0) return;
-      origins[j] = i;
-      used.add(i);
-    });
-  };
+  const mine = toSettingValue(ours);
   const baseKeys = base.map(entryKey);
   const theirsKeys = theirs.map(entryKey);
-  const baseFields = base.map(entryFieldsOf);
-  const theirsFields = theirs.map(entryFieldsOf);
-  for (const [i, j] of commonSubsequence(baseKeys, theirsKeys, (i) => preferred.has(i))) {
-    origins[j] = i;
-    used.add(i);
-  }
-  pass((i, j) => baseKeys[i] === theirsKeys[j]);
-  pass((i, j) => baseFields[i] !== undefined && baseFields[i]?.pattern === theirsFields[j]?.pattern);
-  pass((i, j) => baseFields[i]?.name !== undefined && baseFields[i]?.name === theirsFields[j]?.name);
+  const mineKeys = mine.map(entryKey);
+  const merged = (value: unknown[], conflicts: MergeConflict[] = [], orderConflict = false): MergeOutcome => ({
+    status: 'merged',
+    value,
+    conflicts,
+    orderConflict,
+  });
+  // settings.json is as the editor loaded it: the entries of the editor, exactly.
+  if (sameKeys(theirsKeys, baseKeys)) return merged(mine);
+  // settings.json already holds the entries of the editor (review round 2 of PR #21, F2): nothing to write.
+  if (sameKeys(mineKeys, theirsKeys)) return merged([...theirs]);
 
-  // Neighbors: the position in `theirs` of the nearest matched entry before.
-  const theirsPositionOf = new Map<number, number>();
-  origins.forEach((origin, j) => origin !== undefined && theirsPositionOf.set(origin, j));
-  const baseAnchor = (i: number) => {
-    for (let k = i - 1; k >= 0; k--) if (theirsPositionOf.has(k)) return theirsPositionOf.get(k) ?? -1;
-    return -1;
-  };
-  const theirsAnchor = (j: number) => {
-    for (let k = j - 1; k >= 0; k--) if (origins[k] !== undefined) return k;
-    return -1;
-  };
-  const leftBase = new Map<number, number[]>();
-  base.forEach((_entry, i) => {
-    if (used.has(i)) return;
-    const anchor = baseAnchor(i);
-    leftBase.set(anchor, [...(leftBase.get(anchor) ?? []), i]);
+  // The patch of the editor.
+  const origins = ours.map((entry) => entry.origin);
+  const positionOf = new Map<number, number>();
+  origins.forEach((origin, position) => {
+    if (origin !== undefined && Number.isInteger(origin) && origin >= 0 && origin < base.length && !positionOf.has(origin)) {
+      positionOf.set(origin, position);
+    } else {
+      origins[position] = undefined;
+    }
   });
-  const leftTheirs = new Map<number, number[]>();
-  theirs.forEach((_value, j) => {
-    if (origins[j] !== undefined) return;
-    const anchor = theirsAnchor(j);
-    leftTheirs.set(anchor, [...(leftTheirs.get(anchor) ?? []), j]);
+  const changes: EditorChange[] = [];
+  base.forEach((entry, baseIndex) => {
+    const position = positionOf.get(baseIndex);
+    if (position === undefined) {
+      changes.push({ baseIndex, loading: loadedKey(entry) === undefined });
+    } else if (mineKeys[position] !== baseKeys[baseIndex]) {
+      changes.push({ baseIndex, position, to: mine[position], toKey: mineKeys[position], loading: mineKeys[position] === loadedKey(entry) });
+    }
   });
-  const textOf = (entry: unknown) => entryFieldsOf(entry)?.pattern ?? entryKey(entry);
-  for (const [anchor, baseIndices] of leftBase) {
-    const theirsIndices = leftTheirs.get(anchor) ?? [];
-    if (baseIndices.length === theirsIndices.length) {
-      // As many entries on both sides between the same neighbors: each one was edited in place.
-      baseIndices.forEach((i, k) => (origins[theirsIndices[k]] = i));
+  const additions = origins.flatMap((origin, position) => (origin === undefined ? [position] : []));
+  const originOrder = origins.filter((origin): origin is number => origin !== undefined);
+  if (changes.length === 0 && additions.length === 0 && isIncreasing(originOrder)) return merged([...theirs]);
+
+  // 1. Locate the base entries in settings.json by value.
+  const baseCount = countKeys(baseKeys);
+  const theirsCount = countKeys(theirsKeys);
+  const theirsPositions = new Map<string, number[]>();
+  theirsKeys.forEach((key, position) => {
+    const positions = theirsPositions.get(key);
+    if (positions) positions.push(position);
+    else theirsPositions.set(key, [position]);
+  });
+  const cells: Cell[] = theirs.map((value) => ({ value, after: [] }));
+  const located = new Array<number | undefined>(base.length).fill(undefined);
+  const copiesSeen = new Map<string, number>();
+  baseKeys.forEach((key, baseIndex) => {
+    const copy = copiesSeen.get(key) ?? 0;
+    copiesSeen.set(key, copy + 1);
+    if (baseCount.get(key) !== theirsCount.get(key)) return;
+    const position = (theirsPositions.get(key) ?? [])[copy];
+    located[baseIndex] = position;
+    cells[position].base = baseIndex;
+  });
+  // The last element of the run of elements that are not located after each element.
+  const runEnd = new Array<number>(cells.length);
+  for (let position = cells.length - 1; position >= 0; position--) {
+    runEnd[position] = position + 1 < cells.length && cells[position + 1].base === undefined ? runEnd[position + 1] : position;
+  }
+  // The place in settings.json of each base entry: after the run of the nearest located base entry before it.
+  const basePlace = new Array<number>(base.length);
+  let place = -0.5;
+  base.forEach((_entry, baseIndex) => {
+    basePlace[baseIndex] = place;
+    const position = located[baseIndex];
+    if (position !== undefined) place = runEnd[position] + 0.5;
+  });
+
+  // Copies of a value that settings.json added or removed, not yet used by a change of the editor that it also made.
+  const used = { added: new Map<string, number>(), removed: new Map<string, number>() };
+  const left = (kind: 'added' | 'removed', key: string) => {
+    const delta = (theirsCount.get(key) ?? 0) - (baseCount.get(key) ?? 0);
+    return (kind === 'added' ? delta : -delta) - (used[kind].get(key) ?? 0);
+  };
+  const use = (kind: 'added' | 'removed', key: string) => used[kind].set(key, (used[kind].get(key) ?? 0) + 1);
+  /** The copy of `key` in settings.json nearest to `at`, that no answer changed yet. */
+  const nearestCopy = (key: string, at: number): number | undefined => {
+    let best: number | undefined;
+    for (const position of theirsPositions.get(key) ?? []) {
+      if (cells[position].removed || cells[position].taken) continue;
+      if (best === undefined || Math.abs(position - at) <= Math.abs(best - at)) best = position;
+    }
+    return best;
+  };
+
+  // 2. and 3. Edits and removals.
+  const conflicts: MergeConflict[] = [];
+  const open: MergeConflict[] = [];
+  const placedCell = new Map<number, number>();
+  const insertLater = new Set<number>();
+  origins.forEach((origin, position) => {
+    if (origin !== undefined && located[origin] !== undefined) placedCell.set(position, located[origin] as number);
+  });
+  for (const change of changes) {
+    const at = located[change.baseIndex];
+    if (at !== undefined) {
+      if (change.position === undefined) cells[at].removed = true;
+      else cells[at].value = change.to;
       continue;
     }
-    // Otherwise the pairing in order would be a guess (review round 2 of PR #21, F1): only an entry whose pattern is
-    // clearly the most similar one on both sides is the same entry; the others count as removed and added.
-    for (const [i, j] of similarPairs(
-      baseIndices.map((i) => textOf(base[i])),
-      theirsIndices.map((j) => textOf(theirs[j])),
-    )) {
-      origins[theirsIndices[j]] = baseIndices[i];
+    // settings.json changed or removed an entry that loading changed: its value stays.
+    if (change.loading) continue;
+    const from = baseKeys[change.baseIndex];
+    if (change.position === undefined) {
+      if (!theirsCount.has(from)) continue;
+    } else if (change.toKey !== undefined && left('removed', from) > 0 && left('added', change.toKey) > 0) {
+      use('removed', from);
+      use('added', change.toKey);
+      continue;
+    }
+    const conflict: MergeConflict = {
+      baseIndex: change.baseIndex,
+      base: base[change.baseIndex],
+      ...(change.position !== undefined ? { mine: change.to } : {}),
+    };
+    conflicts.push(conflict);
+    const choice = choices.entries?.get(change.baseIndex);
+    if (choice === undefined) {
+      open.push(conflict);
+      continue;
+    }
+    if (choice === 'theirs') continue;
+    const copy = nearestCopy(from, basePlace[change.baseIndex]);
+    if (change.position === undefined) {
+      if (copy !== undefined) cells[copy].removed = true;
+    } else if (copy !== undefined) {
+      cells[copy].value = change.to;
+      cells[copy].taken = true;
+      placedCell.set(change.position, copy);
+    } else {
+      insertLater.add(change.position);
     }
   }
-  return origins;
-}
 
-/**
- * Pairs texts of `a` and `b` that are similar (more than half of the longer text in common, as a subsequence) and the
- * single most similar one for each other (the smallest edit distance by insertions and deletions, without a tie).
- */
-function similarPairs(a: readonly string[], b: readonly string[]): Array<[number, number]> {
-  const distance = a.map((x) =>
-    b.map((y) => {
-      const common = commonSubsequence([...x], [...y]).length;
-      return 2 * common > Math.max(x.length, y.length) ? x.length + y.length - 2 * common : Infinity;
-    }),
+  // 5. The order (decided before the questions are returned, so they are asked together).
+  const moved = origins.flatMap((origin, position) =>
+    origin !== undefined && located[origin] !== undefined ? [{ position, base: origin, cell: located[origin] as number }] : [],
   );
-  const pairs: Array<[number, number]> = [];
-  const freeA = new Set(a.keys());
-  const freeB = new Set(b.keys());
-  const nearest = (candidates: Set<number>, distanceTo: (k: number) => number): number | undefined => {
-    let best: number | undefined;
-    let tie = false;
-    for (const k of candidates) {
-      const d = distanceTo(k);
-      if (d === Infinity) continue;
-      if (best === undefined || d < distanceTo(best)) {
-        best = k;
-        tie = false;
-      } else if (d === distanceTo(best)) {
-        tie = true;
+  const byCell = [...moved].sort((a, b) => a.cell - b.cell);
+  let orderConflict = false;
+  let reorder = false;
+  if (!isIncreasing(moved.map((entry) => entry.base)) && byCell.some((entry, index) => entry !== moved[index])) {
+    if (isIncreasing(byCell.map((entry) => entry.base))) {
+      reorder = true;
+    } else {
+      orderConflict = true;
+      reorder = choices.order === 'mine';
+    }
+  }
+  const orderOpen = orderConflict && choices.order === undefined;
+  if (open.length > 0 || orderOpen) return { status: 'conflicts', conflicts: open, orderConflict: orderOpen };
+
+  // 4. Additions (and edits answered with Keep Mine whose entry settings.json no longer has), in the order of the editor.
+  const start: Item[] = [];
+  const end: Item[] = [];
+  const placedItem = new Map<number, { list: Item[]; item: Item }>();
+  const cellAfter = new Array<boolean>(ours.length + 1).fill(false);
+  for (let position = ours.length - 1; position >= 0; position--) cellAfter[position] = cellAfter[position + 1] || placedCell.has(position);
+  const insert = (position: number) => {
+    const item: Item = { value: mine[position] };
+    for (let before = position - 1; before >= 0; before--) {
+      const cell = placedCell.get(before);
+      if (cell !== undefined) {
+        const list = cells[runEnd[cell]].after;
+        list.push(item);
+        placedItem.set(position, { list, item });
+        return;
+      }
+      const anchor = placedItem.get(before);
+      if (anchor) {
+        anchor.list.splice(anchor.list.indexOf(anchor.item) + 1, 0, item);
+        placedItem.set(position, { list: anchor.list, item });
+        return;
       }
     }
-    return tie ? undefined : best;
+    const list = cellAfter[position + 1] ? start : end;
+    list.push(item);
+    placedItem.set(position, { list, item });
   };
-  for (let found = true; found; ) {
-    found = false;
-    for (const i of freeA) {
-      const j = nearest(freeB, (k) => distance[i][k]);
-      if (j === undefined || nearest(freeA, (k) => distance[k][j]) !== i) continue;
-      pairs.push([i, j]);
-      freeA.delete(i);
-      freeB.delete(j);
-      found = true;
+  ours.forEach((_entry, position) => {
+    if (origins[position] === undefined) {
+      if (left('added', mineKeys[position]) > 0) use('added', mineKeys[position]);
+      else insert(position);
+    } else if (insertLater.has(position)) {
+      insert(position);
     }
+  });
+
+  const value: unknown[] = start.map((item) => item.value);
+  const append = (from: number, to: number) => {
+    for (let position = from; position < to; position++) {
+      if (!cells[position].removed) value.push(cells[position].value);
+      for (const item of cells[position].after) value.push(item.value);
+    }
+  };
+  if (!reorder) {
+    append(0, cells.length);
+  } else {
+    // Each located entry of the editor with the elements after it, up to the next one; in the order of the editor.
+    append(0, byCell[0].cell);
+    const until = new Map(byCell.map((entry, index) => [entry.cell, index + 1 < byCell.length ? byCell[index + 1].cell : cells.length]));
+    for (const entry of moved) append(entry.cell, until.get(entry.cell) ?? cells.length);
   }
-  return pairs;
+  for (const item of end) value.push(item.value);
+  return merged(value, conflicts, orderConflict);
 }
 
-/**
- * The index pairs of a longest common subsequence of `a` and `b`, in order. Of the longest ones, the one with the most
- * elements of `a` that are `preferred`, then the first of equal choices.
- */
-function commonSubsequence(
-  a: readonly string[],
-  b: readonly string[],
-  preferred: (i: number) => boolean = () => false,
-): Array<[number, number]> {
-  const width = b.length + 1;
-  // A match counts more than all preferred elements together.
-  const weight = (i: number) => a.length + 1 + (preferred(i) ? 1 : 0);
-  // lengths[i * width + j]: the weight of a best common subsequence of a[i..] and b[j..].
-  const lengths = new Float64Array((a.length + 1) * width);
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      const skip = Math.max(lengths[(i + 1) * width + j], lengths[i * width + j + 1]);
-      lengths[i * width + j] = a[i] === b[j] ? Math.max(skip, weight(i) + lengths[(i + 1) * width + j + 1]) : skip;
-    }
-  }
-  const pairs: Array<[number, number]> = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j] && weight(i) + lengths[(i + 1) * width + j + 1] === lengths[i * width + j]) {
-      pairs.push([i, j]);
-      i += 1;
-      j += 1;
-    } else if (lengths[(i + 1) * width + j] >= lengths[i * width + j + 1]) {
-      i += 1;
-    } else {
-      j += 1;
-    }
-  }
-  return pairs;
+function isIncreasing(values: readonly number[]): boolean {
+  return values.every((value, index) => index === 0 || value > values[index - 1]);
+}
+
+function sameKeys(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((key, index) => key === b[index]);
+}
+
+function countKeys(keys: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+  return counts;
+}
+
+/** The key of an element of the setting as the editor loads it (flags other than i, u, and s dropped); `undefined` for one that it leaves out. */
+function loadedKey(entry: unknown): string | undefined {
+  const fields = entryFieldsOf(entry);
+  if (!fields) return undefined;
+  return entryKey(toSettingValue([{ name: fields.name ?? '', pattern: fields.pattern, flags: normalizeFlags(fields.flags ?? '') }])[0]);
 }
 
 /** The name (trimmed, if any) and pattern of an element of the setting, or `undefined` for one of the wrong type. */
@@ -660,7 +653,27 @@ function entryFieldsOf(entry: unknown): { name?: string; pattern: string; flags?
  * name is trimmed, and an empty name or flags text counts as none. Elements of the wrong type compare as JSON.
  */
 function entryKey(entry: unknown): string {
-  return stableJson(entryFieldsOf(entry) ?? { invalid: entry ?? null });
+  const fields = entryFieldsOf(entry);
+  if (!fields) return `invalid:${stableJson(entry ?? null)}`;
+  // The texts with their lengths (unambiguous): no JSON of long patterns, so Save of long lists stays fast.
+  const name = fields.name ?? '';
+  return `${fields.pattern.length}:${fields.pattern}${name.length}:${name}${fields.flags ?? ''}`;
+}
+
+/** At most this many characters of the list of settings.json are shown in a question. */
+const MAX_SHOWN_LIST = 2000;
+
+/** A short text of the list of settings.json for the conflict question: one element per line, cut after MAX_SHOWN_LIST characters. */
+export function describeSettingList(value: unknown): string {
+  if (!Array.isArray(value)) return describeSettingEntry(value);
+  if (value.length === 0) return '(no entries)';
+  let text = '';
+  for (const [index, entry] of value.entries()) {
+    const line = `\n${index + 1}. ${describeSettingEntry(entry)}`;
+    if (text.length + line.length > MAX_SHOWN_LIST) return `${text}\n… (${value.length - index} more)`;
+    text += line;
+  }
+  return text;
 }
 
 /** A short text of an element of the setting for the conflict question. */
@@ -987,7 +1000,7 @@ export function editorHtml(options: { cspSource: string; nonce: string; scriptUr
 <p class="intro">Regular expressions (JavaScript syntax) that filter and group the repositories of the Dev Environments view. Each one is matched against the repository name without the owner; a repository goes under the first entry that matches. The capturing groups are the levels of the tree; the last one is the label of the row. In an owner where a repository matches, the repositories that match none are hidden, except those with an environment.</p>
 <div id="notices" role="status" aria-live="polite"></div>
 <div id="changed" class="banner" role="alert" hidden>
-<span>The setting was changed in settings.json after this editor loaded it. Save adds your changes to it and asks only about entries that were changed on both sides. Load Setting shows the current setting and discards your changes.</span>
+<span>The setting was changed in settings.json after this editor loaded it. Save applies your changes to the current setting. It asks only where settings.json changed or removed an entry that you changed too, or where both moved entries differently. Load Setting shows the current setting and discards your changes.</span>
 <button type="button" id="reload" class="secondary">Load Setting</button>
 </div>
 <section aria-labelledby="entries-heading">
