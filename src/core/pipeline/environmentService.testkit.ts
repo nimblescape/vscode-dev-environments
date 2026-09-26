@@ -71,6 +71,8 @@ export const T0 = Date.parse('2026-09-24T15:40:00.000Z');
  * own labels (review round 2, D2-1): the expectations of the runArgs name them.
  */
 export const CLEARED_COMPOSE_LABELS: readonly string[] = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
+/** Review round 4 (D4-2): the label devenv.config-path of the override configuration, for the default configuration. */
+export const CONFIG_PATH_LABEL: readonly string[] = ['--label', 'devenv.config-path=.devcontainer/devcontainer.json'];
 
 export const DEFAULT_CONFIG_TEXT = `{
   // test configuration
@@ -794,6 +796,9 @@ export class FakeImageChecker {
 export class FakeUi implements PipelineUi {
   trust = true;
   configurationChangedAnswer: 'rebuildNow' | 'later' = 'later';
+  /** Review round 4 (D4-3): the answer to configurationKindChanged, and its questions. */
+  configurationKindChangedAnswer: 'rebuildNow' | 'later' = 'later';
+  readonly kindQuestions: string[] = [];
   filesMissingAnswer: 'cloneAgain' | 'deleteEnvironment' | undefined = undefined;
   readonly prompts: string[] = [];
   readonly infos: string[] = [];
@@ -808,6 +813,12 @@ export class FakeUi implements PipelineUi {
   async configurationChanged(repository: string): Promise<'rebuildNow' | 'later'> {
     this.prompts.push(`configurationChanged ${repository}`);
     return this.configurationChangedAnswer;
+  }
+
+  async configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'> {
+    this.prompts.push(`configurationKindChanged ${repository}`);
+    this.kindQuestions.push(message);
+    return this.configurationKindChangedAnswer;
   }
 
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {

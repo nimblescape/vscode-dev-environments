@@ -21,6 +21,7 @@ import {
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
+  LABEL_CONFIG_PATH,
   LABEL_HOST_ACCESS,
   WORKSPACES_ROOT,
   containerHostname,
@@ -619,6 +620,11 @@ export interface ComposeRewriteParams {
    * on, `checked`. Default `on`.
    */
   hostAccessChecks?: HostAccessChecks;
+  /**
+   * Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path of every service
+   * (LABEL_CONFIG_PATH). Only the up model gets it.
+   */
+  configPath?: string;
 }
 
 /** A change of the rewrite, for the log: what, and why. */
@@ -706,6 +712,7 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     // every service either way (review round 2, D2-2), so that a label of an image that Compose builds or pulls during
     // `up` (not checked before) cannot make a container look unrestricted, or restricted.
     labels[LABEL_HOST_ACCESS] = checksOn ? HOST_ACCESS_CHECKED : HOST_ACCESS_UNRESTRICTED;
+    if (p.configPath !== undefined) labels[LABEL_CONFIG_PATH] = p.configPath;
     service.labels = labels;
     // Names: the dev container has the name of the environment; the others the default names of Compose (a fixed name
     // would collide between two environments of one repository).

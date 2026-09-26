@@ -10,6 +10,7 @@ import type { HostAccessChecks } from '../hostAccessChecks';
 import {
   COMPOSE_CLEARED_LABELS,
   CONTAINER_VERSION_LABEL,
+  configPathLabel,
   containerHostname,
   HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
   HOST_ACCESS_UNRESTRICTED_LABEL,
@@ -201,9 +202,12 @@ export function buildOverrideConfig(p: {
   runArgs?: string[];
   appPort?: DevcontainerConfig['appPort'];
   hostAccessChecks?: HostAccessChecks;
+  /** Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path. */
+  configPath?: string;
 }): Record<string, unknown> {
   const checksOn = p.hostAccessChecks !== 'off';
   const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
+  if (p.configPath !== undefined) labels.push('--label', configPathLabel(p.configPath));
   // Review round 2 (D2-1): the labels of Docker Compose empty, whatever the image inherited.
   for (const label of COMPOSE_CLEARED_LABELS) labels.push('--label', label);
   const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);

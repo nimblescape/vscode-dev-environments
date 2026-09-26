@@ -35,6 +35,20 @@ export const Messages = {
   newerImage: 'A newer image is available. The environment is updated. Your files are kept.',
   filesMissing: 'The files of this environment are missing.',
   configurationChanged: 'The environment configuration changed.',
+  /**
+   * Review round 4 (D4-3): an environment without a build record (restored after a lost registry) whose containers are of
+   * another kind than its configuration. Rebuild now switches the kind; Later keeps it (the non-destructive answer).
+   */
+  configurationKindChanged: (containersUseCompose: boolean, configPath: string) =>
+    containersUseCompose
+      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
+      : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
+  /**
+   * Review round 4 (D4-2): Later for an environment whose Docker Compose dev container is missing: nothing can start
+   * without the switch, so nothing is removed and nothing starts.
+   */
+  composeDevContainerMissing: (configPath: string) =>
+    `The dev container of this Docker Compose environment is missing, and the configuration ${configPath} uses a single container. The containers of the other services are kept. Rebuild the environment to switch it to a single container, or choose Select configuration… for its Docker Compose configuration.`,
   /** Docker Compose could not read the compose files of a configuration (the details have its message). */
   /**
    * Review round 3 (P3-1): the configuration builds from a Dockerfile or a build context that does not exist in the

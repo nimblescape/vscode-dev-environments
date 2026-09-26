@@ -18,10 +18,12 @@ import {
   type ComposeModelOutput,
 } from '../helper/compose';
 import { Messages } from '../messages';
+import { abortError } from '../ports';
 import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
+  LABEL_CONFIG_PATH,
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
   LABEL_ENVIRONMENT_ID,
@@ -1212,20 +1214,22 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
   });
 
-  it('asks for a rebuild instead of an up that would find the container of another service (D3-1)', async () => {
+  it('never lets an up find the container of another service next to a single container (D3-1)', async () => {
     // An up-to-date single container, and a container of a service of Docker Compose with the ID label.
     await seedEnvironment(h, { container: 'stopped' });
+    const dev = devContainer();
     useSingle();
     const db = addDb();
-    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-    expect(error.code).toBe('startFailed');
-    expect(error.detail).toContain('rebuild the environment');
-    expect(h.helper.ups).toEqual([]);
-    // A rebuild removes it and creates the single container.
-    await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+    // Review round 4, P4-3: changed expectation. Next to a single dev container, the container of the other service is a
+    // stray: it is removed (its volumes stay), and the single container starts as usual, without a rebuild (which would
+    // not help when the configuration cannot be used).
+    const result = await h.service.openEnvironment(ENV_ID, options());
     expect(h.docker.log).toContain(`rm ${db.id}`);
-    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).not.toContain(db.id);
-    expect(h.helper.ups.at(-1)?.removeExistingContainer).toBe(true);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([dev?.id]);
+    expect(h.helper.ups.map((up) => [up.image, up.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
+    expect(h.helper.builds).toEqual([]);
+    expect(result.containerName).toBe(NAME);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
   });
 
   it('keeps the kind of a restored environment without build record whose containers are of Docker Compose (D3-2)', async () => {
@@ -1236,16 +1240,19 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     const db = dbContainer();
     const dev = devContainer();
     useSingle();
-    h.ui.configurationChangedAnswer = 'later';
+    // Review round 4, D4-3: changed expectation, a question of its own that names the switch (configurationKindChanged).
+    h.ui.configurationKindChangedAnswer = 'later';
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
+    expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${dev?.id}`);
     expect(dbContainer()?.id).toBe(db?.id);
     // "Rebuild now" switches, as a rebuild does.
-    h.ui.configurationChangedAnswer = 'rebuildNow';
+    // Review round 4, D4-3: changed expectation, the answer of configurationKindChanged.
+    h.ui.configurationKindChangedAnswer = 'rebuildNow';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.builds).toHaveLength(1);
     expect(h.docker.log).toContain(`rm ${db?.id}`);
@@ -1294,3 +1301,183 @@ function useSingle(): void {
   h.helper.composeOutput = undefined as never;
   h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
 }
+
+describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
+  const DB_LABELS = { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db', 'com.docker.compose.config-hash': 'x' };
+  const COMPOSE_PATH = '.devcontainer/compose/devcontainer.json';
+
+  function addDb(state: ContainerState = 'running', labels: Record<string, string> = {}): ContainerInfo {
+    return h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-db-1`, state, image: DB_IMAGE, labels: { ...DB_LABELS, ...labels } });
+  }
+
+  it('never removes a container of Docker Compose that existed before a failed switch, for example of a cancelled one (D4-1)', async () => {
+    // A switch to Docker Compose that was cancelled after `up` created the containers: the record stays single.
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const cancel = new AbortController();
+    h.helper.upError = (image) => (image === IMAGE_2 ? abortError() : undefined);
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+      h.docker.addContainer({
+        environmentId: ENV_ID,
+        name: NAME,
+        state: 'running',
+        image: IMAGE_2,
+        labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', 'com.docker.compose.config-hash': 'y' },
+      });
+      cancel.abort();
+    };
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: cancel.signal }).catch(() => undefined);
+    h.helper.upError = () => undefined;
+    h.helper.beforeUpError = undefined;
+    // "Later": the user works with the containers of Docker Compose.
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    // A later "Rebuild now" whose `up` fails: the db container stays.
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image !== IMAGE_1 && image !== IMAGE_2 ? new Error('port 5432 in use') : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.docker.log).not.toContain(`rm ${db?.id}`);
+    expect(dbContainer()?.id).toBe(db?.id);
+    expect(error.detail).not.toContain('were removed again');
+  });
+
+  it('removes only the containers that the failed up created when the switch removed the single container (D4-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    // A db container of an earlier switch exists already.
+    const db = addDb('stopped');
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    let cache: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      cache = h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-cache-1`, state: 'running', image: DB_IMAGE, labels: { ...DB_LABELS, [LABEL_COMPOSE_SERVICE]: 'cache', 'com.docker.compose.service': 'cache' } });
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.docker.log).toContain(`rm ${cache?.id}`);
+    expect(h.docker.log).not.toContain(`rm ${db.id}`);
+    expect(error.detail).toContain(`The containers that Docker Compose had created were removed again: the container ${PROJECT}-cache-1 of the service cache.`);
+    expect(error.detail).toContain(`The containers of Docker Compose that existed before this start were kept: the container ${PROJECT}-db-1 of the service db.`);
+  });
+
+  it('labels every container that up creates with the configuration path (D4-2)', async () => {
+    // Docker Compose: the dev service and the other services.
+    await h.service.open(TARGET, options());
+    expect(upModel().services.app.labels).toMatchObject({ [LABEL_CONFIG_PATH]: DEFAULT_CONFIG_PATH });
+    expect(upModel().services.db.labels).toMatchObject({ [LABEL_CONFIG_PATH]: DEFAULT_CONFIG_PATH });
+    expect(devContainer()?.labels[LABEL_CONFIG_PATH]).toBe(DEFAULT_CONFIG_PATH);
+    expect(dbContainer()?.labels[LABEL_CONFIG_PATH]).toBe(DEFAULT_CONFIG_PATH);
+    // A single container.
+    const other = createHarness({ newEnvironmentId: () => ENV_ID });
+    try {
+      other.helper.files = { [COMPOSE_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
+      other.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+      await other.service.open({ ...TARGET, configPaths: [COMPOSE_PATH] }, { progress: other.progress });
+      expect(other.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['--label', `${LABEL_CONFIG_PATH}=${COMPOSE_PATH}`]));
+      expect(other.docker.containersOf(ENV_ID)[0].labels[LABEL_CONFIG_PATH]).toBe(COMPOSE_PATH);
+    } finally {
+      other.cleanup();
+    }
+  });
+
+  function seedRestore(): void {
+    h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.images.add(DB_IMAGE);
+  }
+
+  it('restores the configuration path from the label of the containers, the dev container first (D4-2)', async () => {
+    seedRestore();
+    h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'stopped', image: IMAGE_1, labels: { ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', [LABEL_CONFIG_PATH]: COMPOSE_PATH } });
+    addDb('stopped', { [LABEL_CONFIG_PATH]: '.devcontainer/other/devcontainer.json' });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(COMPOSE_PATH);
+  });
+
+  it('restores the configuration path from a container of another service when the dev container is gone (D4-2)', async () => {
+    seedRestore();
+    addDb('stopped', { [LABEL_CONFIG_PATH]: COMPOSE_PATH });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(COMPOSE_PATH);
+  });
+
+  it.each(['../../etc/devcontainer.json', '/workspaces/api/.devcontainer/devcontainer.json', '.devcontainer/../x/devcontainer.json', '.devcontainer/a/b/devcontainer.json', 'devcontainer.json'])(
+    'keeps the default configuration path for the label %j (D4-2)',
+    async (value) => {
+      seedRestore();
+      addDb('stopped', { [LABEL_CONFIG_PATH]: value });
+      expect(await h.service.reconcileFromVolumes()).toBe(1);
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+      expect(h.logger.warnings.some((line) => line.includes('which is no configuration path'))).toBe(true);
+    },
+  );
+
+  it('asks before a switch when the dev container of Docker Compose is gone and old containers of other services carry no label (D4-2, D4-3)', async () => {
+    await seedCompose({ dev: null, db: 'running' });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    useSingle();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // "Later": nothing can start without the switch, and nothing is removed.
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.composeDevContainerMissing(DEFAULT_CONFIG_PATH));
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(dbContainer()?.id).toBe(db?.id);
+    // "Rebuild now" switches.
+    h.ui.configurationKindChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.log).toContain(`rm ${db?.id}`);
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('names the switch to Docker Compose and what Rebuild now removes (D4-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(false, DEFAULT_CONFIG_PATH)]);
+    expect(h.ui.kindQuestions[0]).toContain('Select configuration…');
+    expect(h.ui.kindQuestions[0]).toContain('named volumes are kept');
+    expect(h.helper.ups.map((up) => up.image)).toEqual([IMAGE_1]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('checks devcontainer.json before a Dockerfile of a service that does not exist (P4-2)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    useCompose(h, {
+      ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
+      realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql`, [`${FOLDER}/db`]: `${FOLDER}/db`, [`${FOLDER}/db/Dockerfile`]: null },
+      missing: [`${FOLDER}/db/Dockerfile`],
+    });
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace('"remoteUser"', '"privileged": true, "remoteUser"') } };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess('privileged mode'));
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
+  it.each([false, true])(
+    'removes stray containers of other services next to a single container and starts it, also when the configuration cannot be read (P4-3, rebuild %s)',
+    async (forceRebuild) => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const dev = devContainer();
+      useSingle();
+      h.helper.readConfigurationError = new Error('bad config');
+      const db = addDb('stopped');
+      const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild });
+      expect(result.containerName).toBe(NAME);
+      expect(h.docker.log).toContain(`rm ${db.id}`);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([dev?.id]);
+      expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    },
+  );
+});

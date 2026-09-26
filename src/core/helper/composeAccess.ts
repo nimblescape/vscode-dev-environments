@@ -620,7 +620,12 @@ function localPathProblems(item: string, file: string, ctx: ServiceContext): Pro
   const known = realPaths !== undefined && Object.prototype.hasOwnProperty.call(realPaths, file);
   const real = known ? realPaths[file] : undefined;
   if (isRepositoryPath(file, repository)) {
-    if (known && real === null) return [guarded(`${item} (the path does not exist in the repository)`)];
+    if (known && real === null) {
+      // Review round 4 (P4-1): with the list of the model run, a path of the repository that does not exist and whose
+      // links stay in the repository is in `missing` (composeMissingBuildPaths); what is left is a link that leads out or
+      // in a circle.
+      return [guarded(ctx.input.missing !== undefined ? `${item} (a link that leads out of the repository or in a circle, to a path that does not exist)` : `${item} (the path does not exist in the repository)`)];
+    }
     if (typeof real === 'string' && !isInside(real, repository)) return [guarded(`${item} (a link to ${real}, outside of the repository)`)];
     return [];
   }

@@ -54,6 +54,7 @@ import {
   type Harness,
   type SeedOptions,
   CLEARED_COMPOSE_LABELS,
+  CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 
@@ -159,7 +160,8 @@ describe('open: first open', () => {
       shutdownAction: 'none',
     });
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
     // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
@@ -2516,7 +2518,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
     }
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect((override.runArgs as string[]).slice(-10)).toEqual(['--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect((override.runArgs as string[]).slice(-12)).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('starts a current container as it is', async () => {
@@ -2997,7 +3000,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     }
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
@@ -3005,7 +3009,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {

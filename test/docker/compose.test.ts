@@ -296,6 +296,9 @@ ${extra}volumes:
     // Review round 2 (D2-2): every container gets devenv.host-access=checked from the model, whatever its image says.
     expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
     expect(details?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
+    // Review round 4 (D4-2): every container carries the configuration path, for the restore after a lost registry.
+    expect(dev?.Config.Labels?.['devenv.config-path']).toBe(CONFIG_PATH);
+    expect(details?.Config.Labels?.['devenv.config-path']).toBe(CONFIG_PATH);
     // Review round 2 (D2-4): Compose puts labels on its containers that images never have (isComposeContainer).
     expect(dev?.Config.Labels?.['com.docker.compose.container-number']).toBeDefined();
 

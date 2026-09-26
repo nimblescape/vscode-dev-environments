@@ -131,6 +131,14 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['COPY --from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111:2 /a /a\n' } }), 'service db: COPY --from image devenv-11111111:2 of another environment', 'protected'],
   ['RUN --mount from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nRUN --mount=type=bind,from=docker.io/devenv-11111111,target=/a true\n' } }), 'service db: RUN --mount image docker.io/devenv-11111111 of another environment', 'protected'],
   ['the syntax directive with the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=devenv-11111111:1\nFROM alpine\n' } }), 'service db: syntax image devenv-11111111:1 of another environment', 'protected'],
+  // Review round 4 (S4-4): only the official Dockerfile frontends.
+  ['a custom frontend in the syntax directive', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=docker.io/attacker/frontend:1\nFROM alpine\n' } }), 'service db: syntax image docker.io/attacker/frontend:1 (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)', 'protected'],
+  ['a custom frontend in BUILDKIT_SYNTAX', input(service('db', { build: { context: REPO, args: { BUILDKIT_SYNTAX: 'ghcr.io/x/frontend' } } }), { dockerfiles: { db: 'FROM alpine\n' } }), 'service db: syntax image ghcr.io/x/frontend (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)', 'protected'],
+  // Review round 4 (S4-3): a pattern operator is evaluated as BuildKit evaluates it.
+  ['FROM another environment behind a pattern operator', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'ARG A=devenv-11111111:1x\nFROM ${A%x}\n' } }), 'service db: FROM image devenv-11111111:1 of another environment', 'protected'],
+  // Review round 4 (S4-1): an argument without a value (`args: [BASE]` without the variable) is dropped, so the default
+  // of the ARG applies, and the model gives it as null: the default is checked.
+  ['FROM another environment by the default of an argument without a value', input(service('db', { build: { context: REPO, args: { BASE: null } } }), { dockerfiles: { db: 'ARG BASE=devenv-11111111:1\nFROM $BASE\n' } }), 'service db: FROM image devenv-11111111:1 of another environment', 'protected'],
   ['FROM another environment with a variable that is not resolved', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM devenv-11111111${TARGETVARIANT}\n' } }), 'service db: FROM image devenv-11111111${TARGETVARIANT} of another environment (a variable that is not resolved)', 'protected'],
   ['COPY --from another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'x' } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111 /a /a' } }), 'service db: COPY --from image devenv-11111111 of another environment', 'protected'],
   // Review round 2 (S2-03): the files and folders that the build client reads in the workspace helper.
@@ -240,7 +248,8 @@ describe('review round 3 of unit 6 (S3-1, P3-1)', () => {
     expect(composeMissingBuildPaths(missingDockerfile)).toEqual([`service db: Dockerfile ${REPO}/db.Dockerfile`]);
     // A link that leads nowhere (not in `missing`) stays refused.
     const dangling = { ...missingDockerfile, missing: [] };
-    expect(classes(dangling)).toEqual(['protected: service db: Dockerfile db.Dockerfile (the path does not exist in the repository)']);
+    // Review round 4, P4-1: changed expectation, the text names the link.
+    expect(classes(dangling)).toEqual(['protected: service db: Dockerfile db.Dockerfile (a link that leads out of the repository or in a circle, to a path that does not exist)']);
     expect(composeMissingBuildPaths(dangling)).toEqual([]);
     // A path outside of the repository never counts as missing.
     expect(composeMissingBuildPaths(input(built('/opt/ctx'), { missing: ['/opt/ctx'] }))).toEqual([]);

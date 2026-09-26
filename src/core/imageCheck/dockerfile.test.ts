@@ -278,3 +278,39 @@ describe('extractBuilderFlags (review round 3, S3-5)', () => {
     expect(extractImageReferences(text).map((ref) => `${ref.kind} ${ref.reference}`)).toEqual(['FROM alpine', 'RUN --mount from devenv-1', 'RUN --mount from devenv-2']);
   });
 });
+
+describe('pattern operators of variables (review round 4, S4-3)', () => {
+  const from = (text: string) => extractImageReferences(text).map((ref) => (ref.unchecked ? `${ref.reference} (${ref.unchecked})` : ref.reference));
+
+  it.each([
+    ['ARG A=a.b.c\nFROM x:${A#*.}', 'x:b.c'],
+    ['ARG A=a.b.c\nFROM x:${A##*.}', 'x:c'],
+    ['ARG A=a.b.c\nFROM x:${A%.*}', 'x:a.b'],
+    ['ARG A=a.b.c\nFROM x:${A%%.*}', 'x:a'],
+    ['ARG A=a.b.c\nFROM x:${A#?}', 'x:.b.c'],
+    ['ARG A=a.b.c\nFROM x:${A#z}', 'x:a.b.c'],
+    ['ARG A=a.b.a\nFROM x:${A/a/z}', 'x:z.b.a'],
+    ['ARG A=a.b.a\nFROM x:${A//a/z}', 'x:z.b.z'],
+    // Greedy, and Go's rule for empty matches (ReplaceAllString).
+    ['ARG A=abc\nFROM x:${A//*/z}', 'x:z'],
+    ['ARG A=abc\nFROM x${A///-}', 'x-a-b-c-'],
+    ['ARG A=a*b\nFROM x:${A/\\*/-}', 'x:a-b'],
+    ['ARG A=a.b\nFROM x:${A/./-}', 'x:a-b'],
+    // An undeclared variable of the global scope is empty.
+    ['FROM x:1${NOPE%%.*}', 'x:1'],
+  ])('%j gives %j', (text, reference) => {
+    expect(from(text)).toEqual([reference]);
+  });
+
+  it('marks a form that cannot be evaluated', () => {
+    expect(from('FROM alpine\nCOPY --from=${NOPE%x} / /')).toEqual(['alpine', '${NOPE%x} (protected)']);
+    expect(from('ARG A=alpine\nFROM ${A:0:3}')).toEqual(['${A:0:3} (unsupported)']);
+    expect(from('ARG A=devenv-1\nFROM ${A:0:3}')).toEqual(['${A:0:3} (protected)']);
+    // A variable whose value came from such a form carries the mark.
+    expect(from('ARG A=alpine\nARG B=${A:0:3}\nFROM $B')).toEqual(['${A:0:3} (unsupported)']);
+  });
+
+  it('leaves the pattern operators unevaluated for extractBaseImages', () => {
+    expect(extractBaseImages('ARG A=a.b\nFROM x:${A%.*}\nFROM y')).toEqual(['y']);
+  });
+});

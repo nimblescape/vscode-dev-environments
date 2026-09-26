@@ -54,6 +54,27 @@ export const CONTAINER_VERSION = 4;
  */
 export const LABEL_CONTAINER_CONFIG = 'devenv.container-config';
 export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
+/**
+ * Container label (review round 4, D4-2): the path of the configuration of the repository that the container was
+ * created for (Environment.configPath, for example `.devcontainer/python/devcontainer.json`), on every container that
+ * `up` creates (single containers and every service of Docker Compose). reconcileFromVolumes restores the configuration
+ * path of an entry from it after a lost registry (isConfigPathLabelValue).
+ */
+export const LABEL_CONFIG_PATH = 'devenv.config-path';
+/** `--label` value of the override configuration of a single container: LABEL_CONFIG_PATH with its value. */
+export function configPathLabel(configPath: string): string {
+  return `${LABEL_CONFIG_PATH}=${configPath}`;
+}
+/**
+ * Whether a value of LABEL_CONFIG_PATH is a configuration path of a repository as the discovery finds them: relative,
+ * `.devcontainer/devcontainer.json`, `.devcontainer/<folder>/devcontainer.json`, or `.devcontainer.json`, without `..`
+ * and without an empty or `.` part.
+ */
+export function isConfigPathLabelValue(value: string): boolean {
+  if (value === '.devcontainer.json' || value === '.devcontainer/devcontainer.json') return true;
+  const match = /^\.devcontainer\/([^/\\]+)\/devcontainer\.json$/.exec(value);
+  return match !== null && match[1] !== '.' && match[1] !== '..' && match[1].trim() !== '';
+}
 /** `--label` value of the override configuration: the version of the container setup. */
 export const CONTAINER_VERSION_LABEL = `${LABEL_CONTAINER_VERSION}=${CONTAINER_VERSION}`;
 /** `--label` value of the override configuration of a container created without the configuration of the repository. */

@@ -523,6 +523,24 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.missing).toEqual([`${repo}/ctx/missing.Dockerfile`, `${repo}/gone`, `${repo}/gone/Dockerfile`]);
   });
 
+  it('lists a Dockerfile whose link chain stays in the repository and leads nowhere, not one that leads out (review round 4, P4-1)', () => {
+    const { dir, repo, env } = setup();
+    fs.mkdirSync(path.join(repo, 'db'));
+    fs.symlinkSync('../docker/Dockerfile.gone', path.join(repo, 'db', 'Dockerfile'));
+    fs.symlinkSync(path.join(dir, 'nowhere'), path.join(repo, 'db', 'out.Dockerfile'));
+    fs.symlinkSync('loop.Dockerfile', path.join(repo, 'db', 'loop.Dockerfile'));
+    const model = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        a: { build: { context: `${repo}/db` } },
+        b: { build: { context: `${repo}/db`, dockerfile: 'out.Dockerfile' } },
+        c: { build: { context: `${repo}/db`, dockerfile: 'loop.Dockerfile' } },
+      },
+    };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
+    expect(output.missing).toEqual([`${repo}/db/Dockerfile`]);
+  });
+
   it('prints the hash of the files that Compose read, which follows their texts (review round 1, P-4)', () => {
     const { repo, env } = setup();
     const files = [path.join(repo, 'compose.yml')];
@@ -1184,6 +1202,39 @@ describe('READ_FILES_SCRIPT', () => {
     expect(read(repo, 'd/devcontainer.json')).toEqual({ configText: config('sub/Dockerfile'), dockerfilePath: 'd/sub/Dockerfile' });
     expect(read(repo, 'e/devcontainer.json')).toEqual({ configText: config('${localEnv:X}/Dockerfile') });
     expect(read(repo, 'f/devcontainer.json')).toEqual({ configText: config('../../elsewhere/Dockerfile') });
+  });
+
+  it('takes a link in the repository that leads nowhere in the repository for a missing Dockerfile (review round 4, P4-1)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    const config = (dockerfile: string) => `{ "build": { "dockerfile": "${dockerfile}", "context": ".." } }`;
+    write(path.join(repo, 'docker', 'Dockerfile.real'), 'FROM alpine\n');
+    write(path.join(repo, '.devcontainer', 'devcontainer.json'), config('Dockerfile'));
+    const dev = path.join(repo, '.devcontainer');
+    // A chain of two links in the repository whose target was deleted.
+    fs.symlinkSync('../docker/Dockerfile.gone', path.join(dev, 'Dockerfile'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfilePath: '.devcontainer/Dockerfile', dockerfileMissing: true });
+    fs.unlinkSync(path.join(dev, 'Dockerfile'));
+    fs.symlinkSync('hop', path.join(dev, 'Dockerfile'));
+    fs.symlinkSync('../docker/gone/Dockerfile', path.join(dev, 'hop'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfileMissing: true });
+    // A link through a folder link of the repository.
+    fs.symlinkSync('../docker', path.join(dev, 'dlink'));
+    write(path.join(dev, 'devcontainer.json'), config('dlink/nope'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfilePath: '.devcontainer/dlink/nope', dockerfileMissing: true });
+    // Still refused: a link out of the repository, a chain in a circle, a link through a folder out of the repository.
+    fs.symlinkSync(path.join(root, 'nowhere'), path.join(dev, 'out'));
+    fs.symlinkSync('circle2', path.join(dev, 'circle1'));
+    fs.symlinkSync('circle1', path.join(dev, 'circle2'));
+    fs.symlinkSync('../../elsewhere/x', path.join(dev, 'upward'));
+    fs.symlinkSync('../docker/Dockerfile.real', path.join(dev, 'present'));
+    for (const dockerfile of ['out', 'circle1', 'upward']) {
+      write(path.join(dev, 'devcontainer.json'), config(dockerfile));
+      expect(read(repo, '.devcontainer/devcontainer.json')).toEqual({ configText: config(dockerfile), dockerfilePath: `.devcontainer/${dockerfile}` });
+    }
+    // A link that leads to a file of the repository is read.
+    write(path.join(dev, 'devcontainer.json'), config('present'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfileText: 'FROM alpine\n' });
   });
 
   it('fails for a configuration path outside of the repository', () => {

@@ -14,7 +14,7 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { extractImageReferences, type ImageReferenceKind } from '../imageCheck/dockerfile';
+import { extractImageReferences, type DockerfileImageReference, type ImageReferenceKind } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
   COMPOSE_CLEARED_LABELS,
@@ -26,12 +26,14 @@ import {
   HELPER_CACHE_VOLUME,
   HELPER_DOCKER_SOCKET,
   HOST_ACCESS_UNRESTRICTED_LABEL,
+  LABEL_CONFIG_PATH,
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_VOLUME,
   VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
   composeProjectName,
+  isConfigPathLabelValue,
 } from '../names';
 import {
   DEV_CONTAINERS_VOLUMES,
@@ -359,7 +361,8 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
 const BUILD_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--network': allowValue,
   '--add-host': allowValue,
-  '--build-arg': allowValue,
+  // Review round 4 (S4-1): not without a value (buildArgOptionProblems).
+  '--build-arg': { kind: 'check', check: (value) => buildArgOptionProblems(value) },
   '--target': allowValue,
   '--label': allowValue,
   '--platform': allowValue,
@@ -485,7 +488,9 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
     const context = typeof build.context === 'string' ? build.context : typeof config.context === 'string' ? config.context : undefined;
     const dockerfile = typeof build.dockerfile === 'string' ? build.dockerfile : typeof config.dockerFile === 'string' ? config.dockerFile : undefined;
     for (const [what, value] of [['build context', context], ['Dockerfile', dockerfile]] as const) {
-      if (value === undefined || value.trim() === '' || /^[a-z][a-z0-9+.-]*:\/\//i.test(value.trim())) continue;
+      // Review round 4 (S4-2): no exception for a value that looks like a URL. The CLI 0.89.0 resolves it as a path
+      // (path.posix.resolve against the folder of the configuration), so `x://../../devenv-cache` is a folder.
+      if (value === undefined || value.trim() === '') continue;
       const resolved = path.posix.resolve(input.configFolder, value.trim());
       if (isHelperPath(resolved, repository)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
       else if (what === 'build context' && resolved !== repository && !resolved.startsWith(`${repository}/`)) {
@@ -510,8 +515,9 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
  * The build arguments and the target of the build of a single container as `docker build` gets them (review round 3,
  * S3-2): the CLI 0.89.0 passes `--target` of `build.target`, then `--build-arg` of each `build.args`, then
  * `build.options`, and the last value of an argument or of the target wins. `--build-arg NAME` without a value takes the
- * value of the variable NAME of the workspace helper: unresolved here, it stays `${NAME}` (a variable that the check does
- * not resolve).
+ * value of the variable NAME of the workspace helper, or (buildx drops it when the helper has no such variable) the
+ * earlier value or the default of the ARG: it stays `${NAME}` here, and buildArgOptionProblems refuses it (review round
+ * 4, S4-1).
  */
 export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
   const args: Record<string, string> = {};
@@ -547,7 +553,7 @@ export interface NamedImageReference {
  */
 export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
   return dockerfileReferences(text, args)
-    .filter(({ reference }) => !reference.includes('$'))
+    .filter(({ reference, unchecked }) => !reference.includes('$') && unchecked === undefined)
     .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
 }
 
@@ -556,7 +562,7 @@ export function dockerfileImageReferences(text: string, args: Readonly<Record<st
  * S3-3: the target stage can use a later stage with `COPY --from`), and the frontend that the build argument
  * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
  */
-function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): Array<{ reference: string; kind: ImageReferenceKind }> {
+function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImageReference[] {
   const references = extractImageReferences(text, { ...args });
   const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? args.BUILDKIT_SYNTAX.trim() : '';
   if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
@@ -604,12 +610,30 @@ const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
  * reference whose variable could not be resolved is refused when the text before its first `$` already names an image of
  * the namespace of Dev Environments (for example `devenv-$SUFFIX`), or when its text holds `devenv` anywhere (review
  * round 3, S3-4: for example `devenv${TARGETVARIANT}-…`, where the variable is empty on most platforms); any other one
- * cannot be told apart and is left.
+ * cannot be told apart and is left. Review round 4: the rule on `devenv` anywhere does not apply to a reference with a
+ * registry other than Docker Hub before the first `$` (S4-6, namedRegistry); the pattern operators of variables are
+ * evaluated, and a form that cannot be evaluated is refused (S4-3, DockerfileImageReference.unchecked); a frontend
+ * (`# syntax=`, BUILDKIT_SYNTAX) other than the official Dockerfile frontends is refused (S4-4, isOfficialFrontend).
  */
 export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
   const findings: HostAccessFinding[] = [];
-  for (const { reference, kind } of dockerfileReferences(text, args)) {
+  for (const { reference, kind, unchecked } of dockerfileReferences(text, args)) {
     const what = DOCKERFILE_IMAGE_WHAT[kind];
+    if (unchecked === 'protected') {
+      findings.push({ item: `${what} ${reference} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
+      continue;
+    }
+    if (unchecked === 'unsupported') {
+      findings.push({ item: `${what} ${reference} (uses a variable form that Dev Environments cannot check)`, class: 'unsupported' });
+      continue;
+    }
+    if (kind === 'syntax' && !isOfficialFrontend(reference) && (reference.includes('$') || imageReferenceFinding(reference, what) === undefined)) {
+      findings.push({
+        item: `${what} ${reference} (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)`,
+        class: 'protected',
+      });
+      continue;
+    }
     const dollar = reference.indexOf('$');
     if (dollar < 0) {
       const finding = imageReferenceFinding(reference, what);
@@ -617,11 +641,38 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
       continue;
     }
     const prefix = reference.slice(0, dollar).trim();
-    if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || /devenv/i.test(reference)) {
+    if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
       findings.push({ item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' });
     }
   }
   return findings;
+}
+
+/** The registries of Docker Hub, whose images Docker keeps under their short names (`devenv-…` is local then). */
+const DOCKER_HUB_HOSTS: ReadonlySet<string> = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
+
+/**
+ * Whether a reference names a registry other than Docker Hub before its first `/`, and its first variable (`dollar`)
+ * comes after that `/` (review round 4, S4-6): such an image is never a local image of Dev Environments, whatever the
+ * variable gives (`ghcr.io/example/devenv-base:${TARGETARCH}`). A registry host has a `.` or a `:` (`localhost:5000`).
+ */
+function namedRegistry(reference: string, dollar: number): boolean {
+  const slash = reference.indexOf('/');
+  if (slash <= 0 || dollar < slash) return false;
+  const host = reference.slice(0, slash).trim().toLowerCase();
+  return /[.:]/.test(host) && !DOCKER_HUB_HOSTS.has(host);
+}
+
+/**
+ * Whether a frontend (`# syntax=`, BUILDKIT_SYNTAX) is one of the official Dockerfile frontends (review round 4, S4-4):
+ * `docker/dockerfile` or `docker/dockerfile-upstream` of Docker Hub (also written with `docker.io/`, `index.docker.io/`,
+ * or `registry-1.docker.io/`), with any tag (also the `-labs` ones) and any digest. Any other frontend is a program of
+ * its own that builds with the images of the local store, also those of other environments (D-17).
+ */
+export function isOfficialFrontend(reference: string): boolean {
+  return /^(?:(?:docker\.io|index\.docker\.io|registry-1\.docker\.io)\/)?docker\/dockerfile(?:-upstream)?(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?$/.test(
+    reference.trim(),
+  );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1611,9 +1662,16 @@ export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, 
   return uniqueItems(runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
 }
 
+/** The label devenv.config-path of the override configuration, with a configuration path (review round 4, D4-2). */
+function isOwnConfigPathLabel(value: string): boolean {
+  const prefix = `${LABEL_CONFIG_PATH}=`;
+  return value.startsWith(prefix) && isConfigPathLabelValue(value.slice(prefix.length));
+}
+
 /**
  * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
- * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there.
+ * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, and the label devenv.config-path
+ * of the override configuration (review round 4, D4-2).
  */
 function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
   const problems: Problem[] = [];
@@ -1624,6 +1682,9 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
     if (last && rule !== undefined && (rule.kind === 'allow' || rule.kind === 'check') && takesValue(rule)) {
       problems.push(unsupported(`${flag.raw} without a value`));
     } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && COMPOSE_CLEARED_LABELS.includes(flag.value)) {
+      continue;
+    } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && isOwnConfigPathLabel(flag.value)) {
+      // Review round 4 (D4-2): the label devenv.config-path that the override configuration adds.
       continue;
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
@@ -1715,9 +1776,28 @@ function buildSshOptionProblems(value: string): Problem[] {
   return [access('build option --ssh'), ...files.flatMap((file) => buildFileProblems(`build option --ssh ${value}`, file))];
 }
 
-/** `--output`/`-o` `type=…,dest=<path>`, or `<path>` alone (a local export); `-` is the standard output. */
+/**
+ * `--build-arg NAME` without a value (review round 4, S4-1): buildx takes the value of the variable NAME of the workspace
+ * helper, and drops the argument when the helper has none, so the value of `build.args` or the default of the ARG
+ * applies. Which one the build gets cannot be told here: refused.
+ */
+function buildArgOptionProblems(value: string): Problem[] {
+  if (value.includes('=')) return [];
+  return [
+    unsupported(
+      `build option --build-arg ${value} without a value (the value would come from the environment of the workspace helper, or the argument would be dropped, so Dev Environments cannot check it)`,
+    ),
+  ];
+}
+
+/**
+ * `--output`/`-o` `type=…,dest=<path>`, or `<path>` alone (a local export); `-` is the standard output. Review round 4
+ * (S4-5): read as buildx reads it: a value whose CSV fields are one field that does not start with `type=` is the
+ * destination as a whole (also with `=` in it); otherwise the field `dest=`.
+ */
 function buildOutputOptionProblems(name: string, value: string): Problem[] {
-  const dest = value.includes('=') ? optionFields(value).get('dest') : value.trim();
+  const fields = csvFields(value) ?? value.split(',');
+  const dest = fields.length === 1 && !fields[0].startsWith('type=') ? value.trim() : optionFields(value).get('dest');
   return [access(`build option ${name}`), ...(dest === undefined || dest === '' || dest === '-' ? [] : buildFileProblems(`build option ${name} ${value}`, dest))];
 }
 

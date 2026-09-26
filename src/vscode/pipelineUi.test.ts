@@ -67,6 +67,19 @@ describe('VsCodePipelineUi', () => {
     await expect(ui.configurationChanged('acme/api')).resolves.toBe('later');
   });
 
+  it('asks about a switch between Docker Compose and a single container: Rebuild now, or Later (also when dismissed) (review round 4, D4-3)', async () => {
+    const { ui } = setup();
+    const text = Messages.configurationKindChanged(true, '.devcontainer/devcontainer.json');
+    window.showWarningMessage.mockImplementationOnce(async (_message, _options, rebuildNow) => rebuildNow);
+    await expect(ui.configurationKindChanged('acme/api', text)).resolves.toBe('rebuildNow');
+    const [message, options, ...items] = window.showWarningMessage.mock.calls[0];
+    expect(message).toBe(text);
+    expect(options).toEqual({ modal: true, detail: 'acme/api' });
+    expect(items).toEqual([{ title: 'Rebuild now' }, { title: 'Later', isCloseAffordance: true }]);
+    window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await expect(ui.configurationKindChanged('acme/api', text)).resolves.toBe('later');
+  });
+
   it('asks what to do when the files are missing: Clone again, Delete environment, or cancel', async () => {
     const { ui } = setup();
     window.showWarningMessage.mockResolvedValueOnce(Actions.cloneAgain);

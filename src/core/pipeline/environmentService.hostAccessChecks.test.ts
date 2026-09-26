@@ -37,6 +37,7 @@ import {
   seedEnvironment,
   type Harness,
   CLEARED_COMPOSE_LABELS,
+  CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 
@@ -98,7 +99,8 @@ describe('host access checks off for the repository', () => {
     const runArgs = h.helper.ups[0].override.runArgs as string[];
     const name = environment.containerName;
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
     // The labels of the override configuration pass the policy also with the checks on.
     // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
     expect(hostAccessProblems({ config: { runArgs }, ownVolume: environment.volumeName, overrideConfiguration: true })).toEqual([]);
@@ -124,6 +126,8 @@ describe('host access checks off for the repository', () => {
       'devenv.container-version=4',
       '--label',
       'devenv.host-access=unrestricted',
+      // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+      ...CONFIG_PATH_LABEL,
       ...CLEARED_COMPOSE_LABELS,
       '--name',
       NAME,
@@ -148,7 +152,8 @@ describe('host access checks off for the repository', () => {
     await h.service.openEnvironment(ENV_ID, options());
     const override = h.helper.ups[0].override;
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
     expect(override.appPort).toEqual([3000, '5000:5000', '0.0.0.0:6000:6000']);
   });
 
@@ -226,7 +231,8 @@ describe('host access checks on again (containerIsCurrent)', () => {
     expect(container.id).not.toBe(before);
     expect(container.labels[LABEL_HOST_ACCESS]).toBeUndefined();
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
     expect(h.progress.details).toEqual([Messages.containerHostAccessChecksOn]);
     expect(h.logger.infos.some((line) => line.includes('was created while the host access checks were off. They are on now'))).toBe(true);
     // The next open starts it as it is.

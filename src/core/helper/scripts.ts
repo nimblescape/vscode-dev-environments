@@ -390,6 +390,66 @@ process.stdout.write(JSON.stringify(found) + '\n');
 `;
 
 /**
+ * The function `missingInRepository(file)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they define `fs`, `path`,
+ * `root`, `inside`, and `realPath`): whether a path of the repository does not exist, as a plain error of the
+ * configuration (review round 3, P3-1). Review round 4 (P4-1): a link that leads nowhere counts too when its chain stays
+ * in the repository: each link is read with readlink and its target resolved against the real folder of the link, at
+ * most 32 links; every step must stay in the repository (so never a folder of the workspace helper), and the last path
+ * must not exist while the nearest folder above it that exists is in the repository after links. A link out of the
+ * repository, a chain in a circle or longer than the limit, and a path that exists for the system (stat) are no missing
+ * path: the check refuses them.
+ */
+const MISSING_IN_REPOSITORY = String.raw`const missingInRepository = (file) => {
+  if (!inside(file)) return false;
+  const rootReal = realPath(root);
+  if (rootReal === null) return false;
+  const inRepository = (candidate) => inside(candidate) || candidate === rootReal || candidate.startsWith(rootReal + '/');
+  const absent = (candidate) => {
+    try {
+      fs.lstatSync(candidate);
+      return false;
+    } catch (error) {
+      return Boolean(error) && ['ENOENT', 'ENOTDIR'].includes(error.code);
+    }
+  };
+  // The system follows the links physically: a path that exists for it is not missing, whatever its chain says.
+  try {
+    fs.statSync(file);
+    return false;
+  } catch (error) {
+    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+  }
+  let current = file;
+  const seen = new Set();
+  for (let hop = 0; hop <= 32; hop++) {
+    if (!inRepository(current) || seen.has(current)) return false;
+    seen.add(current);
+    if (absent(current)) {
+      for (let folder = path.posix.dirname(current); inRepository(folder); folder = path.posix.dirname(folder)) {
+        if (absent(folder)) continue;
+        const real = realPath(folder);
+        return real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
+      }
+      return false;
+    }
+    let stat;
+    let target;
+    try {
+      stat = fs.lstatSync(current);
+      if (!stat.isSymbolicLink()) return false;
+      target = fs.readlinkSync(current);
+    } catch {
+      return false;
+    }
+    const folder = realPath(path.posix.dirname(current));
+    if (folder === null || !(folder === rootReal || folder.startsWith(rootReal + '/'))) return false;
+    current = path.posix.resolve(folder, target);
+  }
+  return false;
+};
+`;
+
+/**
  * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it, `argv[3]`
  * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
  * round 2, S2-01), in place of `build.dockerfile` of the text.
@@ -420,27 +480,7 @@ const realPath = (file) => {
     return null;
   }
 };
-// Review round 3 (P3-1): as missingInRepository of COMPOSE_MODEL_SCRIPT.
-const missingInRepository = (file) => {
-  try {
-    fs.lstatSync(file);
-    return false;
-  } catch (error) {
-    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
-  }
-  const rootReal = realPath(root);
-  for (let folder = path.posix.dirname(file); inside(folder); folder = path.posix.dirname(folder)) {
-    try {
-      fs.lstatSync(folder);
-    } catch {
-      continue;
-    }
-    const real = realPath(folder);
-    return rootReal !== null && real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
-  }
-  return false;
-};
-const stripJsonc = (text) => {
+${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
   let result = '';
   let i = 0;
   const skipComment = (j) => {
@@ -695,30 +735,7 @@ const sshFiles = (ssh) => {
   });
   return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
 };
-// Review round 3 (P3-1): a path in the repository that does not exist, and that no link leads to or through: the path
-// itself is no link (a link that leads nowhere exists for lstat), and the nearest folder above it that exists is in the
-// repository after links.
-const missingInRepository = (file) => {
-  if (!inside(file)) return false;
-  try {
-    fs.lstatSync(file);
-    return false;
-  } catch (error) {
-    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
-  }
-  const rootReal = realPath(root);
-  for (let folder = path.posix.dirname(file); inside(folder); folder = path.posix.dirname(folder)) {
-    try {
-      fs.lstatSync(folder);
-    } catch {
-      continue;
-    }
-    const real = realPath(folder);
-    return rootReal !== null && real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
-  }
-  return false;
-};
-const readDockerfile = (file) => {
+${MISSING_IN_REPOSITORY}const readDockerfile = (file) => {
   const real = realPath(file);
   if (real === null) return undefined;
   const allowed = inside(file) ? inside(real) : !isHelperPath(file) && !isHelperPath(real);

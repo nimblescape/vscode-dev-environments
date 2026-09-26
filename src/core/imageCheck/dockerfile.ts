@@ -28,8 +28,30 @@ interface Instruction {
   args: string;
 }
 
-/** Value of a variable: `{ value: undefined }` is unset; `'unresolved'` keeps the variable text in the result. */
-type Lookup = (name: string) => { value: string | undefined } | 'unresolved';
+/**
+ * Value of a variable: `{ value: undefined }` is unset; `'unresolved'` keeps the variable text in the result. `unchecked`:
+ * the value came from an expansion that could not be evaluated (Expansion.unchecked).
+ */
+type Lookup = (name: string) => { value: string | undefined; unchecked?: UncheckedClass } | 'unresolved';
+
+/**
+ * Review round 4 (S4-3): how a reference whose expansion could not be evaluated is refused. `protected`: the value of the
+ * variable is not known or holds `devenv`; `unsupported`: any other value.
+ */
+export type UncheckedClass = 'protected' | 'unsupported';
+
+/** What an expansion met besides its text: a variable form it could not evaluate, and variables it could not resolve. */
+interface Expansion {
+  unchecked?: UncheckedClass;
+  unresolved?: boolean;
+  /** extractBaseImages: the pattern operators stay unevaluated (the reference keeps its `$` and is skipped). */
+  keepPatterns?: boolean;
+}
+
+function markUnchecked(state: Expansion | undefined, value: UncheckedClass | undefined): void {
+  if (state === undefined || value === undefined) return;
+  if (state.unchecked !== 'protected') state.unchecked = value;
+}
 
 /**
  * FROM images of a Dockerfile, deduplicated in order: line continuations, comments, parser directives (`escape`);
@@ -65,7 +87,7 @@ export function extractBaseImages(
         const equals = word.indexOf('=');
         const name = equals < 0 ? word : word.slice(0, equals);
         if (!ARG_NAME.test(name)) continue;
-        const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), lookup, escape);
+        const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), lookup, escape, { keepPatterns: true });
         const override = buildArgs && Object.prototype.hasOwnProperty.call(buildArgs, name) ? buildArgs[name] : undefined;
         globals.set(name, override !== undefined ? override : defaultValue);
       }
@@ -77,7 +99,7 @@ export function extractBaseImages(
     const words = instruction.args.split(/\s+/).filter((word) => word !== '');
     while (words.length > 0 && words[0].startsWith('--')) words.shift();
     if (words.length === 0) continue;
-    const image = expand(words[0], lookup, escape).trim();
+    const image = expand(words[0], lookup, escape, { keepPatterns: true }).trim();
     const stageName = words.length >= 3 && words[1].toLowerCase() === 'as' ? words[2].toLowerCase() : undefined;
 
     const key = image.toLowerCase();
@@ -99,6 +121,12 @@ export interface DockerfileImageReference {
   /** As expanded; still with `$` where a variable could not be resolved. */
   reference: string;
   kind: ImageReferenceKind;
+  /**
+   * Review round 4 (S4-3): the reference uses a variable form that could not be evaluated (a pattern of an unknown
+   * value, an operator that BuildKit's shell lexer does not know, a pattern with a variable that is not resolved), and how
+   * it is refused (UncheckedClass).
+   */
+  unchecked?: UncheckedClass;
 }
 
 /**
@@ -119,17 +147,30 @@ export function extractImageReferences(
   const override = (name: string): string | undefined =>
     buildArgs && Object.prototype.hasOwnProperty.call(buildArgs, name) ? buildArgs[name] : undefined;
   const globals = new Map<string, string | undefined>();
+  // Review round 4 (S4-3): the variables whose value came from an expansion that could not be evaluated.
+  const globalUnchecked = new Map<string, UncheckedClass>();
   const globalLookup: Lookup = (name) => {
     if (PLATFORM_ARGS.has(name)) return override(name) !== undefined ? { value: override(name) } : 'unresolved';
     if (!globals.has(name)) return { value: undefined };
-    return { value: override(name) ?? globals.get(name) };
+    if (override(name) !== undefined) return { value: override(name) };
+    return withUnchecked(globals.get(name), globalUnchecked.get(name));
   };
   // The variables of the current stage; `null`: declared, but its value is not known here (a platform ARG).
   let stage = new Map<string, string | undefined | null>();
+  let stageUnchecked = new Map<string, UncheckedClass>();
   const stageLookup: Lookup = (name) => {
     if (!stage.has(name)) return 'unresolved';
     const value = stage.get(name);
-    return value === null ? 'unresolved' : { value };
+    return value === null ? 'unresolved' : withUnchecked(value, stageUnchecked.get(name));
+  };
+  /** Sets a variable of the current stage (or of the global scope) with what its expansion met. */
+  const setVariable = (scope: 'global' | 'stage', name: string, value: string | undefined | null, state?: Expansion): void => {
+    const values = scope === 'global' ? globals : stage;
+    const unchecked = scope === 'global' ? globalUnchecked : stageUnchecked;
+    if (scope === 'global') globals.set(name, value ?? undefined);
+    else values.set(name, value);
+    if (state?.unchecked !== undefined) unchecked.set(name, state.unchecked);
+    else unchecked.delete(name);
   };
 
   const stages = new Set<string>();
@@ -144,13 +185,24 @@ export function extractImageReferences(
   const seen = new Set<string>();
   // FROM: only the stages before it, as in extractBaseImages (the conservative side for a later name).
   const earlier = new Set<string>();
-  const add = (reference: string, kind: ImageReferenceKind): void => {
+  const add = (reference: string, kind: ImageReferenceKind, state?: Expansion): void => {
     const text = reference.trim();
     const key = text.toLowerCase();
     const isStage = kind === 'FROM' ? earlier.has(key) : stages.has(key);
-    if (text === '' || key === 'scratch' || isStage || (kind !== 'FROM' && /^\d+$/.test(text)) || seen.has(`${kind} ${text}`)) return;
+    if (text === '' || key === 'scratch' || isStage || (kind !== 'FROM' && /^\d+$/.test(text))) return;
+    const known = result.find((other) => other.kind === kind && other.reference === text);
+    if (known) {
+      if (state?.unchecked !== undefined && known.unchecked !== 'protected') known.unchecked = state.unchecked;
+      return;
+    }
+    if (seen.has(`${kind} ${text}`)) return;
     seen.add(`${kind} ${text}`);
-    result.push({ reference: text, kind });
+    result.push({ reference: text, kind, ...(state?.unchecked !== undefined ? { unchecked: state.unchecked } : {}) });
+  };
+  /** Expands a reference, noting what the expansion met (review round 4, S4-3). */
+  const reference = (word: string, lookup: Lookup): { text: string; state: Expansion } => {
+    const state: Expansion = {};
+    return { text: expand(word, lookup, escape, state), state };
   };
   if (syntax !== undefined) add(syntax, 'syntax');
 
@@ -163,16 +215,18 @@ export function extractImageReferences(
         const equals = word.indexOf('=');
         const name = equals < 0 ? word : word.slice(0, equals);
         if (!ARG_NAME.test(name)) continue;
+        const state: Expansion = {};
         if (!fromSeen) {
-          const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), globalLookup, escape);
-          globals.set(name, override(name) ?? defaultValue);
+          const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), globalLookup, escape, state);
+          if (override(name) !== undefined) setVariable('global', name, override(name));
+          else setVariable('global', name, defaultValue, state);
           continue;
         }
-        const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), stageLookup, escape);
-        if (override(name) !== undefined) stage.set(name, override(name));
-        else if (defaultValue !== undefined) stage.set(name, defaultValue);
-        else if (PLATFORM_ARGS.has(name)) stage.set(name, null);
-        else stage.set(name, globals.get(name));
+        const defaultValue = equals < 0 ? undefined : expand(word.slice(equals + 1), stageLookup, escape, state);
+        if (override(name) !== undefined) setVariable('stage', name, override(name));
+        else if (defaultValue !== undefined) setVariable('stage', name, defaultValue, state);
+        else if (PLATFORM_ARGS.has(name)) setVariable('stage', name, null);
+        else setVariable('stage', name, globals.get(name), globalUnchecked.has(name) ? { unchecked: globalUnchecked.get(name) } : undefined);
       }
       continue;
     }
@@ -180,10 +234,12 @@ export function extractImageReferences(
       if (targetDone) break;
       fromSeen = true;
       stage = new Map();
+      stageUnchecked = new Map();
       const words = instruction.args.split(/\s+/).filter((word) => word !== '');
       while (words.length > 0 && words[0].startsWith('--')) words.shift();
       if (words.length === 0) continue;
-      add(expand(words[0], globalLookup, escape), 'FROM');
+      const from = reference(words[0], globalLookup);
+      add(from.text, 'FROM', from.state);
       const name = words.length >= 3 && words[1].toLowerCase() === 'as' ? words[2].toLowerCase() : undefined;
       if (name !== undefined) earlier.add(name);
       if (target && name === target) targetDone = true;
@@ -194,11 +250,13 @@ export function extractImageReferences(
       const words = splitWords(instruction.args, escape);
       if (words.length > 0 && !words[0].includes('=')) {
         // The old form `ENV NAME value…`.
-        stage.set(words[0], expand(words.slice(1).join(' '), stageLookup, escape));
+        const state: Expansion = {};
+        setVariable('stage', words[0], expand(words.slice(1).join(' '), stageLookup, escape, state), state);
       } else {
         for (const word of words) {
           const equals = word.indexOf('=');
-          if (equals > 0) stage.set(word.slice(0, equals), expand(word.slice(equals + 1), stageLookup, escape));
+          const state: Expansion = {};
+          if (equals > 0) setVariable('stage', word.slice(0, equals), expand(word.slice(equals + 1), stageLookup, escape, state), state);
         }
       }
       continue;
@@ -213,11 +271,17 @@ export function extractImageReferences(
       let value = equals < 0 ? undefined : word.slice(equals + 1);
       if (value === undefined && (flag === '--from' || flag === '--mount') && i + 1 < words.length) value = words[++i];
       if (value === undefined) continue;
-      if (instruction.keyword === 'COPY' && flag === '--from') add(expand(value, stageLookup, escape), 'COPY --from');
+      if (instruction.keyword === 'COPY' && flag === '--from') {
+        const from = reference(value, stageLookup);
+        add(from.text, 'COPY --from', from.state);
+      }
       if (instruction.keyword === 'RUN' && flag === '--mount') {
         for (const field of csvFields(value)) {
           const index = field.indexOf('=');
-          if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'from') add(expand(field.slice(index + 1), stageLookup, escape), 'RUN --mount from');
+          if (index > 0 && field.slice(0, index).trim().toLowerCase() === 'from') {
+            const from = reference(field.slice(index + 1), stageLookup);
+            add(from.text, 'RUN --mount from', from.state);
+          }
         }
       }
     }
@@ -433,15 +497,23 @@ function splitWords(text: string, escape: string): string[] {
   return words;
 }
 
-/** Word expansion as in the Dockerfile shell lexer: quotes, escapes, and variables. */
-function expand(word: string, lookup: Lookup, escape: string): string {
+function withUnchecked(value: string | undefined, unchecked: UncheckedClass | undefined): { value: string | undefined; unchecked?: UncheckedClass } {
+  return unchecked !== undefined ? { value, unchecked } : { value };
+}
+
+/**
+ * Word expansion as in the Dockerfile shell lexer: quotes, escapes, and variables. `state` collects what the expansion
+ * met (review round 4, S4-3). `rawEscapes`: the escape character stays in the result with the character after it, as
+ * BuildKit keeps it in the pattern of `${VAR#pattern}` and `${VAR/pattern/replacement}`.
+ */
+function expand(word: string, lookup: Lookup, escape: string, state?: Expansion, rawEscapes = false): string {
   let result = '';
   let inDouble = false;
   let i = 0;
   while (i < word.length) {
     const char = word[i];
     if (char === escape && i + 1 < word.length) {
-      result += word[i + 1];
+      result += rawEscapes ? word.slice(i, i + 2) : word[i + 1];
       i += 2;
       continue;
     }
@@ -461,7 +533,7 @@ function expand(word: string, lookup: Lookup, escape: string): string {
       continue;
     }
     if (char === '$') {
-      const variable = expandVariable(word, i, lookup, escape);
+      const variable = expandVariable(word, i, lookup, escape, state);
       result += variable.text;
       i = variable.end;
       continue;
@@ -472,14 +544,24 @@ function expand(word: string, lookup: Lookup, escape: string): string {
   return result;
 }
 
-/** Expands the variable at `word[start] === '$'`. An unresolvable variable keeps its text, so the result contains `$`. */
-function expandVariable(word: string, start: number, lookup: Lookup, escape: string): { text: string; end: number } {
+/**
+ * Expands the variable at `word[start] === '$'`. An unresolvable variable keeps its text, so the result contains `$`.
+ * Review round 4 (S4-3): the pattern operators of BuildKit's shell lexer (`${VAR#p}`, `${VAR##p}`, `${VAR%p}`,
+ * `${VAR%%p}`, `${VAR/p/r}`, `${VAR//p/r}`) are evaluated as BuildKit evaluates them (shellPatternRegex); a form that
+ * cannot be evaluated keeps its text and is marked in `state` (UncheckedClass).
+ */
+function expandVariable(word: string, start: number, lookup: Lookup, escape: string, state?: Expansion): { text: string; end: number } {
   if (word[start + 1] !== '{') {
     const name = VARIABLE_NAME.exec(word.slice(start + 1))?.[0];
     if (!name) return { text: '$', end: start + 1 };
     const end = start + 1 + name.length;
     const found = lookup(name);
-    return { text: found === 'unresolved' ? word.slice(start, end) : found.value ?? '', end };
+    if (found === 'unresolved') {
+      if (state) state.unresolved = true;
+      return { text: word.slice(start, end), end };
+    }
+    markUnchecked(state, found.unchecked);
+    return { text: found.value ?? '', end };
   }
 
   let depth = 1;
@@ -504,15 +586,38 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
   const end = j + 1;
   const inner = word.slice(start + 2, j);
   const name = VARIABLE_NAME.exec(inner)?.[0];
-  if (!name) return { text: raw, end };
+  if (!name) {
+    // `${}`, `${1}`, `${@}`: BuildKit refuses them; the check cannot read them either (review round 4, S4-3).
+    markUnchecked(state, 'protected');
+    return { text: raw, end };
+  }
+  const modifier = inner.slice(name.length);
   const found = lookup(name);
-  if (found === 'unresolved') return { text: raw, end };
+  if (found === 'unresolved') {
+    if (state) state.unresolved = true;
+    // The value is not known: a pattern or an unknown operator could make any reference of it (review round 4, S4-3).
+    if (!/^(|:?[-+?][\s\S]*)$/.test(modifier)) markUnchecked(state, 'protected');
+    return { text: raw, end };
+  }
+  markUnchecked(state, found.unchecked);
+  if (state?.keepPatterns === true && /^[#%/]/.test(modifier)) return { text: raw, end };
 
   const value = found.value;
   const isSet = value !== undefined;
   const isNonEmpty = isSet && value !== '';
-  const modifier = inner.slice(name.length);
-  const operand = (length: number) => expand(modifier.slice(length), lookup, escape);
+  const operand = (length: number) => expand(modifier.slice(length), lookup, escape, state);
+  /** A form that cannot be evaluated: refused as protected when the value holds `devenv`, else as unsupported. */
+  const unevaluated = (): { text: string; end: number } => {
+    markUnchecked(state, /devenv/i.test(value ?? '') ? 'protected' : 'unsupported');
+    return { text: raw, end };
+  };
+  /** A pattern or a replacement as BuildKit reads it (escapes kept); `undefined` when a variable in it is not resolved. */
+  const patternText = (text: string): string | undefined => {
+    const own: Expansion = {};
+    const result = expand(text, lookup, escape, own, true);
+    markUnchecked(state, own.unchecked);
+    return own.unresolved === true || own.unchecked !== undefined ? undefined : result;
+  };
 
   if (modifier === '') return { text: value ?? '', end };
   if (modifier.startsWith(':-')) return { text: isNonEmpty ? value : operand(2), end };
@@ -521,8 +626,156 @@ function expandVariable(word: string, start: number, lookup: Lookup, escape: str
   if (modifier.startsWith('-')) return { text: isSet ? value : operand(1), end };
   if (modifier.startsWith('+')) return { text: isSet ? operand(1) : '', end };
   if (modifier.startsWith('?')) return { text: isSet ? value : raw, end };
-  // Pattern operations (#, %, /) are not evaluated: the reference is skipped.
-  return { text: raw, end };
+  if (modifier.startsWith('#') || modifier.startsWith('%')) {
+    const operator = modifier[0];
+    let pattern = patternText(modifier.slice(1));
+    if (pattern === undefined || (escape !== '\\' && pattern.includes(escape))) return unevaluated();
+    const greedy = pattern.startsWith(operator);
+    if (greedy) pattern = pattern.slice(1);
+    const trimmed = operator === '#' ? trimPrefix(pattern, value ?? '', greedy) : trimSuffix(pattern, value ?? '', greedy);
+    return trimmed === undefined ? unevaluated() : { text: trimmed, end };
+  }
+  if (modifier.startsWith('/')) {
+    const all = modifier.startsWith('//');
+    const rest = modifier.slice(all ? 2 : 1);
+    const slash = topLevelIndex(rest, '/', escape);
+    if (slash < 0) return unevaluated();
+    const pattern = patternText(rest.slice(0, slash));
+    const replacement = patternText(rest.slice(slash + 1));
+    // Go's ReplaceAllString reads `$` in the replacement as a group; the escapes stay in it as BuildKit keeps them.
+    if (pattern === undefined || replacement === undefined || replacement.includes('$') || (escape !== '\\' && pattern.includes(escape))) {
+      return unevaluated();
+    }
+    const replaced = replacePattern(pattern, replacement, value ?? '', all);
+    return replaced === undefined ? unevaluated() : { text: replaced, end };
+  }
+  // An operator that BuildKit's shell lexer does not know (for example `${VAR:#x}` or `${VAR:1}`).
+  return unevaluated();
+}
+
+/**
+ * The index of `stop` in `text` outside quotes, escapes, and nested `${…}`, as BuildKit's `processStopOn` finds it; -1
+ * without one.
+ */
+function topLevelIndex(text: string, stop: string, escape: string): number {
+  let depth = 0;
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === escape) {
+      i++;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+    else if (char === '$' && text[i + 1] === '{') {
+      depth++;
+      i++;
+    } else if (char === '}' && depth > 0) depth--;
+    else if (char === stop && depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * A shell pattern as a regular expression, as `convertShellPatternToRegex` of BuildKit's shell lexer converts it (review
+ * round 4, S4-3): `*` any text (shortest unless `greedy`), `?` one character, `\*`, `\?`, `\\` the character itself,
+ * `\}` and `\/` the character after the backslash; every other character stands for itself (also `[`: BuildKit has no
+ * bracket expressions). `undefined` for a pattern that BuildKit refuses (another escape).
+ */
+export function shellPatternRegex(pattern: string, greedy: boolean, anchored: boolean): RegExp | undefined {
+  const chars = Array.from(pattern);
+  let out = anchored ? '^' : '';
+  for (let i = 0; i < chars.length; i++) {
+    let char = chars[i];
+    if (char === '*') {
+      out += greedy ? '.*' : '.*?';
+      continue;
+    }
+    if (char === '?') {
+      out += '.';
+      continue;
+    }
+    if (char === '\\') {
+      if (chars[i + 1] === '}' || chars[i + 1] === '/') continue;
+      char = chars[++i];
+      if (char !== '*' && char !== '?' && char !== '\\') return undefined;
+      out += `\\${char}`;
+      continue;
+    }
+    out += /[[\]{}.+()|^$]/.test(char) ? `\\${char}` : char;
+  }
+  try {
+    return new RegExp(out, 'u');
+  } catch {
+    return undefined;
+  }
+}
+
+/** `${VAR#pattern}` and `${VAR##pattern}` as BuildKit's `trimPrefix`. */
+function trimPrefix(pattern: string, value: string, greedy: boolean): string | undefined {
+  const regex = shellPatternRegex(pattern, greedy, true);
+  if (regex === undefined) return undefined;
+  const match = regex.exec(value);
+  return match ? value.slice(match.index + match[0].length) : value;
+}
+
+/**
+ * `${VAR%pattern}` and `${VAR%%pattern}` as BuildKit's `trimSuffix`: the prefix rule on the reversed value, with the
+ * pattern reversed (an escape stays before its character).
+ */
+function trimSuffix(pattern: string, value: string, greedy: boolean): string | undefined {
+  const chars = Array.from(pattern);
+  const reversed: string[] = new Array<string>(chars.length);
+  const last = chars.length - 1;
+  for (let i = 0; i <= last; ) {
+    const out = last - i;
+    if (chars[i] === '\\' && i !== last) {
+      reversed[out - 1] = chars[i];
+      reversed[out] = chars[i + 1];
+      i += 2;
+    } else {
+      reversed[out] = chars[i];
+      i++;
+    }
+  }
+  const trimmed = trimPrefix(reversed.join(''), Array.from(value).reverse().join(''), greedy);
+  return trimmed === undefined ? undefined : Array.from(trimmed).reverse().join('');
+}
+
+/**
+ * `${VAR/pattern/replacement}` (the first match) and `${VAR//pattern/replacement}` (every match, as Go's
+ * `ReplaceAllString`: an empty match right after a match does not count), with a greedy pattern, as BuildKit does.
+ */
+function replacePattern(pattern: string, replacement: string, value: string, all: boolean): string | undefined {
+  const regex = shellPatternRegex(pattern, true, false);
+  if (regex === undefined) return undefined;
+  const global = new RegExp(regex.source, `${regex.flags}g`);
+  const width = (index: number): number => ((value.codePointAt(index) ?? 0) > 0xffff ? 2 : 1);
+  let result = '';
+  let position = 0;
+  let previousEnd = -1;
+  let searchFrom = 0;
+  while (searchFrom <= value.length) {
+    global.lastIndex = searchFrom;
+    const match = global.exec(value);
+    if (match === null) break;
+    const matchStart = match.index;
+    const matchEnd = matchStart + match[0].length;
+    if (matchEnd === matchStart && matchStart === previousEnd) {
+      searchFrom = matchStart + width(matchStart);
+      continue;
+    }
+    result += value.slice(position, matchStart) + replacement;
+    position = matchEnd;
+    previousEnd = matchEnd;
+    if (!all) break;
+    searchFrom = matchEnd > matchStart ? matchEnd : matchStart + width(matchStart);
+  }
+  return result + value.slice(position);
 }
 
 function escapeRegExp(text: string): string {
