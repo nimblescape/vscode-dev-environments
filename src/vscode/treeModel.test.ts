@@ -757,9 +757,10 @@ describe('state texts and icons', () => {
 
   it('maps every state to a codicon', () => {
     expect(stateIcon('connected')).toEqual({ id: 'circle-filled', color: 'charts.green' });
-    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'circle-filled', color: 'charts.green' });
-    expect(stateIcon('running').id).toBe('color-mode');
-    expect(stateIcon('stopped').id).toBe('circle-outline');
+    // Green always means that the container runs; the shape tells which window uses it (user decision 2026-09-26).
+    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'window', color: 'charts.green' });
+    expect(stateIcon('running')).toEqual({ id: 'vm-running', color: 'charts.green' });
+    expect(stateIcon('stopped')).toEqual({ id: 'circle-outline' });
     expect(stateIcon('updating').id).toBe('sync~spin');
     expect(stateIcon('noContainer').id).toBe('circle-large-outline');
     expect(stateIcon('filesMissing').id).toBe('warning');

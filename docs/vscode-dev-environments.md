@@ -161,7 +161,7 @@ A repository has at most one environment per GitHub account (see [D-3](#13-decis
 DEV ENVIRONMENTS         [Select Organizations] [Search] [Refresh] [Collapse All]
   ▾ acme-university
       ● api        main (python)   Connected                  [Stop] [Delete] [⋯]
-      ◐ docs       main            Running                    [Stop] [Delete] [⋯]
+      ▶ docs       main            Running                    [Stop] [Delete] [⋯]
         infra                                                 [Start] [⋯]
       ○ web        feature-x       Stopped · 3 unpushed       [Start] [Delete] [⋯]
   ▾ your-account
@@ -209,12 +209,14 @@ The example shows the nodes expanded. The tooltip of a row names the full `owner
 
 States of an environment (see also [7.15](#715-environment-states)):
 
+Green always means that the container runs; the shape tells which window uses it.
+
 | Symbol | State text | Meaning |
 |---|---|---|
-| ● | Connected | This window is connected to the environment. |
-| ● | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
-| ◐ | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop. |
-| ○ | Stopped | The container is stopped. The next **Start** starts it. |
+| ● (green, filled circle) | Connected | This window is connected to the environment. |
+| green window icon | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
+| green running-machine icon | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
+| ○ (grey ring) | Stopped | The container is stopped. The next **Start** starts it. |
 | ↻ | Updating | An update, a rebuild, or a delete is in progress. |
 | ◌ | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
 | ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
