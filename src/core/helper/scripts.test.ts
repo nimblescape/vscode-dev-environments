@@ -29,6 +29,7 @@ import {
   buildCommand,
   cloneCommand,
   composeModelCommand,
+  createFoldersCommand,
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
@@ -1249,5 +1250,73 @@ describe('READ_FILES_SCRIPT', () => {
     const result = runNode(readFilesCommand(path.join(root, 'repo'), '../devcontainer.json'));
     expect(result.status).not.toBe(0);
     expect(result.stdout).toBe('');
+  });
+});
+
+describe('review round 8 of unit 6 (P8-2): folders of the repository for the bind mounts of Docker Compose', () => {
+  it('COMPOSE_MODEL_SCRIPT prints the nearest folder of each bind mount source in the repository that does not exist', () => {
+    const dir = tempDir();
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(path.join(repo, 'data'), { recursive: true });
+    write(path.join(repo, 'file'), 'x');
+    fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'dangling'));
+    fs.mkdirSync(path.join(dir, 'out'));
+    fs.symlinkSync(path.join(dir, 'out'), path.join(repo, 'out'));
+    const bind = (source: string) => ({ type: 'bind', source, target: `/t${source.length}` });
+    const model = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        db: { image: 'postgres:16', volumes: [bind(`${repo}/data/postgres/16`), bind(`${repo}/new`), bind(`${repo}/file/x`), bind(`${repo}/dangling/x`), bind(`${repo}/out/x`), bind(`${repo}/data`), bind(`${dir}/elsewhere`)] },
+      },
+    };
+    const bin = path.join(dir, 'bin');
+    write(path.join(bin, 'docker'), '#!/bin/sh\nshift\nif [ "$1 $2" = "version --short" ]; then echo 2.29.1; exit 0; fi\ncase "$*" in *"-p devenv-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;; esac\nprintf \'%s\\n\' "$FAKE_MODEL"\n');
+    fs.chmodSync(path.join(bin, 'docker'), 0o755);
+    const env = {
+      ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$$b' } } } }),
+      FAKE_MODEL: JSON.stringify(model),
+    };
+    const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+    const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env });
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim()) as { mountAncestors: Record<string, string | null> };
+    expect(output.mountAncestors).toEqual({
+      [`${repo}/data/postgres/16`]: fs.realpathSync(path.join(repo, 'data')),
+      [`${repo}/new`]: fs.realpathSync(repo),
+      // A file, and a link that leads nowhere: no folder.
+      [`${repo}/file/x`]: null,
+      [`${repo}/dangling/x`]: null,
+      // A link out of the repository: its real path (the check refuses it).
+      [`${repo}/out/x`]: fs.realpathSync(path.join(dir, 'out')),
+    });
+  });
+
+  it('CREATE_FOLDERS_SCRIPT creates the missing folders in the repository, and nothing through a link out of it', () => {
+    const dir = tempDir();
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(path.join(repo, 'data'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'out'));
+    fs.symlinkSync(path.join(dir, 'out'), path.join(repo, 'out'));
+    fs.symlinkSync(path.join(dir, 'nowhere'), path.join(repo, 'dangling'));
+    write(path.join(repo, 'file'), 'x');
+    const ok = runNode(createFoldersCommand(repo, [`${repo}/data/postgres/16`, `${repo}/new`, `${repo}/data`]));
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(fs.statSync(path.join(repo, 'data', 'postgres', '16')).isDirectory()).toBe(true);
+    expect(fs.statSync(path.join(repo, 'new')).isDirectory()).toBe(true);
+    for (const [folder, message] of [
+      [`${repo}/out/x`, 'leads out of the repository'],
+      [`${repo}/dangling/x`, 'a link that leads nowhere'],
+      [`${repo}/file/x`, 'is no folder'],
+      [`${repo}/../x`, 'Not a folder of the repository'],
+      [`${dir}/x`, 'Not a folder of the repository'],
+    ]) {
+      const refused = runNode(createFoldersCommand(repo, [folder]));
+      expect(refused.status, folder).toBe(2);
+      expect(refused.stderr).toContain(message);
+    }
+    expect(fs.existsSync(path.join(dir, 'out', 'x'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'nowhere'))).toBe(false);
   });
 });

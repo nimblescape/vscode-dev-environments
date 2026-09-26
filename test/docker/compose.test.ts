@@ -43,6 +43,7 @@ import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const INIT_SQL = 'select 1;';
@@ -88,6 +89,7 @@ describe('open pipeline for a Docker Compose configuration', () => {
   const sessionFiles = new SessionFiles(paths);
   const ui = new FakeUi();
   const service = new EnvironmentService({
+    analyzer: inProcessAnalyzer,
     docker,
     runner,
     helper,

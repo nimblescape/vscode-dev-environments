@@ -676,6 +676,9 @@ if (process.exitCode === undefined) {
  *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
  * - `missing` (review round 3, P3-1): of the local build contexts and Dockerfiles, those in the repository folder that
  *   do not exist, without a link that leads to or through them (a missing file of the repository, not a link out);
+ * - `mountAncestors` (review round 8, P8-2): of each bind mount source in the repository folder that does not exist, the
+ *   real path of the nearest path above it (or itself, for a link that leads nowhere) that exists, when that is a folder,
+ *   else `null`;
  * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
  *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
  *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
@@ -735,7 +738,23 @@ const sshFiles = (ssh) => {
   });
   return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
 };
-${MISSING_IN_REPOSITORY}const readDockerfile = (file) => {
+${MISSING_IN_REPOSITORY}// Review round 8 (P8-2): the real path of the nearest path at or above a file that does not exist, when it is a folder.
+const nearestFolder = (file) => {
+  for (let current = file; ; current = path.posix.dirname(current)) {
+    try {
+      fs.lstatSync(current);
+    } catch (error) {
+      if (error && ['ENOENT', 'ENOTDIR'].includes(error.code) && current !== '/') continue;
+      return null;
+    }
+    try {
+      return fs.statSync(current).isDirectory() ? realPath(current) : null;
+    } catch {
+      return null;
+    }
+  }
+};
+const readDockerfile = (file) => {
   const real = realPath(file);
   if (real === null) return undefined;
   const allowed = inside(file) ? inside(real) : !isHelperPath(file) && !isHelperPath(real);
@@ -766,6 +785,7 @@ const main = () => {
   const dockerfiles = {};
   const realPaths = {};
   const missing = [];
+  const mountAncestors = {};
   for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
     if (!isObject(service)) continue;
     const build = service.build;
@@ -795,7 +815,10 @@ const main = () => {
       }
     }
     for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
-      if (isObject(volume) && volume.type === 'bind' && typeof volume.source === 'string') realPaths[volume.source] = realPath(volume.source);
+      if (isObject(volume) && volume.type === 'bind' && typeof volume.source === 'string') {
+        realPaths[volume.source] = realPath(volume.source);
+        if (realPaths[volume.source] === null && volume.source.startsWith('/') && inside(path.posix.normalize(volume.source))) mountAncestors[volume.source] = nearestFolder(volume.source);
+      }
     }
     for (const entry of Array.isArray(service.env_file) ? service.env_file : []) {
       const file = typeof entry === 'string' ? entry : isObject(entry) ? entry.path : undefined;
@@ -820,7 +843,7 @@ const main = () => {
     }
   }
   const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, missing, inputsHash };
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, realPaths, missing, mountAncestors, inputsHash };
 };
 let output;
 try {
@@ -886,6 +909,69 @@ export function writeAndRunCommand(p: { repositoryConfig?: string; config?: stri
 /** `node -e` command of COMPOSE_MODEL_SCRIPT for the compose files (absolute paths) of a configuration. */
 export function composeModelCommand(repoFolder: string, files: readonly string[]): string[] {
   return ['node', '-e', COMPOSE_MODEL_SCRIPT, repoFolder, ...files];
+}
+
+/**
+ * `node -e` script (review round 8, P8-2): creates the folders of the repository that bind mounts of a Docker Compose
+ * configuration name and that do not exist yet (composeUpModel's `createFolders`), as Docker would create them on the
+ * computer (`create_host_path`). `argv[1]` = repository folder (absolute), then the folders (absolute, below it). Each
+ * missing part is created one at a time, without following a link: the nearest path that exists must be a folder whose
+ * real path is in the repository, and each created part must be a folder of its own. Exits 0 when all exist afterwards;
+ * otherwise 2 with the reason on stderr, and stops at the first problem.
+ */
+export const CREATE_FOLDERS_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const path = require('path');
+const root = path.posix.resolve(process.argv[1]);
+const fail = (message) => {
+  process.stderr.write(message + '\n');
+  process.exit(2);
+};
+let rootReal;
+try {
+  rootReal = fs.realpathSync(root);
+} catch {
+  fail('The repository folder ' + root + ' does not exist.');
+}
+const inRepository = (real) => real === rootReal || real.startsWith(rootReal + '/');
+for (const folder of process.argv.slice(2)) {
+  if (!folder.startsWith(root + '/') || path.posix.normalize(folder) !== folder || folder.split('/').includes('..')) fail('Not a folder of the repository: ' + folder);
+  const missing = [];
+  let current = folder;
+  for (;;) {
+    try {
+      fs.lstatSync(current);
+    } catch (error) {
+      if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code) || current === root) fail('Cannot read ' + current + ': ' + String(error && error.code));
+      missing.unshift(current);
+      current = path.posix.dirname(current);
+      continue;
+    }
+    let real;
+    try {
+      real = fs.realpathSync(current);
+    } catch {
+      fail(current + ' is a link that leads nowhere.');
+    }
+    if (!fs.statSync(current).isDirectory()) fail(current + ' is no folder.');
+    if (!inRepository(real)) fail(current + ' leads out of the repository, to ' + real + '.');
+    break;
+  }
+  for (const part of missing) {
+    try {
+      fs.mkdirSync(part);
+    } catch (error) {
+      fail('Cannot create ' + part + ': ' + String(error && error.code));
+    }
+    const stat = fs.lstatSync(part);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !inRepository(fs.realpathSync(part))) fail(part + ' is no folder of the repository.');
+  }
+}
+`;
+
+/** `node -e` command of CREATE_FOLDERS_SCRIPT. */
+export function createFoldersCommand(repoFolder: string, folders: readonly string[]): string[] {
+  return ['node', '-e', CREATE_FOLDERS_SCRIPT, repoFolder, ...folders];
 }
 
 /** `sh -c` command for `devcontainer build`. `configFile` is the absolute path of devcontainer.json in the helper. */

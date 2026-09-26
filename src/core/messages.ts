@@ -75,6 +75,11 @@ export const Messages = {
    */
   unsupportedOptions: (items: string) =>
     `This configuration uses options that Dev Environments does not support: ${items}. Change the configuration of the repository.`,
+  /**
+   * Review round 8: the host access analysis of the configuration failed (its worker ran out of time or memory, or
+   * crashed): refused, never allowed. The text is ANALYSIS_FAILED_ITEM of helper/configurationAnalysis.ts.
+   */
+  configurationTooComplex: (item: string) => `${item}. Change the configuration of the repository.`,
   /** Both: settings that need access to the computer, and settings that the policy does not know. */
   hostAccessAndUnsupported: (items: string, unsupported: string) =>
     `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. It also uses options that Dev Environments does not support: ${unsupported}. Change the configuration of the repository.`,

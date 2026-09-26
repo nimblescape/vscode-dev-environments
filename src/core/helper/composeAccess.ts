@@ -18,6 +18,7 @@ import {
   composeVolumeNames,
   decideServiceMount,
   decideServicePort,
+  durationSeconds,
   isOtherEnvironmentProjectName,
   WORKSPACE_VOLUME_KEY,
   type ComposeModel,
@@ -26,11 +27,11 @@ import {
 import {
   LOG_DRIVERS,
   LOG_OPTIONS,
-  MAX_STOP_TIMEOUT_SECONDS,
   RESERVED_COMPOSE_LABEL,
   RESERVED_LABEL,
   capabilityProblems,
   dockerfileImageFindings,
+  withDockerfileCache,
   dockerfileImageReferences,
   foreignNetworkItem,
   imageReferenceFinding,
@@ -64,6 +65,8 @@ export interface ComposeAccessInput extends VolumeInput {
    * of the repository are refused.
    */
   realPaths?: Readonly<Record<string, string | null>>;
+  /** ComposeModelOutput.mountAncestors (review round 8, P8-2): the nearest folders of bind mount sources that do not exist. */
+  mountAncestors?: Readonly<Record<string, string | null>>;
   /**
    * ComposeModelOutput.dockerfiles: the FROM images of each local build are checked (no image of another environment),
    * and a local build whose Dockerfile could not be read is refused (its images would escape the image check).
@@ -128,15 +131,8 @@ function imageProblems(reference: string, what: string): Problem[] {
   return finding ? [finding] : [];
 }
 
-/** A Go duration (`20s`, `1m30s`, `500ms`) in seconds; `undefined` when it is none. */
-export function durationSeconds(value: unknown): number | undefined {
-  if (typeof value === 'number') return value;
-  if (typeof value !== 'string' || !/^(\d+(\.\d+)?(h|m|s|ms|us|µs|ns))+$/.test(value.trim())) return undefined;
-  const factors: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, µs: 1e-6, ns: 1e-9 };
-  let seconds = 0;
-  for (const match of value.trim().matchAll(/(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)/g)) seconds += Number(match[1]) * factors[match[2]];
-  return seconds;
-}
+// A Go duration in seconds (in compose.ts since review round 8, for the cap of stop_grace_period in rewriteModel).
+export { durationSeconds };
 
 function isInside(file: string, folder: string): boolean {
   return file === folder || file.startsWith(`${folder}/`);
@@ -259,12 +255,15 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   logging: loggingProblems,
   storage_opt: (value) => (isRecord(value) ? Object.keys(value).filter((key) => key !== 'size').map((key) => unsupported(`storage_opt ${key}`)) : []),
   // `always` and `unless-stopped` would start the container together with Docker, outside the Session Monitor (D-14):
-  // review round 7, P7-1, rewritten to `no` (rewriteModel in compose.ts), not refused; a restart gives no access.
+  // review round 7, P7-1, rewritten to `no` (rewriteModel in compose.ts), not refused; a restart gives no access. Review
+  // round 8, S8-6: `on-failure[:n]` too (Docker starts such a container again when the Docker daemon starts).
   restart: allow,
+  // Review round 8 (orchestrator decision): a period over MAX_STOP_TIMEOUT_SECONDS is capped at it (rewriteModel), not
+  // refused; one that cannot be read (or is negative) is.
   stop_grace_period: (value) => {
     if (isUnset(value)) return [];
     const seconds = durationSeconds(value);
-    return seconds !== undefined && seconds <= MAX_STOP_TIMEOUT_SECONDS ? [] : [unsupported(`stop_grace_period ${String(value)}`)];
+    return seconds !== undefined && seconds >= 0 ? [] : [unsupported(`stop_grace_period ${String(value)}`)];
   },
   stop_signal: allow,
   deploy: deployProblems,
@@ -397,8 +396,10 @@ function loggingProblems(value: unknown): Problem[] {
 }
 
 /**
- * `deploy` (Swarm, out of scope): only limits of resources and the restart condition (rewritten, P7-1); a GPU or
- * another device (`resources.reservations.devices`) is access to the computer.
+ * `deploy` (Swarm, out of scope): only limits of resources, the restart policy (its condition rewritten, P7-1; review
+ * round 8, P8-1: `delay`, `window`, and `max_attempts` too, which rewriteModel removes with the condition `none`), one
+ * replica, and the mode `replicated` (the default); a GPU or another device (`resources.reservations.devices`) is access
+ * to the computer.
  */
 function deployProblems(value: unknown): Problem[] {
   if (!isRecord(value)) return [];
@@ -422,17 +423,25 @@ function deployProblems(value: unknown): Problem[] {
     } else if (key === 'restart_policy' && isRecord(entry)) {
       for (const [name, setting] of Object.entries(entry)) {
         if (isUnset(setting)) continue;
-        // Review round 7, P7-1: every condition is allowed, rewriteModel makes one other than `none`/`on-failure` `none`.
-        if (name !== 'condition') {
+        // Review round 7, P7-1: every condition is allowed, rewriteModel makes it `none` (review round 8, S8-6: also
+        // `on-failure`).
+        if (!RESTART_POLICY_SETTINGS.includes(name)) {
           problems.push(unsupported(`deploy.restart_policy.${name} ${String(setting)}`));
         }
       }
+    } else if (key === 'replicas' || key === 'mode') {
+      // Review round 8, P8-1: one container per service, as without `deploy`.
+      const allowed = key === 'replicas' ? entry === 1 || entry === '1' : entry === 'replicated';
+      if (!allowed) problems.push(unsupported(`deploy.${key} ${String(entry)}`));
     } else {
       problems.push(unsupported(`deploy.${key}`));
     }
   }
   return problems;
 }
+
+/** The settings of `deploy.restart_policy` that the policy allows (review round 8, P8-1). */
+const RESTART_POLICY_SETTINGS = ['condition', 'delay', 'window', 'max_attempts'];
 
 const BUILD_ALLOWED = new Set([
   'context',
@@ -734,13 +743,14 @@ function topLevelProblems(input: ComposeAccessInput): Problem[] {
  * hostAccessFindings does).
  */
 function findings(problems: readonly Problem[]): Problem[] {
-  const result: Problem[] = [];
+  // Review round 8 (S8-5): by a Map of the items, not a search of the list for each problem (quadratic time).
+  const result = new Map<string, Problem>();
   for (const problem of problems) {
-    const known = result.find((other) => other.item === problem.item);
-    if (!known) result.push({ ...problem });
+    const known = result.get(problem.item);
+    if (!known) result.set(problem.item, { ...problem });
     else if (known.class === 'computer' && problem.class !== 'computer') known.class = problem.class;
   }
-  return result;
+  return [...result.values()];
 }
 
 /**
@@ -769,6 +779,11 @@ export function composeAccessClassification(input: ComposeAccessInput): HostAcce
 }
 
 function composeFindings(input: ComposeAccessInput): Problem[] {
+  // Review round 8 (S8-4): services that build the same Dockerfile with the same arguments share one analysis.
+  return withDockerfileCache(() => readComposeFindings(input));
+}
+
+function readComposeFindings(input: ComposeAccessInput): Problem[] {
   const problems: Problem[] = [];
   const services = isRecord(input.model.services) ? input.model.services : {};
   const names = new Set(Object.keys(services));
@@ -797,6 +812,7 @@ function composeFindings(input: ComposeAccessInput): Problem[] {
         ownVolume: input.ownVolume,
         engineApiVersion: input.engineApiVersion,
         realPaths: input.realPaths,
+        mountAncestors: input.mountAncestors,
       },
     };
     for (const problem of serviceProblems(service, ctx)) problems.push({ ...problem, item: `service ${name}: ${problem.item}` });
@@ -811,6 +827,10 @@ function composeFindings(input: ComposeAccessInput): Problem[] {
  * `additional_contexts`. Each named with its service, as composeAccessReport names its items.
  */
 export function composeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
+  return withDockerfileCache(() => readComposeImageReferences(model, dockerfiles));
+}
+
+function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
   const references: NamedImageReference[] = [];
   for (const [name, service] of Object.entries(isRecord(model.services) ? model.services : {})) {
     if (!isRecord(service)) continue;

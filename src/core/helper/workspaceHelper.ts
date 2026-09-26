@@ -48,6 +48,7 @@ import {
   buildCommand,
   cloneCommand,
   composeModelCommand,
+  createFoldersCommand,
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
@@ -655,6 +656,30 @@ export class WorkspaceHelper {
     });
     if (result.exitCode !== 0) throw new CommandError('docker compose config', result.exitCode, result.stdout, result.stderr);
     return parseComposeModelOutput(result.stdout);
+  }
+
+  /**
+   * Review round 8 (P8-2): creates the folders of the repository that the bind mounts of a Docker Compose configuration
+   * name and that do not exist yet (composeUpModel's `createFolders`, absolute paths below the repository folder), as
+   * Docker would create them on the computer (CREATE_FOLDERS_SCRIPT: no part through a link out of the repository).
+   * Without the Docker socket, the cache volume, and network, and with the configuration folder of the volume hidden.
+   * Throws CommandError when a folder cannot be created.
+   */
+  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[]; signal?: AbortSignal }): Promise<void> {
+    const folder = this.repositoryFolder(p.repository);
+    if (p.folders.some((entry) => !entry.startsWith(`${folder}/`) || entry.slice(folder.length + 1).split('/').some((part) => part === '..' || part === '.' || part === ''))) {
+      throw new Error(`Invalid folders: ${p.folders.join(', ')}`);
+    }
+    if (p.folders.length === 0) return;
+    this.deps.logger.info(`Creating the folders ${p.folders.join(', ')} of ${p.repository} for the bind mounts of Docker Compose.`);
+    const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
+      docker: false,
+      network: false,
+      hideConfigFolder: true,
+      signal: p.signal,
+      onStderr: this.logOutput,
+    });
+    if (result.exitCode !== 0) throw new CommandError('create the folders of the bind mounts', result.exitCode, result.stdout, result.stderr);
   }
 
   /**

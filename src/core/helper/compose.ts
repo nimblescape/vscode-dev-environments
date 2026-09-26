@@ -29,11 +29,12 @@ import {
 } from '../names';
 import {
   isDockerNetworkMode,
+  isHelperPath,
   isLoopbackAddress,
   isOtherEnvironmentProjectName,
   isPathSource,
+  MAX_STOP_TIMEOUT_SECONDS,
   parseMountString,
-  RESTART_POLICY,
   splitPortAddress,
   withLoopbackAddress,
 } from './hostAccess';
@@ -166,6 +167,12 @@ export interface ComposeModelOutput {
    */
   missing?: string[];
   /**
+   * Review round 8 (P8-2): of each bind mount source in the repository that does not exist (realPaths `null`), the real
+   * path of the nearest path above it (or itself, a link that leads nowhere) that exists, when that is a folder; `null`
+   * when it is no folder or cannot be read. Missing in older outputs.
+   */
+  mountAncestors?: Record<string, string | null>;
+  /**
    * sha256 of the texts of the files that Compose read for the model (the compose files, the `.env` of the project
    * folder, the `env_file`s), computed in the helper (review round 1, P-4); `''` when the output has none.
    */
@@ -205,6 +212,10 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     model: value.model as unknown as ComposeModel,
     dockerfiles: value.dockerfiles as Record<string, string>,
     realPaths: value.realPaths as Record<string, string | null>,
+    // Review round 8 (P8-2): only the entries that are a path or null.
+    ...(isRecord(value.mountAncestors)
+      ? { mountAncestors: Object.fromEntries(Object.entries(value.mountAncestors).filter(([, real]) => real === null || typeof real === 'string')) as Record<string, string | null> }
+      : {}),
     ...(Array.isArray(value.missing) ? { missing: value.missing.filter((file): file is string => typeof file === 'string') } : {}),
     inputsHash: typeof value.inputsHash === 'string' ? value.inputsHash : '',
   };
@@ -444,7 +455,11 @@ export function composeUserArgs(service: ComposeService | undefined): string[] {
 export type ComposeEntryDecision =
   | { action: 'keep' }
   | { action: 'drop'; reason: string }
-  | { action: 'replace'; value: unknown; reason: string }
+  /**
+   * `createFolder` (review round 8, P8-2): the source is a folder of the repository that does not exist yet; the pipeline
+   * creates it in the workspace volume before `up` (composeUpModel's `createFolders`).
+   */
+  | { action: 'replace'; value: unknown; reason: string; createFolder?: string }
   | { action: 'refuse'; kind: 'hostAccess' | 'unsupported'; item: string; guarded?: true };
 
 /** What decides the mounts of a service. */
@@ -461,6 +476,8 @@ export interface ComposeMountContext {
   engineApiVersion?: string;
   /** ComposeModelOutput.realPaths; without it, links are not checked. */
   realPaths?: Readonly<Record<string, string | null>>;
+  /** ComposeModelOutput.mountAncestors (review round 8, P8-2). */
+  mountAncestors?: Readonly<Record<string, string | null>>;
 }
 
 function isInside(file: string, folder: string): boolean {
@@ -531,12 +548,23 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
     return { action: 'replace', value, reason: 'the workspace volume in place of the folder' };
   }
   if (!isInside(lexical, repository)) return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
+  let createFolder: string | undefined;
   if (ctx.realPaths && Object.prototype.hasOwnProperty.call(ctx.realPaths, source)) {
     const real = ctx.realPaths[source];
     if (real === null) {
-      return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (the path does not exist in the repository)` };
-    }
-    if (!isInside(real, repository)) {
+      // Review round 8 (P8-2): a folder of the repository that does not exist yet (for example a data folder in
+      // .gitignore), which Docker would create (`create_host_path`): created in the workspace volume before `up`, when the
+      // nearest folder above it that exists is in the repository after links (ComposeModelOutput.mountAncestors).
+      const ancestor = ctx.mountAncestors !== undefined && Object.prototype.hasOwnProperty.call(ctx.mountAncestors, source) ? ctx.mountAncestors[source] : undefined;
+      const bind = isRecord(entry.bind) ? entry.bind : {};
+      if (typeof ancestor !== 'string' || bind.create_host_path === false) {
+        return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (the path does not exist in the repository)` };
+      }
+      if (!isInside(ancestor, repository) || isHelperPath(ancestor, repository)) {
+        return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${ancestor}, outside of the repository)`, guarded: true };
+      }
+      createFolder = lexical;
+    } else if (!isInside(real, repository)) {
       // A subpath of the workspace volume that a link leads out of the repository, for example to the GitHub token: not clear.
       return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${real}, outside of the repository)`, guarded: true };
     }
@@ -560,6 +588,14 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
     volume: { nocopy: true, subpath },
   };
   if (readOnly) value.read_only = true;
+  if (createFolder !== undefined) {
+    return {
+      action: 'replace',
+      value,
+      reason: `the folder ${subpath} of the workspace volume, created in the repository before the start (the service can read and change these files of the repository)`,
+      createFolder,
+    };
+  }
   return { action: 'replace', value, reason: `the folder ${subpath} of the workspace volume (the service can read and change these files of the repository)` };
 }
 
@@ -609,6 +645,8 @@ export interface ComposeRewriteParams {
   engineApiVersion?: string;
   /** ComposeModelOutput.realPaths. */
   realPaths?: Readonly<Record<string, string | null>>;
+  /** ComposeModelOutput.mountAncestors (review round 8, P8-2). */
+  mountAncestors?: Readonly<Record<string, string | null>>;
   /**
    * The sources of the named volumes of the `mounts` of devcontainer.json and of the Features: declared as external
    * volumes `<project>_<source>` (composeMountVolumeName), which the pipeline creates with the labels of the
@@ -640,6 +678,16 @@ export interface ComposeRewrite {
 export interface ComposeModelRewrite {
   model: ComposeModel;
   rewrites: ComposeRewrite[];
+}
+
+/** A Go duration (`20s`, `1m30s`, `500ms`) in seconds; `undefined` when it is none. */
+export function durationSeconds(value: unknown): number | undefined {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string' || !/^(\d+(\.\d+)?(h|m|s|ms|us|µs|ns))+$/.test(value.trim())) return undefined;
+  const factors: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, µs: 1e-6, ns: 1e-9 };
+  let seconds = 0;
+  for (const match of value.trim().matchAll(/(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)/g)) seconds += Number(match[1]) * factors[match[2]];
+  return seconds;
 }
 
 /** The model is our rewrite of a model that the check refused: the pipeline checks before it rewrites. */
@@ -686,12 +734,14 @@ function mountContext(model: ComposeModel, p: ComposeRewriteParams, isDev: boole
     ownVolume: p.volumeName,
     engineApiVersion: p.engineApiVersion,
     realPaths: p.realPaths,
+    mountAncestors: p.mountAncestors,
   };
 }
 
 /** The rewrites that the up model and the build model share. */
-function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: ComposeModel; rewrites: ComposeRewrite[] } {
+function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: ComposeModel; rewrites: ComposeRewrite[]; createFolders: string[] } {
   const rewrites: ComposeRewrite[] = [];
+  const createFolders: string[] = [];
   const model = JSON.parse(JSON.stringify(source)) as ComposeModel;
   if (!isRecord(model.services[p.devService])) throw new Error(`The Compose configuration has no service ${p.devService}.`);
   if (model.name !== undefined && model.name !== p.project) {
@@ -754,6 +804,7 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
       }
       rewrites.push({ item: `${at}bind mount ${mountText(entry)}`, reason: decision.reason });
       if (decision.action === 'replace') volumes.push(decision.value);
+      if (decision.action === 'replace' && decision.createFolder !== undefined && !createFolders.includes(decision.createFolder)) createFolders.push(decision.createFolder);
     }
     if (isDev) volumes.unshift({ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: WORKSPACES_ROOT });
     if (volumes.length > 0) service.volumes = volumes;
@@ -767,19 +818,41 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
     service.pull_policy = pullPolicy;
     // Review round 7, P7-1: `always`/`unless-stopped` (the templates set it on the database) would start the container
     // together with Docker, outside the Session Monitor (D-14): rewritten to `no`, not refused (it gives no access).
-    if (service.restart !== undefined && service.restart !== null && !RESTART_POLICY.test(String(service.restart))) {
+    // Review round 8, S8-6: `on-failure[:n]` too: Docker starts such a container again when the Docker daemon starts.
+    if (service.restart !== undefined && service.restart !== null && String(service.restart) !== 'no') {
       rewrites.push({ item: `${at}restart ${String(service.restart)}`, reason: 'Dev Environments starts the containers itself (no)' });
       service.restart = 'no';
     }
-    // The same for `deploy.restart_policy`: a condition other than `none`/`on-failure` (also a missing one, which is
-    // `any`) becomes `none`.
+    // The same for `deploy.restart_policy`: a condition other than `none` (also a missing one, which is `any`, and,
+    // review round 8, S8-6, `on-failure`) becomes `none`. Review round 8 (P8-1): without `max_attempts`, which Docker
+    // Engine 25 and newer refuse with the restart policy `no` (Compose passes it as the count of retries).
     if (isRecord(service.deploy) && isRecord(service.deploy.restart_policy)) {
       const policy = service.deploy.restart_policy;
       const condition = policy.condition;
-      if (condition !== 'none' && condition !== 'on-failure') {
+      if (condition !== 'none') {
         const text = condition === undefined || condition === null ? '(none given, any)' : String(condition);
         rewrites.push({ item: `${at}deploy.restart_policy.condition ${text}`, reason: 'Dev Environments starts the containers itself (none)' });
         policy.condition = 'none';
+      }
+      if (Object.prototype.hasOwnProperty.call(policy, 'max_attempts')) {
+        if (policy.max_attempts !== undefined && policy.max_attempts !== null && policy.max_attempts !== 0) {
+          rewrites.push({
+            item: `${at}deploy.restart_policy.max_attempts ${String(policy.max_attempts)}`,
+            reason: 'removed: Docker refuses a count of restarts with the restart policy none',
+          });
+        }
+        delete policy.max_attempts;
+      }
+    }
+    // Review round 8 (orchestrator decision): a stop_grace_period over MAX_STOP_TIMEOUT_SECONDS is capped, not refused:
+    // the Session Monitor ends each Docker call after 30 s, also `docker stop`.
+    const grace = service.stop_grace_period;
+    if (grace !== undefined && grace !== null) {
+      const seconds = durationSeconds(grace);
+      if (seconds !== undefined && seconds > MAX_STOP_TIMEOUT_SECONDS) {
+        const capped = `${MAX_STOP_TIMEOUT_SECONDS}s`;
+        rewrites.push({ item: `${at}stop_grace_period ${String(grace)}`, reason: `the Session Monitor stops a container within 30 s (${capped})` });
+        service.stop_grace_period = capped;
       }
     }
     // Images that Compose builds: the name of the project, never a name that another environment could use too.
@@ -799,7 +872,7 @@ function rewriteModel(source: ComposeModel, p: ComposeRewriteParams): { model: C
   }
   volumes[WORKSPACE_VOLUME_KEY] = { name: p.volumeName, external: true };
   model.volumes = volumes;
-  return { model, rewrites };
+  return { model, rewrites, createFolders };
 }
 
 function portText(entry: unknown): string {
@@ -838,8 +911,8 @@ function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check
  * refuses (composeAccessReport must pass first). `rewrites` names each change for the log.
  */
-export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { image: string }): ComposeModelRewrite {
-  const { model: result, rewrites } = rewriteModel(model, p);
+export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { image: string }): ComposeModelRewrite & { createFolders?: string[] } {
+  const { model: result, rewrites, createFolders } = rewriteModel(model, p);
   const dev = result.services[p.devService];
   if (dev.build !== undefined && dev.build !== null) rewrites.push({ item: `service ${p.devService}: build`, reason: `the environment image ${p.image} is used` });
   delete dev.build;
@@ -847,7 +920,8 @@ export function composeUpModel(model: ComposeModel, p: ComposeRewriteParams & { 
   // Without it, Docker names the host after the container ID, and the shell prompt shows that ID (as for a single
   // container, buildOverrideConfig). The other services keep theirs.
   if (!serviceDecidesHostname(dev)) dev.hostname = containerHostname(path.posix.basename(p.repositoryFolder));
-  return { model: finish(result, p.dollarEscaped), rewrites };
+  // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.
+  return createFolders.length > 0 ? { model: finish(result, p.dollarEscaped), rewrites, createFolders } : { model: finish(result, p.dollarEscaped), rewrites };
 }
 
 /**

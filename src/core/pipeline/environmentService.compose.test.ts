@@ -1696,3 +1696,98 @@ describe('review round 7 of unit 6 (P7-1, P7-2, D7-1)', () => {
     stopBeforeRemove(db.id);
   });
 });
+
+describe('review round 8 of unit 6 (P8-3, D8-1): a side service is stopped before each removal', () => {
+  const DB_LABELS = { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db', 'com.docker.compose.config-hash': 'x' };
+
+  function addDb(state: ContainerState = 'running'): ContainerInfo {
+    return h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-db-1`, state, image: DB_IMAGE, labels: { ...DB_LABELS } });
+  }
+
+  /** The lines of the Docker log for `id`: `stop` must come before `rm`. */
+  function stopBeforeRemove(id: string): void {
+    const stop = h.docker.log.indexOf(`stop ${id}`);
+    const rm = h.docker.log.indexOf(`rm ${id}`);
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(rm).toBeGreaterThan(stop);
+  }
+
+  it('stops the containers that a failed up of the switch to Docker Compose created before it removes them (removeFailedComposeContainers)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+    };
+    await rejection(h.service.openEnvironment(ENV_ID, options()));
+    // Before: `docker rm -f` of the running database (a SIGKILL).
+    stopBeforeRemove(db!.id);
+  });
+
+  it('stops the running side services of a failed first open before it removes them (removeFailedFirstOpen)', async () => {
+    h.helper.upError = () => new Error('compose up failed');
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+    };
+    await rejection(h.service.open(TARGET, options()));
+    stopBeforeRemove(db!.id);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+  });
+
+  it('stops a running side service of the project without the ID label before Delete removes it (removeComposeProject)', async () => {
+    await seedCompose({ dev: 'stopped', db: null });
+    const db = addDb();
+    // For example a container of an earlier model: only the labels of the project.
+    delete h.docker.containers.get(db.id)!.labels[LABEL_ENVIRONMENT_ID];
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    stopBeforeRemove(db.id);
+    expect(h.docker.containers.has(db.id)).toBe(false);
+  });
+});
+
+describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder that does not exist yet', () => {
+  const SOURCE = `${FOLDER}/data/postgres`;
+
+  function withDataFolder(ancestor: string | null): void {
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: ancestor };
+    useCompose(h, out);
+  }
+
+  it('creates the folder in the workspace volume before up, and mounts it as a folder of the volume', async () => {
+    withDataFolder(FOLDER);
+    // Before: refused (the path does not exist in the repository).
+    await h.service.open(TARGET, options());
+    expect(h.helper.createdFolders).toEqual([[SOURCE]]);
+    const calls = h.helper.calls;
+    expect(calls.indexOf(`createRepositoryFolders ${SOURCE}`)).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf(`createRepositoryFolders ${SOURCE}`)).toBeLessThan(calls.findIndex((call) => call.startsWith('up')));
+    expect(upModel().services.db.volumes).toEqual([
+      { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/var/lib/postgresql/data', volume: { nocopy: true, subpath: 'api/data/postgres' } },
+    ]);
+    const changed = h.logger.infos.find((line) => line.startsWith('Changed in the Docker Compose model'));
+    expect(changed).toContain(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (the folder api/data/postgres of the workspace volume, created in the repository before the start`);
+  });
+
+  it('refuses it when the nearest folder is a link out of the repository, before anything is built or created', async () => {
+    withDataFolder('/workspaces/.devenv+');
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /workspaces/.devenv+, outside of the repository)`));
+    expect(h.helper.createdFolders).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('does not start when the folder cannot be created', async () => {
+    withDataFolder(FOLDER);
+    h.helper.createFoldersError = new Error('data leads out of the repository');
+    await expect(h.service.open(TARGET, options())).rejects.toThrow();
+    expect(h.helper.ups).toEqual([]);
+  });
+});

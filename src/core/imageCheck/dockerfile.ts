@@ -40,6 +40,12 @@ export const MAX_NESTING = 32;
  * cut and refused as unsupported (for example ARGs that double their value).
  */
 export const MAX_EXPANDED_LENGTH = 64 * 1024;
+/**
+ * Review round 8 (S8-2): the most characters that all expansions of one Dockerfile may make together (each ARG, ENV, and
+ * reference; nested operands count again). Beyond it, the Dockerfile is too complex to check (DockerfileImages.tooComplex):
+ * ARGs that each expand to MAX_EXPANDED_LENGTH would otherwise hold gigabytes.
+ */
+export const MAX_EXPANDED_CHARACTERS = 16 * 1024 * 1024;
 
 interface Instruction {
   keyword: string;
@@ -101,7 +107,23 @@ export function extractBaseImages(
   buildArgs?: Record<string, string>,
   options: { target?: string } = {},
 ): string[] {
+  // Review round 8 (S8-2): the limits of analyzeDockerfileImages. A Dockerfile beyond them gives no base images (the host
+  // access check refuses it).
+  if (dockerfileText.length > MAX_DOCKERFILE_LENGTH) return [];
   const { escape, instructions } = parseInstructions(dockerfileText);
+  if (instructions.length > MAX_DOCKERFILE_INSTRUCTIONS) return [];
+  return withPatternBudget((budget) => {
+    const images = readBaseImages(escape, instructions, buildArgs, options);
+    return budget.charactersExceeded === true ? [] : images;
+  });
+}
+
+function readBaseImages(
+  escape: string,
+  instructions: readonly Instruction[],
+  buildArgs: Record<string, string> | undefined,
+  options: { target?: string },
+): string[] {
   const globals = new Map<string, string | undefined>();
   const lookup: Lookup = (name) => {
     const override = buildArgs && Object.prototype.hasOwnProperty.call(buildArgs, name) ? buildArgs[name] : undefined;
@@ -195,6 +217,11 @@ export interface DockerfileImages {
   stageNames: string[];
   /** Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS; no references. */
   tooLarge?: true;
+  /**
+   * Review round 8 (S8-2): the expansions of the Dockerfile made more than MAX_EXPANDED_CHARACTERS characters; no
+   * references.
+   */
+  tooComplex?: true;
 }
 
 /**
@@ -228,7 +255,10 @@ export function analyzeDockerfileImages(
   if (dockerfileText.length > MAX_DOCKERFILE_LENGTH) return { references: [], stageNames: [], tooLarge: true };
   const { escape, syntax, instructions } = parseInstructions(dockerfileText);
   if (instructions.length > MAX_DOCKERFILE_INSTRUCTIONS) return { references: [], stageNames: [], tooLarge: true };
-  return withPatternBudget(() => readImageReferences(escape, syntax, instructions, buildArgs, options));
+  return withPatternBudget((budget) => {
+    const images = readImageReferences(escape, syntax, instructions, buildArgs, options);
+    return budget.charactersExceeded === true ? { references: [], stageNames: [], tooComplex: true } : images;
+  });
 }
 
 function readImageReferences(
@@ -519,10 +549,26 @@ function csvFields(value: string): string[] {
   return fields;
 }
 
-/** A parser directive `# name=value` (more lenient than BuildKit: white space before the `#`). */
-const DIRECTIVE = /^\s*#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+/**
+ * A parser directive `# name=value` (more lenient than BuildKit: white space before the `#`). Review round 8 (S8-3): the
+ * value is taken as it is and trimmed afterwards (parseDirective); BuildKit's `\s*=\s*(.+?)\s*$` backtracks in quadratic
+ * time on a value with many spaces.
+ */
+const DIRECTIVE = /^\s*#\s*([A-Za-z][A-Za-z0-9]*)\s*=(.*)$/;
 /** A directive in the C form `// name=value` (DetectSyntax). */
-const SLASH_DIRECTIVE = /^\s*\/\/\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+const SLASH_DIRECTIVE = /^\s*\/\/\s*([A-Za-z][A-Za-z0-9]*)\s*=(.*)$/;
+
+/**
+ * A directive line (DIRECTIVE or SLASH_DIRECTIVE) with its name and value, as BuildKit's `\s*=\s*(.+?)\s*$` gives
+ * them: the value without the white space around it; a value of white space only is its last character (the lazy group
+ * takes one); an empty value is no directive.
+ */
+function parseDirective(line: string, pattern: RegExp): { name: string; value: string } | undefined {
+  const match = pattern.exec(line);
+  if (!match || match[2] === '') return undefined;
+  const trimmed = match[2].trim();
+  return { name: match[1], value: trimmed !== '' ? trimmed : match[2].slice(-1) };
+}
 
 /**
  * The frontend of a Dockerfile as `DetectSyntax` of BuildKit's Dockerfile parser finds it (review round 5, S5-3): after a
@@ -538,9 +584,9 @@ export function detectSyntax(text: string): string | undefined {
   const lines = source.split(/\r\n|\r|\n/);
   for (const pattern of [DIRECTIVE, SLASH_DIRECTIVE]) {
     for (const line of lines) {
-      const match = pattern.exec(line);
-      if (!match || !KNOWN_DIRECTIVES.has(match[1].toLowerCase())) break;
-      if (match[1].toLowerCase() === 'syntax') return cutAtSpace(match[2]);
+      const directive = parseDirective(line, pattern);
+      if (!directive || !KNOWN_DIRECTIVES.has(directive.name.toLowerCase())) break;
+      if (directive.name.toLowerCase() === 'syntax') return cutAtSpace(directive.value);
     }
   }
   try {
@@ -572,9 +618,9 @@ function parseInstructions(text: string): { escape: string; syntax?: string; ins
 
   // Parser directives are only recognized at the very top of the file.
   for (; index < lines.length; index++) {
-    const match = DIRECTIVE.exec(lines[index]);
-    if (!match || !KNOWN_DIRECTIVES.has(match[1].toLowerCase())) break;
-    if (match[1].toLowerCase() === 'escape' && (match[2] === '`' || match[2] === '\\')) escape = match[2];
+    const directive = parseDirective(lines[index], DIRECTIVE);
+    if (!directive || !KNOWN_DIRECTIVES.has(directive.name.toLowerCase())) break;
+    if (directive.name.toLowerCase() === 'escape' && (directive.value === '`' || directive.value === '\\')) escape = directive.value;
   }
 
   const continuation = new RegExp(`${escapeRegExp(escape)}[ \\t]*$`);
@@ -680,6 +726,30 @@ function withUnchecked(value: string | undefined, unchecked: UncheckedClass | un
  * BuildKit keeps it in the pattern of `${VAR#pattern}` and `${VAR/pattern/replacement}`.
  */
 function expand(word: string, lookup: Lookup, escape: string, state?: Expansion, rawEscapes = false): string {
+  // Review round 8 (S8-2): after the Dockerfile ran out of MAX_EXPANDED_CHARACTERS, nothing is expanded any more.
+  const budget = activeBudget;
+  if (budget?.charactersExceeded === true) {
+    markTooComplex(state);
+    return word;
+  }
+  const text = expandWord(word, lookup, escape, state, rawEscapes);
+  if (budget !== undefined && budget.characters !== undefined) {
+    budget.characters -= text.length;
+    if (budget.characters < 0) {
+      budget.charactersExceeded = true;
+      markTooComplex(state);
+    }
+  }
+  return text;
+}
+
+/** An expansion that ran out of the budget of the Dockerfile (review round 8, S8-2). */
+function markTooComplex(state: Expansion | undefined): void {
+  markUnchecked(state, 'unsupported');
+  if (state !== undefined) state.tooComplex = true;
+}
+
+function expandWord(word: string, lookup: Lookup, escape: string, state: Expansion | undefined, rawEscapes: boolean): string {
   let result = '';
   let inDouble = false;
   let i = 0;
@@ -892,7 +962,27 @@ export const MAX_PATTERN_STEPS = 10_000_000;
 export interface PatternBudget {
   steps: number;
   exceeded?: boolean;
+  /** Review round 8 (S8-2): the characters that the expansions of the Dockerfile may still make (MAX_EXPANDED_CHARACTERS). */
+  characters?: number;
+  charactersExceeded?: boolean;
 }
+
+/**
+ * Review round 8 (S8-1): charges `count` steps before a pattern form converts its value and its pattern (whose length
+ * the steps of the matcher do not count); `false` when the budget ran out.
+ */
+function charge(budget: PatternBudget, count: number): boolean {
+  if (budget.exceeded === true) return false;
+  budget.steps -= count;
+  if (budget.steps >= 0) return true;
+  budget.exceeded = true;
+  return false;
+}
+
+/** The kinds of PatternToken in matchShellPattern. */
+const KIND_CHAR = 0;
+const KIND_ANY = 1;
+const KIND_STAR = 2;
 
 /** One element of a shell pattern: a character, `?` (any one character), or `*` (any text). */
 type PatternToken = { kind: 'char'; char: string } | { kind: 'any' } | { kind: 'star' };
@@ -944,71 +1034,86 @@ export function matchShellPattern(
   budget: PatternBudget,
 ): { start: number; end: number } | undefined | 'budget' {
   const accept = tokens.length;
-  interface Threads {
-    /** The state of each thread: a token index, or `accept`. */
-    states: number[];
-    /** Where the match of each thread started. */
-    starts: number[];
-  }
+  // Review round 8: the tokens and the thread lists in typed arrays (each state is at most once in a list, see `mark`),
+  // so that a step of the budget costs little.
+  const kinds = new Int8Array(accept);
+  const chars: string[] = new Array<string>(accept);
+  tokens.forEach((token, index) => {
+    kinds[index] = token.kind === 'char' ? KIND_CHAR : token.kind === 'any' ? KIND_ANY : KIND_STAR;
+    chars[index] = token.kind === 'char' ? token.char : '';
+  });
+  /** The threads of a position in the order of their priority: the state (a token index, or `accept`) and where the match started. */
+  let states = new Int32Array(accept + 1);
+  let starts = new Int32Array(accept + 1);
+  let count = 0;
+  let nextStates = new Int32Array(accept + 1);
+  let nextStarts = new Int32Array(accept + 1);
+  let nextCount = 0;
   // Each state once per list: the first thread (of the highest priority) wins.
   const mark = new Int32Array(accept + 1).fill(-1);
   let generation = 0;
-  const lazyStars: number[] = [];
-  /** Adds the ε-closure of `state`: `*` either matches one more character (the state stays) or ends (the next state). */
-  const add = (list: Threads, first: number, start: number): void => {
+  const lazyStars = new Int32Array(accept + 1);
+  /** Adds the ε-closure of `state` to the next list: `*` either matches one more character (the state stays) or ends (the next state). */
+  const add = (first: number, start: number): void => {
     let state = first;
-    lazyStars.length = 0;
-    while (state !== accept && tokens[state].kind === 'star' && mark[state] !== generation) {
+    let lazy = 0;
+    while (state !== accept && kinds[state] === KIND_STAR && mark[state] !== generation) {
       mark[state] = generation;
       if (greedy) {
         // One more character first, then the end of the star.
-        list.states.push(state);
-        list.starts.push(start);
+        nextStates[nextCount] = state;
+        nextStarts[nextCount++] = start;
       } else {
-        lazyStars.push(state);
+        lazyStars[lazy++] = state;
       }
       state++;
     }
     if (mark[state] !== generation) {
       mark[state] = generation;
-      list.states.push(state);
-      list.starts.push(start);
+      nextStates[nextCount] = state;
+      nextStarts[nextCount++] = start;
     }
     // Lazy: the end of each star first, then one more character, the innermost first.
-    for (let i = lazyStars.length - 1; i >= 0; i--) {
-      list.states.push(lazyStars[i]);
-      list.starts.push(start);
+    for (let i = lazy - 1; i >= 0; i--) {
+      nextStates[nextCount] = lazyStars[i];
+      nextStarts[nextCount++] = start;
     }
   };
-  let current: Threads = { states: [], starts: [] };
-  add(current, 0, from);
+  /** The next list becomes the current one. */
+  const swap = (): void => {
+    [states, nextStates] = [nextStates, states];
+    [starts, nextStarts] = [nextStarts, starts];
+    count = nextCount;
+    nextCount = 0;
+  };
+  add(0, from);
+  swap();
   let match: { start: number; end: number } | undefined;
   for (let position = from; ; position++) {
-    budget.steps -= current.states.length + 1;
+    budget.steps -= count + 1;
     if (budget.steps < 0) {
       budget.exceeded = true;
       return 'budget';
     }
     generation++;
-    const next: Threads = { states: [], starts: [] };
     const char = position < value.length ? value[position] : undefined;
-    for (let i = 0; i < current.states.length; i++) {
-      const state = current.states[i];
+    for (let i = 0; i < count; i++) {
+      const state = states[i];
       if (state === accept) {
         // The threads of lower priority are cut; those of higher priority may still find a match that wins.
-        match = { start: current.starts[i], end: position };
+        match = { start: starts[i], end: position };
         break;
       }
       if (char === undefined) continue;
-      const token = tokens[state];
-      if (token.kind === 'char' ? token.char !== char : char === '\n') continue;
-      add(next, token.kind === 'star' ? state : state + 1, current.starts[i]);
+      const kind = kinds[state];
+      if (kind === KIND_CHAR ? chars[state] !== char : char === '\n') continue;
+      add(kind === KIND_STAR ? state : state + 1, starts[i]);
     }
     if (char === undefined) break;
     // A new start at the next position, of the lowest priority, while no match was found.
-    if (match === undefined && !anchored) add(next, 0, position + 1);
-    if (next.states.length === 0) break;
-    current = next;
+    if (match === undefined && !anchored) add(0, position + 1);
+    if (nextCount === 0) break;
+    swap();
   }
   return match;
 }
@@ -1026,7 +1131,7 @@ function patternBudget(): PatternBudget {
 /** Runs `fn` with a fresh budget of MAX_PATTERN_STEPS for all patterns of one Dockerfile. */
 function withPatternBudget<T>(fn: (budget: PatternBudget) => T): T {
   const previous = activeBudget;
-  const budget: PatternBudget = { steps: MAX_PATTERN_STEPS };
+  const budget: PatternBudget = { steps: MAX_PATTERN_STEPS, characters: MAX_EXPANDED_CHARACTERS };
   activeBudget = budget;
   try {
     return fn(budget);
@@ -1040,6 +1145,7 @@ type PatternResult = string | undefined | 'budget';
 
 /** `${VAR#pattern}` and `${VAR##pattern}` as BuildKit's `trimPrefix` (the shortest match, or the longest when `greedy`). */
 export function trimShellPrefix(pattern: string, value: string, greedy: boolean, budget: PatternBudget = patternBudget()): PatternResult {
+  if (!charge(budget, value.length + pattern.length)) return 'budget';
   const tokens = parseShellPattern(pattern);
   if (tokens === undefined) return undefined;
   const chars = Array.from(value);
@@ -1053,6 +1159,8 @@ export function trimShellPrefix(pattern: string, value: string, greedy: boolean,
  * pattern reversed (an escape stays before its character).
  */
 export function trimShellSuffix(pattern: string, value: string, greedy: boolean, budget: PatternBudget = patternBudget()): PatternResult {
+  // Review round 8 (S8-1): before the value is reversed (trimShellPrefix charges the reversed texts again).
+  if (!charge(budget, value.length + pattern.length)) return 'budget';
   const chars = Array.from(pattern);
   const reversed: string[] = new Array<string>(chars.length);
   const last = chars.length - 1;
@@ -1082,6 +1190,7 @@ export function replaceShellPattern(
   all: boolean,
   budget: PatternBudget = patternBudget(),
 ): PatternResult {
+  if (!charge(budget, value.length + pattern.length)) return 'budget';
   const tokens = parseShellPattern(pattern);
   if (tokens === undefined) return undefined;
   const chars = Array.from(value);

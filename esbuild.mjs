@@ -47,7 +47,7 @@ const shared = {
   define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(devcontainerCliVersion()) },
 };
 
-const outfiles = ['dist/extension.js', 'dist/sessionMonitor.js', 'dist/groupsPreviewWorker.js'];
+const outfiles = ['dist/extension.js', 'dist/sessionMonitor.js', 'dist/groupsPreviewWorker.js', 'dist/configurationAnalysisWorker.js'];
 
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
 // match the minified bundles stays in dist/.
@@ -72,6 +72,13 @@ const contexts = await Promise.all([
     ...shared,
     entryPoints: ['src/vscode/groupsPreviewWorker.ts'],
     outfile: outfiles[2],
+  }),
+  // Review round 8: the worker thread of the host access analysis (configurationAnalysisRunner.ts): analyses the
+  // Dockerfiles and the Compose model of a repository with limits of time and memory.
+  esbuild.context({
+    ...shared,
+    entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
+    outfile: outfiles[3],
   }),
 ]);
 

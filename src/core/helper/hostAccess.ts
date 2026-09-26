@@ -177,8 +177,9 @@ const unsupported = (item: string): Problem => ({ item, class: 'unsupported' });
 /** How a flag of `docker run` or `docker build` is treated. */
 type FlagRule =
   | { kind: 'allow'; value: boolean }
-  // Allowed, but not passed to Docker (overrideRunArgs); `reason` tells the log why (removedRunArgs).
-  | { kind: 'remove'; value: boolean; reason: string }
+  // Allowed, but not passed to Docker (overrideRunArgs); `reason` tells the log why (removedRunArgs). With `check`, its
+  // value is checked first (review round 8, S8-6: `--restart`).
+  | { kind: 'remove'; value: boolean; reason: string; check?: (value: string) => Problem[] }
   // `guarded`: refused whatever the switch of the host access checks says (HostAccessClass `protected`).
   | { kind: 'refuse'; value: boolean; item?: string; guarded?: boolean }
   | { kind: 'check'; check: (value: string) => Problem[] };
@@ -198,6 +199,8 @@ function checkGuarded(check: (value: string) => string[]): FlagRule {
 }
 
 const REMOVED_NAME = 'the container gets the name of the environment';
+const REMOVED_RESTART =
+  'Dev Environments starts and stops the container itself; Docker would start the container again when Docker starts, outside the Session Monitor';
 const REMOVED_LIFE_CYCLE = 'Dev Environments stops, starts, and recreates the container; --rm would delete it at each stop';
 const REMOVED_TERMINAL = 'the container runs without a terminal; -i with -t would make its start fail';
 const REMOVED_DETACH = 'the Dev Container CLI stays attached to the container; -d would make its start fail';
@@ -301,8 +304,10 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--stop-signal': allowValue,
   // Only up to MAX_STOP_TIMEOUT_SECONDS, so that a stop of the Session Monitor ends in time (stopTimeoutProblems).
   '--stop-timeout': { kind: 'check', check: stopTimeoutProblems },
-  // Only `no` and `on-failure`: the others start the container together with Docker (restartProblems).
-  '--restart': { kind: 'check', check: restartProblems },
+  // Only `no` and `on-failure`: the others start the container together with Docker (restartProblems). Review round 8
+  // (S8-6): removed before `up` too, with a log line: Docker would start a container with `on-failure` again when the
+  // Docker daemon starts, outside the Session Monitor (D-14).
+  '--restart': { kind: 'remove', value: true, reason: REMOVED_RESTART, check: restartProblems },
   // Only drivers that keep the log in files of the container, or no log (logDriverProblems). Stays refused with the
   // checks off, like the other options of the log (user decision 2026-09-26).
   '--log-driver': checkGuarded(logDriverProblems),
@@ -429,11 +434,21 @@ function applicable(problems: readonly Problem[], checksOn: boolean): Problem[] 
 }
 
 function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
+  return withDockerfileCache(() => readHostAccessFindings(input, checksOn));
+}
+
+function readHostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
   const problems: Problem[] = [];
+  // Review round 8 (S8-5): the problems by their items, not a search of the list for each one.
+  const byItem = new Map<string, Problem>();
   const add = (found: readonly Problem[]): void => {
     for (const problem of found) {
-      const known = problems.find((other) => other.item === problem.item);
-      if (!known) problems.push({ ...problem });
+      const known = byItem.get(problem.item);
+      if (!known) {
+        const copy = { ...problem };
+        problems.push(copy);
+        byItem.set(copy.item, copy);
+      }
       // The same text from two rules (for example the options of two mounts of one volume): the one that the switch does
       // not lift counts.
       else if (known.class === 'computer' && problem.class !== 'computer') known.class = problem.class;
@@ -579,9 +594,41 @@ export function dockerfileImageReferences(text: string, args: Readonly<Record<st
  * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
  */
 function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
+  // Review round 8 (S8-4): one analysis for each Dockerfile and its build arguments within one check.
+  const cache = activeDockerfileCache;
+  const key = cache !== undefined ? JSON.stringify([text, Object.entries(args).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))]) : '';
+  const cached = cache?.get(key);
+  if (cached !== undefined) return cached;
+  const images = analyzeDockerfileReferences(text, args);
+  cache?.set(key, images);
+  return images;
+}
+
+/**
+ * Review round 8 (S8-4): the analyses of the Dockerfiles (dockerfileReferences) of the check that runs, by the text and
+ * the build arguments (the target does not matter, see dockerfileImageFindings); `undefined` outside of one.
+ */
+let activeDockerfileCache: Map<string, DockerfileImages> | undefined;
+
+/**
+ * Runs `fn` as one check (review round 8, S8-4): a Dockerfile that several services (or the report and the image
+ * references) read with the same build arguments is analysed once. Nested calls share the cache of the outer one.
+ */
+export function withDockerfileCache<T>(fn: () => T): T {
+  if (activeDockerfileCache !== undefined) return fn();
+  activeDockerfileCache = new Map();
+  try {
+    return fn();
+  } finally {
+    activeDockerfileCache = undefined;
+  }
+}
+
+function analyzeDockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
   const images = analyzeDockerfileImages(text, { ...args }, { withStages: true });
-  // Review round 7 (S7-2): a Dockerfile that is too large is refused (dockerfileImageFindings), BUILDKIT_SYNTAX with it.
-  if (images.tooLarge === true) return images;
+  // Review round 7 (S7-2): a Dockerfile that is too large is refused (dockerfileImageFindings), BUILDKIT_SYNTAX with it;
+  // review round 8 (S8-2): so is one that is too complex.
+  if (images.tooLarge === true || images.tooComplex === true) return images;
   const references = images.references;
   // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
   const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
@@ -640,6 +687,8 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
   const images = dockerfileReferences(text, args);
   // Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS.
   if (images.tooLarge === true) return [{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }];
+  // Review round 8 (S8-2): its expansions made more than MAX_EXPANDED_CHARACTERS characters.
+  if (images.tooComplex === true) return [{ item: 'Dockerfile (the Dockerfile is too complex to check)', class: 'unsupported' }];
   // Review round 7 (S7-2): each stage name once, with the index of its first FROM (a reference names the first
   // `stagesBefore` of them as stages), instead of a Set for each reference.
   const firstStage = new Map<string, number>();
@@ -1699,6 +1748,11 @@ function takesValue(rule: FlagRule): boolean {
   return rule.kind === 'check' || rule.value;
 }
 
+/** A rule whose value is checked: `check`, or `remove` with a check (review round 8, S8-6). */
+function checksValue(rule: FlagRule): boolean {
+  return rule.kind === 'check' || (rule.kind === 'remove' && rule.check !== undefined);
+}
+
 /**
  * Splits arguments into flags with their values, following the rules for which flags take a value, as Docker reads
  * them: a flag that takes a value takes the next argument, also one that starts with `-`. An entry that is no text is
@@ -1771,7 +1825,8 @@ function flagProblems(flag: ParsedFlag, label: (text: string) => string): Proble
   if (flag.name === undefined) return [unsupported(label(`argument ${flag.raw}`))];
   const rule = flag.rule;
   if (!rule) return [unsupported(label(flag.name.startsWith('--') ? flag.name : flag.raw))];
-  if (rule.kind === 'allow' || rule.kind === 'remove') return [];
+  if (rule.kind === 'allow') return [];
+  if (rule.kind === 'remove') return rule.check !== undefined ? rule.check(flag.value ?? '') : [];
   if (rule.kind === 'refuse') {
     const refused = rule.guarded ? guarded : access;
     if (rule.item) return [refused(rule.item)];
@@ -1811,7 +1866,7 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
     const rule = flag.rule;
     // At the end, without its value, the flag would take the next argument that the extension or the CLI adds.
     const last = flag.index === runArgs.length - 1 && flag.value === undefined;
-    if (last && rule !== undefined && (rule.kind === 'allow' || rule.kind === 'check') && takesValue(rule)) {
+    if (last && rule !== undefined && (rule.kind === 'allow' || checksValue(rule)) && takesValue(rule)) {
       problems.push(unsupported(`${flag.raw} without a value`));
     } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && COMPOSE_CLEARED_LABELS.includes(flag.value)) {
       continue;
@@ -2036,8 +2091,9 @@ export function withoutNameArgs(runArgs: readonly string[]): string[] {
 /**
  * The flags of `runArgs` that the override configuration does not pass to Docker (overrideRunArgs), in order, for the
  * log: `--name` (the extension adds the name of the environment), `--rm` (the extension stops, starts, and recreates
- * the container itself), and `-i`, `-t`, and `-d`, also in a group such as `-it`: with the arguments of the Dev
- * Container CLI, they do nothing or make the start fail.
+ * the container itself), `--restart` (review round 8, S8-6: Docker would start the container again when Docker
+ * starts, outside the Session Monitor), and `-i`, `-t`, and `-d`, also in a group such as `-it`: with the arguments of
+ * the Dev Container CLI, they do nothing or make the start fail.
  */
 export function removedRunArgs(runArgs: readonly string[]): RemovedRunArg[] {
   return [...removals(runArgs)].map(([index, flags]) => {

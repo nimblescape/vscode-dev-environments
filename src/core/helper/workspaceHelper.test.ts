@@ -18,6 +18,7 @@ import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
   COMPOSE_MODEL_SCRIPT,
+  CREATE_FOLDERS_SCRIPT,
   GIT_FILES_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
@@ -1176,6 +1177,28 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     ['the configuration folder', ['/workspaces/.devenv+/compose.yml']],
   ])('composeModel refuses %s before any Docker call', async (_name, files) => {
     await expect(createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: 'p' })).rejects.toThrow(/Invalid compose files/);
+    expect(docker.calls).toHaveLength(0);
+  });
+
+  it('createRepositoryFolders runs its script without the Docker socket, network, and the configuration folder (review round 8, P8-2)', async () => {
+    docker.handler = () => ({ stdout: '' });
+    const folders = ['/workspaces/api/data/postgres', '/workspaces/api/logs'];
+    await createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders });
+    const run = docker.runs[0];
+    expect(hasDockerAccess(run.args)).toBe(false);
+    expect(hasNoNetwork(run.args)).toBe(true);
+    expect(run.args).toContain('type=tmpfs,destination=/workspaces/.devenv+');
+    expect(commandOf(run.args)).toEqual(['node', '-e', CREATE_FOLDERS_SCRIPT, '/workspaces/api', ...folders]);
+    docker.handler = () => ({ exitCode: 2, stderr: '/workspaces/api/out leads out of the repository' });
+    await expect(createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders })).rejects.toBeInstanceOf(CommandError);
+  });
+
+  it.each<[string, string[]]>([
+    ['a folder outside the repository', ['/workspaces/other/data']],
+    ['a folder with ..', ['/workspaces/api/../other']],
+    ['the repository folder itself', ['/workspaces/api']],
+  ])('createRepositoryFolders refuses %s before any Docker call', async (_name, folders) => {
+    await expect(createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders })).rejects.toThrow(/Invalid folders/);
     expect(docker.calls).toHaveLength(0);
   });
 

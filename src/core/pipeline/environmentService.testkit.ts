@@ -50,6 +50,7 @@ import {
 } from './environmentService';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 import type { PullCredentials } from './pullCredentials';
+import { inProcessAnalyzer } from '../helper/configurationAnalysis';
 
 export const REPO = 'acme/api';
 export const ENV_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -566,6 +567,17 @@ export class FakeHelper implements EnvironmentHelper {
     return JSON.parse(JSON.stringify(this.composeOutput)) as ComposeModelOutput | { error: string };
   }
 
+  /** Review round 8 (P8-2): the folders of each createRepositoryFolders. */
+  readonly createdFolders: string[][] = [];
+  createFoldersError: Maybe<Error>;
+
+  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[] }): Promise<void> {
+    this.mount(p.volumeName);
+    this.calls.push(`createRepositoryFolders ${p.folders.join(' ')}`);
+    this.createdFolders.push([...p.folders]);
+    if (this.createFoldersError) throw this.createFoldersError;
+  }
+
   async prepareGit(p: {
     volumeName: string;
     repository: string;
@@ -977,6 +989,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
       h.sleeps.push(ms);
       if (signal?.aborted) throw abortError();
     },
+    // Review round 8: the analysis in this thread (the worker is tested in configurationAnalysisRunner.test.ts).
+    analyzer: inProcessAnalyzer,
     ...overrides,
   });
   return h;

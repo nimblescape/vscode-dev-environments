@@ -593,3 +593,91 @@ describe('review round 7 of unit 6 (S7-2): large Dockerfiles', () => {
     expect(dockerfileImageFindings(`FROM devenv-11111111:1\n# ${'x'.repeat(MAX_DOCKERFILE_LENGTH)}\n`, { BUILDKIT_SYNTAX: 'evil/frontend' })).toHaveLength(1);
   });
 });
+
+describe('review round 8 of unit 6: the budgets of the Dockerfile analysis', () => {
+  /** Milliseconds that `fn` takes. */
+  function timed<T>(fn: () => T): { result: T; ms: number } {
+    const start = performance.now();
+    const result = fn();
+    return { result, ms: performance.now() - start };
+  }
+  /** ARGs B0 … B13 that double their value (B13: MAX_EXPANDED_LENGTH characters, cut), then `lines` ARGs of `form`. */
+  function doubling(first: string, lines: number, form: (i: number) => string): string {
+    const head = `ARG B0=${first}\n${Array.from({ length: 13 }, (_, i) => `ARG B${i + 1}=\${B${i}}\${B${i}}`).join('\n')}\n`;
+    const body: string[] = [];
+    for (let l = 0; l < lines / 50; l++) body.push(`ARG ${Array.from({ length: 50 }, (_, k) => form(l * 50 + k)).join(' ')}`);
+    return `${head}${body.join('\n')}\nFROM alpine\n`;
+  }
+
+  it('S8-1: charges the length of the value and of the pattern before a form converts them', () => {
+    for (const run of [
+      (budget: { steps: number }) => trimShellPrefix('x', 'a'.repeat(100), false, budget),
+      (budget: { steps: number }) => trimShellSuffix('x', 'a'.repeat(100), true, budget),
+      (budget: { steps: number }) => replaceShellPattern('x', 'y', 'a'.repeat(100), true, budget),
+    ]) {
+      const budget: { steps: number; exceeded?: boolean } = { steps: 50 };
+      // Before: the matcher counted 2 steps (one position), and each form converted its whole value.
+      expect(run(budget)).toBe('budget');
+      expect(budget.exceeded).toBe(true);
+    }
+    // 1000 forms on a value of 64 KiB, which the matcher leaves after one step each (before: 3.7 s).
+    const text = doubling('xxxxxxxxxxxxxxxy', 1000, () => 'X=${B13%x}');
+    const { result, ms } = timed(() => dockerfileImageFindings(`${text}FROM alpine:\${X}\n`, {}));
+    expect(ms).toBeLessThan(1500);
+    expect(result).toEqual([{ item: 'FROM image alpine:${B13%x} (the Dockerfile is too complex to check)', class: 'unsupported' }]);
+  });
+
+  it('S8-2: refuses a Dockerfile whose expansions make more than MAX_EXPANDED_CHARACTERS characters', () => {
+    // 2000 ARGs of 64 KiB each (before: 250 MB more memory, and the Dockerfile passed).
+    const text = doubling('€€€€€€€€€€€€€€€€', 2000, (i) => `X${i}=a$B13`);
+    const heap = process.memoryUsage().heapUsed;
+    const { result, ms } = timed(() => dockerfileImageFindings(text, {}));
+    expect(ms).toBeLessThan(1000);
+    expect(process.memoryUsage().heapUsed - heap).toBeLessThan(150 * 1024 * 1024);
+    expect(result).toEqual([{ item: 'Dockerfile (the Dockerfile is too complex to check)', class: 'unsupported' }]);
+    expect(analyzeDockerfileImages(text)).toEqual({ references: [], stageNames: [], tooComplex: true });
+    // extractBaseImages has the same limits: no base images.
+    expect(extractBaseImages(text)).toEqual([]);
+    expect(extractBaseImages(`FROM alpine\n# ${'x'.repeat(MAX_DOCKERFILE_LENGTH)}\n`)).toEqual([]);
+    expect(extractBaseImages(`${Array.from({ length: MAX_DOCKERFILE_INSTRUCTIONS + 1 }, (_, i) => `FROM a${i}`).join('\n')}\n`)).toEqual([]);
+    // Below the limit, as before.
+    expect(extractBaseImages(doubling('€', 20, (i) => `X${i}=a$B13`))).toEqual(['alpine']);
+    expect(dockerfileImageFindings(doubling('€', 20, (i) => `X${i}=a$B13`), {})).toEqual([]);
+  });
+
+  it('S8-3: reads a directive with many spaces in linear time, with the values of the earlier expression', () => {
+    for (const read of [detectSyntax, (text: string) => extractBaseImages(text), (text: string) => extractImageReferences(text)]) {
+      // Before: 1.2 s each.
+      expect(timed(() => read(`# check=a${' '.repeat(40_000)}b\nFROM alpine\n`)).ms).toBeLessThan(300);
+      expect(timed(() => read(`// syntax=a${' '.repeat(40_000)}b\nFROM alpine\n`)).ms).toBeLessThan(300);
+    }
+    // The expression of review rounds 1 to 7 as the oracle.
+    const OLD = /^\s*#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+    const OLD_SLASH = /^\s*\/\/\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+    const oracle = (text: string): string | undefined => {
+      const lines = text.split(/\r\n|\r|\n/);
+      for (const pattern of [OLD, OLD_SLASH]) {
+        for (const line of lines) {
+          const match = pattern.exec(line);
+          if (!match || !['syntax', 'escape', 'check'].includes(match[1].toLowerCase())) break;
+          if (match[1].toLowerCase() === 'syntax') return cutAtSpace(match[2]);
+        }
+      }
+      return undefined;
+    };
+    let seed = 11;
+    const random = (): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const PARTS = ['#', '//', ' ', '\t', 'syntax', 'escape', 'check', 'x', '=', 'a/b:1', ' ', '`', '\\', ' ', 'Syntax'];
+    for (let n = 0; n < 3000; n++) {
+      const line = () => Array.from({ length: Math.floor(random() * 8) }, () => PARTS[Math.floor(random() * PARTS.length)]).join('');
+      const text = `${line()}\n${line()}\nFROM alpine\n`;
+      expect(detectSyntax(text), JSON.stringify(text)).toBe(oracle(text));
+    }
+    expect(detectSyntax('# syntax=  docker/dockerfile:1  \nFROM a\n')).toBe('docker/dockerfile:1');
+    expect(detectSyntax('# syntax=\nFROM a\n')).toBeUndefined();
+    expect(extractImageReferences('# escape=`\nFROM a`\n:1\n')).toEqual([{ reference: 'a:1', kind: 'FROM' }]);
+  });
+});

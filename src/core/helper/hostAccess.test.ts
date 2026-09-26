@@ -1259,3 +1259,43 @@ describe('imageLabelItems', () => {
     ]);
   });
 });
+
+describe('review round 8 of unit 6 (S8-5): the time of the check', () => {
+  it('removes the duplicates of 20000 items in linear time', () => {
+    const mounts = Array.from({ length: 20_000 }, (_, i) => `type=bind,source=/etc/x${i},target=/x${i}`);
+    const start = performance.now();
+    const report = hostAccessReport({ config: { mounts }, ownVolume: OWN });
+    // Before: a search of the list for each item.
+    expect(performance.now() - start).toBeLessThan(600);
+    expect(report.hostAccess).toHaveLength(20_000);
+    expect(report.unsupported).toEqual([]);
+  });
+});
+
+describe('review round 8 of unit 6 (S8-6): --restart is not passed to Docker', () => {
+  const RESTART = expect.stringContaining('would start the container again when Docker starts');
+
+  it.each<[string, string[], Array<{ arg: string; reason: unknown }>, string[]]>([
+    ['--restart on-failure', ['--restart', 'on-failure', '--init'], [{ arg: '--restart on-failure', reason: RESTART }], ['--init']],
+    ['--restart=on-failure:3', ['--restart=on-failure:3'], [{ arg: '--restart=on-failure:3', reason: RESTART }], []],
+    ['--restart no', ['--init', '--restart', 'no'], [{ arg: '--restart no', reason: RESTART }], ['--init']],
+    ['a --restart that is the value of another flag stays', ['--label', '--restart=on-failure'], [], ['--label', '--restart=on-failure']],
+  ])('removes %s from the runArgs that Docker gets, and names it for the log', (_name, runArgs, removed, passed) => {
+    // Before: passed to Docker, which starts a container with on-failure again when the Docker daemon starts.
+    expect(removedRunArgs(runArgs)).toEqual(removed);
+    expect(overrideRunArgs(runArgs)).toEqual(passed);
+    expect(runArgsProblems(runArgs, OWN)).toEqual([]);
+    expect(runArgsProblems(passed, OWN)).toEqual([]);
+  });
+
+  it('still refuses the values that start the container together with Docker, and a --restart without a value', () => {
+    expect(runArgsProblems(['--restart', 'always', '--restart=unless-stopped'], OWN)).toEqual(['--restart=always', '--restart=unless-stopped']);
+    expect(runArgsProblems(['--init', '--restart'], OWN)).toEqual(['--restart without a value']);
+  });
+
+  it('removes it from the override configuration', () => {
+    const override = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['--restart=on-failure:5', '--init'] });
+    expect((override.runArgs as string[]).some((arg) => arg.startsWith('--restart'))).toBe(false);
+    expect(override.runArgs).toContain('--init');
+  });
+});

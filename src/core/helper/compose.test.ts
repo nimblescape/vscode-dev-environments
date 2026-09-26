@@ -427,8 +427,10 @@ describe('composeUpModel', () => {
     ['always', 'always', 'no'],
     ['unless-stopped', 'unless-stopped', 'no'],
     ['no', 'no', 'no'],
-    ['on-failure', 'on-failure', 'on-failure'],
-    ['on-failure:3', 'on-failure:3', 'on-failure:3'],
+    // Review round 8, S8-6: changed expectations, `on-failure` is rewritten to `no` too (Docker restarts such a container
+    // when the Docker daemon starts).
+    ['on-failure', 'on-failure', 'no'],
+    ['on-failure:3', 'on-failure:3', 'no'],
   ])('rewrites restart %s to a restart that Docker does not start by itself', (_name, value, expected) => {
     for (const service of ['app', 'db']) {
       const model = templateModel();
@@ -451,10 +453,12 @@ describe('composeUpModel', () => {
 
   it.each<[string, Record<string, unknown>, Record<string, unknown>, boolean]>([
     ['condition any', { condition: 'any' }, { condition: 'none' }, true],
-    ['no condition', { max_attempts: 3 }, { max_attempts: 3, condition: 'none' }, true],
+    // Review round 8, P8-1: changed expectation, `max_attempts` is removed with the condition `none`.
+    ['no condition', { max_attempts: 3 }, { condition: 'none' }, true],
     ['an empty restart_policy', {}, { condition: 'none' }, true],
     ['condition none', { condition: 'none' }, { condition: 'none' }, false],
-    ['condition on-failure', { condition: 'on-failure', max_attempts: 2 }, { condition: 'on-failure', max_attempts: 2 }, false],
+    // Review round 8, S8-6 and P8-1: changed expectation, `on-failure` becomes `none`, without `max_attempts`.
+    ['condition on-failure', { condition: 'on-failure', max_attempts: 2 }, { condition: 'none' }, true],
   ])('rewrites deploy.restart_policy with %s (review round 7, P7-1)', (_name, policy, expected, logged) => {
     const model = templateModel();
     model.services.db.deploy = { resources: { limits: { memory: '1g' } }, restart_policy: policy };
@@ -682,5 +686,112 @@ describe('review round 5 of unit 6 (D5-1, D5-2)', () => {
     for (const configPath of ['.devcontainer/a/b/devcontainer.json', '../x/devcontainer.json', '.devcontainer/../devcontainer.json']) {
       expect(up(configPath).services.app.labels).not.toHaveProperty(['devenv.config-path']);
     }
+  });
+});
+
+describe('review round 8 of unit 6: the restart and the stop of the services', () => {
+  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: 'devenv-3f2a9c1e:7' });
+
+  it('S8-6: rewrites restart on-failure[:n] and the condition on-failure to no and none, and logs it', () => {
+    const model = templateModel();
+    model.services.db.restart = 'on-failure:5';
+    model.services.app.deploy = { restart_policy: { condition: 'on-failure' } };
+    const { model: result, rewrites } = up(model);
+    // Before: kept, and Docker starts such a container again when the Docker daemon starts.
+    expect(result.services.db.restart).toBe('no');
+    expect(result.services.app.deploy).toEqual({ restart_policy: { condition: 'none' } });
+    expect(rewrites).toContainEqual({ item: 'service db: restart on-failure:5', reason: 'Dev Environments starts the containers itself (no)' });
+    expect(rewrites).toContainEqual({ item: 'service app: deploy.restart_policy.condition on-failure', reason: 'Dev Environments starts the containers itself (none)' });
+    expect(composeBuildModel(model, params()).model.services.db.restart).toBe('no');
+  });
+
+  it('P8-1: removes max_attempts where the condition is none (Docker Engine 25 refuses a count with no), and keeps delay and window', () => {
+    // The example of the Docker documentation.
+    const model = templateModel();
+    model.services.db.deploy = { restart_policy: { condition: 'on-failure', delay: '5s', max_attempts: 3, window: '120s' } };
+    const { model: result, rewrites } = up(model);
+    expect(result.services.db.deploy).toEqual({ restart_policy: { condition: 'none', delay: '5s', window: '120s' } });
+    expect(rewrites).toContainEqual({
+      item: 'service db: deploy.restart_policy.max_attempts 3',
+      reason: 'removed: Docker refuses a count of restarts with the restart policy none',
+    });
+    const none = templateModel();
+    none.services.db.deploy = { restart_policy: { condition: 'none', max_attempts: 0 } };
+    expect(up(none).model.services.db.deploy).toEqual({ restart_policy: { condition: 'none' } });
+  });
+
+  it('caps a stop_grace_period over 20 s at 20 s, and logs it', () => {
+    for (const [value, expected, logged] of [
+      ['1m0s', '20s', true],
+      ['20s', '20s', false],
+      ['2s', '2s', false],
+      ['1h', '20s', true],
+      [90, '20s', true],
+    ] as const) {
+      const model = templateModel();
+      model.services.db.stop_grace_period = value;
+      const { model: result, rewrites } = up(model);
+      expect(result.services.db.stop_grace_period, String(value)).toBe(expected);
+      expect(rewrites.some((entry) => entry.item === `service db: stop_grace_period ${String(value)}`)).toBe(logged);
+      expect(composeBuildModel(model, params()).model.services.db.stop_grace_period).toBe(expected);
+    }
+    const { rewrites } = up({ ...templateModel(), services: { ...templateModel().services, db: { ...templateModel().services.db, stop_grace_period: '1m0s' } } });
+    expect(rewrites).toContainEqual({
+      item: 'service db: stop_grace_period 1m0s',
+      reason: 'the Session Monitor stops a container within 30 s (20s)',
+    });
+  });
+});
+
+describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder that does not exist yet', () => {
+  const SOURCE = `${REPO}/data/postgres`;
+  const entry = (bind: Record<string, unknown> = { create_host_path: true }) => ({ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind });
+  const context = (mountAncestors: Record<string, string | null> | undefined, realPaths: Record<string, string | null> = { [SOURCE]: null }): ComposeMountContext => ({
+    isDev: false,
+    repositoryFolder: REPO,
+    volumeNames: new Map(),
+    ownVolume: OWN,
+    engineApiVersion: '1.47',
+    realPaths,
+    ...(mountAncestors !== undefined ? { mountAncestors } : {}),
+  });
+
+  it('mounts the folder of the workspace volume, and names it to be created before up', () => {
+    // Before: refused (the path does not exist in the repository).
+    expect(decideServiceMount(entry(), context({ [SOURCE]: REPO }))).toEqual({
+      action: 'replace',
+      value: { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/var/lib/postgresql/data', volume: { nocopy: true, subpath: 'api/data/postgres' } },
+      reason: 'the folder api/data/postgres of the workspace volume, created in the repository before the start (the service can read and change these files of the repository)',
+      createFolder: SOURCE,
+    });
+    // A nearest folder that exists deeper in the repository (also through a link that stays in it).
+    expect(decideServiceMount(entry({}), context({ [SOURCE]: `${REPO}/data` }))).toMatchObject({ action: 'replace', createFolder: SOURCE });
+    const model = templateModel();
+    model.services.db.volumes = [entry()];
+    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: 'devenv-3f2a9c1e:7' });
+    expect(result.createFolders).toEqual([SOURCE]);
+    expect(result.model.services.db.volumes).toEqual([{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/var/lib/postgresql/data', volume: { nocopy: true, subpath: 'api/data/postgres' } }]);
+    expect(result.rewrites).toContainEqual({ item: `service db: bind mount ${SOURCE} → /var/lib/postgresql/data`, reason: expect.stringContaining('created in the repository before the start') });
+    // The build model does not create it (no container).
+    expect(composeBuildModel(model, params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }))).not.toHaveProperty('createFolders');
+    // An existing folder is not created.
+    expect(composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7' })).not.toHaveProperty('createFolders');
+  });
+
+  it.each<[string, Record<string, unknown>, Record<string, string | null> | undefined, ComposeEntryDecision]>([
+    ['create_host_path false', { create_host_path: false }, { [SOURCE]: REPO }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (the path does not exist in the repository)` }],
+    ['no nearest folder known (an older helper)', { create_host_path: true }, undefined, { action: 'refuse', kind: 'unsupported', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (the path does not exist in the repository)` }],
+    ['a nearest path that is no folder, or odd', { create_host_path: true }, { [SOURCE]: null }, { action: 'refuse', kind: 'unsupported', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (the path does not exist in the repository)` }],
+    ['a nearest folder that is a link out of the repository', { create_host_path: true }, { [SOURCE]: '/etc' }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /etc, outside of the repository)`, guarded: true }],
+    ['a nearest folder of the workspace helper', { create_host_path: true }, { [SOURCE]: '/workspaces/.devenv+' }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /workspaces/.devenv+, outside of the repository)`, guarded: true }],
+    ['a nearest folder next to the repository', { create_host_path: true }, { [SOURCE]: '/workspaces/api-other' }, { action: 'refuse', kind: 'hostAccess', item: `bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /workspaces/api-other, outside of the repository)`, guarded: true }],
+  ])('refuses it with %s', (_name, bind, ancestors, expected) => {
+    expect(decideServiceMount(entry(bind), context(ancestors))).toEqual(expected);
+  });
+
+  it('reads the nearest folders of the model run, and ignores values that are no paths', () => {
+    const line = JSON.stringify({ version: '2.40.3', dollarEscaped: true, model: { services: {} }, dockerfiles: {}, realPaths: {}, mountAncestors: { [SOURCE]: REPO, a: null, b: 3 } });
+    expect(parseComposeModelOutput(line)).toMatchObject({ mountAncestors: { [SOURCE]: REPO, a: null } });
+    expect(parseComposeModelOutput(line)).not.toHaveProperty(['mountAncestors', 'b']);
   });
 });

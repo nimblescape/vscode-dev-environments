@@ -68,6 +68,7 @@ import {
   timedChecker,
   type CheckRecord,
 } from './harness';
+import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 
 const REPOSITORY = 'devenv-test/tiny';
 const FOLDER = '/workspaces/tiny';
@@ -170,6 +171,7 @@ describe('open pipeline on a seeded environment', () => {
   function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): EnvironmentService {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
     return new EnvironmentService({
+      analyzer: inProcessAnalyzer,
       docker,
       runner,
       helper: workspaceHelper,

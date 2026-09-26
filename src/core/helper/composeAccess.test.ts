@@ -230,8 +230,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['restart unless-stopped', 'db', { restart: 'unless-stopped' }, NONE],
     ['restart unless-stopped of the dev service', 'app', { restart: 'unless-stopped' }, NONE],
     ['stop_grace_period 20s', 'db', { stop_grace_period: '20s' }, NONE],
-    ['stop_grace_period 21s', 'db', { stop_grace_period: '21s' }, U('service db: stop_grace_period 21s')],
-    ['stop_grace_period 1m', 'db', { stop_grace_period: '1m' }, U('service db: stop_grace_period 1m')],
+    // Review round 8 (orchestrator decision): changed expectations, a stop_grace_period over 20 s is capped at 20 s
+    // (composeUpModel), not refused.
+    ['stop_grace_period 21s', 'db', { stop_grace_period: '21s' }, NONE],
+    ['stop_grace_period 1m', 'db', { stop_grace_period: '1m' }, NONE],
     ['stop_grace_period that cannot be read', 'db', { stop_grace_period: 'soon' }, U('service db: stop_grace_period soon')],
     ['stop_signal', 'db', { stop_signal: 'SIGINT' }, NONE],
     // deploy
@@ -240,8 +242,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     // Review round 7, P7-1: changed expectation, the condition `any` is rewritten to `none` (composeUpModel).
     ['deploy restart_policy any', 'db', { deploy: { restart_policy: { condition: 'any' } } }, NONE],
     ['deploy restart_policy without a condition', 'db', { deploy: { restart_policy: {} } }, NONE],
-    ['deploy restart_policy delay', 'db', { deploy: { restart_policy: { condition: 'any', delay: '5s' } } }, U('service db: deploy.restart_policy.delay 5s')],
-    ['deploy replicas', 'db', { deploy: { replicas: 2 } }, U('service db: deploy.replicas')],
+    // Review round 8, P8-1: changed expectation, `delay`, `window`, and `max_attempts` are allowed (composeUpModel removes
+    // `max_attempts` with the condition `none`).
+    ['deploy restart_policy delay', 'db', { deploy: { restart_policy: { condition: 'any', delay: '5s' } } }, NONE],
+    ['deploy replicas', 'db', { deploy: { replicas: 2 } }, U('service db: deploy.replicas 2')],
     ['deploy generic_resources', 'db', { deploy: { resources: { reservations: { generic_resources: [{}] } } } }, U('service db: deploy.resources.reservations.generic_resources')],
     ['pull_policy (rewritten, D-16)', 'db', { pull_policy: 'always' }, NONE],
     ['use_api_socket', 'db', { use_api_socket: true }, A('service db: the Docker socket (use_api_socket)')],
@@ -356,10 +360,11 @@ describe('composeAccessReport: devcontainer.json (rule table 4.3)', () => {
   it('lists each item once, and splits access and unsupported settings', () => {
     const base = model();
     // Review round 7, P7-1: changed expectation, `restart: always` is rewritten, not refused; stop_grace_period 1m is.
-    base.services.db = { ...base.services.db, privileged: true, restart: 'always', stop_grace_period: '1m', cap_add: ['NET_ADMIN', 'NET_ADMIN'] };
+    // Review round 8: changed expectation, a stop_grace_period that cannot be read is (1m is capped at 20 s).
+    base.services.db = { ...base.services.db, privileged: true, restart: 'always', stop_grace_period: 'soon', cap_add: ['NET_ADMIN', 'NET_ADMIN'] };
     expect(composeAccessReport(input({ model: base }))).toEqual({
       hostAccess: ['service db: privileged mode', 'service db: capability NET_ADMIN'],
-      unsupported: ['service db: stop_grace_period 1m'],
+      unsupported: ['service db: stop_grace_period soon'],
     });
   });
 
@@ -430,4 +435,78 @@ describe('review round 6 of unit 6 (P6-1)', () => {
       expect(composeAccessReport(input({ model: { ...model(), services } }), false)).toEqual(U(REMOTE(context)));
     },
   );
+});
+
+describe('review round 8 of unit 6: the time of the check', () => {
+  it('S8-4: analyses a Dockerfile that several services build with the same arguments once', () => {
+    // Each analysis of this Dockerfile takes the whole budget of the pattern matcher (about 0.15 s).
+    const dockerfile = `ARG A=${'a'.repeat(4000)}\nARG P=${'*a'.repeat(500)}b\n${Array.from({ length: 20 }, (_, i) => `FROM \${A#$P}${i}`).join('\n')}\n`;
+    const services: ComposeModel['services'] = {};
+    const dockerfiles: Record<string, string> = {};
+    for (let i = 0; i < 40; i++) {
+      services[`s${i}`] = { build: { context: REPO, dockerfile: 'Dockerfile' } };
+      dockerfiles[`s${i}`] = dockerfile;
+    }
+    const start = performance.now();
+    const report = composeAccessReport(input({ model: { name: PROJECT, services }, devService: 's0', dockerfiles }));
+    // Before: 40 analyses (with the matcher of review round 7: 20 s).
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(report.hostAccess).toEqual([]);
+    // The first two references are too long, and name the same item.
+    expect(report.unsupported).toHaveLength(40 * 19);
+    expect(report.unsupported[0]).toMatch(/^service s0: FROM image a+… \(the image reference is too long\)$/);
+    expect(report.unsupported.at(-1)).toMatch(/^service s39: FROM image \$\{A#\$P\}19 \(the Dockerfile is too complex to check\)$/);
+  });
+
+  it('S8-5: removes the duplicates of 20000 items in linear time', () => {
+    const volumes = Array.from({ length: 20_000 }, (_, i) => ({ type: 'bind', source: `/etc/x${i}`, target: `/x${i}` }));
+    const start = performance.now();
+    const report = composeAccessReport(input({ model: { name: PROJECT, services: { app: { image: 'alpine', volumes } } } }));
+    // Before: 1.5 s (a search of the list for each item).
+    expect(performance.now() - start).toBeLessThan(600);
+    expect(report.hostAccess).toHaveLength(20_000);
+    expect(report.hostAccess[19_999]).toBe('service app: bind mount /etc/x19999 → /x19999');
+  });
+});
+
+describe('review round 8 of unit 6 (P8-1): common deploy settings', () => {
+  it('allows the example of the Docker documentation (restart_policy with delay, max_attempts, and window)', () => {
+    // Before: refused (deploy.restart_policy.delay, max_attempts, window).
+    const report = serviceReport('db', { deploy: { restart_policy: { condition: 'on-failure', delay: '5s', max_attempts: 3, window: '2m0s' } } });
+    expect(report).toEqual(NONE);
+  });
+
+  it('allows one replica, the mode replicated, scale 1, and limits of resources', () => {
+    expect(serviceReport('db', { scale: 1, deploy: { replicas: 1, mode: 'replicated', resources: { limits: { memory: '536870912', cpus: '0.5' } } } })).toEqual(NONE);
+    expect(serviceReport('app', { deploy: { mode: 'replicated', replicas: 1 } })).toEqual(NONE);
+  });
+
+  it.each<[string, Record<string, unknown>, HostAccessReport]>([
+    ['two replicas', { replicas: 2 }, U('service db: deploy.replicas 2')],
+    ['the mode global', { mode: 'global' }, U('service db: deploy.mode global')],
+    ['the mode replicated-job', { mode: 'replicated-job' }, U('service db: deploy.mode replicated-job')],
+    ['an unknown restart_policy setting', { restart_policy: { condition: 'any', backoff: '1s' } }, U('service db: deploy.restart_policy.backoff 1s')],
+    ['placement', { placement: { constraints: ['node.role==manager'] } }, U('service db: deploy.placement')],
+  ])('still refuses %s', (_name, deploy, expected) => {
+    expect(serviceReport('db', { deploy })).toEqual(expected);
+  });
+});
+
+describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder that does not exist yet', () => {
+  const SOURCE = `${REPO}/data/postgres`;
+  const withData = (mountAncestors?: Record<string, string | null>): HostAccessReport => {
+    const base = model();
+    base.services.db = { image: 'postgres:16', volumes: [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }] };
+    return composeAccessReport(input({ model: base, realPaths: { [SOURCE]: null }, ...(mountAncestors !== undefined ? { mountAncestors } : {}) }));
+  };
+
+  it('allows it when its nearest folder that exists is in the repository (a gitignored data folder)', () => {
+    // Before: refused (the path does not exist in the repository).
+    expect(withData({ [SOURCE]: REPO })).toEqual(NONE);
+  });
+
+  it('refuses it when the nearest folder is a link out of the repository, or not known', () => {
+    expect(withData({ [SOURCE]: '/workspaces/.devenv+' })).toEqual(A(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (a link to /workspaces/.devenv+, outside of the repository)`));
+    expect(withData()).toEqual(U(`service db: bind mount ${SOURCE} → /var/lib/postgresql/data (the path does not exist in the repository)`));
+  });
 });

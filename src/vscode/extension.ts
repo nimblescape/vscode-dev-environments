@@ -15,6 +15,7 @@ import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { isRepositoryInScope, sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
+import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
 import { WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
@@ -193,6 +194,8 @@ async function activateExtension(
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     // Concept 7.7: a private image on ghcr.io that the image check reads with the GitHub session is pulled with it too.
     pullCredentials: githubPackagesPullCredentials(credentials.provider(), auth),
+    // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
+    analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
   });
 
   const tree = new RepositoriesTreeProvider(logger);

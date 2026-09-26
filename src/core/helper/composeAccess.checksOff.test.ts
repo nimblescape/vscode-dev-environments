@@ -158,7 +158,8 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['network_mode of a network of another project', input(service('db', { network_mode: 'backend' }), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'service db: network backend of another environment', 'protected'],
   // Not supported, whatever the switch says.
   // Review round 7, P7-1: changed expectation, `restart: always` is rewritten, not refused; stop_grace_period 1m is.
-  ['stop_grace_period 1m', input(service('db', { stop_grace_period: '1m' })), 'service db: stop_grace_period 1m', 'unsupported'],
+  // Review round 8: changed expectation, a stop_grace_period over 20 s is capped; one that cannot be read is refused.
+  ['stop_grace_period soon', input(service('db', { stop_grace_period: 'soon' })), 'service db: stop_grace_period soon', 'unsupported'],
   ['an unknown key', input(service('db', { future: 1 })), 'service db: future', 'unsupported'],
   ['a reserved label', input(service('db', { labels: { 'devenv.environment-id': 'x' } })), 'service db: label devenv.environment-id', 'unsupported'],
   ['a repository file with an old engine', input(service('db', { volumes: [{ type: 'bind', source: `${REPO}/i.sql`, target: '/i' }] }), { engineApiVersion: '1.44' }), `service db: bind mount ${REPO}/i.sql → /i (needs Docker Engine 26 or newer)`, 'unsupported'],
