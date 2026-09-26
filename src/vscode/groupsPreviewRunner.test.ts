@@ -114,6 +114,33 @@ describe('PreviewWorkerRunner', () => {
     expect(run.preview?.owners[0].counts).toEqual([1]);
   });
 
+  it('ends the running job and the queued jobs at dispose without starting a new worker (review round 2 of PR #21, W6r)', async () => {
+    const current = new PreviewWorkerRunner(bundle, 5000);
+    runner = current;
+    const workerOf = () => (current as unknown as { worker: unknown }).worker;
+    const plain = { entries: [entry('^(web)-(.+)$')], testName: '', input: input(['web-shop']) };
+    expect((await current.run(plain)).preview?.owners[0].counts).toEqual([1]);
+    // A slow job runs, two more wait behind it.
+    const slow = current.run({ entries: [entry(SLOW)], testName: '', input: input([SLOW_NAME]) });
+    const queued = [current.run(plain), current.run(plain)];
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(workerOf()).toBeDefined();
+    const started = Date.now();
+    current.dispose();
+    expect(await slow).toMatchObject({ failed: true });
+    for (const job of queued) expect(await job).toEqual({ failed: true });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(workerOf()).toBeUndefined();
+    // Jobs queued behind a finished job, disposed before they start.
+    const waiting = [current.run(plain), current.run(plain)];
+    current.dispose();
+    for (const job of waiting) expect(await job).toEqual({ failed: true });
+    expect(workerOf()).toBeUndefined();
+    // A run after the dispose (the editor opened again) starts a new worker.
+    expect((await current.run(plain)).preview?.owners[0].counts).toEqual([1]);
+    expect(workerOf()).toBeDefined();
+  });
+
   it('reports a worker that cannot start', async () => {
     runner = new PreviewWorkerRunner(path.join(outDir, 'missing.js'));
     expect(await runner.run({ entries: [], testName: '', input: undefined })).toMatchObject({ failed: true });

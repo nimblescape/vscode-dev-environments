@@ -352,9 +352,14 @@ export function mergeRepositoryGroups(
   }
   const theirs = Array.isArray(theirsValue) ? (theirsValue as unknown[]) : [];
   const baseKeys = base.map(entryKey);
+  const oursValues = toSettingValue(ours);
+  // Both sides have the same entries in the same order: nothing to merge, settings.json stays as it is (review round 2
+  // of PR #21, F2).
+  if (oursValues.length === theirs.length && oursValues.every((value, position) => entryKey(value) === entryKey(theirs[position]))) {
+    return { status: 'merged', value: [...theirs], conflicts: [], orderConflict: false };
+  }
 
   // The editor: its entries with a valid origin are the base elements (possibly edited); the others are additions.
-  const oursValues = toSettingValue(ours);
   const oursTokens: Token[] = [];
   const oursByOrigin = new Map<number, unknown>();
   ours.forEach((entry, position) => {
@@ -367,8 +372,10 @@ export function mergeRepositoryGroups(
     }
   });
 
-  // settings.json: its elements matched to the base by content, over the whole list.
-  const theirsOrigins = alignToBase(base, theirs);
+  // settings.json: its elements matched to the base by content, over the whole list. Of equal copies in the base, the
+  // ones that the editor kept are preferred, so a copy that both sides removed is the same copy (review round 2 of
+  // PR #21, F2).
+  const theirsOrigins = alignToBase(base, theirs, new Set(oursByOrigin.keys()));
   const theirsByOrigin = new Map<number, unknown>();
   const theirsTokens: Token[] = theirs.map((value, position) => {
     const origin = theirsOrigins[position];
@@ -479,16 +486,21 @@ function isReordered(indices: readonly number[]): boolean {
  * equal entries in order (a longest common subsequence of both lists), so an entry that settings.json added or removed
  * next to an equal one does not look like a move (review round 2 of PR #21, M2). Then the rest over the whole list, so a
  * moved entry keeps its identity: equal entries (each base entry once, so duplicates keep their multiplicity), then
- * entries with the same pattern, then with the same name; last, the remaining entries after the same matched neighbor,
- * in order (an entry whose pattern and name both changed, also next to an addition).
+ * entries with the same pattern, then with the same name; last, the remaining entries after the same matched neighbor
+ * (an entry whose pattern and name both changed, also next to an addition): in order when both sides have as many,
+ * otherwise only the pairs whose patterns are clearly the most similar (`similarPairs`); the rest count as removed and
+ * added, so no entry of settings.json is dropped for a wrong guess (review round 2 of PR #21, F1). Of equal copies in
+ * the base, the `preferred` ones (that the editor kept) are matched first (F2).
  */
-function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Array<number | undefined> {
+function alignToBase(base: readonly unknown[], theirs: readonly unknown[], preferred: ReadonlySet<number>): Array<number | undefined> {
   const origins = new Array<number | undefined>(theirs.length).fill(undefined);
   const used = new Set<number>();
   const pass = (same: (baseIndex: number, theirsIndex: number) => boolean) => {
     theirs.forEach((_value, j) => {
       if (origins[j] !== undefined) return;
-      const i = base.findIndex((_entry, candidate) => !used.has(candidate) && same(candidate, j));
+      const free = (candidate: number) => !used.has(candidate) && same(candidate, j);
+      let i = base.findIndex((_entry, candidate) => preferred.has(candidate) && free(candidate));
+      if (i < 0) i = base.findIndex((_entry, candidate) => free(candidate));
       if (i < 0) return;
       origins[j] = i;
       used.add(i);
@@ -498,7 +510,7 @@ function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Arra
   const theirsKeys = theirs.map(entryKey);
   const baseFields = base.map(entryFieldsOf);
   const theirsFields = theirs.map(entryFieldsOf);
-  for (const [i, j] of commonSubsequence(baseKeys, theirsKeys)) {
+  for (const [i, j] of commonSubsequence(baseKeys, theirsKeys, (i) => preferred.has(i))) {
     origins[j] = i;
     used.add(i);
   }
@@ -529,29 +541,94 @@ function alignToBase(base: readonly unknown[], theirs: readonly unknown[]): Arra
     const anchor = theirsAnchor(j);
     leftTheirs.set(anchor, [...(leftTheirs.get(anchor) ?? []), j]);
   });
+  const textOf = (entry: unknown) => entryFieldsOf(entry)?.pattern ?? entryKey(entry);
   for (const [anchor, baseIndices] of leftBase) {
     const theirsIndices = leftTheirs.get(anchor) ?? [];
-    baseIndices.slice(0, theirsIndices.length).forEach((i, k) => (origins[theirsIndices[k]] = i));
+    if (baseIndices.length === theirsIndices.length) {
+      // As many entries on both sides between the same neighbors: each one was edited in place.
+      baseIndices.forEach((i, k) => (origins[theirsIndices[k]] = i));
+      continue;
+    }
+    // Otherwise the pairing in order would be a guess (review round 2 of PR #21, F1): only an entry whose pattern is
+    // clearly the most similar one on both sides is the same entry; the others count as removed and added.
+    for (const [i, j] of similarPairs(
+      baseIndices.map((i) => textOf(base[i])),
+      theirsIndices.map((j) => textOf(theirs[j])),
+    )) {
+      origins[theirsIndices[j]] = baseIndices[i];
+    }
   }
   return origins;
 }
 
-/** The index pairs of a longest common subsequence of `a` and `b`, in order (the first of equal choices). */
-function commonSubsequence(a: readonly string[], b: readonly string[]): Array<[number, number]> {
+/**
+ * Pairs texts of `a` and `b` that are similar (more than half of the longer text in common, as a subsequence) and the
+ * single most similar one for each other (the smallest edit distance by insertions and deletions, without a tie).
+ */
+function similarPairs(a: readonly string[], b: readonly string[]): Array<[number, number]> {
+  const distance = a.map((x) =>
+    b.map((y) => {
+      const common = commonSubsequence([...x], [...y]).length;
+      return 2 * common > Math.max(x.length, y.length) ? x.length + y.length - 2 * common : Infinity;
+    }),
+  );
+  const pairs: Array<[number, number]> = [];
+  const freeA = new Set(a.keys());
+  const freeB = new Set(b.keys());
+  const nearest = (candidates: Set<number>, distanceTo: (k: number) => number): number | undefined => {
+    let best: number | undefined;
+    let tie = false;
+    for (const k of candidates) {
+      const d = distanceTo(k);
+      if (d === Infinity) continue;
+      if (best === undefined || d < distanceTo(best)) {
+        best = k;
+        tie = false;
+      } else if (d === distanceTo(best)) {
+        tie = true;
+      }
+    }
+    return tie ? undefined : best;
+  };
+  for (let found = true; found; ) {
+    found = false;
+    for (const i of freeA) {
+      const j = nearest(freeB, (k) => distance[i][k]);
+      if (j === undefined || nearest(freeA, (k) => distance[k][j]) !== i) continue;
+      pairs.push([i, j]);
+      freeA.delete(i);
+      freeB.delete(j);
+      found = true;
+    }
+  }
+  return pairs;
+}
+
+/**
+ * The index pairs of a longest common subsequence of `a` and `b`, in order. Of the longest ones, the one with the most
+ * elements of `a` that are `preferred`, then the first of equal choices.
+ */
+function commonSubsequence(
+  a: readonly string[],
+  b: readonly string[],
+  preferred: (i: number) => boolean = () => false,
+): Array<[number, number]> {
   const width = b.length + 1;
-  // lengths[i * width + j]: the length of a longest common subsequence of a[i..] and b[j..].
-  const lengths = new Uint32Array((a.length + 1) * width);
+  // A match counts more than all preferred elements together.
+  const weight = (i: number) => a.length + 1 + (preferred(i) ? 1 : 0);
+  // lengths[i * width + j]: the weight of a best common subsequence of a[i..] and b[j..].
+  const lengths = new Float64Array((a.length + 1) * width);
   for (let i = a.length - 1; i >= 0; i--) {
     for (let j = b.length - 1; j >= 0; j--) {
-      lengths[i * width + j] =
-        a[i] === b[j] ? lengths[(i + 1) * width + j + 1] + 1 : Math.max(lengths[(i + 1) * width + j], lengths[i * width + j + 1]);
+      const skip = Math.max(lengths[(i + 1) * width + j], lengths[i * width + j + 1]);
+      lengths[i * width + j] = a[i] === b[j] ? Math.max(skip, weight(i) + lengths[(i + 1) * width + j + 1]) : skip;
     }
   }
   const pairs: Array<[number, number]> = [];
   let i = 0;
   let j = 0;
   while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
+    if (a[i] === b[j] && weight(i) + lengths[(i + 1) * width + j + 1] === lengths[i * width + j]) {
       pairs.push([i, j]);
       i += 1;
       j += 1;

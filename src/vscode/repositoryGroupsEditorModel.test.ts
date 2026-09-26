@@ -619,6 +619,152 @@ describe('merge at Save (3-way)', () => {
     expect(mergeRepositoryGroups(base3, [c3, a3, b3], ['b', 'a'])).toEqual(merged(['b', 'a']));
   });
 
+  // Review round 2 of PR #21, F1: between the same neighbors, settings.json added an entry and edited another one.
+  describe('does not guess which entry settings.json edited next to an addition', () => {
+    const theirs = ['^a', '^y', '^b2', '^c'];
+
+    it('asks about the edited entry when the editor removed it, and keeps the addition', () => {
+      const [a, , c] = loaded();
+      expect(merge([a, c], theirs)).toEqual({ status: 'conflicts', conflicts: [{ baseIndex: 1, base: '^b', theirs: '^b2' }], orderConflict: false });
+      expect(merge([a, c], theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^y', '^c'] });
+      expect(merge([a, c], theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: theirs });
+    });
+
+    it('asks about the edited entry when the editor edited it too, and keeps the addition', () => {
+      const [a, b, c] = loaded();
+      const ours = [a, { ...b, pattern: '^bm' }, c];
+      expect(merge(ours, theirs)).toEqual({
+        status: 'conflicts',
+        conflicts: [{ baseIndex: 1, base: '^b', mine: '^bm', theirs: '^b2' }],
+        orderConflict: false,
+      });
+      expect(merge(ours, theirs, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^y', '^bm', '^c'] });
+      expect(merge(ours, theirs, mine(1, 'theirs'))).toMatchObject({ status: 'merged', value: theirs });
+    });
+
+    it('keeps settings.json when the editor did not change the entry', () => {
+      expect(merge(loaded(), theirs)).toEqual(merged(theirs));
+      const [a, b, c] = loaded();
+      expect(merge([a, b, { ...c, pattern: '^cm' }], theirs)).toEqual(merged(['^a', '^y', '^b2', '^cm']));
+    });
+
+    it('counts an entry as removed and the others as added when no pattern is clearly the most similar', () => {
+      const [a, b, c] = loaded();
+      const other = ['^a', '^x', '^y', '^c'];
+      // Nothing is dropped: the question is about the removal, and both additions stay.
+      expect(merge([a, { ...b, pattern: '^bm' }, c], other)).toEqual({
+        status: 'conflicts',
+        conflicts: [{ baseIndex: 1, base: '^b', mine: '^bm' }],
+        orderConflict: false,
+      });
+      expect(merge([a, { ...b, pattern: '^bm' }, c], other, mine(1))).toMatchObject({ status: 'merged', value: ['^a', '^bm', '^x', '^y', '^c'] });
+      expect(merge([a, c], other)).toEqual(merged(other));
+      expect(merge(loaded(), other)).toEqual(merged(other));
+    });
+  });
+
+  // Review round 2 of PR #21, F2: of equal copies, the copy that both sides removed is the same copy.
+  describe('removes a copy of a duplicate once when both sides removed one', () => {
+    it('changes nothing when the editor and settings.json have the same entries', () => {
+      const base = ['^d', '^d'];
+      const [d1, d2] = entriesFromSetting(base).entries;
+      expect(mergeRepositoryGroups(base, [d2], ['^d'])).toEqual(merged(['^d']));
+      expect(mergeRepositoryGroups(base, [d1], ['^d'])).toEqual(merged(['^d']));
+    });
+
+    it('keeps the copy that the editor kept when the copies cannot be told apart', () => {
+      const base = ['^d', '^d', '^e'];
+      const [, d2, e] = entriesFromSetting(base).entries;
+      expect(mergeRepositoryGroups(base, [d2, { ...e, pattern: '^e2' }], ['^d', '^e'])).toEqual(merged(['^d', '^e2']));
+    });
+
+    it('still removes both copies when the sides removed different copies that can be told apart', () => {
+      const base = ['^a', '^b', '^a'];
+      const [, b, a2] = entriesFromSetting(base).entries;
+      expect(mergeRepositoryGroups(base, [b, a2], ['^a', '^b'])).toEqual(merged(['^b']));
+    });
+  });
+
+  // Review round 2 of PR #21, F1: properties of the merge for random changes on both sides.
+  describe('properties for random changes', () => {
+    let seed = 20260926;
+    const random = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return Math.floor((seed / 0x80000000) * n);
+    };
+    const PATTERNS = ['^a', '^b', '^c', '^b2', '^bm', '^y', '^ab', '^abc', '^web-(.+)$', '^web2-(.+)$'];
+    const NAMES = ['', '', 'N', 'M'];
+    const randomEntry = (): unknown => {
+      const pattern = PATTERNS[random(PATTERNS.length)];
+      const name = NAMES[random(NAMES.length)];
+      const flags = random(5) === 0 ? 'i' : '';
+      return name === '' && flags === '' ? pattern : { ...(name ? { name } : {}), pattern, ...(flags ? { flags } : {}) };
+    };
+    // The meaning of an element: the form that the editor writes.
+    const keyOf = (value: unknown) => JSON.stringify(toSettingValue(entriesFromSetting([value]).entries)[0]);
+    const change = <T,>(list: T[], fresh: () => T, edit: (item: T) => T): T[] => {
+      const result = [...list];
+      for (let steps = random(4); steps > 0; steps--) {
+        const step = random(4);
+        if (step === 0 && result.length > 0) result.splice(random(result.length), 1);
+        else if (step === 1) result.splice(random(result.length + 1), 0, fresh());
+        else if (step === 2 && result.length > 1) result.splice(random(result.length), 0, ...result.splice(random(result.length), 1));
+        else if (step === 3 && result.length > 0) {
+          const at = random(result.length);
+          result[at] = edit(result[at]);
+        }
+      }
+      return result;
+    };
+    const changeTheirs = (base: unknown[]) => change<unknown>(base, randomEntry, () => randomEntry());
+    const changeMine = (entries: EditorEntry[]) =>
+      change<EditorEntry>(
+        entries,
+        () => entriesFromSetting([randomEntry()]).entries.map(({ origin: _origin, ...fresh }) => fresh)[0],
+        (item) => ({ ...entriesFromSetting([randomEntry()]).entries[0], origin: item.origin }),
+      );
+
+    it('writes settings.json as it is when the editor changed nothing', () => {
+      for (let round = 0; round < 3000; round++) {
+        const base = Array.from({ length: random(6) }, randomEntry);
+        const theirs = changeTheirs(base);
+        const outcome = mergeRepositoryGroups(base, entriesFromSetting(base).entries, theirs);
+        expect(outcome, JSON.stringify({ base, theirs })).toEqual(merged(theirs));
+      }
+    });
+
+    it('keeps every change of settings.json that was not answered with Keep Mine', () => {
+      for (let round = 0; round < 3000; round++) {
+        const base = Array.from({ length: random(6) }, randomEntry);
+        const theirs = changeTheirs(base);
+        const ours = changeMine(entriesFromSetting(base).entries);
+        const context = JSON.stringify({ base, ours, theirs });
+        let outcome = mergeRepositoryGroups(base, ours, theirs);
+        const keptMine = new Map<string, number>();
+        if (outcome.status === 'conflicts') {
+          const entries = new Map<number, 'mine' | 'theirs'>();
+          for (const conflict of outcome.conflicts) {
+            const choice = random(2) === 0 ? 'mine' : 'theirs';
+            entries.set(conflict.baseIndex, choice);
+            if (choice === 'mine' && conflict.theirs !== undefined) {
+              keptMine.set(keyOf(conflict.theirs), (keptMine.get(keyOf(conflict.theirs)) ?? 0) + 1);
+            }
+          }
+          outcome = mergeRepositoryGroups(base, ours, theirs, { entries, order: random(2) === 0 ? 'mine' : 'theirs' });
+        }
+        expect(outcome.status, context).toBe('merged');
+        if (outcome.status !== 'merged') continue;
+        const count = (list: unknown[], key: string) => list.filter((value) => keyOf(value) === key).length;
+        const baseKeys = new Set(base.map(keyOf));
+        for (const key of new Set(theirs.map(keyOf))) {
+          if (baseKeys.has(key)) continue;
+          const expected = count(theirs, key) - (keptMine.get(key) ?? 0);
+          expect(count(outcome.value, key), `${key} in ${context} -> ${JSON.stringify(outcome.value)}`).toBeGreaterThanOrEqual(expected);
+        }
+      }
+    });
+  });
+
   // Review round 2 of PR #21, M5: a stored value that is not a list is never overwritten without a question.
   it('does not merge with a stored value that is not a list, and replaces it only when asked to', () => {
     const [a] = loaded();

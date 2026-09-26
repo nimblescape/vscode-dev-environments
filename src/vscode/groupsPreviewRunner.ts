@@ -22,6 +22,8 @@ export class PreviewWorkerRunner implements PreviewRunner {
   private worker: Worker | undefined;
   private nextId = 0;
   private chain: Promise<unknown> = Promise.resolve();
+  /** Counts the calls of dispose(): a job queued before a dispose() does not start (review round 2 of PR #21, W6r). */
+  private generation = 0;
 
   constructor(
     private readonly scriptPath: string,
@@ -29,12 +31,20 @@ export class PreviewWorkerRunner implements PreviewRunner {
   ) {}
 
   run(job: Omit<PreviewJob, 'id'>): Promise<PreviewRun> {
-    const result = this.chain.then(() => this.runNow(job));
+    const generation = this.generation;
+    const result = this.chain.then(() =>
+      generation === this.generation ? this.runNow(job) : ({ failed: true } satisfies PreviewRun),
+    );
     this.chain = result.catch(() => undefined);
     return result;
   }
 
+  /**
+   * Stops the worker: the running job and the jobs queued before this call resolve `{ failed: true }` without starting
+   * a new worker. A job run after this call starts a new one.
+   */
   dispose(): void {
+    this.generation += 1;
     const worker = this.worker;
     this.worker = undefined;
     void worker?.terminate();
