@@ -264,6 +264,11 @@ export interface ExtensionSettings {
   includeArchived: boolean;
   includeForks: boolean;
   refreshIntervalMinutes: number;
+  /**
+   * Raw entries of `repositoryGroups` (concept 6.2, 8): regular expressions that filter and group the repositories of the
+   * sidebar. The sidebar checks each entry (src/vscode/repositoryGroups.ts). Missing: the same as an empty list.
+   */
+  repositoryGroups?: unknown[];
 }
 
 /** State of a container as Docker reports it, simplified. */

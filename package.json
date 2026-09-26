@@ -457,6 +457,42 @@
           "minimum": 1,
           "maximum": 35791,
           "description": "Interval in minutes of the background update of the repository list."
+        },
+        "devEnvLauncher.repositoryGroups": {
+          "type": "array",
+          "scope": "application",
+          "default": [],
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "A regular expression (JavaScript syntax) for the repository name without the owner."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "pattern"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of a node that holds the groups of this regular expression. Without a name, its groups are shown directly under the owner."
+                  },
+                  "pattern": {
+                    "type": "string",
+                    "description": "A regular expression (JavaScript syntax) for the repository name without the owner."
+                  },
+                  "flags": {
+                    "type": "string",
+                    "pattern": "^[ius]*$",
+                    "description": "Flags of the regular expression: i (ignore case), u (Unicode), s (dot matches line breaks)."
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "markdownDescription": "Regular expressions that filter and group the repositories in the sidebar. Each one is matched against the repository name without the owner. In each owner where at least one repository matches, the sidebar hides the repositories that match none (repositories with an environment are always shown); an owner without a match keeps its plain list. Capturing groups become levels of the tree: the first group is the top level, the last group is the label of the repository. A repository goes under the first regular expression that matches. An entry with a `name` gets its own node with that name. Example: `^(\\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`. Only the user settings can set this list."
         }
       }
     }

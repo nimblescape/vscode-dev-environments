@@ -15,7 +15,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
-import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, Sidebar, type SidebarDeps } from './sidebar';
+import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SLOW_GROUPING_MS, Sidebar, type SidebarDeps } from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { TreeTexts, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
 
@@ -100,6 +100,8 @@ interface Harness {
   };
   /** The settings that the sidebar reads; a test can change them. */
   settings: ExtensionSettings;
+  logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
+  clock: { now: () => number };
 }
 
 function createHarness(): Harness {
@@ -177,6 +179,8 @@ function createHarness(): Harness {
     discovery,
     auth,
     settings,
+    logger,
+    clock,
   };
 }
 
@@ -636,6 +640,52 @@ describe('Sidebar progressive display (concept 7.4)', () => {
     h.sidebar.onPartialResult(part([info('acme/late')]));
     await h.sidebar.render();
     expect(rows()).toEqual([]);
+  });
+
+  it('groups the rows with the setting repositoryGroups, and warns once per session about each invalid entry', async () => {
+    h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop'), info('acme/api')]));
+    h.settings.repositoryGroups = ['(', { pattern: '^(web)-(.+)$', flags: 'g' }];
+    await signedIn();
+    await h.sidebar.render();
+    const [group] = h.models[h.models.length - 1];
+    expect(group.children.map((child) => [child.kind, child.label])).toEqual([['group', 'web']]);
+    expect(rows().map((row) => [row.repository, row.label])).toEqual([['acme/web-shop', 'shop']]);
+
+    const warnings = fakeVscode.window.showWarningMessage.mock.calls.map((call: unknown[]) => call[0] as string);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain('The repository group "(" in the setting devEnvLauncher.repositoryGroups is ignored');
+    expect(warnings[1]).toContain('uses the flags "g", which are ignored');
+    for (const warning of warnings) expect(h.logger.warn).toHaveBeenCalledWith(warning);
+
+    // Each render compiles the patterns again, but a problem is shown only once.
+    await h.sidebar.render();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
+    // Another invalid entry is a new problem.
+    h.settings.repositoryGroups = ['(', '['];
+    await h.sidebar.render();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(3);
+    // Without valid entries, the view lists the repositories as without the setting.
+    expect(rows().map((row) => row.label)).toEqual(['api', 'web-shop']);
+  });
+
+  it('names the setting repositoryGroups once when grouping is slow, and never without patterns', async () => {
+    h.discovery.refresh.mockResolvedValue(data([info('acme/web-shop')]));
+    await signedIn();
+    let now = 0;
+    const clockNow = vi.spyOn(h.clock, 'now').mockImplementation(() => (now += SLOW_GROUPING_MS));
+    const slow = () =>
+      fakeVscode.window.showWarningMessage.mock.calls.filter((call: unknown[]) => String(call[0]).includes('took'));
+    // Without patterns, a slow render is not about the setting.
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(0);
+    h.settings.repositoryGroups = ['^(web)-(.+)$'];
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(1);
+    expect(String(slow()[0][0])).toContain('devEnvLauncher.repositoryGroups');
+    expect(h.logger.warn).toHaveBeenCalledWith(slow()[0][0]);
+    await h.sidebar.render();
+    expect(slow()).toHaveLength(1);
+    clockNow.mockRestore();
   });
 
   it('shows no part of a first load that failed', async () => {
