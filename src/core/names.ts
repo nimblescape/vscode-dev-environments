@@ -126,7 +126,8 @@ export const GIT_CONFIG_FILE = `${CONFIG_FOLDER}/gitconfig`;
 /**
  * Unit 15: the folder of the token of the owner account in the dev container, a tmpfs (TOKEN_TMPFS) that the override
  * configuration adds (single container: runArgs; Docker Compose: `tmpfs` of the dev service in the up model). It is in
- * memory only: its files are gone when the container stops, and they are never in the workspace volume. The extension
+ * memory only: its files are gone when the container stops, and they are never in the workspace volume
+ * (the kernel may swap the tmpfs to the swap space of the computer or the Docker VM). The extension
  * writes it after each start of an open (TOKEN_WRITE_SCRIPT), owned by the remote user, mode 0700. No configuration of a
  * repository may mount anything at or below it (configFolderTarget).
  */
