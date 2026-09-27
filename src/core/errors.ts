@@ -20,7 +20,6 @@ export type UserErrorCode =
   | 'hostAccess'
   | 'unencryptedDockerConnection'
   | 'otherAccount'
-  | 'environmentUnassigned'
   | 'cancelled';
 
 export class UserFacingError extends Error {

@@ -44,8 +44,6 @@ export class StoragePaths {
   readonly registry: string;
   /** Lock folder for read-modify-write of the registry. */
   readonly registryLock: string;
-  /** Stored result of the discovery of version 1, shared by all accounts. It is removed (repositoriesFile replaces it). */
-  readonly legacyRepositories: string;
   /** Window status files, `<window-id>.json`. */
   readonly sessionsDir: string;
   /** Pending connection files, `<environment-id>.json`. */
@@ -70,7 +68,6 @@ export class StoragePaths {
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
     this.registryLock = path.join(root, 'registry.lock');
-    this.legacyRepositories = path.join(root, 'repositories.json');
     this.sessionsDir = path.join(root, 'sessions');
     this.pendingDir = path.join(root, 'pending');
     this.operationsDir = path.join(root, 'operations');

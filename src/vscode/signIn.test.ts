@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { GitHubApiError } from '../core/discovery/githubApi';
-import { EnvironmentClaims } from '../core/ownership';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
@@ -42,7 +41,7 @@ const REJECTED = { id: 'session-1', accessToken: 'gho_rejected', account: ACCOUN
 const RENEWED = { id: 'session-2', accessToken: 'gho_renewed', account: ACCOUNT, scopes: ['repo', 'read:org'] };
 
 function data(): DiscoveryData {
-  return { version: 1, fetchedAt: new Date(0).toISOString(), viewerLogin: 'octo', organizations: [], repositories: [], hints: [] };
+  return { version: 1, fetchedAt: new Date(0).toISOString(), viewerLogin: 'octo', organizations: [], repositories: [], hints: [], scope: [], withoutConfiguration: [] };
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -106,7 +105,6 @@ describe('Sign in with GitHub replaces a token that GitHub rejected', () => {
       docker: { isInstalled: () => true, isRunning: async () => true },
       discovery,
       auth,
-      claims: new EnvironmentClaims({ registry, getRepository: async () => undefined, logger }),
       tree: { setModel: () => {}, getModel: () => [] },
       settings: () => SETTINGS,
     } as unknown as SidebarDeps);

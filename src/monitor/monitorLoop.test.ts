@@ -57,6 +57,7 @@ function environment(id: string, repository: string, extra: Partial<Environment>
     containerName: name,
     createdAt: iso(T0 - 86_400_000),
     lastUsedAt: iso(T0 - 3_600_000),
+    owner: { id: '1001', login: 'me' },
     ...extra,
   };
 }

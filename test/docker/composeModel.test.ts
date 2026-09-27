@@ -114,7 +114,7 @@ describe('model run of a Docker Compose configuration', () => {
       ownVolume: volumeName,
       engineApiVersion: apiVersion,
       realPaths: output.realPaths,
-      environment: { id: ENVIRONMENT_ID },
+      environment: { id: ENVIRONMENT_ID, ownerId: '1001' },
     });
     log.info(`Engine API ${apiVersion}: ${JSON.stringify(report)}`);
     const subpath = Number(apiVersion.split('.')[1]) >= 45;
@@ -142,7 +142,7 @@ describe('model run of a Docker Compose configuration', () => {
       engineApiVersion: '1.45',
       realPaths: output.realPaths,
       dockerfiles: output.dockerfiles,
-      environment: { id: ENVIRONMENT_ID },
+      environment: { id: ENVIRONMENT_ID, ownerId: '1001' },
     };
     const item = `service linked: build context ${REPO}/ctx (a link to /workspaces/.devenv+, outside of the repository)`;
     expect(composeAccessReport(input).hostAccess).toContain(item);

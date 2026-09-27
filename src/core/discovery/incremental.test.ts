@@ -51,17 +51,13 @@ describe('storedDetections', () => {
       organizations: [],
       repositories: [info('Acme/API', '2026-09-20T10:00:00Z', ['.devcontainer.json'])],
       hints: [],
+      scope: [],
       withoutConfiguration: [{ nameWithOwner: 'acme/empty', pushedAt: '2026-09-19T10:00:00Z', defaultBranch: 'main' }],
     };
     expect([...storedDetections(data)]).toEqual([
       ['acme/empty', { pushedAt: '2026-09-19T10:00:00Z', defaultBranch: 'main', configPaths: [] }],
       ['acme/api', { pushedAt: '2026-09-20T10:00:00Z', defaultBranch: 'main', configPaths: ['.devcontainer.json'] }],
     ]);
-  });
-
-  it('reads a list of an older version, which has no repositories without configuration', () => {
-    const data: DiscoveryData = { version: 1, fetchedAt: '', viewerLogin: 'octo', organizations: [], repositories: [], hints: [] };
-    expect(storedDetections(data).size).toBe(0);
   });
 });
 

@@ -62,11 +62,12 @@ function environment(id: string, repository: string): Environment {
     containerName: `devenv-${id}`,
     createdAt: T0,
     lastUsedAt: T0,
+    owner: { id: '1001', login: 'me' },
   };
 }
 
 function discovery(repositories: RepositoryInfo[]): DiscoveryData {
-  return { version: 1, fetchedAt: T0, viewerLogin: 'me', organizations: [], repositories, hints: [] };
+  return { version: 1, fetchedAt: T0, viewerLogin: 'me', organizations: [], repositories, hints: [], scope: [], withoutConfiguration: [] };
 }
 
 const input_ = (overrides: Partial<TreeInput> = {}): TreeInput => input(overrides);

@@ -47,7 +47,6 @@ describe('StoragePaths', () => {
     expect(paths.root).toBe(root);
     expect(paths.registry).toBe(path.join(root, 'registry.json'));
     expect(paths.registryLock).toBe(path.join(root, 'registry.lock'));
-    expect(paths.legacyRepositories).toBe(path.join(root, 'repositories.json'));
     // One list per GitHub account (concept 6.2): the repository names of one account are never shown to another.
     expect(paths.repositoriesFile('1001')).toBe(path.join(root, 'repositories-1001.json'));
     expect(() => paths.repositoriesFile('../1001')).toThrow(/Invalid account ID/);

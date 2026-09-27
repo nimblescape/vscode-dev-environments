@@ -466,7 +466,7 @@ export class FakeDocker implements EnvironmentDocker {
 
 /**
  * Labels of an additional volume that the pipeline created for the environment `id` (additionalVolumeLabels): only
- * these make a volume the environment's own. `owner` null: an entry of an older version without owner.
+ * these make a volume the environment's own. `owner` null: a volume without the label devenv.owner-id (made by hand).
  */
 export function additionalVolumeLabels(
   id: string = ENV_ID,
@@ -1183,8 +1183,8 @@ export interface SeedOptions {
   volume?: boolean;
   /** Labels of the container. Default: the label devenv.container-version of the current setup. */
   containerLabels?: Record<string, string>;
-  /** Default: ACCOUNT. `null`: an entry of an older version without owner. */
-  owner?: GitHubAccount | null;
+  /** Default: ACCOUNT. */
+  owner?: GitHubAccount;
   extra?: Partial<Environment>;
 }
 
@@ -1219,14 +1219,12 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
     gitSummary: { branch: 'main', uncommittedFiles: 3, unpushedCommits: 4, stashes: 1, recordedAt: '2026-09-20T10:00:00.000Z' },
     lastBuildNumber: record?.buildNumber,
     ...(record ? { buildRecord: record } : {}),
-    ...(options.owner === null ? {} : { owner: options.owner ?? ACCOUNT }),
+    owner: options.owner ?? ACCOUNT,
     ...options.extra,
   };
   await h.registry.add(environment);
   if (options.volume !== false) {
-    const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository };
-    if (environment.owner) labels[LABEL_OWNER_ID] = environment.owner.id;
-    h.docker.volumes.set(name, labels);
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: environment.owner.id });
   }
   if (record && options.image !== false) {
     h.docker.images.add(record.environmentImage);

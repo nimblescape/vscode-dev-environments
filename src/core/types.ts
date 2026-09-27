@@ -46,25 +46,16 @@ export interface ComposeBuildRecord {
   /**
    * The `image` references of the other services that are not built (for example `postgres:16`), as the image check
    * names them in `images` of the build record (review round 1, D5). They are images of the user, pulled for the
-   * services, not base images of the environment image: removeUnusedBaseImages never removes them. A record without it
-   * (written before) removes no base images.
+   * services, not base images of the environment image: removeUnusedBaseImages never removes them.
    */
-  serviceImages?: string[];
+  serviceImages: string[];
   /**
    * Review round 1 (P-4): the version of the Compose plugin that printed the model of `configHash`, and composeInputsHash
    * of the files as written. A new Compose version can print the same files as another model: with equal files, a
    * different model counts as a change only with the same version (composeConfigurationChange).
    */
-  version?: string;
-  inputsHash?: string;
-  /**
-   * Review round 9 (D9-1): the paths of the repository (absolute, for example `/workspaces/api/data/postgres`) that the
-   * other services mount from the workspace volume (composeUpModel's `serviceFolders`), as the last `up` used them. They
-   * may hold the data of those services with their own owner: the ownership fixes after `up` and of Switch branch… leave
-   * them out, and the question of Delete names them. A record without it (written before) leaves nothing out.
-   * Review round 10 (D10-1): no longer written; Environment.serviceFolders holds them. Still read (serviceFoldersOf).
-   */
-  serviceFolders?: string[];
+  version: string;
+  inputsHash: string;
 }
 
 export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';
@@ -137,12 +128,8 @@ export interface Environment {
   serviceFoldersOverflow?: boolean;
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
-  /**
-   * The GitHub account that created the environment. Only this account can use it. Entries of an older version have
-   * none until an account claims them: without a question only when the entry can belong to no other account, otherwise
-   * after a confirmation of the user (concept 7.5).
-   */
-  owner?: GitHubAccount;
+  /** The GitHub account that created the environment. Only this account can use it (concept 7.5). */
+  owner: GitHubAccount;
   /**
    * An update whose new environment image the host access policy refused (concept 7.7): the same update is not built
    * again until a digest or the configuration changes.
@@ -150,8 +137,7 @@ export interface Environment {
   refusedUpdate?: RefusedUpdate;
   /**
    * Keep Running When Closed (concept 7.9; user decision 2026-09-26, "go with the proposal for closing"): the Session
-   * Monitor never stops this environment when no window uses it; only the user's Stop or Delete does. Missing (entries of
-   * earlier versions) or false: the container stops after the waiting time, as the setting stopOnClose says.
+   * Monitor never stops this environment when no window uses it; only the user's Stop or Delete does. Missing or false: the container stops after the waiting time, as the setting stopOnClose says.
    */
   keepRunning?: boolean;
 }
@@ -189,15 +175,14 @@ export interface RefusedUpdate {
  */
 export interface KeptVolume {
   name: string;
-  /** Missing for a volume of an entry of an older version without owner. */
-  owner?: GitHubAccount;
+  owner: GitHubAccount;
   keptAt: string;
 }
 
 export interface RegistryFile {
   version: 1;
   environments: Environment[];
-  /** Additional volumes that a Delete kept. Missing in files of earlier versions. */
+  /** Additional volumes that a Delete kept. Missing when there are none. */
   keptVolumes?: KeptVolume[];
 }
 
@@ -212,11 +197,6 @@ export interface RepositoryInfo {
   isArchived: boolean;
   isFork: boolean;
   isPrivate: boolean;
-  /**
-   * The permission of the account on GitHub (`viewerPermission`: ADMIN, MAINTAIN, WRITE, TRIAGE, or READ). Missing when
-   * GitHub does not return it, and in lists of older versions.
-   */
-  viewerPermission?: string;
   pushedAt: string | null;
   defaultBranch: string | null;
   /** Configuration paths in the order of precedence. The first one is the default. */
@@ -257,15 +237,15 @@ export interface DiscoveryData {
   repositories: RepositoryInfo[];
   hints: OrganizationHint[];
   /**
-   * The scan scope that the list was built with (lower-case logins, sorted; `normalizeScope`). Missing or empty: all
-   * repositories that the account can access (lists of older versions have none).
+   * The scan scope that the list was built with (lower-case logins, sorted; `normalizeScope`). Empty: all repositories
+   * that the account can access.
    */
-  scope?: string[];
+  scope: string[];
   /**
    * The repositories of the scan that have no configuration, so that a later refresh reads the configurations only of
-   * new and changed repositories. Missing in lists of older versions.
+   * new and changed repositories.
    */
-  withoutConfiguration?: CheckedRepository[];
+  withoutConfiguration: CheckedRepository[];
   /**
    * Repositories with a configuration whose lookup was not complete (a GraphQL error in its part of the answer), by
    * `owner/name`: the next refresh reads their configurations again (concept 7.4). Missing when there are none.
@@ -311,11 +291,6 @@ export interface PendingOperation {
    * that the environment recorded after the question is kept.
    */
   additionalVolumesToRemove?: string[];
-  /**
-   * For `delete`, written by an earlier version: also remove the additional volumes. That version's question listed the
-   * recorded additional volumes, so they are removed (pendingVolumesToRemove).
-   */
-  removeAdditionalVolumes?: boolean;
 }
 
 /** Content of reopen.json (concept 7.10). */

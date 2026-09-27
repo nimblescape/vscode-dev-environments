@@ -400,18 +400,18 @@ describe('the queries of the scan scope', () => {
 });
 
 describe('parseDiscoveryData and the scope', () => {
-  const base = { version: 1, fetchedAt: '2026-09-25T12:00:00Z', viewerLogin: 'octo', organizations: [], repositories: [] };
+  const base = { version: 1, fetchedAt: '2026-09-25T12:00:00Z', viewerLogin: 'octo', organizations: [], repositories: [], withoutConfiguration: [] };
 
   it.each<[string, unknown, string[] | undefined]>([
-    ['a list of an older version has no scope', undefined, undefined],
+    ['a list without scope is invalid (it is built again)', undefined, undefined],
     ['the scope is kept normalized', ['Beta', 'acme'], ['acme', 'beta']],
-    ['a scope that is not a list of texts is dropped', ['acme', 3], undefined],
+    ['a scope that is not a list of texts makes the list invalid', ['acme', 3], undefined],
   ])('%s', (_name, scope, expected) => {
     expect(parseDiscoveryData({ ...base, hints: [], ...(scope !== undefined ? { scope } : {}) })?.scope).toEqual(expected);
   });
 
   it('keeps a not-found hint', () => {
     const hint = { organization: 'nobody', kind: 'notFound', url: 'https://github.com/nobody' };
-    expect(parseDiscoveryData({ ...base, hints: [hint] })?.hints).toEqual([hint]);
+    expect(parseDiscoveryData({ ...base, scope: [], hints: [hint] })?.hints).toEqual([hint]);
   });
 });

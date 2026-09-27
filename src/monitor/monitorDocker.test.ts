@@ -112,6 +112,7 @@ describe('MonitorDockerClient', () => {
       containerName: 'devenv-acme-api-3f2a9c1e',
       createdAt: new Date(T0).toISOString(),
       lastUsedAt: new Date(T0).toISOString(),
+      owner: { id: '1001', login: 'me' },
       remoteUser: 'vscode',
     });
     await sessionFiles.writeWindowStatus({

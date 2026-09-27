@@ -40,6 +40,7 @@ function environment(id: string, repository: string, lastUsedAt: number): Enviro
     createdAt: new Date(T0 - 3_600_000).toISOString(),
     lastUsedAt: new Date(lastUsedAt).toISOString(),
     gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: new Date(T0).toISOString() },
+    owner: { id: '1001', login: 'me' },
   };
 }
 
@@ -58,7 +59,7 @@ describe('switcher (concept 6.4)', () => {
   const repositories = [repo('acme/api'), repo('acme/web', { isFork: true }), repo('acme/old', { isArchived: true })];
   const environments = [environment('e-web', 'acme/web', T0 - 60_000), environment('e-api', 'acme/api', T0)];
   const groups = buildTreeModel({
-    discovery: { version: 1, fetchedAt: '', viewerLogin: 'me', organizations: [], repositories, hints: [] },
+    discovery: { version: 1, fetchedAt: '', viewerLogin: 'me', organizations: [], repositories, hints: [], scope: [], withoutConfiguration: [] },
     settings: { owners: [], includeArchived: true, includeForks: true },
     environments,
     runtime: undefined,

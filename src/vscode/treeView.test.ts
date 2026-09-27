@@ -39,6 +39,7 @@ const env: Environment = {
   containerName: 'c',
   createdAt: '2026-09-24T15:00:00.000Z',
   lastUsedAt: '2026-09-24T17:00:00.000Z',
+  owner: { id: '1001', login: 'me' },
   gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: '' },
 };
 
@@ -51,6 +52,8 @@ function model(): OwnerGroup[] {
       organizations: ['acme'],
       repositories: [repo('acme/api'), repo('acme/web')],
       hints: [{ organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' }],
+      scope: [],
+      withoutConfiguration: [],
     },
     settings: { owners: [], includeArchived: false, includeForks: true },
     environments: [env],
@@ -160,6 +163,8 @@ describe('nodes of the setting repositoryGroups', () => {
         organizations: ['school'],
         repositories: names.map((name) => repo(`school/${name}`)),
         hints: [],
+        scope: [],
+        withoutConfiguration: [],
       },
       settings: { owners: [], includeArchived: false, includeForks: true },
       environments: [{ ...env, repository: 'school/2026-3cWI-SWP-module-oop-EnesHA81' }],

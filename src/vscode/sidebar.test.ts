@@ -10,7 +10,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { StateTexts } from '../core/messages';
-import { EnvironmentClaims } from '../core/ownership';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
@@ -73,7 +72,7 @@ function info(nameWithOwner: string): RepositoryInfo {
 }
 
 function data(repositories: RepositoryInfo[]): DiscoveryData {
-  return { version: 1, fetchedAt: iso(NOW), viewerLogin: 'octo', organizations: ['acme'], repositories, hints: [] };
+  return { version: 1, fetchedAt: iso(NOW), viewerLogin: 'octo', organizations: ['acme'], repositories, hints: [], scope: [], withoutConfiguration: [] };
 }
 
 const API = '11111111-1111-4111-8111-111111111111';
@@ -146,11 +145,8 @@ function createHarness(): Harness {
     renewToken: vi.fn(async () => undefined),
   };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
-  const getRepository = discovery.getRepository as unknown as (repository: string, token: string) => Promise<RepositoryInfo | undefined>;
-  const claims = new EnvironmentClaims({ registry, getRepository: (repository, token) => getRepository(repository, token), logger });
   const settings: ExtensionSettings = { ...SETTINGS, owners: [...SETTINGS.owners] };
   const sidebar = new Sidebar({
-    claims,
     logger,
     registry,
     sessionFiles,
@@ -388,7 +384,7 @@ describe('Sidebar', () => {
   it('shows only the environments of the signed-in account, and names no other (concept 7.5)', async () => {
     await h.registry.add(environment(API, 'acme/api'));
     await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
-    await h.registry.add(environment(GONE, 'majikmate/legacy', { owner: undefined }));
+    await h.registry.add(environment(GONE, 'majikmate/legacy', { owner: { id: '3003', login: 'third' } }));
     h.discovery.refresh.mockResolvedValue(data([info('acme/api')]));
     await h.sidebar.initialize();
     await h.sidebar.refreshDiscovery();
@@ -401,7 +397,7 @@ describe('Sidebar', () => {
     expect((await h.sidebar.repositoriesForPicker()).map((repository) => repository.nameWithOwner)).toEqual(['acme/api']);
     expect((await h.sidebar.availableEnvironments()).map((entry) => entry.id)).toEqual([API]);
     // No lookup on GitHub for a hidden environment, and no branch read in its container.
-    expect(h.discovery.getRepository.mock.calls.map((call) => call[0])).toEqual(['majikmate/legacy']);
+    expect(h.discovery.getRepository).not.toHaveBeenCalled();
     h.service.inspectStates.mockResolvedValue(new Map([[OLD, { container: 'running', volume: true }], [API, { container: 'running', volume: true }]]));
     await h.sidebar.refreshStates();
     expect(h.service.currentBranch.mock.calls.map((call) => call[0])).toEqual([API]);
@@ -409,8 +405,6 @@ describe('Sidebar', () => {
 
   it('offers Start for a listed repository that has an environment of another account, and names it nowhere (D-3)', async () => {
     await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: OTHER }));
-    // An entry of an older version is not counted: this account may still claim it.
-    await h.registry.add(environment(GONE, 'acme/legacy', { owner: undefined }));
     h.discovery.refresh.mockResolvedValue(data([info('majikmate/module-ts'), info('acme/legacy'), info('acme/api')]));
     await signedIn();
     await h.sidebar.render();
@@ -422,36 +416,6 @@ describe('Sidebar', () => {
     expect(JSON.stringify(h.models)).not.toContain(OLD);
     expect(rowOf('acme/legacy').actions.canStart).toBe(true);
     expect(rowOf('acme/api').actions.canStart).toBe(true);
-  });
-
-  it('claims an environment of an older version after a refresh only when it can belong to this account alone', async () => {
-    // Without a question (EnvironmentClaims mode `auto`): a private repository of the account itself that it can push to.
-    await h.registry.add(environment(OLD, 'octo/module-ts', { owner: undefined }));
-    await h.registry.add(environment(GONE, 'majikmate/no-access', { owner: undefined }));
-    await h.registry.add(environment(FAILS, 'majikmate/shared', { owner: undefined }));
-    h.discovery.getRepository.mockImplementation(async (repository: string) => {
-      if (repository === 'octo/module-ts') return { ...info(repository), isPrivate: true, viewerPermission: 'WRITE' };
-      // Other members of the organization can access it too: it stays hidden until a command confirms it.
-      if (repository === 'majikmate/shared') return { ...info(repository), isPrivate: true, viewerPermission: 'WRITE' };
-      return undefined;
-    });
-    await h.sidebar.initialize();
-    await h.sidebar.refreshDiscovery();
-    await h.sidebar.render();
-    expect((await h.registry.get(OLD))?.owner).toEqual(OCTO);
-    expect((await h.registry.get(GONE))?.owner).toBeUndefined();
-    expect((await h.registry.get(FAILS))?.owner).toBeUndefined();
-    expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'octo/module-ts']);
-  });
-
-  it('keeps an environment of an older version hidden when GitHub cannot be asked', async () => {
-    await h.registry.add(environment(OLD, 'majikmate/module-ts', { owner: undefined }));
-    h.discovery.getRepository.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
-    await h.sidebar.initialize();
-    await h.sidebar.refreshDiscovery();
-    await h.sidebar.render();
-    expect((await h.registry.get(OLD))?.owner).toBeUndefined();
-    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
   });
 
   it('shows the list and the environments of the new account after an account change, never those of the previous one', async () => {
@@ -473,7 +437,7 @@ describe('Sidebar', () => {
     expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('scalarion');
   });
 
-  it('refreshes and claims with the token and the account of one session', async () => {
+  it('refreshes with the token and the account of one session', async () => {
     await h.sidebar.initialize();
     await h.sidebar.refreshDiscovery();
     // Separate reads would give OCTO's token with OTHER's account after a switch between them.
@@ -494,7 +458,7 @@ describe('Sidebar and the scan scope (setting owners, concept 7.4)', () => {
 
   it('does not show a stored list of another scope, and shows the list of the refresh with the current scope', async () => {
     h.settings.owners = ['acme'];
-    // A list of an older version: all repositories.
+    // A list without a scope: all repositories.
     h.discovery.loadStored.mockResolvedValue(data([info('acme/web'), info('octo/dotfiles')]));
     let finish: (value: DiscoveryData) => void = () => undefined;
     h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));

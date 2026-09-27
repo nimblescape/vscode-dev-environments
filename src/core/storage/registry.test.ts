@@ -31,6 +31,7 @@ function environment(id: string, repository: string, extra: Partial<Environment>
     containerName: name,
     createdAt: '2026-09-24T15:40:00.000Z',
     lastUsedAt: '2026-09-24T17:10:00.000Z',
+    owner: OCTO,
     ...extra,
   };
 }
@@ -66,16 +67,13 @@ afterEach(() => {
 });
 
 describe('isEnvironmentOf (concept D-3: one environment per repository and GitHub account)', () => {
-  it.each<[string, Pick<Environment, 'repository' | 'owner'>, string, string | undefined, boolean]>([
+  it.each<[string, Pick<Environment, 'repository' | 'owner'>, string, string, boolean]>([
     ['the repository of the account', { repository: 'acme/api', owner: OCTO }, 'acme/api', OCTO.id, true],
     ['the repository in another case', { repository: 'Acme/API', owner: OCTO }, 'acme/api', OCTO.id, true],
     ['the owner with another login (renamed on GitHub)', { repository: 'acme/api', owner: { id: OCTO.id, login: 'old' } }, 'acme/api', OCTO.id, true],
     ['the repository of another account', { repository: 'acme/api', owner: STAUSSH }, 'acme/api', OCTO.id, false],
     ['another repository of the account', { repository: 'acme/web', owner: OCTO }, 'acme/api', OCTO.id, false],
     ['a repository whose name starts the same', { repository: 'acme/api-2', owner: OCTO }, 'acme/api', OCTO.id, false],
-    ['an entry of an older version, asked for without owner', { repository: 'acme/api' }, 'ACME/api', undefined, true],
-    ['an entry of an older version, asked for an account', { repository: 'acme/api' }, 'acme/api', OCTO.id, false],
-    ['an environment of an account, asked for without owner', { repository: 'acme/api', owner: OCTO }, 'acme/api', undefined, false],
   ])('%s', (_name, entry, repository, accountId, expected) => {
     expect(isEnvironmentOf(entry, repository, accountId)).toBe(expected);
   });
@@ -134,7 +132,7 @@ describe('EnvironmentRegistry reading', () => {
       environments: [
         valid,
         { ...environment(ID_A, 'o/r'), repository: 'other/one' }, // repeated ID
-        { id: ID_B, repository: 'o/b', volumeName: 'v', containerName: 'c' }, // defaults
+        { id: ID_B, repository: 'o/b', volumeName: 'v', containerName: 'c', owner: OCTO }, // defaults
         {
           ...environment('e3', 'o/c'),
           gitSummary: { branch: 'main', uncommittedFiles: -1, unpushedCommits: 0, stashes: 0, recordedAt: 'x' },
@@ -146,12 +144,14 @@ describe('EnvironmentRegistry reading', () => {
           serviceVolumes: ['', 'b'],
           serviceFolders: ['/workspaces/c/data', 7],
           lastBuildNumber: 1.5,
-          owner: { id: '../1001', login: 'octo' },
           refusedUpdate: { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:1', images: { 'node:20': 1 }, features: {}, items: 'x' },
         },
         // An owner restored from a volume label has no login yet; it stays.
         { ...environment('e7', 'o/d'), owner: { id: '1002', login: '' } },
+        // An entry without a valid owner is left out.
         { ...environment('e8', 'o/e'), owner: { login: 'octo' } },
+        { ...environment('e9', 'o/f'), owner: { id: '../1001', login: 'octo' } },
+        { ...environment('e10', 'o/g'), owner: undefined },
         { ...environment('e4', 'no-slash') },
         { ...environment('e5', 'o/r'), volumeName: '' },
         { ...environment('e6', 'o/r'), containerName: 7 },
@@ -161,7 +161,7 @@ describe('EnvironmentRegistry reading', () => {
       ],
     });
     const list = await new EnvironmentRegistry(paths).list();
-    expect(list.map((entry) => entry.id)).toEqual([ID_A, ID_B, 'e3', 'e7', 'e8']);
+    expect(list.map((entry) => entry.id)).toEqual([ID_A, ID_B, 'e3', 'e7']);
     expect(list[0]).toEqual(valid);
     expect(list[1]).toEqual({
       id: ID_B,
@@ -171,11 +171,10 @@ describe('EnvironmentRegistry reading', () => {
       configPath: '.devcontainer/devcontainer.json',
       createdAt: '1970-01-01T00:00:00.000Z',
       lastUsedAt: '1970-01-01T00:00:00.000Z',
+      owner: OCTO,
     });
     expect(list[2]).toEqual(environment('e3', 'o/c'));
     expect(list[3].owner).toEqual({ id: '1002', login: '' });
-    // An invalid owner is removed: the entry counts as one of an older version, which only a claim makes available.
-    expect(list[4]).toEqual(environment('e8', 'o/e'));
   });
 
   it('accepts busy marks with an operation of a newer version', async () => {
@@ -185,7 +184,7 @@ describe('EnvironmentRegistry reading', () => {
   });
 
   // User decision 2026-09-26, "go with the proposal for closing": the switch Keep Running When Closed is stored with the
-  // environment. Entries of earlier versions have no field, which means false.
+  // environment. An entry without the field means false.
   it('reads keepRunning with and without the field, drops an invalid value, and writes it under the lock', async () => {
     writeRaw({
       version: 1,
@@ -221,7 +220,7 @@ describe('EnvironmentRegistry reading', () => {
       environments: [
         environment(ID_A, 'Acme-University/API', { owner: OCTO }),
         environment(ID_B, 'acme-university/api', { owner: STAUSSH }),
-        environment(ID_C, 'ACME-university/Api'),
+        environment(ID_C, 'ACME-university/Api', { owner: { id: '4004', login: 'other' } }),
         environment(ID_D, 'o/b', { owner: OCTO }),
       ],
     });
@@ -232,9 +231,6 @@ describe('EnvironmentRegistry reading', () => {
     await expect(registry.findForAccount('acme-university/api', '3003')).resolves.toBeUndefined();
     await expect(registry.findForAccount('acme-university/web', OCTO.id)).resolves.toBeUndefined();
     await expect(registry.findForAccount('o/b', STAUSSH.id)).resolves.toBeUndefined();
-    // The entry of an older version (without owner) belongs to no account.
-    await expect(registry.findUnowned('Acme-University/API')).resolves.toMatchObject({ id: ID_C });
-    await expect(registry.findUnowned('o/b')).resolves.toBeUndefined();
     await expect(registry.get(ID_D)).resolves.toMatchObject({ repository: 'o/b' });
   });
 
@@ -269,7 +265,7 @@ describe('EnvironmentRegistry.needsRestore (concept 7.5 "registry lost")', () =>
     }
   });
 
-  it('is true for an unknown older version and for environments that are not a list', async () => {
+  it('is true for an unknown version below 1 and for environments that are not a list', async () => {
     writeRaw({ version: 0, environments: [ENTRY] });
     expect(await needsRestore()).toBe(true);
     writeRaw({ version: 'one', environments: [ENTRY] });
@@ -346,26 +342,20 @@ describe('EnvironmentRegistry changes', () => {
     await expect(registry.add(environment(ID_B, 'acme/api', { owner: OCTO }))).rejects.toThrow(
       'An environment of acme/api of the GitHub account 1001 exists already.',
     );
-    // Entries of an older version (without owner) count as one owner.
-    await registry.add(environment(ID_C, 'acme/Api'));
-    await expect(registry.add(environment(ID_D, 'ACME/api'))).rejects.toThrow('An environment of ACME/api without owner exists already.');
     // Another account gets an environment of its own.
     await registry.add(environment(ID_B, 'acme/api', { owner: STAUSSH }));
     await expect(registry.list()).resolves.toEqual([
       environment(ID_A, 'Acme/API', { owner: OCTO }),
-      environment(ID_C, 'acme/Api'),
       environment(ID_B, 'acme/api', { owner: STAUSSH }),
     ]);
   });
 
-  it.each<[string, GitHubAccount | undefined, GitHubAccount | undefined, number]>([
+  it.each<[string, GitHubAccount, GitHubAccount, number]>([
     ['one account: one of them is added', OCTO, OCTO, 1],
     ['two accounts: both are added', OCTO, STAUSSH, 2],
-    ['two entries without owner: one of them is added', undefined, undefined, 1],
   ])('adds environments of one repository from several windows at the same time: %s', async (_name, first, second, added) => {
     // Each window has its own registry instance; the lock decides.
-    const add = (id: string, owner: GitHubAccount | undefined): Promise<void> =>
-      new EnvironmentRegistry(paths).add(environment(id, 'o/same', owner ? { owner } : {}));
+    const add = (id: string, owner: GitHubAccount): Promise<void> => new EnvironmentRegistry(paths).add(environment(id, 'o/same', { owner }));
     const results = await Promise.allSettled([add(ID_B, first), add(ID_C, second)]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(added);
     await expect(new EnvironmentRegistry(paths).list()).resolves.toHaveLength(added);
@@ -693,12 +683,10 @@ describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.
     await expect(registry.keptVolumes()).resolves.toEqual([{ name: 'a-data', owner: OCTO, keptAt: new Date(T0).toISOString() }]);
   });
 
-  it('records a volume of an entry without owner without owner, and nothing for a missing entry', async () => {
+  it('records nothing for a missing entry', async () => {
     const registry = new EnvironmentRegistry(paths, fixedClock());
-    await registry.add(environment(ID_A, 'o/a', { additionalVolumes: ['a-data'] }));
-    await registry.remove(ID_A, { kept: ['a-data'] });
     await registry.remove('missing', { kept: ['b-data'] });
-    await expect(registry.keptVolumes()).resolves.toEqual([{ name: 'a-data', keptAt: new Date(T0).toISOString() }]);
+    await expect(registry.keptVolumes()).resolves.toEqual([]);
   });
 
   it('keeps one record per volume and owner, and drops all records of a removed volume', async () => {
@@ -710,7 +698,7 @@ describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.
     await registry.remove(ID_B, { kept: ['shared'] });
     await registry.add(environment(ID_D, 'o/a', { owner: OCTO }));
     await registry.remove(ID_D, { kept: ['shared'] });
-    expect((await registry.keptVolumes()).map((record) => [record.name, record.owner?.login])).toEqual([
+    expect((await registry.keptVolumes()).map((record) => [record.name, record.owner.login])).toEqual([
       ['shared', 'octo'],
       ['shared', 'staussh'],
     ]);
@@ -722,13 +710,14 @@ describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.
   it('keeps a copy of the file before a write drops invalid records, because dropping them loosens the policy', async () => {
     const logger = recordingLogger();
     const valid = { name: 'ok', owner: OCTO, keptAt: '2026-09-24T15:40:00.000Z' };
-    writeRaw({ version: 1, environments: [environment(ID_A, 'o/a')], keptVolumes: [valid, { name: 'bad', keptAt: 5 }] });
+    // A record without owner is invalid too.
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/a')], keptVolumes: [valid, { name: 'bad', keptAt: 5 }, { name: 'no-owner', keptAt: valid.keptAt }] });
     const registry = new EnvironmentRegistry(paths, fixedClock(), { logger });
     await expect(registry.needsRestore()).resolves.toBe(false);
     await registry.remove(ID_A);
     const copy = `${paths.registry}.backup-${T0}`;
-    expect(JSON.parse(fs.readFileSync(copy, 'utf8')).keptVolumes).toHaveLength(2);
-    expect(logger.warnings).toEqual([`The environment registry contained 1 invalid records of kept volumes. A copy was saved as ${copy}.`]);
+    expect(JSON.parse(fs.readFileSync(copy, 'utf8')).keptVolumes).toHaveLength(3);
+    expect(logger.warnings).toEqual([`The environment registry contained 2 invalid records of kept volumes. A copy was saved as ${copy}.`]);
     expect(readRaw()).toEqual({ version: 1, environments: [], keptVolumes: [valid] });
   });
 

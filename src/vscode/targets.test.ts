@@ -51,12 +51,13 @@ function environment(id: string, repository: string, overrides: Partial<Environm
     containerName: `devenv-${id}`,
     createdAt: iso(NOW),
     lastUsedAt: iso(NOW),
+    owner: { id: '1001', login: 'me' },
     ...overrides,
   };
 }
 
 function discovery(repositories: RepositoryInfo[], overrides: Partial<DiscoveryData> = {}): DiscoveryData {
-  return { version: 1, fetchedAt: iso(NOW), viewerLogin: 'me', organizations: ['acme'], repositories, hints: [], ...overrides };
+  return { version: 1, fetchedAt: iso(NOW), viewerLogin: 'me', organizations: ['acme'], repositories, hints: [], scope: [], withoutConfiguration: [], ...overrides };
 }
 
 const settings = { owners: [], includeArchived: false, includeForks: true };

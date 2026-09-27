@@ -14,7 +14,7 @@ import { GitHubApiError } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
-import { availableEnvironments, type EnvironmentClaims } from '../core/ownership';
+import { availableEnvironments } from '../core/ownership';
 import { systemClock, type Clock, type Logger } from '../core/ports';
 import type { EnvironmentService } from '../core/pipeline/environmentService';
 import type { EnvironmentRegistry } from '../core/storage/registry';
@@ -52,8 +52,6 @@ export interface SidebarDeps {
   docker: ContainerAdapter;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
-  /** Claims of environments of an older version, after each successful refresh (concept 7.5). */
-  claims: EnvironmentClaims;
   tree: RepositoriesTreeProvider;
   settings: () => ExtensionSettings;
   /**
@@ -430,7 +428,7 @@ export class Sidebar implements vscode.Disposable {
 
   private async refreshDiscoveryNow(): Promise<DiscoveryData | undefined> {
     if (this.disposed) return this.data;
-    // Token and account of one session: the list is stored for the account, and the claims give entries to it.
+    // Token and account of one session: the list is stored for the account.
     const changes = this.accountChanges;
     const session = await this.readSession();
     // The account changed while the session was read: the refresh of that change uses the new session.
@@ -457,8 +455,6 @@ export class Sidebar implements vscode.Disposable {
       if (!this.isOfCurrentScope(data)) return this.data;
       this.data = data;
       this.setLoadFailed(false);
-      // Concept 7.5: environments of an older version become available when this account can access the repository.
-      await this.deps.claims.claim(account, token);
       this.lookups = await this.lookUpUnlisted(data, token);
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 401) this.offerSignInAgain();
@@ -572,7 +568,7 @@ export class Sidebar implements vscode.Disposable {
     }
   }
 
-  /** True if the list was built with the scan scope of the current settings (a list without scope: all repositories). */
+  /** True if the list was built with the scan scope of the current settings (an empty scope: all repositories). */
   private isOfCurrentScope(data: DiscoveryData): boolean {
     return sameScope(data.scope, this.deps.settings().owners);
   }
