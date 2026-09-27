@@ -24,6 +24,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 
 ## Standing user decisions (2026-09-27)
 
+- **Greenfield (user decision 2026-09-27):** no backward compatibility and no migration paths for now — no handling of old records, old containers, old volume layouts or old settings; no container-version bumps for migration. Existing code that only serves migration may be removed when a unit touches it.
 - **Trust model.** Repositories are trusted code. The checks are a guard rail on the final configuration (host bind mounts, Docker socket, privileged, capabilities, devices, host namespaces, ports on all addresses), not a sandbox. Untrusted repositories belong in a VM or a separate user account with its own Docker (`docs/concept-vm-isolation.md`, not planned).
 - **No model of the Dev Container CLI's reader**, and no Docker gate.
 - **The Dockerfile check is frozen.** Review rounds do not report, verify, or fix gaps in the image-reference refusals of the Dockerfile (`src/core/imageCheck/dockerfile.ts`, `dockerfileImageFindings`, expansion budgets). Tell every reviewer this in its prompt. Queued: remove those refusals, keep only the `FROM` extraction for the image update check (needs the user's explicit permission in the session; auto mode blocked it once).
