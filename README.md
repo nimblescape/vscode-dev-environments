@@ -109,7 +109,7 @@ The Dev Containers extension and VS Code keep some channels from the container t
 "dev.containers.githubCLILoginWithToken": false
 ```
 
-The socket that answers credential requests stays open, and a program in the container that looks for it can still ask. On macOS, the Git credential helper `osxkeychain` gives out the passwords it stored without asking. For the items that matter, open Keychain Access, and in the item's **Access Control** select **Confirm before allowing access** and remove `git-credential-osxkeychain` from **Always allow access by these applications**. You then see a prompt for each read, and can deny it. Do not answer the prompt with **Always Allow**. When Git stores the password anew, for example after a failed login, repeat these steps.
+The socket that answers credential requests stays open, and a program in the container that looks for it can still ask. On macOS, the Git credential helper `osxkeychain` gives out the passwords it stored without asking. For the items that matter, open Keychain Access, and in the item's **Access Control** select **Confirm before allowing access** and remove `git-credential-osxkeychain` from **Always allow access by these applications**. You then see a prompt for each read, and can deny it. At the prompt, choose **Allow** or **Deny**, not **Always Allow**, which adds the helper back. When Git stores the password anew, for example after a failed login, repeat these steps.
 
 **SSH agent.** This is the biggest exposure. The Dev Containers extension forwards your SSH agent into every container when one runs as VS Code starts. There is no setting to turn this off; it is an open feature request ([#11413](https://github.com/microsoft/vscode-remote-release/issues/11413)). According to that request, `"SSH_AUTH_SOCK": ""` in `remoteEnv` does not stop it either. What works:
 
@@ -118,7 +118,7 @@ The socket that answers credential requests stays open, and a program in the con
 - Or keep the agent, but have it ask: `ssh-add -c` loads a key that needs your confirmation at each use. For this the agent needs an `ssh-askpass` program (macOS has none); without one, the key cannot be used. 1Password and Secretive can also ask for approval.
 - Load only the keys that you need, for a short time: `ssh-add -t 1h`.
 
-**GPG agent.** It is forwarded when the container has `gpg` and your computer runs an agent. Use short cache times in `gpg-agent.conf` (for example `default-cache-ttl 60` and `max-cache-ttl 600`), and add `no-allow-external-cache` so that the pinentry asks for the passphrase each time instead of saving it. On macOS, do not tick **Save in Keychain** in the passphrase prompt of GPG Suite, and delete a passphrase that is already saved there in Keychain Access. Do not keep a key unlocked while a container that you do not trust is open.
+**GPG agent.** It is forwarded when the container has `gpg` and your computer runs an agent. Use short cache times in `gpg-agent.conf` (for example `default-cache-ttl 60` and `max-cache-ttl 600`), and add `no-allow-external-cache` so that the pinentry does not use the cache of a password manager. On macOS with GPG Suite, untick **Save in Keychain** in the passphrase dialog, and delete the saved `GnuPG` items in Keychain Access: otherwise pinentry-mac gives out the passphrase without asking, whatever the cache time. Do not keep a key unlocked while a container that you do not trust is open.
 
 **WSL and Wayland (Windows and Linux).** Two user settings of the Dev Containers extension:
 
