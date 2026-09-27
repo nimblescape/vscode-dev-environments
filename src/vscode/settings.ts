@@ -26,7 +26,12 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   hostAccessChecksOff: [],
   repositoryGroups: [],
   openInNewWindow: false,
+  remoteStopAfterMinutes: 10,
 });
+
+/** Bounds of the setting remoteStopAfterMinutes (unit 7, PR 2): one minute to one day. */
+export const MIN_REMOTE_STOP_AFTER_MINUTES = 1;
+export const MAX_REMOTE_STOP_AFTER_MINUTES = 1440;
 
 /**
  * Largest refresh interval that a Node.js timer supports (2^31 - 1 ms). A longer delay makes `setInterval` fire every
@@ -36,7 +41,7 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
 
 /**
  * Current settings. Values of a wrong type fall back to the default; waitingTimeSeconds ≥ 0,
- * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES. hostAccessChecksOff is read from the user settings only
+ * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES, 1 ≤ remoteStopAfterMinutes ≤ 1440. hostAccessChecksOff is read from the user settings only
  * (hostAccessChecksOffValue). `repositoryGroups` has the scope `application` in
  * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions. The same
  * for `openInNewWindow`: a workspace does not decide which window a Start uses.
@@ -119,5 +124,11 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     // The entries are checked where they are used (repositoryGroups.ts), so that each problem can be named.
     repositoryGroups: Array.isArray(repositoryGroups) ? [...(repositoryGroups as unknown[])] : [],
     openInNewWindow: bool('openInNewWindow', DEFAULT_SETTINGS.openInNewWindow ?? false),
+    remoteStopAfterMinutes: number(
+      'remoteStopAfterMinutes',
+      DEFAULT_SETTINGS.remoteStopAfterMinutes ?? 10,
+      MIN_REMOTE_STOP_AFTER_MINUTES,
+      MAX_REMOTE_STOP_AFTER_MINUTES,
+    ),
   };
 }

@@ -284,6 +284,22 @@ export type EnvironmentSessionFiles = Pick<
   'writePending' | 'removePending' | 'removeOperation' | 'readReopen' | 'removeReopen'
 >;
 
+/**
+ * Unit 7, PR 2: the Session Monitor container on a remote Docker host (RemoteSessionMonitor, with the socket of that
+ * host and the id of this computer). Both never throw, except an AbortError.
+ */
+export interface EnvironmentRemoteMonitor {
+  /** Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context). */
+  ensure(host: string, helperTag: string, signal?: AbortSignal): Promise<unknown>;
+  /**
+   * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
+   * only on environments that a computer sent a heartbeat for.
+   */
+  heartbeat(host: string, environmentId: string, keepRunning: boolean): Promise<{ ok: true } | { ok: false; detail: string }>;
+  /** Removes the heartbeat record of this computer for a deleted environment (best effort). */
+  forget(host: string, environmentId: string): Promise<void>;
+}
+
 /** Starts Docker when it does not run and waits until it is ready (concept 7.6 "Docker start"). */
 export type DockerStarter = (options: { onStarting: () => void; signal?: AbortSignal }) => Promise<void>;
 
@@ -333,6 +349,12 @@ export interface EnvironmentServiceDeps {
    * (dockerEndpointUnsupported) and never read or recorded.
    */
   dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
+  /**
+   * Unit 7, PR 2: the Session Monitor on a remote Docker host. The open pipeline ensures it right after the helper image
+   * on a remote host (before the container is created or started); Delete removes the record of this computer there.
+   * Without it: nothing on the remote host (the local Session Monitor stops the container while the computer is online).
+   */
+  remoteMonitor?: EnvironmentRemoteMonitor;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
   /**
@@ -512,6 +534,8 @@ interface PipelineContext {
   busy: boolean;
   /** The workspace helper image could not be prepared (for example offline after an extension update). */
   helperUnavailable: boolean;
+  /** Unit 7, PR 2: the Session Monitor on the remote Docker host was ensured in this run (once per run). */
+  remoteMonitorEnsured?: boolean;
   /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
   session: GitHubSession;
   /** The token and the Git configuration were written into the volume in this run. */
@@ -3579,6 +3603,8 @@ export class EnvironmentService {
     await this.deps.sessionFiles.writePending(env.id, this.deps.owner.windowId);
     await this.updateEntry(ctx, (entry) => {
       entry.lastUsedAt = now;
+      // Unit 7, PR 2: Close and Keep Running holds only until a window connects again.
+      delete entry.keepRunningOnce;
       if (remoteUser) entry.remoteUser = remoteUser;
       entry.remoteWorkspaceFolder = remoteWorkspaceFolder;
       if (gitSummary) entry.gitSummary = gitSummary;
@@ -3810,6 +3836,14 @@ export class EnvironmentService {
     await this.requireCurrentHost(environment);
     await this.requireOwnAccount(environment, false);
     await this.exclusive(repositoryKey(environment.repository), undefined, async () => {
+      // Unit 7, PR 2: Stop ends Close and Keep Running (Keep Running When Closed stays).
+      if ((await this.deps.registry.get(environmentId))?.keepRunningOnce !== undefined) {
+        await this.quietly('clear Close and Keep Running', () =>
+          this.deps.registry.updateEnvironment(environmentId, (entry) => {
+            delete entry.keepRunningOnce;
+          }),
+        );
+      }
       if (!(await this.deps.docker.isRunning())) {
         this.logger.info('Docker is not running, so no container runs.');
         return;
@@ -4064,6 +4098,11 @@ export class EnvironmentService {
       await this.deps.registry.remove(env.id, { kept: keptVolumes, removed: removedVolumes });
       removed = true;
       await this.removeEnvironmentFiles(env.id);
+      // Unit 7, PR 2: the heartbeat record of this computer on the remote host (best effort).
+      const host = dockerHostOf(env);
+      if (host !== '' && this.deps.remoteMonitor) {
+        await this.quietly('remove the heartbeat record on the remote host', () => this.deps.remoteMonitor!.forget(host, env.id));
+      }
       this.logger.info(`The environment of ${env.repository} was deleted.`);
     } finally {
       if (!removed) await this.clearOwnMark(env.id);
@@ -4582,8 +4621,9 @@ export class EnvironmentService {
       announced = true;
       ctx.steps.detail(text);
     };
+    let tag: string;
     try {
-      await this.deps.helper.ensureImage({
+      tag = await this.deps.helper.ensureImage({
         onOutput: (text) => {
           announce(PipelineTexts.preparingHelper);
           this.logger.output(text);
@@ -4598,6 +4638,45 @@ export class EnvironmentService {
       throw error;
     } finally {
       if (announced) ctx.steps.clearDetail();
+    }
+    await this.ensureRemoteMonitor(ctx, tag);
+  }
+
+  /**
+   * Unit 7, PR 2: on a remote Docker host, the Session Monitor container there (with the helper image just ensured), and
+   * the first heartbeat of this computer for the environment, once per run and before the container is created or
+   * started: the remote monitor acts only on environments with a record, so this keeps the stop without contact for
+   * every remote environment. The keep-running flag follows the rules of the local Session Monitor (keptWhenClosed). A
+   * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
+   * its ticks).
+   */
+  private async ensureRemoteMonitor(ctx: PipelineContext, helperTag: string): Promise<void> {
+    const remoteMonitor = this.deps.remoteMonitor;
+    if (!remoteMonitor || ctx.remoteMonitorEnsured) return;
+    const target = await this.dockerTarget();
+    if (target.kind !== 'remote') return;
+    ctx.remoteMonitorEnsured = true;
+    try {
+      await remoteMonitor.ensure(target.host, helperTag, ctx.signal);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);
+    }
+    this.throwIfCancelled(ctx.signal);
+    const env = ctx.env;
+    const settings = this.deps.settings();
+    const keepRunning =
+      env.keepRunning === true ||
+      env.keepRunningOnce === true ||
+      settings.stopOnClose === false ||
+      (settings.respectShutdownActionNone === true && env.shutdownActionNone === true);
+    try {
+      const sent = await remoteMonitor.heartbeat(target.host, env.id, keepRunning);
+      if (!sent.ok) {
+        this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${target.host} failed; the Session Monitor of this computer tries again. ${sent.detail}`);
+      }
+    } catch (error) {
+      this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${target.host} failed: ${errorMessage(error)}`);
     }
   }
 

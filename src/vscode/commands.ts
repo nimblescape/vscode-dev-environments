@@ -35,6 +35,9 @@ export const Commands = {
   // The row context menu shows one of the two; the Command Palette offers both with a picker of the environments, as Stop.
   keepRunning: 'devEnvironments.keepRunning',
   stopWhenClosed: 'devEnvironments.stopWhenClosed',
+  // Close and Keep Running (unit 7, PR 2): closes the window of an environment; its container keeps running this time.
+  // Only in a window connected to an environment (context key devEnvironments.connected) and in its row.
+  closeAndKeepRunning: 'devEnvironments.closeAndKeepRunning',
   // The buttons of the Docker setup in the sidebar (welcome view), Start Docker after an installation and of the error
   // "Docker is not running." (Docker Engine on Linux), and Show Docker Setup, the action Install Docker… of the error
   // "Docker Desktop is not installed." (all hidden in the Command Palette).

@@ -31,6 +31,8 @@ export const TreeTexts = {
   archived: 'Archived repository',
   /** Tooltip line of a kept environment (Keep Running When Closed, user decision 2026-09-26). */
   kept: 'Keeps running when closed: stop it yourself.',
+  /** Tooltip line of an environment closed with Close and Keep Running (unit 7, PR 2). */
+  keptOnce: 'Keeps running this time: it stops when a window uses it and closes again, or when you stop it.',
   /** Review round 7, P7-2: tooltip line of an environment whose dev container does not run while another service does. */
   servicesRunning: 'Other services of Docker Compose run. Stop stops them.',
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
@@ -134,7 +136,8 @@ export interface RepositoryRow {
   /**
    * `repository;canStart;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked;canKeepRunning`, only the
    * flags that apply (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are
-   * off; `kept` in place of `canKeepRunning` for a kept environment; neither without an environment.
+   * off; `kept` in place of `canKeepRunning` for a kept environment; neither without an environment; and
+   * `canCloseAndKeepRunning` for the environment of this window (unit 7, PR 2).
    */
   contextValue: string;
 }
@@ -315,9 +318,10 @@ export function rowActions(
  * host access checks of the repository, the flag `hostAccessChecked` (Turn Off Host Access Checks…) or
  * `hostAccessUnrestricted` (Turn On Host Access Checks); none without it. `kept`: the switch Keep Running When Closed of
  * the environment, the flag `kept` (Stop When Closed) or `canKeepRunning` (Keep Running When Closed); none for a row
- * without environment.
+ * without environment. `connectedHere`: the environment of this window, the flag `canCloseAndKeepRunning` (Close and
+ * Keep Running, unit 7 PR 2).
  */
-export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean): string {
+export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean, connectedHere = false): string {
   const flags = ['repository'];
   if (actions.canStart) flags.push('canStart');
   if (actions.canStop) flags.push('canStop');
@@ -329,6 +333,7 @@ export function contextValue(actions: RowActions, checks?: HostAccessChecks, kep
   if (checks === 'off') flags.push('hostAccessUnrestricted');
   if (kept === true) flags.push('kept');
   if (kept === false) flags.push('canKeepRunning');
+  if (connectedHere) flags.push('canCloseAndKeepRunning');
   return flags.join(';');
 }
 
@@ -645,15 +650,18 @@ function environmentRow(
   const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   const left = [branch, configuration !== undefined ? `(${configuration})` : undefined].filter(isText).join(' ');
   const kept = environment.keepRunning === true;
+  // Unit 7, PR 2: Close and Keep Running shows like a kept environment; the menu keeps the switch of Keep Running When Closed.
+  const keptOnce = !kept && environment.keepRunningOnce === true;
   const services = servicesRunning ? StateTexts.servicesRunning : undefined;
-  const right = [rowStateText(state, kept), services, changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
+  const right = [rowStateText(state, kept || keptOnce), services, changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
   const description = [left, right].filter(isText).join('   ');
 
   const formatTime = input.formatTime ?? defaultFormatTime;
   const tooltip = [
     repository,
-    [rowStateText(state, kept), services, changes].filter(isText).join(' · '),
+    [rowStateText(state, kept || keptOnce), services, changes].filter(isText).join(' · '),
     kept ? TreeTexts.kept : undefined,
+    keptOnce ? TreeTexts.keptOnce : undefined,
     servicesRunning ? TreeTexts.servicesRunning : undefined,
     branch !== undefined ? TreeTexts.branch(branch) : undefined,
     configuration !== undefined ? TreeTexts.configuration(configuration) : undefined,
@@ -682,7 +690,7 @@ function environmentRow(
     label: name,
     description,
     tooltip,
-    contextValue: contextValue(actions, checks, kept),
+    contextValue: contextValue(actions, checks, kept, state === 'connected'),
   };
 }
 

@@ -8,7 +8,9 @@
 // It uses only Node.js built-ins, src/core, and src/monitor. It runs until no window is alive and no waiting time runs.
 import * as fs from 'fs';
 import * as path from 'path';
+import { errorMessage } from '../core/errors';
 import { NodeProcessRunner } from '../core/process';
+import { readOrCreateComputerId } from '../core/storage/computerId';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
@@ -88,7 +90,15 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
     logger.info('A window of a newer version asked this Session Monitor to exit.');
     loop.stop();
   };
+  // Unit 7, PR 2: the source of the heartbeats to a Session Monitor on a remote Docker host.
+  let sourceId: string | undefined;
+  try {
+    sourceId = readOrCreateComputerId(paths.computerId);
+  } catch (error) {
+    logger.warn(`The id of this computer could not be read; no heartbeats are sent to a remote Docker host. ${errorMessage(error)}`);
+  }
   const loop: MonitorLoop = new MonitorLoop({
+    sourceId,
     registry: new EnvironmentRegistry(paths, undefined, { logger }),
     sessionFiles: new SessionFiles(paths),
     docker: new MonitorDockerClient({ runner: new NodeProcessRunner(), env: process.env, platform: process.platform, logger }),

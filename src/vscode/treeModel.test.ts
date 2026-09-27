@@ -357,11 +357,12 @@ describe('buildTreeModel', () => {
     }));
     // Unit 10: every repository row has the flag of its host access checks (on by default: hostAccessChecked).
     // Unit 26: every row with an environment has the flag of Keep Running When Closed (off by default: canKeepRunning).
+    // Unit 7, PR 2: the row of this window's environment has the flag of Close and Keep Running.
     expect(view).toEqual([
       {
         owner: 'acme-university',
         rows: [
-          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked;canKeepRunning'],
+          ['api', 'connected', 'main (python)   Connected', 'repository;canStop;canDelete;canRebuild;multiConfig;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning'],
           ['docs', 'running', 'main   Running', 'repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning'],
           ['infra', undefined, '', 'repository;canStart;onGitHub;hostAccessChecked'],
           ['web', 'stopped', 'feature-x   Stopped · 3 unpushed', 'repository;canStart;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning'],
@@ -1477,5 +1478,40 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     // The when clauses of package.json tell the two flags apart.
     expect(/;kept(;|$)/.test('repository;canKeepRunning')).toBe(false);
     expect(/;canKeepRunning(;|$)/.test('repository;kept')).toBe(false);
+  });
+
+  // Unit 7, PR 2: Close and Keep Running.
+  it('shows an environment closed with Close and Keep Running as kept, and keeps the menu of Keep Running When Closed', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api')]),
+        environments: [environment('e1', 'acme/api', { keepRunningOnce: true })],
+        runtime: new Map<string, EnvironmentRuntime>([['e1', { container: 'running', volume: true }]]),
+      }),
+    );
+    const api = row(groups, 'acme/api');
+    expect(api.description).toContain('Running · kept');
+    expect(api.tooltip.split('\n')).toContain(TreeTexts.keptOnce);
+    expect(api.tooltip.split('\n')).not.toContain(TreeTexts.kept);
+    expect(flags(api.contextValue)).toContain('canKeepRunning');
+    expect(flags(api.contextValue)).not.toContain('canCloseAndKeepRunning');
+  });
+
+  it('offers Close and Keep Running only in the row of the environment of this window', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: discovery([repo('acme/api'), repo('acme/web')]),
+        environments: [environment('e1', 'acme/api'), environment('e2', 'acme/web')],
+        runtime: new Map<string, EnvironmentRuntime>([
+          ['e1', { container: 'running', volume: true }],
+          ['e2', { container: 'running', volume: true }],
+        ]),
+        currentEnvironmentId: 'e1',
+        otherWindowEnvironmentIds: new Set(['e2']),
+      }),
+    );
+    expect(flags(row(groups, 'acme/api').contextValue)).toContain('canCloseAndKeepRunning');
+    expect(flags(row(groups, 'acme/web').contextValue)).not.toContain('canCloseAndKeepRunning');
+    expect(contextValue(rowActions('connected', repo('acme/api')), 'on', false, true).split(';').at(-1)).toBe('canCloseAndKeepRunning');
   });
 });

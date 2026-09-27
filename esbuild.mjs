@@ -47,7 +47,13 @@ const shared = {
   define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(devcontainerCliVersion()) },
 };
 
-const outfiles = ['dist/extension.js', 'dist/sessionMonitor.js', 'dist/groupsPreviewWorker.js', 'dist/configurationAnalysisWorker.js'];
+const outfiles = [
+  'dist/extension.js',
+  'dist/sessionMonitor.js',
+  'dist/groupsPreviewWorker.js',
+  'dist/configurationAnalysisWorker.js',
+  'dist/remoteMonitor.js',
+];
 
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
 // match the minified bundles stays in dist/.
@@ -79,6 +85,15 @@ const contexts = await Promise.all([
     ...shared,
     entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
     outfile: outfiles[3],
+  }),
+  // Unit 7, PR 2: the Session Monitor on a remote Docker host. The container gets it as an argument of `docker run`
+  // (MAX_SCRIPT_LENGTH in src/core/remoteMonitor/protocol.ts), so it is always minified and has no source map.
+  esbuild.context({
+    ...shared,
+    entryPoints: ['src/remoteMonitor/main.ts'],
+    outfile: outfiles[4],
+    minify: true,
+    sourcemap: false,
   }),
 ]);
 

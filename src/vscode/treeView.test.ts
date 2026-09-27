@@ -92,7 +92,8 @@ describe('RepositoriesTreeProvider', () => {
       id: 'repo:acme/api',
       description: 'main   Connected',
       // Unit 10: the flag of the host access checks (on by default). Unit 26: Keep Running When Closed (off by default).
-      contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning',
+      // Unit 7, PR 2: Close and Keep Running for the environment of this window.
+      contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning',
     });
     expect((apiItem.iconPath as ThemeIcon).id).toBe('circle-filled');
     // A repository without environment has no state symbol.

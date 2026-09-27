@@ -347,5 +347,11 @@ describe('validators', () => {
     expect(isReopenRecord(null)).toBe(false);
     expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isMonitorSettings({ waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(false);
+    // Unit 7, PR 2: remoteStopAfterSeconds is optional (a file of an older window), and a positive number when present.
+    const base = { waitingTimeSeconds: 30, stopOnClose: true, respectShutdownActionNone: false, updatedAt: '2026-09-24T18:02:11Z' };
+    expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: 600 })).toBe(true);
+    expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: 0 })).toBe(false);
+    expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: '600' })).toBe(false);
+    expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: Number.POSITIVE_INFINITY })).toBe(false);
   });
 });

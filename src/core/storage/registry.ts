@@ -461,6 +461,8 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['lastBuildNumber', isCount],
   ['refusedUpdate', isRefusedUpdate],
   ['keepRunning', (value) => typeof value === 'boolean'],
+  // Unit 7, PR 2: Close and Keep Running.
+  ['keepRunningOnce', (value) => typeof value === 'boolean'],
   // Unit 7: the Docker host; '' is the local Docker, as a missing field.
   ['dockerHost', isNonEmptyString],
 ];

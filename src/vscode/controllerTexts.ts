@@ -21,6 +21,10 @@ export const ControllerTexts = {
     `${repository} keeps running when no window uses it. Stop it yourself when you no longer need it.`,
   stopsWhenClosed: (repository: string) => `${repository} stops when no window uses it.`,
   keepAllRunning: 'The setting "Stop On Close" is off, so all environments keep running when no window uses them.',
+  // Close and Keep Running (unit 7, PR 2).
+  closeAndKeepRunningNotConnected: 'This window is not connected to an environment.',
+  closeAndKeepRunningUnreachable: (host: string, minutes: number) =>
+    `The Docker host ${host} cannot be reached. The container would stop after ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} without contact. The window stays open.`,
   // Stop, Rebuild, and Delete of an environment that another window uses: that window closes its connection first
   // (concept 6.2 Stop, 7.14).
   otherWindowClosesConnection: (repository: string) =>

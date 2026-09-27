@@ -15,6 +15,7 @@
 //      (recording the Git summary takes time), record the Git summary, then `docker stop`.
 //      Remove the window status files of `decision.removeWindowFiles`.
 //   5. End the process when `decision.exit` is true.
+import { DEFAULT_REMOTE_STOP_AFTER_SECONDS, clampLimitSeconds } from '../core/remoteMonitor/protocol';
 import type { MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 
 /** Interval between two ticks of the Session Monitor (concept 7.9). */
@@ -61,8 +62,8 @@ export interface MonitorEnvironment {
   shutdownActionNone: boolean;
   /**
    * Keep Running When Closed (registry field `keepRunning`; user decision 2026-09-26, "go with the proposal for
-   * closing"): the monitor never stops this environment, whatever the windows, the sleep grace, or a failed stop do.
-   * Only the user's Stop or Delete stops it.
+   * closing"), or Close and Keep Running (registry field `keepRunningOnce`, unit 7 PR 2): the monitor never stops this
+   * environment, whatever the windows, the sleep grace, or a failed stop do. Only the user's Stop or Delete stops it.
    */
   keepRunning: boolean;
 }
@@ -310,6 +311,24 @@ export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSecond
     return DEFAULT_WAITING_TIME_SECONDS * 1000;
   }
   return Math.round(seconds * 1000);
+}
+
+/**
+ * Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host, in seconds, from the
+ * setting remoteStopAfterMinutes (clamped to one minute..one day; a missing or invalid value gives 10 minutes).
+ */
+export function remoteStopAfterSeconds(minutes: number | undefined): number {
+  if (typeof minutes !== 'number' || !Number.isFinite(minutes)) return DEFAULT_REMOTE_STOP_AFTER_SECONDS;
+  return clampLimitSeconds(minutes * 60);
+}
+
+/**
+ * Unit 7, PR 2: the keep-running flag of a heartbeat for this environment. True when rule 2 never stops it here (Keep
+ * Running When Closed, Close and Keep Running, stopOnClose off, a respected `"shutdownAction": "none"`), so the Session
+ * Monitor on the remote host does not stop it either when this computer goes offline.
+ */
+export function keptWhenClosed(environment: MonitorEnvironment, settings: MonitorSettings): boolean {
+  return !mayStop(environment, settings);
 }
 
 function mayStop(environment: MonitorEnvironment, settings: MonitorSettings): boolean {

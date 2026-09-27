@@ -141,6 +141,12 @@ export interface Environment {
    */
   keepRunning?: boolean;
   /**
+   * Close and Keep Running (unit 7, PR 2): the window was closed with this command, so the container keeps running this
+   * time, as with `keepRunning`. Cleared when a window connects to the environment again, and by Stop (Delete removes the
+   * entry). Missing or false: as `keepRunning` says.
+   */
+  keepRunningOnce?: boolean;
+  /**
    * Unit 7: the Docker host of the environment, the part after `ssh://` of the Docker context in which it was created
    * (an SSH alias or `user@host[:port]`). Missing: the local Docker. The view, the switcher, the status bar, and every
    * command show and act on the environments of the current Docker host only.
@@ -310,6 +316,11 @@ export interface MonitorSettings {
   waitingTimeSeconds: number;
   stopOnClose: boolean;
   respectShutdownActionNone: boolean;
+  /**
+   * Unit 7, PR 2: the time limit that the heartbeats give the Session Monitor on a remote Docker host (the setting
+   * remoteStopAfterMinutes in seconds). Missing (a file of an older window): DEFAULT_REMOTE_STOP_AFTER_SECONDS.
+   */
+  remoteStopAfterSeconds?: number;
   updatedAt: string;
 }
 
@@ -339,6 +350,11 @@ export interface ExtensionSettings {
    * environment. Only the user setting counts (scope `application`). Missing: false (Start uses the current window).
    */
   openInNewWindow?: boolean;
+  /**
+   * `remoteStopAfterMinutes` (unit 7, PR 2): a container on a remote Docker host stops after this many minutes without
+   * contact from this computer, unless it keeps running when closed. 1 to 1440. Missing: 10.
+   */
+  remoteStopAfterMinutes?: number;
 }
 
 /** State of a container as Docker reports it, simplified. */

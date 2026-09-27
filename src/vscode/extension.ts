@@ -26,15 +26,18 @@ import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/image
 import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
+import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
+import { remoteStopAfterSeconds } from '../monitor/rules';
 import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
@@ -153,6 +156,21 @@ async function activateExtension(
       return { key: target.host, socket: (await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
     },
   });
+  // Unit 7, PR 2: the Session Monitor container on a remote Docker host. Its script is dist/remoteMonitor.js, read once.
+  const remoteMonitorScript = context.asAbsolutePath(path.join('dist', 'remoteMonitor.js'));
+  let remoteMonitorScriptText: Promise<string> | undefined;
+  const remoteMonitor = new RemoteSessionMonitor({
+    docker,
+    logger,
+    script: () => {
+      remoteMonitorScriptText ??= fs.promises.readFile(remoteMonitorScript, 'utf8');
+      // A failed read is tried again at the next open.
+      remoteMonitorScriptText.catch(() => (remoteMonitorScriptText = undefined));
+      return remoteMonitorScriptText;
+    },
+  });
+  // The source of the heartbeats (computer.id); created by the first reader.
+  const computerId = (): string => readOrCreateComputerId(paths.computerId);
   // One stored list per GitHub account (concept 6.2).
   const discovery = new DiscoveryService(
     new GitHubApi(nodeHttpsTransport, logger, {
@@ -206,6 +224,20 @@ async function activateExtension(
     // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
     // neither local nor SSH is refused by every operation and never read.
     dockerTarget: () => targets.current(),
+    // Unit 7, PR 2: the Session Monitor on a remote host, with the socket that the workspace helper mounts there.
+    remoteMonitor: {
+      ensure: async (host, helperTag, signal) =>
+        remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal),
+      heartbeat: async (_host, environmentId, keepRunning) => {
+        const result = await remoteMonitor.heartbeat({
+          source: computerId(),
+          limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
+          environments: [{ id: environmentId, keepRunning }],
+        });
+        return result.ok ? { ok: true } : { ok: false, detail: result.detail };
+      },
+      forget: async (_host, environmentId) => remoteMonitor.forget(computerId(), environmentId),
+    },
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
       startDockerFor(
@@ -312,6 +344,17 @@ async function activateExtension(
         if (view.visible) await sidebar.refreshStates();
       },
     }),
+    // Unit 7, PR 2: Close and Keep Running tells the Session Monitor on the remote host at once.
+    remoteMonitor: {
+      sendKeepRunning: async (environmentId) => {
+        const result = await remoteMonitor.heartbeat({
+          source: computerId(),
+          limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
+          environments: [{ id: environmentId, keepRunning: true }],
+        });
+        return result.ok ? { ok: true } : { ok: false, detail: result.detail };
+      },
+    },
   });
   context.subscriptions.push(
     sidebar,
