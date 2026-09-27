@@ -41,7 +41,13 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 3c. **Merged** (PR #35, 882f626): versions reset (user decision 2026-09-27): keep the container setup version label and the Session Monitor protocol version, both reset to 1 (history removed); fix the docs that say the token is "never on a disk" (a tmpfs can be swapped). Branch `chore/reset-versions`.
 4b. **Merged** (PR #37, 3cf8986): lifecycle commands get the token again — `devcontainer up --skip-post-create`, write the token, then `devcontainer run-user-commands`.
 4. **Merged** (PR #36, b15f434): Unit 11: one policy module, guard rails only (pure refactor).
-5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
+5. Unit 7: Docker on a remote machine — redesigned with the user (2026-09-27), design sketch in the session scratchpad `u7/design.md` (older, setting-based) superseded by:
+   - Remote = the Docker context. Commands "Use a Remote Docker Host…" (ssh:// only; tests the connection; creates `devenv-remote`, remembers the previous context, `docker context use` after a modal) and "Use the Local Docker". No own setting, no DOCKER_HOST, no Dev Containers settings written. One host at a time.
+   - Each environment records its Docker host; environments of another host are hidden and never acted on; a host mismatch (e.g. Docker Desktop reset the context, or a recent entry of the other host) → "Use <host> again?".
+   - "Docker host cannot be reached" message; no Docker Desktop start for a remote host; the install wizard stays (Docker Desktop brings the client). Rootless remote Docker refused. Docs: 127.0.0.1 = remote machine, host.docker.internal only with Docker Desktop.
+   - Remote environments stop when closed by default, like local ones; Keep Running When Closed per environment.
+   - PR 2: Session Monitor as a container on the remote host; heartbeats every 30 s carry the keep-running flag, a switch of the option is sent at once; stops after a time limit (default 10 min, setting) without heartbeat unless keep-running. New one-off command "Close and Keep Running" (local and remote).
+   - Live checks: Dev Containers attaches through the context; port forwarding; stop on close; whether Docker Desktop resets the context.
 6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
 
 Deferred: Docker per account (Docker-in-Docker, rootless per user), builder isolation, VMs.
