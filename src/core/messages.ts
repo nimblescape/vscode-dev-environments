@@ -223,7 +223,47 @@ export const Messages = {
   helperFailed: 'The workspace helper could not be prepared.',
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
+  /**
+   * Unit 7: the remote Docker host (the current Docker context, `ssh://…`) did not answer. `reason` is one of
+   * dockerHostReason. Shown instead of the start of Docker Desktop and of the Docker setup.
+   */
+  dockerHostUnreachable: (host: string, reason: string) => `The Docker host ${host} cannot be reached. ${reason}`,
+  /** Unit 7: the current Docker context points to another computer without SSH (for example `tcp://`). */
+  dockerEndpointUnsupported: (endpoint: string) =>
+    `Docker is set to ${endpoint}. Dev Environments uses Docker on another computer only over SSH. Choose "Dev Environments: Use a Remote Docker Host…" or "Dev Environments: Use the Local Docker".`,
+  /** Unit 7: an environment of another Docker host is never acted on. */
+  otherDockerHost: (repository: string, environmentHost: string, currentHost: string) =>
+    `The environment of ${repository} is on ${describeHost(environmentHost)}, but Docker is set to ${describeHost(currentHost)}. Nothing was changed.`,
 } as const;
+
+function describeHost(host: string): string {
+  return host === '' ? 'the local Docker' : host;
+}
+
+/** Unit 7: the plain reason of a failed connection to the remote Docker host `host` (see dockerHostProblem). */
+export function dockerHostReason(
+  problem: 'unreachable' | 'login' | 'hostKey' | 'dockerMissing' | 'dockerNotRunning' | 'dockerPermission' | 'sshMissing' | 'unknown',
+  host: string,
+): string {
+  switch (problem) {
+    case 'unreachable':
+      return 'The computer does not answer. Check its name and the network connection.';
+    case 'login':
+      return 'SSH could not log in. Add your SSH key to the SSH agent (ssh-add) or name it in your SSH config, then try again.';
+    case 'hostKey':
+      return `SSH does not know the host key of this computer yet. Run "ssh ${host}" once in a terminal, check the key and accept it, then try again.`;
+    case 'dockerMissing':
+      return 'Docker is not installed on that computer.';
+    case 'dockerNotRunning':
+      return 'Docker is not running on that computer.';
+    case 'dockerPermission':
+      return 'Your user on that computer may not use Docker. Add it to the group docker there.';
+    case 'sshMissing':
+      return 'The SSH client (ssh) was not found on this computer.';
+    case 'unknown':
+      return 'The details show why.';
+  }
+}
 
 export const Actions = {
   /** Shows the sidebar view with the steps of the Docker setup (action of the error dockerNotInstalled). */

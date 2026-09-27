@@ -36,6 +36,8 @@ import {
   MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
   helperDockerSocket,
+  helperStatePathFor,
+  type HelperEngine,
   helperRunArgs,
   isPassableEnvName,
   type HelperDeps,
@@ -179,6 +181,23 @@ describe('helperDockerSocket', () => {
 
   it('uses the path of a unix:// DOCKER_HOST on Linux (for example rootless Docker)', () => {
     expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux')).toBe('/run/user/1000/docker.sock');
+  });
+
+  // Unit 7: the endpoint of the current Docker context, like DOCKER_HOST (a context of a local rootless engine).
+  it('uses the endpoint of the current Docker context with the same rules', () => {
+    expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock')).toBe('/run/user/1000/docker.sock');
+    expect(helperDockerSocket({}, 'linux', 'unix:///home/me/.docker/desktop/docker.sock')).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({}, 'darwin', 'unix:///Users/me/.docker/run/docker.sock')).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1/docker.sock' }, 'linux', '')).toBe('/run/user/1/docker.sock');
+  });
+});
+
+describe('helperStatePathFor (unit 7)', () => {
+  it('keeps helper.json for the local Docker and gives each remote host a file of its own', () => {
+    expect(helperStatePathFor('/s/helper.json', '')).toBe('/s/helper.json');
+    const box = helperStatePathFor('/s/helper.json', 'box');
+    expect(box).toMatch(/^\/s\/helper-remote-[0-9a-f]{16}\.json$/);
+    expect(helperStatePathFor('/s/helper.json', 'me@box')).not.toBe(box);
   });
 });
 
@@ -867,6 +886,58 @@ describe('Docker access of the helper runs', () => {
     // Only the runs that fetch or clone have network.
     expect([summary, readFiles, listConfigs].every(hasNoNetwork)).toBe(true);
     expect([switchBranch, clone].some(hasNoNetwork)).toBe(false);
+  });
+
+  // Unit 7: on a remote host the source of the socket mount is a path of that computer.
+  it('mounts the socket of the engine of the operation (remote rootful, remote rootless, local)', async () => {
+    let engine: HelperEngine = { key: 'box', socket: '/var/run/docker.sock' };
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: { DOCKER_HOST: 'unix:///run/user/1000/docker.sock' },
+      platform: 'linux',
+      engine: async () => engine,
+    });
+    docker.handler = () => ({ stdout: '{"configuration":{}}\n' });
+    const read = () =>
+      helper.readConfiguration({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', environmentId: 'e' });
+    await read();
+    engine = { key: 'box', socket: '/run/user/1001/docker.sock' };
+    await read();
+    engine = { key: '', endpoint: 'unix:///run/user/1000/docker.sock' };
+    await read();
+    const sockets = docker.runs.map((run) => run.args.find((arg) => arg.includes('target=/var/run/docker.sock')));
+    expect(sockets).toEqual([
+      'type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock',
+      'type=bind,source=/run/user/1001/docker.sock,target=/var/run/docker.sock',
+      'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
+    ]);
+  });
+
+  it('does not reuse the helper image of another engine (the Docker context changed)', async () => {
+    let engine: HelperEngine = { key: '' };
+    const statePath = path.join(dir, 'helper.json');
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'linux',
+      statePath,
+      engine: async () => engine,
+    });
+    await helper.ensureImage();
+    expect(docker.builds).toHaveLength(1);
+    // The remote engine does not have the image: it is built there, with its own state file.
+    docker.images.clear();
+    engine = { key: 'box', socket: '/var/run/docker.sock' };
+    await helper.ensureImage();
+    expect(docker.builds).toHaveLength(2);
+    expect(fs.existsSync(helperStatePathFor(statePath, 'box'))).toBe(true);
+    // The same engine again: reused.
+    await helper.ensureImage();
+    expect(docker.builds).toHaveLength(2);
   });
 
   it('gives the runs of the Dev Container CLI the Docker socket and the cache volume', async () => {

@@ -14,6 +14,7 @@ import { GitHubApiError } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
+import { environmentsOfHost } from '../core/docker/dockerHost';
 import { availableEnvironments } from '../core/ownership';
 import { systemClock, type Clock, type Logger } from '../core/ports';
 import type { EnvironmentService } from '../core/pipeline/environmentService';
@@ -59,6 +60,11 @@ export interface SidebarDeps {
    * Default: false.
    */
   dockerSetupRequired?: () => boolean;
+  /**
+   * Unit 7: the Docker host of the current Docker context ('' = the local Docker; DockerTargets.host). The view shows
+   * only its environments. Default: the local Docker.
+   */
+  dockerHost?: () => Promise<string>;
   clock?: Clock;
   isAlive?: (pid: number) => boolean;
 }
@@ -265,7 +271,22 @@ export class Sidebar implements vscode.Disposable {
 
   /** The environments of the signed-in account, in the order of the registry (concept 7.5). */
   async availableEnvironments(): Promise<Environment[]> {
-    return availableEnvironments(await this.deps.registry.list(), this.account);
+    return availableEnvironments(await this.environmentsHere(), this.account);
+  }
+
+  /** Unit 7: the entries of the registry on the current Docker host; the others are hidden and never acted on. */
+  private async environmentsHere(): Promise<Environment[]> {
+    const [entries, host] = await Promise.all([this.deps.registry.list(), this.currentDockerHost()]);
+    return environmentsOfHost(entries, host);
+  }
+
+  private async currentDockerHost(): Promise<string> {
+    try {
+      return (await this.deps.dockerHost?.()) ?? '';
+    } catch (error) {
+      this.deps.logger.warn(`The current Docker host could not be read: ${errorMessage(error)}`);
+      return '';
+    }
   }
 
   /**
@@ -311,9 +332,9 @@ export class Sidebar implements vscode.Disposable {
 
   private async renderNow(): Promise<void> {
     if (this.disposed) return;
-    const { registry, sessionFiles, coordinator } = this.deps;
+    const { sessionFiles, coordinator } = this.deps;
     const [entries, statuses, others] = await Promise.all([
-      registry.list(),
+      this.environmentsHere(),
       sessionFiles.readWindowStatuses().catch((error: unknown): WindowStatus[] | undefined => {
         this.deps.logger.warn(`The window status files could not be read: ${errorMessage(error)}`);
         return undefined;

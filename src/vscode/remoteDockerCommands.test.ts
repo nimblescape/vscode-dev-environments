@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+
+import { dockerTargetOf } from '../core/docker/dockerHost';
+import { ENGINE_INFO_FORMAT } from '../core/docker/remoteDocker';
+import { Messages, dockerHostReason } from '../core/messages';
+import type { RunOptions, RunResult } from '../core/ports';
+import { RemoteDockerState } from '../core/storage/remoteDockerState';
+import { RemoteDockerCommands, RemoteDockerTexts, describeEntry } from './remoteDockerCommands';
+import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
+
+const ok = (stdout = ''): RunResult => ({ exitCode: 0, stdout, stderr: '', timedOut: false });
+const fail = (stderr: string): RunResult => ({ exitCode: 1, stdout: '', stderr, timedOut: false });
+
+/**
+ * A Docker CLI with contexts: `context ls|create|update|use|inspect`, and `info` (with -H: the tested host; without:
+ * the current context). `hosts` answers per ssh host.
+ */
+class FakeCli {
+  readonly calls: Array<{ args: string[]; options?: RunOptions }> = [];
+  contexts = new Map<string, string>([
+    ['default', 'unix:///var/run/docker.sock'],
+    ['desktop-linux', 'unix:///home/me/.docker/desktop/docker.sock'],
+  ]);
+  current = 'desktop-linux';
+  hosts = new Map<string, RunResult>();
+
+  isInstalled = () => true;
+  processEnv = (): NodeJS.ProcessEnv => ({ PATH: '/usr/bin', SSH_AUTH_SOCK: '/tmp/agent' });
+
+  run = async (args: readonly string[], options?: RunOptions): Promise<RunResult> => {
+    this.calls.push({ args: [...args], options });
+    if (args[0] === '-H') return this.hosts.get(args[1].slice('ssh://'.length)) ?? fail('ssh: Could not resolve hostname');
+    if (args[0] !== 'context') return ok();
+    switch (args[1]) {
+      case 'ls':
+        return ok(`${[...this.contexts.keys()].join('\n')}\n`);
+      case 'create':
+      case 'update':
+        this.contexts.set(args[2], args[args.length - 1].replace(/^host=/, ''));
+        return ok();
+      case 'use':
+        if (!this.contexts.has(args[2])) return fail(`context "${args[2]}" does not exist`);
+        this.current = args[2];
+        return ok();
+      case 'inspect':
+        return ok(JSON.stringify({ Name: this.current, Endpoints: { docker: { Host: this.contexts.get(this.current) } } }));
+    }
+    return fail('unknown');
+  };
+
+  get changes(): string[][] {
+    return this.calls.filter((call) => call.args[0] === 'context' && ['create', 'update', 'use'].includes(call.args[1])).map((call) => call.args);
+  }
+}
+
+const engineInfo = (rootless = false): RunResult =>
+  ok(JSON.stringify({ version: '28.1.0', securityOptions: rootless ? ['name=rootless'] : ['name=seccomp,profile=builtin'] }));
+
+let dir: string;
+let cli: FakeCli;
+let state: RemoteDockerState;
+let runner: { run: ReturnType<typeof vi.fn> };
+let onDidSwitch: ReturnType<typeof vi.fn>;
+let showLog: ReturnType<typeof vi.fn>;
+let env: NodeJS.ProcessEnv;
+let commands: RemoteDockerCommands;
+const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+const { window } = fakeVscode;
+
+function create(): RemoteDockerCommands {
+  return new RemoteDockerCommands({
+    docker: cli,
+    runner,
+    targets: {
+      resolve: async () => {
+        const result = await cli.run(['context', 'inspect', '--format', '{{json .}}']);
+        const parsed = JSON.parse(result.stdout) as { Name: string; Endpoints: { docker: { Host: string } } };
+        return dockerTargetOf(parsed.Endpoints.docker.Host, parsed.Name);
+      },
+    },
+    state,
+    logger,
+    showLog,
+    sshHosts: () => [
+      { alias: 'build-box', hostName: 'build-box.example.com', user: 'me' },
+      { alias: 'gpu', port: '2222' },
+    ],
+    sshPath: () => '/usr/bin/ssh',
+    env,
+    platform: 'linux',
+    onDidSwitch,
+  });
+}
+
+beforeEach(() => {
+  resetFakeVscode();
+  vi.clearAllMocks();
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-remote-ui-'));
+  cli = new FakeCli();
+  state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
+  runner = { run: vi.fn(async () => ok('/run/user/1000')) };
+  onDidSwitch = vi.fn(async () => {});
+  showLog = vi.fn();
+  env = { PATH: '/usr/bin' };
+  window.withProgress.mockImplementation(async (_options: unknown, task: (...args: unknown[]) => Promise<unknown>) =>
+    task({ report: () => {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }),
+  );
+  commands = create();
+});
+
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** The user picks `label` in the quick pick, and answers the modal with `answer`. */
+function answer(label: string, confirm: 'yes' | 'no' = 'yes'): void {
+  window.showQuickPick.mockImplementation(async (items: Array<{ label: string }>) => items.find((item) => item.label === label));
+  window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => (confirm === 'yes' ? button : undefined));
+}
+
+describe('Use a Remote Docker Host…', () => {
+  it('lists the hosts of the SSH config with HostName and User, and "Enter an SSH address…" last', async () => {
+    await commands.useRemoteHost();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string; kind?: number }>, { title: string }];
+    expect(items.map((item) => [item.label, item.description])).toEqual([
+      ['build-box', 'me@build-box.example.com'],
+      ['gpu', 'gpu:2222'],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+    ]);
+    expect(items[2].kind).toBe(fakeVscode.QuickPickItemKind.Separator);
+    expect(options.title).toBe('Use a Remote Docker Host');
+    // Cancelled: nothing ran.
+    expect(cli.calls).toEqual([]);
+  });
+
+  it('tests the host, asks in a modal, remembers the context, then creates and uses devenv-remote', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    // The test: docker -H ssh://build-box info, without questions.
+    const test = cli.calls.find((call) => call.args[0] === '-H');
+    expect(test?.args).toEqual(['-H', 'ssh://build-box', 'info', '--format', ENGINE_INFO_FORMAT]);
+    expect(test?.options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+    // The modal.
+    expect(window.showWarningMessage).toHaveBeenCalledWith(
+      'All Docker tools on this computer will use build-box until you switch back.',
+      expect.objectContaining({ modal: true }),
+      'Use build-box',
+    );
+    expect(cli.changes).toEqual([
+      ['context', 'create', 'devenv-remote', '--description', 'Dev Environments: remote Docker host', '--docker', 'host=ssh://build-box'],
+      ['context', 'use', 'devenv-remote'],
+    ]);
+    expect(await state.previousContext()).toBe('desktop-linux');
+    expect(window.showInformationMessage).toHaveBeenCalledWith('Docker now uses build-box.');
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+    // No ssh of our own for a rootful engine.
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('changes nothing when the modal is cancelled', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box', 'no');
+    await commands.useRemoteHost();
+    expect(cli.changes).toEqual([]);
+    expect(await state.previousContext()).toBeUndefined();
+    expect(onDidSwitch).not.toHaveBeenCalled();
+  });
+
+  it('shows the plain reason and changes nothing when the host cannot be used', async () => {
+    cli.hosts.set('build-box', fail('Host key verification failed.'));
+    answer('build-box');
+    window.showErrorMessage.mockResolvedValue('Show details');
+    await commands.useRemoteHost();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(
+      Messages.dockerHostUnreachable('build-box', dockerHostReason('hostKey', 'build-box')),
+      'Show details',
+    );
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
+    expect(cli.changes).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(showLog).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes a typed SSH address after validation, and updates devenv-remote when it exists', async () => {
+    cli.contexts.set('devenv-remote', 'ssh://old');
+    cli.hosts.set('me@192.0.2.10:2222', engineInfo());
+    answer(RemoteDockerTexts.enterAddress);
+    window.showInputBox.mockImplementation(async (options: { validateInput: (value: string) => string | undefined }) => {
+      expect(options.validateInput('-oProxyCommand=x')).toBe(RemoteDockerTexts.addressProblem('option'));
+      expect(options.validateInput('me@2001:db8::1')).toBe(RemoteDockerTexts.addressProblem('ipv6'));
+      expect(options.validateInput('me@192.0.2.10:2222')).toBeUndefined();
+      return ' me@192.0.2.10:2222 ';
+    });
+    await commands.useRemoteHost();
+    expect(cli.changes[0]).toEqual([
+      'context',
+      'update',
+      'devenv-remote',
+      '--description',
+      'Dev Environments: remote Docker host',
+      '--docker',
+      'host=ssh://me@192.0.2.10:2222',
+    ]);
+    expect(cli.current).toBe('devenv-remote');
+  });
+
+  it('keeps the first remembered context when it switches from one remote host to another', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    answer('gpu');
+    await commands.useRemoteHost();
+    expect(cli.contexts.get('devenv-remote')).toBe('ssh://gpu');
+    expect(await state.previousContext()).toBe('desktop-linux');
+  });
+
+  it('records the socket of a rootless engine (read once with ssh, BatchMode) before the switch', async () => {
+    cli.hosts.set('build-box', engineInfo(true));
+    answer('build-box');
+    await commands.useRemoteHost();
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    const [file, args] = runner.run.mock.calls[0] as [string, string[]];
+    expect(file).toBe('/usr/bin/ssh');
+    expect(args).toContain('BatchMode=yes');
+    expect(args.slice(-3)).toEqual(['--', 'build-box', 'printf %s "$XDG_RUNTIME_DIR"']);
+    expect(await state.rootlessSocket('build-box')).toBe('/run/user/1000/docker.sock');
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote('build-box', true));
+  });
+
+  it('refuses while DOCKER_HOST is set for VS Code (the context would have no effect)', async () => {
+    env.DOCKER_HOST = 'unix:///var/run/docker.sock';
+    commands = create();
+    await commands.useRemoteHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(RemoteDockerTexts.variableSet('DOCKER_HOST'), 'Show details');
+    expect(cli.calls).toEqual([]);
+  });
+});
+
+describe('Use the Local Docker', () => {
+  it('goes back to the remembered context and forgets it', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('desktop-linux');
+    expect(await state.previousContext()).toBeUndefined();
+    expect(window.showInformationMessage).toHaveBeenLastCalledWith('Docker now uses the local Docker (context desktop-linux).');
+    expect(onDidSwitch).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the context default when none is remembered (or it is gone)', async () => {
+    cli.contexts.set('devenv-remote', 'ssh://box');
+    cli.current = 'devenv-remote';
+    await state.setPreviousContext('removed-context');
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+  });
+
+  it('says so when Docker is local already', async () => {
+    await commands.useLocalDocker();
+    expect(cli.changes).toEqual([]);
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.alreadyLocal);
+  });
+});
+
+describe('the mismatch of a restored window (offerSwitchBack)', () => {
+  it('asks "Use <host> again?", then switches as the command does (test and modal)', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    const current = dockerTargetOf('unix:///home/me/.docker/desktop/docker.sock', 'desktop-linux');
+    await expect(commands.offerSwitchBack('build-box', current)).resolves.toBe(true);
+    expect(window.showWarningMessage.mock.calls[0][0]).toBe(
+      'This environment is on build-box, but Docker is set to the local Docker. Use build-box again?',
+    );
+    expect(window.showWarningMessage.mock.calls[1][0]).toBe(RemoteDockerTexts.confirm('build-box'));
+    expect(cli.current).toBe('devenv-remote');
+  });
+
+  it('switches back to the local Docker for a local environment', async () => {
+    cli.contexts.set('devenv-remote', 'ssh://box');
+    cli.current = 'devenv-remote';
+    await state.setPreviousContext('desktop-linux');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', 'devenv-remote'))).resolves.toBe(true);
+    expect(window.showWarningMessage.mock.calls[0][0]).toBe(
+      'This environment is on the local Docker, but Docker is set to box. Use the local Docker again?',
+    );
+    expect(cli.current).toBe('desktop-linux');
+  });
+
+  it('changes nothing when the user declines', async () => {
+    await expect(commands.offerSwitchBack('build-box', dockerTargetOf('', 'default'))).resolves.toBe(false);
+    expect(cli.calls).toEqual([]);
+  });
+});
+
+describe('describeEntry', () => {
+  it('shows User, HostName and Port where set', () => {
+    expect(describeEntry({ alias: 'a' })).toBeUndefined();
+    expect(describeEntry({ alias: 'a', user: 'me' })).toBe('me@a');
+    expect(describeEntry({ alias: 'a', hostName: 'h', port: '22' })).toBe('h:22');
+  });
+});

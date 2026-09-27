@@ -79,6 +79,35 @@ describe('isEnvironmentOf (concept D-3: one environment per repository and GitHu
   });
 });
 
+describe('the Docker host in the key of an environment (unit 7: repository, account, Docker host)', () => {
+  it('matches the host exactly; a missing field is the local Docker', () => {
+    expect(isEnvironmentOf({ repository: 'acme/api', owner: OCTO }, 'acme/api', OCTO.id, '')).toBe(true);
+    expect(isEnvironmentOf({ repository: 'acme/api', owner: OCTO }, 'acme/api', OCTO.id, 'box')).toBe(false);
+    expect(isEnvironmentOf({ repository: 'acme/api', owner: OCTO, dockerHost: 'box' }, 'acme/api', OCTO.id, 'box')).toBe(true);
+    expect(isEnvironmentOf({ repository: 'acme/api', owner: OCTO, dockerHost: 'box' }, 'acme/api', OCTO.id)).toBe(false);
+  });
+
+  it('finds the environment of the current host, and allows one per host', async () => {
+    const registry = new EnvironmentRegistry(paths);
+    await registry.add(environment(ID_A, 'acme/api', { owner: OCTO }));
+    await registry.add(environment(ID_B, 'acme/api', { owner: OCTO, dockerHost: 'box' }));
+    await expect(registry.add(environment(ID_C, 'acme/api', { owner: OCTO, dockerHost: 'box' }))).rejects.toThrow(
+      'An environment of acme/api of the GitHub account 1001 exists already.',
+    );
+    expect((await registry.findForAccount('acme/api', OCTO.id))?.id).toBe(ID_A);
+    expect((await registry.findForAccount('acme/api', OCTO.id, 'box'))?.id).toBe(ID_B);
+    expect(await registry.findForAccount('acme/api', OCTO.id, 'other')).toBeUndefined();
+  });
+
+  it('keeps the host through a read, and drops an invalid one (which then counts as local)', async () => {
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/r', { dockerHost: 'me@box:2222' }), { ...environment(ID_B, 'o/s'), dockerHost: 7 }] });
+    const registry = new EnvironmentRegistry(paths);
+    const [a, b] = await registry.list();
+    expect(a.dockerHost).toBe('me@box:2222');
+    expect(b).not.toHaveProperty('dockerHost');
+  });
+});
+
 describe('EnvironmentRegistry reading', () => {
   it('gives an empty registry for a missing file', async () => {
     const registry = new EnvironmentRegistry(paths);

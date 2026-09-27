@@ -42,6 +42,9 @@ export const Commands = {
   dockerSetupStart: 'devEnvironments.dockerSetup.start',
   dockerSetupInstallWsl: 'devEnvironments.dockerSetup.installWsl',
   dockerSetupShow: 'devEnvironments.dockerSetup.show',
+  // Unit 7 (user decisions 2026-09-27): Docker on another computer through the Docker context, and back.
+  useRemoteDockerHost: 'devEnvironments.useRemoteDockerHost',
+  useLocalDocker: 'devEnvironments.useLocalDocker',
 } as const;
 
 export type CommandName = keyof typeof Commands;

@@ -258,6 +258,16 @@
         "command": "devEnvironments.dockerSetup.show",
         "title": "Show Docker Setup",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.useRemoteDockerHost",
+        "title": "Use a Remote Docker Host…",
+        "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.useLocalDocker",
+        "title": "Use the Local Docker",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [

@@ -26,6 +26,7 @@ import {
 } from '../ports';
 import type { ContainerState } from '../types';
 import { dockerProcessEnv, envValue } from './dockerCli';
+import { operationDockerTarget } from './dockerTargets';
 
 export interface ContainerInfo {
   id: string;
@@ -514,7 +515,7 @@ export class ContainerAdapter {
     const dockerPath = this.path;
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
-      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.env });
+      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv() });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
@@ -528,6 +529,26 @@ export class ContainerAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * The environment of a Docker call. Within an operation (unit 7, dockerTargets.ts) that read its Docker context, the
+   * call gets DOCKER_CONTEXT with that context's name, so the whole operation stays on the Docker host it started with,
+   * even when the user switches the context meanwhile. DOCKER_HOST is never set here; when it is set for VS Code, it
+   * decides the endpoint and the operation has no context name.
+   */
+  private operationEnv(): NodeJS.ProcessEnv {
+    const context = operationDockerTarget()?.context;
+    if (context === undefined) return this.env;
+    const env: NodeJS.ProcessEnv = { ...this.env };
+    deleteEnv(env, 'DOCKER_CONTEXT');
+    env.DOCKER_CONTEXT = context;
+    return env;
+  }
+
+  /** A copy of the environment of the Docker calls outside of an operation. */
+  processEnv(): NodeJS.ProcessEnv {
+    return { ...this.env };
   }
 
   /**
@@ -1066,7 +1087,7 @@ export class ContainerAdapter {
    * folder). A DOCKER_HOST that is set already stays. When the endpoint cannot be read, the default endpoint is used.
    */
   private async envForOwnConfig(signal: AbortSignal | undefined): Promise<NodeJS.ProcessEnv> {
-    const env: NodeJS.ProcessEnv = { ...this.env };
+    const env: NodeJS.ProcessEnv = { ...this.operationEnv() };
     if (!envValue(env, 'DOCKER_HOST', this.platform)) {
       const args = ['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'];
       const result = await this.run(args, { signal, timeoutMs: DOCKER_QUERY_TIMEOUT_MS });

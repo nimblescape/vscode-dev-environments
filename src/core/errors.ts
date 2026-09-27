@@ -20,6 +20,9 @@ export type UserErrorCode =
   | 'hostAccess'
   | 'unencryptedDockerConnection'
   | 'otherAccount'
+  | 'dockerHostUnreachable'
+  | 'dockerEndpointUnsupported'
+  | 'otherDockerHost'
   | 'cancelled';
 
 export class UserFacingError extends Error {

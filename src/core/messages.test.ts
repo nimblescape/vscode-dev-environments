@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { LINUX_ENGINE_START_COMMAND } from './docker/dockerSetup';
-import { Messages } from './messages';
+import { Messages, dockerHostReason } from './messages';
 
 describe('Messages.localEnvNotPassed', () => {
   // The CLI resolves ${localEnv:NAME} in the workspace helper: HOME is /root there, not empty.
@@ -41,5 +41,48 @@ describe('Messages.dockerEngineNotRunning', () => {
   it('names the command that enables and starts the Docker service', () => {
     expect(Messages.dockerEngineNotRunning).toContain(LINUX_ENGINE_START_COMMAND);
     expect(LINUX_ENGINE_START_COMMAND).toBe('sudo systemctl enable --now docker');
+  });
+});
+
+describe('the messages of a remote Docker host (unit 7)', () => {
+  it('names the host and the plain reason', () => {
+    expect(Messages.dockerHostUnreachable('build-box', dockerHostReason('unreachable', 'build-box'))).toBe(
+      'The Docker host build-box cannot be reached. The computer does not answer. Check its name and the network connection.',
+    );
+  });
+
+  it('asks the user to accept an unknown host key in a terminal, never accepts it', () => {
+    const reason = dockerHostReason('hostKey', 'me@box:2222');
+    expect(reason).toContain('Run "ssh me@box:2222" once in a terminal');
+    expect(reason).toContain('accept it');
+  });
+
+  it.each([
+    ['login', 'SSH could not log in'],
+    ['dockerMissing', 'Docker is not installed on that computer.'],
+    ['dockerNotRunning', 'Docker is not running on that computer.'],
+    ['dockerPermission', 'group docker'],
+    ['sshMissing', 'ssh'],
+    ['unknown', 'The details show why.'],
+  ] as const)('%s', (problem, text) => {
+    expect(dockerHostReason(problem, 'box')).toContain(text);
+  });
+
+  it('never offers the Docker Desktop start or its installation for a remote host', () => {
+    const text = Messages.dockerHostUnreachable('box', dockerHostReason('dockerNotRunning', 'box'));
+    expect(text).not.toMatch(/Docker Desktop|install/i);
+  });
+
+  it('names both hosts when an environment is on another host', () => {
+    expect(Messages.otherDockerHost('acme/api', 'build-box', '')).toBe(
+      'The environment of acme/api is on build-box, but Docker is set to the local Docker. Nothing was changed.',
+    );
+  });
+
+  it('names the refused endpoint and the two commands', () => {
+    const text = Messages.dockerEndpointUnsupported('tcp://192.0.2.10:2376');
+    expect(text).toContain('tcp://192.0.2.10:2376');
+    expect(text).toContain('Use a Remote Docker Host…');
+    expect(text).toContain('Use the Local Docker');
   });
 });
