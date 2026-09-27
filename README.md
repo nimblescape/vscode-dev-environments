@@ -37,7 +37,9 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 1. Remove the Dockerfile refusals — **merged** (PR #32, f1594dc). Accepted leftover (low, same as before): a devcontainer.json with a JSON syntax slip that the Dev Container CLI tolerates makes a named Dockerfile unreadable for the check, so it is refused as 'could not be read'.
 2. ~~Helper socket follows the Docker context~~ — dropped (user decision 2026-09-27: not worth the complexity; rootless Docker needs `DOCKER_HOST`, as the README says). Branch `fix/helper-socket-context` stays unmerged.
 3. Unit 15: token only in the container's memory (tmpfs) — **merged** (PR #33, 23bcb6e). Open question to the user: should lifecycle commands get the token (write first, then `devcontainer run-user-commands`)?
-3b. Remove all migration code — **merged** (PR #34, 0cdd350). Still open (user decision pending): container setup version label (keep, reset to 1?) and Session Monitor protocol version (drop?).
+3b. Remove all migration code — **merged** (PR #34, 0cdd350).
+3c. Versions reset (user decision 2026-09-27): keep the container setup version label and the Session Monitor protocol version, both reset to 1 (history removed); fix the docs that say the token is "never on a disk" (a tmpfs can be swapped). Branch `chore/reset-versions`.
+4b. After unit 11 (user decision 2026-09-27: "agree"): lifecycle commands get the token again — `devcontainer up --skip-post-create`, write the token, then `devcontainer run-user-commands`.
 4. Unit 11: one policy module, guard rails only (pure refactor).
 5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
 6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
