@@ -12,6 +12,7 @@ import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { hostAccessProblems } from '../helper/hostAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
   ANALYSIS_FAILED_ITEM,
   analysisFailure,
@@ -2849,15 +2850,42 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.checker.calls.at(-1)?.images).toEqual(['devenv-7c1d2e3f:2']);
   });
 
-  it('allows a configured Dockerfile that cannot be read; the update check has no FROM images of it (review round 2, S2-01)', async () => {
+  it('refuses a configured Dockerfile that cannot be read as protected, whatever the switch says (review round 2, S2-01; U2)', async () => {
     h.helper.config = { build: { dockerfile: 'missing.Dockerfile' } };
     // Review round 3, P3-1: changed setup, a Dockerfile that exists but cannot be read (for example a link out of the
     // repository); a missing one is an error of the configuration (the tests of review round 3).
     h.helper.unreadableDockerfiles = ['.devcontainer/missing.Dockerfile'];
-    // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile missing.Dockerfile (it could not be read, so its images cannot be checked)`.
+    // review, U1/U2: refused again (protected), not for its images: the CLI and BuildKit in the workspace helper would
+    // read the file that the link points to (for example the token) as the Dockerfile.
+    const item = 'Dockerfile missing.Dockerfile (the Dockerfile is a link out of the repository or could not be read)';
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(item));
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(item));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a Dockerfile longer than MAX_DOCKERFILE_LENGTH as not supported, and allows a normal one (U1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    // What READ_FILES_SCRIPT returns of a longer Dockerfile: MAX_DOCKERFILE_LENGTH + 1 characters.
+    const long = `FROM alpine\n#${'x'.repeat(MAX_DOCKERFILE_LENGTH - 12)}`;
+    expect(long.length).toBe(MAX_DOCKERFILE_LENGTH + 1);
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': long };
+    const item = `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions(item));
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions(item));
+    expect(h.helper.builds).toEqual([]);
+    // Exactly MAX_DOCKERFILE_LENGTH characters, and a normal Dockerfile: built.
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': long.slice(0, -1) };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
-    expect(h.checker.calls.at(-1)?.images ?? []).toEqual([]);
+  });
+
+  it('allows a normal Dockerfile (U1, U2)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\nRUN echo hi\n' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 
   it('refuses an image that Docker would find by the prefix of its ID, and allows an image named with hexadecimal characters (review round 2, S2-05)', async () => {
@@ -3550,7 +3578,7 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
     expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
   });
 
-  it('allows a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1)', async () => {
+  it('refuses a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1, U2)', async () => {
     await seedEnvironment(h, { container: 'stopped', record: { configHash: configHash(MISSING_TEXT) } });
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT };
     for (const [dockerfile, unreadable] of [
@@ -3560,11 +3588,13 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
       h.helper.config = { build: { dockerfile } };
       h.helper.dockerfiles = {};
       h.helper.unreadableDockerfiles = [...unreadable];
-      // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile … (it could not be read, so its images
-      // cannot be checked)`. The configuration hash has no Dockerfile text, as before: the existing container starts.
-      const result = await h.service.open(TARGET, options());
-      expect(result.containerName).toBe(NAME);
+      // review, U1/U2: refused again (protected), as before the Dockerfile refusals were removed (then as not supported,
+      // for its images): the CLI would read the file that it points to as the Dockerfile.
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.hostAccess(`Dockerfile ${dockerfile} (the Dockerfile is a link out of the repository or could not be read)`));
     }
+    expect(h.helper.ups).toEqual([]);
     expect(h.helper.builds).toEqual([]);
   });
 

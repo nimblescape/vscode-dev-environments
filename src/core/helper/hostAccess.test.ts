@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { devContainersSettings } from '../devContainers';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -1148,13 +1149,45 @@ describe('foreignNetworkItem and runArgsNetworks', () => {
 });
 
 describe('the Dockerfile of a single container (review round 2, S2-01)', () => {
-  it('allows a configured Dockerfile that could not be read; the update check has no FROM images of it', () => {
-    // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile ${localEnv:X}/Dockerfile (it could not
-    // be read, so its images cannot be checked)` (unsupported). The pipeline passes no text (resolvedDockerfile).
+  it('refuses a configured Dockerfile that could not be read as protected; the update check has no FROM images of it', () => {
+    // review, U1/U2: before the Dockerfile refusals were removed, `Dockerfile ${localEnv:X}/Dockerfile (it could not be
+    // read, so its images cannot be checked)` (unsupported); now refused as protected, whatever the switch says: the CLI
+    // would read the file that a link out of the repository points to as the Dockerfile. The pipeline passes
+    // dockerfileUnreadable (resolvedDockerfile).
     const config = { build: { dockerfile: '${localEnv:X}/Dockerfile' } };
-    const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config });
-    expect(analysis.report).toEqual({ hostAccess: [], unsupported: [] });
-    expect(analysis.references.images).toEqual([]);
+    for (const checksOn of [true, false]) {
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' }, checksOn, config });
+      expect(analysis.report).toEqual({ hostAccess: ['Dockerfile ${localEnv:X}/Dockerfile (the Dockerfile is a link out of the repository or could not be read)'], unsupported: [] });
+      expect(analysis.references.images).toEqual([]);
+    }
+    // Without dockerfileUnreadable (the Dockerfile was read, or the configuration names none): nothing is refused.
+    expect(runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config }).report).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  const HELPER = { configFolder: '/workspaces/api/.devcontainer', repositoryFolder: '/workspaces/api' };
+
+  it('U2: refuses a Dockerfile that is a link out of the repository (to the token or the cache volume), also with the checks off', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)';
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' }, checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
+    }
+    expect(hostAccessClassification({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' })).toEqual([{ item, class: 'protected' }]);
+    // A path of the workspace helper as written is named once, as such.
+    const cache = { build: { dockerfile: '/devenv-cache/x' } };
+    expect(hostAccessReport({ config: cache, ownVolume: OWN, ...HELPER, dockerfileUnreadable: '/devenv-cache/x' }, false)).toEqual({
+      hostAccess: ['Dockerfile /devenv-cache/x (a folder of the workspace helper)'],
+      unsupported: [],
+    });
+  });
+
+  it('U1: refuses a Dockerfile of MAX_DOCKERFILE_LENGTH + 1 characters as not supported, and allows a normal one', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH + 1 }, checksOn)).toEqual({ hostAccess: [], unsupported: [item] });
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH }, checksOn)).toEqual({ hostAccess: [], unsupported: [] });
+    }
   });
 });
 

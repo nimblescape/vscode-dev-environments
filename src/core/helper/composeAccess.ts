@@ -71,8 +71,11 @@ export interface ComposeAccessInput extends VolumeInput {
   /**
    * ComposeModelOutput.dockerfiles: the Dockerfile of the dev service, for the texts that the Dev Container CLI writes
    * into its compose file (devBuildTextProblems); the build of the dev service writes this text (composeBuildModel), so
-   * a dev service whose Dockerfile could not be read is refused. The Dockerfiles are not checked otherwise (Dockerfile
-   * refusals removed, user decision 2026-09-27). Without it, nothing of them is checked.
+   * a dev service whose Dockerfile could not be read is refused. A Dockerfile of any service longer than
+   * MAX_DOCKERFILE_LENGTH is refused (U1: the configuration hash sees only the text that was read). The content of the
+   * Dockerfiles is not checked (Dockerfile refusals removed, user decision 2026-09-27). The Dockerfile of another service
+   * that could not be read is not refused for that (a link of it out of the repository is, by localPathProblems); the
+   * update check and the configuration hash skip it. Without it, nothing of them is checked.
    */
   dockerfiles?: Readonly<Record<string, string>>;
   /**
@@ -678,8 +681,9 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
     problems.push(...fileProblems);
     // The Dockerfile of the dev service that the model run could not read: the build writes the text that was read
     // (composeBuildModel), and the texts that the CLI writes into its compose file come from it (devBuildTextProblems).
-    // A refusal that the switch lifts does not excuse it. The Dockerfiles of the other services are not read for a
-    // check (Dockerfile refusals removed, user decision 2026-09-27).
+    // A refusal that the switch lifts does not excuse it. The Dockerfile of another service that could not be read is
+    // not refused for that (Dockerfile refusals removed, user decision 2026-09-27): a link of it out of the repository is
+    // refused by localPathProblems, and otherwise the update check and the configuration hash skip it.
     const dockerfiles = ctx.input.dockerfiles;
     const refused = [...contextProblems, ...fileProblems].some((problem) => problem.class !== 'computer');
     if (ctx.isDev && dockerfiles !== undefined && !refused && !Object.prototype.hasOwnProperty.call(dockerfiles, ctx.name)) {
@@ -688,6 +692,12 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   }
   // The Dockerfile (or `dockerfile_inline`) of the dev service, for devBuildTextProblems.
   const text = ctx.input.dockerfiles?.[ctx.name];
+  // U1: a size limit for every service with a Dockerfile that was read, not a check of its content: the model run reads
+  // at most one character more than MAX_DOCKERFILE_LENGTH, and the configuration hash sees only that text, so an edit
+  // after it would offer no rebuild. The dev service has its own reason (devBuildTextProblems).
+  if (!ctx.isDev && text !== undefined && text.length > MAX_DOCKERFILE_LENGTH) {
+    problems.push(unsupported(`the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`));
+  }
   problems.push(...labelProblems(value.labels, 'build '));
   // Review round 16 (Dp): what the Dev Container CLI writes as text into its compose file for the build of the dev service.
   if (ctx.isDev) problems.push(...devBuildTextProblems(value, text));

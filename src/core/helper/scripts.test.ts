@@ -1633,6 +1633,22 @@ describe('READ_FILES_SCRIPT', () => {
     expect(read(repo, 'b/devcontainer.json')).not.toHaveProperty('dockerfilePath');
   });
 
+  it('U2: returns neither a text nor dockerfileMissing for a Dockerfile linked out of the repository, as written or resolved (the extension refuses it)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    write(path.join(root, '.devenv+', 'gh', 'hosts.yml'), 'github.com:\n  oauth_token: gho_SECRET\n');
+    write(path.join(repo, '.devcontainer', 'devcontainer.json'), '{ "build": { "dockerfile": "${localEnv:DF:Dockerfile}" } }');
+    fs.symlinkSync('../../.devenv+/gh/hosts.yml', path.join(repo, '.devcontainer', 'Dockerfile'));
+    for (const dockerfile of [undefined, 'Dockerfile', '../../.devenv+/gh/hosts.yml']) {
+      const result = runNode(readFilesCommand(repo, '.devcontainer/devcontainer.json', dockerfile));
+      expect(result.status).toBe(0);
+      const out = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(out).not.toHaveProperty('dockerfileText');
+      expect(out).not.toHaveProperty('dockerfileMissing');
+      expect(result.stdout).not.toContain('gho_SECRET');
+    }
+  });
+
   it('reads the Dockerfile that the resolved configuration names in place of the one of the text (review round 2, S2-01)', () => {
     const root = tempDir();
     const repo = path.join(root, 'repo');

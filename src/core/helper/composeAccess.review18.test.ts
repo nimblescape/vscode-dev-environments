@@ -103,9 +103,29 @@ describe('Docker\'s view: an image of the Dockerfile', () => {
       `service app: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the dev service is built from the text that Dev Environments read)`,
     ]);
     expect(composeAccessReport(input({}, long), false).unsupported).toHaveLength(1);
-    // The same Dockerfile of another service is allowed (its FROM images are skipped by the update check).
+    // review, U1/U2: the same Dockerfile of another service is refused too (a size limit): the configuration hash sees
+    // only the text that the model run read, so an edit after it would offer no rebuild.
     const other: ComposeAccessInput = { ...input({}, 'FROM alpine\n'), model: { name: PROJECT, services: { ...model({}).services, db: { build: { context: REPO } } } }, dockerfiles: { app: 'FROM alpine\n', db: long } };
-    expect(composeAccessReport(other)).toEqual({ hostAccess: [], unsupported: [] });
+    expect(composeAccessReport(other)).toEqual({
+      hostAccess: [],
+      unsupported: [`service db: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`],
+    });
+  });
+
+  it('U1: refuses a Dockerfile of a side service of MAX_DOCKERFILE_LENGTH + 1 characters, whatever the switch says', () => {
+    const long = `FROM alpine\n#${'x'.repeat(MAX_DOCKERFILE_LENGTH - 12)}`;
+    expect(long.length).toBe(MAX_DOCKERFILE_LENGTH + 1);
+    const side = (text: string): ComposeAccessInput => ({
+      ...input({}, 'FROM alpine\n'),
+      model: { name: PROJECT, services: { ...model({}).services, db: { build: { context: REPO } } } },
+      dockerfiles: { app: 'FROM alpine\n', db: text },
+    });
+    const item = `service db: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    expect(composeAccessReport(side(long)).unsupported).toEqual([item]);
+    expect(composeAccessReport(side(long), false).unsupported).toEqual([item]);
+    // A Dockerfile of exactly MAX_DOCKERFILE_LENGTH characters, and a normal one, are allowed.
+    expect(composeAccessReport(side(long.slice(0, -1)))).toEqual({ hostAccess: [], unsupported: [] });
+    expect(composeAccessReport(side('FROM alpine\nRUN echo hi\n'))).toEqual({ hostAccess: [], unsupported: [] });
   });
 });
 

@@ -14,7 +14,7 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
+import { MAX_DOCKERFILE_LENGTH, MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
   COMPOSE_CLEARED_LABELS,
@@ -98,6 +98,20 @@ export interface HostAccessInput {
   configFolder?: string;
   /** The folder of the repository in the workspace helper (for example `/workspaces/api`), for isHelperPath. */
   repositoryFolder?: string;
+  /**
+   * The length of the Dockerfile of a single container, read at the path that the configuration names after the CLI
+   * resolved its variables (review round 2, S2-01), at most MAX_DOCKERFILE_LENGTH + 1 characters (READ_FILES_SCRIPT).
+   * A longer Dockerfile is refused as not supported (U1): the configuration hash would see only its start. Its content
+   * is not checked (Dockerfile refusals removed, user decision 2026-09-27).
+   */
+  dockerfileLength?: number;
+  /**
+   * The Dockerfile that the configuration of a single container names (as written), when it exists but could not be
+   * read (U2): a link out of the repository (for example into the folder with the token or the cache volume), a real
+   * path outside of it, or a path with a variable that is not resolved. Refused whatever the switch says (`protected`):
+   * the CLI and BuildKit in the workspace helper would read that file as the Dockerfile.
+   */
+  dockerfileUnreadable?: string;
   /**
    * `config` is the override configuration of `up` (the final check of its runArgs, review round 2, D2-1): its runArgs
    * may carry the labels of Docker Compose with empty values that the override configuration adds (COMPOSE_CLEARED_LABELS).
@@ -598,12 +612,15 @@ function secondPassProblems(what: string, entries: readonly unknown[]): Problem[
  * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
  * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
  * of the computer), and the check does not resolve its links. `image`: no image of another environment, and no image
- * ID (imageReferenceFinding). The Dockerfile itself is not checked (Dockerfile refusals removed, user decision
- * 2026-09-27): it runs as trusted code.
+ * ID (imageReferenceFinding). The content of the Dockerfile is not checked (Dockerfile refusals removed, user decision
+ * 2026-09-27): it runs as trusted code. The Dockerfile itself is: a Dockerfile that is a link out of the repository or
+ * could not be read is refused whatever the switch says (dockerfileUnreadable, U2), and one longer than
+ * MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength, U1).
  */
 function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
   const problems: Problem[] = [];
   const build = isRecord(config.build) ? config.build : {};
+  let dockerfileRefused = false;
   if (input.configFolder !== undefined && input.repositoryFolder !== undefined) {
     const repository = input.repositoryFolder;
     const context = typeof build.context === 'string' ? build.context : typeof config.context === 'string' ? config.context : undefined;
@@ -613,11 +630,24 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
       // (path.posix.resolve against the folder of the configuration), so `x://../../devenv-cache` is a folder.
       if (value === undefined || value.trim() === '') continue;
       const resolved = path.posix.resolve(input.configFolder, value.trim());
-      if (isHelperPath(resolved, repository)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+      if (isHelperPath(resolved, repository)) {
+        problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+        if (what === 'Dockerfile') dockerfileRefused = true;
+      }
       else if (what === 'build context' && resolved !== repository && !resolved.startsWith(`${repository}/`)) {
         problems.push(guarded(`${what} ${value} (outside of the repository)`));
       }
     }
+  }
+  // U2: a Dockerfile that exists but could not be read (a link out of the repository, a real path outside of it), unless
+  // its path as written is refused already. Checked on the path that the CLI resolved, whatever the switch says.
+  if (input.dockerfileUnreadable !== undefined && !dockerfileRefused) {
+    problems.push(guarded(`Dockerfile ${input.dockerfileUnreadable} (the Dockerfile is a link out of the repository or could not be read)`));
+  }
+  // U1: a size limit, not a check of the content: the configuration hash sees at most MAX_DOCKERFILE_LENGTH + 1
+  // characters, so an edit after them would offer no rebuild.
+  if (input.dockerfileLength !== undefined && input.dockerfileLength > MAX_DOCKERFILE_LENGTH) {
+    problems.push(unsupported(`the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`));
   }
   if (typeof config.image === 'string') {
     const finding = imageReferenceFinding(config.image);

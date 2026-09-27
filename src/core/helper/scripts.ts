@@ -403,8 +403,9 @@ process.stdout.write(JSON.stringify(found) + '\n');
 /**
  * Review round 9 (S9-2): the function `readLimited(file, limit)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they
  * define `fs`): the text of a file, at most `limit + 1` characters of it, so that the length check of the extension
- * still sees a longer file (MAX_CONFIG_TEXT_LENGTH refuses it; beyond MAX_DOCKERFILE_LENGTH, the update check skips a
- * Dockerfile, and the dev service of a Docker Compose configuration is refused), while a file of any size costs at most
+ * still sees a longer file (MAX_CONFIG_TEXT_LENGTH refuses it, and MAX_DOCKERFILE_LENGTH refuses a Dockerfile of a
+ * single container or of any service of a Docker Compose configuration, U1: the configuration hash sees only the text
+ * that was read), while a file of any size costs at most
  * 4 · (`limit` + 1) bytes (4 bytes per character of UTF-8 at most), never the whole file. Throws what `fs` throws.
  */
 const READ_LIMITED = String.raw`const readLimited = (file, limit) => {
@@ -588,7 +589,9 @@ const main = () => {
     result.dockerfileMissing = true;
     return result;
   }
-  // Review round 3 (P3-1): a link out of the repository is not read (the check refuses the Dockerfile).
+  // Review round 3 (P3-1), U2: a link out of the repository (a real path outside of it, for example the folder with the
+  // token or the cache volume) is not read: without a text or dockerfileMissing, the extension refuses the Dockerfile
+  // whatever the switch says (hostAccess.ts, dockerfileUnreadable).
   const real = realPath(dockerfileFile);
   const rootReal = realPath(root);
   if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
