@@ -65,8 +65,22 @@ export interface SidebarDeps {
    * only its environments. Default: the local Docker.
    */
   dockerHost?: () => Promise<string>;
+  /**
+   * The tree view of the repositories, once createTreeView registered it. The refresh shows its progress in the view
+   * only while the view is visible (viewProgressLocation). Default: no view, the progress shows in the status bar.
+   */
+  view?: { readonly visible: boolean };
   clock?: Clock;
   isAlive?: (pid: number) => boolean;
+}
+
+/**
+ * Where the refresh shows its progress: in the view while it is registered and visible, else in the status bar. In a
+ * freshly opened or reconnecting window the refresh starts before the view is shown, and VS Code rejects a view
+ * location of a view that is not shown ("Bad progress location").
+ */
+export function viewProgressLocation(view: { readonly visible: boolean } | undefined): vscode.ProgressOptions['location'] {
+  return view?.visible ? { viewId: REPOSITORIES_VIEW_ID } : vscode.ProgressLocation.Window;
 }
 
 export class Sidebar implements vscode.Disposable {
@@ -467,7 +481,7 @@ export class Sidebar implements vscode.Disposable {
     this.progressiveAccountId = this.data === undefined ? account.id : undefined;
     this.partial = undefined;
     try {
-      const data = await vscode.window.withProgress({ location: { viewId: REPOSITORIES_VIEW_ID } }, () =>
+      const data = await vscode.window.withProgress({ location: viewProgressLocation(this.deps.view) }, () =>
         this.deps.discovery.refresh(token, account.id),
       );
       // The account changed while the list loaded: the list is not shown (the next refresh loads the new one).

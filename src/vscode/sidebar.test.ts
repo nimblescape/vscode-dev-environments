@@ -14,7 +14,14 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
-import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY, SLOW_GROUPING_MS, Sidebar, type SidebarDeps } from './sidebar';
+import {
+  LOADED_CONTEXT_KEY,
+  LOAD_FAILED_CONTEXT_KEY,
+  SLOW_GROUPING_MS,
+  Sidebar,
+  viewProgressLocation,
+  type SidebarDeps,
+} from './sidebar';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { parseRepositoryGroups } from './repositoryGroups';
 import { buildGroupsPreview, entriesFromSetting } from './repositoryGroupsEditorModel';
@@ -106,6 +113,8 @@ interface Harness {
   clock: { now: () => number };
   /** Unit 7: the Docker host of the current Docker context ('' = the local Docker). */
   dockerHost: { value: string };
+  /** The registered tree view of the repositories; a test can show it. */
+  view: { visible: boolean };
 }
 
 function createHarness(): Harness {
@@ -118,6 +127,7 @@ function createHarness(): Harness {
   const models: OwnerGroup[][] = [];
   const setupRequired = { value: false };
   const dockerHost = { value: '' };
+  const view = { visible: false };
   const signedInFlags: boolean[] = [];
   const tree = {
     setModel: (groups: OwnerGroup[], options: { signedIn?: boolean }) => {
@@ -162,6 +172,7 @@ function createHarness(): Harness {
     settings: () => settings,
     dockerSetupRequired: () => setupRequired.value,
     dockerHost: async () => dockerHost.value,
+    view,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
@@ -182,6 +193,7 @@ function createHarness(): Harness {
     logger,
     clock,
     dockerHost,
+    view,
   };
 }
 
@@ -237,6 +249,29 @@ describe('Sidebar', () => {
     expect(h.models[h.models.length - 1]).toEqual([]);
     expect(h.docker.isRunning).not.toHaveBeenCalled();
     expect(h.docker.isInstalled).not.toHaveBeenCalled();
+  });
+
+  // A freshly opened or reconnecting window refreshes before the view is shown; VS Code rejects the view location then
+  // ("Bad progress location").
+  it('shows the refresh progress in the status bar while the view is not visible, and in the view once it is', async () => {
+    const locations: unknown[] = [];
+    fakeVscode.window.withProgress.mockImplementation(async (options: { location: unknown }, task: () => Promise<unknown>) => {
+      locations.push(options.location);
+      return task();
+    });
+    await signedIn();
+    expect(locations.length).toBeGreaterThan(0);
+    expect(locations.every((location) => location === fakeVscode.ProgressLocation.Window)).toBe(true);
+    locations.length = 0;
+    h.view.visible = true;
+    await h.sidebar.refreshDiscovery({ again: true });
+    expect(locations).toEqual([{ viewId: 'devEnvironments.repositories' }]);
+  });
+
+  it('uses the status bar for the progress while no view is registered', () => {
+    expect(viewProgressLocation(undefined)).toBe(fakeVscode.ProgressLocation.Window);
+    expect(viewProgressLocation({ visible: false })).toBe(fakeVscode.ProgressLocation.Window);
+    expect(viewProgressLocation({ visible: true })).toEqual({ viewId: 'devEnvironments.repositories' });
   });
 
   it('shows the stored list at once and marks the view as loaded, then refreshes in the background', async () => {
