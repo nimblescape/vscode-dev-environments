@@ -39,7 +39,7 @@ import {
   imageReferenceFinding,
   isHelperPath,
   localContextPath,
-  refusedVariableItem,
+  refusedVariable,
   securityOptionProblems,
   volumeNameFindings,
   type HostAccessClass,
@@ -210,8 +210,9 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
     if (!ctx.isDev) return [];
     const names = isRecord(value) ? Object.keys(value) : listOf(value).map((entry) => String(entry).split('=')[0]);
     return names.flatMap((name) => {
-      const item = refusedVariableItem(name.trim(), 'environment');
-      return item === undefined ? [] : [guarded(item)];
+      // The rules of containerEnv (refusedVariable), also for the part of a name before a `=` (merge of #27).
+      const problem = refusedVariable(String(name), 'environment');
+      return problem === undefined ? [] : [problem];
     });
   },
   env_file: envFileProblems,

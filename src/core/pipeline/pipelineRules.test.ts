@@ -5,6 +5,7 @@
 import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
+import { helperCliVariables } from '../helper/cliVariables';
 import {
   baseImageKey,
   composeContainerOrder,
@@ -29,6 +30,7 @@ import {
   isRepositoryName,
   isUnrestrictedContainer,
   isRootUser,
+  MAX_REFUSED_ITEMS_LENGTH,
   lifecycleHookFailure,
   lifecycleHookName,
   needsBuild,
@@ -149,6 +151,16 @@ describe('refused updates (concept 7.7: a new image that the host access policy 
     expect(refusedUpdateOf({ refusedUpdate: { ...refused, images: { a: 1 } } })).toBeUndefined();
     expect(refusedUpdateOf({ refusedUpdate: { ...refused, items: undefined } })).toBeUndefined();
     expect(refusedUpdateOf({ refusedUpdate: 'x' })).toBeUndefined();
+  });
+
+  it('bounds the items of a stored refusal when they are read (hotfix review 4, Q3)', () => {
+    // 100 KB, as an older version stored them.
+    const items = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
+    const read = refusedUpdateOf({ refusedUpdate: { ...refused, items } });
+    expect(read?.items).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
+    expect(read?.items.startsWith('bind mount /aaa')).toBe(true);
+    expect(read?.items.endsWith('aaa, and 20 more')).toBe(true);
+    expect(read).toEqual({ ...refused, items: read?.items });
   });
 
   it('recognizes the same update: same configuration and digests, ignoring the case of the digests', () => {
@@ -349,6 +361,35 @@ describe('imageRemoteUser', () => {
     ['numeric users other than 0 stay', { User: 'root' }, ['-u', '1000'], '1000'],
   ])('%s', (_name, config, runArgs, expected) => {
     expect(imageRemoteUser(config, runArgs)).toBe(expected);
+  });
+
+  // hotfix review 2, P3: the CLI substitutes each entry of the label at `up` before it reads the users.
+  describe('reads the users of the label as the Dev Container CLI substitutes them', () => {
+    const variables = helperCliVariables('acme/api');
+
+    it.each<[string, unknown, readonly unknown[] | undefined, string]>([
+      ['a default of a variable that is not set in the helper', metadata([{ remoteUser: '${localEnv:DEVUSER:vscode}' }]), undefined, 'vscode'],
+      ['a default in containerUser', metadata([{ remoteUser: '' }, { containerUser: '${localEnv:NOPE:node}' }]), undefined, 'node'],
+      ['an empty result does not count (the earlier entry wins)', metadata([{ remoteUser: 'vscode' }, { remoteUser: '${localEnv:NOPE}' }]), undefined, 'vscode'],
+      ['the basename of the workspace folder', metadata([{ remoteUser: '${localWorkspaceFolderBasename}' }]), undefined, 'api'],
+      ['a containerUser with a leftover under a remoteUser', metadata([{ containerUser: '${localEnv:TERM}', remoteUser: 'vscode' }]), undefined, 'vscode'],
+      ['a containerUser with a leftover under runArgs --user', metadata([{ containerUser: '${localEnv:TERM}' }]), ['--user', 'node'], 'node'],
+    ])('%s', (_name, config, runArgs, expected) => {
+      expect(imageRemoteUser(config, runArgs, variables)).toBe(expected);
+    });
+
+    it.each<[string, unknown]>([
+      ['a remoteUser with a variable of the helper whose value is not known', metadata([{ remoteUser: '${localEnv:TERM:vscode}' }])],
+      ['a containerUser with such a variable', metadata([{ containerUser: '${env:HOSTNAME}' }])],
+      ['${containerEnv:…}', metadata([{ remoteUser: '${containerEnv:USER}' }])],
+    ])('is not known for %s', (_name, config) => {
+      expect(imageRemoteUser(config, undefined, variables)).toBeUndefined();
+    });
+
+    it('uses the variables of the workspace helper without the variables of the pipeline', () => {
+      expect(imageRemoteUser(metadata([{ remoteUser: '${localEnv:DEVUSER:vscode}' }]))).toBe('vscode');
+      expect(imageRemoteUser(metadata([{ remoteUser: '${localEnv:TERM:vscode}' }]))).toBeUndefined();
+    });
   });
 });
 

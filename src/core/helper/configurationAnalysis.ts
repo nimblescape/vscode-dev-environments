@@ -11,6 +11,7 @@
 import { collectReferences, type ConfigReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
 import { composeReferences } from './compose';
+import { mayBeSetInHelper } from './cliVariables';
 import { composeAccessReport, composeImageReferences, type ComposeAccessInput } from './composeAccess';
 import {
   hostAccessReport,
@@ -96,6 +97,22 @@ export type AnalysisResult<J extends AnalysisJob> = AnalysisResults[J['kind']];
 /** Runs the analyses of the host access policy; a failed one resolves the refusal of analysisFailure, never rejects. */
 export interface ConfigurationAnalyzer {
   analyze<J extends AnalysisJob>(job: J): Promise<AnalysisResult<J>>;
+}
+
+/**
+ * `job` as the worker gets it (merge of #27 into the Compose branch): the structured clone of postMessage copies no
+ * function, and HostAccessInput.variables (helperCliVariables) holds `mayBeSet`. The only one that the pipeline passes is
+ * mayBeSetInHelper, which the checks use when none is given (cliVariablesOf in ./hostAccess.ts, imageRemoteUser): it is
+ * left out, the key too (a key with `undefined` would replace the default). Any other function cannot be passed: an
+ * error, which the runner reports as a job that could not be passed (the configuration is refused).
+ */
+export function transferableJob<J extends AnalysisJob>(job: J): J {
+  if (job.kind === 'compose') return job;
+  const variables = job.input.variables;
+  if (variables === undefined || !('mayBeSet' in variables)) return job;
+  const { mayBeSet, ...rest } = variables;
+  if (mayBeSet !== undefined && mayBeSet !== mayBeSetInHelper) throw new Error('HostAccessInput.variables.mayBeSet is not mayBeSetInHelper');
+  return { ...job, input: { ...job.input, variables: rest } };
 }
 
 /** Runs a job in this thread (the worker runs it with runAnalysisJob too). Throws what the analysis throws. */

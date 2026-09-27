@@ -32,7 +32,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * does no harm or where the host access policy decides. Text in comments is ignored.
  *
  * `${localWorkspaceFolderBasename}` is not reported: in the helper the CLI resolves it to the repository name, which is
- * the name of a local clone too.
+ * the name of a local clone too. For a repository named `*.code-workspace`, read-configuration and build read the folder
+ * as a workspace file and resolve it to `workspaces`, while `up` resolves it to the repository name (hotfix review 5,
+ * A5-1). The host access policy checks the mounts of the image metadata with the value that `up` uses
+ * (helperCliVariables).
  */
 export function checkConfiguration(configText: string): ConfigurationProblems {
   let config: Record<string, unknown> | undefined;

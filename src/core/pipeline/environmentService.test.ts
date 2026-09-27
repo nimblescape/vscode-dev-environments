@@ -39,7 +39,7 @@ import {
 } from '../names';
 import { abortError } from '../ports';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
-import { PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
+import { MAX_REFUSED_ITEMS_LENGTH, PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -388,6 +388,44 @@ describe('open: first open', () => {
     expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['--user', 'node:staff']));
     expect(h.docker.runs).toHaveLength(1);
     expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'node']);
+  });
+
+  // hotfix review 2, P3: the CLI substitutes the label at `up` before it reads the remote user.
+  describe('a remote user of the label with a variable', () => {
+    const labelUser = (remoteUser: string): void => {
+      const { remoteUser: _remoteUser, ...config } = h.helper.config;
+      h.helper.config = config;
+      const build = h.helper.build.bind(h.helper);
+      h.helper.build = async (p) => {
+        const result = await build(p);
+        h.docker.imageConfigs.set(p.imageName, imageConfigWithUser(remoteUser));
+        return result;
+      };
+    };
+
+    it('gives the cloned files to the user that the CLI resolves before up', async () => {
+      labelUser('${localEnv:DEVUSER:vscode}');
+      await h.service.open(TARGET, options());
+      expect(h.docker.runs).toHaveLength(1);
+      expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    });
+
+    it('skips the fix before up when the user is not known, and gives the files to the user that up reports', async () => {
+      labelUser('${localEnv:TERM:vscode}');
+      await h.service.open(TARGET, options());
+      expect(h.docker.runs).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('is not known before the container is created'))).toBe(true);
+      expect(h.docker.execs.find((e) => e.user === 'root')?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    });
+
+    it('does not store the text of the label as the remote user after a failed lifecycle command', async () => {
+      labelUser('${localEnv:TERM:vscode}');
+      h.helper.lifecycleFailure = () => 'postCreateCommand from devcontainer.json failed.';
+      await h.service.open(TARGET, options());
+      const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
+      expect(env.remoteUser).toBeUndefined();
+      expect(h.docker.execs.some((e) => e.command.includes('${localEnv:TERM:vscode}'))).toBe(false);
+    });
   });
 
   it('continues when the files cannot be given to the remote user before up', async () => {
@@ -3208,6 +3246,46 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.ui.warnings).toEqual([REFUSED]);
       expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
     });
+
+    it('keeps a bounded text of what it needed, also for many long items (hotfix review 3, C3-2)', async () => {
+      // 40 long bind mounts (access to the computer) and 40 long mounts with a leftover variable (unsupported): 21 items
+      // of each list, each at most 200 characters, are still more than MAX_REFUSED_ITEMS_LENGTH together.
+      const binds = Array.from({ length: 40 }, (_, i) => ({ source: `/${i}${'a'.repeat(5000)}`, target: `/t${i}`, type: 'bind' }));
+      const leftovers = Array.from({ length: 40 }, (_, i) => `type=volume,src=\${localEnv:TERM:v${i}${'b'.repeat(5000)}},dst=/v${i}`);
+      h.helper.buildMetadata = [{ id: 'many-mounts', mounts: [...binds, ...leftovers] }];
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      await h.service.openEnvironment(ENV_ID, options());
+      const items = ((await refusedUpdate()) as { items: string }).items;
+      expect(items.length).toBe(MAX_REFUSED_ITEMS_LENGTH + 1);
+      expect(items.startsWith(`bind mount /0${'a'.repeat(80)}`)).toBe(true);
+      // The start and the end stay: the first item that needs the computer, and the count of the unknown items.
+      expect(items.endsWith(', and 20 more')).toBe(true);
+      expect(items).toContain('…');
+      expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
+    });
+
+    it('bounds a stored refusal with long items when it is read, logged, shown, and kept (hotfix review 4, Q3)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      await h.service.openEnvironment(ENV_ID, options());
+      // 100 KB of items, as an older version stored them without a bound.
+      const long = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
+      await h.registry.updateEnvironment(ENV_ID, (e) => {
+        if (e.refusedUpdate) e.refusedUpdate.items = long;
+      });
+      h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+      h.ui.warnings.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(1);
+      expect(h.ui.warnings).toHaveLength(1);
+      expect(h.ui.warnings[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
+      expect(h.ui.warnings[0]).toContain('…');
+      const logged = h.logger.infos.filter((line) => line.includes('was refused by the host access policy'));
+      expect(logged).toHaveLength(1);
+      expect(logged[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
+      const stored = ((await refusedUpdate()) as { items: string }).items;
+      expect(stored).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
+      expect(stored.endsWith(', and 20 more')).toBe(true);
+    });
   });
 
   it('binds published ports to 127.0.0.1 in the override configuration', async () => {
@@ -3345,6 +3423,21 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-history', 'api-cache', 'feature-store'] }));
       for (const name of ['api-history', 'api-cache', 'feature-store']) expect(h.docker.volumes.has(name)).toBe(false);
       expect(h.docker.volumes.has('api-existing')).toBe(true);
+    });
+
+    // hotfix review 2, P5 (a known limit): an existing volume without labels (created by a version before the labels, or
+    // by Docker at `up`) is shared by every environment that mounts it; the pipeline names it in the log.
+    it('logs an existing volume without labels that the container mounts', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=api-node_modules,target=/n,type=volume', 'source=api-labelled,target=/l,type=volume'] };
+      h.docker.volumes.set('api-node_modules', {});
+      h.docker.volumes.set('api-labelled', { 'com.example': 'x' });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(h.logger.infos.filter((line) => line.includes('without labels'))).toEqual([
+        expect.stringContaining('The volume api-node_modules exists without labels'),
+      ]);
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toBeUndefined();
     });
 
     it('creates no volume when the container exists already', async () => {

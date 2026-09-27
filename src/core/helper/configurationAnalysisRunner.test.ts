@@ -13,7 +13,16 @@ import { Worker } from 'worker_threads';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
 import type { ComposeAccessInput } from './composeAccess';
-import { ANALYSIS_FAILED_ITEM, analysisFailure, analysisInternalItem, inProcessAnalyzer, runAnalysisJob, type AnalysisJob } from './configurationAnalysis';
+import { helperCliVariables, mayBeSetInHelper } from './cliVariables';
+import {
+  ANALYSIS_FAILED_ITEM,
+  analysisFailure,
+  analysisInternalItem,
+  inProcessAnalyzer,
+  runAnalysisJob,
+  transferableJob,
+  type AnalysisJob,
+} from './configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from './configurationAnalysisRunner';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
@@ -291,6 +300,26 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect(result.failure).toEqual({ kind: 'limit', reason: 'it took longer than 300 ms' });
     const early = await new WorkerConfigurationAnalyzer(file, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 1 }).analyze(job);
     expect(early.failure).toEqual({ kind: 'internal', reason: 'the worker did not start within 1 ms' });
+  });
+
+  it('passes the variables of the Dev Container CLI to the worker (merge of #27: postMessage copies no function)', async () => {
+    const variables = helperCliVariables('acme/api');
+    const input = {
+      ownVolume: OWN,
+      variables,
+      metadata: [{ mounts: ['source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind', 'source=${localEnv:TERM}-x,target=/x,type=volume'] }],
+    };
+    const job: AnalysisJob = { kind: 'hostAccess', checksOn: true, input };
+    const result = await analyzer().analyze(job);
+    expect(result.failure).toBeUndefined();
+    expect(result.report).toEqual(runAnalysisJob(job).report);
+    expect(result.report.hostAccess).toEqual(['bind mount /root/.ssh']);
+    // The job of the caller keeps its function; only the copy for the worker is without it.
+    expect(transferableJob(job)).toEqual({ ...job, input: { ...input, variables: { localWorkspaceFolder: REPO, containerWorkspaceFolder: REPO, env: variables.env } } });
+    expect(job.input.variables?.mayBeSet).toBe(mayBeSetInHelper);
+    // Another function is not passed: the job is refused (it cannot be checked as the caller meant it).
+    const other: AnalysisJob = { kind: 'hostAccess', checksOn: true, input: { ...input, variables: { ...variables, mayBeSet: () => true } } };
+    expect((await analyzer().analyze(other)).failure?.kind).toBe('internal');
   });
 
   it('is built by esbuild.mjs and included in the package', () => {

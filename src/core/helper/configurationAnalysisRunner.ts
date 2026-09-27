@@ -23,6 +23,7 @@ import {
   exceedsJobSize,
   isAnalysisResult,
   thrownFailure,
+  transferableJob,
   type AnalysisFailureKind,
   type AnalysisJob,
   type AnalysisResult,
@@ -136,7 +137,8 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
         if (!done && worker !== undefined) watch = this.watchMemory(worker, () => fail('it used too much memory', 'limit'));
       });
       try {
-        worker.postMessage(job);
+        // Without the function of the variables of the CLI (transferableJob), which postMessage cannot copy.
+        worker.postMessage(transferableJob(job));
       } catch (error) {
         fail(`the job could not be passed: ${String(error)}`);
       }

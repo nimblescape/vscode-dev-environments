@@ -10,7 +10,8 @@ import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';
 import { composeMountVolumeName } from '../helper/compose';
-import { isAnonymousVolumeName, runArgsUser } from '../helper/hostAccess';
+import { isAnonymousVolumeName, runArgsUser, truncated } from '../helper/hostAccess';
+import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessChecks } from '../hostAccessChecks';
 import {
@@ -62,7 +63,16 @@ export function isUnrestrictedContainer(labels: Readonly<Record<string, string>>
   return labels[LABEL_HOST_ACCESS] === HOST_ACCESS_UNRESTRICTED;
 }
 
-/** The field `refusedUpdate` of a registry entry, when it is valid. */
+/**
+ * The most characters of the text `items` of a refused update (hotfix review 3, C3-2): it is kept in the registry, and
+ * an error message that is no HostAccessError has no bound of its own. The middle is `…` (truncated).
+ */
+export const MAX_REFUSED_ITEMS_LENGTH = 4096;
+
+/**
+ * The field `refusedUpdate` of a registry entry, when it is valid. Its items at most MAX_REFUSED_ITEMS_LENGTH
+ * characters (hotfix review 4, Q3): an older version stored them without a bound, and they are logged and shown.
+ */
 export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
   const value: unknown = (entry as { refusedUpdate?: unknown }).refusedUpdate;
   if (
@@ -81,7 +91,7 @@ export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
     configHash: value.configHash,
     images: value.images,
     features: value.features,
-    items: value.items,
+    items: truncated(value.items, MAX_REFUSED_ITEMS_LENGTH),
   };
   if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
   // Review round 10 (P10-3).
@@ -348,12 +358,25 @@ export function containerUserName(user: string): string {
  * of the image. The remote user is the last `remoteUser` of the metadata, else that container user, else root; of
  * `user:group` only the user part counts, and `0` is root (containerUserName). `imageConfig` is `Config` of `docker
  * image inspect`; `runArgs` are those that `up` passes to Docker (the override configuration).
+ * The CLI substitutes each entry of the label at `up` before it reads the users (hotfix review 2, P3), so they are read
+ * substituted with `variables` (helperCliVariables in the pipeline; by default the variables of the process of the
+ * workspace helper, HELPER_KNOWN_ENV and mayBeSetInHelper). `undefined` when the user that decides holds a variable
+ * whose value is not known (a variable of the helper process that may be set, `${containerEnv:…}`): the caller then
+ * relies on the remote user that `up` reports.
  */
-export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown[]): string {
+export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown[], variables?: CliVariables): string | undefined {
   const config = isRecord(imageConfig) ? imageConfig : {};
   const labels = isRecord(config.Labels) ? config.Labels : {};
-  let remoteUser: string | undefined;
-  let containerUser: string | undefined;
+  const cliVariables: CliVariables = { env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper, ...variables };
+  // A user of an entry as the CLI substitutes it; `unknown` when a leftover of the substitution is in it.
+  type LabelUser = { user: string; unknown: boolean };
+  const labelUser = (value: unknown): LabelUser | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const { value: user, leftovers } = resolveCliVariables(value, cliVariables);
+    return nonEmptyString(user) === undefined ? undefined : { user, unknown: leftovers.length > 0 };
+  };
+  let remoteUser: LabelUser | undefined;
+  let containerUser: LabelUser | undefined;
   const metadata = labels['devcontainer.metadata'];
   if (typeof metadata === 'string') {
     let entries: unknown;
@@ -364,13 +387,16 @@ export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown
     }
     for (const entry of Array.isArray(entries) ? entries : [entries]) {
       if (!isRecord(entry)) continue;
-      remoteUser = nonEmptyString(entry.remoteUser) ?? remoteUser;
-      containerUser = nonEmptyString(entry.containerUser) ?? containerUser;
+      remoteUser = labelUser(entry.remoteUser) ?? remoteUser;
+      containerUser = labelUser(entry.containerUser) ?? containerUser;
     }
   }
+  if (remoteUser !== undefined) return remoteUser.unknown ? undefined : containerUserName(remoteUser.user);
+  const argsUser = runArgsUser(runArgs);
+  if (argsUser !== undefined) return containerUserName(argsUser);
+  if (containerUser !== undefined) return containerUser.unknown ? undefined : containerUserName(containerUser.user);
   const imageUser = typeof config.User === 'string' ? nonEmptyString(config.User) : undefined;
-  const runUser = runArgsUser(runArgs) ?? containerUser ?? imageUser;
-  return containerUserName(remoteUser ?? runUser ?? 'root');
+  return containerUserName(imageUser ?? 'root');
 }
 
 /**

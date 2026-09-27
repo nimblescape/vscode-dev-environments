@@ -44,6 +44,7 @@ import {
   type ComposeRewriteParams,
 } from '../helper/compose';
 import { composeConfigurationReport, composeIgnoredProperties, composeMissingBuildPaths } from '../helper/composeAccess';
+import { helperCliVariables } from '../helper/cliVariables';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import {
   ANALYSIS_FAILED_ITEM,
@@ -71,6 +72,7 @@ import {
   removedRunArgs,
   resolveNetworkReference,
   runArgsNetworks,
+  truncated,
   volumeLabelOwner,
   type HostAccessInput,
   type HostAccessReport,
@@ -180,6 +182,7 @@ import {
   nonEmptyString,
   recordDigests,
   refusedUpdateOf,
+  MAX_REFUSED_ITEMS_LENGTH,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
@@ -390,6 +393,9 @@ export interface EnvironmentRuntimeState {
    */
   servicesRunning?: boolean;
 }
+
+/** MAX_REFUSED_ITEMS_LENGTH of ./pipelineRules (hotfix review 3, C3-2; review 4, Q3). */
+export { MAX_REFUSED_ITEMS_LENGTH };
 
 const BUSY_POLL_MS = 500;
 const DEFAULT_BUSY_WAIT_MS = 10_000;
@@ -1894,6 +1900,9 @@ export class EnvironmentService {
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
         delete entry.refusedUpdate;
+      } else if (refused !== undefined && entry.refusedUpdate !== undefined) {
+        // The items bounded as they are read (hotfix review 4, Q3): an older version stored them without a bound.
+        entry.refusedUpdate.items = refused.items;
       }
     });
   }
@@ -2247,7 +2256,8 @@ export class EnvironmentService {
     error: unknown,
     reason?: 'size',
   ): Promise<void> {
-    const items = error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error);
+    // At most MAX_REFUSED_ITEMS_LENGTH characters (hotfix review 3, C3-2): the text is kept in the registry.
+    const items = truncated(error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error), MAX_REFUSED_ITEMS_LENGTH);
     this.logger.info(`The existing environment of ${ctx.env.repository} is started without the update. A changed digest or configuration tries it again.`);
     this.deps.ui.warn(reason === 'size' ? Messages.updateTooLarge(items) : Messages.updateRefused(items));
     if (check.kind !== 'checked') return;
@@ -2579,11 +2589,12 @@ export class EnvironmentService {
       // Review round 4 (D4-2): reconcileFromVolumes restores the configuration path from it.
       configPath: env.configPath,
     });
-    // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
-    // pass the policy too (the check of the configuration covers them as the repository wrote them).
+    // Concept section 9 "Host access": the arguments and published ports that Docker gets, after the changes of the
+    // override configuration, pass the policy too (the check of the configuration covers them as read-configuration
+    // returned them; the CLI substitutes both again at `up`, hotfix review 1).
     let finalRunArgs: HostAccessReport;
     try {
-      finalRunArgs = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: { runArgs: override.runArgs }, overrideConfiguration: true }), checksOn);
+      finalRunArgs = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: { runArgs: override.runArgs, appPort: override.appPort }, overrideConfiguration: true }), checksOn);
     } catch (error) {
       // Review round 9 (P9-2): `up` only starts the existing container, which passed the check when it was created, and
       // applies no runArgs: an analysis that could not run does not keep it from starting.
@@ -2602,7 +2613,11 @@ export class EnvironmentService {
     await this.requireVolume(env);
     if (createsContainer) {
       const metadataVolumes = await this.checkImageHostAccess(ctx, image);
-      const configVolumes = mountedVolumeNames({ ownVolume: env.volumeName, config: { mounts: config?.mounts, runArgs: dockerRunArgs } });
+      const configVolumes = mountedVolumeNames({
+        ownVolume: env.volumeName,
+        config: { mounts: config?.mounts, runArgs: dockerRunArgs },
+        variables: helperCliVariables(env.repository),
+      });
       await this.createAdditionalVolumes(ctx, [...configVolumes, ...metadataVolumes]);
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
@@ -3040,7 +3055,15 @@ export class EnvironmentService {
     const env = ctx.env;
     const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
     if (candidates.length === 0) return;
-    const existing = new Set((await this.deps.docker.inspectVolumes(candidates)).map((volume) => volume.name));
+    const inspected = await this.deps.docker.inspectVolumes(candidates);
+    const existing = new Set(inspected.map((volume) => volume.name));
+    // hotfix review 2, P5 (a known limit, docs/container-restrictions.md): an existing volume without labels is nobody's,
+    // so every environment that mounts it by the same name shares it, also of another account.
+    for (const volume of inspected) {
+      if (Object.keys(volume.labels).length === 0) {
+        this.logger.info(`The volume ${volume.name} exists without labels (created by an older version or by Docker at a start): it is not the environment's, and every environment that mounts it shares it.`);
+      }
+    }
     for (const name of candidates) {
       if (existing.has(name)) continue;
       this.throwIfCancelled(ctx.signal);
@@ -3089,7 +3112,9 @@ export class EnvironmentService {
     this.deps.ui.warn(PipelineTexts.lifecycleCommandFailed(lifecycleHookName(description)));
     if (nonEmptyString(result.remoteUser) !== undefined) return result;
     try {
-      return { ...result, remoteUser: await this.imageUser(image, runArgs, ctx.signal) };
+      // Not known when the label names it with a variable whose value is not known (hotfix review 2, P3): then none.
+      const remoteUser = await this.imageUser(ctx, image, runArgs);
+      return remoteUser === undefined ? result : { ...result, remoteUser };
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The remote user of ${image} could not be read: ${errorMessage(error)}`);
@@ -3099,10 +3124,11 @@ export class EnvironmentService {
 
   /**
    * The user that `devcontainer up` gives a container of `image` with the `runArgs` that it passes to Docker (label
-   * devcontainer.metadata, `--user` of the runArgs, and the user of the image; see imageRemoteUser).
+   * devcontainer.metadata, as the CLI substitutes it at `up`, `--user` of the runArgs, and the user of the image; see
+   * imageRemoteUser). `undefined` when it depends on a variable whose value is not known.
    */
-  private async imageUser(image: string, runArgs: readonly string[], signal: AbortSignal | undefined): Promise<string> {
-    return imageRemoteUser(await this.imageConfig(image, signal), runArgs);
+  private async imageUser(ctx: PipelineContext, image: string, runArgs: readonly string[]): Promise<string | undefined> {
+    return imageRemoteUser(await this.imageConfig(image, ctx.signal), runArgs, helperCliVariables(ctx.env.repository));
   }
 
   /** `Config` of `docker image inspect`. */
@@ -3127,7 +3153,8 @@ export class EnvironmentService {
     moreVolumes: readonly string[] = [],
     moreNetworks: readonly string[] = [],
   ): Promise<HostAccessInput> {
-    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
+    // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables).
+    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository) };
     const file = await this.deps.registry.read();
     const otherOwner = (owner: GitHubAccount | undefined) => owner === undefined || owner.id !== env.owner?.id;
     const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));
@@ -3447,7 +3474,12 @@ export class EnvironmentService {
     const env = ctx.env;
     const folder = repositoryFolder(env.repository);
     try {
-      const user = await this.imageUser(image, runArgs, ctx.signal);
+      const user = await this.imageUser(ctx, image, runArgs);
+      if (user === undefined) {
+        // hotfix review 2, P3: the fix after `up` gives the files to the remote user that `up` reports.
+        this.logger.info(`The remote user of ${image} is not known before the container is created (the label devcontainer.metadata names it with a variable of the Dev Container CLI): the files in ${folder} get their owner after the start.`);
+        return;
+      }
       if (isRootUser(user)) return;
       this.logger.info(`Giving the files in ${folder} to ${user} before the container is created.`);
       // Review round 9 (D9-1): after a new clone, no service has run on the files yet: every file gets its owner (also the

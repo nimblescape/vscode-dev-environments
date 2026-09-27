@@ -2635,6 +2635,27 @@ describe('review round 15 of unit 6 (K1, K2): the `mounts` of a Compose configur
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
   });
+
+  it('checks the label with the variables of the CLI substituted, as for a single container (merge of #27, review round 16, L3)', async () => {
+    h.helper.buildMetadata = [
+      {
+        id: 'ghcr.io/acme/features/cache:1',
+        mounts: ['source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume'],
+      },
+    ];
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('refuses a variable of the label that is left after the substitution with the item of #27, not as written differently', async () => {
+    const mount = 'source=${localEnv:TERM}-x,target=/x,type=volume';
+    h.helper.buildMetadata = [{ id: 'ghcr.io/acme/features/term:1', mounts: [mount] }];
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(`mount ${JSON.stringify(mount)} uses \${localEnv:TERM}, which cannot be checked`);
+    expect(error.message).not.toContain(REWRITTEN(mount));
+    expect(h.helper.ups).toEqual([]);
+  });
 });
 
 describe('review round 15 of unit 6 (K3, K4): the ownership fixes after up', () => {

@@ -9,6 +9,7 @@
 import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
 import { CONFIG_FOLDER } from '../names';
+import { helperCliVariables } from './cliVariables';
 import { hostAccessReport, type HostAccessInput } from './hostAccess';
 
 const OWN = 'devenv-api-12345678';
@@ -209,6 +210,50 @@ describe('review round 15 (K1, K2): Compose `mounts` as the Dev Container CLI wr
       for (const where of ['metadata', 'config'] as const) {
         expect(refused(where, mount, true), `${where} ${JSON.stringify(mount)} → ${text}`).toBe(true);
       }
+    }
+  });
+});
+
+// Review round 16 (L3), after the merge of #27: the Compose reading of `mounts` saw the label devcontainer.metadata as it
+// is written, so every `$` of a variable of the Dev Container CLI in the image metadata was refused. With #27 the entries
+// of the metadata are substituted first (resolvedInput, helperCliVariables), exactly as for a single container, and a
+// leftover variable is decided by #27's rules (mountEntries, on the raw strings).
+describe('review round 16 (L3): the Compose reading of the image metadata sees the substituted label', () => {
+  const variables = helperCliVariables('acme/api');
+  const metadata = (mount: unknown, checksOn = true) =>
+    hostAccessReport({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }], composeMounts: true }, checksOn);
+
+  it('allows the usual volumes of the label with variables of the CLI', () => {
+    for (const mount of [
+      'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume',
+      { source: '${localWorkspaceFolderBasename}-cache', target: '/cache', type: 'volume' },
+      'source=${localEnv:DEVUSER:cache}-x,target=/x,type=volume',
+      'source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume',
+    ]) {
+      expect(metadata(mount), JSON.stringify(mount)).toEqual({ hostAccess: [], unsupported: [] });
+    }
+  });
+
+  it('reads a bind mount of a known variable as the bind mount that Compose gets (access to the computer)', () => {
+    const mount = 'source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind';
+    expect(metadata(mount)).toEqual({ hostAccess: ['bind mount /root/.ssh'], unsupported: [] });
+    expect(metadata(mount, false)).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  it('refuses a leftover variable with the item of #27 only, whatever the switch says', () => {
+    for (const checksOn of [true, false]) {
+      expect(metadata('source=${localEnv:TERM}-x,target=/x,type=volume', checksOn)).toEqual({
+        hostAccess: [],
+        unsupported: ['mount "source=${localEnv:TERM}-x,target=/x,type=volume" uses ${localEnv:TERM}, which cannot be checked'],
+      });
+    }
+  });
+
+  it('still refuses a `$` that is left after the substitution (Compose would interpolate it)', () => {
+    for (const mount of ['type=volume,src=${localEnv:DEVUSER:$x},dst=/a', 'type=volume,src=foo,dst=/a$b', { type: 'volume', source: 'foo$$', target: '/a' }]) {
+      expect(metadata(mount, false).unsupported, JSON.stringify(mount)).toEqual([
+        expect.stringContaining('is written differently by the Dev Container CLI and is not supported'),
+      ]);
     }
   });
 });

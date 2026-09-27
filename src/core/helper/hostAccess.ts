@@ -50,6 +50,20 @@ import {
   isDevContainersCloneVolumeName,
   LOCAL_PORT_HOST_SETTING,
 } from '../devContainers';
+import {
+  DEVCONTAINER_ID_PLACEHOLDER,
+  HELPER_KNOWN_ENV,
+  MAX_CLI_SOURCE_LENGTH,
+  MAX_CLI_TEXT_LENGTH,
+  SECOND_PASS_VARIABLE_NAMES,
+  containsText,
+  mayBeSetInHelper,
+  resolveCliVariables,
+  textLengths,
+  unresolvedCliVariables,
+  withDevcontainerIdPlaceholder,
+  type CliVariables,
+} from './cliVariables';
 import { GITHUB_CLI_ACCOUNT_REASON, isContainerGitVariable, isGitHubCliAccountVariable } from './containerGit';
 
 export interface HostAccessInput {
@@ -115,6 +129,16 @@ export interface HostAccessInput {
    * too.
    */
   composeMounts?: boolean;
+  /**
+   * The variables of the Dev Container CLI at `up` (helperCliVariables in ./cliVariables.ts): the image metadata is
+   * checked as the CLI substitutes it before it passes it to Docker, with the repository folder for
+   * `${localWorkspaceFolder}`, as `up` uses it for every repository name (hotfix review 5, A5-1). `config` and `merged`
+   * are the output of read-configuration, substituted once already (for a repository named `*.code-workspace` with
+   * `/workspaces`, read-configuration's folder), and are checked as they are (hotfix review 1). Without it, the
+   * workspace folders are not known, and the variables of the process are those of the workspace helper
+   * (HELPER_KNOWN_ENV, mayBeSetInHelper).
+   */
+  variables?: CliVariables;
 }
 
 /**
@@ -244,10 +268,11 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '-l': { kind: 'check', check: labelProblems },
   '--hostname': allowValue,
   '-h': allowValue,
-  // Not a variable of container-only Git (envProblems).
-  // The identity of the owner account: stays refused with the checks off.
-  '--env': checkGuarded(envProblems),
-  '-e': checkGuarded(envProblems),
+  // Not a variable of container-only Git or of the account of the GitHub CLI, also not before a `=` of the name, and no
+  // name with a space or a control character (envProblems). The identity of the owner account: stays refused with the
+  // checks off.
+  '--env': { kind: 'check', check: envProblems },
+  '-e': { kind: 'check', check: envProblems },
   // docker run reads the file in the workspace helper: only a file of the workspace volume (envFileProblems).
   '--env-file': { kind: 'check', check: envFileProblems },
   '--shm-size': allowValue,
@@ -412,7 +437,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * the items of the class `computer` (hostAccessClassification), and the published ports keep their address.
  */
 export function hostAccessProblems(input: HostAccessInput, checksOn = true): string[] {
-  return applicable(hostAccessFindings(input, checksOn), checksOn).map((problem) => problem.item);
+  return capped(applicable(hostAccessFindings(input, checksOn), checksOn).map((problem) => problem.item));
 }
 
 /**
@@ -424,7 +449,48 @@ export function hostAccessReport(input: HostAccessInput, checksOn = true): HostA
   for (const problem of applicable(hostAccessFindings(input, checksOn), checksOn)) {
     report[problem.class === 'unsupported' ? 'unsupported' : 'hostAccess'].push(problem.item);
   }
-  return report;
+  return { hostAccess: capped(report.hostAccess), unsupported: capped(report.unsupported) };
+}
+
+/**
+ * The most items that a list of a refusal names (hotfix review 2, P2): a configuration with thousands of refused
+ * entries would otherwise make a message and a log line of megabytes. The rest is counted.
+ */
+export const MAX_LISTED_ITEMS = 20;
+
+/**
+ * The most characters of one listed item or expression (hotfix review 3, C3-2): an item quotes its entry, which may be
+ * up to MAX_CLI_TEXT_LENGTH long, and the substitution of the CLI makes it longer. The middle is `…` (truncated).
+ */
+export const MAX_ITEM_LENGTH = 200;
+
+/**
+ * `text` with at most `max` characters: its start and its end, with `…` for the middle (never half of a surrogate
+ * pair). The end stays because it says why an item is refused (for example `, which cannot be checked`).
+ */
+export function truncated(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const tail = Math.floor(max / 2);
+  let headEnd = max - tail;
+  let tailStart = text.length - tail;
+  if (/[\uD800-\uDBFF]/.test(text.charAt(headEnd - 1))) headEnd--;
+  if (/[\uDC00-\uDFFF]/.test(text.charAt(tailStart))) tailStart++;
+  return `${text.slice(0, headEnd)}…${text.slice(tailStart)}`;
+}
+
+/**
+ * `items`, of which at most MAX_LISTED_ITEMS, and then `and <n> more`; each at most MAX_ITEM_LENGTH characters. Called
+ * after the items are without duplicates and the placeholder of an ID is named as the configuration writes it (add in
+ * hostAccessFindings), so that both see the whole text.
+ */
+function capped(items: readonly string[]): string[] {
+  const listed = items.slice(0, MAX_LISTED_ITEMS).map((item) => truncated(item, MAX_ITEM_LENGTH));
+  return items.length <= MAX_LISTED_ITEMS ? listed : [...listed, `and ${items.length - MAX_LISTED_ITEMS} more`];
+}
+
+/** The expressions of a leftover list for an item: at most MAX_LISTED_ITEMS, each at most MAX_ITEM_LENGTH characters, then `and <n> more`. */
+function listedVariables(expressions: readonly string[]): string {
+  return capped(expressions).join(', ');
 }
 
 /**
@@ -444,30 +510,35 @@ function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[
   return withDockerfileCache(() => readHostAccessFindings(input, checksOn));
 }
 
-function readHostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
-  const problems: Problem[] = [];
-  // Review round 8 (S8-5): the problems by their items, not a search of the list for each one.
-  const byItem = new Map<string, Problem>();
+function readHostAccessFindings(original: HostAccessInput, checksOn: boolean): Problem[] {
+  // First, and alone (hotfix review 2, P2): the other checks take more than linear time on some texts.
+  const tooLong = textLengthProblems(original);
+  if (tooLong.length > 0) return tooLong;
+  const reserved = reservedTextProblems(original);
+  if (reserved.length > 0) return reserved;
+  const input = resolvedInput(original);
+  // By item (hotfix review 2, P2: a Map, not a search of the list).
+  const problems = new Map<string, Problem>();
   const add = (found: readonly Problem[]): void => {
     for (const problem of found) {
-      const known = byItem.get(problem.item);
-      if (!known) {
-        const copy = { ...problem };
-        problems.push(copy);
-        byItem.set(copy.item, copy);
-      }
+      // The placeholder of an ID is named as the configuration writes it (resolvedInput).
+      const item = problem.item.includes(DEVCONTAINER_ID_PLACEHOLDER) ? problem.item.split(DEVCONTAINER_ID_PLACEHOLDER).join('${devcontainerId}') : problem.item;
+      const known = problems.get(item);
+      if (!known) problems.set(item, { item, class: problem.class });
       // The same text from two rules (for example the options of two mounts of one volume): the one that the switch does
       // not lift counts.
       else if (known.class === 'computer' && problem.class !== 'computer') known.class = problem.class;
     }
   };
   const volumes = volumeContext(input);
-  for (const source of configurationSources(input)) {
+  for (const { source, raw } of configurationSources(input, original)) {
     // Read as the Dev Container CLI merges them: any true-like `privileged`, and a single value in place of a list.
-    for (const mount of cliList(source.mounts)) {
-      add(mountProblems(parseMountEntry(mount), volumes));
-      // Review round 15 (K1, K2): what the Dev Container CLI writes into its compose file, as Compose reads it.
-      if (input.composeMounts === true) add(composeCliMountProblems(mount, volumes));
+    for (const { entry, leftovers } of mountEntries(source.mounts, raw, input.variables ?? {})) {
+      add(mountEntryProblems(entry, leftovers, volumes));
+      // Review round 15 (K1, K2): what the Dev Container CLI writes into its compose file, as Compose reads it. Checked on
+      // the substituted entry (resolvedInput), as mountEntryProblems checks it; a mount with leftovers is refused there
+      // already (merge of #27: the raw label of the image metadata no longer reaches this check, review round 16, L3).
+      if (input.composeMounts === true && leftovers.length === 0) add(composeCliMountProblems(entry, volumes));
     }
     if (source.privileged) add([access('privileged mode')]);
     add(accessAll(capabilityProblems(cliList(source.capAdd))));
@@ -479,28 +550,60 @@ function readHostAccessFindings(input: HostAccessInput, checksOn: boolean): Prob
     if (hasCommand(source.initializeCommand)) add([guarded('initializeCommand')]);
     add(accessAll(portHostProblems(source.customizations)));
   }
-  for (const source of [input.config, input.merged]) {
-    if (!source) continue;
-    if (Array.isArray(source.runArgs)) {
-      // The labels of Docker Compose with empty values: only those that the override configuration adds (D2-1), which the
-      // merged configuration of an existing container holds too.
-      const cleared = source === input.merged || input.overrideConfiguration === true;
-      add(runArgsFindings(source.runArgs, volumes, cleared));
-      // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
-      add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared));
+  for (const [source, written] of [
+    [input.config, original.config],
+    [input.merged, original.merged],
+  ] as const) {
+    if (!source || !written) continue;
+    if (Array.isArray(source.runArgs) && Array.isArray(written.runArgs)) {
+      // The CLI substitutes the runArgs again at `up` (secondPassProblems, on the entries as read-configuration returned
+      // them); without a variable left, the list is what Docker gets, up to the ID of the container (resolvedInput), and
+      // so is the list of the override configuration.
+      const left = secondPassProblems('runArgs', written.runArgs);
+      if (left.length > 0) add(left);
+      else {
+        // The labels of Docker Compose with empty values: only those that the override configuration adds (D2-1), which
+        // the merged configuration of an existing container holds too.
+        const cleared = source === input.merged || input.overrideConfiguration === true;
+        add(runArgsFindings(source.runArgs, volumes, cleared));
+        // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
+        add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared));
+      }
     }
-    if (source.appPort !== undefined) add(appPortProblems(source.appPort));
+    if (source.appPort !== undefined) {
+      const ports = Array.isArray(written.appPort) ? written.appPort : [written.appPort];
+      const left = secondPassProblems('appPort', ports);
+      add(left.length > 0 ? left : appPortProblems(source.appPort));
+    }
     const build = isRecord(source.build) ? source.build : undefined;
     if (build && Array.isArray(build.options)) add(buildOptionFindings(build.options));
   }
   // Not the merged configuration: for an existing container, it holds the values of the override configuration, also of
   // an earlier version of the extension. The image metadata has none of them (the build runs without it). The identity
   // of the owner account: stays refused with the checks off.
-  for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(guardedAll(environmentProblems(source)));
+  for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(environmentProblems(source));
   // The build of a single container: no folder of the workspace helper as its context or Dockerfile, and no image of
   // another environment (as image, FROM image, or additional context). Not the merged configuration: it holds the
   // values of the configuration, and the image of an existing container.
   if (input.config) add(singleBuildProblems(input.config, input));
+  return [...problems.values()];
+}
+
+/**
+ * The entries of runArgs or appPort (`what`) of the output of read-configuration that still hold a variable that the Dev
+ * Container CLI resolves (unresolvedCliVariables; `${devcontainerId}` is allowed): the CLI substitutes them a second
+ * time at `up`, when it reads the override configuration, so what Docker gets is not what the checks see (for example
+ * `${localEnv:A:$}{localEnv:B:8080}` is `${localEnv:B:8080}` after read-configuration and `8080` at `up`). Not
+ * supported, whatever the switch says (hotfix review 1). Without such an entry, the list is what Docker gets.
+ */
+function secondPassProblems(what: string, entries: readonly unknown[]): Problem[] {
+  const problems: Problem[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue;
+    // Not `${containerEnv:…}`: the CLI does not resolve it in the arguments of `docker run` (hotfix review 2, P4).
+    const left = unresolvedCliVariables(entry, SECOND_PASS_VARIABLE_NAMES);
+    if (left.length > 0) problems.push(unsupported(`${what} ${JSON.stringify(entry)} uses ${listedVariables(left)}, which cannot be checked`));
+  }
   return problems;
 }
 
@@ -1147,13 +1250,100 @@ export function imageLabelItems(image: string, labels: Readonly<Record<string, s
     .map((key) => `label ${key} of the image ${image}`);
 }
 
-/** The repository configuration, the merged configuration, and the entries of the image metadata that are objects. */
-function configurationSources(input: HostAccessInput): Record<string, unknown>[] {
-  const sources: Record<string, unknown>[] = [];
-  if (input.config) sources.push(input.config);
-  if (input.merged) sources.push(input.merged);
-  for (const entry of input.metadata ?? []) if (isRecord(entry)) sources.push(entry);
+/**
+ * Texts that are too long for the checks and the Dev Container CLI (MAX_CLI_TEXT_LENGTH, MAX_CLI_SOURCE_LENGTH; hotfix
+ * review 1, N5): not supported, whatever the switch says.
+ */
+/**
+ * DEVCONTAINER_ID_PLACEHOLDER in a text of the configuration, the merged configuration, or the image metadata, as it is
+ * written or after the first pass of the CLI: not supported, whatever the switch says (hotfix review 2, P6). The checks
+ * put it in place of `${devcontainerId}`, and skip the names of volumes with it (mountedVolumeNames).
+ */
+function reservedTextProblems(input: HostAccessInput): Problem[] {
+  const variables = cliVariablesOf(input);
+  const written = [input.config, input.merged, input.metadata];
+  const resolved = (input.metadata ?? []).map((entry) => resolveCliVariables(entry, variables).value);
+  if (![...written, resolved].some((value) => value !== undefined && containsText(value, DEVCONTAINER_ID_PLACEHOLDER))) return [];
+  return [unsupported(`the text ${DEVCONTAINER_ID_PLACEHOLDER.slice(0, 25)}…, which Dev Environments uses in place of \${devcontainerId}`)];
+}
+
+function textLengthProblems(input: HostAccessInput): Problem[] {
+  const problems: Problem[] = [];
+  const sources: Array<[string, unknown]> = [
+    ['the configuration', input.config],
+    ['the merged configuration', input.merged],
+    ['the image metadata', input.metadata],
+  ];
+  for (const [name, value] of sources) {
+    if (value === undefined) continue;
+    const { longest, total } = textLengths(value);
+    if (longest > MAX_CLI_TEXT_LENGTH) problems.push(unsupported(`a text longer than ${MAX_CLI_TEXT_LENGTH / 1024} KB in ${name}`));
+    else if (total > MAX_CLI_SOURCE_LENGTH) problems.push(unsupported(`more than ${MAX_CLI_SOURCE_LENGTH / 1024 / 1024} MB of text in ${name}`));
+  }
+  return problems;
+}
+
+/**
+ * `input` as Dev Container CLI 0.89.0 passes it to Docker at `up` (concept section 9 "Host access"): each entry of the
+ * image metadata with the variables `${…}` resolved (resolveCliVariables), because the CLI substitutes every entry of
+ * the label devcontainer.metadata once at `up`, also one that the Dockerfile of the repository set with LABEL. A
+ * variable of the process whose value is not known stays as written (a leftover, mountEntries). The configuration and
+ * the merged configuration are the output of read-configuration, which the CLI has substituted already: they stay as
+ * they are (hotfix review 1). Their runArgs and appPort, which the CLI substitutes again at `up`, may hold no variable
+ * (secondPassProblems). Then, in all of them, every expression named `devcontainerId` (also with arguments) is
+ * DEVCONTAINER_ID_PLACEHOLDER, as the second pass of the CLI (tg) makes it the ID of the container (hotfix review 2, P6).
+ */
+function resolvedInput(input: HostAccessInput): HostAccessInput {
+  const variables = cliVariablesOf(input);
+  return {
+    ...input,
+    variables,
+    config: input.config && withDevcontainerIdPlaceholder(input.config),
+    merged: input.merged && withDevcontainerIdPlaceholder(input.merged),
+    metadata: input.metadata && input.metadata.map((entry) => withDevcontainerIdPlaceholder(resolveCliVariables(entry, variables).value)),
+  };
+}
+
+/** The variables of the CLI for `input`: those of the workspace helper (HELPER_KNOWN_ENV, mayBeSetInHelper), and the given ones. */
+function cliVariablesOf(input: HostAccessInput): CliVariables {
+  return { env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper, ...input.variables };
+}
+
+/**
+ * The repository configuration, the merged configuration, and the entries of the image metadata that are objects, as
+ * resolvedInput made them (`source`), each metadata entry with the entry as the label writes it (`raw`, from
+ * `original`, at the same index).
+ */
+function configurationSources(input: HostAccessInput, original: HostAccessInput): Array<{ source: Record<string, unknown>; raw?: Record<string, unknown> }> {
+  const sources: Array<{ source: Record<string, unknown>; raw?: Record<string, unknown> }> = [];
+  if (input.config) sources.push({ source: input.config });
+  if (input.merged) sources.push({ source: input.merged });
+  (input.metadata ?? []).forEach((entry, index) => {
+    const raw = original.metadata?.[index];
+    if (isRecord(entry) && isRecord(raw)) sources.push({ source: entry, raw });
+  });
   return sources;
+}
+
+/**
+ * The mounts of a source (cliList), each with its leftovers: for an entry of the image metadata (`raw` given), the
+ * leftovers of the first pass of the CLI on the raw strings (resolveCliVariables), those of the string, or, for the
+ * object form, the union over its fields `type`, `source`, and `target`, each on its own, never of the joined text
+ * (hotfix review 2, P1). substituteCliVariables keeps the structure of the entry, so the raw mount is at the same index.
+ * For the configuration and the merged configuration, which the CLI has substituted already and passes on as they are,
+ * the variables of the text (unresolvedCliVariables).
+ */
+function mountEntries(mounts: unknown, raw: Record<string, unknown> | undefined, variables: CliVariables): Array<{ entry: unknown; leftovers: string[] }> {
+  const entries = cliList(mounts);
+  if (raw === undefined) return entries.map((entry) => ({ entry, leftovers: unresolvedCliVariables(mountText(entry)) }));
+  const written = Array.isArray(raw.mounts) ? raw.mounts : [raw.mounts];
+  return entries.map((entry, index) => {
+    const rawEntry = written[index];
+    const fields = isRecord(rawEntry) ? [rawEntry.type, rawEntry.source, rawEntry.target] : [rawEntry];
+    const leftovers = new Set<string>();
+    for (const field of fields) for (const expression of resolveCliVariables(field, variables).leftovers) leftovers.add(expression);
+    return { entry, leftovers: [...leftovers] };
+  });
 }
 
 function volumeContext(input: VolumeInput): VolumeContext {
@@ -1186,35 +1376,46 @@ function hasCommand(value: unknown): boolean {
   return true;
 }
 
+/** A space, a line break, or another control character in the name of a variable. */
+const INVALID_VARIABLE_NAME = /[\s\p{Cc}]/u;
+
 /**
- * The item of a variable that a configuration may not set, or `undefined` when it may: a variable of container-only Git
- * (isContainerGitVariable), named alone, or a variable that chooses the account of the GitHub CLI
- * (isGitHubCliAccountVariable), with the reason. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
+ * The problem of a variable that a configuration may not set, or `undefined` when it may: a variable of container-only
+ * Git (isContainerGitVariable), named alone, or a variable that chooses the account of the GitHub CLI
+ * (isGitHubCliAccountVariable), with the reason (both `protected`); or a name with a space or a control character
+ * (`unsupported`: Docker and the environment of a process would not read it as one name). The rules apply to the part of
+ * `name` before the first `=`, without surrounding spaces: Docker passes a `containerEnv` key `GH_TOKEN=x` as
+ * `GH_TOKEN=x=<value>`, which sets GH_TOKEN. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
  */
-export function refusedVariableItem(name: string, where: string): string | undefined {
-  if (isContainerGitVariable(name)) return `variable ${name} in ${where}`;
-  if (isGitHubCliAccountVariable(name)) return `variable ${name} in ${where} (${GITHUB_CLI_ACCOUNT_REASON})`;
+export function refusedVariable(name: string, where: string): Problem | undefined {
+  const index = name.indexOf('=');
+  const variable = (index < 0 ? name : name.slice(0, index)).trim();
+  if (isContainerGitVariable(variable)) return guarded(`variable ${variable} in ${where}`);
+  if (isGitHubCliAccountVariable(variable)) return guarded(`variable ${variable} in ${where} (${GITHUB_CLI_ACCOUNT_REASON})`);
+  if (INVALID_VARIABLE_NAME.test(index < 0 ? name : name.slice(0, index))) {
+    return unsupported(`variable ${JSON.stringify(name)} in ${where} (a name with a space or a control character)`);
+  }
   return undefined;
 }
 
 /**
  * The variables of container-only Git and of the account of the GitHub CLI in `containerEnv` and `remoteEnv` of the
- * configuration or of an entry of the image metadata (refusedVariableItem): the override configuration would replace
+ * configuration or of an entry of the image metadata (refusedVariable): the override configuration would replace
  * those that it sets without a word, because its values win, the others (for example GIT_CONFIG_PARAMETERS) would
  * change the configuration of Git in the container, and a token or host of the GitHub CLI would win over the sign-in of
  * the owner account.
  */
-function environmentProblems(config: Record<string, unknown>): string[] {
-  const items: string[] = [];
+function environmentProblems(config: Record<string, unknown>): Problem[] {
+  const problems: Problem[] = [];
   for (const property of ['containerEnv', 'remoteEnv']) {
     const env = config[property];
     if (!isRecord(env)) continue;
     for (const name of Object.keys(env)) {
-      const item = refusedVariableItem(name.trim(), property);
-      if (item !== undefined) items.push(item);
+      const problem = refusedVariable(name, property);
+      if (problem !== undefined) problems.push(problem);
     }
   }
-  return items;
+  return problems;
 }
 
 /**
@@ -1315,20 +1516,38 @@ export function parseMountString(spec: string): MountSpec {
 function parseMountEntry(entry: unknown): MountSpec {
   if (typeof entry === 'string') return parseMountString(entry);
   if (!isRecord(entry)) return { type: 'unknown', volumeOptions: false };
-  const parts: string[] = [];
-  if (entry.type !== undefined) parts.push(`type=${String(entry.type)}`);
-  if (entry.source) parts.push(`src=${String(entry.source)}`);
-  parts.push(`dst=${String(entry.target)}`);
-  const mount = parseMountString(parts.join(','));
+  const mount = parseMountString(objectMountText(entry));
   const keys = Object.keys(entry).filter((key) => /^volume(-?(driver|opt|options|label|labels))$/i.test(key));
   if (keys.length > 0) mount.volumeOptions = true;
   if (keys.some((key) => !/^volume-?(driver|opt)$/i.test(key))) mount.otherVolumeOptions = true;
   return mount;
 }
 
+/** The `--mount` text that the Dev Container CLI makes of a mount in the object form: `type=…,src=…,dst=…`. */
+function objectMountText(entry: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (entry.type !== undefined) parts.push(`type=${String(entry.type)}`);
+  if (entry.source) parts.push(`src=${String(entry.source)}`);
+  parts.push(`dst=${String(entry.target)}`);
+  return parts.join(',');
+}
+
 /** A mount source is a folder of the computer when it looks like a path; otherwise it is the name of a volume. */
 export function isPathSource(source: string): boolean {
   return /[\\/]/.test(source) || source.startsWith('.') || source.startsWith('~') || /^[A-Za-z]:/.test(source);
+}
+
+/**
+ * The source of a bind mount as an item shows it (hotfix review 4, Q2): normalized (`.` and `..` resolved, repeated
+ * separators joined), a drive path (`C:\…`) as on Windows, any other as on posix; a relative path keeps a leading `./`.
+ * The item is truncated later (MAX_ITEM_LENGTH), which keeps only the start and the end: without the normalization, a
+ * source such as `/Users/me/proj/./././…/../../../Users/me/.ssh/./././…` would hide in the middle what Docker mounts.
+ */
+export function shownBindSource(source: string): string {
+  if (/^[A-Za-z]:/.test(source)) return path.win32.normalize(source);
+  const normalized = path.posix.normalize(source);
+  if (source.startsWith('/') || /^[./~]/.test(normalized)) return normalized;
+  return `./${normalized}`;
 }
 
 /** What the mounts of an environment may use besides the rules of volumeNameProblems. */
@@ -1375,7 +1594,7 @@ function targetProblems(target: string | undefined): Problem[] {
 }
 
 function mountTypeProblems(mount: MountSpec, type: string, source: string, volumes: VolumeContext): Problem[] {
-  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${source}` : 'bind mount')];
+  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${shownBindSource(source)}` : 'bind mount')];
   if (type === 'npipe') return [access(`mount of the type ${type}`)];
   if (type !== 'volume') return [guarded(`mount of the type ${type}`)];
   const options: Problem[] = [];
@@ -1488,10 +1707,32 @@ function composeCliMountProblems(entry: unknown, volumes: VolumeContext): Proble
   if (writtenSource === '') return problems;
   if (isPathSource(writtenSource)) {
     if (type !== undefined && type !== 'bind' && type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
-    return [...problems, access(`bind mount ${cliSource}`)];
+    return [...problems, access(`bind mount ${shownBindSource(cliSource)}`)];
   }
   if (type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
   return [...problems, ...volumeNameProblems(cliSource, volumes)];
+}
+
+/**
+ * A mount of `mounts` (string or object) or of `--mount`, after the substitution of the variables (resolvedInput), with
+ * its leftovers (mountEntries; for `--mount` of runArgs, the variables of its text): a variable of the Dev Container CLI
+ * that the substitution keeps as written (a variable of the process of the workspace helper whose value is not known,
+ * such as `${localEnv:HOSTNAME}` or `${localEnv:TERM}`, `${containerEnv:…}`, or a workspace folder that is not known)
+ * makes the name of a volume, the target, or the fields of the mount unknown: such a mount is not supported, whatever
+ * the switch says, also a bind mount (hotfix review 1, N1: a default such as `${localEnv:TERM:type=volume}` can add a
+ * field that makes it a volume). For the image metadata, the leftovers come from the raw strings, never from a scan of
+ * the substituted text (hotfix review 2, P1). `${localEnv:HOME}` is known (/root), so the usual bind mounts of
+ * `${localEnv:HOME}/.ssh` stay access to the computer. An object is read as the `--mount` text that the CLI makes of it
+ * (objectMountText), and named so.
+ */
+function mountEntryProblems(entry: unknown, leftovers: readonly string[], volumes: VolumeContext): Problem[] {
+  if (leftovers.length === 0) return mountProblems(parseMountEntry(entry), volumes);
+  return [unsupported(`mount ${JSON.stringify(mountText(entry))} uses ${listedVariables(leftovers)}, which cannot be checked`)];
+}
+
+/** The text of a mount of `mounts`: the string, the `--mount` text of the object form (objectMountText), or its JSON. */
+function mountText(entry: unknown): string {
+  return typeof entry === 'string' ? entry : isRecord(entry) ? objectMountText(entry) : String(JSON.stringify(entry));
 }
 
 /** The name of the named volume of a mount; `undefined` for other mounts and anonymous volumes. */
@@ -1510,12 +1751,18 @@ const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]+$/;
  * `${devcontainerId}-history`, which the CLI resolves only at `up`), each once: the volumes whose labels the pipeline
  * reads for HostAccessInput.volumeLabels.
  */
-export function mountedVolumeNames(input: HostAccessInput): string[] {
+export function mountedVolumeNames(original: HostAccessInput): string[] {
+  // Nothing for a configuration that is refused for its size (hotfix review 2, P2): its volumes are not inspected.
+  if (textLengthProblems(original).length > 0) return [];
+  // The names that Docker gets: the image metadata resolved as the CLI resolves it (resolvedInput).
+  const input = resolvedInput(original);
   const names = new Set<string>();
   const add = (name: string | undefined): void => {
-    if (name !== undefined && name !== input.ownVolume && VOLUME_NAME.test(name)) names.add(name);
+    // Not a name with the ID of the container (DEVCONTAINER_ID_PLACEHOLDER): Docker gets it only at `up` (hotfix review
+    // 2, P6).
+    if (name !== undefined && name !== input.ownVolume && VOLUME_NAME.test(name) && !name.includes(DEVCONTAINER_ID_PLACEHOLDER)) names.add(name);
   };
-  for (const source of configurationSources(input)) {
+  for (const { source } of configurationSources(input, original)) {
     for (const mount of cliList(source.mounts)) add(namedVolumeOf(parseMountEntry(mount)));
   }
   for (const source of [input.config, input.merged]) {
@@ -1702,10 +1949,13 @@ export function volumeFlagTarget(spec: string): string {
 }
 
 function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
+  // As in mountEntryProblems: a variable that is left makes the volume or the target unknown, also of a bind mount.
+  const left = unresolvedCliVariables(value);
+  if (left.length > 0) return [unsupported(`volume ${JSON.stringify(value)} uses ${listedVariables(left)}, which cannot be checked`)];
   const internal = targetProblems(volumeFlagTarget(value));
   const source = volumeFlagSource(value);
   if (source === undefined) return internal;
-  if (isPathSource(source)) return [...internal, access(`bind mount ${source}`)];
+  if (isPathSource(source)) return [...internal, access(`bind mount ${shownBindSource(source)}`)];
   return [...internal, ...volumeNameProblems(source, volumes)];
 }
 
@@ -1905,15 +2155,13 @@ function labelProblems(value: string): Problem[] {
 
 /**
  * `-e`/`--env`: no variable of container-only Git and no variable of the account of the GitHub CLI
- * (refusedVariableItem), with or without a value. `docker run` gets the runArgs after the containerEnv of the override
+ * (refusedVariable), with or without a value. `docker run` gets the runArgs after the containerEnv of the override
  * configuration, so the value of the runArgs would win; a `-e NAME` without a value takes the value of the workspace
  * helper, or removes the variable.
  */
-function envProblems(value: string): string[] {
-  const index = value.indexOf('=');
-  const name = (index < 0 ? value : value.slice(0, index)).trim();
-  const item = refusedVariableItem(name, 'runArgs');
-  return item === undefined ? [] : [item];
+function envProblems(value: string): Problem[] {
+  const problem = refusedVariable(value, 'runArgs');
+  return problem === undefined ? [] : [problem];
 }
 
 /**
@@ -2121,17 +2369,17 @@ function flagProblems(flag: ParsedFlag, label: (text: string) => string): Proble
 }
 
 function uniqueItems(problems: readonly Problem[]): string[] {
-  const items: string[] = [];
-  for (const { item } of problems) if (!items.includes(item)) items.push(item);
-  return items;
+  return [...new Set(problems.map((problem) => problem.item))];
 }
 
 /**
- * `runArgs` (`docker run` arguments of the configuration), with the rules of RUN_FLAGS. `foreignVolumes`: as in
- * HostAccessInput.
+ * `runArgs` (`docker run` arguments of the output of read-configuration), with the rules of RUN_FLAGS. An entry with a
+ * variable that the Dev Container CLI resolves again at `up` is not supported (secondPassProblems); otherwise the list
+ * is what Docker gets. `foreignVolumes`: as in HostAccessInput.
  */
 export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, foreignVolumes: readonly string[] = []): string[] {
-  return uniqueItems(runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
+  const left = secondPassProblems('runArgs', runArgs);
+  return uniqueItems(left.length > 0 ? left : runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
 }
 
 /** The label devenv.config-path of the override configuration, with a configuration path (review round 4, D4-2). */
@@ -2161,7 +2409,8 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
     } else if (flag.name === '--mount') {
-      problems.push(...mountProblems(parseMountString(flag.value ?? ''), volumes));
+      // The text that Docker gets (its variables: as in mountEntries for the configuration).
+      problems.push(...mountEntryProblems(flag.value ?? '', unresolvedCliVariables(flag.value ?? ''), volumes));
     } else if (flag.name === '--tmpfs' && flag.value !== undefined) {
       problems.push(...tmpfsFlagProblems(flag.value));
     } else if (flag.name === '--network' || flag.name === '--net') {
