@@ -328,6 +328,23 @@ describe('containers', () => {
     expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
   });
 
+  it('prefers the container with the name of the environment over other dev containers, even running and newer ones (final review, FC-1)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['old', 'dev', 'stray']));
+      return ok(
+        inspectOutput([
+          // The previous dev container of a Select configuration… (renamed, without devenv.compose-service), running.
+          containerJson({ id: 'old', name: 'devenv-3f2a9c1e-app-1', status: 'running', created: '2026-01-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', created: '2026-02-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'stray', name: 'stray', status: 'running', created: '2026-03-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
+    // Without a container of that name (an older container, a failed switch), a running one, then the newest.
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-00000000'))?.id).toBe('stray');
+  });
+
   it('finds no container when only other services of a Docker Compose environment exist', async () => {
     const { docker } = adapter((call) => {
       if (call.args[0] === 'ps') return ok(idLines(['db']));

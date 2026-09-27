@@ -621,6 +621,9 @@ export class ContainerAdapter {
    * so this is always the dev container. A container with the name of the environment (`containerName`, the name of
    * the dev container) is never skipped, whatever labels its image gave it (review round 1, D2: an image with the label
    * devenv.compose-service would hide a single container, which then kept running after the checks were turned on).
+   * That container comes first (final review, FC-1: the previous dev container of a Select configuration…, renamed and
+   * without devenv.compose-service, or a stray container of the environment never wins over it); without it (an older
+   * container, a failed switch), a running one, then the newest.
    */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
@@ -629,7 +632,8 @@ export class ContainerAdapter {
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
     }
-    return publicInfo([...containers].sort(preferred)[0]);
+    const named = containers.find((container) => container.name === containerName);
+    return publicInfo(named ?? [...containers].sort(preferred)[0]);
   }
 
   /**

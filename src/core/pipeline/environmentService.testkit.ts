@@ -218,12 +218,17 @@ export class FakeDocker implements EnvironmentDocker {
     return '';
   }
 
-  /** Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped. */
+  /**
+   * Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped; the container
+   * with the name of the environment first (final review, FC-1), then a running one, then the newest (the order of
+   * insertion is the order of creation).
+   */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const matching = [...this.containers.values()].filter(
       (c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId && isDevContainer(c, containerName),
     );
-    const found = matching.find((c) => c.state === 'running') ?? matching[matching.length - 1];
+    const newestFirst = [...matching].reverse();
+    const found = matching.find((c) => c.name === containerName) ?? newestFirst.find((c) => c.state === 'running') ?? newestFirst[0];
     return found && { ...found, labels: { ...found.labels } };
   }
 

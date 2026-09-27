@@ -2917,7 +2917,8 @@ export class EnvironmentService {
    * Review round 22 (D22-1): the dev container `previous` of the service `previousService` of the project, while the
    * configuration names another dev service (compose.service), which gets the name of the environment. It is renamed to
    * the default name of Compose for its service, so that Compose creates it again as another service (and keeps its
-   * volumes without a name, for example `node_modules`); when that fails, it is stopped and removed (its volumes stay),
+   * volumes without a name, for example `node_modules`) and stopped (final review, FC-1: when the configuration does
+   * not start that service, it stays as it is); when the rename fails, it is stopped and removed (its volumes stay),
    * as at a switch of the kind, and the user learns it. A container that an earlier failed attempt of Compose left in the
    * state `created` (`<id>_<name>`) is removed. The container of the new dev service is stopped before the Dev Container
    * CLI removes it (`--remove-existing-container`, D9-3).
@@ -2934,9 +2935,11 @@ export class EnvironmentService {
     const number = previous.labels[COMPOSE_CONTAINER_NUMBER_LABEL] ?? '1';
     const name = `${compose.project}-${previousService}-${number}`;
     this.logger.info(`The dev container ${previous.name} of ${env.repository} is of the service ${previousService}; the configuration uses the service ${compose.service}.`);
+    let renamed = false;
     try {
       await docker.renameContainer(previous.id, name);
-      this.logger.info(`The container ${previous.name} is now ${name}; Docker Compose creates it again as the service ${previousService}.`);
+      renamed = true;
+      this.logger.info(`The container ${previous.name} is now ${name}; Docker Compose creates it again as the service ${previousService} when the configuration starts it.`);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The container ${previous.name} could not be renamed (${errorMessage(error)}). It is removed; its volumes are kept.`);
@@ -2945,6 +2948,11 @@ export class EnvironmentService {
       await docker.removeContainer(previous.id);
       (ctx.kindSwitchRemoved ??= []).push(`the container ${previous.name} of the service ${previousService}`);
     }
+    // Final review (FC-1): a renamed one is stopped (never removed, nor its volumes), as it keeps the labels of a dev
+    // container: when the new configuration does not start its service (runServices, depends_on), Compose leaves it
+    // alone, and a running one would outlive Stop. A failed switch leaves it startable: the next open with the previous
+    // configuration starts it again.
+    if (renamed) await this.stopContainerGracefully(ctx, { ...previous, name });
     for (const container of await this.composeContainers(env)) {
       if (container.id === previous.id) continue;
       if (container.rawState === 'created' && isComposeRecreateLeftoverName(container.name)) {
@@ -3952,6 +3960,22 @@ export class EnvironmentService {
     } catch (error) {
       this.logger.warn(`The container ${container.name} could not be stopped, it is removed anyway: ${errorMessage(error)}`);
     }
+  }
+
+  /**
+   * Final review (FC-1): `docker stop` of a container that is kept, with its own stop time (capped by the policy, as for
+   * stopServiceBeforeRemoval). A failed stop is logged; a cancellation throws.
+   */
+  private async stopContainerGracefully(ctx: PipelineContext, container: ContainerInfo): Promise<void> {
+    if (container.state !== 'running') return;
+    this.logger.info(`Stopping the container ${container.name} of ${ctx.env.repository}.`);
+    try {
+      await this.deps.docker.stopContainer(container.id);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The container ${container.name} could not be stopped: ${errorMessage(error)}`);
+    }
+    this.throwIfCancelled(ctx.signal);
   }
 
   private async stopServices(env: Environment): Promise<void> {

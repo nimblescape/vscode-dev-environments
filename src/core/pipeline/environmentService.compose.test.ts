@@ -3094,4 +3094,66 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     expect(error.code).toBe('startFailed');
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
   });
+
+  describe('final review, FC-1: the new configuration does not start the previous dev service (runServices)', () => {
+    const RUN_TEXT = WEB_TEXT.replace('"service": "web"', '"service": "web",\n  "runServices": ["web", "db"]');
+
+    beforeEach(() => {
+      h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT }, [WEB_PATH]: { configText: RUN_TEXT } };
+    });
+
+    const running = (): string[] => h.docker.containersOf(ENV_ID).filter((c) => c.state === 'running').map((c) => c.name);
+
+    it('stops the renamed previous dev container (never removes it); Stop then leaves nothing running and a reopen connects to the new dev container', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      const log = h.docker.log.length;
+      await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+      const after = h.docker.log.slice(log);
+      expect(after).toContain(`rename ${app.id} ${PROJECT}-app-1`);
+      expect(after).toContain(`stop ${app.id}`);
+      expect(after).not.toContain(`rm ${app.id}`);
+      expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+      // Compose does not create the service app again: the previous dev container stays, stopped, under its new name.
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      const web = byService('web')!;
+      expect(web).toMatchObject({ name: NAME, state: 'running' });
+
+      await h.service.stop(ENV_ID);
+      expect(running()).toEqual([]);
+
+      const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+      expect(result.containerName).toBe(NAME);
+      expect(h.docker.containers.get(web.id)?.state).toBe('running');
+      expect(h.docker.containers.get(app.id)?.state).toBe('stopped');
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(WEB_PATH);
+    });
+
+    it('connects to the dev container with the name of the environment even when the previous one runs again', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+      const web = byService('web')!;
+      await h.service.stop(ENV_ID);
+      // For example started by hand, or left running by an earlier version of the extension.
+      await h.docker.runChecked(['start', app.id]);
+      const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+      expect(result.containerName).toBe(NAME);
+      expect(h.docker.containers.get(web.id)?.state).toBe('running');
+    });
+
+    it('after a failed switch, a reopen with the previous configuration starts the previous dev container again', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      h.helper.upError = () => new Error('compose up failed');
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('startFailed');
+      // Stopped, not removed.
+      expect(h.docker.containers.get(app.id)?.state).toBe('stopped');
+      h.helper.upError = () => undefined;
+      await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+      expect(h.docker.containers.get(app.id)?.state).toBe('running');
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    });
+  });
 });
