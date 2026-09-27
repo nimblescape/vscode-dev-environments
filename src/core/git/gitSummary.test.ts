@@ -23,7 +23,7 @@ import {
   servicePathArguments,
   servicePrunePatterns,
 } from './gitSummary';
-import { devMountFolders } from '../pipeline/pipelineRules';
+import { devMountFolders, verifiedIdentityTargets, workspaceIdentityMounts } from '../pipeline/pipelineRules';
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';
 
@@ -618,8 +618,8 @@ describe.skipIf(process.getuid?.() !== 0)('review round 13 (D13-1, D13-3): the o
   const VOLUME = 'acme-api-3f2a9c1e';
 
   /** devMountFolders of `mounts` (targets below /workspaces/api), moved to `repo`. */
-  function devFolders(repo: string, mounts: Array<{ type: string; volume?: string; target: string }>): string[] {
-    return devMountFolders({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }, 'on').map((folder) => repo + folder.slice('/workspaces/api'.length));
+  function devFolders(repo: string, mounts: Array<{ type: string; volume?: string; target: string; subpath?: string }>, identities?: ReadonlySet<string>): string[] {
+    return devMountFolders({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }, 'on', identities).map((folder) => repo + folder.slice('/workspaces/api'.length));
   }
 
   /** Runs `body` with `source` bind-mounted at `target`; skips the test when the sandbox does not allow `mount --bind`. */
@@ -701,6 +701,33 @@ describe.skipIf(process.getuid?.() !== 0)('review round 13 (D13-1, D13-3): the o
     // Before (review round 12): uid 1000 kept, and `npm install` as the remote user failed with EACCES.
     for (const name of ['node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
     for (const name of ['.cache', '.cache/entry']) expect(uidOf(path.join(repo, name)), name).toBe(1000);
+  });
+
+  it('gives src the full fix after a change of the uid when the dev service mounts ../src at its own path (review round 14, P14-1)', ({ skip }) => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src/lib', 'data']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'src/lib/b.ts', 'data/PG_VERSION']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The files of the remote user of the previous container (uid 1000); the remote user now has another uid.
+    for (const file of ['.', 'src', 'src/a.ts', 'src/lib', 'src/lib/b.ts']) fs.chownSync(path.join(repo, file), 1000, 1000);
+    for (const file of ['data', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    // ..:/workspaces/api and ../src:/workspaces/api/src, rewritten to the subpaths api and api/src.
+    withBind(skip, path.join(repo, 'src'), path.join(repo, 'src'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api', subpath: 'api' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/src', subpath: 'api/src' },
+      ];
+      const root = `/var/lib/docker/volumes/${VOLUME}/_data`;
+      const identities = verifiedIdentityTargets(
+        workspaceIdentityMounts({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }),
+        `2 1 8:1 ${root} /workspaces rw\n3 2 8:1 ${root}/api /workspaces/api rw\n4 3 8:1 ${root}/api/src /workspaces/api/src rw\n`,
+      );
+      // Before: [src], and only the files of root in src changed: uid 1000 stayed (EACCES for the remote user).
+      expect(devFolders(repo, mounts, identities)).toEqual([]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts, identities)]);
+      for (const name of ['.', 'src', 'src/a.ts', 'src/lib', 'src/lib/b.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+      for (const name of ['data', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    });
   });
 });
 

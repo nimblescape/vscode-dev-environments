@@ -113,6 +113,11 @@ export class FakeDocker implements EnvironmentDocker {
   readonly pulls: Array<{ reference: string; credentials?: PullCredentials }> = [];
   pullError: (reference: string, credentials?: PullCredentials) => Error | undefined = () => undefined;
   execHandler: (container: string, command: readonly string[], user?: string) => Partial<RunResult> = () => ({});
+  /**
+   * Review round 14 (P14-1): links in the volumes (subpath → the subpath it leads to), which Docker follows when it mounts
+   * a subpath; `cat /proc/self/mountinfo` in a container shows the real folder as the root of such a mount.
+   */
+  readonly volumeLinks = new Map<string, string>();
   /** Review round 11 (G3): paths of the workspace volume that do not exist (EXISTING_PATHS_SCRIPT leaves them out). */
   readonly missingPaths = new Set<string>();
   /** Volumes that `docker volume rm` refuses to remove. */
@@ -250,11 +255,37 @@ export class FakeDocker implements EnvironmentDocker {
   ): Promise<RunResult> {
     this.execs.push({ container, command, user: options.user, signal: options.signal });
     // Review round 11 (G3): the check of the recorded paths of the services prints those that exist.
-    const existing = command[2] === EXISTING_PATHS_SCRIPT ? command.slice(4).filter((folder) => !this.missingPaths.has(folder)).map((folder) => `${folder}\0`).join('') : '';
+    const existing =
+      command[2] === EXISTING_PATHS_SCRIPT
+        ? command.slice(4).filter((folder) => !this.missingPaths.has(folder)).map((folder) => `${folder}\0`).join('')
+        : command.length === 2 && command[0] === 'cat' && command[1] === '/proc/self/mountinfo'
+          ? this.mountInfo(container)
+          : '';
     const result: RunResult = { exitCode: 0, stdout: existing, stderr: '', timedOut: false, ...this.execHandler(container, command, options.user) };
     // Like the process runner: an abort during the call kills the process and rejects.
     if (options.signal?.aborted) throw abortError();
     return result;
+  }
+
+  /**
+   * Review round 14 (P14-1): `/proc/self/mountinfo` of a container from its mountTargets: a volume on the device 8:1 with
+   * the root `/var/lib/docker/volumes/<name>/_data`, a subpath below it after volumeLinks; others on other devices.
+   */
+  private mountInfo(ref: string): string {
+    const container = [...this.containers.values()].find((c) => c.id === ref || c.name === ref);
+    const lines = ['1 0 0:30 / / rw - overlay overlay rw'];
+    (container?.mountTargets ?? []).forEach((mount, index) => {
+      const escaped = (text: string) => text.replace(/[ \t\n\\]/g, (c) => `\\${c.charCodeAt(0).toString(8).padStart(3, '0')}`);
+      if (mount.type === 'volume' && mount.volume !== undefined) {
+        let subpath = mount.subpath ?? '';
+        for (const [link, real] of this.volumeLinks) if (subpath === link || subpath.startsWith(`${link}/`)) subpath = real + subpath.slice(link.length);
+        const root = `/var/lib/docker/volumes/${mount.volume}/_data${subpath === '' ? '' : `/${subpath}`}`;
+        lines.push(`${index + 2} 1 8:1 ${escaped(root)} ${escaped(mount.target)} rw - ext4 /dev/sda1 rw`);
+      } else {
+        lines.push(`${index + 2} 1 0:${index + 40} / ${escaped(mount.target)} rw - ${mount.type} ${mount.type} rw`);
+      }
+    });
+    return `${lines.join('\n')}\n`;
   }
 
   async volumeExists(name: string): Promise<boolean> {
@@ -818,10 +849,12 @@ export class FakeHelper implements EnvironmentHelper {
       containerId = create(service, String(dev.container_name), image, dev.labels, volumes).id;
       // Review round 12 (D12-2): the mounts of the dev service, as `docker inspect` reads them.
       const mountTargets: MountTarget[] = [
-        ...(Array.isArray(dev.volumes) ? dev.volumes : []).flatMap((entry: { type?: string; source?: string; target?: string }) => {
+        ...(Array.isArray(dev.volumes) ? dev.volumes : []).flatMap((entry: { type?: string; source?: string; target?: string; volume?: { subpath?: unknown } }) => {
           if (typeof entry.target !== 'string' || typeof entry.type !== 'string') return [];
           const name = entry.type === 'volume' && entry.source ? (entry.source === WORKSPACE_VOLUME_KEY ? p.volumeName : model.volumes?.[entry.source]?.name) : undefined;
-          return [{ type: entry.type, ...(typeof name === 'string' ? { volume: name } : {}), target: entry.target }];
+          // Review round 14 (P14-1): the subpath, as `HostConfig.Mounts` has it.
+          const subpath = typeof name === 'string' && typeof entry.volume?.subpath === 'string' && entry.volume.subpath !== '' ? entry.volume.subpath : undefined;
+          return [{ type: entry.type, ...(typeof name === 'string' ? { volume: name } : {}), target: entry.target, ...(subpath !== undefined ? { subpath } : {}) }];
         }),
         ...this.containerMounts,
       ];

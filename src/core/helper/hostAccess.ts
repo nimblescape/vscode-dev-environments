@@ -884,6 +884,29 @@ export function isHelperPath(file: string, repositoryFolder: string): boolean {
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }
 
+/** Review round 14 (S14-1): the reason of configFolderMountItem. */
+export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal folder are not supported";
+
+/**
+ * Review round 14 (S14-1): the target of a mount of the dev container, normalized (`.`, `..`, double and trailing
+ * slashes), when it is CONFIG_FOLDER or a path below it (on segment boundaries: `/workspaces/.devenv+x` is not);
+ * `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
+ * every file there the remote user (`find -xdev`, no paths left out): a mount there would shadow them, and would give
+ * the files of the mounted folder (for example the data of another service, or the whole repository through an alias)
+ * to the remote user. Other paths of WORKSPACES_ROOT outside the repository (for example a cache volume at
+ * `/workspaces/.cache`) are not concerned. Only absolute targets (Docker refuses others).
+ */
+export function configFolderTarget(target: string): string | undefined {
+  if (!target.startsWith('/')) return undefined;
+  const normal = path.posix.normalize(target).replace(/(.)\/+$/, '$1');
+  return normal === CONFIG_FOLDER || normal.startsWith(`${CONFIG_FOLDER}/`) ? normal : undefined;
+}
+
+/** Review round 14 (S14-1): the item of a mount at configFolderTarget `target` (class `unsupported`). */
+export function configFolderMountItem(target: string, what = 'mount at'): string {
+  return `${what} ${target} (${CONFIG_FOLDER_MOUNT_REASON})`;
+}
+
 /**
  * An image ID in place of a name by its form alone: `sha256:<hex>`, or 64 hexadecimal characters. A shorter prefix of an
  * ID looks like a name (for example `a1b2c3d4`, which may also be the name of an image): the pipeline asks Docker which
@@ -1200,6 +1223,8 @@ export interface MountSpec {
   /** Lower case. `undefined` when the entry names none. */
   type?: string;
   source?: string;
+  /** Review round 14 (S14-1): the target (`target`, `dst`, or `destination`). */
+  target?: string;
   /**
    * Options of the volume other than `volume-nocopy` and `volume-subpath`: `volume-driver` and `volume-opt` (a "volume"
    * that can be a folder of the computer) and `volume-label` (labels of a volume that the mount creates, for example the
@@ -1262,6 +1287,7 @@ export function parseMountString(spec: string): MountSpec {
     const value = index < 0 ? '' : field.slice(index + 1).trim();
     if (key === 'type') mount.type = value.toLowerCase();
     else if (key === 'source' || key === 'src') mount.source = value;
+    else if (key === 'target' || key === 'dst' || key === 'destination') mount.target = value;
     else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') {
       mount.volumeOptions = true;
       if (key !== 'volume-driver' && key !== 'volume-opt') mount.otherVolumeOptions = true;
@@ -1325,7 +1351,19 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
   if (mount.unreadable !== undefined) return [guarded(`mount ${JSON.stringify(mount.unreadable)}`)];
   const source = mount.source ?? '';
   const type = mountType(mount);
-  if (type === 'tmpfs') return [];
+  // Review round 14 (S14-1): whatever the type, and whatever the switch says.
+  const internal = targetProblems(mount.target);
+  if (type === 'tmpfs') return internal;
+  return [...internal, ...mountTypeProblems(mount, type, source, volumes)];
+}
+
+/** Review round 14 (S14-1): a mount target in the extension's internal folder (configFolderTarget). */
+function targetProblems(target: string | undefined): Problem[] {
+  const internal = target === undefined ? undefined : configFolderTarget(target);
+  return internal === undefined ? [] : [unsupported(configFolderMountItem(internal))];
+}
+
+function mountTypeProblems(mount: MountSpec, type: string, source: string, volumes: VolumeContext): Problem[] {
   if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${source}` : 'bind mount')];
   if (type === 'npipe') return [access(`mount of the type ${type}`)];
   if (type !== 'volume') return [guarded(`mount of the type ${type}`)];
@@ -1530,11 +1568,32 @@ export function volumeFlagSource(spec: string): string | undefined {
   return index > 0 ? spec.slice(0, index) : undefined;
 }
 
+/**
+ * Review round 14 (S14-1): the target of a `-v`/`--volume` value `source:target[:options]` (after volumeFlagSource, the
+ * text up to the next colon), or `target[:options]` of an anonymous volume: without a colon, the value; when the text
+ * after the first colon is no absolute path (for example `/data:ro`), the text before it, as Docker reads it.
+ */
+export function volumeFlagTarget(spec: string): string {
+  const source = volumeFlagSource(spec);
+  if (source === undefined) return spec;
+  const rest = spec.slice(source.length + 1);
+  const index = rest.indexOf(':');
+  const target = index >= 0 ? rest.slice(0, index) : rest;
+  return target.startsWith('/') ? target : source;
+}
+
 function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
+  const internal = targetProblems(volumeFlagTarget(value));
   const source = volumeFlagSource(value);
-  if (source === undefined) return [];
-  if (isPathSource(source)) return [access(`bind mount ${source}`)];
-  return volumeNameProblems(source, volumes);
+  if (source === undefined) return internal;
+  if (isPathSource(source)) return [...internal, access(`bind mount ${source}`)];
+  return [...internal, ...volumeNameProblems(source, volumes)];
+}
+
+/** Review round 14 (S14-1): `--tmpfs <target>[:options]`. */
+function tmpfsFlagProblems(value: string): Problem[] {
+  const index = value.indexOf(':');
+  return targetProblems(index >= 0 ? value.slice(0, index) : value);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1984,6 +2043,8 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
     } else if (flag.name === '--mount') {
       problems.push(...mountProblems(parseMountString(flag.value ?? ''), volumes));
+    } else if (flag.name === '--tmpfs' && flag.value !== undefined) {
+      problems.push(...tmpfsFlagProblems(flag.value));
     } else if (flag.name === '--network' || flag.name === '--net') {
       problems.push(...networkProblems(flag.value ?? '', volumes));
     } else {

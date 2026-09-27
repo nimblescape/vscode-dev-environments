@@ -529,3 +529,30 @@ describe('review round 9 (S9-1): many missing build paths', () => {
     expect(items[0]).toBe(`service s0: build context ${repo}/m0`);
   });
 });
+
+describe('review round 14 of unit 6 (S14-1): no mount of the dev service into the extension\'s internal folder', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const devMounts = (volumes: unknown[], tmpfs?: unknown) => serviceReport('app', { volumes, ...(tmpfs !== undefined ? { tmpfs } : {}) });
+
+  it('refuses a bind mount of repository data, a .. alias, and a named volume below /workspaces/.devenv+', () => {
+    // The probe of r14-S: ./pgdata:/workspaces/.devenv+/pg in app, while db mounts ./pgdata.
+    expect(devMounts([{ type: 'bind', source: `${REPO}/pgdata`, target: '/workspaces/.devenv+/pg' }])).toEqual(U(`service app: mount at /workspaces/.devenv+/pg (${INTERNAL})`));
+    // `..` (the repository), written with dots and slashes.
+    expect(devMounts([{ type: 'bind', source: REPO, target: '/workspaces/api/..//.devenv+/./repo/' }])).toEqual(U(`service app: mount at /workspaces/.devenv+/repo (${INTERNAL})`));
+    // A named volume that db shares, and the folder itself as a tmpfs (it would hide the token and the Git configuration).
+    expect(devMounts([{ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+' }])).toEqual(U(`service app: mount at /workspaces/.devenv+ (${INTERNAL})`));
+    expect(devMounts([{ type: 'tmpfs', target: '/workspaces/.devenv+/gh' }])).toEqual(U(`service app: mount at /workspaces/.devenv+/gh (${INTERNAL})`));
+    expect(devMounts([], ['/workspaces/.devenv+:size=1m'])).toEqual(U(`service app: tmpfs /workspaces/.devenv+ (${INTERNAL})`));
+    expect(devMounts([], '/workspaces/./.devenv+/docker')).toEqual(U(`service app: tmpfs /workspaces/.devenv+/docker (${INTERNAL})`));
+  });
+
+  it('allows other paths of /workspaces outside the repository, and a folder that only starts like it', () => {
+    expect(devMounts([{ type: 'volume', source: 'pgdata', target: '/workspaces/.cache' }])).toEqual(NONE);
+    expect(devMounts([{ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+x' }])).toEqual(NONE);
+    expect(devMounts([{ type: 'tmpfs', target: '/workspaces/.devenv' }], ['/workspaces/.devenv+x', '/tmp'])).toEqual(NONE);
+  });
+
+  it('leaves the other services alone: their containers do not have the folder', () => {
+    expect(serviceReport('db', { volumes: [{ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+/pg' }], tmpfs: ['/workspaces/.devenv+'] })).toEqual(NONE);
+  });
+});

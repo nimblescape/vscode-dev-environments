@@ -29,6 +29,8 @@ import {
 } from '../names';
 import {
   isDockerNetworkMode,
+  configFolderMountItem,
+  configFolderTarget,
   isHelperPath,
   isLoopbackAddress,
   isOtherEnvironmentProjectName,
@@ -581,7 +583,11 @@ function normalizedTarget(target: unknown): string | undefined {
  *   workspace volume with `volume.subpath` (Docker Engine 26, API 1.45; refused with an older or unknown engine) and
  *   `nocopy` (so the content of the image never lands in the repository), read-only as before;
  * - every other bind mount, and the types npipe, cluster, and image: refused;
- * - in the dev service, any other mount at WORKSPACES_ROOT: refused (the workspace volume is mounted there).
+ * - in the dev service, any other mount at WORKSPACES_ROOT: refused (the workspace volume is mounted there);
+ * - review round 14 (S14-1): in the dev service, any mount at or below CONFIG_FOLDER (configFolderTarget): refused as not
+ *   supported (the token and the Git configuration of the extension are there, and its ownership fix walks the folder in
+ *   full). The other services do not have the folder (they cannot mount the workspace volume), so their targets there
+ *   stay allowed.
  */
 export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): ComposeEntryDecision {
   if (!isRecord(entry)) return { action: 'refuse', kind: 'unsupported', item: `volume ${JSON.stringify(entry)}` };
@@ -591,6 +597,9 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
   const describe = `${source || '(anonymous)'} → ${String(entry.target)}`;
   const atWorkspaces = ctx.isDev && target === WORKSPACES_ROOT;
   if (target === undefined) return { action: 'refuse', kind: 'unsupported', item: `volume ${describe} without a target` };
+  // Review round 14 (S14-1): only the dev container has the folder (the other services cannot mount the workspace volume).
+  const internal = ctx.isDev ? configFolderTarget(target) : undefined;
+  if (internal !== undefined) return { action: 'refuse', kind: 'unsupported', item: configFolderMountItem(internal) };
   if (type === 'tmpfs') {
     return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'keep' };
   }

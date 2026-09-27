@@ -30,6 +30,8 @@ import {
   RESERVED_COMPOSE_LABEL,
   RESERVED_LABEL,
   capabilityProblems,
+  configFolderMountItem,
+  configFolderTarget,
   dockerfileImageFindings,
   withDockerfileCache,
   dockerfileImageReferences,
@@ -298,7 +300,16 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   tty: allow,
   stdin_open: allow,
   read_only: allow,
-  tmpfs: allow,
+  // Review round 14 (S14-1): not in the extension's internal folder of the dev container (`<target>[:options]`).
+  tmpfs: (value, ctx) =>
+    !ctx.isDev
+      ? []
+      : listOf(value).flatMap((entry) => {
+          const text = String(entry);
+          const index = text.indexOf(':');
+          const internal = configFolderTarget(index >= 0 ? text.slice(0, index) : text);
+          return internal === undefined ? [] : [unsupported(configFolderMountItem(internal, 'tmpfs'))];
+        }),
   shm_size: allow,
   ulimits: allow,
   cpu_count: allow,

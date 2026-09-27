@@ -39,6 +39,7 @@ import {
   runArgsNetworks,
   runArgsProblems,
   splitPortAddress,
+  volumeFlagTarget,
   volumeLabelOwner,
   volumeNameItems,
   withLoopbackAddress,
@@ -1371,5 +1372,45 @@ describe('isValidImageReference (review round 12, P12-1): the digest rules of go
     ]) {
       expect([reference, isValidImageReference(reference)]).toEqual([reference, true]);
     }
+  });
+});
+
+describe('review round 14 (S14-1): no mount of a single container into the extension\'s internal folder', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN });
+  const U = (...items: string[]) => ({ hostAccess: [], unsupported: items });
+
+  it('refuses the `mounts` forms (text and object) at or below /workspaces/.devenv+', () => {
+    expect(report({ mounts: ['source=cache,target=/workspaces/.devenv+/pg,type=volume'] })).toEqual(U(`mount at /workspaces/.devenv+/pg (${INTERNAL})`));
+    expect(report({ mounts: ['type=tmpfs,dst=/workspaces//.devenv+/'] })).toEqual(U(`mount at /workspaces/.devenv+ (${INTERNAL})`));
+    expect(report({ mounts: [{ source: 'cache', target: '/workspaces/api/../.devenv+/x', type: 'volume' }] })).toEqual(U(`mount at /workspaces/.devenv+/x (${INTERNAL})`));
+    expect(report({ mounts: ['type=volume,src=cache,destination=/workspaces/.devenv+/gh'] })).toEqual(U(`mount at /workspaces/.devenv+/gh (${INTERNAL})`));
+  });
+
+  it('refuses -v, --mount, and --tmpfs of runArgs there', () => {
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.devenv+/pg'] })).toEqual(U(`mount at /workspaces/.devenv+/pg (${INTERNAL})`));
+    expect(report({ runArgs: ['--volume=/workspaces/.devenv+/anonymous'] })).toEqual(U(`mount at /workspaces/.devenv+/anonymous (${INTERNAL})`));
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.devenv+:ro'] })).toEqual(U(`mount at /workspaces/.devenv+ (${INTERNAL})`));
+    expect(report({ runArgs: ['--mount', 'type=volume,source=cache,target=/workspaces/.devenv+/x'] })).toEqual(U(`mount at /workspaces/.devenv+/x (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs', '/workspaces/.devenv+:size=1m'] })).toEqual(U(`mount at /workspaces/.devenv+ (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs=/workspaces/.devenv+/docker'] })).toEqual(U(`mount at /workspaces/.devenv+/docker (${INTERNAL})`));
+  });
+
+  it('allows other paths of /workspaces outside the repository, and a folder that only starts like it', () => {
+    expect(report({ mounts: ['source=cache,target=/workspaces/.cache,type=volume', 'source=cache2,target=/workspaces/.devenv+x,type=volume'] })).toEqual({ hostAccess: [], unsupported: [] });
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.cache', '--tmpfs', '/workspaces/.devenv+x', '--mount', 'type=tmpfs,target=/workspaces/.devenv'] })).toEqual({ hostAccess: [], unsupported: [] });
+  });
+});
+
+describe('volumeFlagTarget (review round 14, S14-1)', () => {
+  it.each([
+    ['cache:/data', '/data'],
+    ['cache:/data:ro', '/data'],
+    ['/data', '/data'],
+    ['/data:ro', '/data'],
+    ['C:\\x:/data:rw', '/data'],
+    ['/host:/data', '/data'],
+  ])('%s → %s', (spec, target) => {
+    expect(volumeFlagTarget(spec)).toBe(target);
   });
 });

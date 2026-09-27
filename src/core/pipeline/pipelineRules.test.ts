@@ -18,6 +18,8 @@ import {
   configRemoteUser,
   containerUserName,
   devMountFolders,
+  verifiedIdentityTargets,
+  workspaceIdentityMounts,
   imageRemoteUser,
   imagesToPull,
   isComposeContainer,
@@ -517,6 +519,76 @@ describe('Docker Compose rules (unit 6)', () => {
         [{ source: 'cache', target: '/other', type: 'volume' }],
       ]),
     ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'] });
+  });
+});
+
+describe('workspace-volume mounts at their own canonical path (review round 14, P14-1)', () => {
+  const env = { repository: 'acme/api', volumeName: 'acme-api-3f2a9c1e' };
+  const V = env.volumeName;
+  const container = {
+    mountTargets: [
+      { type: 'volume', volume: V, target: '/workspaces' },
+      { type: 'volume', volume: V, target: '/workspaces/api', subpath: 'api' },
+      { type: 'volume', volume: V, target: '/workspaces/api/src/', subpath: 'api/src/' },
+      { type: 'volume', volume: V, target: '/workspaces/api/lib', subpath: 'api/./x/../lib' },
+      // ./data:/workspaces/api/pgview: an alias.
+      { type: 'volume', volume: V, target: '/workspaces/api/pgview', subpath: 'api/data' },
+      // Subpath not known, another volume, a subpath outside the repository.
+      { type: 'volume', volume: V, target: '/workspaces/api/docs' },
+      { type: 'volume', volume: 'other', target: '/workspaces/api/tools', subpath: 'api/tools' },
+      { type: 'bind', target: '/workspaces/api/bin', subpath: 'api/bin' },
+    ],
+  };
+  const root = `/var/lib/docker/volumes/${V}/_data`;
+  const info = (lines: string[]) => ['1 0 0:30 / / rw - overlay overlay rw', ...lines].join('\n');
+
+  it('names the candidates lexically, below the repository folder only', () => {
+    expect(workspaceIdentityMounts(container, env)).toEqual([
+      { target: '/workspaces/api/src', subpath: 'api/src' },
+      { target: '/workspaces/api/lib', subpath: 'api/lib' },
+    ]);
+    expect(workspaceIdentityMounts(undefined, env)).toEqual([]);
+  });
+
+  it('verifies them with /proc/self/mountinfo: same device, and the root of /workspaces joined with the subpath', () => {
+    const candidates = workspaceIdentityMounts(container, env);
+    expect(
+      verifiedIdentityTargets(
+        candidates,
+        info([`2 1 8:1 ${root} /workspaces rw - ext4 /dev/sda1 rw`, `3 1 8:1 ${root}/api/src /workspaces/api/src rw - ext4 /dev/sda1 rw`, `4 1 8:1 ${root}/api/lib /workspaces/api/lib rw`]),
+      ),
+    ).toEqual(new Set(['/workspaces/api/src', '/workspaces/api/lib']));
+    // A link in the volume: lib -> data, Docker mounted data there.
+    expect(verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `4 1 8:1 ${root}/api/data /workspaces/api/lib rw`]))).toEqual(new Set());
+    // Another device, a mount over it later (the last line counts), no mount at /workspaces, an empty text.
+    expect(verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `3 1 8:2 ${root}/api/src /workspaces/api/src rw`]))).toEqual(new Set());
+    expect(
+      verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `3 1 8:1 ${root}/api/src /workspaces/api/src rw`, `5 3 0:50 / /workspaces/api/src rw - tmpfs tmpfs rw`])),
+    ).toEqual(new Set());
+    expect(verifiedIdentityTargets(candidates, info([`3 1 8:1 ${root}/api/src /workspaces/api/src rw`]))).toEqual(new Set());
+    expect(verifiedIdentityTargets(candidates, '')).toEqual(new Set());
+    // A volume that is its own file system (root `/`), and the kernel's escapes.
+    const spaced = [{ target: '/workspaces/api/my src', subpath: 'api/my src' }];
+    expect(verifiedIdentityTargets(spaced, info(['2 1 0:77 / /workspaces rw', '3 1 0:77 /api/my\\040src /workspaces/api/my\\040src rw']))).toEqual(new Set(['/workspaces/api/my src']));
+  });
+
+  it('leaves the verified targets out of devMountFolders, and keeps a real alias (pgview) protected', () => {
+    expect(devMountFolders(container, env, 'on', new Set(['/workspaces/api/src', '/workspaces/api/pgview', '/workspaces/api/tools', '/workspaces/api/bin']))).toEqual([
+      '/workspaces/api/lib',
+      '/workspaces/api/pgview',
+      '/workspaces/api/docs',
+      '/workspaces/api/tools',
+      '/workspaces/api/bin',
+    ]);
+    // Without verification: all protected, as before.
+    expect(devMountFolders(container, env, 'on')).toEqual([
+      '/workspaces/api/src',
+      '/workspaces/api/lib',
+      '/workspaces/api/pgview',
+      '/workspaces/api/docs',
+      '/workspaces/api/tools',
+      '/workspaces/api/bin',
+    ]);
   });
 });
 

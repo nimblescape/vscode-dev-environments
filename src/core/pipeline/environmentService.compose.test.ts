@@ -2222,6 +2222,53 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     expect(devContainer()?.state).toBe('running');
   });
 
+  it('does not refuse a transient reference as an image ID from the images of the others (review round 14, P14-2)', async () => {
+    // A service with the image `cafe` (a local cafe:latest); db's image has an ID that starts with cafe.
+    const cafeModel = model();
+    cafeModel.services.cache = { image: 'cafe' };
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: 'cafe' };
+      }),
+    );
+    await seedCompose({ record: { configHash: composeConfigHash(CONFIG_TEXT, cafeModel, {}), images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
+    h.docker.images.add('cafe');
+    h.docker.imageIds.set(DB_IMAGE, `sha256:cafe${'0'.repeat(60)}`);
+    // The load answers (cafe is the image cafe:latest); before the `up` of the new image, the first batch finds db's image and `cafe` is transient.
+    failInspection(2, () => (h.docker.transientImages = new Set(['cafe'])));
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.imageInspections.at(-1)).toEqual([BASE_IMAGE, DB_IMAGE, 'cafe']);
+    // Before: refused as "an image ID; name the image" (cafe was never inspected), and remembered as a refused update.
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(dockerCheckItem('cafe'))]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(devContainer()?.state).toBe('running');
+  });
+
+  it('logs a transient reference and refuses the others for their definitive items (review round 14, P14-2)', async () => {
+    // `cafe` is transient, 3f2a1b9c (an image ID) is answered: refused for 3f2a1b9c only.
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: '3f2a1b9c' };
+        m.services.web = { image: 'cafe' };
+      }),
+    );
+    h.docker.images.add('3f2a1b9c');
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.images.add('cafe');
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageIds.set(DB_IMAGE, `sha256:cafe${'0'.repeat(60)}`);
+    h.docker.transientImages = new Set(['cafe']);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service cache: image 3f2a1b9c (an image ID; name the image)');
+    // Before: also "service web: image cafe (an image ID; name the image)".
+    expect(error.message).not.toContain('image cafe');
+    expect(h.logger.warnings).toContain('Docker could not check the image references cafe; the configuration is refused for the others.');
+  });
+
   it('passes the cancellation to the inspect (G2)', async () => {
     const controller = new AbortController();
     h.docker.inspectImageNames = async (_references: readonly string[], signal?: AbortSignal) => {
@@ -2475,6 +2522,53 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [DATA, PGVIEW])]]);
     // Not recorded: it matters only in the dev container.
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
+  });
+
+  it('gives a mount of the workspace volume at its own canonical path the full fix (review round 14, P14-1)', async () => {
+    // ..:/workspaces/api and ../src:/workspaces/api/src in the dev service: the subpaths api and api/src of the workspace
+    // volume, each at its own path. src is no alias: after a change of the uid of the remote user, its files of the
+    // old uid must get the new one.
+    const SRC = `${FOLDER}/src`;
+    const out = output((m) => {
+      m.services.app.volumes = [
+        ...(m.services.app.volumes as unknown[]),
+        { type: 'bind', source: FOLDER, target: FOLDER, bind: {} },
+        { type: 'bind', source: SRC, target: SRC, bind: {} },
+      ];
+    });
+    out.realPaths = { ...out.realPaths, [FOLDER]: FOLDER, [SRC]: SRC };
+    useCompose(h, out);
+    await h.service.open(TARGET, options());
+    const upApp = upModel().services.app.volumes as Array<{ type: string; target: string; volume?: { subpath?: string } }>;
+    expect(upApp.find((entry) => entry.target === SRC)).toMatchObject({ type: 'volume', volume: { subpath: 'api/src' } });
+    // Before: [SRC], and only the files of root in src got the remote user.
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode']]);
+  });
+
+  it('keeps a mount of the workspace volume at its own path protected when the mounts of the container cannot be read (review round 14, P14-1)', async () => {
+    const SRC = `${FOLDER}/src`;
+    const out = output((m) => {
+      m.services.app.volumes = [...(m.services.app.volumes as unknown[]), { type: 'bind', source: SRC, target: SRC, bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [SRC]: SRC };
+    useCompose(h, out);
+    h.docker.execHandler = (_container, command) => (command[0] === 'cat' ? { exitCode: 1, stderr: 'cat: not found' } : {});
+    await h.service.open(TARGET, options());
+    expect(h.docker.execs.filter((e) => e.command[0] === 'cat').map((e) => [e.command, e.user])).toEqual([[['cat', '/proc/self/mountinfo'], 'root']]);
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC])]]);
+  });
+
+  it('keeps a mount of the workspace volume protected when a link in the volume makes it another folder (review round 14, P14-1)', async () => {
+    // ../src:/workspaces/api/src, but src is a link to data in the volume (db mounts ./data): Docker mounts data there.
+    const SRC = `${FOLDER}/src`;
+    const out = output((m) => {
+      m.services.app.volumes = [...(m.services.app.volumes as unknown[]), { type: 'bind', source: SRC, target: SRC, bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [SRC]: SRC };
+    useCompose(h, out);
+    h.docker.volumeLinks.set('api/src', 'api/data');
+    await h.service.open(TARGET, options());
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC])]]);
   });
 
   it('gives an anonymous volume of the dev container the full fix, and keeps a named volume protected (review round 13, D13-3)', async () => {

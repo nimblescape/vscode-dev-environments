@@ -60,6 +60,11 @@ export interface MountTarget {
   volume?: string;
   /** The path in the container (`Destination`). */
   target: string;
+  /**
+   * Review round 14 (P14-1): the subpath of a named volume (`VolumeOptions.Subpath` of the entry of `HostConfig.Mounts`
+   * with the same volume and target; the top-level `Mounts` do not have it). Missing: the whole volume, or not known.
+   */
+  subpath?: string;
 }
 
 /** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
@@ -277,18 +282,42 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
       ...(Array.isArray(value.Mounts) ? value.Mounts : []),
       ...(isRecord(value.HostConfig) && Array.isArray(value.HostConfig.Mounts) ? value.HostConfig.Mounts : []),
     ]),
-    mountTargets: mountTargets(value.Mounts, isRecord(value.HostConfig) ? value.HostConfig.Tmpfs : undefined),
+    mountTargets: mountTargets(
+      value.Mounts,
+      isRecord(value.HostConfig) ? value.HostConfig.Tmpfs : undefined,
+      isRecord(value.HostConfig) ? value.HostConfig.Mounts : undefined,
+    ),
     created: typeof value.Created === 'string' ? value.Created : '',
   };
 }
 
-/** Review round 12 (D12-2): the mounts of `docker container inspect` with their targets (ContainerInfo.mountTargets). */
-function mountTargets(mounts: unknown, tmpfs: unknown): MountTarget[] {
+/** A target path as Docker compares it: normalized, without a trailing slash. */
+function cleanTarget(target: string): string {
+  const normal = path.posix.normalize(target);
+  return normal.length > 1 ? normal.replace(/\/+$/, '') : normal;
+}
+
+/**
+ * Review round 12 (D12-2): the mounts of `docker container inspect` with their targets (ContainerInfo.mountTargets).
+ * Review round 14 (P14-1): a volume mount with the subpath of the entry of `HostConfig.Mounts` (`hostMounts`) with the
+ * same volume (`Source`) and target; with more than one such entry of different subpaths, none (not known).
+ */
+function mountTargets(mounts: unknown, tmpfs: unknown, hostMounts: unknown): MountTarget[] {
+  const subpaths = new Map<string, string | null>();
+  for (const mount of Array.isArray(hostMounts) ? hostMounts : []) {
+    if (!isRecord(mount) || mount.Type !== 'volume' || typeof mount.Target !== 'string' || !mount.Target.startsWith('/')) continue;
+    if (typeof mount.Source !== 'string' || mount.Source === '' || !isRecord(mount.VolumeOptions)) continue;
+    const subpath = mount.VolumeOptions.Subpath;
+    if (typeof subpath !== 'string' || subpath === '') continue;
+    const key = `${mount.Source}\0${cleanTarget(mount.Target)}`;
+    subpaths.set(key, subpaths.has(key) && subpaths.get(key) !== subpath ? null : subpath);
+  }
   const result: MountTarget[] = [];
   for (const mount of Array.isArray(mounts) ? mounts : []) {
     if (!isRecord(mount) || typeof mount.Destination !== 'string' || mount.Destination === '' || typeof mount.Type !== 'string') continue;
     const volume = mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : undefined;
-    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination });
+    const subpath = volume !== undefined && mount.Destination.startsWith('/') ? subpaths.get(`${volume}\0${cleanTarget(mount.Destination)}`) : undefined;
+    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination, ...(typeof subpath === 'string' ? { subpath } : {}) });
   }
   if (isRecord(tmpfs)) for (const target of Object.keys(tmpfs)) if (target !== '') result.push({ type: 'tmpfs', target });
   return result;

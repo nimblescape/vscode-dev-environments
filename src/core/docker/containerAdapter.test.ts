@@ -1325,6 +1325,42 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
     ]);
   });
 
+  it('reads the subpath of a volume mount from HostConfig.Mounts, matched by volume and target (review round 14, P14-1)', async () => {
+    const V = 'acme-api-3f2a9c1e';
+    const source = `/var/lib/docker/volumes/${V}/_data`;
+    const dev = {
+      ...containerJson({ id: 'dev1', name: V, status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      HostConfig: {
+        Mounts: [
+          { Type: 'volume', Source: V, Target: '/workspaces' },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/', VolumeOptions: { NoCopy: true, Subpath: 'api' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/src', VolumeOptions: { Subpath: 'api/src' } },
+          // Another volume at the same target does not count; two different subpaths at one target: not known.
+          { Type: 'volume', Source: 'other', Target: '/workspaces/api/pgview', VolumeOptions: { Subpath: 'x' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/twice', VolumeOptions: { Subpath: 'api/a' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/twice', VolumeOptions: { Subpath: 'api/b' } },
+        ],
+      },
+      // The top-level Mounts have no VolumeOptions.
+      Mounts: [
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/src', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/pgview', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/twice', RW: true },
+      ],
+    };
+    const { docker } = adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['dev1'])) : ok(inspectOutput([dev]))));
+    const [container] = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(container.mountTargets).toEqual([
+      { type: 'volume', volume: V, target: '/workspaces' },
+      { type: 'volume', volume: V, target: '/workspaces/api', subpath: 'api' },
+      { type: 'volume', volume: V, target: '/workspaces/api/src', subpath: 'api/src' },
+      { type: 'volume', volume: V, target: '/workspaces/api/pgview' },
+      { type: 'volume', volume: V, target: '/workspaces/api/twice' },
+    ]);
+  });
+
   it('lists the networks of the project by its label', async () => {
     const { docker, runner } = adapter(() => ok('"devenv-3f2a9c1e_default"\n"devenv-3f2a9c1e_backend"\n'));
     expect(await docker.listProjectNetworks('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e_default', 'devenv-3f2a9c1e_backend']);

@@ -981,3 +981,37 @@ describe('review round 10 (S10-1, S10-2): the bounds of the model in the extensi
     expect(composeModelLimit({ services: {}, secrets: many } as unknown as ComposeModel)).toBe('5001 top-level secrets (at most 5000)');
   });
 });
+
+describe('decideServiceMount: the extension\'s internal folder (review round 14, S14-1)', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const context = (isDev: boolean): ComposeMountContext => ({
+    isDev,
+    repositoryFolder: REPO,
+    volumeNames: new Map([
+      ['pgdata', `${PROJECT}_pgdata`],
+      ['ws', OWN],
+    ]),
+    ownVolume: OWN,
+    engineApiVersion: '1.47',
+  });
+  const refused = (target: string) => ({ action: 'refuse', kind: 'unsupported', item: `mount at ${target} (${INTERNAL})` });
+
+  it.each<[string, unknown, string]>([
+    ['repository data (the probe of r14-S)', { type: 'bind', source: `${REPO}/pgdata`, target: '/workspaces/.devenv+/pg' }, '/workspaces/.devenv+/pg'],
+    ['a .. alias', { type: 'bind', source: `${REPO}/`, target: '/workspaces/.devenv+/repo' }, '/workspaces/.devenv+/repo'],
+    ['the parent of the repository', { type: 'bind', source: '/workspaces', target: '/workspaces/.devenv+/all' }, '/workspaces/.devenv+/all'],
+    ['a named volume', { type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+' }, '/workspaces/.devenv+'],
+    ['the workspace volume', { type: 'volume', source: 'ws', target: '/workspaces/.devenv+/w' }, '/workspaces/.devenv+/w'],
+    ['an anonymous volume, written with dots and slashes', { type: 'volume', target: '/workspaces/api/..//.devenv+/./x/' }, '/workspaces/.devenv+/x'],
+    ['a tmpfs', { type: 'tmpfs', target: '/workspaces/.devenv+/gh' }, '/workspaces/.devenv+/gh'],
+  ])('refuses %s in the dev service', (_name, entry, target) => {
+    expect(decideServiceMount(entry, context(true))).toEqual(refused(target));
+  });
+
+  it('keeps /workspaces/.cache and /workspaces/.devenv+x in the dev service, and the folder in another service', () => {
+    expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.cache' }, context(true))).toEqual({ action: 'keep' });
+    expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+x' }, context(true))).toEqual({ action: 'keep' });
+    expect(decideServiceMount({ type: 'tmpfs', target: '/workspaces/.devenv+x/y' }, context(true))).toEqual({ action: 'keep' });
+    expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+/pg' }, context(false))).toEqual({ action: 'keep' });
+  });
+});

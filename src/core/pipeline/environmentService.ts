@@ -153,6 +153,8 @@ import {
   composeRecordOf,
   serviceFoldersOf,
   devMountFolders,
+  verifiedIdentityTargets,
+  workspaceIdentityMounts,
   liveServiceFolders,
   repositoryServiceDataFolders,
   configHash,
@@ -1777,7 +1779,11 @@ export class EnvironmentService {
     });
     this.throwIfCancelled(signal);
     const transient = unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference);
-    const byId = new Set(imageIdResolvedReferences(distinct, images));
+    // Review round 14 (P14-2): the ID test only over the references with a definitive answer: a transient one was never
+    // inspected, so the images of the others (a batch before the failure) say nothing about it (for example `cafe`, with
+    // a local cafe:latest, and another image whose ID starts with cafe). It takes the transient path below.
+    const transientSet = new Set(transient);
+    const byId = new Set(imageIdResolvedReferences(distinct.filter((reference) => !transientSet.has(reference)), images));
     // Review round 13 (P13-1): only a definitive answer (`invalid`) becomes an item; a transient one never does.
     const notChecked = new Set(unchecked.filter((entry) => entry.reason === 'invalid').map((entry) => entry.reference));
     if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
@@ -3483,7 +3489,8 @@ export class EnvironmentService {
     if (serviceFolders === 'repository') return serviceFolders;
     let mounts: string[];
     try {
-      mounts = devMountFolders(await this.deps.docker.findContainer(ctx.env.id, containerName), ctx.env, ctx.hostAccessChecks);
+      const container = await this.deps.docker.findContainer(ctx.env.id, containerName);
+      mounts = devMountFolders(container, ctx.env, ctx.hostAccessChecks, await this.workspaceIdentities(ctx, container));
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);
@@ -3492,6 +3499,25 @@ export class EnvironmentService {
     if (mounts.length === 0) return serviceFolders;
     const bounded = boundServiceFolders(repositoryFolder(ctx.env.repository), [serviceFolders, mounts]);
     return bounded.overflow ? 'repository' : bounded.folders;
+  }
+
+  /**
+   * Review round 14 (P14-1): the targets of the mounts of the workspace volume in the dev container that show their folder
+   * at its own canonical path (workspaceIdentityMounts), checked with `/proc/self/mountinfo` of the container
+   * (verifiedIdentityTargets). When it cannot be read, none: the mounts stay protected.
+   */
+  private async workspaceIdentities(ctx: PipelineContext, container: ContainerInfo | undefined): Promise<Set<string>> {
+    const candidates = workspaceIdentityMounts(container, ctx.env);
+    if (container === undefined || candidates.length === 0) return new Set();
+    try {
+      const result = await this.deps.docker.exec(container.id, ['cat', '/proc/self/mountinfo'], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+      if (result.exitCode === 0) return verifiedIdentityTargets(candidates, result.stdout);
+      this.logger.info(`The mounts of the container of ${ctx.env.repository} could not be read: ${(result.stderr || result.stdout).trim()}`);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.info(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);
+    }
+    return new Set();
   }
 
   /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */

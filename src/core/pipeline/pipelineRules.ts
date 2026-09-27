@@ -5,7 +5,7 @@
 // Pure decisions and helpers of the open pipeline (concept 7.6, 7.7, 7.12). No I/O.
 import * as crypto from 'crypto';
 import * as path from 'path';
-import type { ContainerInfo } from '../docker/containerAdapter';
+import type { ContainerInfo, MountTarget } from '../docker/containerAdapter';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';
@@ -477,19 +477,89 @@ export function liveServiceFolders(
  * populated as uid 1000) gets the remote user in full. With the checks off, a configuration may mount the anonymous
  * volume of another container by its name, so it stays protected. Named volumes and bind mounts stay protected, since
  * they can be shared with another container or environment; a tmpfs needs nothing (`-xdev` does not go into it).
+ * Review round 14 (P14-1): a mount of the workspace volume whose target is `identities` (workspaceIdentityMounts, checked
+ * in the container with verifiedIdentityTargets) is not protected: it shows the folder of the volume at its own canonical
+ * path (for example `../src:/workspaces/api/src`), no alias; its files get the full fix like the rest of the repository.
  */
 export function devMountFolders(
   container: Pick<ContainerInfo, 'mountTargets'> | undefined,
   env: Pick<Environment, 'repository' | 'volumeName'>,
   hostAccessChecks: HostAccessChecks,
+  identities: ReadonlySet<string> = new Set(),
 ): string[] {
   const targets = (container?.mountTargets ?? [])
     .filter((mount) => mount.target.startsWith('/'))
     .map((mount) => ({ ...mount, target: path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') }))
     .filter((mount) => !(mount.type === 'volume' && mount.volume === env.volumeName && mount.target === WORKSPACES_ROOT))
+    // Review round 14 (P14-1): a mount of the workspace volume at its own canonical path, checked in the container.
+    .filter((mount) => !(identities.has(mount.target) && identityMountTarget(mount, env) === mount.target))
     .filter((mount) => !(hostAccessChecks === 'on' && mount.type === 'volume' && mount.volume !== undefined && isAnonymousVolumeName(mount.volume)))
     .map((mount) => mount.target);
   return serviceFolderPaths(repositoryFolder(env.repository), targets);
+}
+
+/** Review round 14 (P14-1): a mount of a subpath of the workspace volume at the path of that subpath (workspaceIdentityMounts). */
+export interface WorkspaceIdentityMount {
+  /** The normalized target, below the repository folder, for example `/workspaces/api/src`. */
+  target: string;
+  /** The subpath, normalized, for example `api/src`. */
+  subpath: string;
+}
+
+/**
+ * Review round 14 (P14-1): the mounts of the workspace volume of the dev container below the repository folder whose
+ * target is the path of their subpath in the volume (`/workspaces/<subpath>` equals the target), for example
+ * `../src:/workspaces/api/src` of a dev service (rewritten to the subpath `api/src`). Only lexically: a link in the
+ * volume can make the mounted folder another one, so verifiedIdentityTargets checks them in the container. A mount
+ * without a known subpath (MountTarget.subpath) is never one.
+ */
+export function workspaceIdentityMounts(container: Pick<ContainerInfo, 'mountTargets'> | undefined, env: Pick<Environment, 'repository' | 'volumeName'>): WorkspaceIdentityMount[] {
+  const result: WorkspaceIdentityMount[] = [];
+  for (const mount of container?.mountTargets ?? []) {
+    const target = identityMountTarget(mount, env);
+    if (target !== undefined && !result.some((known) => known.target === target)) result.push({ target, subpath: target.slice(WORKSPACES_ROOT.length + 1) });
+  }
+  return result;
+}
+
+/** The normalized target of a mount of the workspace volume below the repository folder at `/workspaces/<subpath>`. */
+function identityMountTarget(mount: MountTarget, env: Pick<Environment, 'repository' | 'volumeName'>): string | undefined {
+  if (mount.type !== 'volume' || mount.volume !== env.volumeName || mount.subpath === undefined || mount.subpath === '' || !mount.target.startsWith('/')) return undefined;
+  if (mount.subpath.startsWith('/') || mount.subpath.includes('\0')) return undefined;
+  const target = path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1');
+  const canonical = path.posix.join(WORKSPACES_ROOT, mount.subpath).replace(/(.)\/+$/, '$1');
+  return canonical === target && target.startsWith(`${repositoryFolder(env.repository)}/`) ? target : undefined;
+}
+
+/** The kernel's escapes of `/proc/self/mountinfo` (`\040` for a space, `\011`, `\012`, `\134`). */
+function mountInfoPath(text: string): string {
+  return text.replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+}
+
+/**
+ * Review round 14 (P14-1): of `candidates` (workspaceIdentityMounts), the targets whose mount shows the folder of the
+ * volume at its canonical path, from `/proc/self/mountinfo` of the dev container (`mountInfo`): the mount at the target
+ * lies on the same file system (`major:minor`) as the mount at WORKSPACES_ROOT (the whole workspace volume), and its root
+ * in that file system is the root of the mount at WORKSPACES_ROOT joined with the subpath. The kernel records the real
+ * folder: a link in the volume (Docker follows links in a subpath within the volume) gives another root, and the mount
+ * stays protected. The topmost mount of a path counts (the last line). Without a clear answer, none.
+ */
+export function verifiedIdentityTargets(candidates: readonly WorkspaceIdentityMount[], mountInfo: string): Set<string> {
+  const mounts = new Map<string, { device: string; root: string }>();
+  for (const line of mountInfo.split('\n')) {
+    const fields = line.split(' ');
+    if (fields.length < 5 || !/^\d+:\d+$/.test(fields[2])) continue;
+    mounts.set(mountInfoPath(fields[4]), { device: fields[2], root: mountInfoPath(fields[3]) });
+  }
+  const verified = new Set<string>();
+  const workspaces = mounts.get(WORKSPACES_ROOT);
+  if (workspaces === undefined || !workspaces.root.startsWith('/')) return verified;
+  const base = workspaces.root === '/' ? '' : workspaces.root.replace(/\/+$/, '');
+  for (const candidate of candidates) {
+    const mount = mounts.get(candidate.target);
+    if (mount !== undefined && mount.device === workspaces.device && mount.root === `${base}/${candidate.subpath}`) verified.add(candidate.target);
+  }
+  return verified;
 }
 
 /**
