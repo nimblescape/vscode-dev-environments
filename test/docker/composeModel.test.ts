@@ -173,7 +173,6 @@ describe('model run of a Docker Compose configuration', () => {
       containerName: 'devenv-test-compose-app',
       volumeName,
       repositoryFolder: REPO,
-      dollarEscaped: output.dollarEscaped,
       engineApiVersion: '1.45',
       realPaths: output.realPaths,
       image: 'devenv-c0ffee00:1',
@@ -219,7 +218,6 @@ describe('model run of a Docker Compose configuration', () => {
       containerName: 'devenv-test-compose-app',
       volumeName,
       repositoryFolder: REPO,
-      dollarEscaped: output.dollarEscaped,
       // Only `config` reads the model (no container starts), so the rewrite of repository files is read also on an
       // engine before Docker Engine 26.
       engineApiVersion: '1.45',

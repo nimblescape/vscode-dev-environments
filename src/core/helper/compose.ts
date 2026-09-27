@@ -727,8 +727,6 @@ export interface ComposeRewriteParams {
   volumeName: string;
   /** The folder of the repository in the helper, for example `/workspaces/api`. */
   repositoryFolder: string;
-  /** ComposeModelOutput.dollarEscaped (review round 19, S19-1: the rewrite no longer uses it; the written texts are always escaped). */
-  dollarEscaped: boolean;
   /**
    * Review round 20 (P20-1): ComposeModelOutput.dockerfiles, the checked Dockerfile texts. composeBuildModel writes the
    * one of the dev service to COMPOSE_DEV_DOCKERFILE, and refuses a local build of it without one.

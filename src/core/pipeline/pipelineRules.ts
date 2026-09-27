@@ -430,6 +430,16 @@ export function nonEmptyString(value: unknown): string | undefined {
 
 /** Label that Docker Compose gives each container, network, and volume of a project. */
 export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+/** Review round 22 (D22-1): label that Docker Compose gives each container of a project: the name of its service. */
+export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
+
+/**
+ * Review round 22 (D22-1): the name that Docker Compose gives a container that it creates in place of another one while
+ * it recreates a service (`<first 12 characters of the ID>_<name>`), which stays behind when that fails.
+ */
+export function isComposeRecreateLeftoverName(name: string): boolean {
+  return /^[0-9a-f]{12}_/.test(name);
+}
 
 /** BuildRecord.compose, when it is valid: the build record of a Docker Compose configuration. */
 export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRecord | undefined {

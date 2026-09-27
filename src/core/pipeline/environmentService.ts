@@ -172,6 +172,9 @@ import {
   imageRemoteUser,
   imagesToPull,
   isComposeContainer,
+  isComposeRecreateLeftoverName,
+  COMPOSE_CONTAINER_NUMBER_LABEL,
+  COMPOSE_SERVICE_LABEL,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -213,6 +216,7 @@ export type EnvironmentDocker = Pick<
   | 'findContainer'
   | 'listEnvironmentContainers'
   | 'removeContainer'
+  | 'renameContainer'
   | 'stopContainer'
   | 'exec'
   | 'volumeExists'
@@ -1331,11 +1335,26 @@ export class EnvironmentService {
       }
     }
     if (loaded) {
+      const previousConfigPath = ctx.env.configPath;
       await this.saveConfiguration(ctx, loaded, record);
       // A container of an older setup is created again (concept section 9); it does not count as a working container.
       const currentContainer = container !== undefined && containerIsCurrent(container.labels, true, ctx.hostAccessChecks);
       const plan = await this.planUpdate(ctx, loaded, record, imagePresent, currentContainer);
-      if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
+      try {
+        if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
+      } catch (error) {
+        // Review round 22 (D22-1): a selected configuration that could not start does not stay selected, so the next open
+        // starts the environment with the configuration that it had (its containers are of that one).
+        if (ctx.env.configPath !== previousConfigPath) {
+          this.logger.info(`The configuration ${ctx.env.configPath} of ${ctx.env.repository} could not be started; ${previousConfigPath} stays selected.`);
+          await this.quietly('restore the configuration path', () =>
+            this.updateEntry(ctx, (entry) => {
+              entry.configPath = previousConfigPath;
+            }),
+          );
+        }
+        throw error;
+      }
     }
     outcome ??= await this.startContainer(ctx, container, record, imagePresent, this.configurationOfKind(ctx, loaded, container, record));
     return this.finish(ctx, outcome, loaded);
@@ -1893,7 +1912,6 @@ export class EnvironmentService {
       containerName: env.containerName,
       volumeName: env.volumeName,
       repositoryFolder: repositoryFolder(env.repository),
-      dollarEscaped: compose.output.dollarEscaped,
       // Review round 20 (P20-1): the checked Dockerfile of the dev service, which the build writes.
       dockerfiles: compose.output.dockerfiles,
       ...(compose.engineApiVersion !== undefined ? { engineApiVersion: compose.engineApiVersion } : {}),
@@ -2851,6 +2869,12 @@ export class EnvironmentService {
       // was cancelled, which the user may have used since) are not new, whatever the failed `up` does.
       ctx.composeSwitch = { existing: await this.composeContainerIds(env) };
     }
+    // Review round 22 (D22-1): the dev container of another service of the project (Select configuration… between two
+    // configurations of one compose file with another `service`): it holds the name that the new dev service gets.
+    const previousService = found !== undefined && replaced === undefined ? found.labels[COMPOSE_SERVICE_LABEL] : undefined;
+    if (found !== undefined && previousService !== undefined && previousService !== compose.service) {
+      await this.movePreviousDevContainer(ctx, compose, found, previousService, removeExistingContainer);
+    }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
     await this.prepareGit(ctx);
     const override = buildComposeOverrideConfig({
@@ -2887,6 +2911,49 @@ export class EnvironmentService {
     }
     const failure = nonEmptyString(result.lifecycleCommandFailure);
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image, userArgs);
+  }
+
+  /**
+   * Review round 22 (D22-1): the dev container `previous` of the service `previousService` of the project, while the
+   * configuration names another dev service (compose.service), which gets the name of the environment. It is renamed to
+   * the default name of Compose for its service, so that Compose creates it again as another service (and keeps its
+   * volumes without a name, for example `node_modules`); when that fails, it is stopped and removed (its volumes stay),
+   * as at a switch of the kind, and the user learns it. A container that an earlier failed attempt of Compose left in the
+   * state `created` (`<id>_<name>`) is removed. The container of the new dev service is stopped before the Dev Container
+   * CLI removes it (`--remove-existing-container`, D9-3).
+   */
+  private async movePreviousDevContainer(
+    ctx: PipelineContext,
+    compose: LoadedCompose,
+    previous: ContainerInfo,
+    previousService: string,
+    removeExistingContainer: boolean,
+  ): Promise<void> {
+    const env = ctx.env;
+    const { docker } = this.deps;
+    const number = previous.labels[COMPOSE_CONTAINER_NUMBER_LABEL] ?? '1';
+    const name = `${compose.project}-${previousService}-${number}`;
+    this.logger.info(`The dev container ${previous.name} of ${env.repository} is of the service ${previousService}; the configuration uses the service ${compose.service}.`);
+    try {
+      await docker.renameContainer(previous.id, name);
+      this.logger.info(`The container ${previous.name} is now ${name}; Docker Compose creates it again as the service ${previousService}.`);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.info(`The container ${previous.name} could not be renamed (${errorMessage(error)}). It is removed; its volumes are kept.`);
+      ctx.steps.detail(Messages.containerComposeDevServiceChanged);
+      await this.stopServiceBeforeRemoval(previous, env);
+      await docker.removeContainer(previous.id);
+      (ctx.kindSwitchRemoved ??= []).push(`the container ${previous.name} of the service ${previousService}`);
+    }
+    for (const container of await this.composeContainers(env)) {
+      if (container.id === previous.id) continue;
+      if (container.rawState === 'created' && isComposeRecreateLeftoverName(container.name)) {
+        this.logger.info(`The container ${container.name} that an earlier start of Docker Compose left behind is removed. Its volumes are kept.`);
+        await docker.removeContainer(container.id);
+      } else if (removeExistingContainer && container.labels[COMPOSE_SERVICE_LABEL] === compose.service) {
+        await this.stopServiceBeforeRemoval(container, env);
+      }
+    }
   }
 
   /**

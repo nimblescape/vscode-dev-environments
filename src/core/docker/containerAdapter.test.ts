@@ -426,6 +426,13 @@ describe('containers', () => {
     await expect(docker.stopContainer('x')).rejects.toBeInstanceOf(CommandError);
   });
 
+  it('renameContainer runs docker rename and throws when it fails (review round 22, D22-1)', async () => {
+    const { docker, runner } = adapter((call) => (call.args[2] === 'taken' ? fail('Error response from daemon: Conflict. The container name "/taken" is already in use') : ok()));
+    await docker.renameContainer('x', 'devenv-3f2a9c1e-app-1');
+    expect(runner.calls[0].args).toEqual(['rename', 'x', 'devenv-3f2a9c1e-app-1']);
+    await expect(docker.renameContainer('x', 'taken')).rejects.toBeInstanceOf(CommandError);
+  });
+
   it('removeContainer uses rm -f and ignores a missing container', async () => {
     const { docker, runner } = adapter((call) =>
       call.args[2] === 'gone' ? fail('Error: No such container: gone') : ok(),

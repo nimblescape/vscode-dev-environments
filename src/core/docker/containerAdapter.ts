@@ -738,6 +738,16 @@ export class ContainerAdapter {
     throw this.commandError(args, result);
   }
 
+  /**
+   * Review round 22 (D22-1): `docker rename`. Throws when the container does not exist or the name is taken.
+   */
+  async renameContainer(nameOrId: string, newName: string): Promise<void> {
+    this.logger.info(`Renaming container ${nameOrId} to ${newName}.`);
+    const args = ['rename', nameOrId, newName];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) throw this.commandError(args, result);
+  }
+
   /** `docker rm -f`. A missing container is not an error. */
   async removeContainer(nameOrId: string): Promise<void> {
     this.logger.info(`Removing container ${nameOrId}.`);

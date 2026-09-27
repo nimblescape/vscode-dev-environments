@@ -39,7 +39,6 @@ function params(overrides: Partial<ComposeRewriteParams> = {}): ComposeRewritePa
     containerName: OWN,
     volumeName: OWN,
     repositoryFolder: REPO,
-    dollarEscaped: true,
     engineApiVersion: '1.47',
     image: 'devenv-3f2a9c1e:7',
     ...overrides,

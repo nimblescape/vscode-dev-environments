@@ -95,7 +95,8 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['--uts', input(run('--uts', 'host')), '--uts=host', 'computer'],
   ['--userns', input(run('--userns', 'host')), '--userns=host', 'computer'],
   ['--cgroupns', input(run('--cgroupns', 'host')), '--cgroupns=host', 'computer'],
-  ['--volumes-from', input(run('--volumes-from', 'db')), '--volumes-from=db', 'computer'],
+  // review round 22, H22-2: changed expectation, the volumes of another container stay refused whatever the switch says.
+  ['--volumes-from', input(run('--volumes-from', 'db')), '--volumes-from=db', 'protected'],
   ['--link', input(run('--link', 'db')), '--link=db', 'computer'],
   ['--network container:', input(run('--network', 'container:db')), 'network of another container (container:db)', 'computer'],
   // Ports on all addresses.

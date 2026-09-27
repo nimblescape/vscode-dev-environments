@@ -188,8 +188,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['a volume at /workspaces of the dev service', 'app', { volumes: [{ type: 'volume', source: 'pgdata', target: '/workspaces' }] }, U('service app: mount at /workspaces')],
     ['a mount of the type npipe', 'db', { volumes: [{ type: 'npipe', source: 'p', target: '/p' }] }, U('service db: mount of the type npipe (p → /p)')],
     // other containers
-    ['volumes_from', 'db', { volumes_from: ['app'] }, A('service db: volumes_from')],
-    ['links', 'db', { links: ['app'] }, A('service db: links')],
+    // review round 22, H22-2: changed expectation, the volumes of the dev service are named with the reason (protected).
+    ['volumes_from', 'db', { volumes_from: ['app'] }, A('service db: volumes_from app (the volumes of the dev container, with the workspace volume, which holds the GitHub token)')],
+    // review round 22, H22-1: changed expectation, links to services of the model are allowed.
+    ['links', 'db', { links: ['app'] }, NONE],
     ['external_links', 'db', { external_links: ['redis'] }, A('service db: external_links')],
     // privileges
     ['privileged', 'db', { privileged: true }, A('service db: privileged mode')],
@@ -213,7 +215,8 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['oom_score_adj below 0', 'db', { oom_score_adj: -500 }, A('service db: oom_score_adj -500')],
     // namespaces
     ['pid host', 'db', { pid: 'host' }, A('service db: pid host')],
-    ['pid of another service', 'db', { pid: 'service:app' }, A('service db: pid service:app')],
+    // review round 22, H22-6: changed expectation, the pid namespace of the dev service is named with the reason (protected).
+    ['pid of another service', 'db', { pid: 'service:app' }, A('service db: pid service:app (the processes of the dev container, which holds the GitHub token)')],
     ['ipc private', 'db', { ipc: 'private' }, NONE],
     ['ipc shareable', 'db', { ipc: 'shareable' }, NONE],
     ['ipc host', 'db', { ipc: 'host' }, A('service db: ipc host')],
@@ -257,8 +260,9 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['deploy generic_resources', 'db', { deploy: { resources: { reservations: { generic_resources: [{}] } } } }, U('service db: deploy.resources.reservations.generic_resources')],
     ['pull_policy (rewritten, D-16)', 'db', { pull_policy: 'always' }, NONE],
     ['use_api_socket', 'db', { use_api_socket: true }, A('service db: the Docker socket (use_api_socket)')],
-    ['service secrets', 'db', { secrets: [{ source: 'pw' }] }, A('service db: secrets')],
-    ['service configs', 'db', { configs: [{ source: 'c' }] }, A('service db: configs')],
+    // review round 22, H22-4: changed expectation, the top-level secrets and configs decide.
+    ['service secrets', 'db', { secrets: [{ source: 'pw' }] }, NONE],
+    ['service configs', 'db', { configs: [{ source: 'c' }] }, NONE],
     ['models', 'db', { models: { m: {} } }, U('service db: models')],
     ['provider', 'db', { provider: { type: 'x' } }, U('service db: provider')],
     ['credential_spec', 'db', { credential_spec: { file: 'x' } }, U('service db: credential_spec')],
@@ -305,8 +309,9 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
   it.each<[string, (model: ComposeModel) => void, HostAccessReport]>([
     ['another project name', (m) => (m.name = 'api_devcontainer'), U('project name api_devcontainer')],
     ['version (obsolete)', (m) => (m.version = '3.8'), NONE],
-    ['secrets', (m) => (m.secrets = { pw: { file: './pw.txt' } }), A('secrets')],
-    ['configs', (m) => (m.configs = { c: { file: './c' } }), A('configs')],
+    // review round 22, H22-4: changed expectation, each file is named (a relative path stays refused whatever the switch says).
+    ['secrets', (m) => (m.secrets = { pw: { file: './pw.txt' } }), A('secret pw: file ./pw.txt (a relative path)')],
+    ['configs', (m) => (m.configs = { c: { file: './c' } }), A('config c: file ./c (a relative path)')],
     ['models', (m) => (m.models = { m: {} }), U('models')],
     ['include (left after the merge)', (m) => (m.include = ['x.yml']), U('include')],
     ['an unknown key', (m) => (m.future = { a: 1 }), U('future')],
@@ -314,8 +319,9 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
     ['a named volume', (m) => (m.volumes = { ...m.volumes, cache: { name: 'shared-cache' } }), NONE],
     ['an external volume', (m) => (m.volumes = { ...m.volumes, old: { external: true, name: 'old' } }), NONE],
     ['a volume with the local driver', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'local' } }), NONE],
-    ['a volume with another driver', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } }), A('volume pgdata: driver nfs')],
-    ['a volume with driver options', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver_opts: { type: 'none', device: '/Users/x', o: 'bind' } } }), A('volume pgdata: driver options')],
+    // review round 22, H22-5: changed expectation, not supported (the pipeline creates the volumes without them).
+    ['a volume with another driver', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } }), U('volume pgdata: driver nfs (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)')],
+    ['a volume with driver options', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver_opts: { type: 'none', device: '/Users/x', o: 'bind' } } }), U('volume pgdata: driver options (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)')],
     ['a volume with a reserved label', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, labels: { 'devenv.volume': 'additional' } } }), U('volume pgdata: label devenv.volume')],
     ['a volume with an unknown option', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, future: 1 } }), U('volume pgdata: future')],
     ['the key of the workspace volume', (m) => (m.volumes = { ...m.volumes, 'devenv-workspace': { name: `${PROJECT}_devenv-workspace` } }), U('volume key devenv-workspace (Dev Environments uses it)')],

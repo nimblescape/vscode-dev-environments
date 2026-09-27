@@ -239,6 +239,20 @@ export class FakeDocker implements EnvironmentDocker {
     if (container) this.containers.delete(container.id);
   }
 
+  /** Review round 22 (D22-1): `docker rename`; fails with renameError, or when the name is taken. */
+  renameError: Error | undefined = undefined;
+
+  async renameContainer(nameOrId: string, newName: string): Promise<void> {
+    this.log.push(`rename ${nameOrId} ${newName}`);
+    if (this.renameError) throw this.renameError;
+    const container = this.containerByRef(nameOrId);
+    if (!container) throw new CommandError(`docker rename ${nameOrId}`, 1, '', `Error: No such container: ${nameOrId}`);
+    if ([...this.containers.values()].some((c) => c.name === newName && c.id !== container.id)) {
+      throw new CommandError(`docker rename ${nameOrId}`, 1, '', `Error response from daemon: Conflict. The container name "/${newName}" is already in use`);
+    }
+    container.name = newName;
+  }
+
   async stopContainer(nameOrId: string): Promise<void> {
     this.log.push(`stop ${nameOrId}`);
     const container = this.containerByRef(nameOrId);
@@ -818,6 +832,10 @@ export class FakeHelper implements EnvironmentHelper {
       );
     const create = (name: string, containerName: string, serviceImage: string, labels: unknown, volumes: string[]): ContainerInfo => {
       if (!this.docker.images.has(serviceImage)) throw new DevcontainerCommandError('devcontainer up', 1, '', `Error: No such image: ${serviceImage}`);
+      // Review round 22 (D22-1): like Docker, a name that another container has already is a conflict.
+      if ([...this.docker.containers.values()].some((c) => c.name === containerName)) {
+        throw new DevcontainerCommandError('devcontainer up', 1, '', `Error response from daemon: Conflict. The container name "/${containerName}" is already in use`);
+      }
       const created = this.docker.addContainer({
         environmentId: p.environmentId,
         name: containerName,
@@ -867,12 +885,18 @@ export class FakeHelper implements EnvironmentHelper {
     for (const name of runServices) {
       if (name === service) continue;
       const other = ofProject(name);
-      if (other) {
+      const definition = model.services[name];
+      // Review round 22 (D22-1): Compose creates a container again when its configuration changed (here: the label of the
+      // service, for example the previous dev container, which becomes another service).
+      const labelsOf = (value: unknown): Record<string, string> => (value !== null && typeof value === 'object' ? (value as Record<string, string>) : {});
+      if (other && other.labels[LABEL_COMPOSE_SERVICE] !== labelsOf(definition.labels)[LABEL_COMPOSE_SERVICE]) {
+        this.docker.log.push(`compose recreate ${other.id}`);
+        this.docker.containers.delete(other.id);
+      } else if (other) {
         other.state = 'running';
         other.rawState = 'running';
         continue;
       }
-      const definition = model.services[name];
       create(name, `${project}-${name}-1`, String(definition.image), definition.labels, volumeNames(definition.volumes));
     }
     const failure = this.lifecycleFailure(image);

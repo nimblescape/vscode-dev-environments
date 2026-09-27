@@ -3032,3 +3032,66 @@ describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev s
     }
   });
 });
+
+describe('review round 22 (D22-1): Select configuration… between two configurations of one compose file with another service', () => {
+  const WEB_PATH = '.devcontainer/web/devcontainer.json';
+  const WEB_TEXT = CONFIG_TEXT.replace('"service": "app"', '"service": "web"').replace('["compose.yml"]', '["../compose.yml"]');
+
+  beforeEach(() => {
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT }, [WEB_PATH]: { configText: WEB_TEXT } };
+    h.helper.composeOutput = output((m) => {
+      // Each configuration mounts the workspace volume into its dev service only (another service may not mount it).
+      delete m.services.app.volumes;
+      m.services.web = { image: BASE_IMAGE, command: ['sleep', 'infinity'], networks: { default: null } };
+    });
+  });
+
+  const byService = (service: string): ContainerInfo | undefined => h.docker.containersOf(ENV_ID).find((c) => c.labels['com.docker.compose.service'] === service);
+
+  it('renames the previous dev container out of the way, stops the container of the new dev service before up removes it, and starts', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    const web = byService('web')!;
+    expect(app.name).toBe(NAME);
+    expect(web.state).toBe('running');
+    const log = h.docker.log.length;
+    // A container that an earlier failed attempt of Compose left in the state `created`.
+    const leftover = h.docker.addContainer({ environmentId: ENV_ID, name: `${'a'.repeat(12)}_${PROJECT}-app-1`, state: 'stopped', image: IMAGE_1, labels: { ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', [LABEL_COMPOSE_SERVICE]: 'app' } });
+    leftover.rawState = 'created';
+
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+
+    const after = h.docker.log.slice(log);
+    expect(after).toContain(`rename ${app.id} ${PROJECT}-app-1`);
+    expect(after).toContain(`stop ${web.id}`);
+    expect(after).toContain(`rm ${leftover.id}`);
+    // Never removed with its volumes, and the previous dev container is not removed by the extension.
+    expect(after).not.toContain(`rm ${app.id}`);
+    expect(h.helper.calls.filter((call) => call.startsWith('up')).at(-1)).toBe(`up ${IMAGE_2} --remove-existing-container`);
+    expect(byService('web')).toMatchObject({ name: NAME, state: 'running' });
+    // Compose creates the previous dev service again as another service, under its default name.
+    expect(byService('app')).toMatchObject({ name: `${PROJECT}-app-1`, labels: expect.objectContaining({ [LABEL_COMPOSE_SERVICE]: 'app' }) });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(WEB_PATH);
+    expect(h.progress.details).not.toContain(Messages.containerComposeDevServiceChanged);
+  });
+
+  it('stops and removes the previous dev container (its volumes stay) when it cannot be renamed, and tells the user', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    h.docker.renameError = new CommandError('docker rename', 1, '', 'Error response from daemon: rename failed');
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+    expect(h.docker.log).toContain(`stop ${app.id}`);
+    expect(h.docker.log).toContain(`rm ${app.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(byService('web')).toMatchObject({ name: NAME, state: 'running' });
+    expect(h.progress.details).toContain(Messages.containerComposeDevServiceChanged);
+  });
+
+  it('keeps the previous configuration path when the start with the new one fails', async () => {
+    await h.service.open(TARGET, options());
+    h.helper.upError = () => new Error('compose up failed');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+    expect(error.code).toBe('startFailed');
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+  });
+});

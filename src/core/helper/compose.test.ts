@@ -81,13 +81,20 @@ function params(overrides: Partial<ComposeRewriteParams> = {}): ComposeRewritePa
     containerName: OWN,
     volumeName: OWN,
     repositoryFolder: REPO,
-    dollarEscaped: true,
     engineApiVersion: '1.47',
     // Review round 20 (P20-1): the Dockerfile of the dev service that the model run read (templateModel builds one).
     dockerfiles: { app: DEV_DOCKERFILE },
     ...overrides,
   };
 }
+
+describe('review round 22, H22-7', () => {
+  it('has no parameter dollarEscaped of the rewrite any more (the written texts are always escaped)', () => {
+    // @ts-expect-error review round 22, H22-7: ComposeRewriteParams.dollarEscaped is removed (tsc fails if it comes back).
+    const p: ComposeRewriteParams = { ...params(), dollarEscaped: true };
+    expect(composeUpModel(templateModel(), { ...p, image: 'devenv-3f2a9c1e:7' }).model.name).toBe(PROJECT);
+  });
+});
 
 describe('names', () => {
   it('the project of an environment is devenv-<short id>, the repository part of the environment image', () => {
@@ -559,10 +566,10 @@ describe('composeUpModel', () => {
   it('escapes $ whatever the output of Docker Compose', () => {
     const model = templateModel();
     model.services.app.environment = { A: 'a$b' };
-    expect(up(model, { dollarEscaped: false }).model.services.app.environment).toEqual({ A: 'a$$b' });
     // review round 19, S19-1: changed expectation, the model holds the unescaped texts (COMPOSE_MODEL_SCRIPT unescapes
-    // them), so the written model is escaped also when Compose prints $ as $$.
-    expect(up(model, { dollarEscaped: true }).model.services.app.environment).toEqual({ A: 'a$$b' });
+    // them), so the written model is escaped also when Compose prints $ as $$. Review round 22, H22-7: the rewrite has
+    // no parameter dollarEscaped any more.
+    expect(up(model).model.services.app.environment).toEqual({ A: 'a$$b' });
   });
 
   it.each<[string, (model: ComposeModel) => void, RegExp]>([
@@ -610,11 +617,10 @@ describe('composeBuildModel', () => {
     // review round 19, S19-1: changed expectation, the model holds the unescaped text (COMPOSE_MODEL_SCRIPT unescapes
     // it), which is written as it is, whatever Compose prints.
     source.services.app.build = { context: REPO, dockerfile_inline: 'FROM alpine:3.22\nRUN echo $HOME\n' };
-    const escaped = composeBuildModel(source, params({ dollarEscaped: true }));
+    // Review round 22, H22-7: the rewrite has no parameter dollarEscaped any more.
+    const escaped = composeBuildModel(source, params());
     expect(escaped.devDockerfile).toBe('FROM alpine:3.22\nRUN echo $HOME\n');
     expect(escaped.model.services.app.build).toEqual({ context: REPO, dockerfile: COMPOSE_DEV_DOCKERFILE });
-    source.services.app.build = { context: REPO, dockerfile_inline: 'FROM alpine:3.22\nRUN echo $HOME\n' };
-    expect(composeBuildModel(source, params({ dollarEscaped: false })).devDockerfile).toBe('FROM alpine:3.22\nRUN echo $HOME\n');
   });
 
   it('throws for a dev service without image and build', () => {
@@ -840,7 +846,6 @@ describe('review round 9 (S9-1): the bounds of the model in the extension host',
       containerName: 'c',
       volumeName: 'devenv-x',
       repositoryFolder: REPO_FOLDER,
-      dollarEscaped: true,
       engineApiVersion: '1.47',
       realPaths,
       mountAncestors,
@@ -1034,13 +1039,12 @@ describe('review round 20 (P20-1): the Dockerfile of a local build of the dev se
   }
 
   it('writes the checked text to COMPOSE_DEV_DOCKERFILE for a Dockerfile or context with a $, whatever Compose prints', () => {
-    for (const dollarEscaped of [true, false]) {
-      const source = fileBuild({ context: `${REPO}/c$d`, dockerfile: `${REPO}/c$d/D$x`, args: { A: '1' } });
-      const built = composeBuildModel(source, params({ dollarEscaped, dockerfiles: { app: TEXT } }));
-      expect(built.devDockerfile, String(dollarEscaped)).toBe(TEXT);
-      // The context stays (escaped once, as every text); the Dockerfile is ours.
-      expect(built.model.services.app.build, String(dollarEscaped)).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' } });
-    }
+    // Review round 22, H22-7: the rewrite has no parameter dollarEscaped any more.
+    const source = fileBuild({ context: `${REPO}/c$d`, dockerfile: `${REPO}/c$d/D$x`, args: { A: '1' } });
+    const built = composeBuildModel(source, params({ dockerfiles: { app: TEXT } }));
+    expect(built.devDockerfile).toBe(TEXT);
+    // The context stays (escaped once, as every text); the Dockerfile is ours.
+    expect(built.model.services.app.build).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' } });
   });
 
   it('writes it for a plain Dockerfile too (no gap between the check and the read of the CLI and of BuildKit)', () => {

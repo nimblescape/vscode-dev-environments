@@ -14,6 +14,7 @@
 import * as path from 'path';
 import { buildArgumentTexts } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
+import { WORKSPACES_ROOT } from '../names';
 import {
   composeNetworkNames,
   composeVolumeNames,
@@ -164,6 +165,11 @@ interface ServiceContext {
   input: ComposeAccessInput;
   mounts: ComposeMountContext;
   services: ReadonlySet<string>;
+  /**
+   * Review round 22 (H22-6): the services that share the pid namespace of the dev service through `pid: service:…`
+   * (directly or through a chain, in either direction); empty when the dev service shares it with none.
+   */
+  devPidGroup: ReadonlySet<string>;
 }
 
 type KeyRule = (value: unknown, ctx: ServiceContext) => Problem[];
@@ -230,9 +236,17 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
       const decision = decideServiceMount(entry, ctx.mounts);
       return decision.action === 'refuse' ? [decisionProblem(decision)] : [];
     }),
-  // Other containers, whose volumes, environment, and network would join this one.
-  volumes_from: refuseAccess('volumes_from'),
-  links: refuseAccess('links'),
+  // Review round 22 (H22-2): the volumes of another service of the model (volumesFromProblems).
+  volumes_from: volumesFromProblems,
+  // Review round 22 (H22-1): another name of a service of the model in its network (Compose accepts only services of the
+  // model).
+  links: (value, ctx) =>
+    listOf(value).flatMap((entry) => {
+      const text = String(entry).trim();
+      const parts = text.split(':');
+      return parts.length <= 2 && ctx.services.has(parts[0]) ? [] : [unsupported(`links ${text} (not a service of the Docker Compose configuration)`)];
+    }),
+  // Containers that are not of the model, whose network would join this one.
   external_links: refuseAccess('external_links'),
   privileged: refuseAccess('privileged mode'),
   cap_add: (value) => capabilityProblems(listOf(value)).map(access),
@@ -249,8 +263,13 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   cgroup_parent: refuseAccess('cgroup_parent'),
   oom_kill_disable: (value) => (isUnset(value) ? [] : [guarded('oom_kill_disable')]),
   oom_score_adj: (value) => (value === undefined || value === null || (typeof value === 'number' && value >= 0) ? [] : [guarded(`oom_score_adj ${String(value)}`)]),
-  pid: namespaceRule('pid', []),
-  ipc: namespaceRule('ipc', ['private', 'shareable', 'none']),
+  pid: pidProblems,
+  // Review round 22 (H22-6): the ipc namespace of another service of the model (which needs `ipc: shareable`, else
+  // Docker refuses to start).
+  ipc: (value, ctx) => {
+    if (!isUnset(value) && otherService(String(value), ctx) !== undefined) return [];
+    return namespaceRule('ipc', ['private', 'shareable', 'none'])(value, ctx);
+  },
   uts: namespaceRule('uts', []),
   userns_mode: namespaceRule('userns_mode', []),
   cgroup: namespaceRule('cgroup', ['private']),
@@ -275,9 +294,10 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   pull_policy: allow,
   // Mounts the Docker socket and the registry credentials of the computer.
   use_api_socket: refuseAccess('the Docker socket (use_api_socket)'),
-  // Files of the computer, mounted by Compose.
-  secrets: refuseAccess('secrets'),
-  configs: refuseAccess('configs'),
+  // Review round 22 (H22-4): the top-level secrets and configs decide (secretConfigProblems); here only the targets in
+  // the dev service.
+  secrets: (value, ctx) => secretTargetProblems('secret', value, ctx),
+  configs: (value, ctx) => secretTargetProblems('config', value, ctx),
   models: refuseUnsupported('models'),
   provider: refuseUnsupported('provider'),
   credential_spec: refuseUnsupported('credential_spec'),
@@ -337,6 +357,158 @@ const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
   attach: allow,
   develop: allow,
 };
+
+/** The service that `service:<name>` names, when it is another service of the model; `undefined` otherwise. */
+function otherService(mode: string, ctx: ServiceContext): string | undefined {
+  const text = mode.trim();
+  if (!/^service:/i.test(text)) return undefined;
+  const target = text.slice('service:'.length);
+  return ctx.services.has(target) && target !== ctx.name ? target : undefined;
+}
+
+/**
+ * Review round 22 (H22-6): `pid`. `service:<name>` of another service of the model is allowed, unless the dev service
+ * shares the namespace (ServiceContext.devPidGroup): a process of the other container could read the files of the dev
+ * container (the GitHub token) through /proc/<pid>/root, so that stays refused whatever the switch says; so does
+ * `container:…` (another container, perhaps the dev container of another environment). `host`: access to the computer.
+ */
+function pidProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  if (isUnset(value)) return [];
+  const text = String(value).trim();
+  if (/^container:/i.test(text)) return [guarded(`pid ${text}`)];
+  if (otherService(text, ctx) !== undefined) {
+    return ctx.devPidGroup.has(ctx.name) ? [guarded(`pid ${text} (the processes of the dev container, which holds the GitHub token)`)] : [];
+  }
+  return namespaceRule('pid', [])(value, ctx);
+}
+
+/**
+ * Review round 22 (H22-6): the services that share the pid namespace of the dev service (`pid: service:…` between
+ * services of the model, followed in both directions); empty when there is none.
+ */
+function devPidGroup(services: Readonly<Record<string, unknown>>, devService: string): Set<string> {
+  const edges = new Map<string, string[]>();
+  const link = (a: string, b: string): void => {
+    edges.set(a, [...(edges.get(a) ?? []), b]);
+  };
+  for (const [name, service] of Object.entries(services)) {
+    const pid = isRecord(service) && typeof service.pid === 'string' ? service.pid.trim() : '';
+    if (!/^service:/i.test(pid)) continue;
+    const target = pid.slice('service:'.length);
+    if (target === name || !Object.prototype.hasOwnProperty.call(services, target)) continue;
+    link(name, target);
+    link(target, name);
+  }
+  const group = new Set<string>();
+  if (!edges.has(devService)) return group;
+  const queue = [devService];
+  group.add(devService);
+  while (queue.length > 0) {
+    for (const next of edges.get(queue.pop() as string) ?? []) {
+      if (group.has(next)) continue;
+      group.add(next);
+      queue.push(next);
+    }
+  }
+  return group;
+}
+
+/** Review round 22 (H22-2): an entry of `volumes_from`: `<service>[:ro|:rw]` or `container:<name>[:ro|:rw]`. */
+function volumesFromEntry(entry: unknown): { container: boolean; name: string } | undefined {
+  if (typeof entry !== 'string') return undefined;
+  const text = entry.trim();
+  const container = /^container:/i.test(text);
+  const name = (container ? text.slice('container:'.length) : text).replace(/:(ro|rw)$/, '');
+  if (name === '' || (!container && name.includes(':'))) return undefined;
+  return { container, name };
+}
+
+/**
+ * Review round 22 (H22-2): `volumes_from`. The volumes of another service of the model are allowed, except those of the
+ * dev service (the workspace volume, which holds the GitHub token); a container (`container:…`, perhaps of another
+ * environment) stays refused whatever the switch says. When the dev service takes the volumes of other services (also
+ * through their own `volumes_from`), their mounts land in the dev container: the rules of its mounts apply to their
+ * targets (not at WORKSPACES_ROOT, not in the internal folder with the token).
+ */
+function volumesFromProblems(value: unknown, ctx: ServiceContext): Problem[] {
+  const services = isRecord(ctx.input.model.services) ? ctx.input.model.services : {};
+  const problems: Problem[] = [];
+  for (const entry of listOf(value)) {
+    const text = String(entry).trim();
+    const parsed = volumesFromEntry(entry);
+    if (parsed === undefined) {
+      problems.push(unsupported(`volumes_from ${text}`));
+    } else if (parsed.container) {
+      problems.push(guarded(`volumes_from ${text} (the volumes of another container)`));
+    } else if (!ctx.services.has(parsed.name) || parsed.name === ctx.name) {
+      problems.push(unsupported(`volumes_from ${text} (not a service of the Docker Compose configuration)`));
+    } else if (parsed.name === ctx.input.devService) {
+      problems.push(guarded(`volumes_from ${text} (the volumes of the dev container, with the workspace volume, which holds the GitHub token)`));
+    } else if (ctx.isDev) {
+      for (const target of volumesFromTargets(parsed.name, services)) {
+        const internal = configFolderTarget(target);
+        if (internal !== undefined) problems.push(unsupported(configFolderMountItem(internal, `volumes_from ${text}: mount at`)));
+        else if (target === WORKSPACES_ROOT) problems.push(unsupported(`volumes_from ${text}: mount at ${WORKSPACES_ROOT}`));
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * Review round 22 (H22-2): the targets (normalized) of the mounts that `volumes_from: [<name>]` brings: the `volumes`,
+ * `tmpfs`, `secrets`, and `configs` of the service, and those of the services whose volumes it takes in turn.
+ */
+function volumesFromTargets(name: string, services: Readonly<Record<string, unknown>>): string[] {
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  const queue = [name];
+  while (queue.length > 0) {
+    const current = queue.pop() as string;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const service = services[current];
+    if (!isRecord(service)) continue;
+    for (const entry of listOf(service.volumes)) if (isRecord(entry) && typeof entry.target === 'string') targets.push(entry.target);
+    for (const entry of listOf(service.tmpfs)) targets.push(String(entry).split(':')[0]);
+    for (const entry of listOf(service.secrets)) targets.push(secretTarget('secret', entry));
+    for (const entry of listOf(service.configs)) targets.push(secretTarget('config', entry));
+    for (const entry of listOf(service.volumes_from)) {
+      const parsed = volumesFromEntry(entry);
+      if (parsed !== undefined && !parsed.container) queue.push(parsed.name);
+    }
+  }
+  return targets.filter((target) => target.startsWith('/')).map((target) => path.posix.normalize(target).replace(/(.)\/+$/, '$1'));
+}
+
+/**
+ * Review round 22 (H22-4): where Compose puts a secret (`/run/secrets/<target or source>`) or a config
+ * (`/<target or source>`) of a service; an absolute target as it is.
+ */
+function secretTarget(kind: 'secret' | 'config', entry: unknown): string {
+  const source = typeof entry === 'string' ? entry : isRecord(entry) && typeof entry.source === 'string' ? entry.source : '';
+  const target = isRecord(entry) && typeof entry.target === 'string' && entry.target !== '' ? entry.target : source;
+  if (target.startsWith('/')) return target;
+  return kind === 'secret' ? `/run/secrets/${target}` : `/${target}`;
+}
+
+/**
+ * Review round 22 (H22-4): the `secrets` and `configs` of a service. What they hold is decided at the top level
+ * (secretConfigProblems); in the dev service, a target at WORKSPACES_ROOT or in the internal folder (the token) is not
+ * supported, as a mount there.
+ */
+function secretTargetProblems(kind: 'secret' | 'config', value: unknown, ctx: ServiceContext): Problem[] {
+  if (!ctx.isDev) return [];
+  const problems: Problem[] = [];
+  for (const entry of listOf(value)) {
+    const source = typeof entry === 'string' ? entry : isRecord(entry) ? String(entry.source) : JSON.stringify(entry);
+    const target = path.posix.normalize(secretTarget(kind, entry)).replace(/(.)\/+$/, '$1');
+    const internal = configFolderTarget(target);
+    if (internal !== undefined) problems.push(unsupported(configFolderMountItem(internal, `${kind} ${source} at`)));
+    else if (target === WORKSPACES_ROOT) problems.push(unsupported(`${kind} ${source} at ${WORKSPACES_ROOT}`));
+  }
+  return problems;
+}
 
 /** `post_start`/`pre_stop`: commands in the container, but not with `privileged`. */
 function hookProblems(key: string): KeyRule {
@@ -765,6 +937,9 @@ function serviceProblems(service: unknown, ctx: ServiceContext): Problem[] {
 // ---------------------------------------------------------------------------------------------------------------------
 // Top level
 
+/** Review round 22 (H22-5): the hint of a refused driver or driver options of a top-level volume. */
+const VOLUME_DRIVER_HINT = 'Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service';
+
 const VOLUME_ALLOWED = new Set(['name', 'external', 'driver', 'driver_opts', 'labels']);
 
 function topLevelVolumeProblems(input: ComposeAccessInput): Problem[] {
@@ -778,8 +953,11 @@ function topLevelVolumeProblems(input: ComposeAccessInput): Problem[] {
     if (isOtherEnvironmentProjectName(name, input.project)) problems.push(guarded(`volume ${name} of another environment`));
     else problems.push(...volumeNameFindings(name, input));
     if (!isRecord(volume)) continue;
-    if (!isUnset(volume.driver) && String(volume.driver) !== 'local') problems.push(access(`${at}driver ${String(volume.driver)}`));
-    if (!isUnset(volume.driver_opts)) problems.push(access(`${at}driver options`));
+    // Review round 22 (H22-5): the pipeline creates every volume itself (composeUpModel makes them external), with the
+    // local driver and without options, so a driver or driver options would be dropped (for example a tmpfs volume would
+    // become a volume on the disk): not supported, whatever the switch says.
+    if (!isUnset(volume.driver) && String(volume.driver) !== 'local') problems.push(unsupported(`${at}driver ${String(volume.driver)} (${VOLUME_DRIVER_HINT})`));
+    if (!isUnset(volume.driver_opts)) problems.push(unsupported(`${at}driver options (${VOLUME_DRIVER_HINT})`));
     problems.push(...labelProblems(volume.labels, at));
     for (const [option, value] of Object.entries(volume)) {
       if (!VOLUME_ALLOWED.has(option) && !isExtension(option) && value !== undefined && value !== null) problems.push(unsupported(`${at}${option}`));
@@ -824,11 +1002,52 @@ function topLevelProblems(input: ComposeAccessInput): Problem[] {
   if (model.name !== undefined && model.name !== input.project) problems.push(unsupported(`project name ${String(model.name)}`));
   for (const [key, value] of Object.entries(model)) {
     if (TOP_LEVEL_ALLOWED.has(key) || isExtension(key) || isUnset(value)) continue;
-    // Compose mounts file secrets and configs as bind mounts of the computer.
-    if (key === 'secrets' || key === 'configs') problems.push(access(key));
+    // Review round 22 (H22-4): secretConfigProblems.
+    if (key === 'secrets' || key === 'configs') problems.push(...secretConfigProblems(key, value, input));
     else problems.push(unsupported(key));
   }
   problems.push(...topLevelVolumeProblems(input), ...topLevelNetworkProblems(input));
+  return problems;
+}
+
+/**
+ * Review round 22 (H22-4): the top-level `secrets` and `configs`. From the environment of Compose (`environment`) or,
+ * for a config, the text in the file (`content`): allowed (Compose copies them into the container; the token is never a
+ * variable of that environment). A `file` is a bind mount that the Docker Engine reads on the computer: one of the
+ * repository is not supported (a bind mount of it, read-only, is rewritten to the workspace volume), one of the
+ * workspace helper stays refused whatever the switch says, any other one is access to the computer. Everything else
+ * (`external`, a driver, and unknown keys) is not supported.
+ */
+function secretConfigProblems(key: 'secrets' | 'configs', value: unknown, input: ComposeAccessInput): Problem[] {
+  const kind = key === 'secrets' ? 'secret' : 'config';
+  if (!isRecord(value)) return [unsupported(key)];
+  const problems: Problem[] = [];
+  for (const [name, entry] of Object.entries(value)) {
+    const at = `${kind} ${name}: `;
+    if (!isRecord(entry)) {
+      problems.push(unsupported(`${at}${JSON.stringify(entry)}`));
+      continue;
+    }
+    for (const [option, setting] of Object.entries(entry)) {
+      if (isExtension(option) || setting === undefined || setting === null) continue;
+      if (option === 'name' || option === 'environment' || (option === 'content' && kind === 'config')) continue;
+      if (option !== 'file') {
+        problems.push(unsupported(`${at}${option}`));
+        continue;
+      }
+      const file = String(setting);
+      if (isRepositoryPath(file, input.repositoryFolder)) {
+        const target = kind === 'secret' ? `/run/secrets/${name}` : `/${name}`;
+        problems.push(unsupported(`${at}file ${file} (a file of the repository is not supported; mount it read-only instead, for example ./${path.posix.basename(file)}:${target}:ro)`));
+      } else if (!file.startsWith('/')) {
+        problems.push(guarded(`${at}file ${file} (a relative path)`));
+      } else if (isHelperPath(file, input.repositoryFolder)) {
+        problems.push(guarded(`${at}file ${file}`));
+      } else {
+        problems.push(access(`${at}file ${file}`));
+      }
+    }
+  }
   return problems;
 }
 
@@ -895,6 +1114,7 @@ function readComposeFindings(input: ComposeAccessInput): Problem[] {
   }
   problems.push(...topLevelProblems(input));
   const volumeNames = new Map(composeVolumeNames(input.model, input.project).map((volume) => [volume.key, volume.name]));
+  const pidGroup = devPidGroup(services, input.devService);
   for (const [name, service] of Object.entries(services)) {
     const isDev = name === input.devService;
     const ctx: ServiceContext = {
@@ -902,6 +1122,7 @@ function readComposeFindings(input: ComposeAccessInput): Problem[] {
       isDev,
       input,
       services: names,
+      devPidGroup: pidGroup,
       mounts: {
         isDev,
         repositoryFolder: input.repositoryFolder,

@@ -389,12 +389,16 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   // Without the OOM killer, a container without a memory limit can make the computer hang. Not named by the user
   // decision on the switch, so it stays refused with the checks off (the safer choice for an unclear item).
   '--oom-kill-disable': { kind: 'refuse', value: false, guarded: true },
-  '--pid': refuseValue,
+  // Review round 22 (H22-6): the processes of another container (for example a dev container, which holds the GitHub
+  // token, or one of another environment) stay refused whatever the switch says.
+  '--pid': { kind: 'check', check: (value) => [(/^container:/i.test(value.trim()) ? guarded : access)(`--pid=${value}`)] },
   '--ipc': refuseValue,
   '--uts': refuseValue,
   '--userns': refuseValue,
   '--cgroupns': refuseValue,
-  '--volumes-from': refuseValue,
+  // Review round 22 (H22-2): the volumes of another container (for example the workspace volume of a dev container, with
+  // the GitHub token, or the volumes of another environment): refused whatever the switch says.
+  '--volumes-from': { kind: 'refuse', value: true, guarded: true },
   // Another container, whose environment variables older versions of Docker copy into this one.
   '--link': refuseValue,
   // Checked in runArgsProblems with the rules of `mounts`: only volumes (not of another environment) and tmpfs.
@@ -2103,12 +2107,37 @@ export function isDockerNetworkMode(name: string): boolean {
   return /^(host|none|bridge|default)$/i.test(name) || /^(container|service):/i.test(name);
 }
 
-/** `capAdd`, `--cap-add`, and `cap_add`: every capability except SYS_PTRACE (for debuggers). */
+/**
+ * Review round 22 (H22-3): the capabilities that Docker gives every container (its default set), which a hardened
+ * configuration adds again after `cap_drop: [ALL]`, and SYS_PTRACE (for debuggers).
+ */
+const ALLOWED_CAPABILITIES: ReadonlySet<string> = new Set([
+  'CHOWN',
+  'DAC_OVERRIDE',
+  'FOWNER',
+  'FSETID',
+  'KILL',
+  'SETGID',
+  'SETUID',
+  'SETPCAP',
+  'NET_BIND_SERVICE',
+  'NET_RAW',
+  'SYS_CHROOT',
+  'MKNOD',
+  'AUDIT_WRITE',
+  'SETFCAP',
+  'SYS_PTRACE',
+]);
+
+/**
+ * `capAdd`, `--cap-add`, and `cap_add`: every capability except ALLOWED_CAPABILITIES (with or without `CAP_`, in any
+ * case); `ALL` too.
+ */
 export function capabilityProblems(values: readonly unknown[]): string[] {
   const items: string[] = [];
   for (const value of values) {
     const name = String(value).trim();
-    if (/^(CAP_)?SYS_PTRACE$/i.test(name)) continue;
+    if (ALLOWED_CAPABILITIES.has(name.toUpperCase().replace(/^CAP_/, ''))) continue;
     items.push(`capability ${name}`);
   }
   return items;

@@ -70,20 +70,28 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['the uts namespace of the computer', input(service('db', { uts: 'host' })), 'service db: uts host', 'computer'],
   ['the user namespace of the computer', input(service('db', { userns_mode: 'host' })), 'service db: userns_mode host', 'computer'],
   ['the cgroup namespace of the computer', input(service('db', { cgroup: 'host' })), 'service db: cgroup host', 'computer'],
-  ['volumes_from', input(service('db', { volumes_from: ['other'] })), 'service db: volumes_from', 'computer'],
-  ['links', input(service('db', { links: ['other'] })), 'service db: links', 'computer'],
+  // review round 22, H22-2 and H22-1: changed rows, the volumes of the dev service stay refused whatever the switch
+  // says; links to services of the model are allowed, a link to an unknown service is not supported.
+  ['volumes_from', input(service('db', { volumes_from: ['app'] })), 'service db: volumes_from app (the volumes of the dev container, with the workspace volume, which holds the GitHub token)', 'protected'],
+  ['volumes_from of a container', input(service('db', { volumes_from: ['container:other'] })), 'service db: volumes_from container:other (the volumes of another container)', 'protected'],
+  ['links', input(service('db', { links: ['other'] })), 'service db: links other (not a service of the Docker Compose configuration)', 'unsupported'],
   ['external_links', input(service('db', { external_links: ['other'] })), 'service db: external_links', 'computer'],
   ['the network of another container', input(service('db', { network_mode: 'container:x' })), 'service db: network of another container (container:x)', 'computer'],
   ['a port on all addresses', input(service('db', { ports: [{ target: 5432, published: '5432', host_ip: '0.0.0.0' }] })), 'service db: published port 0.0.0.0:5432:5432', 'computer'],
   ['the Docker socket', input(service('db', { use_api_socket: true })), 'service db: the Docker socket (use_api_socket)', 'computer'],
-  ['secrets of a service', input(service('db', { secrets: ['pw'] })), 'service db: secrets', 'computer'],
-  ['top-level secrets', input((m) => (m.secrets = { pw: { file: '/etc/pw' } })), 'secrets', 'computer'],
+  // review round 22, H22-4: changed rows, the file of a top-level secret or config decides.
+  ['a secret of a file of the computer', input((m) => ((m.secrets = { pw: { file: '/etc/pw' } }), service('db', { secrets: ['pw'] })(m))), 'secret pw: file /etc/pw', 'computer'],
+  ['top-level secrets', input((m) => (m.secrets = { pw: { file: '/etc/pw' } })), 'secret pw: file /etc/pw', 'computer'],
+  ['a secret of a file of the workspace helper', input((m) => (m.configs = { t: { file: '/workspaces/.devenv+/token' } })), 'config t: file /workspaces/.devenv+/token', 'protected'],
+  ['a secret of a file of the repository', input((m) => (m.secrets = { pw: { file: `${REPO}/pw` } })), `secret pw: file ${REPO}/pw (a file of the repository is not supported; mount it read-only instead, for example ./pw:/run/secrets/pw:ro)`, 'unsupported'],
   ['a privileged hook', input(service('db', { post_start: [{ command: 'x', privileged: true }] })), 'service db: privileged post_start', 'computer'],
   ['a build context outside the repository', input(service('db', { build: { context: '/etc' } })), 'service db: build context /etc', 'computer'],
   ['build secrets', input(service('db', { build: { context: REPO, secrets: ['npmrc'] } })), 'service db: build secrets', 'computer'],
   ['an additional build context of a folder', input(service('db', { build: { context: REPO, additional_contexts: { home: '/root' } } })), 'service db: build additional_contexts home=/root', 'computer'],
-  ['a volume driver', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } })), 'volume pgdata: driver nfs', 'computer'],
-  ['volume driver options', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver_opts: { device: '/x' } } })), 'volume pgdata: driver options', 'computer'],
+  // review round 22, H22-5: changed rows, not supported (the pipeline creates the volumes without them, so the switch
+  // cannot lift them).
+  ['a volume driver', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } })), 'volume pgdata: driver nfs (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)', 'unsupported'],
+  ['volume driver options', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver_opts: { device: '/x' } } })), 'volume pgdata: driver options (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)', 'unsupported'],
   ['a network driver', input((m) => (m.networks = { lan: { driver: 'macvlan' } })), 'network lan: driver macvlan', 'computer'],
   ['a volume of another program', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'com.docker.compose.project': 'shop' } } }), `volume ${PROJECT}_pgdata of the Docker Compose project shop`, 'computer'],
   // Account separation, the GitHub token, the owner account, and items whose class is not clear.

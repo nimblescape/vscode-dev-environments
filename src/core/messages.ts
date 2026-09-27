@@ -128,6 +128,12 @@ export const Messages = {
   // volumes without a name is no longer used (Docker keeps those volumes as unused volumes).
   containerComposeReplaced:
     'The configuration of the environment no longer uses Docker Compose, so the container is set up again, and the containers of the other services are removed. Your files in the repository and the data that the services keep in named volumes are kept. Data that the services keep in volumes without a name is no longer used; Docker keeps those volumes as unused volumes. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * Review round 22 (D22-1): the selected configuration names another service of the same Docker Compose project as its
+   * dev container, and the previous dev container could not be renamed out of the way: it is removed (its volumes stay).
+   */
+  containerComposeDevServiceChanged:
+    'The configuration of the environment uses another service of Docker Compose for the dev container, so the previous dev container is removed and the containers are set up again. Your files in the repository and the data in named volumes are kept. Files in other folders of the previous dev container, for example in the home folder, are removed.',
   /** Review round 1 (P-1): a single container is replaced by the containers of a Docker Compose configuration. */
   containerComposeCreated:
     'The configuration of the environment now uses Docker Compose, so the container is set up again with the containers of its services. Your files in the repository are kept. Files in other folders of the container, for example in the home folder, are removed.',
