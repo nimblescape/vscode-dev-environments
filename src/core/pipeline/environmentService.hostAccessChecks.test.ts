@@ -358,3 +358,106 @@ describe('a refused update and the switch (concept 7.7)', () => {
     expect((await refusedUpdate())?.hostAccessChecks).toBeUndefined();
   });
 });
+
+// Hotfix M1: the Dev Container CLI substitutes the variables of the image metadata at `up`. A Dockerfile's own LABEL
+// devcontainer.metadata reaches the image when the CLI adds no label of its own, and the merged configuration is not
+// checked for a container that was created with the checks off: the check of the image metadata before `up` must see the
+// values that Docker gets.
+describe('variables of the Dev Container CLI in the image metadata (hotfix M1)', () => {
+  const VECTORS: Array<[string, string | { source: string; target: string; type: string }, string]> = [
+    ['a default of an unset ${localEnv:…}', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', 'volume devenv-other-abcdef12 of another environment'],
+    ['a default of an unset ${env:…}', 'source=${env:NOPE:devenv-helper-cache},target=/c,type=volume', 'volume devenv-helper-cache of the workspace helper'],
+    ['the object form', { source: '${localEnv:NOPE:devenv-other-abcdef12}', target: '/x', type: 'volume' }, 'volume devenv-other-abcdef12 of another environment'],
+    ['a name built from the basename', 'source=devenv-${localWorkspaceFolderBasename}-abcdef12,target=/x,type=volume', 'volume devenv-api-abcdef12 of another environment'],
+  ];
+
+  describe.each<[string, boolean]>([
+    ['checks on', true],
+    ['checks off', false],
+  ])('%s', (_mode, on) => {
+    beforeEach(() => {
+      if (on) checksOn();
+      else checksOff(REPO);
+    });
+
+    it.each(VECTORS)('refuses %s that only the label of the image names (a LABEL of the Dockerfile), before up', async (_name, mount, item) => {
+      // The configuration and the merged configuration are clean; the built image carries the mount.
+      h.helper.buildMetadata = [{ id: 'dockerfile-label', mounts: [mount] }];
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toHaveLength(1);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it.each(VECTORS)('refuses %s in the configuration, before any build', async (_name, mount, item) => {
+      h.helper.config = { image: BASE_IMAGE, mounts: [mount] };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toEqual([]);
+    });
+
+    it.each(VECTORS)('refuses %s in the merged configuration, before any build', async (_name, mount, item) => {
+      h.helper.merged = { mounts: [mount] };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toEqual([]);
+    });
+
+    it('does not support a volume named by a variable of the workspace helper process', async () => {
+      await seedEnvironment(h, { container: null });
+      const mount = 'source=${localEnv:HOSTNAME:devenv-other-abcdef12},target=/x,type=volume';
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [mount] }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.unsupportedOptions(`mount ${JSON.stringify(mount)} uses \${localEnv:HOSTNAME:devenv-other-abcdef12}, which cannot be checked`));
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('keeps the common patterns working, and creates the resolved volume with the labels of the environment before up', async () => {
+      await seedEnvironment(h, { container: null });
+      const nodeModules = 'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume';
+      h.helper.config = { image: BASE_IMAGE };
+      h.docker.imageConfigs.set(
+        IMAGE_1,
+        imageConfigWithUser('vscode', [
+          { id: 'docker-in-docker', mounts: [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }] },
+          { mounts: [nodeModules, 'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume'] },
+        ]),
+      );
+      let createdAtUp: string[] = [];
+      const up = h.helper.up.bind(h.helper);
+      h.helper.up = async (p) => {
+        createdAtUp = h.docker.log.filter((line) => line.startsWith('volume create'));
+        return up(p);
+      };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(createdAtUp).toEqual(['volume create api-node_modules']);
+    });
+  });
+
+  it('refuses the vectors in the image metadata of a container created with the checks off, whose merged configuration is not checked', async () => {
+    for (const [, mount, item] of VECTORS) {
+      h.cleanup();
+      h = createHarness();
+      await seedEnvironment(h, { container: 'stopped', containerLabels: UNRESTRICTED_LABELS });
+      h.helper.merged = { mounts: [mount] };
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'base' }, { mounts: [mount] }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    }
+  });
+
+  it('allows the bind mount ${localEnv:HOME}/.ssh of the image metadata with the checks off, and refuses it with the checks on', async () => {
+    const ssh = 'source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached';
+    await seedEnvironment(h, { container: null });
+    h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ mounts: [ssh] }]));
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.message).toBe(Messages.hostAccess('bind mount ${localEnv:HOME}/.ssh'));
+    checksOff(REPO);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+});

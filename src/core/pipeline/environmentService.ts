@@ -12,6 +12,7 @@ import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
 import { checkConfiguration } from '../helper/configChecks';
+import { helperCliVariables } from '../helper/cliVariables';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { DevcontainerCommandError, buildOverrideConfig } from '../helper/devcontainerCli';
 import {
@@ -1651,7 +1652,11 @@ export class EnvironmentService {
     await this.requireVolume(env);
     if (createsContainer) {
       const metadataVolumes = await this.checkImageHostAccess(ctx, image);
-      const configVolumes = mountedVolumeNames({ ownVolume: env.volumeName, config: { mounts: config?.mounts, runArgs: dockerRunArgs } });
+      const configVolumes = mountedVolumeNames({
+        ownVolume: env.volumeName,
+        config: { mounts: config?.mounts, runArgs: dockerRunArgs },
+        variables: helperCliVariables(env.repository),
+      });
       await this.createAdditionalVolumes(ctx, [...configVolumes, ...metadataVolumes]);
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
@@ -1811,7 +1816,8 @@ export class EnvironmentService {
    * exist, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
    */
   private async hostAccessInput(env: Environment, input: Omit<HostAccessInput, 'ownVolume'>): Promise<HostAccessInput> {
-    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName };
+    // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables).
+    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository) };
     const file = await this.deps.registry.read();
     const otherOwner = (owner: GitHubAccount | undefined) => owner === undefined || owner.id !== env.owner?.id;
     const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));

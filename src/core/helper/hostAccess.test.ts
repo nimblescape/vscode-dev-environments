@@ -12,7 +12,8 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../names';
-import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { helperCliVariables } from './cliVariables';
+import { GITHUB_CLI_ACCOUNT_REASON, containerEnvironment, remoteEnvironment } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_STOP_TIMEOUT_SECONDS,
@@ -31,6 +32,7 @@ import {
   splitPortAddress,
   withLoopbackAddress,
   withoutNameArgs,
+  type HostAccessInput,
   type HostAccessReport,
 } from './hostAccess';
 
@@ -973,5 +975,179 @@ describe('variables of the account of the GitHub CLI (user decision 2026-09-26, 
       hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
       unsupported: [],
     });
+  });
+});
+
+// Hotfix M1: Dev Container CLI 0.89.0 substitutes the variables of every entry of the image metadata (and of the
+// configuration and the override configuration) at `up`, before it passes the mounts to `docker run`. The policy checks
+// the resolved values (./cliVariables.ts), in the image metadata, the configuration, and the merged configuration.
+describe('host access policy: variables of the Dev Container CLI in mounts (hotfix M1)', () => {
+  const variables = helperCliVariables('acme/api');
+  const FOREIGN = 'volume devenv-other-abcdef12 of another environment';
+  const HELPER_CACHE = `volume ${HELPER_CACHE_VOLUME} of the workspace helper`;
+  type Where = 'metadata' | 'config' | 'merged';
+  const input = (where: Where, mounts: unknown[], withVariables = true): HostAccessInput => {
+    const base = { ownVolume: OWN, ...(withVariables ? { variables } : {}) };
+    if (where === 'metadata') return { ...base, metadata: [{ id: 'base' }, { mounts }] };
+    return { ...base, [where]: { mounts } };
+  };
+
+  describe.each<Where>(['metadata', 'config', 'merged'])('in the %s', (where) => {
+    it.each<[string, unknown, string]>([
+      ['a default of an unset ${localEnv:…} that names a volume of another environment', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', FOREIGN],
+      ['a default of an unset ${env:…} that names the cache volume of the helper', 'source=${env:NOPE:devenv-helper-cache},target=/c,type=volume', HELPER_CACHE],
+      ['the object form', { source: '${localEnv:NOPE:devenv-other-abcdef12}', target: '/x', type: 'volume' }, FOREIGN],
+      ['the object form of the helper cache', { type: 'volume', source: '${env:NOPE:devenv-helper-cache}', target: '/c' }, HELPER_CACHE],
+      ['a name of another environment built from the basename (repository api)', 'source=devenv-${localWorkspaceFolderBasename}-abcdef12,target=/x,type=volume', 'volume devenv-api-abcdef12 of another environment'],
+      ['a default without a type', 'src=${localEnv:NOPE:devenv-other-abcdef12},dst=/x', FOREIGN],
+    ])('refuses %s, with the checks on and off', (_name, mount, item) => {
+      for (const checksOn of [true, false]) {
+        expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
+      }
+    });
+
+    it.each<[string, unknown, string, string?]>([
+      ['a variable of the helper process in a volume name', 'source=${localEnv:HOSTNAME},target=/x,type=volume', '${localEnv:HOSTNAME}'],
+      ['a variable of the helper process with a default', 'source=${env:HOME:devenv-other-abcdef12},target=/x,type=volume', '${env:HOME:devenv-other-abcdef12}'],
+      ['a variable of the helper process in a target', 'source=cache,target=${localEnv:PATH},type=volume', '${localEnv:PATH}'],
+      ['a variable of the helper process in the object form', { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' }, '${localEnv:HOSTNAME}'],
+      ['a variable of the helper process without a type', 'source=${localEnv:HOSTNAME},target=/x', '${localEnv:HOSTNAME}'],
+      ['${containerEnv:…}, which the CLI leaves for a new container', 'source=${containerEnv:VOLUME},target=/x,type=volume', '${containerEnv:VOLUME}'],
+      [
+        'a variable left by a default (named in the resolved text)',
+        'source=${localEnv:NOPE:$}{localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume',
+        '${localEnv:NOPE:devenv-other-abcdef12}',
+        'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume',
+      ],
+      ['${env} without a name (the CLI stops)', 'source=${env},target=/x,type=volume', '${env}'],
+      ['a tmpfs with a variable of the helper process', 'type=tmpfs,target=${localEnv:HOME}/t', '${localEnv:HOME}'],
+    ])('does not support %s, with the checks on and off', (_name, mount, variable, resolved) => {
+      const text = resolved ?? (typeof mount === 'string' ? mount : JSON.stringify(mount));
+      for (const checksOn of [true, false]) {
+        expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [`mount ${JSON.stringify(text)} uses ${variable}, which cannot be checked`],
+        });
+      }
+    });
+
+    it('refuses a bind mount that a default adds to a volume mount (a comma in the default)', () => {
+      const mount = 'type=volume,source=v,target=/x${localEnv:NOPE:,type=bind,source=/}';
+      expect(hostAccessProblems(input(where, [mount]))).toEqual(['bind mount /']);
+    });
+
+    it('refuses the workspace folder variables without the variables of the pipeline (fail closed)', () => {
+      const mount = 'source=${localWorkspaceFolderBasename}-node_modules,target=/n,type=volume';
+      expect(hostAccessReport(input(where, [mount], false), false).unsupported).toEqual([
+        `mount ${JSON.stringify(mount)} uses \${localWorkspaceFolderBasename}, which cannot be checked`,
+      ]);
+    });
+
+    it('keeps the common patterns working, with the checks on', () => {
+      const mounts = [
+        'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume',
+        { source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' },
+        'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume',
+        'source=${localWorkspaceFolderBasename}-bashhistory,target=/commandhistory,type=volume',
+        'source=projectname-bashhistory,target=/commandhistory,type=volume',
+        'type=tmpfs,target=${containerWorkspaceFolder}/tmp',
+      ];
+      expect(hostAccessProblems(input(where, mounts))).toEqual([]);
+      // The names that Docker gets; a name with ${devcontainerId} gets its name only at `up`.
+      expect(mountedVolumeNames(input(where, mounts))).toEqual(['api-node_modules', 'api-bashhistory', 'projectname-bashhistory']);
+    });
+
+    it('keeps the bind mounts of ${localEnv:HOME} as access to the computer: allowed with the checks off', () => {
+      const mounts = ['source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached', { source: '${localEnv:HOME}/.aws', target: '/a', type: 'bind' }];
+      expect(hostAccessProblems(input(where, mounts))).toEqual(['bind mount ${localEnv:HOME}/.ssh', 'bind mount ${localEnv:HOME}/.aws']);
+      expect(hostAccessProblems(input(where, mounts), false)).toEqual([]);
+      // A path without a type is a bind mount too.
+      expect(hostAccessProblems(input(where, ['source=${localEnv:HOME}/.m2,target=/m2']), false)).toEqual([]);
+    });
+
+    it('names the resolved volumes, for the labels and for the check of existing volumes', () => {
+      const mounts = ['source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', { source: '${env:NOPE:shared}', target: '/s', type: 'volume' }];
+      expect(mountedVolumeNames(input(where, mounts))).toEqual(['devenv-other-abcdef12', 'shared']);
+      // An existing volume of another program, by the resolved name.
+      const labelled = { ...input(where, [mounts[1]]), volumeLabels: { shared: { 'com.docker.compose.project': 'db' } } };
+      expect(hostAccessProblems(labelled)).toEqual(['volume shared of the Docker Compose project db']);
+      // A volume of an environment of another account (registry), by the resolved name.
+      expect(hostAccessProblems({ ...input(where, [mounts[1]]), foreignVolumes: ['shared'] }, false)).toEqual(['volume shared of another environment']);
+    });
+  });
+
+  it.each<[string, string[], string[]]>([
+    ['--mount with a default', ['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume'], [FOREIGN]],
+    ['-v with a default', ['-v', '${env:NOPE:devenv-helper-cache}:/c'], [HELPER_CACHE]],
+    ['--volume= with the basename', ['--volume=devenv-${localWorkspaceFolderBasename}-abcdef12:/x'], ['volume devenv-api-abcdef12 of another environment']],
+  ])('refuses %s in runArgs, with the checks on and off', (_name, runArgs, items) => {
+    for (const checksOn of [true, false]) {
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs } }, checksOn)).toEqual(items);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, merged: { runArgs } }, checksOn)).toEqual(items);
+    }
+  });
+
+  it('does not support a variable of the helper process in a volume of runArgs, and keeps bind mounts as access to the computer', () => {
+    // In -v, the colon of the variable hides where the source ends, so a -v with such a variable is not supported, also
+    // for a path (read-configuration has resolved ${localEnv:HOME} in the runArgs of the configuration already).
+    const runArgs = ['-v', '${localEnv:HOSTNAME}:/c', '--mount', 'type=volume,src=${env:PATH},dst=/p', '-v', '${localEnv:HOME}/.ssh:/s'];
+    expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, false)).toEqual({
+      hostAccess: [],
+      unsupported: [
+        'volume "${localEnv:HOSTNAME}:/c" uses ${localEnv:HOSTNAME}, which cannot be checked',
+        'mount "type=volume,src=${env:PATH},dst=/p" uses ${env:PATH}, which cannot be checked',
+        'volume "${localEnv:HOME}/.ssh:/s" uses ${localEnv:HOME}, which cannot be checked',
+      ],
+    });
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } })).toEqual([
+      'bind mount ${localEnv:HOME}/.ssh',
+    ]);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } }, false)).toEqual([]);
+    expect(runArgsProblems(['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x'], OWN)).toEqual([FOREIGN]);
+  });
+
+  it('checks the other properties of the metadata as the CLI resolves them', () => {
+    const metadata = [{ capAdd: ['${localEnv:NOPE:SYS_ADMIN}'], customizations: { vscode: { settings: { 'remote.localPortHost': '${localEnv:NOPE:allInterfaces}' } } } }];
+    expect(hostAccessProblems({ ownVolume: OWN, variables, metadata })).toEqual(['capability SYS_ADMIN', 'setting remote.localPortHost "allInterfaces"']);
+  });
+
+  it('keeps the own workspace volume and names built from the basename that are not named like an environment', () => {
+    const own = helperCliVariables('acme/devenv-acme-api-3f2a9c1e');
+    expect(hostAccessProblems({ ownVolume: OWN, variables: own, metadata: [{ mounts: ['source=${localWorkspaceFolderBasename},target=/o,type=volume'] }] })).toEqual([]);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts: ['source=devenv-${localWorkspaceFolderBasename}-cache,target=/c,type=volume'] }] })).toEqual([]);
+  });
+});
+
+// Hotfix GH: Docker passes a `containerEnv` key `GH_TOKEN=x` as `GH_TOKEN=x=<value>`, which sets GH_TOKEN.
+describe('host access policy: names of variables (hotfix GH)', () => {
+  const REASON = `(${GITHUB_CLI_ACCOUNT_REASON})`;
+  it.each<[string, Record<string, unknown>, HostAccessReport]>([
+    ['GH_TOKEN=x in containerEnv', { containerEnv: { 'GH_TOKEN=x': 'value' } }, { hostAccess: [`variable GH_TOKEN in containerEnv ${REASON}`], unsupported: [] }],
+    ['GITHUB_TOKEN= in remoteEnv', { remoteEnv: { 'GITHUB_TOKEN=': 'value' } }, { hostAccess: [`variable GITHUB_TOKEN in remoteEnv ${REASON}`], unsupported: [] }],
+    [' GH_HOST in containerEnv', { containerEnv: { ' GH_HOST': 'evil.example' } }, { hostAccess: [`variable GH_HOST in containerEnv ${REASON}`], unsupported: [] }],
+    ['a Git variable before =', { containerEnv: { 'GIT_CONFIG_GLOBAL=/x': 'y' } }, { hostAccess: ['variable GIT_CONFIG_GLOBAL in containerEnv'], unsupported: [] }],
+    [
+      'a name with a line break',
+      { containerEnv: { 'FOO\nGH_TOKEN': 'value' } },
+      { hostAccess: [], unsupported: ['variable "FOO\\nGH_TOKEN" in containerEnv (a name with a space or a control character)'] },
+    ],
+    ['a name with a space', { remoteEnv: { 'A B': 'value' } }, { hostAccess: [], unsupported: ['variable "A B" in remoteEnv (a name with a space or a control character)'] }],
+    ['a name with a tab', { containerEnv: { 'A\tB': 'value' } }, { hostAccess: [], unsupported: ['variable "A\\tB" in containerEnv (a name with a space or a control character)'] }],
+    ['a name with a control character', { containerEnv: { 'A\u0001': 'value' } }, { hostAccess: [], unsupported: ['variable "A\\u0001" in containerEnv (a name with a space or a control character)'] }],
+    ['an ordinary name with = in the value', { containerEnv: { FOO: 'a=b c' } }, { hostAccess: [], unsupported: [] }],
+  ])('%s, with the checks on and off, in the configuration and the image metadata', (_name, env, expected) => {
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ ownVolume: OWN, config: env }, checksOn)).toEqual(expected);
+      expect(hostAccessReport({ ownVolume: OWN, metadata: [env] }, checksOn)).toEqual(expected);
+    }
+  });
+
+  it.each<[string, string[], HostAccessReport]>([
+    ['GH_TOKEN=x=y', ['-e', 'GH_TOKEN=x=y'], { hostAccess: [`variable GH_TOKEN in runArgs ${REASON}`], unsupported: [] }],
+    ['a name with a line break', ['--env', 'FOO\nGH_TOKEN=x'], { hostAccess: [], unsupported: ['variable "FOO\\nGH_TOKEN=x" in runArgs (a name with a space or a control character)'] }],
+    ['a name with a space', ['-e', 'A B=1'], { hostAccess: [], unsupported: ['variable "A B=1" in runArgs (a name with a space or a control character)'] }],
+    ['a space in the value only', ['-e', 'A=b c'], { hostAccess: [], unsupported: [] }],
+  ])('runArgs: %s, with the checks on and off', (_name, runArgs, expected) => {
+    for (const checksOn of [true, false]) expect(hostAccessReport({ ownVolume: OWN, config: { runArgs } }, checksOn)).toEqual(expected);
   });
 });
