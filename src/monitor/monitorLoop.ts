@@ -201,6 +201,11 @@ export class MonitorLoop {
   private unsupportedLogged: string | undefined;
   /** Unit 7, PR 2: the heartbeats to the current remote host. */
   private heartbeats: HeartbeatSeries | undefined;
+  /**
+   * Review round 4 of PR #39 (P1): the target, the settings, and the environments in use of the running tick, for the
+   * heartbeats between its stops; undefined outside of a tick on an SSH host.
+   */
+  private tickHeartbeat: { target: DockerTarget; settings: MonitorSettings; inUse: ReadonlySet<string> } | undefined;
   /** Unit 7, PR 2: env id → until when it counts as in use from another computer (not asked again before). */
   private readonly otherComputerUntil = new Map<string, number>();
 
@@ -266,6 +271,7 @@ export class MonitorLoop {
         return await this.tickOn(target, now, settings);
       } finally {
         this.tickTarget = LOCAL_DOCKER_TARGET;
+        this.tickHeartbeat = undefined;
       }
     };
     const { docker } = this.deps;
@@ -323,11 +329,15 @@ export class MonitorLoop {
       if (!(id in decision.state.idleSince)) this.otherComputerUntil.delete(id);
     }
     // Unit 7, PR 2: only through the context of an SSH host, never through the local Docker.
-    if (target.kind === 'remote') await this.sendHeartbeat(target, snapshot, decision, settings, now);
+    if (target.kind === 'remote') await this.sendHeartbeat(target, snapshot, decision.inUse, settings, now);
+    this.tickHeartbeat = target.kind === 'remote' ? { target, settings, inUse: decision.inUse } : undefined;
 
     const stopped: string[] = [];
     for (const id of decision.stop) {
       if (this.stopRequested) break;
+      // Review round 4 of PR #39 (P1): the stops can take long (Git, SSH); the environments in use still get their
+      // heartbeat when it is due.
+      await this.heartbeatDuringStops();
       const outcome = await this.stopEnvironment(id, runningContainers.get(id) ?? []);
       if (outcome === 'lockLost') {
         this.deps.logger.info('Another Session Monitor took over.');
@@ -460,6 +470,7 @@ export class MonitorLoop {
       // Review round 1 (D4): each stop can take up to the time limit of a Docker call, and a window can start a session
       // meanwhile; the containers that still run then stay running (the window starts a stopped one again).
       if (index > 0 && (this.stopRequested || !(await this.idleEnvironment(id)))) return 'skipped';
+      await this.heartbeatDuringStops();
       try {
         logger.info(`Stopping the container ${container.name} of ${label}: no window uses it.`);
         await this.deps.docker.stopContainer(container.id);
@@ -520,7 +531,7 @@ export class MonitorLoop {
   private async sendHeartbeat(
     target: DockerTarget,
     snapshot: Snapshot,
-    decision: MonitorDecision,
+    inUse: ReadonlySet<string>,
     settings: MonitorSettings,
     now: number,
   ): Promise<void> {
@@ -533,7 +544,7 @@ export class MonitorLoop {
       // An id that the remote monitor cannot record (not of newEnvironmentId) is left out.
       if (!isRemoteEnvironmentId(environment.id) || entries.size >= MAX_HEARTBEAT_ENVIRONMENTS) continue;
       const kept = keptWhenClosed(environment, settings);
-      if (kept || decision.inUse.has(environment.id)) entries.set(environment.id, kept);
+      if (kept || inUse.has(environment.id)) entries.set(environment.id, kept);
     }
     const reported = entries.size > 0;
     const known = new Set(snapshot.monitorEnvironments.map((environment) => environment.id));
@@ -596,6 +607,35 @@ export class MonitorLoop {
     series.synced = true;
     series.sent = new Map([...entries].filter(([id]) => !clearOnly.has(id)));
     series.sentAt = now;
+  }
+
+  /**
+   * Review round 4 of PR #39 (P1): between the stops of a tick (each can take up to the time limits of the Git summary,
+   * the question about other computers, and one `docker stop` per container, over SSH), the heartbeat of the tick is sent
+   * again when it is due (REMOTE_HEARTBEAT_INTERVAL_MS since the last successful one), so that an environment in use is
+   * not stopped by the remote monitor meanwhile. The registry is read again (a fresh `seq`); the environments in use are
+   * those of the tick plus those that the new read shows in use. Only through the context of the tick's SSH host.
+   * Cheap when it is not due: no file is read.
+   */
+  private async heartbeatDuringStops(): Promise<void> {
+    const tick = this.tickHeartbeat;
+    const series = this.heartbeats;
+    if (!tick || !series || series.host !== tick.target.host || series.sentAt === undefined) return;
+    const now = this.clock.now();
+    if (Math.abs(now - series.sentAt) < REMOTE_HEARTBEAT_INTERVAL_MS) return;
+    try {
+      const snapshot = await this.readSnapshot(now);
+      const { inUse } = computeInUse({
+        now,
+        environments: snapshot.monitorEnvironments,
+        windows: snapshot.windows,
+        pendings: snapshot.pendings,
+        state: this.monitorState,
+      });
+      await this.sendHeartbeat(tick.target, snapshot, new Set([...tick.inUse, ...inUse]), tick.settings, now);
+    } catch (error) {
+      this.deps.logger.warn(`The heartbeat between the stops could not be sent. ${errorMessage(error)}`);
+    }
   }
 
   /**

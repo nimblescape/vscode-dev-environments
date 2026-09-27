@@ -98,14 +98,23 @@ describe('settings (concept section 8)', () => {
     expect(MAX_REFRESH_INTERVAL_MINUTES * 60_000).toBeLessThanOrEqual(2 ** 31 - 1);
   });
 
-  // Unit 7, PR 2: the time limit of a container on a remote Docker host without contact, one minute to one day.
-  it('clamps remoteStopAfterMinutes to 1..1440 and gives 10 for a value that is no number', () => {
+  // Unit 7, PR 2: the time limit of a container on a remote Docker host without contact; review round 4 of PR #39 (P1):
+  // five minutes to one day.
+  it('clamps remoteStopAfterMinutes to 5..1440 and gives 10 for a value that is no number', () => {
     const settings = (raw: Record<string, unknown>) => normalizeSettings((key) => raw[key]);
-    expect(settings({ remoteStopAfterMinutes: 0 }).remoteStopAfterMinutes).toBe(1);
+    expect(settings({ remoteStopAfterMinutes: 0 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 1 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 4.9 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 5 }).remoteStopAfterMinutes).toBe(5);
     expect(settings({ remoteStopAfterMinutes: 30 }).remoteStopAfterMinutes).toBe(30);
     expect(settings({ remoteStopAfterMinutes: 100_000 }).remoteStopAfterMinutes).toBe(1440);
     expect(settings({ remoteStopAfterMinutes: '5' }).remoteStopAfterMinutes).toBe(10);
     expect(settings({ remoteStopAfterMinutes: Number.NaN }).remoteStopAfterMinutes).toBe(10);
+    // The same bounds in package.json.
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { minimum?: number; maximum?: number }> } };
+    };
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.remoteStopAfterMinutes`]).toMatchObject({ minimum: 5, maximum: 1440 });
   });
 
   it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {

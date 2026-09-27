@@ -544,7 +544,7 @@
         "devEnvLauncher.remoteStopAfterMinutes": {
           "type": "number",
           "default": 10,
-          "minimum": 1,
+          "minimum": 5,
           "maximum": 1440,
           "description": "Stops a container on a remote Docker host after this many minutes without contact from this computer, for example when it sleeps or is offline. Not for environments that keep running when closed."
         },

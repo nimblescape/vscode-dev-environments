@@ -1214,6 +1214,58 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_A, keepRunning: false }]);
   });
 
+  // Review round 4 of PR #39 (P1): the heartbeats go on during long stop phases.
+  describe('between the stops of a tick', () => {
+    const ID_C = '8d2e3f40-0000-4000-8000-000000000003';
+
+    /** A in use in window w1; B and C on build-box, closed, their containers run. */
+    async function twoStops(): Promise<() => Promise<void>> {
+      await h.registry.add(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
+      await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+      await h.registry.add(environment(ID_C, 'acme/lib', { dockerHost: 'build-box' }));
+      await writeSettings(h);
+      h.docker.containers = [
+        containerOf(environment(ID_A, 'acme/api')),
+        containerOf(environment(ID_B, 'acme/web')),
+        containerOf(environment(ID_C, 'acme/lib')),
+      ];
+      return () => writeWindow(h, 'w1', ID_A);
+    }
+
+    const forA = () => sentHeartbeats().filter((item) => item.environments.some((entry) => entry.id === ID_A && !('clearOnly' in entry)));
+
+    it('sends a due heartbeat between two long stops, with a fresh seq', async () => {
+      const each = await twoStops();
+      // Each docker stop takes 35 s (the clock advances while it runs).
+      h.docker.stopHook = async () => h.clock.advance(35_000);
+      const results = await runUntil(h, T0 + WAITING_MS + 1, each);
+      expect(results.flatMap((result) => result.stopped).sort()).toEqual([ID_B, ID_C].sort());
+      // At the ticks of 0 s and 30 s, and once between the two stops (35 s after the one of 30 s).
+      expect(forA().map((item) => item.environments.find((entry) => entry.id === ID_A)?.seq)).toEqual([T0, T0 + 30_000, T0 + 65_000]);
+      // The second stop came after that heartbeat.
+      const order = h.docker.calls.filter((call) => call.startsWith('stop') || call.startsWith('exec devenv-session-monitor'));
+      expect(order.indexOf('stop id-devenv-acme-web-7c1d2e3f')).toBeLessThan(order.lastIndexOf('exec devenv-session-monitor'));
+    });
+
+    it('sends no extra heartbeat when the stops are quick', async () => {
+      const each = await twoStops();
+      await runUntil(h, T0 + WAITING_MS + 1, each);
+      expect(forA().map((item) => item.environments.find((entry) => entry.id === ID_A)?.seq)).toEqual([T0, T0 + 30_000]);
+    });
+
+    it('never between the stops on the local Docker', async () => {
+      target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+      await h.registry.add(environment(ID_A, 'acme/api'));
+      await h.registry.add(environment(ID_B, 'acme/web'));
+      await h.registry.add(environment(ID_C, 'acme/lib'));
+      await writeSettings(h);
+      h.docker.containers = [containerOf(environment(ID_A, 'acme/api')), containerOf(environment(ID_B, 'acme/web')), containerOf(environment(ID_C, 'acme/lib'))];
+      h.docker.stopHook = async () => h.clock.advance(35_000);
+      await runUntil(h, T0 + WAITING_MS + 1, () => writeWindow(h, 'w1', ID_A));
+      expect(sentHeartbeats()).toEqual([]);
+    });
+  });
+
   it('never sends a heartbeat through the local Docker', async () => {
     target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await h.registry.add(environment(ID_A, 'acme/api', { keepRunning: true }));

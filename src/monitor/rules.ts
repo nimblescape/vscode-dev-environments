@@ -315,7 +315,7 @@ export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSecond
 
 /**
  * Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host, in seconds, from the
- * setting remoteStopAfterMinutes (clamped to one minute..one day; a missing or invalid value gives 10 minutes).
+ * setting remoteStopAfterMinutes (clamped to one minute..one day as the protocol allows; the setting itself is 5..1440 minutes; a missing or invalid value gives 10 minutes).
  */
 export function remoteStopAfterSeconds(minutes: number | undefined): number {
   if (typeof minutes !== 'number' || !Number.isFinite(minutes)) return DEFAULT_REMOTE_STOP_AFTER_SECONDS;

@@ -352,7 +352,7 @@ export interface ExtensionSettings {
   openInNewWindow?: boolean;
   /**
    * `remoteStopAfterMinutes` (unit 7, PR 2): a container on a remote Docker host stops after this many minutes without
-   * contact from this computer, unless it keeps running when closed. 1 to 1440. Missing: 10.
+   * contact from this computer, unless it keeps running when closed. 5 to 1440. Missing: 10.
    */
   remoteStopAfterMinutes?: number;
 }
