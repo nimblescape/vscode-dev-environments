@@ -18,6 +18,7 @@ import {
   type ComposeModelOutput,
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
+import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
@@ -3237,5 +3238,405 @@ describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.warnings).toEqual([PipelineTexts.lifecycleCommandFailed('postStartCommand')]);
     expect(devContainer()?.state).toBe('running');
+  });
+});
+
+describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
+  const PASSWD_DAMAGED = 'Error response from daemon: unable to find user vscode: no matching entries in passwd file';
+  /**
+   * Review round 1 (D2): Compose labels each container with the ID of its image (the fake image ID of DB_IMAGE); review
+   * round 2: and with the configuration hash of its service (serviceHashes of the fake helper, set below).
+   */
+  const DB_IMAGE_ID = { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' };
+
+  beforeEach(() => {
+    h.helper.serviceHashes = { app: 'hash-of-app', db: 'hash-of-db' };
+  });
+
+  /**
+   * `up` of the existing containers fails because the dev container is damaged: like the CLI, the failed `up` leaves the
+   * containers running, and the check as the remote user fails in the dev container only. The `up` that replaces the dev
+   * container works.
+   */
+  function damageDevContainer(): void {
+    const devId = devContainer()?.id;
+    // Review round 3 (F1): the check runs as the user of the label devcontainer.metadata of the container.
+    const dev = devContainer();
+    if (dev) dev.labels['devcontainer.metadata'] = JSON.stringify([{ remoteUser: 'vscode' }]);
+    h.helper.upError = (_image, removeExisting) => (removeExisting ? undefined : new DevcontainerCommandError('devcontainer up', 1, '', PASSWD_DAMAGED));
+    h.helper.beforeUpError = () => {
+      for (const c of h.docker.containersOf(ENV_ID)) {
+        c.state = 'running';
+        c.rawState = 'running';
+      }
+    };
+    h.docker.execHandler = (container, command) => (container === devId && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
+  }
+
+  it('Recreate removes only the dev container (stopped first, never a volume); the database keeps running with its data', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running', dbLabels: DB_IMAGE_ID });
+    const dev = devContainer();
+    const db = dbContainer();
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.recreateQuestions).toEqual([{ message: Messages.containerRecreateQuestion(REPO, true), detail: Messages.containerRecreateDetail(true) }]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+    const log = h.docker.log;
+    expect(log.indexOf(`stop ${dev?.id}`)).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf(`stop ${dev?.id}`)).toBeLessThan(log.indexOf(`rm ${dev?.id}`));
+    // The side service is untouched: neither stopped nor removed, the same container, running.
+    expect(log.filter((line) => line.includes(String(db?.id)))).toEqual([]);
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+    expect(log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
+    expect(devContainer()).toMatchObject({ name: NAME, state: 'running', image: IMAGE_1 });
+    expect(devContainer()?.id).not.toBe(dev?.id);
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged());
+  });
+
+  it('a running dev container that the remote user cannot use: only it is recreated', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: DB_IMAGE_ID, devLabels: { 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }]) } });
+    const dev = devContainer();
+    const db = dbContainer();
+    h.docker.execHandler = (container, command) => (container === dev?.id && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('Cancel: nothing is removed, startFailed', async () => {
+    await seedCompose({ dbLabels: DB_IMAGE_ID });
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    damageDevContainer();
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a refusal of the check before the new dev container: it is not removed', async () => {
+    await seedCompose({ dbLabels: DB_IMAGE_ID });
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    // The metadata of the environment image is checked only when `up` creates the dev container.
+    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }, { privileged: true }]) } });
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('hostAccess');
+    // Refused after the question, by the check of the new dev container, before anything was removed.
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a damage text that cannot be tied to the dev container (it does not run, or its check passes): no question', async () => {
+    await seedCompose({ dbLabels: DB_IMAGE_ID });
+    // For example the shell of the database container is gone: Compose cannot start it, and the dev container stays stopped.
+    h.helper.upError = () =>
+      new DevcontainerCommandError(
+        'devcontainer up',
+        1,
+        '',
+        'Error response from daemon: failed to create task for container: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "/bin/sh": stat /bin/sh: no such file or directory',
+      );
+
+    const stopped = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(stopped.code).toBe('startFailed');
+    expect(h.logger.infos.some((line) => line.includes('the fault cannot be tied to it'))).toBe(true);
+
+    // The dev container runs after the failed `up`, but its check passes: the fault is another service's.
+    h.helper.beforeUpError = () => {
+      const dev = h.docker.containersOf(ENV_ID).find((c) => c.labels[LABEL_COMPOSE_SERVICE] === undefined);
+      if (dev) {
+        dev.state = 'running';
+        dev.labels['devcontainer.metadata'] = JSON.stringify([{ remoteUser: 'vscode' }]);
+      }
+    };
+    const running = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(running.code).toBe('startFailed');
+    expect(h.docker.execs.some((exec) => exec.command[2] === 'exit 0')).toBe(true);
+
+    expect(h.ui.prompts).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a failure of a side service that names no damage: no question', async () => {
+    await seedCompose({ dbLabels: DB_IMAGE_ID });
+    h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'Error response from daemon: Bind for 127.0.0.1:5432 failed: port is already allocated');
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.prompts).toEqual([]);
+  });
+
+  describe('review round 1 (D2): never when Compose would create the other services again', () => {
+    async function expectNotOffered(): Promise<void> {
+      const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts.filter((prompt) => prompt.startsWith('recreateContainer'))).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('is not offered to be created again'))).toBe(true);
+    }
+
+    it('after "Rebuild later" (the model is not the one of the build record)', async () => {
+      await seedCompose({ dbLabels: DB_IMAGE_ID, record: { configHash: 'sha256:changed' } });
+      h.ui.configurationChangedAnswer = 'later';
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectNotOffered();
+      expect(h.ui.prompts).toContain(`configurationChanged ${REPO}`);
+    });
+
+    it('in the fallback after a failed update (a newer image of the database)', async () => {
+      await seedCompose({ dbLabels: DB_IMAGE_ID });
+      h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+      h.helper.buildError = () => new DevcontainerCommandError('devcontainer build', 1, '', 'failed to solve');
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectNotOffered();
+    });
+
+    it('a container of another service without the current image (for example a tag that moved)', async () => {
+      await seedCompose({ dbLabels: { 'com.docker.compose.image': 'sha256:an-older-postgres' } });
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectNotOffered();
+    });
+
+    it('another version of Docker Compose than at the build', async () => {
+      await seedCompose({ dbLabels: DB_IMAGE_ID });
+      useCompose(h, { ...output(), version: '2.41.0' });
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectNotOffered();
+    });
+  });
+
+  it('review round 1 (D1): another window recreated the dev container while the question was open: nothing is removed', async () => {
+    await seedCompose({ dbLabels: DB_IMAGE_ID });
+    damageDevContainer();
+    h.ui.recreateContainer = async (repository) => {
+      h.ui.prompts.push(`recreateContainer ${repository}`);
+      // Another window replaced the damaged dev container with a healthy one.
+      const old = devContainer();
+      if (old) h.docker.containers.delete(old.id);
+      h.docker.addContainer({
+        environmentId: ENV_ID,
+        name: NAME,
+        state: 'running',
+        image: IMAGE_1,
+        labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app' },
+      });
+      return true;
+    };
+    const healthy = () => devContainer()?.id;
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.containerChangedMeanwhile);
+    expect(healthy()).toBeDefined();
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  describe('review round 4 (H1): another service that builds its image', () => {
+    const WORKER_DOCKERFILES = { worker: `FROM ${DB_IMAGE}\n` };
+    const withWorker = (m: ComposeModel) => {
+      m.services.worker = { build: { context: `${FOLDER}/worker`, dockerfile: 'Dockerfile' }, command: ['sleep', 'infinity'], networks: { default: null } };
+    };
+
+    async function seedWithWorker(configText: string): Promise<void> {
+      const changed = { ...output(withWorker), dockerfiles: WORKER_DOCKERFILES };
+      h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText } };
+      h.helper.composeOutput = changed;
+      // The build record is of this configuration: no configuration change, no "Rebuild later".
+      await seedCompose({
+        dbLabels: DB_IMAGE_ID,
+        record: {
+          configHash: composeConfigHash(configText, changed.model, WORKER_DOCKERFILES),
+          compose: {
+            service: 'app',
+            images: [`${PROJECT}-app`, `${PROJECT}-worker`],
+            serviceImages: [DB_IMAGE],
+            version: '2.40.3',
+            inputsHash: composeInputsHash(configText, 'inputs-1', WORKER_DOCKERFILES),
+          },
+        },
+      });
+      h.docker.images.add(`${PROJECT}-worker`);
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+    }
+
+    it('a service with build: (all services are started): no question, nothing removed, the log says why', async () => {
+      await seedWithWorker(CONFIG_TEXT);
+
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts.filter((prompt) => prompt.startsWith('recreateContainer'))).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('other services build their images (worker)'))).toBe(true);
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+    });
+
+    it('runServices without the built service: offered as before, only the dev container is recreated', async () => {
+      await seedWithWorker(CONFIG_TEXT.replace('"service": "app",', '"service": "app",\n  "runServices": ["db"],'));
+      const dev = devContainer();
+      const db = dbContainer();
+
+      await h.service.openEnvironment(ENV_ID, options());
+
+      expect(h.ui.prompts).toContain(`recreateContainer ${REPO}`);
+      expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
+      expect(dbContainer()?.id).toBe(db?.id);
+    });
+  });
+
+  describe('review round 3 (G2): another service that shares a namespace or the volumes of another service', () => {
+    // Of a third service `cache` (the policy refuses `pid` and `volumes_from` of the dev service).
+    it.each<[string, (db: Record<string, unknown>) => void, string]>([
+      ['network_mode service:cache', (db) => (db.network_mode = 'service:cache'), 'db: network_mode service:cache'],
+      ['ipc service:cache', (db) => (db.ipc = 'service:cache'), 'db: ipc service:cache'],
+      ['pid service:cache', (db) => (db.pid = 'service:cache'), 'db: pid service:cache'],
+      ['volumes_from cache', (db) => (db.volumes_from = ['cache']), 'db: volumes_from cache'],
+    ])('%s: no question (the direct check could never pass), and the log says why', async (_name, change, item) => {
+      const changed = output((m) => {
+        m.services.cache = { image: DB_IMAGE, command: ['sleep', 'infinity'], networks: { default: null } };
+        if ((m.services.db as Record<string, unknown>).network_mode === undefined) delete m.services.db.networks;
+        change(m.services.db as Record<string, unknown>);
+        if ((m.services.db as Record<string, unknown>).network_mode === undefined) m.services.db.networks = { default: null };
+      });
+      // The build record is of this model: no configuration change, no "Rebuild later".
+      await seedCompose({ dbLabels: DB_IMAGE_ID, record: { configHash: composeConfigHash(CONFIG_TEXT, changed.model, {}) } });
+      useCompose(h, changed);
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts.filter((prompt) => prompt.startsWith('recreateContainer'))).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('share a namespace or the volumes of another service') && line.includes(item))).toBe(true);
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+    });
+  });
+
+  describe('review round 2 (E1–E3): the direct check of the other services right before up', () => {
+    /** A first open creates the containers as Compose does (their labels: the hash of the model, the image ID). */
+    async function openedEnvironment(): Promise<{ devId: string; dbId: string }> {
+      h.helper.serviceHashes = undefined;
+      await h.service.open(TARGET, options());
+      for (const c of h.docker.containersOf(ENV_ID)) {
+        c.state = 'stopped';
+        c.rawState = 'exited';
+      }
+      h.ui.prompts.length = 0;
+      h.docker.log.length = 0;
+      return { devId: String(devContainer()?.id), dbId: String(dbContainer()?.id) };
+    }
+
+    async function expectRefusedAfterAnswer(dbId: string, devId: string): Promise<void> {
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('startFailed');
+      expect(error.detail).toBe(Messages.composeServicesWouldBeRecreated('db'));
+      expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+      // Nothing was stopped or removed; no `up` replaced anything.
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+      expect(dbContainer()?.id).toBe(dbId);
+      expect(devContainer()?.id).toBe(devId);
+      expect(h.helper.calls.filter((call) => call.includes('--remove-existing-container'))).toEqual([]);
+      expect(h.logger.warnings.some((line) => line.startsWith(`Docker Compose would create the service db of ${REPO} again`))).toBe(true);
+      expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    }
+
+    it('the happy path: the hashes of the exact up model and the image IDs match; only the dev container is recreated', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+
+      await h.service.openEnvironment(ENV_ID, options());
+
+      // The hashes come from the model that `up` got.
+      expect(h.helper.hashModels.at(-1)).toBe(h.helper.ups.at(-1)?.files?.[COMPOSE_MODEL_PATH]);
+      expect(h.helper.calls.indexOf(`composeServiceHashes ${PROJECT}`)).toBeLessThan(h.helper.calls.lastIndexOf(`up ${IMAGE_1} --remove-existing-container`));
+      expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${devId}`]);
+      expect(dbContainer()?.id).toBe(dbId);
+      expect(devContainer()?.id).not.toBe(devId);
+    });
+
+    it('E1: the host access checks were turned off after the containers were created: no recreation, nothing removed', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('E2: a build record rewritten without new containers, but the database container from an older Compose (another hash)', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      const db = h.docker.containers.get(dbId);
+      if (db) db.labels['com.docker.compose.config-hash'] = 'hash-of-an-older-compose';
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('E3: the tag of the database image moves while the question is open: no recreation, nothing removed', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateContainer = async (repository) => {
+        h.ui.prompts.push(`recreateContainer ${repository}`);
+        // Another environment pulled a newer postgres:16.
+        h.docker.imageIds.set(DB_IMAGE, 'sha256:a-newer-postgres');
+        return true;
+      };
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('a container without the hash label, or a failed hash computation: no recreation', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      h.helper.serviceHashes = new CommandError('docker compose config --hash', 1, '', 'unknown flag: --hash');
+      await expectRefusedAfterAnswer(dbId, devId);
+      expect(h.logger.warnings.some((line) => line.includes('could not be computed'))).toBe(true);
+    });
+  });
+
+  it('review round 2 (V1): the folders of the dev container in volumes without a name are named; nothing removes them', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running', dbLabels: DB_IMAGE_ID });
+    const dev = devContainer();
+    const anonymous = 'b'.repeat(64);
+    if (dev) h.docker.containers.set(dev.id, { ...dev, mountTargets: [{ type: 'volume', volume: anonymous, target: `${FOLDER}/node_modules` }] });
+    h.docker.volumes.set(anonymous, {});
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.recreateQuestions[0].detail).toBe(Messages.containerRecreateDetail(true, [`${FOLDER}/node_modules`]));
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged([`${FOLDER}/node_modules`]));
+    expect(h.docker.volumes.has(anonymous)).toBe(true);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
   });
 });

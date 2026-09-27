@@ -41,17 +41,19 @@ import {
   type HelperBuildKind,
 } from './helperImage';
 import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
-import { parseComposeModelOutput, type ComposeModelOutput } from './compose';
+import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import {
   OVERRIDE_CONFIG_PATH,
   OVERRIDE_FOLDER,
   SECRETS_FOLDER,
   buildCommand,
   cloneCommand,
+  composeHashCommand,
   composeModelCommand,
   createFoldersCommand,
   gitFilesCommand,
   listConfigsCommand,
+  parseComposeHashes,
   readFilesCommand,
   switchBranchCommand,
   upCommand,
@@ -750,6 +752,28 @@ export class WorkspaceHelper {
     });
     if (result.exitCode !== 0) throw new CommandError('docker compose config', result.exitCode, result.stdout, result.stderr);
     return parseComposeModelOutput(result.stdout);
+  }
+
+  /**
+   * Recreate offer, review round 2: the configuration hash of each service of the up model `model` (its text, as `up`
+   * gets it at COMPOSE_MODEL_PATH) with the project name `project`, computed by the Docker Compose of this helper, the
+   * one that runs `up` (COMPOSE_HASH_SCRIPT). Without the Docker socket, the cache volume, and network, and with the
+   * configuration folder of the volume hidden. Throws CommandError when Compose fails.
+   */
+  async composeServiceHashes(p: { volumeName: string; repository: string; model: string; project: string; signal?: AbortSignal }): Promise<Map<string, string>> {
+    this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
+    const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
+      input: p.model,
+      env: { COMPOSE_PROJECT_NAME: p.project },
+      docker: false,
+      network: false,
+      hideConfigFolder: true,
+      timeoutMs: COMPOSE_MODEL_TIMEOUT_MS,
+      signal: p.signal,
+      onStderr: this.logOutput,
+    });
+    if (result.exitCode !== 0) throw new CommandError('docker compose config --hash', result.exitCode, result.stdout, result.stderr);
+    return parseComposeHashes(result.stdout);
   }
 
   /**

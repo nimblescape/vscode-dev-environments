@@ -41,6 +41,9 @@ import {
   refusedUpdateOf,
   shouldCheckImages,
   stringList,
+  containerMetadataUser,
+  sharedNamespaceServices,
+  builtOtherServices,
   type ImageCheckState,
 } from './pipelineRules';
 
@@ -739,5 +742,62 @@ describe('devMountFolders (review round 12, D12-2)', () => {
     expect(devMountFolders(container, env, 'off')).toEqual(['/workspaces/api/.git/pg', '/workspaces/api/.git/hooks', '/workspaces/api/sub/.git/pg']);
     // Still not the repository folder, `..`, or a path outside of it.
     expect(devMountFolders({ mountTargets: [{ type: 'bind', target: '/workspaces/api/.git/../..' }] }, env, 'off')).toEqual([]);
+  });
+});
+
+describe('containerMetadataUser (recreate offer, review round 3, F1)', () => {
+  const meta = (entries: unknown) => ({ 'devcontainer.metadata': JSON.stringify(entries) });
+
+  it('takes the last remoteUser of the label of the container, else its containerUser', () => {
+    expect(containerMetadataUser(meta([{ remoteUser: 'vscode' }, { remoteUser: 'node' }]))).toBe('node');
+    expect(containerMetadataUser(meta([{ containerUser: 'dev' }]))).toBe('dev');
+    expect(containerMetadataUser(meta([{ containerUser: 'dev' }, { remoteUser: 'node' }]))).toBe('node');
+  });
+
+  it('substitutes variables as the CLI does, and knows no user for an unknown value', () => {
+    expect(containerMetadataUser(meta([{ remoteUser: '${localEnv:NOT_SET:fallback}' }]), helperCliVariables('acme/api'))).toBe('fallback');
+    expect(containerMetadataUser(meta([{ remoteUser: '${containerEnv:USER}' }]), helperCliVariables('acme/api'))).toBeUndefined();
+  });
+
+  it('knows no user without a label, with an invalid one, or with one that names none', () => {
+    expect(containerMetadataUser({})).toBeUndefined();
+    expect(containerMetadataUser({ 'devcontainer.metadata': '{' })).toBeUndefined();
+    expect(containerMetadataUser(meta([{ customizations: {} }]))).toBeUndefined();
+  });
+});
+
+describe('sharedNamespaceServices (recreate offer, review round 3, G2)', () => {
+  it('names each other service with service: network_mode, ipc, pid, or volumes_from', () => {
+    const model = {
+      services: {
+        app: { network_mode: 'service:db' },
+        db: {},
+        a: { network_mode: 'service:db' },
+        b: { ipc: 'service:db', pid: 'service:db' },
+        c: { volumes_from: ['db:ro'] },
+        d: { network_mode: 'host', ipc: 'shareable', pid: 'container:x', volumes_from: [] },
+      },
+    };
+    expect(sharedNamespaceServices(model, 'app')).toEqual(['a: network_mode service:db', 'b: ipc service:db', 'b: pid service:db', 'c: volumes_from db:ro']);
+    expect(sharedNamespaceServices({ services: { app: {}, db: {} } }, 'app')).toEqual([]);
+  });
+});
+
+describe('builtOtherServices (recreate offer, review round 4, H1)', () => {
+  const model = {
+    services: {
+      app: { build: { context: '.' } },
+      db: { image: 'postgres:16' },
+      worker: { build: { context: './worker' } },
+      tools: { build: null },
+    },
+  };
+
+  it('names the other services with build: that the up builds: all of them, or those of runServices', () => {
+    expect(builtOtherServices(model, 'app')).toEqual(['worker']);
+    expect(builtOtherServices(model, 'app', [])).toEqual(['worker']);
+    expect(builtOtherServices(model, 'app', ['db'])).toEqual([]);
+    expect(builtOtherServices(model, 'app', ['db', 'worker'])).toEqual(['worker']);
+    expect(builtOtherServices({ services: { app: {}, db: { image: 'x' } } }, 'app')).toEqual([]);
   });
 });

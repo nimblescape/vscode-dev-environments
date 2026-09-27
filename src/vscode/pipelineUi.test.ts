@@ -65,6 +65,16 @@ describe('VsCodePipelineUi', () => {
     await expect(ui.configurationKindChanged('acme/api', text)).resolves.toBe('later');
   });
 
+  it('offers to recreate a damaged container in a modal question with what is kept and lost; Recreate or Cancel (dismissed)', async () => {
+    const { ui } = setup();
+    const question = { message: Messages.containerRecreateQuestion('acme/api', false), detail: Messages.containerRecreateDetail(false) };
+    window.showWarningMessage.mockResolvedValueOnce(Actions.recreateContainer);
+    await expect(ui.recreateContainer('acme/api', question)).resolves.toBe(true);
+    expect(window.showWarningMessage).toHaveBeenCalledWith(question.message, { modal: true, detail: question.detail }, 'Recreate');
+    window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await expect(ui.recreateContainer('acme/api', question)).resolves.toBe(false);
+  });
+
   it('asks what to do when the files are missing: Clone again, Delete environment, or cancel', async () => {
     const { ui } = setup();
     window.showWarningMessage.mockResolvedValueOnce(Actions.cloneAgain);

@@ -303,6 +303,51 @@ export function lifecycleHookFailure(result: DevcontainerResult | undefined): st
   return lifecycleHookName(result.description);
 }
 
+// Messages of Docker (verified on 29.3.1 with runc 1.3) when the existing container itself is damaged, so that it cannot
+// be started or used, while Docker works: its /etc/passwd or /etc/group lacks the user (`docker exec -u`, also when the
+// file is gone), the shell that the Dev Container CLI starts it with is missing or not executable (`docker start` and
+// `docker exec`), or the container is marked for removal (state `dead`). Only an allowlist: a failure that another
+// container of the same image would have as well (a published port in use, a missing bind mount source or device, a
+// missing network, an image of another platform) names none of them.
+const CONTAINER_FAULT_PATTERNS: readonly RegExp[] = [
+  /unable to find (?:user|group) [^\n]*?: no matching entries in (?:passwd|group) file/i,
+  /unable to start container process: [^\n]*?exec: "\/[^"\n]*": (?:stat [^\n]*?: no such file or directory|permission denied)/i,
+  /is marked for removal and cannot be started/i,
+];
+
+// Messages of Docker when its engine does not answer (local, or on a remote host over SSH): never the container's fault.
+const DOCKER_UNREACHABLE_PATTERNS: readonly RegExp[] = [
+  /cannot connect to the docker daemon/i,
+  /error during connect/i,
+  /is the docker daemon running/i,
+  /\bssh: /i,
+  /connection (?:closed|lost)|broken pipe|unexpected eof/i,
+];
+
+/**
+ * Recreate offer (user request 2026-09-26): whether the text of a failed start of an existing container (the output of
+ * `devcontainer up` or `run-user-commands`, or of a `docker exec` in the running container) says that the container
+ * itself is damaged (CONTAINER_FAULT_PATTERNS), so that a new container of the same environment image would work. A
+ * text that also names a failure of the connection to Docker or of the network is never one: when unsure, the pipeline
+ * does not offer to recreate the container.
+ */
+export function isContainerFault(text: string): boolean {
+  if (DOCKER_UNREACHABLE_PATTERNS.some((pattern) => pattern.test(text)) || isNetworkFailure(text)) return false;
+  return CONTAINER_FAULT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Recreate offer, review round 2 (V1): the folders of `container` that are volumes without a name (Docker names such a
+ * volume with 64 hexadecimal digits: `- /workspaces/api/node_modules` of a compose file, `VOLUME /data` of the image, a
+ * mount without a source). The recreation does not carry them over: the question and the progress name them.
+ */
+export function unnamedVolumeFolders(container: Pick<ContainerInfo, 'mountTargets'>): string[] {
+  const folders = (container.mountTargets ?? [])
+    .filter((mount) => mount.type === 'volume' && mount.volume !== undefined && /^[0-9a-f]{64}$/.test(mount.volume))
+    .map((mount) => mount.target);
+  return [...new Set(folders)].sort();
+}
+
 /** Technical details of an error for the log and for `UserFacingError.detail`: the message and the end of stderr. */
 export function errorDetail(error: unknown): string {
   const message = errorMessage(error);
@@ -399,6 +444,59 @@ export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown
 }
 
 /**
+ * Recreate offer, review round 3 (F1): the remote user of a container by its own label devcontainer.metadata (which the
+ * Dev Container CLI puts on the container it creates, and by which the Dev Containers extension attaches), substituted
+ * as imageRemoteUser does: its `remoteUser`, else its `containerUser`. `undefined` when the label names neither, or the
+ * user holds a variable whose value is not known.
+ */
+export function containerMetadataUser(labels: Readonly<Record<string, string>>, variables?: CliVariables): string | undefined {
+  let entries: unknown;
+  try {
+    entries = JSON.parse(labels['devcontainer.metadata'] ?? 'null');
+  } catch {
+    return undefined;
+  }
+  const named = (Array.isArray(entries) ? entries : [entries]).some(
+    (entry) => isRecord(entry) && (nonEmptyString(entry.remoteUser) !== undefined || nonEmptyString(entry.containerUser) !== undefined),
+  );
+  return named ? imageRemoteUser({ Labels: labels }, undefined, variables) : undefined;
+}
+
+/**
+ * Recreate offer, review round 3 (G2): the other services of a Docker Compose model (not `devService`) that share a
+ * namespace or the volumes of another service (`network_mode`, `ipc`, or `pid` of the form `service:<name>`, or
+ * `volumes_from`), as `<service>: <setting>`. Compose hashes such a reference in its resolved form (`container:<id>`),
+ * so the hash of the model never equals the label of the container, and a new dev container could make Compose create
+ * them again.
+ */
+export function sharedNamespaceServices(model: { services: Record<string, unknown> }, devService: string): string[] {
+  const found: string[] = [];
+  for (const [name, service] of Object.entries(model.services)) {
+    if (name === devService || !isRecord(service)) continue;
+    for (const key of ['network_mode', 'ipc', 'pid']) {
+      const value = service[key];
+      if (typeof value === 'string' && value.startsWith('service:')) found.push(`${name}: ${key} ${value}`);
+    }
+    if (Array.isArray(service.volumes_from) && service.volumes_from.length > 0) found.push(`${name}: volumes_from ${service.volumes_from.join(', ')}`);
+  }
+  return found;
+}
+
+/**
+ * Recreate offer, review round 4 (H1): the other services (not `devService`) with a `build:` section that the `up` of
+ * the Dev Container CLI builds when the dev container does not exist (CLI 0.89.0: `docker compose build` of every
+ * service, or of `runServices` and the dev service, before `up -d` without `--no-recreate`): all of them without
+ * `runServices`, else those that `runServices` names. A new image of such a service, for example of a changed build
+ * context or a pruned build cache, makes Compose create its container again, after the direct check.
+ */
+export function builtOtherServices(model: { services: Record<string, unknown> }, devService: string, runServices?: readonly string[]): string[] {
+  return Object.entries(model.services)
+    .filter(([name, service]) => name !== devService && isRecord(service) && service.build !== undefined && service.build !== null)
+    .map(([name]) => name)
+    .filter((name) => runServices === undefined || runServices.length === 0 || runServices.includes(name));
+}
+
+/**
  * The remote user by the configuration alone, when neither `up` nor the image named it: its `remoteUser`, else the last
  * `--user`/`-u` of `runArgs`, else its `containerUser` (the order of imageRemoteUser, without the image). `undefined`
  * when the configuration names none.
@@ -431,6 +529,12 @@ export function nonEmptyString(value: unknown): string | undefined {
 export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /** Review round 22 (D22-1): label that Docker Compose gives each container of a project: the name of its service. */
 export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
+/**
+ * Recreate offer, review round 1 (D2): label that Docker Compose gives each container: the ID of the image that it was
+ * created from (verified with Compose 5.1.1). Compose creates a container again when it differs from the ID of the image
+ * of the service now.
+ */
+export const COMPOSE_IMAGE_LABEL = 'com.docker.compose.image';
 
 /**
  * Review round 22 (D22-1): the name that Docker Compose gives a container that it creates in place of another one while
@@ -643,6 +747,8 @@ export function isComposeContainer(labels: Readonly<Record<string, string>>, pro
 /** Labels that Docker Compose puts on the containers that it creates (not on images): isComposeContainer. */
 export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-number';
 export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
+/** Recreate offer, review round 2: label of a one-off container of `docker compose run` (`True`); `up` leaves it. */
+export const COMPOSE_ONEOFF_LABEL = 'com.docker.compose.oneoff';
 
 /**
  * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the

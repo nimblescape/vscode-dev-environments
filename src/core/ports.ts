@@ -138,6 +138,12 @@ export interface PipelineUi {
   configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'>;
   /** Concept 7.12: the workspace volume is missing. `undefined` means cancel. */
   filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined>;
+  /**
+   * Recreate offer (user request 2026-09-26): the existing container of the environment is damaged, so that it cannot be
+   * started or used. `question`: Messages.containerRecreateQuestion and containerRecreateDetail (what is kept and what is
+   * lost). `true` only when the user chooses Recreate; a dismissed question changes nothing.
+   */
+  recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean>;
   /** Non-blocking information message. */
   info(message: string): void;
   /** Non-blocking warning message. */

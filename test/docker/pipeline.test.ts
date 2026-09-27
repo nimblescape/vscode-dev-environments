@@ -797,6 +797,54 @@ describe('open pipeline on a seeded environment', () => {
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);
   });
 
+  it('recreate offer: a container whose /etc/passwd lacks the remote user; Cancel changes nothing, Recreate creates it again and keeps the files', async () => {
+    const damagedId = cli.container(containerName)?.Id;
+    const image = cli.container(containerName)?.Config.Image;
+    // A file outside the volumes, which the recreation removes, and the damage: the remote user is gone from /etc/passwd.
+    execIn(REMOTE_USER, 'echo outside > /tmp/outside-the-volume');
+    cli.ok(['exec', '-u', '0', containerName, 'sh', '-c', `sed -i '/^${REMOTE_USER}:/d' /etc/passwd`]);
+    cli.ok(['stop', '-t', '1', containerName]);
+
+    // Cancel: `up` of the stopped container fails in the Dev Container CLI (it cannot exec as the user); nothing is removed.
+    ui.recreateAnswer = false;
+    let events = ui.events.length;
+    const cancelled = await timings.measure('damaged container, Cancel', () =>
+      offline.openEnvironment(environmentId, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught),
+    );
+    expect(cancelled).toMatchObject({ code: 'startFailed' });
+    expect((cancelled as { detail?: string }).detail).toContain(`unable to find user ${REMOTE_USER}`);
+    expect(ui.since(events).filter((event) => event.kind === 'recreateContainer')).toEqual([
+      { kind: 'recreateContainer', text: `${REPOSITORY}: ${Messages.containerRecreateQuestion(REPOSITORY, false)}` },
+    ]);
+    expect(cli.container(containerName)?.Id).toBe(damagedId);
+    expect(cli.volume(volumeName)).toBeDefined();
+
+    // Recreate: the failed `up` left the container running; the check as the remote user finds the damage again.
+    ui.recreateAnswer = true;
+    events = ui.events.length;
+    const progress = new RecordingProgress();
+    const result = await timings.measure('damaged container, Recreate', () => offline.openEnvironment(environmentId, { progress }), () => progress.summary());
+
+    expect(ui.since(events).filter((event) => event.kind === 'recreateContainer')).toHaveLength(1);
+    expect(progress.details).toContain(Messages.containerRecreatedDamaged());
+    expect(progress.steps).not.toContain('preparing');
+    const container = cli.container(containerName);
+    expect(container?.Id).not.toBe(damagedId);
+    expect(container?.State.Running).toBe(true);
+    expect(container?.Config.Image).toBe(image);
+    expect(containersOfEnvironment()).toHaveLength(1);
+    // The user exists again, the files in the volume are kept, the file outside it is gone.
+    expect(execIn(REMOTE_USER, 'id -un')).toBe(REMOTE_USER);
+    expect(untrackedFileKept()).toBe(true);
+    expect(workspaceMount()?.Name).toBe(volumeName);
+    expect(execIn(REMOTE_USER, 'test -e /tmp/outside-the-volume && echo present || echo gone')).toBe('gone');
+    // postCreateCommand ran again in the new container, with the token.
+    expect(execIn(REMOTE_USER, `cat ${POST_CREATE_LOG}`)).toBe('present');
+    expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+    expect(result.remoteWorkspaceFolder).toBe(FOLDER);
+    expect((await registry.get(environmentId))?.busy).toBeUndefined();
+  });
+
   it.each<[string, Record<string, unknown>, string]>([
     ['a bind mount', { mounts: ['source=/tmp,target=/host-tmp,type=bind'] }, 'bind mount /tmp'],
     ['privileged mode', { privileged: true }, 'privileged mode'],
