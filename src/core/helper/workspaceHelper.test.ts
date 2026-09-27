@@ -31,6 +31,7 @@ import {
 import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
   COMPOSE_MODEL_TIMEOUT_MS,
+  DOCKER_CONTEXT_TIMEOUT_MS,
   DOCKER_SOCKET,
   HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
@@ -38,6 +39,7 @@ import {
   helperDockerSocket,
   helperRunArgs,
   isPassableEnvName,
+  readDockerContextEndpoint,
   type HelperDeps,
   type HelperDocker,
 } from './workspaceHelper';
@@ -179,6 +181,123 @@ describe('helperDockerSocket', () => {
 
   it('uses the path of a unix:// DOCKER_HOST on Linux (for example rootless Docker)', () => {
     expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux')).toBe('/run/user/1000/docker.sock');
+  });
+});
+
+describe('helperDockerSocket with the endpoint of the Docker context', () => {
+  it('uses a unix:// DOCKER_HOST on Linux, before the endpoint of the context', () => {
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux', 'unix:///run/user/2000/docker.sock')).toBe(
+      '/run/user/1000/docker.sock',
+    );
+    expect(helperDockerSocket({ DOCKER_HOST: 'tcp://10.0.0.1:2376' }, 'linux', 'unix:///run/user/1000/docker.sock')).toBe(DOCKER_SOCKET);
+  });
+
+  it('uses the socket of a rootless context on Linux when DOCKER_HOST is empty', () => {
+    expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock')).toBe('/run/user/1000/docker.sock');
+    expect(helperDockerSocket({ DOCKER_HOST: '  ' }, 'linux', ' unix:///run/user/1000/docker.sock\n')).toBe('/run/user/1000/docker.sock');
+  });
+
+  it.each([
+    ['the default context', 'linux', 'unix:///var/run/docker.sock'],
+    ['Docker Desktop for Linux', 'linux', 'unix:///home/u/.docker/desktop/docker.sock'],
+    ['ssh', 'linux', 'ssh://me@build-host'],
+    ['tcp', 'linux', 'tcp://10.0.0.5:2376'],
+    ['a relative unix path', 'linux', 'unix://docker.sock'],
+    ['an empty endpoint', 'linux', ''],
+    ['macOS', 'darwin', 'unix:///Users/me/.docker/run/docker.sock'],
+    ['a unix socket on macOS', 'darwin', 'unix:///run/user/1000/docker.sock'],
+    ['Windows', 'win32', 'npipe:////./pipe/docker_engine'],
+  ] as const)('uses /var/run/docker.sock for %s', (_name, platform, endpoint) => {
+    expect(helperDockerSocket({}, platform, endpoint)).toBe(DOCKER_SOCKET);
+  });
+});
+
+describe('readDockerContextEndpoint', () => {
+  it('inspects the current context without DOCKER_CONTEXT', async () => {
+    docker.handler = () => ({ stdout: '"unix:///run/user/1000/docker.sock"\n' });
+    await expect(readDockerContextEndpoint(docker, {}, logger)).resolves.toBe('unix:///run/user/1000/docker.sock');
+    expect(docker.calls.map((call) => call.args)).toEqual([['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}']]);
+    expect(docker.calls[0].options.timeoutMs).toBe(DOCKER_CONTEXT_TIMEOUT_MS);
+  });
+
+  it('inspects the context of DOCKER_CONTEXT', async () => {
+    docker.handler = () => ({ stdout: '"unix:///run/user/1000/docker.sock"' });
+    await expect(readDockerContextEndpoint(docker, { DOCKER_CONTEXT: 'rootless' }, logger)).resolves.toBe('unix:///run/user/1000/docker.sock');
+    expect(docker.calls[0].args).toEqual(['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}', 'rootless']);
+  });
+
+  it('does not pass a DOCKER_CONTEXT that is no context name', async () => {
+    await expect(readDockerContextEndpoint(docker, { DOCKER_CONTEXT: '--help' }, logger)).resolves.toBeUndefined();
+    expect(docker.calls).toEqual([]);
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes(DOCKER_SOCKET))).toBe(true);
+  });
+
+  it.each<[string, Partial<RunResult> | Error]>([
+    ['a failed inspect', { exitCode: 1, stderr: 'context "gone": context not found' }],
+    ['a time limit', { exitCode: -1, timedOut: true }],
+    ['output that is no JSON string', { stdout: 'null' }],
+    ['a missing CLI', new Error('spawn docker ENOENT')],
+  ])('gives undefined and logs after %s', async (_name, outcome) => {
+    docker.handler = () => {
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    };
+    await expect(readDockerContextEndpoint(docker, {}, logger)).resolves.toBeUndefined();
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('current Docker context') && line.includes(DOCKER_SOCKET))).toBe(
+      true,
+    );
+  });
+});
+
+describe('WorkspaceHelper socket mount with the Docker context', () => {
+  function helperWith(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, contextEndpoint: () => Promise<string | undefined>): WorkspaceHelper {
+    return new WorkspaceHelper({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env, platform, contextEndpoint });
+  }
+
+  function socketMount(args: string[]): string | undefined {
+    return args.find((arg) => arg.startsWith('type=bind,'));
+  }
+
+  it('mounts the socket of the rootless context on Linux with an empty DOCKER_HOST, and asks for it once', async () => {
+    const lookup = vi.fn(async () => 'unix:///run/user/1000/docker.sock');
+    const helper = helperWith({}, 'linux', lookup);
+    await helper.run('vol', ['true']);
+    await helper.run('vol', ['true']);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    for (const run of docker.runs) {
+      expect(socketMount(run.args)).toBe('type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock');
+      expect(run.args.join(' ')).not.toMatch(/DOCKER_HOST|DOCKER_CONTEXT/);
+    }
+  });
+
+  it('with the real lookup, mounts the socket of the context of DOCKER_CONTEXT', async () => {
+    const env = { DOCKER_CONTEXT: 'rootless' };
+    docker.handler = (args) => (args[0] === 'context' ? { stdout: '"unix:///run/user/1000/docker.sock"' } : {});
+    const helper = helperWith(env, 'linux', () => readDockerContextEndpoint(docker, env, logger));
+    await helper.run('vol', ['true']);
+    expect(docker.calls.find((call) => call.args[0] === 'context')?.args.at(-1)).toBe('rootless');
+    expect(socketMount(docker.runs[0].args)).toBe('type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock');
+    expect(docker.runs[0].args.join(' ')).not.toContain('DOCKER_CONTEXT');
+  });
+
+  it('mounts /var/run/docker.sock and logs when the context cannot be read', async () => {
+    docker.handler = (args) => (args[0] === 'context' ? { exitCode: -1, timedOut: true } : {});
+    const helper = helperWith({}, 'linux', () => readDockerContextEndpoint(docker, {}, logger));
+    await helper.run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe('type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock');
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('current Docker context'))).toBe(true);
+  });
+
+  it.each<[string, NodeJS.ProcessEnv, NodeJS.Platform, string]>([
+    ['a set DOCKER_HOST', { DOCKER_HOST: 'unix:///run/user/2000/docker.sock' }, 'linux', '/run/user/2000/docker.sock'],
+    ['macOS', {}, 'darwin', DOCKER_SOCKET],
+    ['Windows', {}, 'win32', DOCKER_SOCKET],
+  ])('does not ask for the context with %s', async (_name, env, platform, expected) => {
+    const lookup = vi.fn(async () => 'unix:///run/user/1000/docker.sock');
+    const helper = helperWith(env, platform, lookup);
+    await helper.run('vol', ['true']);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(socketMount(docker.runs[0].args)).toBe(`type=bind,source=${expected},target=/var/run/docker.sock`);
   });
 });
 

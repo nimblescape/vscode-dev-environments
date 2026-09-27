@@ -75,8 +75,17 @@ export interface HelperDeps {
   logger: Logger;
   /** resources/helper/Dockerfile of the installed extension. */
   dockerfilePath: string;
-  /** Environment of the extension host. Only DOCKER_HOST is read (for the socket path); nothing of it enters the helper. */
+  /**
+   * Environment of the extension host. Only DOCKER_HOST (and DOCKER_CONTEXT through `contextEndpoint`) is read, for the
+   * socket path; nothing of it enters the helper.
+   */
   env: NodeJS.ProcessEnv;
+  /**
+   * Endpoint of the Docker context that the CLI uses (readDockerContextEndpoint), asked once, before the first run that
+   * mounts the socket, and only on Linux with an empty DOCKER_HOST. Without it, or when it gives `undefined`, only
+   * DOCKER_HOST counts (helperDockerSocket).
+   */
+  contextEndpoint?: () => Promise<string | undefined>;
   /** Default: the platform of this process. */
   platform?: NodeJS.Platform;
   clock?: Clock;
@@ -122,15 +131,79 @@ export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
 /**
  * Source of the socket mount (implementation notes 6). The source is a path on the machine of the Docker engine.
  * Assumption (V-7): Docker Desktop (macOS, Windows, and Linux) runs the engine in a VM, where the socket is
- * /var/run/docker.sock, whatever DOCKER_HOST points to on the computer. So a `unix://` DOCKER_HOST is used only on
- * Linux without Docker Desktop (for example rootless Docker Engine).
+ * /var/run/docker.sock, whatever DOCKER_HOST points to on the computer. So a `unix://` endpoint is used only on Linux
+ * without Docker Desktop (for example rootless Docker Engine). The endpoint is DOCKER_HOST, or, when it is empty,
+ * `contextEndpoint`: the endpoint of the Docker context that the CLI uses (readDockerContextEndpoint), for example
+ * after `docker context use rootless`. Any other endpoint (ssh://, tcp://, npipe://, Docker Desktop) gives
+ * /var/run/docker.sock.
  */
-export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
-  const host = env.DOCKER_HOST?.trim();
+export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, contextEndpoint?: string): string {
+  const host = env.DOCKER_HOST?.trim() || contextEndpoint?.trim();
   if (platform !== 'linux' || !host || !host.startsWith('unix://')) return DOCKER_SOCKET;
   const socketPath = host.slice('unix://'.length);
   if (!socketPath.startsWith('/') || socketPath.includes('/.docker/desktop/')) return DOCKER_SOCKET;
   return socketPath;
+}
+
+/**
+ * Whether the helper needs the endpoint of the Docker context for its socket: only on Linux, and only when DOCKER_HOST
+ * is empty (a set DOCKER_HOST wins over any context, as in the Docker CLI).
+ */
+export function needsDockerContextEndpoint(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  return platform === 'linux' && !env.DOCKER_HOST?.trim();
+}
+
+/** Time limit of `docker context inspect` (readDockerContextEndpoint). The CLI reads only its own files. */
+export const DOCKER_CONTEXT_TIMEOUT_MS = 5_000;
+
+// Names of Docker contexts, as the CLI accepts them. Anything else (for example a leading `-`) is not passed.
+const DOCKER_CONTEXT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]*$/;
+
+/**
+ * Endpoint of the Docker context that the Docker CLI uses: the context of DOCKER_CONTEXT when it is set, otherwise the
+ * current context (`docker context inspect [<name>] --format '{{json .Endpoints.docker.Host}}'`). `undefined` when
+ * it cannot be read (an error, a time limit, an invalid name); that is logged, and the helper then uses
+ * /var/run/docker.sock. Never throws.
+ */
+export async function readDockerContextEndpoint(
+  docker: Pick<HelperDocker, 'run'>,
+  env: NodeJS.ProcessEnv,
+  logger: Logger,
+  timeoutMs: number = DOCKER_CONTEXT_TIMEOUT_MS,
+): Promise<string | undefined> {
+  const name = env.DOCKER_CONTEXT?.trim();
+  const fallback = `The workspace helper uses ${DOCKER_SOCKET}`;
+  if (name && !DOCKER_CONTEXT_NAME.test(name)) {
+    logger.warn(`The Docker context "${name}" of DOCKER_CONTEXT is not a valid name. ${fallback}.`);
+    return undefined;
+  }
+  const args = ['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}', ...(name ? [name] : [])];
+  const context = name ? `the Docker context ${name}` : 'the current Docker context';
+  try {
+    const result = await docker.run(args, { timeoutMs });
+    if (result.timedOut) {
+      logger.warn(`The endpoint of ${context} was not read within ${Math.round(timeoutMs / 1000)} seconds. ${fallback}.`);
+      return undefined;
+    }
+    let host: unknown;
+    if (result.exitCode === 0) {
+      try {
+        host = JSON.parse(result.stdout.trim());
+      } catch {
+        host = undefined;
+      }
+    }
+    if (typeof host !== 'string') {
+      const detail = result.stderr.trim() || `exit code ${result.exitCode}`;
+      logger.warn(`The endpoint of ${context} could not be read (${detail}). ${fallback}.`);
+      return undefined;
+    }
+    logger.info(`Endpoint of ${context}: ${host || '(empty)'}`);
+    return host;
+  } catch (error) {
+    logger.warn(`The endpoint of ${context} could not be read (${errorMessage(error)}). ${fallback}.`);
+    return undefined;
+  }
 }
 
 // Variables that would break the tools in the helper (or point them to the computer) if a caller passed them with the
@@ -362,11 +435,27 @@ export class WorkspaceHelper {
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
-  private readonly socketPath: string;
+  /** Source of the socket mount (helperDockerSocket), resolved once per instance. */
+  private socketPathPromise: Promise<string> | undefined;
 
   constructor(private readonly deps: HelperDeps) {
     this.clock = deps.clock ?? systemClock;
-    this.socketPath = helperDockerSocket(deps.env, deps.platform ?? process.platform);
+  }
+
+  /** helperDockerSocket, with the endpoint of the Docker context when it is needed; cached for the life of the helper. */
+  private dockerSocketPath(): Promise<string> {
+    if (!this.socketPathPromise) {
+      const { env, contextEndpoint } = this.deps;
+      const platform = this.deps.platform ?? process.platform;
+      this.socketPathPromise = (async () => {
+        const endpoint =
+          contextEndpoint && needsDockerContextEndpoint(env, platform) ? await contextEndpoint().catch(() => undefined) : undefined;
+        const socketPath = helperDockerSocket(env, platform, endpoint);
+        this.deps.logger.info(`Docker socket of the workspace helper: ${socketPath}`);
+        return socketPath;
+      })();
+    }
+    return this.socketPathPromise;
   }
 
   /**
@@ -1032,7 +1121,7 @@ export class WorkspaceHelper {
     const args = helperRunArgs({
       tag,
       volumeName,
-      socketPath: this.socketPath,
+      socketPath: options.docker !== false ? await this.dockerSocketPath() : DOCKER_SOCKET,
       containerName,
       env,
       secrets: options.secrets === true,
