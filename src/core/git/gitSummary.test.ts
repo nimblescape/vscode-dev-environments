@@ -23,6 +23,7 @@ import {
   servicePathArguments,
   servicePrunePatterns,
 } from './gitSummary';
+import { devMountFolders } from '../pipeline/pipelineRules';
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';
 
@@ -547,7 +548,8 @@ describe('review round 12 (P12-2): the ownership fix resolves the paths of the s
       fix(repo, [
         ...test([`${repo}/data`, `${repo}/app.conf`, `${repo}/store/pg`, `${repo}/lib/x`]),
         '-o',
-        ...test([`${repo}/storage/pg`, `${repo}/storage/app.conf`, `${repo}/storage/pg`]),
+        // Review round 13, D13-2: a real path is added once (before: storage/pg twice, for data and for store/pg).
+        ...test([`${repo}/storage/pg`, `${repo}/storage/app.conf`]),
       ]),
     );
   });
@@ -607,6 +609,98 @@ describe.skipIf(process.getuid?.() !== 0)('review round 12 (D12-2): the ownershi
     // Before (without the paths): 'nobody' too.
     for (const name of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
     expect(uidOf(path.join(repo, 'node_modules/.other'))).toBe(1234);
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 13 (D13-1, D13-3): the ownership fix with the mounts of the dev container, with real tools and bind mounts as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const VOLUME = 'acme-api-3f2a9c1e';
+
+  /** devMountFolders of `mounts` (targets below /workspaces/api), moved to `repo`. */
+  function devFolders(repo: string, mounts: Array<{ type: string; volume?: string; target: string }>): string[] {
+    return devMountFolders({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }, 'on').map((folder) => repo + folder.slice('/workspaces/api'.length));
+  }
+
+  /** Runs `body` with `source` bind-mounted at `target`; skips the test when the sandbox does not allow `mount --bind`. */
+  function withBind(skip: () => void, source: string, target: string, body: () => void): void {
+    fs.mkdirSync(target, { recursive: true });
+    if (spawnSync('mount', ['--bind', source, target], { stdio: 'ignore' }).status !== 0) {
+      skip();
+      return;
+    }
+    try {
+      body();
+    } finally {
+      spawnSync('umount', [target], { stdio: 'ignore' });
+    }
+  }
+
+  function fixAll(repo: string, folders: string[], loop = false): void {
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', folders);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    if (!loop) {
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      return;
+    }
+    // find reports the loop of an ancestor mounted below itself (and exits with 1), but goes on with the rest.
+    for (const line of result.stderr.split('\n').filter((text) => text !== '')) expect(line).toMatch(/^find: File system loop detected/);
+  }
+
+  it('leaves the files of db alone behind an alias of the workspace volume (./data:/workspaces/api/pgview)', ({ skip }) => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src', 'data/base']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'data/PG_VERSION', 'data/base/1']) fs.writeFileSync(path.join(repo, file), 'x');
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    withBind(skip, path.join(repo, 'data'), path.join(repo, 'pgview'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/pgview' },
+      ];
+      // Before: devMountFolders was empty, and `find -xdev` gave the files of db to nobody through pgview.
+      expect(devFolders(repo, mounts)).toEqual([`${repo}/pgview`]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts)]);
+      for (const name of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+      for (const name of ['.', 'src', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    });
+  });
+
+  it('fixes the repository in full under its canonical path when `..` is mounted below it', ({ skip }) => {
+    const base = tempDir();
+    const repo = path.join(base, 'api');
+    for (const folder of ['src', 'data']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'src/b.ts', 'data/PG_VERSION']) fs.writeFileSync(path.join(repo, file), 'x');
+    fs.chownSync(path.join(repo, 'src/b.ts'), 1234, 1234);
+    for (const file of ['data', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    withBind(skip, base, path.join(repo, 'parent'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/parent' },
+      ];
+      expect(devFolders(repo, mounts)).toEqual([`${repo}/parent`]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts)], true);
+      // The files of db stay theirs also through parent/api/data; the others get the user under their canonical path.
+      for (const name of ['data', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+      for (const name of ['.', 'src', 'src/a.ts', 'src/b.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    });
+  });
+
+  it('gives the image content of an anonymous volume the user, and leaves a named volume to its owners', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['node_modules/left-pad', '.cache']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['node_modules/left-pad/index.js', '.cache/entry']) fs.writeFileSync(path.join(repo, file), 'x');
+    // Copied up from the image as uid 1000 (the remote user has another uid).
+    for (const file of ['node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js', '.cache', '.cache/entry']) fs.chownSync(path.join(repo, file), 1000, 1000);
+    const folders = devFolders(repo, [
+      { type: 'volume', volume: 'd'.repeat(64), target: '/workspaces/api/node_modules' },
+      { type: 'volume', volume: 'api-cache', target: '/workspaces/api/.cache' },
+    ]);
+    expect(folders).toEqual([`${repo}/.cache`]);
+    fixAll(repo, folders);
+    // Before (review round 12): uid 1000 kept, and `npm install` as the remote user failed with EACCES.
+    for (const name of ['node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    for (const name of ['.cache', '.cache/entry']) expect(uidOf(path.join(repo, name)), name).toBe(1000);
   });
 });
 

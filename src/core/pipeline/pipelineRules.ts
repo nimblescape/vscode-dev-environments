@@ -10,7 +10,7 @@ import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';
 import { composeMountVolumeName } from '../helper/compose';
-import { runArgsUser } from '../helper/hostAccess';
+import { isAnonymousVolumeName, runArgsUser } from '../helper/hostAccess';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessChecks } from '../hostAccessChecks';
 import {
@@ -459,20 +459,36 @@ export function liveServiceFolders(
 
 /**
  * Review round 12 (D12-2): the paths of the repository at which the dev container `container` mounts something else than
- * the workspace volume (a named volume, such as a `node_modules` volume or one that another service shares, an anonymous
- * volume, a tmpfs, or a bind mount; of the Docker Compose model, of the `mounts` of devcontainer.json, or of runArgs), as
- * `docker inspect` reads them (ContainerInfo.mountTargets). `find -xdev` stays only out of other file systems, and a
- * local named volume lies on the file system of the workspace volume: the ownership fix in the dev container leaves
- * these paths to their owners (only the files of root change: the folder of a new volume that Docker created as root
- * still gets the remote user). Only paths below the repository folder (serviceFolderPaths filters them).
+ * the workspace volume (a named volume, such as a `node_modules` volume or one that another service shares, a tmpfs, or
+ * a bind mount; of the Docker Compose model, of the `mounts` of devcontainer.json, or of runArgs), as `docker inspect`
+ * reads them (ContainerInfo.mountTargets). `find -xdev` stays only out of other file systems, and a local named volume
+ * lies on the file system of the workspace volume: the ownership fix in the dev container leaves these paths to their
+ * owners (only the files of root change: the folder of a new volume that Docker created as root still gets the remote
+ * user). Only paths below the repository folder (serviceFolderPaths filters them, and so the repository folder itself).
+ * Review round 13 (D13-1): a mount of the workspace volume (whole, or a subpath of it) below the repository folder is
+ * protected too: it is an alias of files of the volume (for example `./data:/workspaces/api/pgview` of the dev service,
+ * rewritten to a subpath of the workspace volume, with db mounting `./data`, or `..` mounted below the repository), which
+ * `find -xdev` walks. Only the mount at WORKSPACES_ROOT is left out. The same files are still fixed in full under their
+ * canonical path (unless that path is protected itself).
+ * Review round 13 (D13-3): an anonymous volume of the dev container (a mount of Type volume whose name is 64 hexadecimal
+ * characters, isAnonymousVolumeName) is not protected when the host access checks are on: it is always the dev
+ * container's own (fresh per container, or inherited by Docker Compose from the previous dev container), because the
+ * policy refuses a configuration that names such a volume; so its content (for example a `node_modules` that the image
+ * populated as uid 1000) gets the remote user in full. With the checks off, a configuration may mount the anonymous
+ * volume of another container by its name, so it stays protected. Named volumes and bind mounts stay protected, since
+ * they can be shared with another container or environment; a tmpfs needs nothing (`-xdev` does not go into it).
  */
 export function devMountFolders(
   container: Pick<ContainerInfo, 'mountTargets'> | undefined,
   env: Pick<Environment, 'repository' | 'volumeName'>,
+  hostAccessChecks: HostAccessChecks,
 ): string[] {
   const targets = (container?.mountTargets ?? [])
-    .filter((mount) => !(mount.type === 'volume' && mount.volume === env.volumeName) && mount.target.startsWith('/'))
-    .map((mount) => path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1'));
+    .filter((mount) => mount.target.startsWith('/'))
+    .map((mount) => ({ ...mount, target: path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') }))
+    .filter((mount) => !(mount.type === 'volume' && mount.volume === env.volumeName && mount.target === WORKSPACES_ROOT))
+    .filter((mount) => !(hostAccessChecks === 'on' && mount.type === 'volume' && mount.volume !== undefined && isAnonymousVolumeName(mount.volume)))
+    .map((mount) => mount.target);
   return serviceFolderPaths(repositoryFolder(env.repository), targets);
 }
 

@@ -1380,6 +1380,15 @@ export function mountedVolumeNames(input: HostAccessInput): string[] {
 const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
 
 /**
+ * Review round 13 (D13-3): whether `name` is Docker's name of an anonymous volume (64 hexadecimal characters). The host
+ * access policy refuses a configuration that names such a volume (foreignVolumeName: "another container"), so with the
+ * checks on, a volume mount of the dev container with such a name is an anonymous volume of the dev container itself.
+ */
+export function isAnonymousVolumeName(name: string): boolean {
+  return ANONYMOUS_VOLUME_NAME.test(name);
+}
+
+/**
  * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
  * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume

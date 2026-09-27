@@ -2175,8 +2175,51 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     expect(error.message).toContain('service web: image redis:-1 (not a valid image reference)');
     // Before: inspected with the other references, then one by one.
     expect(h.docker.imageInspections.flat()).not.toContain('foo/Bar');
-    expect(h.docker.imageInspections).toEqual([[BASE_IMAGE, DB_IMAGE]]);
+    // Review round 13, P13-1: the configuration is refused for them anyway, so the other references are not inspected
+    // either (before: [[BASE_IMAGE, DB_IMAGE]]).
+    expect(h.docker.imageInspections).toEqual([]);
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a reference that is not valid in Docker\'s grammar also when Docker cannot answer for the others (review round 13, P13-1)', async () => {
+    await seedCompose();
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: 'foo/Bar' };
+      }),
+    );
+    h.docker.transientImages = 'all';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    // Before: AnalysisFailedError of Docker (the invalid reference dropped), and the existing environment started.
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service cache: image foo/Bar (not a valid image reference)');
+    expect(error.message).not.toContain('Docker could not check');
+    expect(h.ui.warnings).toEqual([]);
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()?.state).toBe('stopped');
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    // The configuration is refused anyway: no inspect.
+    expect(h.docker.imageInspections).toEqual([]);
+  });
+
+  it('refuses, and remembers, an update with a reference that Docker calls invalid also when another one is transient (review round 13, P13-1)', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
+    // The load answers; the check before the `up` of the new image gets `invalid` for the base image (for example an
+    // image ID prefix of several images) and then `transient` for db (the daemon stopped answering).
+    failInspection(2, () => {
+      h.docker.uninspectableImages.add(BASE_IMAGE);
+      h.docker.transientImages = new Set([DB_IMAGE]);
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.imageInspections.at(-1)).toEqual([BASE_IMAGE, DB_IMAGE]);
+    const items = `service app: image ${BASE_IMAGE} (the image reference could not be checked)`;
+    // Before: AnalysisFailedError of Docker for db, and the refusal for the base image was neither shown nor remembered.
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toMatchObject({ configHash: HASH, items });
+    expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(devContainer()?.state).toBe('running');
   });
 
   it('passes the cancellation to the inspect (G2)', async () => {
@@ -2413,5 +2456,43 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     };
     await h.service.open(TARGET, options());
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, 'repository')]]);
+  });
+  it('protects an alias of the workspace volume below the repository that the dev service mounts (review round 13, D13-1)', async () => {
+    // ./data:/workspaces/api/pgview in the dev service, ./data:/var/lib/postgresql/data in db.
+    const DATA = `${FOLDER}/data`;
+    const PGVIEW = `${FOLDER}/pgview`;
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: DATA, target: '/var/lib/postgresql/data', bind: {} }];
+      m.services.app.volumes = [...(m.services.app.volumes as unknown[]), { type: 'bind', source: DATA, target: PGVIEW, bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [DATA]: DATA };
+    useCompose(h, out);
+    await h.service.open(TARGET, options());
+    const upApp = upModel().services.app.volumes as Array<{ type: string; source?: string; target: string }>;
+    // The pipeline rewrote the bind to the workspace volume (a subpath of it).
+    expect(upApp.find((entry) => entry.target === PGVIEW)).toMatchObject({ type: 'volume', source: WORKSPACE_VOLUME_KEY });
+    // Before: [DATA] alone, and `find -xdev` gave the files of db (uid 999) to vscode through pgview.
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [DATA, PGVIEW])]]);
+    // Not recorded: it matters only in the dev container.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
+  });
+
+  it('gives an anonymous volume of the dev container the full fix, and keeps a named volume protected (review round 13, D13-3)', async () => {
+    // An anonymous `node_modules` volume (Docker names it with 64 hexadecimal characters), whose image content is of uid
+    // 1000, and a named cache volume.
+    h.helper.containerMounts = [
+      { type: 'volume', volume: 'c'.repeat(64), target: `${FOLDER}/node_modules` },
+      { type: 'volume', volume: 'api-cache', target: `${FOLDER}/.cache` },
+    ];
+    await h.service.open(TARGET, options());
+    // Before (review round 12): node_modules protected too (only the files of root changed).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.cache`])]]);
+  });
+
+  it('keeps an anonymous volume protected when the host access checks are off (review round 13, D13-3)', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    h.helper.containerMounts = [{ type: 'volume', volume: 'c'.repeat(64), target: `${FOLDER}/node_modules` }];
+    await h.service.open(TARGET, options());
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`])]]);
   });
 });

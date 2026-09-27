@@ -541,9 +541,48 @@ describe('devMountFolders (review round 12, D12-2)', () => {
           ],
         },
         env,
+        'on',
       ),
-    ).toEqual(['/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp']);
-    expect(devMountFolders(undefined, env)).toEqual([]);
-    expect(devMountFolders({}, env)).toEqual([]);
+      // Review round 13, D13-1: the subpath mount of the workspace volume at /workspaces/api/src is protected too (an
+      // alias of files of the volume, which `find -xdev` walks); before: left out like the mount at /workspaces.
+    ).toEqual(['/workspaces/api/src', '/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp']);
+    expect(devMountFolders(undefined, env, 'on')).toEqual([]);
+    expect(devMountFolders({}, env, 'on')).toEqual([]);
+  });
+
+  it('protects the alias mounts of the workspace volume below the repository, only not the mount at /workspaces (review round 13, D13-1)', () => {
+    const mounts = (targets: string[]) => ({
+      mountTargets: [
+        { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+        ...targets.map((target) => ({ type: 'volume', volume: 'acme-api-3f2a9c1e', target })),
+      ],
+    });
+    // ./data:/workspaces/api/pgview of the dev service, rewritten to a subpath of the workspace volume (db mounts ./data).
+    expect(devMountFolders(mounts(['/workspaces/api/pgview']), env, 'on')).toEqual(['/workspaces/api/pgview']);
+    // `..` (the subpath `` or `api/..`) mounted below the repository; the repository folder itself is not protected.
+    expect(devMountFolders(mounts(['/workspaces/api/parent/', '/workspaces/api', '/workspaces/api/']), env, 'on')).toEqual(['/workspaces/api/parent']);
+    expect(devMountFolders(mounts(['/workspaces/', '/workspaces/other']), env, 'on')).toEqual([]);
+  });
+
+  it('gives an anonymous volume of the dev container the full fix, and keeps named volumes and binds protected (review round 13, D13-3)', () => {
+    const anonymous = 'a'.repeat(64);
+    const container = {
+      mountTargets: [
+        { type: 'volume', volume: anonymous, target: '/workspaces/api/node_modules' },
+        { type: 'volume', volume: 'api-cache', target: '/workspaces/api/.cache' },
+        { type: 'volume', volume: `${'b'.repeat(63)}g`, target: '/workspaces/api/x' },
+        { type: 'bind', target: '/workspaces/api/host' },
+        { type: 'bind', volume: anonymous, target: '/workspaces/api/odd' },
+      ],
+    };
+    expect(devMountFolders(container, env, 'on')).toEqual(['/workspaces/api/.cache', '/workspaces/api/x', '/workspaces/api/host', '/workspaces/api/odd']);
+    // With the checks off, a configuration may name the anonymous volume of another container: it stays protected.
+    expect(devMountFolders(container, env, 'off')).toEqual([
+      '/workspaces/api/node_modules',
+      '/workspaces/api/.cache',
+      '/workspaces/api/x',
+      '/workspaces/api/host',
+      '/workspaces/api/odd',
+    ]);
   });
 });

@@ -1738,6 +1738,9 @@ export class EnvironmentService {
    * configuration (remembered when it refuses an update); when Docker could not answer (`transient`: a timeout, a daemon
    * that cannot be reached, an unknown error), the check failed: AnalysisFailedError of kind `internal` (P9-1: still no
    * new or changed configuration is used, an existing environment starts, and a refused update is not remembered).
+   * Review round 13 (P13-1): a failure of Docker never hides a definitive refusal: grammar-invalid references are returned
+   * before any inspect, and the items of `invalid` answers (and image IDs) are returned also when other references are
+   * transient (which are logged, never turned into items); AnalysisFailedError only when there is no definitive item.
    */
   private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
     const named: NamedImageReference[] = [];
@@ -1749,9 +1752,14 @@ export class EnvironmentService {
       if (isValidImageReference(entry.reference)) named.push(entry);
       else invalid.push(imageInvalidReferenceItem(entry.reference, entry.what));
     }
-    if (invalid.length > 0) this.logger.warn(`Image references that are not valid: ${invalid.join(', ')}.`);
+    // Review round 13 (P13-1): the configuration is refused for them anyway (like the isRefused short-circuit of the
+    // callers): no inspect, so that no failure of Docker for another reference hides the refusal.
+    if (invalid.length > 0) {
+      this.logger.warn(`Image references that are not valid: ${invalid.join(', ')}.`);
+      return invalid;
+    }
     const distinct = [...new Set(named.map((entry) => entry.reference))];
-    if (distinct.length === 0) return invalid;
+    if (distinct.length === 0) return [];
     // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
     if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
     this.throwIfCancelled(signal);
@@ -1769,21 +1777,26 @@ export class EnvironmentService {
     });
     this.throwIfCancelled(signal);
     const transient = unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference);
+    const byId = new Set(imageIdResolvedReferences(distinct, images));
+    // Review round 13 (P13-1): only a definitive answer (`invalid`) becomes an item; a transient one never does.
+    const notChecked = new Set(unchecked.filter((entry) => entry.reason === 'invalid').map((entry) => entry.reference));
+    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
+    const items = named.flatMap((entry) => [
+      ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
+      ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
+    ]);
     if (transient.length > 0) {
       const shown = transient.slice(0, 5).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
+      // Review round 13 (P13-1): a definitive refusal is not hidden by a failure of Docker for another reference: the
+      // configuration is refused for it anyway (and an update refused for it is remembered); the failure is logged.
+      if (items.length > 0) {
+        this.logger.warn(`Docker could not check the image references ${shown}; the configuration is refused for the others.`);
+        return items;
+      }
       // Review round 12 (P12-1): a text of its own (dockerCheckItem), not the one of an analysis that could not run.
       throw new AnalysisFailedError({ kind: 'internal', docker: true, reason: shown });
     }
-    const byId = new Set(imageIdResolvedReferences(distinct, images));
-    const notChecked = new Set(unchecked.map((entry) => entry.reference));
-    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
-    return [
-      ...invalid,
-      ...named.flatMap((entry) => [
-        ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
-        ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
-      ]),
-    ];
+    return items;
   }
 
   /** What composeBuildModel and composeUpModel need to know about the environment. */
@@ -3463,13 +3476,14 @@ export class EnvironmentService {
    * else than the workspace volume (devMountFolders, from `docker inspect` of the dev container: this covers the model of
    * Docker Compose, the `mounts` of devcontainer.json, and runArgs, for a single container too). They are not recorded:
    * they matter only in the dev container, where they are mounted. When the dev container cannot be read, the whole
-   * repository (only the files of root change).
+   * repository (only the files of root change). Review round 13 (D13-1, D13-3): also the mounts of the workspace volume
+   * below the repository, but not the anonymous volumes of the dev container while the host access checks are on.
    */
   private async withDevMountFolders(ctx: PipelineContext, containerName: string, serviceFolders: ServiceFolders | undefined): Promise<ServiceFolders | undefined> {
     if (serviceFolders === 'repository') return serviceFolders;
     let mounts: string[];
     try {
-      mounts = devMountFolders(await this.deps.docker.findContainer(ctx.env.id, containerName), ctx.env);
+      mounts = devMountFolders(await this.deps.docker.findContainer(ctx.env.id, containerName), ctx.env, ctx.hostAccessChecks);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);

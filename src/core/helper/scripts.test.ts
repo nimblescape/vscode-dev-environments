@@ -38,6 +38,7 @@ import {
   upCommand,
   writeAndRunCommand,
 } from './scripts';
+import { MAX_SERVICE_REAL_PATHS } from '../git/gitSummary';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 import { parseComposeModelOutput } from './compose';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
@@ -710,7 +711,10 @@ describe('LIST_CONFIGS_SCRIPT', () => {
 describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
   // The script needs Linux (a tmpfs in /proc/mounts, GNU stat). Fake tools on PATH stand in for them and for Git, and
   // record what the script does.
-  function runSwitch(git: { fetchExit: number; switchExit: number }, serviceFolders?: (repo: string) => string[]): {
+  function runSwitch(
+    git: { fetchExit: number; switchExit: number; switchScript?: (repo: string) => string },
+    serviceFolders?: (repo: string) => string[],
+  ): {
     status: number | null;
     stdout: string;
     stderr: string;
@@ -739,7 +743,7 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
         `echo "git $1 token=$token" >> '${log}'`,
         'case "$1" in',
         `  fetch) [ ${git.fetchExit} -eq 0 ] || { echo 'fatal: unable to access the repository' >&2; exit ${git.fetchExit}; } ;;`,
-        `  switch) [ ${git.switchExit} -eq 0 ] || { echo 'error: Your local changes would be overwritten' >&2; exit ${git.switchExit}; } ;;`,
+        `  switch) [ ${git.switchExit} -eq 0 ] || { echo 'error: Your local changes would be overwritten' >&2; exit ${git.switchExit}; }; ${git.switchScript?.(repo) ?? ':'} ;;`,
         'esac',
       ].join('\n'),
     );
@@ -891,6 +895,124 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     // Before: 1000 (the data of Postgres was given to the owner of the repository at each Switch branch…).
     for (const file of ['storage/pg', 'storage/pg/base', 'storage/pg/base/1', 'storage/pg/PG_VERSION']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(999);
     for (const file of ['storage', 'storage/readme.md', 'data']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(1000);
+  });
+
+  it('protects the real path that a service path had before the switch too (review round 13, D13-2)', () => {
+    let repoFolder = '';
+    const result = runSwitch(
+      // Branch B has `data` as a folder: after the switch, data is no longer a link to storage/pg.
+      { fetchExit: 0, switchExit: 0, switchScript: (repo) => `rm '${repo}/data' && mkdir '${repo}/data'` },
+      (repo) => {
+        repoFolder = repo;
+        // Branch A: data -> storage/pg, which db mounts (the restored entry names only ./data).
+        fs.mkdirSync(path.join(repo, 'storage/pg'), { recursive: true });
+        fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+        return [`${repo}/data`];
+      },
+    );
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.lstatSync(path.join(repoFolder, 'data')).isDirectory()).toBe(true);
+    // Before: only `-path <repo>/data -o -path <repo>/data/*` (resolved after the switch, data was a folder), and the
+    // data of Postgres under storage/pg was given to the owner of the repository while db ran.
+    const inPaths = `-path ${repoFolder}/data -o -path ${repoFolder}/data/* -o -path ${repoFolder}/storage/pg -o -path ${repoFolder}/storage/pg/*`;
+    expect(result.log).toContain(`find ${repoFolder} -xdev ( ( ${inPaths} ) -user 0 -o ! ( ${inPaths} ) ( ! -user 1000 -o ! -group 1000 ) ) -exec chown -h 1000:1000`);
+  });
+
+  it('adds a real path once when it is the same before and after the switch, and a new one after it (review round 13, D13-2)', () => {
+    let repoFolder = '';
+    const result = runSwitch(
+      // After the switch, cache -> storage/cache (before: a folder); data -> storage/pg on both branches.
+      { fetchExit: 0, switchExit: 0, switchScript: (repo) => `rmdir '${repo}/cache' && ln -s storage/cache '${repo}/cache'` },
+      (repo) => {
+        repoFolder = repo;
+        for (const folder of ['storage/pg', 'storage/cache', 'cache']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+        fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+        return [`${repo}/data`, `${repo}/cache`];
+      },
+    );
+    expect(result.status).toBe(0);
+    const inPaths = [
+      `-path ${repoFolder}/data -o -path ${repoFolder}/data/* -o -path ${repoFolder}/cache -o -path ${repoFolder}/cache/*`,
+      `-o -path ${repoFolder}/storage/pg -o -path ${repoFolder}/storage/pg/*`,
+      `-o -path ${repoFolder}/storage/cache -o -path ${repoFolder}/storage/cache/*`,
+    ].join(' ');
+    expect(result.log).toContain(`find ${repoFolder} -xdev ( ( ${inPaths} ) -user 0 -o ! ( ${inPaths} ) ( ! -user 1000 -o ! -group 1000 ) ) -exec chown -h 1000:1000`);
+  });
+
+  it('counts the real paths before and after the switch against one bound (review round 13, D13-2)', () => {
+    let repoFolder = '';
+    const half = MAX_SERVICE_REAL_PATHS / 2;
+    const result = runSwitch(
+      // Before the switch, half of the links lead to before/<i>; after it, all of them lead to after/<i>.
+      {
+        fetchExit: 0,
+        switchExit: 0,
+        switchScript: (repo) => `i=0; while [ $i -lt ${half + 1} ]; do rm '${repo}'/link-$i; ln -s after/$i '${repo}'/link-$i; i=$((i + 1)); done`,
+      },
+      (repo) => {
+        repoFolder = repo;
+        return Array.from({ length: half + 1 }, (_, i) => {
+          fs.mkdirSync(path.join(repo, `before/${i}`), { recursive: true });
+          fs.mkdirSync(path.join(repo, `after/${i}`), { recursive: true });
+          fs.symlinkSync(`before/${i}`, path.join(repo, `link-${i}`));
+          return `${repo}/link-${i}`;
+        });
+      },
+    );
+    expect(result.status).toBe(0);
+    // 2 * (half + 1) real paths: over the bound, only the files of root change.
+    expect(result.log).toContain(`find ${repoFolder} -xdev -user 0 -exec chown -h 1000:1000`);
+  });
+
+  it.skipIf(process.getuid?.() !== 0 || !hasGit)('leaves the data behind the link of the branch before the switch alone, with real git, find and chown (review round 13, D13-2)', () => {
+    const dir = tempDir();
+    const bin = path.join(dir, 'bin');
+    const secrets = path.join(dir, 'secrets');
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(secrets);
+    fs.mkdirSync(repo);
+    const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: '*' };
+    const g = (...args: string[]) => {
+      const result = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, encoding: 'utf8', env: gitEnv });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    // Branch b: data is a folder. Branch a: data -> storage/pg (storage is not tracked).
+    g('init', '-q', '-b', 'b');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'storage/\n');
+    fs.mkdirSync(path.join(repo, 'data'));
+    fs.writeFileSync(path.join(repo, 'data/readme.md'), 'b');
+    g('add', '.');
+    g('commit', '-q', '-m', 'b');
+    g('switch', '-q', '-c', 'a');
+    g('rm', '-q', '-r', 'data');
+    fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+    g('add', 'data');
+    g('commit', '-q', '-m', 'a');
+    fs.mkdirSync(path.join(repo, 'storage/pg/base'), { recursive: true });
+    for (const file of ['storage/pg/PG_VERSION', 'storage/pg/base/1']) fs.writeFileSync(path.join(repo, file), '16');
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    for (const file of ['storage/pg', 'storage/pg/base', 'storage/pg/base/1', 'storage/pg/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    const tool = (name: string, body: string) => {
+      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(bin, name), 0o755);
+    };
+    tool('awk', 'exit 0');
+    // The fetch is not run (no network); every other Git command is the real Git.
+    const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+    tool('git', `for arg do [ "$arg" = fetch ] && exit 0; done\nexec '${realGit}' "$@"`);
+    const script = SWITCH_BRANCH_SCRIPT.split(SECRETS_FOLDER).join(secrets);
+    const result = spawnSync('sh', ['-c', script, ...switchBranchCommand(repo, 'b', 'acme/api', [`${repo}/data`]).slice(3)], {
+      encoding: 'utf8',
+      input: 'gho_secret',
+      env: { ...gitEnv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.lstatSync(path.join(repo, 'data')).isDirectory()).toBe(true);
+    // Before: 1000 (resolved after the switch, data was the folder of branch b).
+    for (const file of ['storage/pg', 'storage/pg/base', 'storage/pg/base/1', 'storage/pg/PG_VERSION']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(999);
+    // What git switch wrote as root gets the owner of the repository.
+    for (const file of ['data', 'data/readme.md']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(1000);
   });
 
   it('restores the owner and does not switch when the fetch fails', () => {

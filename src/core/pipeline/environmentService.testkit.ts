@@ -312,8 +312,15 @@ export class FakeDocker implements EnvironmentDocker {
 
   async inspectImageNames(references: readonly string[]): Promise<ImageInspection> {
     this.imageInspections.push([...references]);
-    const transient = (reference: string) => this.transientImages === 'all' || this.transientImages.has(reference);
-    if (references.some(transient)) return { images: [], unchecked: references.map((reference) => ({ reference, reason: 'transient' })) };
+    if (this.transientImages === 'all') return { images: [], unchecked: references.map((reference) => ({ reference, reason: 'transient' })) };
+    // Review round 13 (P13-1): like ContainerAdapter.inspectImageNames one by one, the first transient reference and all
+    // after it are transient; the ones before it are answered.
+    const first = references.findIndex((reference) => (this.transientImages as Set<string>).has(reference));
+    if (first >= 0) {
+      const answered = await this.inspectImageNames(references.slice(0, first));
+      this.imageInspections.pop();
+      return { images: answered.images, unchecked: [...answered.unchecked, ...references.slice(first).map((reference) => ({ reference, reason: 'transient' as const }))] };
+    }
     const images = references
       .filter((reference) => this.images.has(reference) && !this.uninspectableImages.has(reference))
       .map((reference) => ({

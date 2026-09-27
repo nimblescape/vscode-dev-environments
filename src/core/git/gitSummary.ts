@@ -53,32 +53,30 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
 export const MAX_SERVICE_REAL_PATHS = 64;
 
 /**
- * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner> <find arguments…>` of the
- * ownership fixes: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each file that does
- * not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount (the test "in a path of
- * a service" of servicePathArguments, `"$@"`); in those, only to the files and folders of root (uid 0): the workspace
- * helper writes as root (a clone, the `git switch` of Switch branch…), while the data of a service (for example of
- * Postgres, uid 999) keeps its owner. A service that runs as root keeps its access to files of another owner (unless its
- * capabilities are dropped). Review round 11 (G5): the arguments come ready from servicePathArguments (built in linear
- * time), in place of the shell loop of round 9 that rebuilt `"$@"` for each pattern (quadratic: 5000 paths took 51 s).
- *
- * Review round 12 (P12-2): `find` does not follow links, so a path of a service behind a link of the repository (a mount
- * of `./data`, where `data -> storage/pg`) would not protect its data under the real path. So each path of the test (the
- * argument after `-path` that is not a `<path>/*` pattern) is resolved in the volume (`cd -P`, a builtin, for a folder;
- * `readlink -f` otherwise), and a real path that differs, lies in the folder (not the folder itself, not in `.git`), is
- * added to the test too: both paths are protected. The paths stay arguments (no shell text is built from them). A path
- * with a character that `-path` reads as a pattern (then written with `\`), a real path with one, or more than
- * MAX_SERVICE_REAL_PATHS real paths: the whole folder counts as a path of the services (only the files of root change).
+ * Review round 13 (D13-2): the state of SERVICE_REAL_PATHS, set once per script (never taken from the environment of
+ * the process): `whole` (non-empty: the whole folder counts as a path of the services), `added` (the real paths added so
+ * far, against MAX_SERVICE_REAL_PATHS), and `seen` (the real paths added so far, each between newlines).
  */
-export const SERVICE_OWNER_FIX = `service_owner_fix() {
-  folder="$1"
-  fix_uid="$2"
-  fix_gid="$3"
-  fix_owner="$4"
-  shift 4
-  whole=''
-  added=0
-  here=$PWD
+const SERVICE_REAL_PATHS_INIT = `whole=''
+added=0
+nl='
+'
+seen=$nl
+`;
+
+/**
+ * Review round 12 (P12-2), review round 13 (D13-2): the resolution of the paths of the services behind links, in the
+ * folder `$folder`, as shell code that works on the positional parameters (the arguments of find, servicePathArguments):
+ * each path after `-path` that is not a `<path>/*` pattern is resolved in the volume (`cd -P`, a builtin, for a folder;
+ * `readlink -f` otherwise), and a real path that differs, lies in the folder (not the folder itself, not in `.git`), and
+ * was not added before (`seen`) is appended as `-o -path <real> -o -path <real>/*`. A path with a character that `-path`
+ * reads as a pattern (then written with `\`), a real path with one or with a newline, or more than
+ * MAX_SERVICE_REAL_PATHS real paths in all: `whole`. It runs in service_owner_fix (at the time of the fix) and, in
+ * SWITCH_BRANCH_SCRIPT, also at the top level before `git fetch` and `git switch` (the real paths of the branch before
+ * the switch, which service_owner_fix gets as arguments and unites with its own). The paths stay arguments: no shell
+ * text is built from them.
+ */
+export const SERVICE_REAL_PATHS = `  here=$PWD
   previous=''
   for arg do
     if [ "$previous" = '-path' ]; then
@@ -97,14 +95,20 @@ export const SERVICE_OWNER_FIX = `service_owner_fix() {
               "$folder"/*)
                 case "/\${real#"$folder"/}/" in
                   */.git/*) ;;
-                  *[[\\\\*?]*) whole=1 ;;
+                  *[[\\\\*?]* | *"$nl"*) whole=1 ;;
                   *)
-                    if [ "$added" -ge ${MAX_SERVICE_REAL_PATHS} ]; then
-                      whole=1
-                    else
-                      set -- "$@" -o -path "$real" -o -path "$real/*"
-                      added=$((added + 1))
-                    fi
+                    case $seen in
+                      *"$nl$real$nl"*) ;;
+                      *)
+                        if [ "$added" -ge ${MAX_SERVICE_REAL_PATHS} ]; then
+                          whole=1
+                        else
+                          set -- "$@" -o -path "$real" -o -path "$real/*"
+                          added=$((added + 1))
+                          seen=$seen$real$nl
+                        fi
+                        ;;
+                    esac
                     ;;
                 esac
                 ;;
@@ -116,7 +120,33 @@ export const SERVICE_OWNER_FIX = `service_owner_fix() {
     previous=$arg
   done
   cd "$here" 2>/dev/null || :
-  if [ -n "$whole" ]; then
+`;
+
+/**
+ * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner> <find arguments…>` of the
+ * ownership fixes: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each file that does
+ * not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount (the test "in a path of
+ * a service" of servicePathArguments, `"$@"`); in those, only to the files and folders of root (uid 0): the workspace
+ * helper writes as root (a clone, the `git switch` of Switch branch…), while the data of a service (for example of
+ * Postgres, uid 999) keeps its owner. A service that runs as root keeps its access to files of another owner (unless its
+ * capabilities are dropped). Review round 11 (G5): the arguments come ready from servicePathArguments (built in linear
+ * time), in place of the shell loop of round 9 that rebuilt `"$@"` for each pattern (quadratic: 5000 paths took 51 s).
+ *
+ * Review round 12 (P12-2): `find` does not follow links, so a path of a service behind a link of the repository (a mount
+ * of `./data`, where `data -> storage/pg`) would not protect its data under the real path. So each path of the test (the
+ * argument after `-path` that is not a `<path>/*` pattern) is resolved in the volume (`cd -P`, a builtin, for a folder;
+ * `readlink -f` otherwise), and a real path that differs, lies in the folder (not the folder itself, not in `.git`), is
+ * added to the test too: both paths are protected. The paths stay arguments (no shell text is built from them). A path
+ * with a character that `-path` reads as a pattern (then written with `\`), a real path with one, or more than
+ * MAX_SERVICE_REAL_PATHS real paths: the whole folder counts as a path of the services (only the files of root change).
+ */
+export const SERVICE_OWNER_FIX = `${SERVICE_REAL_PATHS_INIT}service_owner_fix() {
+  folder="$1"
+  fix_uid="$2"
+  fix_gid="$3"
+  fix_owner="$4"
+  shift 4
+${SERVICE_REAL_PATHS}  if [ -n "$whole" ]; then
     find "$folder" -xdev -user 0 -exec chown -h "$fix_owner" {} +
   elif [ "$#" -gt 0 ]; then
     find "$folder" -xdev \\( \\( "$@" \\) -user 0 -o ! \\( "$@" \\) \\( ! -user "$fix_uid" -o ! -group "$fix_gid" \\) \\) -exec chown -h "$fix_owner" {} +

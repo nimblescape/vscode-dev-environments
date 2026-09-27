@@ -13,7 +13,7 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // The only copies in the volume are the token file of the dev container and the sign-in of the GitHub CLI there
 // (GIT_FILES_SCRIPT, both mode 0600); REMOVE_GIT_TOKEN_SCRIPT removes both.
-import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, servicePathArguments, type ServiceFolders } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, SERVICE_REAL_PATHS, servicePathArguments, type ServiceFolders } from '../git/gitSummary';
 import { CONFIG_FOLDER, GH_CONFIG_FOLDER, GH_HOSTS_FILE, GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
@@ -148,7 +148,11 @@ echo "The repository is in $target."
  * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find`
  * test of the paths that the other services of Docker Compose mount (servicePathArguments, review round 11), which the
  * restore of the owner leaves out with their content, except (review round 10, D10-3) their files and folders of root,
- * which `git switch` wrote (SERVICE_OWNER_FIX). Token on stdin.
+ * which `git switch` wrote (SERVICE_OWNER_FIX). Token on stdin. Review round 13 (D13-2): the real paths of the paths of
+ * the services behind links are resolved before `git fetch` and `git switch` too (SERVICE_REAL_PATHS, the same code as
+ * in service_owner_fix, which unites them with the real paths after the switch, against one bound): a link of the branch
+ * before the switch (for example `data -> storage/pg`, which db mounts) that the other branch replaces with a folder
+ * still protects the data behind it.
  * Fetches the branches of https://github.com/<owner>/<repository>.git into refs/remotes/origin (the same result as
  * `git fetch origin`, but independent of the remote in .git/config), removes the token, runs `git switch <branch>`
  * (a remote branch gets a local tracking branch), and gives files that the helper created as root the owner of the
@@ -169,7 +173,8 @@ fi
 cd "$dir"
 read_token
 owner=$(stat -c '%u:%g' "$dir")
-status=0
+folder=$dir
+${SERVICE_REAL_PATHS}status=0
 out=$(git_net fetch -- "https://github.com/$repo.git" '+refs/heads/*:refs/remotes/origin/*' 2>&1) || status=$?
 rm -f "$token_file"
 if [ "$status" -eq 0 ]; then
