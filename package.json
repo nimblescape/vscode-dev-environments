@@ -240,6 +240,11 @@
         "category": "Dev Environments"
       },
       {
+        "command": "devEnvironments.closeAndKeepRunning",
+        "title": "Close and Keep Running",
+        "category": "Dev Environments"
+      },
+      {
         "command": "devEnvironments.dockerSetup.install",
         "title": "Install Docker",
         "category": "Dev Environments"
@@ -322,6 +327,10 @@
         {
           "command": "devEnvironments.turnOnHostAccessChecks",
           "when": "false"
+        },
+        {
+          "command": "devEnvironments.closeAndKeepRunning",
+          "when": "devEnvironments.connected"
         }
       ],
       "view/title": [
@@ -408,6 +417,11 @@
           "group": "1_actions@5"
         },
         {
+          "command": "devEnvironments.closeAndKeepRunning",
+          "when": "view == devEnvironments.repositories && viewItem =~ /;canCloseAndKeepRunning(;|$)/",
+          "group": "1_actions@6"
+        },
+        {
           "command": "devEnvironments.switchBranch",
           "when": "view == devEnvironments.repositories && viewItem =~ /^repository/",
           "group": "2_more@1"
@@ -458,6 +472,11 @@
           "command": "devEnvironments.stopWhenClosed",
           "when": "viewItem =~ /;kept(;|$)/",
           "group": "1_more@5"
+        },
+        {
+          "command": "devEnvironments.closeAndKeepRunning",
+          "when": "viewItem =~ /;canCloseAndKeepRunning(;|$)/",
+          "group": "1_more@6"
         },
         {
           "command": "devEnvironments.switchBranch",
@@ -521,6 +540,13 @@
           "default": 30,
           "minimum": 0,
           "description": "Waiting time in seconds before a stop. It prevents a stop during a window reload."
+        },
+        "devEnvLauncher.remoteStopAfterMinutes": {
+          "type": "number",
+          "default": 10,
+          "minimum": 5,
+          "maximum": 1440,
+          "description": "Stops a container on a remote Docker host after this many minutes without contact from this computer, for example when it sleeps or is offline. Not for environments that keep running when closed."
         },
         "devEnvLauncher.updateImagesOnConnect": {
           "type": "boolean",

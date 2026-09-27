@@ -1011,3 +1011,349 @@ describe('the Docker host of a tick (review, D2)', () => {
     expect(h.logger.lines.filter((line) => line.includes('neither local nor SSH'))).toHaveLength(1);
   });
 });
+
+// Unit 7, PR 2: the heartbeats to the Session Monitor on a remote Docker host, and the shared engine.
+describe('heartbeats to the Session Monitor on a remote host', () => {
+  const SOURCE = '0123456789abcdef0123456789abcdef';
+  const OTHER_SOURCE = 'fedcba9876543210fedcba9876543210';
+  let h: Harness;
+  let target: DockerTarget;
+  /** The answer of the remote monitor container to `heartbeat` and `records`; the Git summary as before. */
+  let heartbeatResult: () => RunResult;
+  let recordsResult: () => RunResult;
+
+  type SentHeartbeat = { source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean; seq: number }> };
+  const sentHeartbeats = (): SentHeartbeat[] =>
+    h.docker.execCalls.filter((call) => call.command[2] === 'heartbeat').map((call) => JSON.parse(call.command[3]) as SentHeartbeat);
+  /** The heartbeats without the seq of their entries (checked on its own). */
+  const heartbeats = (): Array<{ source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean }> }> =>
+    sentHeartbeats().map((item) => ({ ...item, environments: item.environments.map(({ id, keepRunning }) => ({ id, keepRunning })) }));
+  const recordsCalls = (): ExecCall[] => h.docker.execCalls.filter((call) => call.command[2] === 'records');
+
+  beforeEach(() => {
+    h = createHarness();
+    target = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    heartbeatResult = () => ok('');
+    recordsResult = () => ok(JSON.stringify({ now: h.clock.time, records: [] }));
+    h.docker.execResult = () => {
+      const command = h.docker.execCalls[h.docker.execCalls.length - 1].command;
+      if (command[2] === 'heartbeat') return heartbeatResult();
+      if (command[2] === 'records') return recordsResult();
+      return ok(GIT_OUTPUT);
+    };
+    (h.docker as FakeDocker & MonitorDocker).withCurrentTarget = async (fn) => {
+      const current = target;
+      return runWithDockerTarget(current, () => fn(current));
+    };
+    h.loop = h.newLoop({ sourceId: SOURCE });
+  });
+
+  /** A: on build-box, used by the live window w1 (which writes its status file at each tick). */
+  async function inUseScenario(extra: Partial<Environment> = {}): Promise<() => Promise<void>> {
+    await h.registry.add(environment(ID_A, 'acme/api', { dockerHost: 'build-box', ...extra }));
+    await writeSettings(h, { remoteStopAfterSeconds: 900 });
+    h.docker.containers = [containerOf(environment(ID_A, 'acme/api'))];
+    return () => writeWindow(h, 'w1', ID_A);
+  }
+
+  it('sends a heartbeat for an environment in use at once, then every 30 seconds, with the limit of the settings', async () => {
+    const each = await inUseScenario();
+    await runUntil(h, T0 + 60_000, each);
+    const sent = heartbeats();
+    // At 0 s, 30 s (not at every tick of 5 s).
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toEqual({ source: SOURCE, limitSeconds: 900, environments: [{ id: ID_A, keepRunning: false }] });
+    // Review round 2 of PR #39 (L1): seq is the time of the tick (the registry was read after it).
+    expect(sentHeartbeats().map((item) => item.environments[0].seq)).toEqual([T0, T0 + 30_000]);
+    const call = h.docker.execCalls.find((item) => item.command[2] === 'heartbeat')!;
+    expect(call.container).toBe('devenv-session-monitor');
+    expect(call.command.slice(0, 2)).toEqual(['node', '/opt/devenv/monitor.js']);
+    expect(call.options.timeoutMs).toBe(20_000);
+    expect(call.options.user).toBeUndefined();
+  });
+
+  it('uses the default limit of 10 minutes when monitor.json has none', async () => {
+    const each = await inUseScenario();
+    await writeSettings(h);
+    await step(h);
+    await each();
+    await step(h);
+    expect(heartbeats()[0].limitSeconds).toBe(600);
+  });
+
+  it('sends at once when a keep flag changes, and when an environment comes into use', async () => {
+    const each = await inUseScenario();
+    await runUntil(h, T0 + 10_000, each);
+    expect(heartbeats()).toHaveLength(1);
+    await h.registry.updateEnvironment(ID_A, (entry) => {
+      entry.keepRunning = true;
+    });
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_A, keepRunning: true }]);
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await writeWindow(h, 'w2', ID_B, { pid: LIVE_PID_2 });
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments).toEqual([
+      { id: ID_A, keepRunning: true },
+      { id: ID_B, keepRunning: false },
+    ]);
+    expect(heartbeats()).toHaveLength(3);
+  });
+
+  it('reports a kept environment without a window as kept, and once without the flag when it is no longer kept', async () => {
+    await h.registry.add(environment(ID_A, 'acme/api', { dockerHost: 'build-box', keepRunning: true }));
+    await writeSettings(h);
+    // A window without an environment keeps the monitor running.
+    await writeWindow(h, 'w1', null);
+    const each = ownerWritesEvery15s(h, 'w1', LIVE_PID);
+    await runUntil(h, T0 + 10_000, each);
+    expect(heartbeats().map((item) => item.environments)).toEqual([[{ id: ID_A, keepRunning: true }]]);
+    await h.registry.updateEnvironment(ID_A, (entry) => {
+      delete entry.keepRunning;
+    });
+    await runUntil(h, T0 + 120_000, each);
+    // Once without the flag, then nothing: the environment is neither in use nor kept.
+    expect(heartbeats().map((item) => item.environments)).toEqual([[{ id: ID_A, keepRunning: true }], [{ id: ID_A, keepRunning: false }]]);
+  });
+
+  it('reports Close and Keep Running (keepRunningOnce) as kept, and never stops such an environment', async () => {
+    await closedWindowScenario(h, { dockerHost: 'build-box', keepRunningOnce: true });
+    const results = await runUntil(h, T0 + WAITING_MS + 4 * TICK_MS);
+    expect(results.flatMap((result) => result.stopped)).toEqual([]);
+    expect(h.docker.count('stop')).toBe(0);
+    expect(heartbeats()[0].environments).toEqual([{ id: ID_A, keepRunning: true }]);
+  });
+
+  it('sends the keep flag for every environment while stopOnClose is off', async () => {
+    const each = await inUseScenario();
+    await writeSettings(h, { stopOnClose: false });
+    await each();
+    await step(h);
+    expect(heartbeats()[0].environments).toEqual([{ id: ID_A, keepRunning: true }]);
+  });
+
+  it('logs a missing monitor container once, tries again at each tick, and says when it answers again', async () => {
+    const each = await inUseScenario();
+    heartbeatResult = () => ({ exitCode: 1, stdout: '', stderr: 'Error response from daemon: No such container: devenv-session-monitor', timedOut: false });
+    await runUntil(h, T0 + 4 * TICK_MS, each);
+    expect(heartbeats()).toHaveLength(4);
+    expect(h.logger.lines.filter((line) => line.includes('The Session Monitor on build-box is missing; it starts with the next open.'))).toHaveLength(1);
+    heartbeatResult = () => ok('');
+    await runUntil(h, T0 + 6 * TICK_MS, each);
+    expect(heartbeats()).toHaveLength(5);
+    expect(h.logger.lines.filter((line) => line.includes('The Session Monitor on build-box answers again.'))).toHaveLength(1);
+  });
+
+  it('logs another failure once with its reason', async () => {
+    const each = await inUseScenario();
+    heartbeatResult = () => ({ exitCode: 2, stdout: '', stderr: 'Invalid heartbeat.', timedOut: false });
+    await runUntil(h, T0 + 3 * TICK_MS, each);
+    expect(h.logger.lines.filter((line) => line.includes('A heartbeat to the Session Monitor on build-box failed'))).toHaveLength(1);
+  });
+
+  // Review round 1 of PR #39 (R3): the first heartbeat of a series is a full sync.
+  it('a new monitor process reports every environment of the host without the flag once, then only the used and kept ones', async () => {
+    const each = await inUseScenario();
+    // B was kept by an earlier process (its record on the host may still say keepRunning), and is neither used nor kept now.
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await runUntil(h, T0 + 60_000, each);
+    const sent = heartbeats().map((item) => item.environments);
+    expect(sent[0]).toEqual([
+      { id: ID_A, keepRunning: false },
+      { id: ID_B, keepRunning: false },
+    ]);
+    expect(sent.slice(1)).toEqual([[{ id: ID_A, keepRunning: false }]]);
+    // Review round 3 of PR #39 (N1): the entry of the full sync is clear-only; the one in use is a real heartbeat.
+    expect(sentHeartbeats()[0].environments.map((entry) => (entry as { clearOnly?: boolean }).clearOnly)).toEqual([undefined, true]);
+    // Another process: the full sync again.
+    h.loop = h.newLoop({ sourceId: SOURCE });
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments.map((item) => item.id)).toEqual([ID_A, ID_B]);
+  });
+
+  it('a clear-only entry of the full sync does not hold back the real heartbeat when the environment comes into use', async () => {
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await writeSettings(h);
+    await writeWindow(h, 'w0', null);
+    const each = ownerWritesEvery15s(h, 'w0', LIVE_PID);
+    await runUntil(h, T0 + 10_000, each);
+    expect(sentHeartbeats()).toHaveLength(1);
+    expect(sentHeartbeats()[0].environments).toEqual([{ id: ID_B, keepRunning: false, seq: T0, clearOnly: true }]);
+    // B comes into use: a real heartbeat at once (not only after 30 s).
+    await writeWindow(h, 'w2', ID_B, { pid: LIVE_PID_2 });
+    await step(h);
+    expect(sentHeartbeats()).toHaveLength(2);
+    expect(sentHeartbeats()[1].environments).toEqual([{ id: ID_B, keepRunning: false, seq: T0 + 10_000 }]);
+  });
+
+  it('sends the full sync also when no environment is in use, and then nothing; the monitor still ends', async () => {
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await writeSettings(h);
+    const results = await runUntil(h, T0 + 60_000);
+    expect(heartbeats().map((item) => item.environments)).toEqual([[{ id: ID_B, keepRunning: false }]]);
+    expect(results.at(-1)?.end).toBe('idle');
+  });
+
+  it('a switch to another host starts a new series with a full sync there', async () => {
+    const each = await inUseScenario();
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'other-box' }));
+    await runUntil(h, T0 + 10_000, each);
+    expect(heartbeats().map((item) => item.environments.map((entry) => entry.id))).toEqual([[ID_A]]);
+    target = dockerTargetOf('ssh://other-box', 'devenv-remote-22222222');
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_B, keepRunning: false }]);
+    // And back: a full sync on build-box again, at once (not only after 30 s).
+    target = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    await each();
+    await step(h);
+    expect(heartbeats()).toHaveLength(3);
+    expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_A, keepRunning: false }]);
+  });
+
+  // Review round 4 of PR #39 (P1): the heartbeats go on during long stop phases.
+  describe('between the stops of a tick', () => {
+    const ID_C = '8d2e3f40-0000-4000-8000-000000000003';
+
+    /** A in use in window w1; B and C on build-box, closed, their containers run. */
+    async function twoStops(): Promise<() => Promise<void>> {
+      await h.registry.add(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
+      await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+      await h.registry.add(environment(ID_C, 'acme/lib', { dockerHost: 'build-box' }));
+      await writeSettings(h);
+      h.docker.containers = [
+        containerOf(environment(ID_A, 'acme/api')),
+        containerOf(environment(ID_B, 'acme/web')),
+        containerOf(environment(ID_C, 'acme/lib')),
+      ];
+      return () => writeWindow(h, 'w1', ID_A);
+    }
+
+    const forA = () => sentHeartbeats().filter((item) => item.environments.some((entry) => entry.id === ID_A && !('clearOnly' in entry)));
+
+    it('sends a due heartbeat between two long stops, with a fresh seq', async () => {
+      const each = await twoStops();
+      // Each docker stop takes 35 s (the clock advances while it runs).
+      h.docker.stopHook = async () => h.clock.advance(35_000);
+      const results = await runUntil(h, T0 + WAITING_MS + 1, each);
+      expect(results.flatMap((result) => result.stopped).sort()).toEqual([ID_B, ID_C].sort());
+      // At the ticks of 0 s and 30 s, and once between the two stops (35 s after the one of 30 s).
+      expect(forA().map((item) => item.environments.find((entry) => entry.id === ID_A)?.seq)).toEqual([T0, T0 + 30_000, T0 + 65_000]);
+      // The second stop came after that heartbeat.
+      const order = h.docker.calls.filter((call) => call.startsWith('stop') || call.startsWith('exec devenv-session-monitor'));
+      expect(order.indexOf('stop id-devenv-acme-web-7c1d2e3f')).toBeLessThan(order.lastIndexOf('exec devenv-session-monitor'));
+    });
+
+    it('sends no extra heartbeat when the stops are quick', async () => {
+      const each = await twoStops();
+      await runUntil(h, T0 + WAITING_MS + 1, each);
+      expect(forA().map((item) => item.environments.find((entry) => entry.id === ID_A)?.seq)).toEqual([T0, T0 + 30_000]);
+    });
+
+    it('never between the stops on the local Docker', async () => {
+      target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+      await h.registry.add(environment(ID_A, 'acme/api'));
+      await h.registry.add(environment(ID_B, 'acme/web'));
+      await h.registry.add(environment(ID_C, 'acme/lib'));
+      await writeSettings(h);
+      h.docker.containers = [containerOf(environment(ID_A, 'acme/api')), containerOf(environment(ID_B, 'acme/web')), containerOf(environment(ID_C, 'acme/lib'))];
+      h.docker.stopHook = async () => h.clock.advance(35_000);
+      await runUntil(h, T0 + WAITING_MS + 1, () => writeWindow(h, 'w1', ID_A));
+      expect(sentHeartbeats()).toEqual([]);
+    });
+  });
+
+  it('never sends a heartbeat through the local Docker', async () => {
+    target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    await h.registry.add(environment(ID_A, 'acme/api', { keepRunning: true }));
+    await writeSettings(h);
+    await writeWindow(h, 'w1', ID_A);
+    await runUntil(h, T0 + 60_000, () => writeWindow(h, 'w1', ID_A));
+    expect(heartbeats()).toEqual([]);
+  });
+
+  it('sends nothing without the id of this computer', async () => {
+    h.loop = h.newLoop();
+    const each = await inUseScenario();
+    await runUntil(h, T0 + 60_000, each);
+    expect(heartbeats()).toEqual([]);
+  });
+
+  it('reports only the environments of the host of the tick', async () => {
+    const each = await inUseScenario();
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'other-box', keepRunning: true }));
+    await each();
+    await step(h);
+    expect(heartbeats()[0].environments.map((item) => item.id)).toEqual([ID_A]);
+  });
+
+  describe('shared engine', () => {
+    it('does not stop an environment that another computer used a moment ago, says so once, and asks again after 30 s', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () => ok(JSON.stringify({ now: 1_000_000, records: [{ source: OTHER_SOURCE, at: 1_000_000 - 10_000, keepRunning: false }] }));
+      await runUntil(h, T0 + WAITING_MS + 10 * TICK_MS);
+      expect(h.docker.count('stop')).toBe(0);
+      expect(h.logger.lines.filter((line) => line.includes('acme/api is in use or kept running by another computer. Its container is not stopped.'))).toHaveLength(1);
+      // Asked at the first stop, and again after OTHER_COMPUTER_RECHECK_MS (not at every tick).
+      expect(recordsCalls().length).toBeGreaterThanOrEqual(2);
+      expect(recordsCalls().length).toBeLessThanOrEqual(3);
+      expect(recordsCalls()[0].command[3]).toBe(ID_A);
+      // The other computer stopped sending: the environment stops.
+      recordsResult = () => ok(JSON.stringify({ now: 1_000_000, records: [{ source: OTHER_SOURCE, at: 1_000_000 - 91_000, keepRunning: false }] }));
+      const results = await runUntil(h, h.clock.time + 40_000);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    });
+
+    // Review round 1 of PR #39 (F2).
+    it('does not stop an environment that another computer keeps running, however old its record', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () => ok(JSON.stringify({ now: 1_000_000_000, records: [{ source: OTHER_SOURCE, at: 1_000, keepRunning: true }] }));
+      await runUntil(h, T0 + WAITING_MS + 10 * TICK_MS);
+      expect(h.docker.count('stop')).toBe(0);
+      expect(h.logger.lines.filter((line) => line.includes('kept running by another computer'))).toHaveLength(1);
+    });
+
+    // Review round 2 of PR #39 (M1): the newest record decides; an orphaned keep of another computer does not block.
+    it('stops an environment whose keep of another computer is older than the own newest record', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () =>
+        ok(
+          JSON.stringify({
+            now: 1_000_000_000,
+            records: [
+              { source: OTHER_SOURCE, at: 1_000, keepRunning: true },
+              { source: SOURCE, at: 1_000_000_000 - 200_000, keepRunning: false },
+            ],
+          }),
+        );
+      const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    });
+
+    it('stops as before when only its own record is fresh', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () => ok(JSON.stringify({ now: 1_000_000, records: [{ source: SOURCE, at: 1_000_000, keepRunning: false }] }));
+      const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    });
+
+    it('stops as before when the question fails', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () => ({ exitCode: 1, stdout: '', stderr: 'No such container: devenv-session-monitor', timedOut: false });
+      const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+      expect(recordsCalls()).toHaveLength(1);
+    });
+
+    it('never asks on the local Docker', async () => {
+      target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+      await closedWindowScenario(h);
+      const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+      expect(recordsCalls()).toEqual([]);
+    });
+  });
+});

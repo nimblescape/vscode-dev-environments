@@ -66,6 +66,8 @@ export class StoragePaths {
   readonly helperState: string;
   /** Remote Docker hosts (unit 7): the context before the switch, and the rootless sockets (RemoteDockerState). */
   readonly remoteDocker: string;
+  /** The random id of this installation for the heartbeats to the Session Monitor on a remote host (unit 7, PR 2). */
+  readonly computerId: string;
 
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
@@ -81,6 +83,7 @@ export class StoragePaths {
     this.monitorLog = path.join(root, 'monitor.log');
     this.helperState = path.join(root, 'helper.json');
     this.remoteDocker = path.join(root, 'remote-docker.json');
+    this.computerId = path.join(root, 'computer.id');
   }
 
   /**

@@ -275,6 +275,9 @@ export function isMonitorSettings(value: unknown): value is MonitorSettings {
     value.waitingTimeSeconds >= 0 &&
     typeof value.stopOnClose === 'boolean' &&
     typeof value.respectShutdownActionNone === 'boolean' &&
+    // Unit 7, PR 2: optional (a file of an older window has none).
+    (value.remoteStopAfterSeconds === undefined ||
+      (typeof value.remoteStopAfterSeconds === 'number' && Number.isFinite(value.remoteStopAfterSeconds) && value.remoteStopAfterSeconds > 0)) &&
     isTime(value.updatedAt)
   );
 }

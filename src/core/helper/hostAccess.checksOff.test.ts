@@ -145,6 +145,9 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['a volume with the labels of another environment', input(mount('source=data,target=/d'), { volumeLabels: { data: { 'devenv.environment-id': 'other', 'devenv.owner-id': '2002' } } }), 'volume data of another environment', 'protected'],
   ['-v with the volume of another environment', input(run('-v', 'devenv-acme-web-11111111:/w')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
   ['the cache volume of the workspace helper', input(mount('source=devenv-helper-cache,target=/c,type=volume')), 'volume devenv-helper-cache of the workspace helper', 'protected'],
+  // Review round 1 of PR #39 (R1): the heartbeat records of the Session Monitor on a remote Docker host.
+  ['the volume of the remote Session Monitor', input(mount('source=devenv-session-monitor,target=/s,type=volume')), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
+  ['-v with the volume of the remote Session Monitor', input(run('-v', 'devenv-session-monitor:/s')), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
   ['--env-file outside the workspace volume (a file of the workspace helper)', input(run('--env-file', '/devenv-cache/x')), '--env-file=/devenv-cache/x', 'protected'],
   ['volume-label (the labels that tell the volumes of the environments apart)', input(mount('type=volume,source=v,target=/x,volume-label=devenv.environment-id=x')), 'volume options of the mount v', 'protected'],
   ['volumeLabels in the object form', input(mount({ type: 'volume', source: 'v', target: '/x', volumeLabels: {} })), 'volume options of the mount v', 'protected'],

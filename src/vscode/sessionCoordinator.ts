@@ -26,7 +26,7 @@ import {
   requestMonitorExit,
   runningMonitor,
 } from '../monitor/lock';
-import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../monitor/rules';
+import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS, remoteStopAfterSeconds } from '../monitor/rules';
 
 /** Interval of the window status file updates (concept 7.9). */
 export const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -362,6 +362,8 @@ export class SessionCoordinator implements vscode.Disposable {
         typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_WAITING_TIME_SECONDS,
       stopOnClose: settings.stopOnClose !== false,
       respectShutdownActionNone: settings.respectShutdownActionNone === true,
+      // Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host.
+      remoteStopAfterSeconds: remoteStopAfterSeconds(settings.remoteStopAfterMinutes),
       updatedAt: isoTime(this.clock),
     };
   }

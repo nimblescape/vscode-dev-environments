@@ -16,6 +16,7 @@ import {
   composeProjectName,
 } from '../names';
 import { DEV_CONTAINERS_VOLUMES, hasDevContainersVolumeLabel, isDevContainersCloneVolumeName } from '../devContainers';
+import { REMOTE_MONITOR_VOLUME } from '../remoteMonitor/protocol';
 import { access, guarded, type HostAccessFinding, type Problem } from './report';
 
 export function volumeContext(input: VolumeInput): VolumeContext {
@@ -107,13 +108,15 @@ export function isAnonymousVolumeName(name: string): boolean {
 }
 
 /**
- * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
+ * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, the Session Monitor
+ * on a remote Docker host (its heartbeat records; review round 1 of PR #39, R1: a mount could forge or delete them), another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
  * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume
  * is an environment's own is decided by its labels (isOwnVolume).
  */
 export function foreignVolumeName(name: string): string | undefined {
   if (name === HELPER_CACHE_VOLUME) return 'the workspace helper';
+  if (name === REMOTE_MONITOR_VOLUME) return 'the Session Monitor';
   if (ENVIRONMENT_VOLUME_PATTERN.test(name)) return 'another environment';
   if (ANONYMOUS_VOLUME_NAME.test(name)) return 'another container';
   if (DEV_CONTAINERS_VOLUMES.includes(name)) return 'the Dev Containers extension';
@@ -189,14 +192,16 @@ function mayMountEnvironmentVolume(labels: Readonly<Record<string, string>>, vol
  */
 export function volumeNameProblems(name: string, volumes: VolumeContext): Problem[] {
   if (name === '' || name === volumes.own) return [];
-  // Account separation: the volumes of other environments and the cache volume of the workspace helper, which all
-  // environments share, stay refused with the host access checks off. The volumes of other programs (another container,
+  // Account separation: the volumes of other environments, the cache volume of the workspace helper, which all
+  // environments share, and the volume of the Session Monitor on a remote host (its heartbeat records decide the stop of
+  // every environment there; review round 1 of PR #39, R1) stay refused with the host access checks off. The volumes of other programs (another container,
   // the Dev Containers extension, Docker Compose) are access to the computer.
   if (volumes.foreign.has(name)) return [guarded(`volume ${name} of another environment`)];
   const byName = foreignVolumeName(name);
   if (byName !== undefined) {
     const item = `volume ${name} of ${byName}`;
-    return [name === HELPER_CACHE_VOLUME || ENVIRONMENT_VOLUME_PATTERN.test(name) ? guarded(item) : access(item)];
+    const protectedName = name === HELPER_CACHE_VOLUME || name === REMOTE_MONITOR_VOLUME || ENVIRONMENT_VOLUME_PATTERN.test(name);
+    return [protectedName ? guarded(item) : access(item)];
   }
   const labels = volumes.labels[name];
   // Not known to exist.

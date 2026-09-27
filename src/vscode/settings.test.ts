@@ -40,6 +40,8 @@ describe('settings (concept section 8)', () => {
       repositoryGroups: [],
       // Unit 14 (setting openInNewWindow, concept 6.2, 8): a new setting with the default false (Start uses this window).
       openInNewWindow: false,
+      // Unit 7, PR 2 (setting remoteStopAfterMinutes): a new setting with the default of 10 minutes.
+      remoteStopAfterMinutes: 10,
     });
   });
 
@@ -94,6 +96,25 @@ describe('settings (concept section 8)', () => {
     // A timer with a longer delay would fire every millisecond.
     expect(settings({ refreshIntervalMinutes: 1_000_000 }).refreshIntervalMinutes).toBe(MAX_REFRESH_INTERVAL_MINUTES);
     expect(MAX_REFRESH_INTERVAL_MINUTES * 60_000).toBeLessThanOrEqual(2 ** 31 - 1);
+  });
+
+  // Unit 7, PR 2: the time limit of a container on a remote Docker host without contact; review round 4 of PR #39 (P1):
+  // five minutes to one day.
+  it('clamps remoteStopAfterMinutes to 5..1440 and gives 10 for a value that is no number', () => {
+    const settings = (raw: Record<string, unknown>) => normalizeSettings((key) => raw[key]);
+    expect(settings({ remoteStopAfterMinutes: 0 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 1 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 4.9 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 5 }).remoteStopAfterMinutes).toBe(5);
+    expect(settings({ remoteStopAfterMinutes: 30 }).remoteStopAfterMinutes).toBe(30);
+    expect(settings({ remoteStopAfterMinutes: 100_000 }).remoteStopAfterMinutes).toBe(1440);
+    expect(settings({ remoteStopAfterMinutes: '5' }).remoteStopAfterMinutes).toBe(10);
+    expect(settings({ remoteStopAfterMinutes: Number.NaN }).remoteStopAfterMinutes).toBe(10);
+    // The same bounds in package.json.
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { minimum?: number; maximum?: number }> } };
+    };
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.remoteStopAfterMinutes`]).toMatchObject({ minimum: 5, maximum: 1440 });
   });
 
   it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {

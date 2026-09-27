@@ -25,7 +25,7 @@ import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
-import { Controller, type ControllerDeps } from './controller';
+import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
 import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
@@ -221,6 +221,7 @@ interface Harness {
     open: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
     openInNewWindow: ReturnType<typeof vi.fn<(containerName: string, folder: string) => Promise<void>>>;
     closeRemoteConnection: ReturnType<typeof vi.fn<() => Promise<void>>>;
+    closeWindow: ReturnType<typeof vi.fn<() => Promise<void>>>;
     isEmptyWindow: ReturnType<typeof vi.fn<() => boolean>>;
     currentContainerName: ReturnType<typeof vi.fn<() => string | undefined>>;
   };
@@ -267,6 +268,8 @@ function createHarness(
     /** Unit 7: the current Docker host and the remote Docker commands. Default: none (the local Docker). */
     dockerTargets?: ControllerDeps['dockerTargets'];
     remoteDocker?: ControllerDeps['remoteDocker'];
+    /** Unit 7, PR 2: the heartbeat of Close and Keep Running. */
+    remoteMonitor?: ControllerDeps['remoteMonitor'];
   } = {},
 ): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
@@ -310,6 +313,7 @@ function createHarness(
     open: vi.fn(async () => {}),
     openInNewWindow: vi.fn(async () => {}),
     closeRemoteConnection: vi.fn(async () => {}),
+    closeWindow: vi.fn(async () => {}),
     isEmptyWindow: vi.fn(() => false),
     currentContainerName: vi.fn(() => undefined),
   };
@@ -382,6 +386,7 @@ function createHarness(
     viewVisible: () => false,
     dockerTargets: options.dockerTargets,
     remoteDocker: options.remoteDocker,
+    remoteMonitor: options.remoteMonitor,
     clock,
     isAlive: (pid: number) => alive.has(pid),
     timing: {
@@ -568,7 +573,8 @@ describe('Controller commands', () => {
     // 26 since the Docker setup walkthrough was removed (user decision 2026-09-27): no Install Docker… command.
     // 27 with Show Docker Setup (hidden), the action Install Docker… of an error: it looks for the CLI, then shows the view.
     // 29 since unit 7: Use a Remote Docker Host… and Use the Local Docker.
-    expect(declared).toHaveLength(29);
+    // 30 since unit 7, PR 2: Close and Keep Running.
+    expect(declared).toHaveLength(30);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -3229,5 +3235,142 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote');
     await run('stop', row('acme/api', environment()));
     expect(operations.map((target) => target.host)).toEqual(['', 'build-box']);
+  });
+});
+
+// Unit 7, PR 2: Close and Keep Running closes the window; the container keeps running this time.
+describe('Close and Keep Running (unit 7, PR 2)', () => {
+  const REMOTE_TARGET = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+  let current: DockerTarget;
+  let sendKeepRunning: ReturnType<typeof vi.fn<(environmentId: string, seq: number) => Promise<{ ok: true } | { ok: false; detail: string }>>>;
+  const order: string[] = [];
+
+  function remoteHarness(options: { leaveCheckMs?: number } = {}): void {
+    current = REMOTE_TARGET;
+    order.length = 0;
+    sendKeepRunning = vi.fn(async (id: string, _seq: number) => {
+      order.push(`heartbeat ${id}`);
+      return { ok: true as const };
+    });
+    const dockerTargets = {
+      resolve: vi.fn(async () => current),
+      current: vi.fn(async () => current),
+      withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => fn()),
+    };
+    recreateHarness({
+      dockerTargets: dockerTargets as unknown as ControllerDeps['dockerTargets'],
+      remoteMonitor: { sendKeepRunning },
+      leaveCheckMs: options.leaveCheckMs,
+    });
+    h.connection.closeWindow.mockImplementation(async () => {
+      order.push('close');
+    });
+  }
+
+  it('says so in a window without an environment, and changes nothing', async () => {
+    await h.registry.add(environment());
+    await run('closeAndKeepRunning');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.closeAndKeepRunningNotConnected);
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+  });
+
+  it('local environment: sets the flag and closes the window, without a heartbeat', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning');
+    expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
+    expect(h.connection.closeWindow).toHaveBeenCalledTimes(1);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    // The row argument of the context menu does not matter: the command acts on the environment of this window.
+    expect(h.service.stop).not.toHaveBeenCalled();
+  });
+
+  it('remote environment: sends one heartbeat with the keep flag first, then closes the window', async () => {
+    remoteHarness();
+    const env = environment({ dockerHost: 'build-box' });
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning', row('acme/api', env));
+    // Review round 2 of PR #39 (L1): seq is the time right after the flag was set.
+    expect(sendKeepRunning).toHaveBeenCalledWith(ENV_ID, NOW);
+    expect(order).toEqual([`heartbeat ${ENV_ID}`, 'close']);
+    expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
+  });
+
+  it('remote environment: when the host cannot be reached, clears the flag, says so, and the window stays open', async () => {
+    remoteHarness();
+    h.settings.remoteStopAfterMinutes = 15;
+    sendKeepRunning.mockResolvedValue({ ok: false, detail: 'ssh: connect to host build-box port 22: Connection timed out' });
+    const env = environment({ dockerHost: 'build-box' });
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning');
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(
+      'The Docker host build-box cannot be reached. The container would stop after 15 minutes without contact. The window stays open.',
+    );
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Connection timed out'));
+  });
+
+  it('remote environment while Docker is set to another host: refused, nothing changed', async () => {
+    remoteHarness();
+    const env = environment({ dockerHost: 'build-box' });
+    await h.registry.add(env);
+    await connectHere(env);
+    current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    await run('closeAndKeepRunning');
+    expect(warningMessages()).toContain(Messages.otherDockerHost('acme/api', 'build-box', ''));
+    expect(sendKeepRunning).not.toHaveBeenCalled();
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+  });
+
+  // Review round 1 of PR #39 (F1): closeWindow resolves when the close starts, not after the dialog about unsaved files.
+  it('keeps the flag when the window stays open (Cancel in the dialog about unsaved files), until the next connect', async () => {
+    recreateHarness({ leaveCheckMs: 10 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning');
+    await pause(50);
+    expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
+    expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('stayed open'));
+  });
+
+  it('a window that connects to the environment again clears the flag', async () => {
+    const env = environment({ keepRunningOnce: true, keepRunning: true });
+    await h.registry.add(env);
+    await connectHere(env);
+    const stored = await h.registry.get(ENV_ID);
+    expect(stored).not.toHaveProperty('keepRunningOnce');
+    expect(stored?.keepRunning).toBe(true);
+  });
+
+  it('sets the context key of a connected window when it connects', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', CONNECTED_CONTEXT_KEY, true);
+  });
+
+  it('is offered in the Command Palette only in a connected window, and in the menus of the row of this window', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        commands: Array<{ command: string; title: string }>;
+        menus: Record<string, Array<{ command?: string; when?: string }>>;
+      };
+    };
+    expect(manifest.contributes.commands.find((entry) => entry.command === Commands.closeAndKeepRunning)?.title).toBe('Close and Keep Running');
+    const when = (menu: string) => manifest.contributes.menus[menu].filter((item) => item.command === Commands.closeAndKeepRunning).map((item) => item.when);
+    expect(when('commandPalette')).toEqual([CONNECTED_CONTEXT_KEY]);
+    const clause = when('devEnvironments.more')[0]!;
+    expect(when('view/item/context')).toEqual([`view == devEnvironments.repositories && ${clause}`]);
+    const matches = (value: string) => new RegExp(clause.match(/viewItem =~ \/(.*)\/$/)![1]).test(value);
+    expect(matches(treeContextValue(rowActions('connected', undefined), 'on', false, true))).toBe(true);
+    expect(matches(treeContextValue(rowActions('connected', undefined), 'on', true, true))).toBe(true);
+    expect(matches(treeContextValue(rowActions('running', undefined), 'on', false))).toBe(false);
   });
 });

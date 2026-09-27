@@ -35,6 +35,7 @@ import type {
   WindowStatus,
 } from '../core/types';
 import { isProcessAlive } from '../monitor/lock';
+import { remoteStopAfterSeconds } from '../monitor/rules';
 import { decideReopen, pipelineJustRan, sortPendingOperations } from './activationRules';
 import type { VsCodeGitHubAuth } from './auth';
 import { Commands, type CommandName } from './commands';
@@ -91,6 +92,10 @@ const TOKEN_REMOVAL_TIMEOUT_MS = 30_000;
 const REOPEN_CHECK_DELAY_MS = 3_000;
 /** A Delete that waits for the operation of another window reads the registry this often (concept 7.15). */
 const BUSY_POLL_MS = 1_000;
+/**
+ * Unit 7, PR 2: set while this window is connected to an environment (Close and Keep Running in the Command Palette).
+ */
+export const CONNECTED_CONTEXT_KEY = 'devEnvironments.connected';
 
 /** The busy mark that a hand-off sets (concept 7.14 step 1): a stop needs none, it does not change the container. */
 const HAND_OFF_BUSY: Record<PendingOperationKind, BusyOperation | undefined> = {
@@ -130,6 +135,18 @@ export interface ControllerDeps {
   dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation'>;
   /** Unit 7: "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'offerSwitchBack'>;
+  /**
+   * Unit 7, PR 2: one heartbeat with the keep-running flag for an environment to the Session Monitor on the remote
+   * Docker host of the current context (Close and Keep Running). Without it, Close and Keep Running refuses a remote
+   * environment.
+   */
+  remoteMonitor?: {
+    /**
+     * `seq` (review round 2 of PR #39, L1): the wall clock right after the flag was set in the registry, so that a
+     * heartbeat of the Session Monitor that read the registry before cannot overwrite this one on the remote host.
+     */
+    sendKeepRunning(environmentId: string, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
+  };
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
   development?: boolean;
   clock?: Clock;
@@ -229,6 +246,8 @@ export class Controller implements vscode.Disposable {
   private readonly disconnectTask = new CoalescingTask(() => this.checkDisconnectRequest());
   private disconnectWatcher: { dispose(): void } | undefined;
   private disposed = false;
+  /** The last value of CONNECTED_CONTEXT_KEY (unit 7, PR 2). */
+  private connectedContext: boolean | undefined;
 
   constructor(private readonly deps: ControllerDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -253,7 +272,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 29 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 30 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -279,6 +298,7 @@ export class Controller implements vscode.Disposable {
       turnOnHostAccessChecks: (argument) => this.turnOnHostAccessChecks(parseCommandArgument(argument)),
       keepRunning: (argument) => this.setKeepRunning(parseCommandArgument(argument), true),
       stopWhenClosed: (argument) => this.setKeepRunning(parseCommandArgument(argument), false),
+      closeAndKeepRunning: () => this.closeAndKeepRunning(),
       dockerSetupInstall: () => this.deps.dockerSetup.install(),
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
@@ -390,6 +410,8 @@ export class Controller implements vscode.Disposable {
   ): Promise<void> {
     this.current = { environment, containerName, lost: false };
     this.updateStatusBar();
+    // Unit 7, PR 2: a window connects again, so Close and Keep Running has done its work.
+    await this.clearKeepRunningOnce(environment.id);
     // Concept 7.5: an account change while the window checked its environment found no
     // environment of this window yet. Check the account again now that the window has one; the window leaves (and the
     // token file is removed) when the environment is not the account's.
@@ -615,6 +637,72 @@ export class Controller implements vscode.Disposable {
     // environment stops.
     if (!keep && this.deps.settings().stopOnClose === false) this.inform(ControllerTexts.keepAllRunning);
     else this.inform(keep ? ControllerTexts.keptRunning(repository) : ControllerTexts.stopsWhenClosed(repository));
+  }
+
+  /**
+   * Close and Keep Running (unit 7, PR 2): closes this window, and the container of its environment keeps running this
+   * time. It sets `keepRunningOnce` in the registry (under its lock), which the Session Monitor treats like Keep Running
+   * When Closed until a window connects again, or Stop or Delete. For an environment on a remote Docker host, one
+   * heartbeat with the keep-running flag goes to the Session Monitor there first, so that it keeps the container also
+   * when this computer goes offline; when it fails, the flag is cleared again, an error says so, and the window stays
+   * open. The flag stays until the next open or attach of the environment, or Stop or Delete, also when the user
+   * cancels the close (the dialog about unsaved files): `workbench.action.closeWindow` resolves when the close starts,
+   * not after that dialog, so the window cannot tell (review round 1 of PR #39, F1). A cancelled close leaves the
+   * environment kept until then: the safe side.
+   */
+  async closeAndKeepRunning(): Promise<void> {
+    const current = this.current;
+    if (!current) {
+      this.inform(ControllerTexts.closeAndKeepRunningNotConnected);
+      return;
+    }
+    const environment = current.environment;
+    const repository = this.displayName({ repository: environment.repository });
+    const host = dockerHostOf(environment);
+    if (host !== '') {
+      const currentHost = await this.currentDockerHost();
+      if (currentHost !== host) {
+        this.warn(Messages.otherDockerHost(repository, host, currentHost));
+        return;
+      }
+    }
+    const updated = await this.deps.registry.updateEnvironment(environment.id, (entry) => {
+      entry.keepRunningOnce = true;
+    });
+    if (!updated) {
+      this.inform(PipelineTexts.environmentMissing);
+      return;
+    }
+    if (host !== '') {
+      const seq = this.clock.now();
+      const sent = (await this.deps.remoteMonitor?.sendKeepRunning(environment.id, seq)) ?? {
+        ok: false as const,
+        detail: 'The Session Monitor on the remote host is not available in this window.',
+      };
+      if (!sent.ok) {
+        this.logger.warn(`Close and Keep Running: the heartbeat to the Session Monitor on ${host} failed: ${sent.detail}`);
+        await this.clearKeepRunningOnce(environment.id);
+        const minutes = Math.round(remoteStopAfterSeconds(this.deps.settings().remoteStopAfterMinutes) / 60);
+        vscode.window
+          .showErrorMessage(ControllerTexts.closeAndKeepRunningUnreachable(host, minutes))
+          .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
+        return;
+      }
+    }
+    this.logger.info(`${repository} keeps running this time. The window closes.`);
+    await this.deps.connection.closeWindow();
+  }
+
+  /** Unit 7, PR 2: removes `keepRunningOnce` (a window connected again, or the heartbeat failed). Never throws. */
+  private async clearKeepRunningOnce(environmentId: string): Promise<void> {
+    try {
+      if ((await this.deps.registry.get(environmentId))?.keepRunningOnce === undefined) return;
+      await this.deps.registry.updateEnvironment(environmentId, (entry) => {
+        delete entry.keepRunningOnce;
+      });
+    } catch (error) {
+      this.logger.warn(`Close and Keep Running could not be cleared: ${errorMessage(error)}`);
+    }
   }
 
   /** Delete (concept 6.2, 7.14): safety check, confirmation, then the removal. */
@@ -1647,6 +1735,8 @@ export class Controller implements vscode.Disposable {
     this.current = { environment, containerName, lost: false };
     await this.deps.coordinator.setEnvironment(environment.id);
     this.updateStatusBar();
+    // Unit 7, PR 2: a window connects again, so Close and Keep Running has done its work.
+    await this.clearKeepRunningOnce(environment.id);
     if (!(await this.stillAvailable(environment))) return;
     this.background(this.readWindowBranch(), 'read the branch of the environment');
   }
@@ -1941,6 +2031,7 @@ export class Controller implements vscode.Disposable {
   private updateStatusBar(): void {
     const current = this.current;
     const { statusBar } = this.deps;
+    this.updateConnectedContext(current !== undefined);
     if (!current) {
       statusBar.showNotConnected();
       return;
@@ -1948,6 +2039,15 @@ export class Controller implements vscode.Disposable {
     const repository = this.displayName({ repository: current.environment.repository });
     if (current.lost) statusBar.showConnectionLost(repository, current.environment.id);
     else statusBar.showConnected(repository, current.branch ?? current.environment.gitSummary?.branch ?? undefined);
+  }
+
+  /** Unit 7, PR 2: the context key CONNECTED_CONTEXT_KEY, set when it changes. */
+  private updateConnectedContext(connected: boolean): void {
+    if (this.connectedContext === connected) return;
+    this.connectedContext = connected;
+    Promise.resolve(vscode.commands.executeCommand('setContext', CONNECTED_CONTEXT_KEY, connected)).catch((error: unknown) =>
+      this.logger.warn(`The context key ${CONNECTED_CONTEXT_KEY} could not be set: ${errorMessage(error)}`),
+    );
   }
 
   private isConnectedHere(environment: Environment): boolean {

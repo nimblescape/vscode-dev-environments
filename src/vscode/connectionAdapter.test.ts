@@ -4,7 +4,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { encodeAuthority } from './connection/authority';
-import { CLOSE_REMOTE_COMMAND, ConnectionAdapter, OPEN_FOLDER_COMMAND, RELOAD_WINDOW_COMMAND } from './connectionAdapter';
+import { CLOSE_REMOTE_COMMAND, CLOSE_WINDOW_COMMAND, ConnectionAdapter, OPEN_FOLDER_COMMAND, RELOAD_WINDOW_COMMAND } from './connectionAdapter';
 
 interface FakeUri {
   scheme: string;
@@ -112,6 +112,13 @@ describe('ConnectionAdapter', () => {
   it('closes the remote connection with the command of VS Code', async () => {
     await new ConnectionAdapter().closeRemoteConnection();
     expect(fake.state.commands).toEqual([[CLOSE_REMOTE_COMMAND]]);
+  });
+
+  // Unit 7, PR 2: Close and Keep Running closes the whole window.
+  it('closes the window with the command of VS Code', async () => {
+    await new ConnectionAdapter().closeWindow();
+    expect(fake.state.commands).toEqual([[CLOSE_WINDOW_COMMAND]]);
+    expect(CLOSE_WINDOW_COMMAND).toBe('workbench.action.closeWindow');
   });
 
   it('finds the container of an attached window from its first folder', () => {

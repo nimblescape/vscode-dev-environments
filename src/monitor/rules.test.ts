@@ -12,7 +12,9 @@ import {
   DOCKER_UNKNOWN_MAX_MS,
   HEARTBEAT_MAX_AGE_MS,
   initialMonitorState,
+  keptWhenClosed,
   PENDING_MAX_AGE_MS,
+  remoteStopAfterSeconds,
   SLEEP_GAP_MS,
   SLEEP_GRACE_MS,
   sleepGraceAt,
@@ -1131,5 +1133,25 @@ describe('exit', () => {
     expect(decide(base({ running: undefined, state: unknownSince })).exit).toBe(true);
     // Nothing needed: no Docker answer is necessary.
     expect(decide(base({ running: undefined, settings: settings({ stopOnClose: false }) })).exit).toBe(true);
+  });
+});
+
+// Unit 7, PR 2: the heartbeats to the Session Monitor on a remote Docker host.
+describe('keptWhenClosed and remoteStopAfterSeconds', () => {
+  it('is true exactly when rule 2 never stops the environment', () => {
+    expect(keptWhenClosed(env('A'), settings())).toBe(false);
+    expect(keptWhenClosed(env('A', { keepRunning: true }), settings())).toBe(true);
+    expect(keptWhenClosed(env('A'), settings({ stopOnClose: false }))).toBe(true);
+    expect(keptWhenClosed(env('A', { shutdownActionNone: true }), settings())).toBe(false);
+    expect(keptWhenClosed(env('A', { shutdownActionNone: true }), settings({ respectShutdownActionNone: true }))).toBe(true);
+  });
+
+  it('turns the minutes of the setting into the seconds of a heartbeat, within one minute..one day', () => {
+    expect(remoteStopAfterSeconds(10)).toBe(600);
+    expect(remoteStopAfterSeconds(1.5)).toBe(90);
+    expect(remoteStopAfterSeconds(0)).toBe(60);
+    expect(remoteStopAfterSeconds(5000)).toBe(86_400);
+    expect(remoteStopAfterSeconds(undefined)).toBe(600);
+    expect(remoteStopAfterSeconds(Number.NaN)).toBe(600);
   });
 });

@@ -214,6 +214,26 @@ describe('EnvironmentRegistry reading', () => {
 
   // User decision 2026-09-26, "go with the proposal for closing": the switch Keep Running When Closed is stored with the
   // environment. An entry without the field means false.
+  // Unit 7, PR 2: Close and Keep Running is stored like keepRunning.
+  it('reads keepRunningOnce with and without the field, and drops an invalid value', async () => {
+    writeRaw({
+      version: 1,
+      environments: [
+        environment(ID_A, 'o/a', { keepRunningOnce: true }),
+        environment(ID_B, 'o/b'),
+        { ...environment(ID_C, 'o/c'), keepRunningOnce: 1 },
+      ],
+    });
+    const registry = new EnvironmentRegistry(paths);
+    const list = await registry.list();
+    expect(list.map((entry) => entry.keepRunningOnce)).toEqual([true, undefined, undefined]);
+    expect('keepRunningOnce' in list[2]).toBe(false);
+    await registry.updateEnvironment(ID_B, (entry) => {
+      entry.keepRunningOnce = true;
+    });
+    expect((await registry.get(ID_B))?.keepRunningOnce).toBe(true);
+  });
+
   it('reads keepRunning with and without the field, drops an invalid value, and writes it under the lock', async () => {
     writeRaw({
       version: 1,

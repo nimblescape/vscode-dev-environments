@@ -185,6 +185,8 @@ describe('SessionCoordinator', () => {
       waitingTimeSeconds: 45,
       stopOnClose: true,
       respectShutdownActionNone: false,
+      // Unit 7, PR 2: the time limit of the heartbeats to a remote Session Monitor (the default of 10 minutes).
+      remoteStopAfterSeconds: 600,
       updatedAt: iso(T0),
     });
     expect(h.spawns).toHaveLength(1);

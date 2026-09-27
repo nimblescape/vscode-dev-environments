@@ -16,6 +16,8 @@ export const OPEN_FOLDER_COMMAND = 'vscode.openFolder';
 export const CLOSE_REMOTE_COMMAND = 'workbench.action.remote.close';
 /** "Developer: Reload Window". */
 export const RELOAD_WINDOW_COMMAND = 'workbench.action.reloadWindow';
+/** "Close Window" (Close and Keep Running, unit 7 PR 2). */
+export const CLOSE_WINDOW_COMMAND = 'workbench.action.closeWindow';
 
 export class ConnectionAdapter {
   constructor(private readonly logger: Logger = silentLogger) {}
@@ -97,6 +99,15 @@ export class ConnectionAdapter {
   async closeRemoteConnection(): Promise<void> {
     this.logger.info('Closing the remote connection of this window.');
     await vscode.commands.executeCommand(CLOSE_REMOTE_COMMAND);
+  }
+
+  /**
+   * "Close Window" (Close and Keep Running, unit 7 PR 2): the whole window closes, and this extension host ends with it.
+   * VS Code may ask about unsaved files first; with Cancel the window stays open.
+   */
+  async closeWindow(): Promise<void> {
+    this.logger.info('Closing this window.');
+    await vscode.commands.executeCommand(CLOSE_WINDOW_COMMAND);
   }
 
   /** The window shows exactly this folder of this container (a folder window, not a workspace). */
