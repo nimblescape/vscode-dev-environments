@@ -5,7 +5,7 @@
 // Discovery Service (concept 7.4): finds the repositories with a Dev Container configuration through the GitHub
 // GraphQL API and stores the result in repositories-<account ID>.json, one file per GitHub account (concept 6.2). Security
 // (concept section 9): the token is only passed on to the GitHubApi; the stored file contains metadata only.
-import { allOrAbort, Semaphore } from '../concurrency';
+import { allOrAbort, RequestLimiter, type RequestKind } from '../concurrency';
 import { readJson, writeJsonAtomic } from '../storage/atomicJson';
 import type { GitHubViewer } from '../helper/containerGit';
 import { splitRepository } from '../names';
@@ -418,18 +418,26 @@ export interface PartialDiscovery {
   data: DiscoveryData;
 }
 
-/** The requests of one refresh: the token, the limit of parallel requests, the collected errors, and a counter for the log. */
+/** The requests of one refresh: the token, the limit of parallel requests, the collected errors, and counters for the log. */
 interface RefreshRun {
   token: string;
   accountId: string;
   scope: string[];
-  limiter: Semaphore;
+  limiter: RequestLimiter;
   /** Aborts every request of the refresh at its first failure (`failure`), or when the signal of the caller aborts. */
   controller: AbortController;
+  /** The requests of the refresh that did not settle yet, also those that wait for a slot. */
+  pending: Set<Promise<unknown>>;
   failure?: { error: unknown };
   onAbort: () => void;
   requests: number;
+  /** Requests by kind: list pages, batches of lookups, and others (account, organizations, probes); and their time. */
+  requestsByKind: Record<RequestKind, number>;
+  requestMs: Record<RequestKind, number>;
   lookupRequests: number;
+  /** Start of the refresh, and the time when the first repository with a configuration was ready (progressive display). */
+  started: number;
+  firstRepositoryMs?: number;
   /** The configuration lookups, started while the list still loads. */
   lookups: LookupQueue;
   errors: CollectedError[];
@@ -499,38 +507,54 @@ export class DiscoveryService {
    *   owners in parallel, the pages of one owner one after another. No request is about another owner. An owner that
    *   GitHub does not return gets a `notFound` hint.
    * The configuration lookups follow in batches of LOOKUP_BATCH_SIZE, each started as soon as its repositories are listed:
-   * for all repositories on the first load, else only for new and changed ones (incremental detection). All requests
-   * share the limit of DISCOVERY_CONCURRENCY at the same time; the list pages go first. Keeps only repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth
+   * for all repositories on the first load, else only for new and changed ones (incremental detection), there also the
+   * rest of each page at once while a slot is free. All requests share the limit of DISCOVERY_CONCURRENCY at the same
+   * time (RequestLimiter); while a list loads, the lookups leave it one slot, and the list pages go first. Keeps only
+   * repositories with at least one configuration. Errors for organizations with SAML single sign-on or OAuth
    * app access restrictions become one hint per organization. Partial data with errors is used. Stores the result with
    * its scope atomically in the file of the account and returns it. Throws on a network failure, an HTTP error, when
    * GitHub does not return the list, or when the token belongs to another account (a sign-in changed the session
    * meanwhile); the stored file then stays unchanged.
    */
   async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
-    const started = this.clock.now();
     const logins = scopeLogins(this.options.scope?.() ?? []);
     const run = this.newRun(token, accountId, normalizeScope(logins), DISCOVERY_CONCURRENCY, signal);
-    // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
-    // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
-    const previous = await this.loadStored(accountId).catch(() => undefined);
-    const detections: Detections = previous ? storedDetections(previous) : undefined;
-    let scan: ScanResult;
     try {
-      scan = logins.length === 0 ? await this.scanAll(run, accountId, detections) : await this.scanScope(run, accountId, logins, detections);
-      await run.lookups.finish();
+      return await this.refreshRun(run, logins);
     } catch (error) {
+      // A failed refresh stops all its requests (also the lookups that it started, and the pages of other owners), and
+      // rejects only when they settled: the next refresh, which the sidebar starts only after this one, never runs
+      // beside them, so no more than DISCOVERY_CONCURRENCY requests run at the same time.
+      if (!run.failure && !isAbortError(error)) run.failure = { error };
+      run.controller.abort();
+      await settle(run.pending);
       if (signal?.aborted) throw abortError();
       throw run.failure ? run.failure.error : error;
     } finally {
       signal?.removeEventListener('abort', run.onAbort);
     }
+  }
+
+  /** The refresh of `refresh` within its run. */
+  private async refreshRun(run: RefreshRun, logins: string[]): Promise<DiscoveryData> {
+    const accountId = run.accountId;
+    // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
+    // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
+    const previous = await this.loadStored(accountId).catch(() => undefined);
+    const detections: Detections = previous ? storedDetections(previous) : undefined;
+    // Concept 7.4: on a refresh, the few new and changed repositories are read right after their page (they come first,
+    // last push first), so their lookups overlap with the rest of the list. The first load fills batches of 50.
+    run.lookups.flushEachPage = detections !== undefined;
+    const scan = logins.length === 0 ? await this.scanAll(run, accountId, detections) : await this.scanScope(run, accountId, logins, detections);
+    await run.lookups.finish();
     if (run.lookups.count > 0) {
       this.logger.info(
         `Repository list: configurations of ${run.lookups.count} ${detections ? 'new or changed ' : ''}repositories read with ${run.lookupRequests} requests.`,
       );
     }
 
-    const organizations = await this.collectOrganizations(scan.organizations, run, signal);
+    // Every request of the run observes its signal, which an abort of `signal` reaches too.
+    const organizations = await this.collectOrganizations(scan.organizations, run, run.controller.signal);
     const hints = new HintCollector(scan.viewerLogin);
     for (const { error, data, organization } of run.errors) hints.add(error, data, organization);
     if (hints.unattributed > 0) {
@@ -542,7 +566,7 @@ export class DiscoveryService {
         ),
         hints,
         run,
-        signal,
+        run.controller.signal,
       );
     }
     for (const owner of scan.missingOwners) hints.addNotFound(owner);
@@ -565,10 +589,21 @@ export class DiscoveryService {
       `Repository list: ${repositories.length} of ${scan.collector.scanned} repositories have a Dev Container configuration` +
         (result.hints.length > 0 ? `, ${result.hints.length} organizations need an authorization or were not found.` : '.'),
     );
-    const seconds = Math.max(0, this.clock.now() - started) / 1000;
+    const seconds = Math.max(0, this.clock.now() - run.started) / 1000;
     this.logger.info(
       `Repository list: loaded in ${seconds.toFixed(1)} seconds with ${run.requests} requests` +
         (logins.length > 0 ? ` (scan scope: ${logins.join(', ')}).` : '.'),
+    );
+    // The time that GitHub needs per request of each kind, to compare with the estimates of concept 7.4.
+    const kinds = (['list', 'lookup', 'other'] as const).map((kind) => {
+      const count = run.requestsByKind[kind];
+      const average = count > 0 ? run.requestMs[kind] / count / 1000 : 0;
+      return `${count} ${kind} requests` + (count > 0 ? ` (${average.toFixed(1)} seconds each on average)` : '');
+    });
+    const first = run.firstRepositoryMs === undefined ? 'none' : `${(run.firstRepositoryMs / 1000).toFixed(1)} seconds`;
+    this.logger.info(
+      `Repository list: ${kinds.join(', ')}; at most ${run.limiter.peak} at the same time; ` +
+        `first repositories with a configuration after ${first}.`,
     );
     try {
       await writeJsonAtomic(this.fileOf(accountId), result);
@@ -675,36 +710,40 @@ export class DiscoveryService {
     const usedCursors = new Set<string>();
     let pageSize = DISCOVERY_PAGE_SIZE;
     let pages = 0;
-
-    for (;;) {
-      if (pages >= MAX_PAGES) {
-        this.logger.warn(`Repository list: stopped after ${pages} pages.`);
-        break;
+    const closeList = run.limiter.openList();
+    try {
+      for (;;) {
+        if (pages >= MAX_PAGES) {
+          this.logger.warn(`Repository list: stopped after ${pages} pages.`);
+          break;
+        }
+        const withOrganizations = pages === 0;
+        const after: string | null = cursor;
+        const page = await this.fetchPage(
+          run,
+          DISCOVERY_QUERY,
+          (size) => ({ cursor: after, pageSize: size, withOrganizations }),
+          pageSize,
+          (data: DiscoverData | undefined) => (isPageViewer(data?.viewer) ? data.viewer : undefined),
+        );
+        pages++;
+        pageSize = page.pageSize;
+        const viewer = page.value;
+        if (pages === 1) {
+          viewerLogin = viewer.login;
+          organizations = viewer.organizations;
+          checkAccount(viewer.databaseId, accountId);
+          run.viewerLogin = viewerLogin;
+        }
+        for (const error of page.errors) run.errors.push({ error, data: page.data });
+        run.lookups.add(collector.addPage(asArray(viewer.repositories.nodes), page.errors));
+        this.reportPartial(run);
+        const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
+        if (next === undefined) break;
+        cursor = next;
       }
-      const withOrganizations = pages === 0;
-      const after: string | null = cursor;
-      const page = await this.fetchPage(
-        run,
-        DISCOVERY_QUERY,
-        (size) => ({ cursor: after, pageSize: size, withOrganizations }),
-        pageSize,
-        (data: DiscoverData | undefined) => (isPageViewer(data?.viewer) ? data.viewer : undefined),
-      );
-      pages++;
-      pageSize = page.pageSize;
-      const viewer = page.value;
-      if (pages === 1) {
-        viewerLogin = viewer.login;
-        organizations = viewer.organizations;
-        checkAccount(viewer.databaseId, accountId);
-        run.viewerLogin = viewerLogin;
-      }
-      for (const error of page.errors) run.errors.push({ error, data: page.data });
-      run.lookups.add(collector.addPage(asArray(viewer.repositories.nodes), page.errors));
-      this.reportPartial(run);
-      const next = nextCursor(viewer.repositories.pageInfo, usedCursors);
-      if (next === undefined) break;
-      cursor = next;
+    } finally {
+      closeList();
     }
     return { viewerLogin, organizations, collector, missingOwners: [] };
   }
@@ -741,7 +780,7 @@ export class DiscoveryService {
   private async scopeViewer(
     run: RefreshRun,
   ): Promise<{ login: string; databaseId: number | null | undefined; organizations: Connection<LoginNode> | null | undefined }> {
-    const result = await this.request<ScopeViewerData>(run, SCOPE_VIEWER_QUERY, {}, run.controller.signal, true);
+    const result = await this.request<ScopeViewerData>(run, SCOPE_VIEWER_QUERY, {}, run.controller.signal, 'other');
     const viewer = result.data?.viewer;
     if (!isRecord(viewer) || typeof viewer.login !== 'string' || viewer.login === '') {
       throw new Error(`GitHub did not return the account: ${describeGraphQLErrors(result.errors)}`);
@@ -765,28 +804,33 @@ export class DiscoveryService {
     const usedCursors = new Set<string>();
     let pageSize = DISCOVERY_PAGE_SIZE;
     let pages = 0;
-    for (;;) {
-      if (pages >= MAX_PAGES) {
-        this.logger.warn(`Repository list: stopped after ${pages} pages of ${login}.`);
-        break;
+    const closeList = run.limiter.openList();
+    try {
+      for (;;) {
+        if (pages >= MAX_PAGES) {
+          this.logger.warn(`Repository list: stopped after ${pages} pages of ${login}.`);
+          break;
+        }
+        const after: string | null = cursor;
+        const page = await this.fetchPage(
+          run,
+          own ? VIEWER_REPOSITORIES_QUERY : OWNER_REPOSITORIES_QUERY,
+          (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size }),
+          pageSize,
+          (data: OwnerPageData | undefined, errors) => readOwnerPage(own ? data?.viewer : data?.repositoryOwner, data, errors),
+        );
+        pages++;
+        pageSize = page.pageSize;
+        for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
+        if (page.value === MISSING_OWNER) return { collector, missing: pages === 1 };
+        run.lookups.add(collector.addPage(asArray(page.value.nodes), page.errors));
+        this.reportPartial(run);
+        const next = nextCursor(page.value.pageInfo, usedCursors);
+        if (next === undefined) break;
+        cursor = next;
       }
-      const after: string | null = cursor;
-      const page = await this.fetchPage(
-        run,
-        own ? VIEWER_REPOSITORIES_QUERY : OWNER_REPOSITORIES_QUERY,
-        (size) => ({ ...(own ? {} : { login }), cursor: after, pageSize: size }),
-        pageSize,
-        (data: OwnerPageData | undefined, errors) => readOwnerPage(own ? data?.viewer : data?.repositoryOwner, data, errors),
-      );
-      pages++;
-      pageSize = page.pageSize;
-      for (const error of page.errors) run.errors.push({ error, data: page.data, organization: login });
-      if (page.value === MISSING_OWNER) return { collector, missing: pages === 1 };
-      run.lookups.add(collector.addPage(asArray(page.value.nodes), page.errors));
-      this.reportPartial(run);
-      const next = nextCursor(page.value.pageInfo, usedCursors);
-      if (next === undefined) break;
-      cursor = next;
+    } finally {
+      closeList();
     }
     return { collector, missing: false };
   }
@@ -804,12 +848,19 @@ export class DiscoveryService {
       token,
       accountId,
       scope,
-      limiter: new Semaphore(concurrency),
+      limiter: new RequestLimiter(concurrency),
       controller,
+      pending: new Set(),
       onAbort,
       requests: 0,
+      requestsByKind: { list: 0, lookup: 0, other: 0 },
+      requestMs: { list: 0, lookup: 0, other: 0 },
       lookupRequests: 0,
-      lookups: new LookupQueue((batch) => this.guard(run, this.lookUpBatch(run, batch, controller.signal))),
+      started: this.clock.now(),
+      lookups: new LookupQueue(
+        (batch) => this.guard(run, this.lookUpBatch(run, batch, controller.signal)),
+        () => run.limiter.lookupIdle(),
+      ),
       errors: [],
       viewerLogin: '',
       collectors: [],
@@ -840,7 +891,13 @@ export class DiscoveryService {
     let retryable: boolean;
     try {
       run.lookupRequests++;
-      const result = await this.request<Record<string, ConfigurationNode | null>>(run, configurationsQuery(batch.length), variables, signal);
+      const result = await this.request<Record<string, ConfigurationNode | null>>(
+        run,
+        configurationsQuery(batch.length),
+        variables,
+        signal,
+        'lookup',
+      );
       const data = result.data;
       const answered = isRecord(data) && batch.some((_entry, index) => isRecord(data[`r${index}`]));
       if (isRecord(data) && (answered || !isTimeoutResponse(result.errors))) {
@@ -880,6 +937,11 @@ export class DiscoveryService {
 
   /** Gives the repositories found so far to the listeners of onPartialResult. A failing listener is logged. */
   private reportPartial(run: RefreshRun): void {
+    // A refresh that failed or was aborted reports nothing more: its requests may still settle after it rejected.
+    if (run.controller.signal.aborted) return;
+    if (run.firstRepositoryMs === undefined && run.collectors.some((collector) => collector.hasConfiguration())) {
+      run.firstRepositoryMs = Math.max(0, this.clock.now() - run.started);
+    }
     if (this.partialListeners.size === 0) return;
     const merged = new RepositoryCollector(undefined);
     for (const collector of run.collectors) merged.addAll(collector);
@@ -903,20 +965,31 @@ export class DiscoveryService {
   }
 
   /**
-   * One GraphQL request of a refresh, within the limit of parallel requests. A `priority` request (a page of the list)
-   * goes before the waiting lookups, so the list keeps loading while the lookups run.
+   * One GraphQL request of a refresh, within the limit of parallel requests of the refresh (RequestLimiter). A page of a
+   * list and another request go before the waiting lookups, and an open list keeps a slot free for its next page, so the
+   * list keeps loading while the lookups run.
    */
   private request<T>(
     run: RefreshRun,
     query: string,
     variables: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    priority = false,
+    kind: RequestKind,
   ): Promise<{ data?: T; errors?: GraphQLError[] }> {
-    return run.limiter.run(() => {
+    const request = run.limiter.run(async () => {
       run.requests++;
-      return this.api.graphql<T>(query, variables, run.token, signal);
-    }, priority);
+      run.requestsByKind[kind]++;
+      const started = this.clock.now();
+      try {
+        return await this.api.graphql<T>(query, variables, run.token, signal);
+      } finally {
+        run.requestMs[kind] += Math.max(0, this.clock.now() - started);
+      }
+    }, kind);
+    run.pending.add(request);
+    const forget = () => run.pending.delete(request);
+    request.then(forget, forget);
+    return request;
   }
 
   /**
@@ -935,7 +1008,7 @@ export class DiscoveryService {
       let failure: unknown;
       let retryable: boolean;
       try {
-        const result = await this.request<D>(run, query, variables(pageSize), run.controller.signal, true);
+        const result = await this.request<D>(run, query, variables(pageSize), run.controller.signal, 'list');
         const value = read(result.data, result.errors);
         if (value !== undefined) return { value, errors: result.errors ?? [], data: result.data, pageSize };
         failure = new Error(`GitHub did not return the repository list: ${describeGraphQLErrors(result.errors)}`);
@@ -973,7 +1046,7 @@ export class DiscoveryService {
       const cursor = nextCursor(connection?.pageInfo, usedCursors);
       if (cursor === undefined) break;
       try {
-        const result = await this.request<OrganizationsData>(run, ORGANIZATIONS_QUERY, { cursor }, signal);
+        const result = await this.request<OrganizationsData>(run, ORGANIZATIONS_QUERY, { cursor }, signal, 'other');
         for (const error of result.errors ?? []) run.errors.push({ error, data: result.data });
         connection = result.data?.viewer?.organizations;
         addAll(connection);
@@ -1006,7 +1079,7 @@ export class DiscoveryService {
         variables[`o${index}`] = login;
       });
       try {
-        const result = await this.request<Record<string, unknown>>(run, organizationAccessQuery(chunk.length), variables, signal);
+        const result = await this.request<Record<string, unknown>>(run, organizationAccessQuery(chunk.length), variables, signal, 'other');
         for (const error of result.errors ?? []) {
           const alias = error.path?.[0];
           const match = typeof alias === 'string' ? /^o(\d+)$/.exec(alias) : null;
@@ -1197,6 +1270,11 @@ function asArray<T>(value: T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : [];
 }
 
+/** Waits until every request of `pending` settled, also those that start meanwhile. */
+async function settle(pending: Set<Promise<unknown>>): Promise<void> {
+  while (pending.size > 0) await Promise.allSettled([...pending]);
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1296,6 +1374,11 @@ class RepositoryCollector {
     for (const entry of other.entries) this.add(entry);
   }
 
+  /** True if a repository with a configuration was found so far. */
+  hasConfiguration(): boolean {
+    return this.entries.some((entry) => entry.info.configPaths.length > 0);
+  }
+
   repositories(): RepositoryInfo[] {
     return this.entries.filter((entry) => entry.info.configPaths.length > 0).map((entry) => entry.info);
   }
@@ -1324,20 +1407,27 @@ class RepositoryCollector {
 
 /**
  * The configuration lookups of a refresh (concept 7.4): a batch starts as soon as LOOKUP_BATCH_SIZE repositories are
- * listed, while the list still loads; `finish` starts the rest and waits for all batches.
+ * listed, while the list still loads; `finish` starts the rest and waits for all batches. With `flushEachPage` (a refresh
+ * with a stored list), the rest of a page starts at once too when a slot for lookups is free (`idle`).
  */
 class LookupQueue {
   private buffer: CollectedRepository[] = [];
   private readonly running: Array<Promise<void>> = [];
   /** Repositories handed to a lookup. */
   count = 0;
+  flushEachPage = false;
 
-  constructor(private readonly start: (batch: CollectedRepository[]) => Promise<void>) {}
+  constructor(
+    private readonly start: (batch: CollectedRepository[]) => Promise<void>,
+    private readonly idle: () => boolean,
+  ) {}
 
+  /** Adds the repositories of a list page that need a lookup. */
   add(entries: readonly CollectedRepository[]): void {
     this.buffer.push(...entries);
     this.count += entries.length;
     while (this.buffer.length >= LOOKUP_BATCH_SIZE) this.launch(this.buffer.splice(0, LOOKUP_BATCH_SIZE));
+    if (this.flushEachPage && this.buffer.length > 0 && this.idle()) this.launch(this.buffer.splice(0));
   }
 
   async finish(): Promise<void> {

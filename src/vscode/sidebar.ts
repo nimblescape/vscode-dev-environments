@@ -9,7 +9,7 @@
 // sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
-import type { DiscoveryService, PartialDiscovery } from '../core/discovery/discoveryService';
+import { DISCOVERY_CONCURRENCY, type DiscoveryService, type PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
@@ -106,6 +106,8 @@ export class Sidebar implements vscode.Disposable {
   private signInOffered = false;
   /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
   private accountChanges = 0;
+  /** The token of the refresh that asks GitHub now; `undefined` while none does. */
+  private refreshToken: string | undefined;
   private disposed = false;
   /** Problems of the setting repositoryGroups that were shown: each distinct one once per window session. */
   private readonly shownGroupProblems = new Set<string>();
@@ -230,20 +232,33 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
-   * Sign-in, sign-out, or account change: new state, then a new list. `again` (default true) starts one more refresh
-   * after a running one, because the account may have changed; `again: false` reuses a running refresh.
-   * Never rejects.
+   * Sign-in, sign-out, or account change: new state, then a new list. `again` starts one more refresh after a running
+   * one; `again: false` reuses a running refresh. By default, a running refresh is reused only when it loads the list
+   * of the same account with the token of the current session, for example when VS Code reports a session of other
+   * scopes (read:packages) or of another extension: the list would be the same, and the Refresh command would wait for
+   * two refreshes. Never rejects.
    */
   async onSessionChanged(options: { again?: boolean } = {}): Promise<void> {
     const account = await this.readAccount();
+    const accountChanged = account?.id !== this.account?.id;
     // Another account: its own stored list at once, never the list of the previous one (concept 6.2).
-    if (account?.id !== this.account?.id) {
+    if (accountChanged) {
       this.accountChanges++;
       await this.useAccount(account);
     }
+    const wasSignedIn = this.signedIn;
     this.setSignedIn(account !== undefined && (await this.authSignedIn()));
     this.renderInBackground();
-    if (this.signedIn) await this.refreshDiscovery({ again: options.again ?? true });
+    if (!this.signedIn) return;
+    const again = options.again ?? (accountChanged || !wasSignedIn || !(await this.refreshUsesCurrentSession()));
+    await this.refreshDiscovery({ again });
+  }
+
+  /** True if a refresh asks GitHub now with the token of the current session. */
+  private async refreshUsesCurrentSession(): Promise<boolean> {
+    const running = this.refreshToken;
+    if (running === undefined) return false;
+    return (await this.readSession())?.token === running;
   }
 
   /** Starts the background refresh again with the interval of the settings. */
@@ -480,6 +495,7 @@ export class Sidebar implements vscode.Disposable {
     }
     this.progressiveAccountId = this.data === undefined ? account.id : undefined;
     this.partial = undefined;
+    this.refreshToken = token;
     try {
       const data = await vscode.window.withProgress({ location: viewProgressLocation(this.deps.view) }, () =>
         this.deps.discovery.refresh(token, account.id),
@@ -490,7 +506,13 @@ export class Sidebar implements vscode.Disposable {
       if (!this.isOfCurrentScope(data)) return this.data;
       this.data = data;
       this.setLoadFailed(false);
-      this.lookups = await this.lookUpUnlisted(data, token);
+      // The complete list is shown at once. The repositories of environments that it lacks follow; until then their rows
+      // show what the previous refresh found.
+      this.endProgressiveDisplay();
+      this.setLoaded();
+      this.renderInBackground();
+      const lookups = await this.lookUpUnlisted(data, token);
+      if (this.account?.id === account.id) this.lookups = lookups;
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 401) this.offerSignInAgain();
       // Concept 7.4: without internet access, the view shows the stored list and skips the update. Without a stored
@@ -499,35 +521,43 @@ export class Sidebar implements vscode.Disposable {
       this.deps.logger.warn(`The repository list could not be updated. ${shown} ${errorMessage(error)}`);
       this.setLoadFailed(this.data === undefined);
     } finally {
-      this.progressiveAccountId = undefined;
-      if (this.partial) {
-        this.partial = undefined;
-        this.renderInBackground();
-      }
+      this.refreshToken = undefined;
+      this.endProgressiveDisplay();
     }
     this.setLoaded();
     this.renderInBackground();
     return this.data;
   }
 
+  /** The refresh of the progressive display ended: the view shows no part of it anymore. */
+  private endProgressiveDisplay(): void {
+    this.progressiveAccountId = undefined;
+    if (this.partial) {
+      this.partial = undefined;
+      this.renderInBackground();
+    }
+  }
+
   /**
    * The discovery stores only repositories with a configuration on the default branch. The repositories of the other
-   * environments are asked one by one, so the view shows `not on GitHub` only for repositories that GitHub does not
-   * return. A failed question leaves the repository unknown.
+   * environments are asked one by one, at most DISCOVERY_CONCURRENCY at the same time (the refresh has ended, so no other
+   * request of the list runs), so the view shows `not on GitHub` only for repositories that GitHub does not return.
+   * A failed question leaves the repository unknown.
    */
   private async lookUpUnlisted(data: DiscoveryData, token: string): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
     const environments = await this.availableEnvironments();
     // Concept 7.4: GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
-    for (const repository of repositoriesToLookUp(environments, data.repositories, this.deps.settings().owners)) {
-      if (this.disposed) break;
+    const repositories = repositoriesToLookUp(environments, data.repositories, this.deps.settings().owners);
+    await mapLimit(repositories, DISCOVERY_CONCURRENCY, async (repository) => {
+      if (this.disposed) return;
       try {
         const info = await this.deps.discovery.getRepository(repository, token);
         result.set(repositoryKey(repository), info ?? null);
       } catch (error) {
         this.deps.logger.info(`GitHub could not be asked for ${repository}: ${errorMessage(error)}`);
       }
-    }
+    });
     return result;
   }
 

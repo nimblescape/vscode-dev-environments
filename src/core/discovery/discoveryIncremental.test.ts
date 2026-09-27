@@ -11,7 +11,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
 import type { Logger } from '../ports';
 import { GitHubApi } from './githubApi';
+import type { RepositoryInfo } from '../types';
 import {
+  DISCOVERY_CONCURRENCY,
   DISCOVERY_QUERY,
   DiscoveryService,
   LOOKUP_BATCH_SIZE,
@@ -52,6 +54,10 @@ class FakeGitHub implements HttpTransport {
   peak = 0;
   /** Time of a batch of lookups: GitHub needs much longer for them than for a list page. */
   lookupDelayMs = 3;
+  /** Time of every other request. */
+  listDelayMs = 3;
+  /** Time of a request, instead of `lookupDelayMs` and `listDelayMs`. */
+  delayOf?: (operation: string) => number;
   /** `start <operation>` and `end <operation>` of each request, in order. */
   readonly events: string[] = [];
 
@@ -62,7 +68,8 @@ class FakeGitHub implements HttpTransport {
     this.events.push(`start ${name}`);
     this.open++;
     this.peak = Math.max(this.peak, this.open);
-    await new Promise((resolve) => setTimeout(resolve, name === 'Configurations' ? this.lookupDelayMs : 3));
+    const delayMs = this.delayOf?.(name) ?? (name === 'Configurations' ? this.lookupDelayMs : this.listDelayMs);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
     this.open--;
     this.events.push(`end ${name}`);
     return { status: 200, headers: {}, body: JSON.stringify(this.answer(parsed)) };
@@ -494,5 +501,250 @@ describe('the first load (concept 7.4): list pages, then pipelined lookups of al
     expect(counts.at(-1)).toBe(70);
     // One report per list page (2) and per batch (3).
     expect(counts).toHaveLength(5);
+  });
+});
+
+/**
+ * The most lookups that were open while a list page started, and the most requests that were open at once, from the
+ * events of the fake.
+ */
+function openCounts(events: readonly string[]): { lookupsAtPageStart: number; total: number } {
+  let lookups = 0;
+  let open = 0;
+  let lookupsAtPageStart = 0;
+  let total = 0;
+  for (const event of events) {
+    const [kind, name] = event.split(' ');
+    const lookup = name === 'Configurations';
+    if (kind === 'start') {
+      if (!lookup && name !== 'ScopeViewer') lookupsAtPageStart = Math.max(lookupsAtPageStart, lookups);
+      open++;
+      if (lookup) lookups++;
+      total = Math.max(total, open);
+    } else {
+      open--;
+      if (lookup) lookups--;
+    }
+  }
+  return { lookupsAtPageStart, total };
+}
+
+describe('the request pattern of a refresh (concept 7.4): list pages beside the lookups, at most 4 requests', () => {
+  /** The repositories with a configuration and those without one, in the order of the list: what every refresh must find. */
+  function expected(repos: FakeRepository[]): { repositories: string[]; withoutConfiguration: string[] } {
+    return {
+      repositories: repos.filter((item) => item.config).map((item) => item.nameWithOwner),
+      withoutConfiguration: repos.filter((item) => !item.config).map((item) => item.nameWithOwner),
+    };
+  }
+
+  it('lists every page of the first load while the lookups run: a page never waits for a batch', async () => {
+    github.repos = Array.from({ length: 664 }, (_, i) => repo(`acme/r${i}`, i % 3 === 0));
+    github.lookupDelayMs = 40;
+    const logger = recordingLogger();
+    const result = await service(logger).refresh(TOKEN, ACCOUNT_ID);
+    expect(github.ofQuery(DISCOVERY_QUERY).map((request) => [request.variables.cursor, request.variables.pageSize])).toEqual([
+      [null, 100],
+      ['100', 100],
+      ['200', 100],
+      ['300', 100],
+      ['400', 100],
+      ['500', 100],
+      ['600', 100],
+    ]);
+    expect(github.lookups().map((request) => Object.keys(request.variables).length / 2)).toEqual([...Array(13).fill(50), 14]);
+    expect(github.requests).toHaveLength(21);
+    // The whole list arrives before the first batch ends: the pages overlap with the lookups and never wait for them.
+    expect(github.events.lastIndexOf('end Discover')).toBeLessThan(github.events.indexOf('end Configurations'));
+    expect(github.events.indexOf('start Configurations')).toBeLessThan(github.events.lastIndexOf('start Discover'));
+    const counts = openCounts(github.events);
+    expect(counts.lookupsAtPageStart).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY - 1);
+    expect(counts.total).toBe(DISCOVERY_CONCURRENCY);
+    expect(github.peak).toBe(4);
+    expect(names(result.repositories)).toEqual(expected(github.repos).repositories);
+    expect(names(result.withoutConfiguration)).toEqual(expected(github.repos).withoutConfiguration);
+    expect(logger.lines).toContain(
+      'Repository list: 7 list requests (0.0 seconds each on average), 14 lookup requests (0.0 seconds each on average), ' +
+        '0 other requests; at most 4 at the same time; first repositories with a configuration after 0.0 seconds.',
+    );
+  });
+
+  it('finds the same repositories and detections whatever GitHub answers first', async () => {
+    const repos = Array.from({ length: 333 }, (_, i) => repo(`acme/r${i}`, i % 4 === 1));
+    const timings: Array<(operation: string) => number> = [
+      (operation) => (operation === 'Configurations' ? 30 : 2),
+      (operation) => (operation === 'Configurations' ? 1 : 15),
+      () => Math.floor(Math.random() * 12),
+    ];
+    const results: unknown[] = [];
+    for (const delayOf of timings) {
+      github = new FakeGitHub();
+      github.repos = repos;
+      github.delayOf = delayOf;
+      fs.rmSync(file, { force: true });
+      const result = await service().refresh(TOKEN, ACCOUNT_ID);
+      expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+      expect(github.lookups()).toHaveLength(7);
+      results.push({ ...result, fetchedAt: undefined });
+    }
+    expect(results[1]).toEqual(results[0]);
+    expect(results[2]).toEqual(results[0]);
+    const first = results[0] as { repositories: RepositoryInfo[]; withoutConfiguration: Array<{ nameWithOwner: string }> };
+    expect(names(first.repositories)).toEqual(expected(repos).repositories);
+    expect(names(first.withoutConfiguration)).toEqual(expected(repos).withoutConfiguration);
+  });
+
+  it('starts the lookups of changed repositories right after their page on a refresh, while the list still loads', async () => {
+    const repos = Array.from({ length: 250 }, (_, i) => repo(`acme/r${i}`, i % 2 === 0));
+    github.repos = repos;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    // Last push first: the pushed repositories are on the first page; a new one is on the last.
+    github.repos = [
+      ...repos.slice(0, 3).map((item) => ({ ...item, pushedAt: '2026-09-25T08:00:00Z' })),
+      ...repos.slice(3),
+      repo('acme/new'),
+    ];
+    github.requests.length = 0;
+    github.events.length = 0;
+    github.lookupDelayMs = 30;
+    const logger = recordingLogger();
+    const result = await service(logger).refresh(TOKEN, ACCOUNT_ID);
+    expect(github.requests.map((request) => operation(request))).toEqual([
+      'query Discover',
+      'query Configurations',
+      'query Discover',
+      'query Discover',
+      'query Configurations',
+    ]);
+    expect(github.lookups().map((request) => request.variables)).toEqual([
+      { o0: 'acme', n0: 'r0', o1: 'acme', n1: 'r1', o2: 'acme', n2: 'r2' },
+      { o0: 'acme', n0: 'new' },
+    ]);
+    // The first batch runs while the other pages load.
+    expect(github.events.indexOf('start Configurations')).toBeLessThan(github.events.lastIndexOf('start Discover'));
+    expect(github.events.lastIndexOf('end Discover')).toBeLessThan(github.events.indexOf('end Configurations'));
+    expect(names(result.repositories)).toEqual([...expected(repos).repositories, 'acme/new']);
+    expect(names(result.withoutConfiguration)).toEqual(expected(repos).withoutConfiguration);
+    expect(logger.lines).toContain('Repository list: configurations of 4 new or changed repositories read with 2 requests.');
+    expect(logger.lines.some((line) => /^Repository list: 3 list requests \(.*\), 2 lookup requests \(.*\), 0 other requests; at most 2 /.test(line))).toBe(true);
+  });
+
+  it('asks only about the owners of the scope, and keeps a slot for their pages beside the lookups', async () => {
+    owners = ['acme', 'beta'];
+    github.repos = [
+      ...Array.from({ length: 230 }, (_, i) => repo(`acme/a${i}`, i % 2 === 0)),
+      ...Array.from({ length: 170 }, (_, i) => repo(`other/o${i}`)),
+      ...Array.from({ length: 120 }, (_, i) => repo(`beta/b${i}`, i % 3 === 0)),
+    ];
+    github.lookupDelayMs = 30;
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    const scoped = github.repos.filter((item) => !item.nameWithOwner.startsWith('other/'));
+    expect(github.ofQuery(OWNER_REPOSITORIES_QUERY).map((request) => [request.variables.login, request.variables.cursor])).toEqual(
+      expect.arrayContaining([
+        ['acme', null],
+        ['acme', '100'],
+        ['acme', '200'],
+        ['beta', null],
+        ['beta', '100'],
+      ]),
+    );
+    expect(github.ofQuery(OWNER_REPOSITORIES_QUERY)).toHaveLength(5);
+    expect(JSON.stringify(github.requests)).not.toContain('other');
+    const looked = github.lookups().flatMap((request) =>
+      Array.from({ length: Object.keys(request.variables).length / 2 }, (_, i) => `${String(request.variables[`o${i}`])}/${String(request.variables[`n${i}`])}`),
+    );
+    expect(looked.sort()).toEqual(scoped.map((item) => item.nameWithOwner).sort());
+    expect(github.lookups()).toHaveLength(Math.ceil(scoped.length / LOOKUP_BATCH_SIZE));
+    const counts = openCounts(github.events);
+    expect(counts.lookupsAtPageStart).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY - 1);
+    expect(counts.total).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+    expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+    // The order of the scope, then the order of the pages.
+    expect(names(result.repositories)).toEqual(scoped.filter((item) => item.config).map((item) => item.nameWithOwner));
+    expect(names(result.withoutConfiguration)).toEqual(scoped.filter((item) => !item.config).map((item) => item.nameWithOwner));
+  });
+});
+
+describe('a failed refresh stops its requests (review round 1)', () => {
+  /**
+   * Answers the matching list page (or page of an owner) with HTTP 403, and counts the requests whose signal was aborted
+   * while GitHub answered them (the fake answers them anyway, like a server that does not notice the abort in time).
+   */
+  function failingPage(match: (variables: Record<string, unknown>) => boolean): HttpTransport & { aborted: number } {
+    const transport = {
+      aborted: 0,
+      request: async (request: HttpRequest, signal?: AbortSignal): Promise<HttpResponse> => {
+        const parsed = JSON.parse(request.body ?? '{}') as GraphQLRequest;
+        if (!parsed.query.startsWith('query Configurations(') && match(parsed.variables)) {
+          return { status: 403, headers: {}, body: '{"message":"Resource not accessible"}' };
+        }
+        const response = await github.request(request);
+        if (signal?.aborted) transport.aborted++;
+        return response;
+      },
+    };
+    return transport;
+  }
+
+  /** A stored list of `count` repositories, then 5 pushed repositories on every page of 100. */
+  async function storedWithChanges(count: number, owner = 'acme'): Promise<FakeRepository[]> {
+    const repos = Array.from({ length: count }, (_, i) => repo(`${owner}/r${i}`));
+    github.repos = repos;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    return repos.map((item, i) => (i % 100 < 5 ? { ...item, pushedAt: '2026-09-24T10:00:00Z' } : item));
+  }
+
+  it('aborts the lookups it started, rejects only when they settled, and reports no part after that', async () => {
+    github.repos = await storedWithChanges(500);
+    github.lookupDelayMs = 60;
+    github.requests.length = 0;
+    github.peak = 0;
+    const transport = failingPage((variables) => variables.cursor === '300');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    const stored = fs.readFileSync(file, 'utf8');
+    const error = await discovery.refresh(TOKEN, ACCOUNT_ID).catch((reason: unknown) => reason);
+    expect(String(error)).toMatch(/HTTP status 403: Resource not accessible/);
+    // Batches of pages 1 to 3 ran when page 4 failed: all were aborted and settled before the refresh rejected.
+    expect(github.lookups().length).toBeGreaterThan(0);
+    expect(github.open).toBe(0);
+    expect(transport.aborted).toBeGreaterThan(0);
+    expect(fs.readFileSync(file, 'utf8')).toBe(stored);
+
+    // The next refresh, started at once, never runs beside requests of the failed one.
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+    expect(result.repositories).toHaveLength(500);
+  });
+
+  it('reports no part of the failed refresh after it rejected', async () => {
+    github.repos = await storedWithChanges(500);
+    github.lookupDelayMs = 60;
+    const transport = failingPage((variables) => variables.cursor === '300');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    const parts: number[] = [];
+    discovery.onPartialResult(({ data }) => parts.push(data.repositories.length));
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/403/);
+    const before = parts.length;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(parts).toHaveLength(before);
+  });
+
+  it('stops the pages of the other owners of a scope and their lookups too', async () => {
+    owners = ['acme', 'beta'];
+    const acme = await storedWithChanges(300, 'acme');
+    github.repos = [...acme, ...Array.from({ length: 300 }, (_, i) => repo(`beta/b${i}`, true, i % 100 < 5 ? '2026-09-24T10:00:00Z' : '2026-09-20T10:00:00Z'))];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.repos = github.repos.map((item) => ({ ...item, pushedAt: item.pushedAt === '2026-09-24T10:00:00Z' ? '2026-09-25T10:00:00Z' : item.pushedAt }));
+    github.lookupDelayMs = 60;
+    github.listDelayMs = 10;
+    github.peak = 0;
+    const transport = failingPage((variables) => variables.login === 'acme' && variables.cursor === '100');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/403/);
+    expect(github.open).toBe(0);
+    expect(transport.aborted).toBeGreaterThan(0);
+    // The next refresh, started at once, never runs beside requests of the failed one.
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
   });
 });
