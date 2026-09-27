@@ -9,17 +9,17 @@ import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
-import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
+import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
-import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
+import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import { PipelineTexts, type ConfigurationKindChange, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
 import { containerIsCurrent, isUnrestrictedContainer, repositoryServiceDataFolders } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
-import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
+import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
   BusyMark,
   BusyOperation,
@@ -108,8 +108,6 @@ export interface ControllerDeps {
   service: EnvironmentService;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
-  /** Claims of environments of an older version (concept 7.5). */
-  claims: EnvironmentClaims;
   ui: VsCodePipelineUi;
   connection: ConnectionAdapter;
   coordinator: SessionCoordinator;
@@ -154,8 +152,6 @@ interface Target {
    * account that is signed in then (D-3).
    */
   named?: boolean;
-  /** The command asked whether the entry of an older version of the repository is assigned (the open does not ask again). */
-  olderEnvironmentAsked?: boolean;
 }
 
 interface StartOptions {
@@ -282,10 +278,7 @@ export class Controller implements vscode.Disposable {
       try {
         await handlers[name](argument);
       } catch (error) {
-        // An entry of an older version that a command could not assign yet (for example the account changed during the
-        // claim): Try again runs the command again, for the account that is signed in then.
-        const again = isUserFacingError(error) && error.code === 'environmentUnassigned' ? () => run(name, argument) : undefined;
-        this.showError(error, again);
+        this.showError(error);
       }
     };
     return (Object.keys(handlers) as CommandName[]).map((name) =>
@@ -370,7 +363,7 @@ export class Controller implements vscode.Disposable {
     if (!environment) return;
     this.current = { environment, containerName, lost: false };
     this.updateStatusBar();
-    // Concept 7.5: an account change while the window checked its environment (for example during the claim) found no
+    // Concept 7.5: an account change while the window checked its environment found no
     // environment of this window yet. Check the account again now that the window has one; the window leaves (and the
     // token file is removed) when the environment is not the account's.
     if (!(await this.stillAvailable(environment))) return;
@@ -702,9 +695,8 @@ export class Controller implements vscode.Disposable {
 
   /** Select configuration… (concept 6.2, 7.5): changes the configuration of the environment and rebuilds it. */
   async selectConfiguration(argument: CommandArgument): Promise<void> {
-    const resolved = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForConfiguration);
-    if (!resolved) return;
-    const target = await this.withOlderEnvironment(resolved);
+    const target = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForConfiguration);
+    if (!target) return;
     const repository = this.displayName(target);
     const environment = target.environment;
     let configPaths = target.info?.configPaths ?? [];
@@ -748,7 +740,7 @@ export class Controller implements vscode.Disposable {
     const environment = target.environment;
     if (!environment) {
       await this.startTarget(target, { configPath, window: 'currentWindow' }, async () =>
-        this.applyConfiguration(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), configPath),
+        this.applyConfiguration(await this.refreshedTarget(target, 'token'), configPath),
       );
       return;
     }
@@ -761,9 +753,8 @@ export class Controller implements vscode.Disposable {
 
   /** Switch branch… (concept 6.2, 7.5). */
   async switchBranch(argument: CommandArgument): Promise<void> {
-    const resolved = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForBranch);
-    if (!resolved) return;
-    const target = await this.withOlderEnvironment(resolved);
+    const target = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForBranch);
+    if (!target) return;
     const token = await this.deps.auth.getToken({ interactive: true });
     if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
     const environment = target.environment;
@@ -777,15 +768,14 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Switch branch… after the pick. Try again of a first open that failed runs this step again with the same branch, for
-   * the environment of the repository that the account signed in now has then (its own, an older entry that it claims,
-   * or none), as the command does.
+   * the environment of the repository that the account signed in now has then (its own, or none), as the command does.
    */
   private async switchToBranch(target: Target, branch: string): Promise<void> {
     const environment = target.environment;
     if (!environment) {
       // Concept 6.2: without an environment, the first Start creates it on the selected branch.
       await this.startTarget(target, { branch, window: 'currentWindow' }, async () =>
-        this.switchToBranch(await this.withOlderEnvironment(await this.refreshedTarget(target, 'token')), branch),
+        this.switchToBranch(await this.refreshedTarget(target, 'token'), branch),
       );
       return;
     }
@@ -1049,7 +1039,6 @@ export class Controller implements vscode.Disposable {
                   signal,
                   branch: options.branch,
                   configPath: options.configPath,
-                  olderEnvironmentAsked: target.olderEnvironmentAsked,
                 });
               }
               await this.connect(result, progress, request, signal);
@@ -1507,7 +1496,7 @@ export class Controller implements vscode.Disposable {
         operation: request.operation,
         reason: request.reason,
         configPath: request.configPath,
-        additionalVolumesToRemove: request.operation === 'delete' ? pendingVolumesToRemove(request, environment) : undefined,
+        additionalVolumesToRemove: request.operation === 'delete' ? (request.additionalVolumesToRemove ?? []) : undefined,
       },
       HAND_OFF_BUSY[request.operation],
     );
@@ -1537,7 +1526,7 @@ export class Controller implements vscode.Disposable {
           await this.operation(
             this.displayName(target),
             'Delete',
-            () => this.deleteWithProgress(this.displayName(target), environment, pendingVolumesToRemove(operation, environment)),
+            () => this.deleteWithProgress(this.displayName(target), environment, operation.additionalVolumesToRemove ?? []),
             { retry: () => this.delete({ kind: 'environment', environmentId: environment.id }) },
           );
           return;
@@ -1729,8 +1718,7 @@ export class Controller implements vscode.Disposable {
   private async reopenLeftEnvironment(left: LeftEnvironment): Promise<boolean> {
     if (left.reason !== 'account') return false;
     const account = await this.readAccount();
-    const found = await this.deps.registry.get(left.environmentId).catch(() => undefined);
-    const environment = found && account ? await this.claimIfUnowned(found, account, 'auto') : found;
+    const environment = await this.deps.registry.get(left.environmentId).catch(() => undefined);
     if (this.left !== left || this.current || this.disposed) return false;
     if (!environment || !isAvailableTo(environment, account)) return false;
     this.left = undefined;
@@ -1770,26 +1758,19 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Concept 7.5, role A and a restored registry: the environment that this window is attached to, when it belongs to the
-   * signed-in account (an entry of an older version is claimed first; a sign-in is asked for when needed). Otherwise
+   * signed-in account (a sign-in is asked for when needed). Otherwise
    * the window runs no pipeline, starts no container, and closes its remote connection with a message; `undefined`.
    * Assumption (V-8): the activation blocks the connection of a restored window (V-2), so the window of another account
    * never connects to a stopped container; a container that still runs is closed right after the connection.
    */
   private async ownWindowEnvironment(environment: Environment, containerName: string): Promise<Environment | undefined> {
     const account = await this.readAccount(true);
-    // Before the connection of a restored window: no question (concept 7.5), only an unambiguous claim.
-    const current = account ? await this.claimIfUnowned(environment, account, 'auto') : environment;
-    if (account && isAvailableTo(current, account)) return current;
+    if (account && isAvailableTo(environment, account)) return environment;
     const repository = this.displayName({ repository: environment.repository });
     let message: string;
     if (!account) {
       this.logger.info('Nobody is signed in to GitHub. The window closes its remote connection.');
       message = ControllerTexts.signedOutConnection(repository);
-    } else if (current.owner === undefined) {
-      this.logger.info(
-        `The environment ${environment.id} of an older version does not belong to an account yet. The window closes its remote connection.`,
-      );
-      message = ControllerTexts.ownerNotConfirmedConnection(repository);
     } else {
       this.logger.info('This window is attached to an environment of another GitHub account. It closes its remote connection.');
       message = Messages.otherAccountConnection(repository);
@@ -1957,8 +1938,7 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Concept 7.5: the target, when its environment (if any) belongs to the signed-in account; an entry of an older
-   * version is claimed first. Asks for a sign-in when the target has an environment and nobody is signed in. Otherwise
+   * Concept 7.5: the target, when its environment (if any) belongs to the signed-in account. Asks for a sign-in when the target has an environment and nobody is signed in. Otherwise
    * shows Messages.otherAccount and returns `undefined`: only an environment that the command names can be one of
    * another account (a row or the status bar item from before an account change), never the environment of a repository.
    */
@@ -1967,70 +1947,10 @@ export class Controller implements vscode.Disposable {
     if (!environment) return target;
     const account = await this.readAccount(true);
     if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    // A command of the user: an entry of an older version is assigned after a question when the claim is not unambiguous.
-    const current = await this.claimIfUnowned(environment, account, 'interactive');
-    if (isAvailableTo(current, account)) return { ...target, environment: current };
-    if (current.owner === undefined) {
-      // Not "another account": nobody owns the entry yet (no answer of GitHub, no access, or no confirmation).
-      this.logger.info(`The environment ${environment.id} of an older version does not belong to an account yet. It is not used.`);
-      this.warn(Messages.olderEnvironmentNotAssigned(this.displayName(target)));
-      return undefined;
-    }
+    if (isAvailableTo(environment, account)) return target;
     this.logger.info(`The environment ${environment.id} belongs to another GitHub account. It is not used.`);
     this.warn(Messages.otherAccount(this.displayName(target)));
     return undefined;
-  }
-
-  /**
-   * Switch branch… and Select configuration… change the environment of the repository. When the signed-in account has
-   * none, an entry of an older version of the repository is claimed first (concept 7.5), so that the branch or the
-   * configuration applies to it. Otherwise the target stays without environment, and the open pipeline creates the
-   * environment of the account (D-3).
-   */
-  private async withOlderEnvironment(target: Target): Promise<Target> {
-    if (target.environment) return target;
-    const account = await this.readAccount();
-    const older = account ? await this.deps.registry.findUnowned(target.repository) : undefined;
-    if (!account || !older) return target;
-    // The command asks also about an entry that the user declined before (like a new Start), so the open need not ask.
-    const claimed = await this.claimIfUnowned(older, account, 'interactive', true);
-    return isAvailableTo(claimed, account) ? { ...target, environment: claimed } : { ...target, olderEnvironmentAsked: true };
-  }
-
-  /**
-   * An environment without owner (of an older version) is claimed for `account` (EnvironmentClaims, concept 7.5): in the
-   * mode `auto` only when it can belong to no other account, in the mode `interactive` also after a question to the user.
-   * The token and the account come from one session: a session that changed since `account` was read claims nothing.
-   */
-  private async claimIfUnowned(
-    environment: Environment,
-    account: GitHubAccount,
-    mode: ClaimMode,
-    askAgain = false,
-  ): Promise<Environment> {
-    if (environment.owner) return environment;
-    let session: { token: string; account: GitHubAccount } | undefined;
-    try {
-      // The claim asks GitHub, so it needs a working token: a command of the user asks for a new sign-in while GitHub
-      // rejects the token of the session (auth.ts); a restored window (`auto`) never asks.
-      session = await this.deps.auth.getSession({ interactive: mode === 'interactive' });
-    } catch (error) {
-      this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
-      return environment;
-    }
-    // A command whose sign-in the user cancelled ends here: it would ask for the same sign-in again.
-    if (!session && mode === 'interactive') throw new UserFacingError('signInRequired', Messages.signInRequired);
-    if (!session) return environment;
-    if (session.account.id !== account.id) {
-      this.logger.info(`The GitHub session changed. The environment ${environment.id} is not claimed.`);
-      // A command says so (not "not assigned"): the account that is signed in now was not asked.
-      if (mode === 'interactive') {
-        throw new UserFacingError('environmentUnassigned', ControllerTexts.accountChangedDuringClaim(this.displayName({ repository: environment.repository })));
-      }
-      return environment;
-    }
-    await this.deps.claims.claim(session.account, session.token, { mode, environmentIds: [environment.id], ...(askAgain ? { askAgain } : {}) });
-    return (await this.deps.registry.get(environment.id)) ?? environment;
   }
 
   /**

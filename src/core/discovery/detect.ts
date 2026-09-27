@@ -26,7 +26,7 @@ export interface ConfigurationNode {
 }
 
 function isFile(entry: { type?: string }): boolean {
-  // Nested entries of older query results may lack `type`; a name match is then enough.
+  // A nested entry without `type` in the answer of GitHub: a name match is then enough.
   return entry.type === undefined || entry.type === 'blob';
 }
 

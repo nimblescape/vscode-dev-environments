@@ -71,6 +71,8 @@ function input(names: string[]): TreeInput | undefined {
     organizations: [],
     repositories: names.map((name) => repo(`school/${name}`)),
     hints: [],
+    scope: [],
+    withoutConfiguration: [],
   };
   return cloneableInput({
     discovery,

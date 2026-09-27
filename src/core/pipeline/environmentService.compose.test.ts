@@ -42,7 +42,7 @@ import {
   resourceName,
 } from '../names';
 import type { ContainerInfo } from '../docker/containerAdapter';
-import type { BuildRecord, ContainerState } from '../types';
+import type { BuildRecord, ContainerState, Environment } from '../types';
 import { PipelineTexts, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
@@ -183,15 +183,24 @@ async function seedCompose(
     /** More labels of the dev container and of the db container. */
     devLabels?: Record<string, string>;
     dbLabels?: Record<string, string>;
+    /** More fields of the entry. */
+    extra?: Partial<Environment>;
   } = {},
 ): Promise<void> {
   await seedEnvironment(h, {
+    ...(p.extra ? { extra: p.extra } : {}),
     container: p.dev === undefined ? 'stopped' : p.dev,
     containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', ...p.devLabels },
     record: {
       configHash: HASH,
       images: { [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST },
-      compose: { service: 'app', images: [`${PROJECT}-app`] },
+      compose: {
+        service: 'app',
+        images: [`${PROJECT}-app`],
+        serviceImages: [DB_IMAGE],
+        version: '2.40.3',
+        inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}),
+      },
       ...p.record,
     },
   });
@@ -611,7 +620,7 @@ describe('existing Docker Compose environment', () => {
 
   it('removes the old base image of the dev service after an update, but not the old image of a side service (review round 1, D5)', async () => {
     await seedCompose({
-      record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST }, compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE] } },
+      record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST }, compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.40.3', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } },
     });
     const oldBase = `mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`;
     const oldDb = `docker.io/library/postgres@${DB_DIGEST}`;
@@ -624,16 +633,6 @@ describe('existing Docker Compose environment', () => {
     // The image of the database is the user's (for example also used outside Dev Environments).
     expect(h.docker.log).not.toContain(`rmi ${oldDb}`);
     expect(h.docker.images.has(oldDb)).toBe(true);
-  });
-
-  it('removes no base image of a Docker Compose build record without the list of service images (review round 1, D5)', async () => {
-    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
-    const oldDb = `docker.io/library/postgres@${DB_DIGEST}`;
-    h.docker.images.add(oldDb);
-    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
-    await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
-    expect(h.docker.log.filter((line) => line.startsWith('rmi') && line.includes('@'))).toEqual([]);
   });
 
   it('keeps the environment when the newer dev service image needs access to the computer (refused update)', async () => {
@@ -1131,7 +1130,7 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
   });
 
   it('asks about every volume of a restored entry whose volumes have no label of the data of a service (review round 2, D2-3)', async () => {
-    // Created by a version before the label: whether a service used it is not known.
+    // Created without the label (for example by Docker at `up`): whether a service used it is not known.
     seedVolumes({ 'myapp-db': volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'shared-tools': volumeLabelsOf(VOLUME_KIND_ADDITIONAL) });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
@@ -1851,7 +1850,6 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     // Review round 10, D10-1 and D10-3: in the entry, not in the build record, and without the read-only INIT_SQL
     // (before: buildRecord.compose.serviceFolders [SOURCE, INIT_SQL]).
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toBeUndefined();
   });
 
   it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
@@ -1865,9 +1863,9 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     expect(h.helper.switchServiceFolders).toEqual([[SOURCE]]);
   });
 
-  it('records the paths at an up without a build, and leaves out nothing for a build record written before them', async () => {
+  it('records the paths at an up without a build; an entry without them leaves out nothing before', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
-    // A record without serviceFolders (written by an earlier version): Switch branch… leaves out nothing, as before.
+    // An entry without serviceFolders: Switch branch… leaves out nothing.
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
     expect(h.helper.switchServiceFolders).toEqual([[]]);
     // The next start with up records the paths of the model. Review round 10, D10-3: with a data folder of db that
@@ -1900,8 +1898,8 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
   }
 
   it('keeps the folder of the old model at an up --no-recreate (Rebuild later), for Switch branch… and Delete', async () => {
-    // A build record of review round 9 names OLD; the db container was created with it and is not created again.
-    await seedCompose({ dev: 'stopped', db: 'stopped', record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceFolders: [OLD] } } as Partial<BuildRecord> });
+    // The entry names OLD; the db container was created with it and is not created again.
+    await seedCompose({ dev: 'stopped', db: 'stopped', extra: { serviceFolders: [OLD] } });
     withNewFolder();
     h.ui.configurationChangedAnswer = 'later';
     await h.service.openEnvironment(ENV_ID, options());
@@ -1910,7 +1908,6 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     // Before: [NEW] (in the build record), and the next Switch branch… gave the live data in OLD to the dev user.
     // Review round 11, G3: the paths of the model first, then the recorded ones (before: [OLD, NEW]).
     expect(entry?.serviceFolders).toEqual([NEW, OLD]);
-    expect(entry?.buildRecord?.compose?.serviceFolders).toBeUndefined();
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
     // Review round 11, G3: in the order of the record (before: [OLD, NEW]).
     expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW, OLD]);
@@ -1942,7 +1939,7 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
   });
 
   it('replaces the list when no container of another service exists before up (review round 11, G3: and the old folder is gone)', async () => {
-    await seedCompose({ dev: 'stopped', db: null, record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceFolders: [OLD] } } as Partial<BuildRecord> });
+    await seedCompose({ dev: 'stopped', db: null, extra: { serviceFolders: [OLD] } });
     withNewFolder();
     // Review round 11, G3: OLD is kept only while it exists in the volume (before: dropped because no container of
     // another service existed, although its data may still be there); here it no longer exists.
@@ -2968,45 +2965,6 @@ describe('review round 19 of unit 6 (D19-1): `${localEnv:COMPOSE_PROJECT_NAME}` 
   });
 });
 
-describe('review round 19 of unit 6 (S19-1): the configuration hash of an environment whose model has a $ changes once', () => {
-  /** The model as it holds the texts now (unescaped), and the hash that an earlier version recorded (escaped texts). */
-  const withDollar = () => output((m) => (m.services.db.environment = { POSTGRES_PASSWORD: 'a$b' }));
-  const legacyHash = () => {
-    const m = model();
-    m.services.db.environment = { POSTGRES_PASSWORD: 'a$$b' };
-    return composeConfigHash(CONFIG_TEXT, m, {});
-  };
-  const legacyRecord = () => ({
-    configHash: legacyHash(),
-    compose: { service: 'app', images: [`${PROJECT}-app`], version: '2.40.3', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) },
-  });
-
-  it('asks as for any change; "Rebuild later" starts the existing containers as they are', async () => {
-    await seedCompose({ dev: 'stopped', record: legacyRecord() });
-    useCompose(h, withDollar());
-    h.ui.configurationChangedAnswer = 'later';
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-    await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.builds).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
-    expect(devContainer()?.state).toBe('running');
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(legacyHash());
-  });
-
-  it('"Rebuild now" rebuilds once, keeps the volumes, and records the new hash; then no change is left', async () => {
-    await seedCompose({ record: legacyRecord() });
-    useCompose(h, withDollar());
-    h.ui.configurationChangedAnswer = 'rebuildNow';
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-    await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
-    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
-    expect(upModel().services.db.environment).toEqual({ POSTGRES_PASSWORD: 'a$$b' });
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(composeConfigHash(CONFIG_TEXT, withDollar().model, {}));
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
-  });
-});
-
 describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev service', () => {
   const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS base\n';
 
@@ -3174,7 +3132,7 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
       const web = byService('web')!;
       await h.service.stop(ENV_ID);
-      // For example started by hand, or left running by an earlier version of the extension.
+      // For example started by hand.
       await h.docker.runChecked(['start', app.id]);
       const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
       expect(result.containerName).toBe(NAME);

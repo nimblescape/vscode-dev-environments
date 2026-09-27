@@ -157,13 +157,6 @@ describe('showError (concept 6.5)', () => {
     expect(shown()).toEqual({ severity: 'warning', message: Messages.otherAccount('acme/api'), actions: [] });
   });
 
-  it('shows an environment of an older version that is not assigned yet as a warning with Try again (concept 7.5)', () => {
-    const { logger } = recordingLogger();
-    const message = Messages.olderEnvironmentNotAssigned('acme/api');
-    showError(new UserFacingError('environmentUnassigned', message), { logger, showLog: vi.fn(), retry: vi.fn() });
-    expect(shown()).toEqual({ severity: 'warning', message, actions: ['Show details', 'Try again'] });
-  });
-
   it('shows nothing for a cancellation, and logs it', () => {
     for (const error of [new UserFacingError('cancelled', 'The operation was cancelled.'), abortError()]) {
       resetFakeVscode();
@@ -210,7 +203,6 @@ describe('showError (concept 6.5)', () => {
       'hostAccess',
       'unencryptedDockerConnection',
       'otherAccount',
-      'environmentUnassigned',
     ] as const;
     for (const code of codes) {
       for (const retry of [undefined, vi.fn()]) {

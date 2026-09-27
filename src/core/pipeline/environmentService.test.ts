@@ -120,26 +120,6 @@ async function rejection(promise: Promise<unknown>): Promise<UserFacingError> {
   throw new Error('The promise did not reject.');
 }
 
-type ClaimSpy = ReturnType<typeof fakeClaims>;
-
-/**
- * EnvironmentClaims.claim for the service: gives each entry of `environmentIds` without owner to the account when `grant`
- * resolves to true (GitHub confirmed the access). Never throws, like EnvironmentClaims.
- */
-function fakeClaims(grant: () => Promise<boolean>) {
-  return vi.fn(async (account: GitHubAccount, _token: string, claimOptions: { environmentIds?: readonly string[]; mode?: string } = {}) => {
-    const claimed: string[] = [];
-    for (const id of claimOptions.environmentIds ?? []) {
-      if (!(await grant())) continue;
-      const updated = await h.registry.updateEnvironment(id, (e) => {
-        e.owner ??= { ...account };
-      });
-      if (updated?.owner?.id === account.id) claimed.push(id);
-    }
-    return claimed;
-  });
-}
-
 /** A git summary script run through docker exec: 4 lines. */
 function gitExecOutput(branch: string, counts = [0, 0, 0]): string {
   return `${branch}\n${counts.join('\n')}\n`;
@@ -1553,19 +1533,9 @@ describe('open: registry lost', () => {
     expect(result.environment.owner).toEqual(ACCOUNT);
   });
 
-  /** A harness whose service claims entries without owner (fakeClaims), with a restored volume without owner. */
-  function withClaims(grant: () => Promise<boolean>): ClaimSpy {
-    const claim = fakeClaims(grant);
-    h = recreate({ claims: { claim } });
-    h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
-    return claim;
-  }
-
-  it('creates an environment of the account next to a restored volume of another account, without a claim (concept D-3)', async () => {
-    const claim = withClaims(async () => true);
+  it('creates an environment of the account next to a restored volume of another account (concept D-3)', async () => {
     h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
     const result = await h.service.open(TARGET, options());
-    expect(claim).not.toHaveBeenCalled();
     expect(result.environment.id).not.toBe(OTHER_ID);
     expect(result.environment.owner).toEqual(ACCOUNT);
     expect(h.helper.clones).toEqual([expect.objectContaining({ volumeName: result.environment.volumeName, token: TOKEN })]);
@@ -1576,69 +1546,17 @@ describe('open: registry lost', () => {
     expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);
   });
 
-  it('claims a restored volume of an older version (without owner) for the account, and uses it', async () => {
-    const claim = withClaims(async () => true);
-    const result = await h.service.open(TARGET, options());
-    // Start is a command of the user: the claim may ask (EnvironmentClaims, mode interactive).
-    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [OTHER_ID], mode: 'interactive' }));
-    expect(result.environment.id).toBe(OTHER_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect((await h.registry.list()).map((e) => e.id)).toEqual([OTHER_ID]);
-    expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
-    expect(h.helper.clones).toEqual([]);
-  });
-
-  it('leaves a restored volume of an older version hidden when the claim fails, and creates an environment of the account', async () => {
-    const claim = withClaims(async () => false);
-    const result = await h.service.open(TARGET, options());
-    expect(claim).toHaveBeenCalledTimes(1);
-    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [OTHER_ID], mode: 'interactive' }));
-    expect(result.environment.id).not.toBe(OTHER_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect(h.helper.clones).toEqual([expect.objectContaining({ volumeName: result.environment.volumeName })]);
-    // The entry of the older version keeps its volume and stays without owner, so the account that created it can claim it.
-    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
-    expect(h.docker.volumes.has(OLD_NAME)).toBe(true);
-    expect(h.ui.warnings).toEqual([]);
-
-    // The next open uses the environment of the account; the entry of the older version is not asked about again.
-    const again = await h.service.open(TARGET, options());
-    expect(again.environment.id).toBe(result.environment.id);
-    expect(claim).toHaveBeenCalledTimes(1);
-    expect(h.helper.clones).toHaveLength(1);
-  });
-
-  it('leaves a restored volume of an older version hidden without claims, and creates an environment of the account', async () => {
+  it('restores no volume without a valid label devenv.owner-id, and creates an environment of the account', async () => {
     h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).not.toBe(OTHER_ID);
-    expect((await h.registry.list()).map((e) => e.id).sort()).toEqual([OTHER_ID, result.environment.id].sort());
-    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
-  });
-
-  it('refuses the restored entry of an older version as not assigned when it is opened by its ID and the claim fails', async () => {
-    let online = false;
-    const claim = withClaims(async () => online);
-    expect(await h.service.reconcileFromVolumes()).toBe(1);
-    const error = await rejection(h.service.openEnvironment(OTHER_ID, options()));
-    expect(claim).toHaveBeenCalledTimes(1);
-    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect(error.code).not.toBe('otherAccount');
-    expect((await h.registry.get(OTHER_ID))?.owner).toBeUndefined();
-    expect(h.helper.calls).toEqual([]);
-
-    // Try again, with GitHub reachable: the open claims it and uses it.
-    online = true;
-    const result = await h.service.openEnvironment(OTHER_ID, options());
-    expect(claim).toHaveBeenCalledTimes(2);
-    expect(result.environment.id).toBe(OTHER_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect(h.helper.clones).toEqual([]);
+    expect((await h.registry.list()).map((e) => e.id)).toEqual([result.environment.id]);
+    expect(h.docker.volumes.has(OLD_NAME)).toBe(true);
   });
 
   it('creates the environment when only volumes of other repositories exist, and restores those', async () => {
     h.docker.volumes.delete(OLD_NAME);
-    h.docker.volumes.set(resourceName('acme/web', OTHER_ID), { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web' });
+    h.docker.volumes.set(resourceName('acme/web', OTHER_ID), { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web', [LABEL_OWNER_ID]: ACCOUNT.id });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).not.toBe(OTHER_ID);
     expect(h.helper.clones).toHaveLength(1);
@@ -1923,27 +1841,28 @@ describe('delete', () => {
   it('removes only volumes whose labels make them its own, and names why it keeps each other one', async () => {
     await seedEnvironment(h, { extra: { additionalVolumes: ['own', 'legacy', 'other-env', 'other-owner', 'no-owner'] } });
     h.docker.volumes.set('own', additionalVolumeLabels());
-    // Recorded by a version before the labels: the user removes it.
+    // Without the labels of the environment (for example made by hand): the user removes it.
     h.docker.volumes.set('legacy', {});
     h.docker.volumes.set('other-env', additionalVolumeLabels(OTHER_ID));
     h.docker.volumes.set('other-owner', additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
-    // A volume without an owner label (an entry of an older version) is its own by the ID.
+    // A volume without an owner label (made by hand) is not its own: the owner label must match too.
     h.docker.volumes.set('no-owner', additionalVolumeLabels(ENV_ID, null));
     await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['own', 'legacy', 'other-env', 'other-owner', 'no-owner'] }));
     expect(h.docker.volumes.has('own')).toBe(false);
-    expect(h.docker.volumes.has('no-owner')).toBe(false);
+    expect(h.docker.volumes.has('no-owner')).toBe(true);
     expect(h.docker.volumes.has('legacy')).toBe(true);
     expect(h.docker.volumes.has('other-env')).toBe(true);
     expect(h.docker.volumes.has('other-owner')).toBe(true);
-    const unlabeled = 'its labels do not show that this environment created it (for example, a version of Dev Environments before these labels created it)';
+    const unlabeled = 'its labels do not show that this environment created it';
     expect(h.logger.infos).toEqual(
       expect.arrayContaining([
         `The volume legacy is kept, because ${unlabeled}.`,
         'The volume other-env is kept, because another environment created it.',
         'The volume other-owner is kept, because another environment created it.',
+        'The volume no-owner is kept, because another environment created it.',
       ]),
     );
-    expect(h.docker.log.filter((line) => line.startsWith('volume rm ') && !line.endsWith(NAME))).toEqual(['volume rm own', 'volume rm no-owner']);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm ') && !line.endsWith(NAME))).toEqual(['volume rm own']);
   });
 
   it('names for the question only the volumes that Delete would remove', async () => {
@@ -2176,8 +2095,8 @@ describe('reconcileFromVolumes', () => {
   it('adds an entry for each labeled volume that the registry lacks', async () => {
     await seedEnvironment(h);
     const name = resourceName('acme/web', OTHER_ID);
-    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web' });
-    h.docker.volumes.set('bad', { [LABEL_ENVIRONMENT_ID]: '../x', [LABEL_REPOSITORY]: 'acme/bad' });
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web', [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.volumes.set('bad', { [LABEL_ENVIRONMENT_ID]: '../x', [LABEL_REPOSITORY]: 'acme/bad', [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set('duplicate', {
       [LABEL_ENVIRONMENT_ID]: '11111111-2222-3333-4444-555555555555',
       [LABEL_REPOSITORY]: 'ACME/api',
@@ -2209,18 +2128,18 @@ describe('reconcileFromVolumes', () => {
   });
 
   // Review round 1 of unit 5 (VOL-2): a named volume without labels that the container mounts ('api-history', for
-  // example one that a version before the labels recorded) is restored again, as origin/main did, so that another
+  // example one that Docker created at `up`) is restored again, as origin/main did, so that another
   // account cannot mount it; this test expected it to be left out before. Delete still keeps it (not the environment's own).
   it('restores its own labelled volumes and the unlabelled named volumes of its container: not anonymous ones, not those of other programs or environments', async () => {
     const name = resourceName('acme/api', OTHER_ID);
     const anonymous = 'ab'.repeat(32);
-    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api' });
-    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, null));
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/api', [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, ACCOUNT));
     h.docker.volumes.set(anonymous, { 'com.docker.volume.anonymous': '' });
     h.docker.volumes.set('shop_db', { 'com.docker.compose.project': 'shop' });
-    // Mounted by the container, but without the labels (a version before them, or `${devcontainerId}`).
+    // Mounted by the container, but without the labels (`${devcontainerId}`, or made by hand).
     h.docker.volumes.set('api-history', {});
-    h.docker.volumes.set('x-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001'));
+    h.docker.volumes.set('x-cache', additionalVolumeLabels('f0000001-0000-4000-8000-000000000001', OTHER_ACCOUNT));
     // Mounted by another container only: never the environment's.
     h.docker.volumes.set('x-only', {});
     for (const volumes of [[name, 'api-node_modules', anonymous, 'api-history'], [name, 'api-node_modules', 'shop_db', 'x-cache', 'api-history']]) {
@@ -2261,10 +2180,10 @@ describe('reconcileFromVolumes', () => {
     expect(h.logger.infos).toContain('The volume web-node_modules is kept, because another environment uses it too.');
   });
 
-  it('lets a declined claim of a restored entry with only anonymous volumes create an environment of the account', async () => {
+  it('records no anonymous volume of a restored entry', async () => {
     const name = resourceName(REPO, OTHER_ID);
     const anonymous = 'cd'.repeat(32);
-    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
     const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, anonymous] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
@@ -2273,8 +2192,8 @@ describe('reconcileFromVolumes', () => {
 
   it('restores no volume that the policy gives to something else by its name', async () => {
     const name = resourceName(REPO, OTHER_ID);
-    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
-    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, null));
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, ACCOUNT));
     const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-acme-web-12345678'];
     const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
@@ -2282,7 +2201,7 @@ describe('reconcileFromVolumes', () => {
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
   });
 
-  it('restores one environment per repository and owner: two accounts, and one entry of an older version (concept D-3)', async () => {
+  it('restores one environment per repository and owner: two accounts, and no volume without an owner label (concept D-3)', async () => {
     const ids = ['a0000001-0000-4000-8000-000000000001', 'a0000002-0000-4000-8000-000000000002', 'a0000003-0000-4000-8000-000000000003'];
     const skippedIds = ['b0000004-0000-4000-8000-000000000004', 'b0000005-0000-4000-8000-000000000005'];
     const volume = (id: string, owner: GitHubAccount | undefined): void => {
@@ -2296,20 +2215,22 @@ describe('reconcileFromVolumes', () => {
     // A second volume of the same repository and owner is not added.
     volume(skippedIds[0], OTHER_ACCOUNT);
     volume(skippedIds[1], undefined);
-    expect(await h.service.reconcileFromVolumes()).toBe(3);
+    expect(await h.service.reconcileFromVolumes()).toBe(2);
     const entries = await h.registry.list();
-    expect(entries.map((e) => [e.id, e.owner?.id])).toEqual([
+    expect(entries.map((e) => [e.id, e.owner.id])).toEqual([
       [ids[0], ACCOUNT.id],
       [ids[1], OTHER_ACCOUNT.id],
-      [ids[2], undefined],
     ]);
-    expect(h.logger.warnings.filter((warning) => warning.includes('another environment of the same owner'))).toEqual(
-      skippedIds.map((id) => `The volume ${resourceName(REPO, id)} belongs to a repository that has another environment of the same owner. It is not added.`),
+    expect(h.logger.warnings.filter((warning) => warning.includes('another environment of the same owner'))).toEqual([
+      `The volume ${resourceName(REPO, skippedIds[0])} belongs to a repository that has another environment of the same owner. It is not added.`,
+    ]);
+    // A volume without the owner label is skipped like one with invalid labels.
+    expect(h.logger.warnings).toEqual(
+      expect.arrayContaining([ids[2], skippedIds[1]].map((id) => `The volume ${resourceName(REPO, id)} has invalid labels and is skipped.`)),
     );
     // Each account finds its own environment of the repository.
     expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.id).toBe(ids[0]);
     expect((await h.registry.findForAccount(REPO, OTHER_ACCOUNT.id))?.id).toBe(ids[1]);
-    expect((await h.registry.findUnowned(REPO))?.id).toBe(ids[2]);
   });
 
   it('does nothing when Docker does not run', async () => {
@@ -2359,44 +2280,6 @@ describe('accounts (concept 7.5, section 9 "Accounts")', () => {
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
     expect(await pendingIds()).toEqual([result.environment.id]);
     expect((await entry())?.owner).toEqual(OTHER_ACCOUNT);
-  });
-
-  it('hides an entry of an older version without owner until a claim: the open is refused as not assigned', async () => {
-    await seedEnvironment(h, { owner: null });
-    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-    expect(error.code).not.toBe('otherAccount');
-    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect((await rejection(h.service.stop(ENV_ID))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect((await rejection(h.service.switchBranch(ENV_ID, 'dev', options()))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect(h.helper.calls).toEqual([]);
-  });
-
-  it('claims an entry of an older version at an open that no claim reached before (a retry, a reopen)', async () => {
-    const claim = fakeClaims(async () => true);
-    h = recreate({ claims: { claim } });
-    await seedEnvironment(h, { owner: null });
-    const result = await h.service.openEnvironment(ENV_ID, options());
-    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [ENV_ID], mode: 'interactive' }));
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect((await entry())?.owner).toEqual(ACCOUNT);
-    expect(h.helper.ups).toHaveLength(1);
-  });
-
-  it('claims without a question for an operation that is not interactive, and never for an entry of another account', async () => {
-    const claim = fakeClaims(async () => false);
-    h = recreate({ claims: { claim } });
-    await seedEnvironment(h, { owner: null, container: 'running' });
-    expect((await rejection(h.service.stop(ENV_ID))).message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect(claim).toHaveBeenCalledWith(ACCOUNT, TOKEN, expect.objectContaining({ environmentIds: [ENV_ID], mode: 'auto' }));
-    expect(h.docker.log).toEqual([]);
-
-    claim.mockClear();
-    await h.registry.updateEnvironment(ENV_ID, (e) => {
-      e.owner = OTHER_ACCOUNT;
-    });
-    expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('otherAccount');
-    expect((await rejection(h.service.switchBranch(ENV_ID, 'dev', options()))).code).toBe('otherAccount');
-    expect(claim).not.toHaveBeenCalled();
   });
 
   it('asks for a sign-in: without an account, no environment is available', async () => {
@@ -3020,7 +2903,6 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
 
   it.each<[string, SeedOptions | undefined]>([
     ['another owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: OTHER_ACCOUNT }],
-    ['an entry without owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: null }],
     ['no entry', undefined],
   ])('refuses a network of the user with a container of an environment of %s (review round 2, P2-2)', async (_name, seed) => {
     if (seed) await seedEnvironment(h, seed);
@@ -3369,10 +3251,10 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
     });
 
-    it('bounds a stored refusal with long items when it is read, logged, shown, and kept (hotfix review 4, Q3)', async () => {
+    it('bounds a stored refusal with long items when it is read, logged, and shown (hotfix review 4, Q3)', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
       await h.service.openEnvironment(ENV_ID, options());
-      // 100 KB of items, as an older version stored them without a bound.
+      // 100 KB of items, as a registry changed by hand could hold them.
       const long = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
       await h.registry.updateEnvironment(ENV_ID, (e) => {
         if (e.refusedUpdate) e.refusedUpdate.items = long;
@@ -3387,9 +3269,6 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       const logged = h.logger.infos.filter((line) => line.includes('was refused by the host access policy'));
       expect(logged).toHaveLength(1);
       expect(logged[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
-      const stored = ((await refusedUpdate()) as { items: string }).items;
-      expect(stored).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
-      expect(stored.endsWith(', and 20 more')).toBe(true);
     });
   });
 
@@ -3440,8 +3319,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
   describe('named volumes of environments of other accounts (finding 4)', () => {
     const SHARED = 'shared-cache';
 
-    /** An environment of another repository that uses the volume SHARED. `null`: an entry of an older version. */
-    async function otherEnvironment(owner: GitHubAccount | null): Promise<void> {
+    /** An environment of another repository that uses the volume SHARED. */
+    async function otherEnvironment(owner: GitHubAccount): Promise<void> {
       await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner, container: null, extra: { additionalVolumes: [SHARED] } });
     }
 
@@ -3454,31 +3333,6 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
       expect(h.helper.builds).toEqual([]);
       expect(h.helper.ups).toEqual([]);
-    });
-
-    it('are refused when an entry of an older version without owner of the same repository uses them: it may hold the work of another person', async () => {
-      await seedEnvironment(h, { id: OTHER_ID, owner: null, container: null, extra: { additionalVolumes: [SHARED] } });
-      await seedEnvironment(h, { container: null });
-      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
-      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
-      expect(h.helper.ups).toEqual([]);
-    });
-
-    it('are refused when an entry of an older version without owner of another repository uses them', async () => {
-      await otherEnvironment(null);
-      await seedEnvironment(h, { container: null });
-      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
-      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-      expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
-    });
-
-    it('are allowed when the environment recorded them itself: entries of one person shared them before the separation', async () => {
-      await otherEnvironment(null);
-      await seedEnvironment(h, { container: null, extra: { additionalVolumes: [SHARED] } });
-      h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };
-      await h.service.openEnvironment(ENV_ID, options());
-      expect(h.helper.ups).toHaveLength(1);
     });
 
     it('are allowed when the environment recorded them itself, also when another account uses them', async () => {
@@ -3530,7 +3384,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.docker.volumes.has('api-existing')).toBe(true);
     });
 
-    // hotfix review 2, P5 (a known limit): an existing volume without labels (created by a version before the labels, or
+    // hotfix review 2, P5 (a known limit): an existing volume without labels (created by hand, or
     // by Docker at `up`) is shared by every environment that mounts it; the pipeline names it in the log.
     it('logs an existing volume without labels that the container mounts', async () => {
       await seedEnvironment(h, { container: null });
@@ -3567,7 +3421,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       };
       await rejection(h.service.openEnvironment(ENV_ID, options()));
       expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['0k5q7r2m-history']);
-      // An entry without it (for example of a version before this record) gets it at the next open of the container.
+      // An entry without it (for example changed by hand) gets it at the next open of the container.
       await h.registry.updateEnvironment(ENV_ID, (entry) => {
         delete entry.additionalVolumes;
       });
@@ -3597,7 +3451,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(['quoted-cache', 'feature-store']);
     });
 
-    it.each<[string, GitHubAccount | null]>([['an environment of the same account', ACCOUNT]])('are allowed when %s uses them', async (_name, owner) => {
+    it.each<[string, GitHubAccount]>([['an environment of the same account', ACCOUNT]])('are allowed when %s uses them', async (_name, owner) => {
       await otherEnvironment(owner);
       await seedEnvironment(h, { container: null });
       h.helper.config = { image: BASE_IMAGE, runArgs: ['-v', `${SHARED}:/cache`] };

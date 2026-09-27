@@ -22,15 +22,6 @@ describe('Messages.localEnvNotPassed', () => {
   });
 });
 
-describe('Messages.olderEnvironmentNotAssigned', () => {
-  // Concept 7.5: nobody owns such an entry yet, so the text must not say "another account".
-  it('does not name another account', () => {
-    const text = Messages.olderEnvironmentNotAssigned('acme/api');
-    expect(text).toContain('acme/api');
-    expect(text).not.toMatch(/another/i);
-  });
-});
-
 describe('Messages.containerComposeReplaced (review round 1 of unit 6, P-1)', () => {
   // The containers of the other services are removed: their volumes without a name are left behind, not kept in use.
   it('does not claim that all data of the services is kept', () => {

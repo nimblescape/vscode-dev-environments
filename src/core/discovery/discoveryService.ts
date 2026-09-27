@@ -77,7 +77,6 @@ const REPOSITORY_FIELDS_FRAGMENT = `fragment RepositoryFields on Repository {
   isArchived
   isFork
   isPrivate
-  viewerPermission
   pushedAt
   owner {
     login
@@ -102,7 +101,6 @@ const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Reposi
   isArchived
   isFork
   isPrivate
-  viewerPermission
   pushedAt
   owner {
     login
@@ -113,7 +111,7 @@ const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Reposi
 }`;
 
 /**
- * The list query of concept 7.4 with `owner { login }`, `isPrivate`, and `viewerPermission`, without the configuration
+ * The list query of concept 7.4 with `owner { login }` and `isPrivate`, without the configuration
  * lookups, which make a request slow: they follow in batches (`configurationsQuery`). The first page also reads the
  * login of the user and the organizations where the user is a member (`$withOrganizations`).
  * Variables: `cursor` (String, null for the first page), `pageSize` (Int, normally 100), `withOrganizations` (Boolean).
@@ -338,7 +336,6 @@ interface RepositoryNode extends ConfigurationNode {
   isArchived?: boolean;
   isFork?: boolean;
   isPrivate?: boolean;
-  viewerPermission?: string | null;
   pushedAt?: string | null;
   owner?: LoginNode | null;
   defaultBranchRef?: { name?: string } | null;
@@ -653,26 +650,11 @@ export class DiscoveryService {
    * One repository, for repositories that are not in the stored list (for example environments that only the registry
    * knows). `undefined` if GitHub does not return it (not found, or no access). The result can have no configuration.
    * Throws when the query failed (for example a rate limit or a timeout), because the answer is then unknown.
-   * `quiet` (for repositories that may belong to another account, concept 7.5): nothing is logged, and an error message
-   * names neither the repository nor quotes GitHub, whose messages can contain the name.
    */
-  async getRepository(
-    repository: string,
-    token: string,
-    signal?: AbortSignal,
-    options: { quiet?: boolean } = {},
-  ): Promise<RepositoryInfo | undefined> {
-    const quiet = options.quiet === true;
-    let owner: string;
-    let name: string;
-    try {
-      ({ owner, name } = splitRepository(repository));
-    } catch (error) {
-      if (quiet) throw new Error('Invalid repository name.');
-      throw error;
-    }
+  async getRepository(repository: string, token: string, signal?: AbortSignal): Promise<RepositoryInfo | undefined> {
+    const { owner, name } = splitRepository(repository);
     const result = await this.api.graphql<RepositoryData>(REPOSITORY_QUERY, { owner, name }, token, signal);
-    if (result.errors && !quiet) this.logger.info(`Repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
+    if (result.errors) this.logger.info(`Repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
     const node = result.data?.repository;
     if (isRecord(node)) return toRepositoryInfo(node);
     const notFoundOrNoAccess =
@@ -680,7 +662,6 @@ export class DiscoveryService {
       node === null &&
       (result.errors ?? []).every((error) => error.type === 'NOT_FOUND' || classifyGraphQLError(error) !== undefined);
     if (notFoundOrNoAccess) return undefined;
-    if (quiet) throw new Error(`GitHub did not answer the query for a repository (${graphQLErrorKinds(result.errors)}).`);
     throw new Error(`GitHub did not answer the query for the repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
   }
 
@@ -910,6 +891,7 @@ export class DiscoveryService {
       repositories: merged.repositories(),
       hints: [],
       scope: [...run.scope],
+      withoutConfiguration: [],
     };
     for (const listener of this.partialListeners) {
       try {
@@ -1236,12 +1218,6 @@ function isRetryableError(error: unknown): boolean {
   return error instanceof GitHubApiError && (error.status === 502 || error.status === 503 || error.status === 504);
 }
 
-/** The kinds of GraphQL errors, without their messages (which can name a repository), for example `RATE_LIMITED, timeout`. */
-function graphQLErrorKinds(errors: GraphQLError[] | undefined): string {
-  const kinds = new Set((errors ?? []).map((error) => error.type ?? (TIMEOUT_PATTERN.test(error.message) ? 'timeout' : 'error')));
-  return kinds.size > 0 ? [...kinds].join(', ') : 'no details';
-}
-
 /** GitHub answers a query that takes too long with an error "Something went wrong … This may be the result of a timeout". */
 function isTimeoutResponse(errors: GraphQLError[] | undefined): boolean {
   if (!errors || errors.length === 0) return false;
@@ -1396,9 +1372,6 @@ function toRepositoryInfo(node: RepositoryNode): RepositoryInfo | undefined {
     isArchived: node.isArchived === true,
     isFork: node.isFork === true,
     isPrivate: node.isPrivate === true,
-    ...(typeof node.viewerPermission === 'string' && node.viewerPermission !== ''
-      ? { viewerPermission: node.viewerPermission }
-      : {}),
     pushedAt: typeof node.pushedAt === 'string' ? node.pushedAt : null,
     defaultBranch: typeof defaultBranch === 'string' && defaultBranch !== '' ? defaultBranch : null,
     configPaths: detectConfigurations(node),
@@ -1425,8 +1398,6 @@ function isRepositoryInfo(value: unknown): value is RepositoryInfo {
     typeof value.isArchived === 'boolean' &&
     typeof value.isFork === 'boolean' &&
     typeof value.isPrivate === 'boolean' &&
-    // Lists of older versions have no permission.
-    (value.viewerPermission === undefined || typeof value.viewerPermission === 'string') &&
     (value.pushedAt === null || typeof value.pushedAt === 'string') &&
     (value.defaultBranch === null || typeof value.defaultBranch === 'string') &&
     isStringArray(value.configPaths) &&
@@ -1445,11 +1416,15 @@ function isOrganizationHint(value: unknown): value is OrganizationHint {
   );
 }
 
-/** Checks the content of repositories-<account ID>.json. Invalid entries are dropped; an invalid file gives `undefined`. */
+/**
+ * Checks the content of repositories-<account ID>.json. Invalid entries are dropped; an invalid file (also one without
+ * `scope` or `withoutConfiguration`) gives `undefined`, so the list is built again.
+ */
 export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
   if (!isRecord(value) || value.version !== 1) return undefined;
   if (typeof value.fetchedAt !== 'string' || typeof value.viewerLogin !== 'string') return undefined;
   if (!Array.isArray(value.organizations) || !Array.isArray(value.repositories)) return undefined;
+  if (!isStringArray(value.scope) || !Array.isArray(value.withoutConfiguration)) return undefined;
   return {
     version: 1,
     fetchedAt: value.fetchedAt,
@@ -1457,11 +1432,8 @@ export function parseDiscoveryData(value: unknown): DiscoveryData | undefined {
     organizations: value.organizations.filter((item): item is string => typeof item === 'string'),
     repositories: value.repositories.filter(isRepositoryInfo),
     hints: Array.isArray(value.hints) ? value.hints.filter(isOrganizationHint) : [],
-    // Lists of older versions have no scope: they were built from all repositories.
-    ...(isStringArray(value.scope) ? { scope: normalizeScope(value.scope) } : {}),
-    ...(Array.isArray(value.withoutConfiguration)
-      ? { withoutConfiguration: value.withoutConfiguration.filter(isCheckedRepository).map(checkedRepository) }
-      : {}),
+    scope: normalizeScope(value.scope),
+    withoutConfiguration: value.withoutConfiguration.filter(isCheckedRepository).map(checkedRepository),
     ...(isStringArray(value.uncertain) ? { uncertain: [...value.uncertain] } : {}),
   };
 }

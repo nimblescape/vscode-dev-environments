@@ -60,15 +60,14 @@ const EPOCH = new Date(0).toISOString();
 
 /**
  * True if `environment` is the environment of the repository `owner/name` (ignoring case) of the GitHub account
- * `accountId`; `undefined` stands for the entries of an older version, which have no owner. A repository has at most one
- * environment per account, and at most one entry without owner (concept D-3).
+ * `accountId`. A repository has at most one environment per account (concept D-3).
  */
 export function isEnvironmentOf(
   environment: Pick<Environment, 'repository' | 'owner'>,
   repository: string,
-  accountId: string | undefined,
+  accountId: string,
 ): boolean {
-  return environment.repository.toLowerCase() === repository.toLowerCase() && environment.owner?.id === accountId;
+  return environment.repository.toLowerCase() === repository.toLowerCase() && environment.owner.id === accountId;
 }
 
 /** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
@@ -130,14 +129,6 @@ export class EnvironmentRegistry {
     return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, accountId));
   }
 
-  /**
-   * Finds the entry of an older version of `owner/name` (ignoring case): it has no owner, and it stays hidden until an
-   * account claims it (concept 7.5).
-   */
-  async findUnowned(repository: string): Promise<Environment | undefined> {
-    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, undefined));
-  }
-
   /** Finds the environment of a container name, with or without the leading `/` of `docker inspect`. */
   async findByContainerName(containerName: string): Promise<Environment | undefined> {
     const wanted = withoutLeadingSlash(containerName);
@@ -159,19 +150,17 @@ export class EnvironmentRegistry {
 
   /**
    * Adds an environment. Throws if an environment with the same ID exists, or one of the same repository (ignoring case)
-   * and the same owner account: one environment per repository and GitHub account (concept D-3); the entries of an older
-   * version count as one owner. The check runs under the lock, so two windows of one account that start the same
+   * and the same owner account: one environment per repository and GitHub account (concept D-3). The check runs under the lock, so two windows of one account that start the same
    * repository at the same time cannot both add an environment.
    */
   async add(environment: Environment): Promise<void> {
-    const accountId = environment.owner?.id;
+    const accountId = environment.owner.id;
     await this.update((file) => {
       if (file.environments.some((existing) => existing.id === environment.id)) {
         throw new Error(`The environment ${environment.id} exists already.`);
       }
       if (file.environments.some((existing) => isEnvironmentOf(existing, environment.repository, accountId))) {
-        const owner = accountId === undefined ? 'without owner' : `of the GitHub account ${accountId}`;
-        throw new Error(`An environment of ${environment.repository} ${owner} exists already.`);
+        throw new Error(`An environment of ${environment.repository} of the GitHub account ${accountId} exists already.`);
       }
       file.environments.push(environment);
     });
@@ -206,9 +195,11 @@ export class EnvironmentRegistry {
       const removed = new Set(volumes.removed ?? []);
       const records = (file.keptVolumes ?? []).filter((record) => !removed.has(record.name));
       const keptAt = isoTime(this.clock);
-      for (const name of entry ? new Set(volumes.kept ?? []) : []) {
-        if (removed.has(name) || records.some((record) => record.name === name && record.owner?.id === entry?.owner?.id)) continue;
-        records.push({ name, ...(entry?.owner ? { owner: entry.owner } : {}), keptAt });
+      if (entry) {
+        for (const name of new Set(volumes.kept ?? [])) {
+          if (removed.has(name) || records.some((record) => record.name === name && record.owner.id === entry.owner.id)) continue;
+          records.push({ name, owner: entry.owner, keptAt });
+        }
       }
       if (records.length > 0) file.keptVolumes = records;
       else delete file.keptVolumes;
@@ -458,13 +449,12 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   // Review round 11 (G5).
   ['serviceFoldersOverflow', (value) => typeof value === 'boolean'],
   ['lastBuildNumber', isCount],
-  ['owner', isOwner],
   ['refusedUpdate', isRefusedUpdate],
   ['keepRunning', (value) => typeof value === 'boolean'],
 ];
 
 /**
- * Checks one entry in place. An entry without a usable ID, repository, volume name, or container name is left out.
+ * Checks one entry in place. An entry without a usable ID, repository, volume name, container name, or owner is left out.
  * Missing configuration path and times get defaults. Invalid optional fields are removed. Unknown fields are kept.
  */
 function normalizeEnvironment(value: unknown): Environment | undefined {
@@ -473,7 +463,8 @@ function normalizeEnvironment(value: unknown): Environment | undefined {
     !isNonEmptyString(value.id) ||
     !isRepositoryName(value.repository) ||
     !isNonEmptyString(value.volumeName) ||
-    !isNonEmptyString(value.containerName)
+    !isNonEmptyString(value.containerName) ||
+    !isOwner(value.owner)
   ) {
     return undefined;
   }
@@ -521,9 +512,9 @@ function isRefusedUpdate(value: unknown): value is RefusedUpdate {
   );
 }
 
-/** A record of a volume that a Delete kept: its name, the time, and the owner account unless it had none. */
+/** A record of a volume that a Delete kept: its name, the time, and the owner account. */
 function isKeptVolume(value: unknown): value is KeptVolume {
-  return isRecord(value) && isNonEmptyString(value.name) && isString(value.keptAt) && (value.owner === undefined || isOwner(value.owner));
+  return isRecord(value) && isNonEmptyString(value.name) && isString(value.keptAt) && isOwner(value.owner);
 }
 
 /** The owner account: a GitHub user ID and a login (empty after a restore from the volume labels). */

@@ -83,7 +83,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   }
 
   /**
-   * The token and the account of one session. Use it where both must belong together (a claim, concept 7.5): the session
+   * The token and the account of one session. Use it where both must belong together (concept 7.5): the session
    * can change between a call of getAccount and a call of getToken. `undefined` without a session.
    */
   async getSession(options: { interactive: boolean }): Promise<{ token: string; account: GitHubAccount } | undefined> {

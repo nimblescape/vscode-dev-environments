@@ -29,7 +29,7 @@ interface Harness {
 }
 
 function listOf(viewerLogin: string, organizations: string[]): DiscoveryData {
-  return { version: 1, fetchedAt: '', viewerLogin, organizations, repositories: [], hints: [], scope: [] };
+  return { version: 1, fetchedAt: '', viewerLogin, organizations, repositories: [], hints: [], scope: [], withoutConfiguration: [] };
 }
 
 function harness(): Harness {

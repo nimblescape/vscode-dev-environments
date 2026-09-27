@@ -182,21 +182,6 @@ export const Messages = {
    */
   otherAccount: (repository: string) =>
     `The environment of ${repository} belongs to another GitHub account. Sign in with that account to use it.`,
-  /** Concept 7.5: the question before an entry of an older version is assigned to the signed-in account. */
-  assignOlderEnvironment: (repository: string, login: string) =>
-    `The environment of ${repository} was created before environments were separated by GitHub account. Assign it to ${login}? Afterwards, only ${login} can use it.`,
-  /**
-   * Concept 7.5: an entry of an older version has no owner, and the claim did not assign it to the signed-in account (no
-   * answer of GitHub, no access, or no confirmation). Not "another account": nobody owns it yet.
-   */
-  olderEnvironmentNotAssigned: (repository: string) =>
-    `The environment of ${repository} was created with an older version of Dev Environments and is not assigned to a GitHub account yet. It could not be assigned to the signed-in account: GitHub did not confirm the access to ${repository}, or the assignment was not confirmed. Try again later.`,
-  /**
-   * Concept 7.5: the entry of an older version of the repository stays without owner, and it uses named volumes of the
-   * repository that a new environment would share. Nothing is created; the next Start asks again.
-   */
-  olderEnvironmentUsesVolumes: (repository: string) =>
-    `The environment of ${repository} was created with an older version of Dev Environments and uses named volumes of the repository. A new environment would share them, so none was created. Assign the older environment to your account to use it.`,
   otherAccountConnection: (repository: string) =>
     `The environment of ${repository} does not belong to the GitHub account that is signed in. This window closes its connection.`,
   gitSetupFailed: 'Git in the environment could not be prepared. Pushing to GitHub may not work.',
@@ -211,7 +196,7 @@ export const Messages = {
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   /**
    * Review round 9 (D9-2): the paths of the repository that the other services of Docker Compose mount
-   * (ComposeBuildRecord.serviceFolders): they are in the workspace volume, so Delete removes them with the repository;
+   * (Environment.serviceFolders): they are in the workspace volume, so Delete removes them with the repository;
    * the confirmation names them, as the question about the data volumes of the services (D-19) names those.
    */
   deleteRepositoryServiceData: (folders: string) => `Service data in the repository will be deleted: ${folders}.`,
@@ -262,8 +247,6 @@ export const Actions = {
   open: 'Open',
   cancel: 'Cancel',
   continue: 'Continue',
-  assign: 'Assign',
-  notNow: 'Not now',
   /** The button of the modal question of Turn Off Host Access Checks…. */
   turnOffChecks: 'Turn Off Checks',
 } as const;

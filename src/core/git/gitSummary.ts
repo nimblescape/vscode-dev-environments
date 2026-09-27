@@ -228,8 +228,8 @@ interface PathNode {
  * Review round 9 (D9-1): of `folders`, the paths of the repository that the other services of Docker Compose mount
  * (Environment.serviceFolders), which the ownership fixes leave out with their content: a service such as a database
  * gives its data files its own owner, and would not start with others. Only absolute paths below `repoFolder` (never the
- * folder itself, which would leave out everything); review round 10 (D10-3): never `.git` or a path in it (also of a
- * record written before), where Git writes as root. Review round 11 (G5): without duplicates, and without a path below
+ * folder itself, which would leave out everything); review round 10 (D10-3): never `.git` or a path in it, where Git
+ * writes as root. Review round 11 (G5): without duplicates, and without a path below
  * another path of the list (its test `-path <path>/*` covers it). In the order of `folders`. Review round 12 (S12-1):
  * linear in the total length of the paths (a tree of their segments, in place of a lookup of each ancestor); a path over
  * MAX_SERVICE_PATH_LENGTH or MAX_SERVICE_PATH_DEPTH (isOverlongServicePath) stays in the list unless a path of the list

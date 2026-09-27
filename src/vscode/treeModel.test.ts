@@ -64,6 +64,7 @@ function environment(id: string, repository: string, overrides: Partial<Environm
     containerName: `devenv-${id}`,
     createdAt: iso(T0 - 3_600_000),
     lastUsedAt: iso(T0),
+    owner: { id: '1001', login: 'me' },
     gitSummary: summary(),
     ...overrides,
   };
@@ -77,6 +78,8 @@ function discovery(repositories: RepositoryInfo[], overrides: Partial<DiscoveryD
     organizations: ['acme-university'],
     repositories,
     hints: [],
+    scope: [],
+    withoutConfiguration: [],
     ...overrides,
   };
 }

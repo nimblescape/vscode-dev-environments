@@ -155,7 +155,7 @@ describe('refused updates (concept 7.7: a new image that the host access policy 
   });
 
   it('bounds the items of a stored refusal when they are read (hotfix review 4, Q3)', () => {
-    // 100 KB, as an older version stored them.
+    // 100 KB, as a registry changed by hand could hold them.
     const items = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
     const read = refusedUpdateOf({ refusedUpdate: { ...refused, items } });
     expect(read?.items).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
@@ -499,10 +499,14 @@ describe('isGitHubTokenRejected', () => {
 
 describe('Docker Compose rules (unit 6)', () => {
   const record = { builtAt: '', environmentImage: 'devenv-3f2a9c1e:1', buildNumber: 1, configPath: 'c', configHash: 'h', images: {}, features: {} };
+  const valid = { service: 'app', images: [], serviceImages: [], version: '2.40.3', inputsHash: 'sha256:x' };
 
   it.each([
     ['no compose part', undefined, undefined],
-    ['a valid part', { service: 'app', images: ['devenv-3f2a9c1e-app'] }, { service: 'app', images: ['devenv-3f2a9c1e-app'] }],
+    ['a valid part', { ...valid, images: ['devenv-3f2a9c1e-app'] }, { ...valid, images: ['devenv-3f2a9c1e-app'] }],
+    ['no list of service images', { service: 'app', images: [], version: '2.40.3', inputsHash: 'sha256:x' }, undefined],
+    ['no Compose version', { service: 'app', images: [], serviceImages: [], inputsHash: 'sha256:x' }, undefined],
+    ['no hash of the files', { service: 'app', images: [], serviceImages: [], version: '2.40.3' }, undefined],
     ['an empty service', { service: '', images: [] }, undefined],
     ['images that are no list of texts', { service: 'app', images: [1] }, undefined],
     ['no object', 'app', undefined],
@@ -513,7 +517,8 @@ describe('Docker Compose rules (unit 6)', () => {
   it('composeRecordOf keeps the service images, the Compose version, and the hash of the files (review round 1, D5, P-4)', () => {
     const compose = { service: 'app', images: [], serviceImages: ['postgres:16'], version: '2.40.3', inputsHash: 'sha256:x' };
     expect(composeRecordOf({ ...record, compose } as never)).toEqual(compose);
-    expect(composeRecordOf({ ...record, compose: { ...compose, serviceImages: [1], version: 2 } } as never)).toEqual({ service: 'app', images: [], inputsHash: 'sha256:x' });
+    expect(composeRecordOf({ ...record, compose: { ...compose, serviceImages: [1] } } as never)).toBeUndefined();
+    expect(composeRecordOf({ ...record, compose: { ...compose, version: 2 } } as never)).toBeUndefined();
   });
 
   it.each<[string, Record<string, unknown> | undefined, { configHash: string; inputsHash: string; version: string }, string]>([
@@ -523,11 +528,9 @@ describe('Docker Compose rules (unit 6)', () => {
     ['the same files, another model of the same version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.40' }, 'changed'],
     ['the same files, another model of another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
     ['the same files and model, another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
-    ['an older record: the model hash alone', {}, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
-    ['an older record with the same model', {}, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'unchanged'],
     ['no compose part', undefined, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
   ])('composeConfigurationChange: %s (review round 1, P-4)', (_name, compose, current, expected) => {
-    const withCompose = compose === undefined ? record : { ...record, compose: { service: 'app', images: [], ...compose } };
+    const withCompose = compose === undefined ? record : { ...record, compose: { service: 'app', images: [], serviceImages: [], ...compose } };
     expect(composeConfigurationChange(withCompose as never, current)).toBe(expected);
   });
 

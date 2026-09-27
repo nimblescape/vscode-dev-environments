@@ -203,8 +203,7 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
  * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
  *   created when missing, with an example in comments; an existing file stays as it is;
  * - docker/ (DOCKER_CONFIG), mode 0700.
- * A link or a file in place of one of the folders is removed first. The folder gnupg/ of an earlier version stays as it
- * is; nothing uses it.
+ * A link or a file in place of one of the folders is removed first.
  */
 export const GIT_FILES_SCRIPT = `set -eu
 folder="$1"

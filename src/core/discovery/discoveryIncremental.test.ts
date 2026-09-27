@@ -302,17 +302,6 @@ describe('incremental detection, empty scope', () => {
     expect(github.lookups()[0].variables).toEqual({ o0: 'acme', n0: 'flaky' });
     expect(names(third.repositories)).toEqual(['acme/api', 'acme/flaky']);
   });
-
-  it('reads the repositories without configuration of a list of an older version once', async () => {
-    fs.writeFileSync(
-      file,
-      JSON.stringify({ version: 1, fetchedAt: '', viewerLogin: 'octo', organizations: [], hints: [], repositories: [] }),
-    );
-    github.repos = [repo('acme/empty', false)];
-    const result = await service().refresh(TOKEN, ACCOUNT_ID);
-    expect(github.requests.map((request) => operation(request))).toEqual(['query Discover', 'query Configurations']);
-    expect(names(result.withoutConfiguration ?? [])).toEqual(['acme/empty']);
-  });
 });
 
 describe('incremental detection with a scan scope', () => {

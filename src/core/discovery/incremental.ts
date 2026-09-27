@@ -22,7 +22,7 @@ export interface StoredDetection {
 export function storedDetections(data: DiscoveryData | undefined): Map<string, StoredDetection> {
   const detections = new Map<string, StoredDetection>();
   if (!data) return detections;
-  for (const checked of data.withoutConfiguration ?? []) {
+  for (const checked of data.withoutConfiguration) {
     detections.set(checked.nameWithOwner.toLowerCase(), { pushedAt: checked.pushedAt, defaultBranch: checked.defaultBranch, configPaths: [] });
   }
   // A detection that was not certain is read again (concept 7.4: a lookup that fails is repeated at the next refresh).

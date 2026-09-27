@@ -122,7 +122,7 @@ import {
   shortId,
   splitRepository,
 } from '../names';
-import { isAvailableTo, ownerOf, type EnvironmentClaims } from '../ownership';
+import { isAvailableTo, ownerOf } from '../ownership';
 import {
   abortError,
   isAbortError,
@@ -268,7 +268,7 @@ export type EnvironmentHelper = Pick<
 /** The part of EnvironmentRegistry that the service uses. */
 export type EnvironmentStore = Pick<
   EnvironmentRegistry,
-  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'findUnowned' | 'add' | 'update' | 'updateEnvironment' | 'remove'
+  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'add' | 'update' | 'updateEnvironment' | 'remove'
 >;
 
 /** The part of SessionFiles that the service uses. */
@@ -296,15 +296,6 @@ export interface EnvironmentServiceDeps {
   viewer?: (token: string, signal?: AbortSignal) => Promise<GitHubViewer>;
   /** Time limit of `viewer`. Default 5 s. */
   viewerTimeoutMs?: number;
-  /**
-   * Claims of entries without owner (concept 7.5). An open of an entry of an older version, for example one restored from
-   * its volume during a first open, claims it for the signed-in account first. Without it, or when the claim does not
-   * succeed, `openEnvironment` refuses such an entry, and `open` leaves it hidden and creates an environment of the
-   * account; only when GitHub could not be asked, `open` refuses it too (environmentFor). An open is a command of the user
-   * (a restored window runs the pipeline only for an entry that the controller checked before), so its claim is
-   * `interactive`.
-   */
-  claims?: Pick<EnvironmentClaims, 'claim'>;
   ui: PipelineUi;
   logger: Logger;
   clock: Clock;
@@ -376,11 +367,6 @@ export interface OpenOptions extends OperationOptions {
   forceRebuild?: boolean;
   /** "Select configuration…": change the configuration first. Implies a rebuild when an environment exists. */
   configPath?: string;
-  /**
-   * The command asked the user already whether an entry of an older version of the repository is assigned (Switch
-   * branch…, Select configuration…): the open does not ask about a declined entry again (concept 7.5).
-   */
-  olderEnvironmentAsked?: boolean;
 }
 
 export interface OpenResult {
@@ -654,7 +640,7 @@ function repositoryKey(repository: string): string {
 function volumeLabels(environment: Environment): Record<string, string> {
   const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environment.id, [LABEL_REPOSITORY]: environment.repository };
   // The owner comes back with the entry when the registry is lost (concept 7.5).
-  if (environment.owner) labels[LABEL_OWNER_ID] = environment.owner.id;
+  labels[LABEL_OWNER_ID] = environment.owner.id;
   return labels;
 }
 
@@ -735,18 +721,6 @@ function isHostAccess(error: unknown): boolean {
 
 function otherAccount(repository: string): UserFacingError {
   return new UserFacingError('otherAccount', Messages.otherAccount(repository));
-}
-
-/**
- * An entry of an older version without owner that could not be claimed (GitHub did not confirm the access of the
- * account, for example without a connection). It belongs to no account yet, so the text of otherAccount would be wrong.
- */
-function environmentUnassigned(repository: string): UserFacingError {
-  return new UserFacingError(
-    'environmentUnassigned',
-    Messages.olderEnvironmentNotAssigned(repository),
-    'The environment has no owner, and the claim for the signed-in account did not succeed.',
-  );
 }
 
 /** True if the host access policy refuses something of `report`. */
@@ -923,7 +897,7 @@ export class EnvironmentService {
       try {
         // The account decides which environment is used, and the token of the same session goes into it.
         const session = await this.requireSession();
-        const existing = await this.environmentFor(target.repository, session, options.signal, options.olderEnvironmentAsked !== true);
+        const existing = await this.deps.registry.findForAccount(target.repository, session.account.id);
         if (existing) {
           if (options.branch !== undefined) {
             this.logger.info(`The branch ${options.branch} applies only to a first open; use Switch branch for an environment.`);
@@ -953,51 +927,6 @@ export class EnvironmentService {
   }
 
   /**
-   * Concept 7.5, D-3: the environment of `repository` of the account of `session`, or `undefined` when the account has
-   * none. An entry of an older version of the repository (without owner) is claimed for the account first; an open is a
-   * command of the user, so the claim may ask. When the claim is refused (no access, or no confirmation), the entry stays
-   * hidden, and the account gets an environment of its own. When GitHub could not be asked, the entry may hold work of the
-   * account: the open is refused as not assigned (environmentUnassigned), so that no second environment hides it.
-   */
-  private async environmentFor(
-    repository: string,
-    session: GitHubSession,
-    signal: AbortSignal | undefined,
-    askAgain: boolean,
-  ): Promise<Environment | undefined> {
-    const own = await this.deps.registry.findForAccount(repository, session.account.id);
-    if (own) return own;
-    const older = await this.deps.registry.findUnowned(repository);
-    if (!older) return undefined;
-    if (this.deps.claims) {
-      let unanswered = false;
-      await this.deps.claims.claim(session.account, session.token, {
-        mode: 'interactive',
-        environmentIds: [older.id],
-        askAgain,
-        signal,
-        onUnanswered: () => {
-          unanswered = true;
-        },
-      });
-      const claimed = await this.deps.registry.findForAccount(repository, session.account.id);
-      if (claimed) return claimed;
-      if (unanswered) {
-        this.logger.info(`The environment ${older.id} of an older version could not be given to the signed-in account. No second environment is created.`);
-        throw environmentUnassigned(repository);
-      }
-    }
-    if ((older.additionalVolumes ?? []).length > 0) {
-      // A new environment of the repository would mount the named volumes of the entry (the policy refuses them after the
-      // clone): nothing is created, and the next Start asks again.
-      this.logger.info(`The environment ${older.id} of an older version uses named volumes of the repository. No second environment is created.`);
-      throw new UserFacingError('environmentUnassigned', Messages.olderEnvironmentUsesVolumes(repository));
-    }
-    this.logger.info(`The environment ${older.id} of an older version stays hidden. The signed-in account gets an environment of its own.`);
-    return undefined;
-  }
-
-  /**
    * Concept 7.6 "First open" of the repository for the account of `session`: security confirmation, registry entry,
    * workspace volume, clone, then the pipeline.
    */
@@ -1016,8 +945,7 @@ export class EnvironmentService {
     // work of the user. It becomes the environment again; a second environment would hide it. Docker runs now, so the
     // volumes are read also when the registry was lost while Docker was stopped, or when registry.json is invalid.
     if ((await this.reconcileFromVolumes()) > 0) {
-      // The question about an entry of an older version was asked a moment ago: a declined one is not asked about again.
-      const restored = await this.environmentFor(target.repository, session, signal, false);
+      const restored = await this.deps.registry.findForAccount(target.repository, session.account.id);
       if (restored) {
         this.logger.info(`An environment of ${target.repository} was restored from its volume ${restored.volumeName}. It is used.`);
         if (options.branch !== undefined) {
@@ -1099,7 +1027,7 @@ export class EnvironmentService {
     const steps = new StepReporter(options.progress, this.logger);
     // Concept 7.5: only the owner account opens an environment; each open writes its token into the environment.
     const session = known ?? (await this.requireSession());
-    const owned = await this.requireOwner(environment, session, signal);
+    const owned = await this.requireOwner(environment, session);
     // Asked now, so the question to GitHub runs while Docker starts and the image check runs (NFR-08).
     const identity = this.identityOf(session);
     // The Session Monitor must not stop a running container while the pipeline runs (concept 7.9). The file is written
@@ -1157,63 +1085,34 @@ export class EnvironmentService {
   /**
    * Refuses an environment of another account (concept 7.5): UserFacingError('otherAccount'). Only an explicit
    * environment (openEnvironment: a reconnect, a reopen, a restored window) can be one; `open` of a repository uses the
-   * environment of the account. An entry of an older version without owner is claimed for the account of `session` first
-   * (for example at a retry or a reopen that no claim reached before); when the claim does not succeed, it is refused as
-   * not assigned. Returns the registry entry; the login of the owner is updated when the account has another one now (a
-   * rename on GitHub, or an owner restored from a volume label).
+   * environment of the account. Returns the registry entry; the login of the owner is updated when the account has
+   * another one now (a rename on GitHub, or an owner restored from a volume label).
    */
-  private async requireOwner(environment: Environment, session: GitHubSession, signal: AbortSignal | undefined): Promise<Environment> {
+  private async requireOwner(environment: Environment, session: GitHubSession): Promise<Environment> {
     const { account } = session;
-    const current = await this.availableEntry(environment, account, { token: session.token, interactive: true, signal });
-    if (current.owner?.login === account.login) return current;
+    const current = this.availableEntry(environment, account);
+    if (current.owner.login === account.login) return current;
     const updated = await this.deps.registry.updateEnvironment(current.id, (entry) => {
-      if (entry.owner?.id === account.id) entry.owner = ownerOf(account);
+      if (entry.owner.id === account.id) entry.owner = ownerOf(account);
     });
     return updated ?? current;
   }
 
   /**
    * The signed-in account (`interactive`: a sign-in may be asked for); refuses an environment of another account (concept
-   * 7.5). The claim of an entry without owner needs a working token, which a command of the user may ask for.
+   * 7.5).
    */
   private async requireOwnAccount(environment: Environment, interactive: boolean): Promise<void> {
     const account = await this.deps.auth.getAccount({ interactive });
     if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    if (isAvailableTo(environment, account)) return;
-    // The token for a claim must be one of the session of `account` (see requireSession): after a change, no claim.
-    // The claim asks GitHub: a command of the user gets a working token (a new sign-in while GitHub rejects the token).
-    let token = environment.owner === undefined ? await this.deps.auth.getToken({ interactive }) : undefined;
-    if (token !== undefined && (await this.deps.auth.getAccount({ interactive: false }))?.id !== account.id) token = undefined;
-    await this.availableEntry(environment, account, { token, interactive });
+    this.availableEntry(environment, account);
   }
 
-  /**
-   * The registry entry, when it belongs to `account` (concept 7.5). An entry without owner is claimed first when a claim
-   * is possible (`claims` and the token of the session of `account`); `interactive`: a command of the user, whose claim
-   * may ask. Throws otherAccount for an entry of another account, and environmentUnassigned for an entry that still has
-   * no owner.
-   */
-  private async availableEntry(
-    environment: Environment,
-    account: GitHubAccount,
-    claim: { token: string | undefined; interactive: boolean; signal?: AbortSignal },
-  ): Promise<Environment> {
-    let current = environment;
-    if (current.owner === undefined && this.deps.claims && claim.token) {
-      await this.deps.claims.claim(account, claim.token, {
-        mode: claim.interactive ? 'interactive' : 'auto',
-        environmentIds: [current.id],
-        signal: claim.signal,
-      });
-      current = (await this.deps.registry.get(current.id)) ?? current;
-    }
-    if (isAvailableTo(current, account)) return current;
-    if (current.owner === undefined) {
-      this.logger.info(`The environment ${current.id} of an older version could not be given to the signed-in account. It is not used.`);
-      throw environmentUnassigned(current.repository);
-    }
-    this.logger.info(`The environment ${current.id} does not belong to the signed-in account. It is not used.`);
-    throw otherAccount(current.repository);
+  /** The registry entry, when it belongs to `account` (concept 7.5). Throws otherAccount for an entry of another account. */
+  private availableEntry(environment: Environment, account: GitHubAccount): Environment {
+    if (isAvailableTo(environment, account)) return environment;
+    this.logger.info(`The environment ${environment.id} does not belong to the signed-in account. It is not used.`);
+    throw otherAccount(environment.repository);
   }
 
   /** Concept 7.12: the workspace volume is missing. Never creates an empty volume without asking (concept 7.5). */
@@ -1995,9 +1894,6 @@ export class EnvironmentService {
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
         delete entry.refusedUpdate;
-      } else if (refused !== undefined && entry.refusedUpdate !== undefined) {
-        // The items bounded as they are read (hotfix review 4, Q3): an older version stored them without a bound.
-        entry.refusedUpdate.items = refused.items;
       }
     });
   }
@@ -3064,21 +2960,18 @@ export class EnvironmentService {
 
   /**
    * Review round 9 (D9-1), round 10 (D10-1), round 11 (G3, G5): writes `facts` (serviceFolderFacts) to
-   * Environment.serviceFolders and Environment.serviceFoldersOverflow when they differ. The list of a build record of
-   * review round 9 is taken over into it.
+   * Environment.serviceFolders and Environment.serviceFoldersOverflow when they differ.
    */
   private async recordServiceFolders(ctx: PipelineContext, facts: { folders: string[]; overflow: boolean }): Promise<void> {
     const next = facts.folders;
     const own = ctx.env.serviceFolders ?? [];
-    const legacy = composeRecordOf(ctx.env.buildRecord)?.serviceFolders !== undefined;
     const sameOverflow = (ctx.env.serviceFoldersOverflow === true) === facts.overflow;
-    if (!legacy && sameOverflow && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
+    if (sameOverflow && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
     await this.updateEntry(ctx, (entry) => {
       if (next.length > 0) entry.serviceFolders = [...next];
       else delete entry.serviceFolders;
       if (facts.overflow) entry.serviceFoldersOverflow = true;
       else delete entry.serviceFoldersOverflow;
-      if (entry.buildRecord && isRecord(entry.buildRecord.compose)) delete entry.buildRecord.compose.serviceFolders;
     });
   }
 
@@ -3187,13 +3080,12 @@ export class EnvironmentService {
 
   /**
    * The volumes of `names` that the pipeline records as additional volumes of `env`: existing volumes, other than the
-   * workspace volume, whose labels make them its own (isOwnVolume: devenv.environment-id, and devenv.owner-id when both
-   * are set), and existing additional volumes of other environments of the same owner (isSameOwnerAdditionalVolume),
+   * workspace volume, whose labels make them its own (isOwnVolume: devenv.environment-id and devenv.owner-id), and existing additional volumes of other environments of the same owner (isSameOwnerAdditionalVolume),
    * which the environments of one account share (for example `${localWorkspaceFolderBasename}-node_modules` of a fork
    * and its upstream repository). Such a record only protects the shared volume: the Delete of the other environment
    * keeps a volume that another entry records, and the Delete of this one never removes it (removableVolumes: not its
-   * own). Any other volume (an anonymous volume, a volume of another program or account, a volume that a version before
-   * the labels or Docker at `up` created) is never recorded, so Delete never removes it.
+   * own). Any other volume (an anonymous volume, a volume of another program or account, a volume that Docker created at
+   * `up`) is never recorded, so Delete never removes it.
    */
   private async recordedVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
     const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
@@ -3201,7 +3093,7 @@ export class EnvironmentService {
     const volumes = await this.deps.docker.inspectVolumes(candidates);
     const recorded = new Set(
       volumes
-        .filter((volume) => isOwnVolume(volume.labels, env.id, env.owner?.id) || isSameOwnerAdditionalVolume(volume.labels, env.owner?.id))
+        .filter((volume) => isOwnVolume(volume.labels, env.id, env.owner.id) || isSameOwnerAdditionalVolume(volume.labels, env.owner.id))
         .map((volume) => volume.name),
     );
     return candidates.filter((name) => recorded.has(name));
@@ -3229,7 +3121,7 @@ export class EnvironmentService {
     // so every environment that mounts it by the same name shares it, also of another account.
     for (const volume of inspected) {
       if (Object.keys(volume.labels).length === 0) {
-        this.logger.info(`The volume ${volume.name} exists without labels (created by an older version or by Docker at a start): it is not the environment's, and every environment that mounts it shares it.`);
+        this.logger.info(`The volume ${volume.name} exists without labels (created by Docker at a start, or by hand): it is not the environment's, and every environment that mounts it shares it.`);
       }
     }
     for (const name of candidates) {
@@ -3310,10 +3202,9 @@ export class EnvironmentService {
 
   /**
    * Concept section 9 "Host access": what the policy checks for `env`, with what it needs to know about the named volumes
-   * that the configuration mounts: the volumes of the environments of other accounts (their additional volumes), and of
-   * the entries of an older version without owner, which may hold the work of another person until an account takes them
-   * over, and the volumes that the Delete of an environment of another account (or of such an entry) kept while they
-   * exist, except the volumes that `env` recorded itself; and the labels of the volumes that exist.
+   * that the configuration mounts: the volumes of the environments of other accounts (their additional volumes), and the
+   * volumes that the Delete of an environment of another account kept while they exist, except the volumes that `env`
+   * recorded itself; and the labels of the volumes that exist.
    */
   private async hostAccessInput(
     env: Environment,
@@ -3326,7 +3217,7 @@ export class EnvironmentService {
     const composeEnv: Record<string, string> = input.composeMounts === true ? { COMPOSE_PROJECT_NAME: composeProjectName(env.id) } : {};
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository, composeEnv) };
     const file = await this.deps.registry.read();
-    const otherOwner = (owner: GitHubAccount | undefined) => owner === undefined || owner.id !== env.owner?.id;
+    const otherOwner = (owner: GitHubAccount) => owner.id !== env.owner.id;
     const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));
     // `moreVolumes`: the named volumes of a Docker Compose model, whose labels its check needs too.
     const names = [...new Set([...mountedVolumeNames(checked), ...moreVolumes])];
@@ -3337,13 +3228,13 @@ export class EnvironmentService {
     const gone = names.filter((name) => !(name in volumeLabels) && (file.keptVolumes ?? []).some((record) => record.name === name));
     if (gone.length > 0) await this.deps.registry.forgetKeptVolumes(gone);
     const kept = (file.keptVolumes ?? []).filter((record) => otherOwner(record.owner) && record.name in volumeLabels);
-    // A volume that the environment recorded itself stays its own: older entries of one person shared volumes before
-    // the environments were separated by account.
+    // A volume that the environment recorded itself stays its own: after a lost registry, the restored entries of two
+    // accounts can both record a volume without devenv labels that their containers mount (protectedMountedVolumes).
     const own = new Set(env.additionalVolumes ?? []);
     const foreignVolumes = [...others.flatMap((other) => other.additionalVolumes ?? []), ...kept.map((record) => record.name)].filter(
       (name) => !own.has(name),
     );
-    const environment = { id: env.id, ...(env.owner ? { ownerId: env.owner.id } : {}) };
+    const environment = { id: env.id, ownerId: env.owner.id };
     // Review round 1 (S2, S3): the networks that the configuration names, with their labels and containers, so that the
     // network of another environment is refused also under a name of its own.
     const networkNames = [...new Set([...runArgsNetworks(input.config?.runArgs), ...runArgsNetworks(input.merged?.runArgs), ...moreNetworks])];
@@ -3368,9 +3259,9 @@ export class EnvironmentService {
         if (id !== undefined) environments.set(container.id, id);
       }
     }
-    // An environment of an entry without owner, or of no entry, is never of the same owner.
-    const owner = env.owner?.id;
-    const sameOwner = (id: string): boolean => owner !== undefined && entries.some((entry) => entry.id === id && entry.owner?.id === owner);
+    // An environment of no entry is never of the same owner.
+    const owner = env.owner.id;
+    const sameOwner = (id: string): boolean => entries.some((entry) => entry.id === id && entry.owner.id === owner);
     for (const reference of names) {
       const network = resolveNetworkReference(reference, networks);
       if (!network) continue;
@@ -4112,7 +4003,8 @@ export class EnvironmentService {
         await this.stopServiceBeforeRemoval(container, env);
         await docker.removeContainer(container.id);
       }
-      // Review round 9 (D9-3): a dev container without the ID label (an older version) is stopped first too.
+      // Review round 9 (D9-3): a dev container of the name without the ID label (for example relabelled by hand) is
+      // stopped first too.
       const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
       if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
       await docker.removeContainer(env.containerName);
@@ -4148,7 +4040,7 @@ export class EnvironmentService {
         await this.startDocker(steps, options.signal);
         const found = await this.deps.registry.get(environmentId);
         if (!found) throw environmentMissing(environment.repository);
-        const current = await this.availableEntry(found, session.account, { token: session.token, interactive: true, signal: options.signal });
+        const current = this.availableEntry(found, session.account);
         let env = await this.waitForOtherOperation(current, options.signal);
         await this.requireVolume(env);
         const token = session.token;
@@ -4390,8 +4282,8 @@ export class EnvironmentService {
 
   /**
    * Registry lost (concept 7.5): adds an entry for each volume with the label devenv.environment-id that the registry
-   * lacks, with the owner of its label devenv.owner-id. A volume of a repository of which the owner account (or, without
-   * the label, an entry of an older version) has an environment already is not added: one environment per repository and
+   * lacks, with the owner of its label devenv.owner-id; a volume without a valid owner label is skipped. A volume of a
+   * repository of which the owner account has an environment already is not added: one environment per repository and
    * account (concept D-3). The additional volumes of an entry are its own labelled volumes (devenv.volume, isOwnVolume),
    * the additional volumes of other environments of the same owner that its surviving container mounts
    * (isSameOwnerAdditionalVolume), and the volumes without devenv labels that it mounts (protectedMountedVolumes), which
@@ -4413,7 +4305,8 @@ export class EnvironmentService {
       }
       const id = volume.labels[LABEL_ENVIRONMENT_ID];
       const repository = volume.labels[LABEL_REPOSITORY];
-      if (!isStorageId(id) || !isRepositoryName(repository)) {
+      const ownerId = volume.labels[LABEL_OWNER_ID];
+      if (!isStorageId(id) || !isRepositoryName(repository) || !isStorageId(ownerId)) {
         this.logger.warn(`The volume ${volume.name} has invalid labels and is skipped.`);
         continue;
       }
@@ -4425,7 +4318,6 @@ export class EnvironmentService {
         continue;
       }
       // The owner label of the volume gives the entry its owner again; its login follows at the next open.
-      const ownerId = volume.labels[LABEL_OWNER_ID];
       candidates.push({
         id,
         repository,
@@ -4434,7 +4326,7 @@ export class EnvironmentService {
         containerName: volume.name,
         createdAt: now,
         lastUsedAt: now,
-        ...(isStorageId(ownerId) ? { owner: { id: ownerId, login: '' } } : {}),
+        owner: { id: ownerId, login: '' },
       });
     }
     if (candidates.length === 0) return 0;
@@ -4443,7 +4335,7 @@ export class EnvironmentService {
     const containers = await docker.listEnvironmentContainers();
     for (const candidate of candidates) {
       const labelled = additional
-        .filter((volume) => isOwnVolume(volume.labels, candidate.id, candidate.owner?.id))
+        .filter((volume) => isOwnVolume(volume.labels, candidate.id, candidate.owner.id))
         .map((volume) => volume.name)
         .filter((name) => name !== candidate.volumeName);
       const mounted = containers
@@ -4452,7 +4344,7 @@ export class EnvironmentService {
       // An additional volume of another environment of the same owner that the container mounts: recorded again, so that
       // the Delete of that environment keeps it, as the pipeline records it (recordedVolumes).
       const shared = additional
-        .filter((volume) => mounted.includes(volume.name) && isSameOwnerAdditionalVolume(volume.labels, candidate.owner?.id))
+        .filter((volume) => mounted.includes(volume.name) && isSameOwnerAdditionalVolume(volume.labels, candidate.owner.id))
         .map((volume) => volume.name)
         .filter((name) => name !== candidate.volumeName);
       const volumes = [...new Set([...labelled, ...shared, ...(await this.protectedMountedVolumes(mounted, candidate.volumeName))])];
@@ -4490,7 +4382,7 @@ export class EnvironmentService {
       let count = 0;
       for (const candidate of candidates) {
         if (file.environments.some((e) => e.id === candidate.id || e.volumeName === candidate.volumeName)) continue;
-        if (file.environments.some((e) => isEnvironmentOf(e, candidate.repository, candidate.owner?.id))) {
+        if (file.environments.some((e) => isEnvironmentOf(e, candidate.repository, candidate.owner.id))) {
           skipped.push(candidate.volumeName);
           continue;
         }
@@ -4508,8 +4400,8 @@ export class EnvironmentService {
 
   /**
    * Registry lost: the named volumes without devenv labels that the container of a restored environment mounts (the
-   * container, which a lost registry does not remove, still mounts them), for example the volumes that a version before
-   * the labels recorded. Recorded again, they protect the data of the environment: without them, the environment of
+   * container, which a lost registry does not remove, still mounts them), for example volumes that Docker created at `up`
+   * without labels. Recorded again, they protect the data of the environment: without them, the environment of
    * another account could mount them (the host access policy refuses the recorded volumes of other accounts). Delete
    * never removes them (removableVolumes: they are not the environment's own). Not a volume that the policy gives to
    * something else by its name (the workspace volume, an anonymous volume, a volume of the Dev Containers extension, of
@@ -4708,10 +4600,8 @@ export class EnvironmentService {
     }
     // Review round 1 (D5): the images of the other services of Docker Compose that are not built (for example
     // `postgres:16`) are images of the user, not base images of the environment image (concept 7.7 "Disk space" removes
-    // only base images). A Docker Compose record without the list removes none.
-    const compose = composeRecordOf(oldRecord);
-    if (compose !== undefined && compose.serviceImages === undefined) return;
-    const serviceImages = new Set(compose?.serviceImages ?? []);
+    // only base images).
+    const serviceImages = new Set(composeRecordOf(oldRecord)?.serviceImages ?? []);
     for (const [reference, digest] of Object.entries(oldRecord.images)) {
       if (inUse.has(baseImageKey(reference, digest)) || serviceImages.has(reference)) continue;
       const image = digestReference(reference, digest);
@@ -4781,7 +4671,7 @@ export class EnvironmentService {
         if (!isDevContainer(container, env.containerName)) for (const name of container.volumes ?? []) services.add(name);
       }
       // Review round 2 (D2-3): an entry that knows neither the volumes of its services nor its build (for example one
-      // restored from its volumes, whose volumes an older version created without the label devenv.service-data): every
+      // restored from its volumes, or whose service volume Docker created at `up` without the label devenv.service-data): every
       // volume may hold the data of a service, so each goes to that question, none ticked (the conservative side).
       const unknown = env.serviceVolumes === undefined && env.buildRecord === undefined;
       const known = (name: string): boolean => services.has(name) || labels.get(name)?.[LABEL_SERVICE_DATA] === SERVICE_DATA;
@@ -4801,7 +4691,7 @@ export class EnvironmentService {
    * Of the additional volumes `names` that `env` records, those that Delete may remove, and the reason for each other
    * one. Removable is only an existing volume whose labels make it the environment's own (isOwnVolume) and that no other
    * environment records and no Delete of another account kept. Kept, with its reason: every other volume, among them a
-   * volume that a version before the labels recorded (the user removes it), a volume of another program (for example of
+   * volume without the labels of the environment (the user removes it), a volume of another program (for example of
    * Docker Compose, which took a name that the environment used before), and a volume of another environment.
    */
   private async removableVolumes(
@@ -4815,21 +4705,21 @@ export class EnvironmentService {
     const file = await this.deps.registry.read();
     const others = file.environments.filter((other) => other.id !== env.id);
     // A volume that the Delete of an environment of another account kept holds that account's data.
-    const keptByOthers = (file.keptVolumes ?? []).filter((record) => record.owner?.id !== env.owner?.id).map((record) => record.name);
+    const keptByOthers = (file.keptVolumes ?? []).filter((record) => record.owner.id !== env.owner.id).map((record) => record.name);
     for (const volume of await this.deps.docker.inspectVolumes(volumes)) labels.set(volume.name, volume.labels);
     for (const name of volumes) {
       const volumeLabelsOf = labels.get(name);
       if (volumeLabelsOf === undefined) continue;
       if (others.some((other) => other.volumeName === name || (other.additionalVolumes ?? []).includes(name)) || keptByOthers.includes(name)) {
         result.kept.push({ name, reason: 'another environment uses it too' });
-      } else if (!isOwnVolume(volumeLabelsOf, env.id, env.owner?.id)) {
+      } else if (!isOwnVolume(volumeLabelsOf, env.id, env.owner.id)) {
         const owner = volumeLabelOwner(volumeLabelsOf);
         result.kept.push({
           name,
           reason:
             owner !== undefined
               ? `${owner} created it`
-              : 'its labels do not show that this environment created it (for example, a version of Dev Environments before these labels created it)',
+              : 'its labels do not show that this environment created it',
         });
       } else {
         result.removable.push(name);

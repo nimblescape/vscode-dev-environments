@@ -13,7 +13,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
-import { isRepositoryInScope, sameScope } from '../core/discovery/scope';
+import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
@@ -22,7 +22,6 @@ import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
-import { EnvironmentClaims } from '../core/ownership';
 import { systemClock, type Logger } from '../core/ports';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
@@ -134,7 +133,7 @@ async function activateExtension(
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
   });
-  // One stored list per GitHub account (concept 6.2); the shared list of version 1 is removed.
+  // One stored list per GitHub account (concept 6.2).
   const discovery = new DiscoveryService(
     new GitHubApi(nodeHttpsTransport, logger, {
       onUnauthorized: (token) => auth.reportRejectedToken(token),
@@ -146,20 +145,7 @@ async function activateExtension(
     // Concept 7.4: the setting `owners` is the scan scope; GitHub is asked only about these owners.
     { scope: () => getSettings().owners },
   );
-  fs.promises
-    .rm(paths.legacyRepositories, { force: true })
-    .catch((error: unknown) => logger.warn(`The old repository list could not be removed: ${errorMessage(error)}`));
   const ui = new VsCodePipelineUi(auth, logger, () => logger.show());
-  // Concept 7.5: entries of an older version. The quiet question logs no repository name (a hidden entry may belong to
-  // another account); a command of the user asks before an entry that is not unambiguous is assigned.
-  const claims = new EnvironmentClaims({
-    registry,
-    getRepository: (repository, token, signal) => discovery.getRepository(repository, token, signal, { quiet: true }),
-    confirm: (environment, account) => ui.confirmAssignment(environment.repository, account.login),
-    // Concept 7.4: no lookup of a repository outside the scan scope; such an entry stays hidden.
-    inScope: (repository) => isRepositoryInScope(getSettings().owners, repository),
-    logger,
-  });
   const connection = new ConnectionAdapter(logger);
   const sessionCoordinator = new SessionCoordinator({
     paths,
@@ -185,8 +171,6 @@ async function activateExtension(
     auth,
     // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
     viewer: (token, signal) => discovery.viewer(token, signal),
-    // Concept 7.5: an entry of an older version that an open meets (for example restored from its volume) is claimed first.
-    claims,
     ui,
     logger,
     clock: systemClock,
@@ -236,7 +220,6 @@ async function activateExtension(
     docker,
     discovery,
     auth,
-    claims,
     tree,
     settings: getSettings,
     dockerSetupRequired: () => setup.setupRequired,
@@ -260,7 +243,6 @@ async function activateExtension(
     service,
     discovery,
     auth,
-    claims,
     ui,
     connection,
     coordinator: sessionCoordinator,

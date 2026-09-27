@@ -87,7 +87,7 @@ export interface HostAccessInput {
    * name it is its own (isOwnVolume) and may be mounted, and so may an additional volume of another environment of the
    * same owner (isSameOwnerAdditionalVolume). Without it, every volume with devenv.environment-id is refused.
    */
-  environment?: { id: string; ownerId?: string };
+  environment?: { id: string; ownerId: string };
   /**
    * The networks that the configuration names (runArgsNetworks, or the networks of a Docker Compose model) and that
    * exist, by name: their labels and the environments of the containers attached to them (foreignNetworkItem).
@@ -153,7 +153,7 @@ export interface NetworkState {
   /**
    * Of `environments`, those of registry entries of the owner of the checked environment (review round 2, P2-2): the
    * environments of one account may share a network of their own (as they share additional volumes). An environment
-   * of another owner, of an entry without owner, or without an entry stays another environment's.
+   * of another owner, or without an entry, stays another environment's.
    */
   sameOwnerEnvironments?: readonly string[];
 }
@@ -1387,7 +1387,7 @@ interface VolumeContext {
   /** HostAccessInput.volumeLabels. */
   labels: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** HostAccessInput.environment. */
-  environment: { id: string; ownerId?: string } | undefined;
+  environment: { id: string; ownerId: string } | undefined;
   /** HostAccessInput.networks. */
   networks: Readonly<Record<string, NetworkState>>;
 }
@@ -1644,15 +1644,12 @@ export function foreignVolumeName(name: string): string | undefined {
 
 /**
  * True when the labels of a volume make it the own volume of the environment `environmentId`: devenv.environment-id is
- * that ID, and devenv.owner-id, when both the volume and the environment have an owner, is the owner of the
- * environment. The only rule by which the pipeline records an additional volume and Delete removes one: a volume
- * without these labels (for example one that a version before the labels created, one named with `${devcontainerId}`,
- * which Docker creates at `up`, or one of another program) is never the environment's.
+ * that ID, and devenv.owner-id is the owner of the environment. The only rule by which the pipeline records an
+ * additional volume and Delete removes one: a volume without these labels (for example one named with
+ * `${devcontainerId}`, which Docker creates at `up`, or one of another program) is never the environment's.
  */
-export function isOwnVolume(labels: Readonly<Record<string, string>>, environmentId: string, ownerId: string | undefined): boolean {
-  if (labels[LABEL_ENVIRONMENT_ID] !== environmentId) return false;
-  const volumeOwner = labels[LABEL_OWNER_ID];
-  return volumeOwner === undefined || ownerId === undefined || volumeOwner === ownerId;
+export function isOwnVolume(labels: Readonly<Record<string, string>>, environmentId: string, ownerId: string): boolean {
+  return labels[LABEL_ENVIRONMENT_ID] === environmentId && labels[LABEL_OWNER_ID] === ownerId;
 }
 
 /**
@@ -1681,25 +1678,21 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
  * GitHub user `ownerId`: devenv.environment-id is set, and devenv.owner-id is set and is that user. The environments of one account share such a volume,
  * for example `${localWorkspaceFolderBasename}-node_modules` of a fork and its upstream repository, or a fixed cache
  * name: each may mount it (mayMountEnvironmentVolume) and records it, so that the Delete of one keeps it while another
- * records it. A volume without the owner label, a workspace volume (no devenv.volume), and every volume when the
- * environment has no owner are not.
+ * records it. A volume without the owner label and a workspace volume (no devenv.volume) are not.
  */
-export function isSameOwnerAdditionalVolume(labels: Readonly<Record<string, string>>, ownerId: string | undefined): boolean {
-  const volumeOwner = labels[LABEL_OWNER_ID];
+export function isSameOwnerAdditionalVolume(labels: Readonly<Record<string, string>>, ownerId: string): boolean {
   return (
     labels[LABEL_ENVIRONMENT_ID] !== undefined &&
     labels[LABEL_VOLUME] === VOLUME_KIND_ADDITIONAL &&
-    volumeOwner !== undefined &&
-    ownerId !== undefined &&
-    volumeOwner === ownerId
+    labels[LABEL_OWNER_ID] === ownerId
   );
 }
 
 /**
  * An existing volume with devenv labels that the environment may mount: its own (isOwnVolume), or an additional volume
  * of another environment of the same owner (isSameOwnerAdditionalVolume), whether that environment still exists or its
- * Delete kept the volume. A volume of another account, a volume without an owner label, a workspace volume, and every
- * such volume for an environment without owner are refused.
+ * Delete kept the volume. A volume of another account, a volume without an owner label, and a workspace volume are
+ * refused.
  */
 function mayMountEnvironmentVolume(labels: Readonly<Record<string, string>>, volumes: VolumeContext): boolean {
   const environment = volumes.environment;

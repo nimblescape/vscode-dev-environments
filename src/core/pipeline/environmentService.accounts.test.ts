@@ -3,14 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Concept D-3: one environment per repository and GitHub account. The environment service with two accounts that open
-// the same repository, with the claims of entries of an older version, and with the names of a new environment.
+// the same repository, and with the names of a new environment.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
-import { EnvironmentClaims, availableEnvironments } from '../ownership';
-import { silentLogger } from '../ports';
-import type { Environment, GitHubAccount, RepositoryInfo } from '../types';
+import { availableEnvironments } from '../ownership';
+import type { Environment, GitHubAccount } from '../types';
 import type { EnvironmentServiceDeps, RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
@@ -45,8 +44,8 @@ function recreate(overrides: Partial<EnvironmentServiceDeps>): void {
   h = createHarness(overrides);
 }
 
-function options(extra: { olderEnvironmentAsked?: boolean } = {}): { progress: typeof h.progress; olderEnvironmentAsked?: boolean } {
-  return { progress: h.progress, ...extra };
+function options(): { progress: typeof h.progress } {
+  return { progress: h.progress };
 }
 
 /** A switch of the GitHub account in VS Code: another account, with a token of its own. */
@@ -63,51 +62,6 @@ async function rejection(promise: Promise<unknown>): Promise<UserFacingError> {
     return error as UserFacingError;
   }
   throw new Error('The promise did not reject.');
-}
-
-/** A repository of an organization, as GitHub returns it to a member that can push to it: a claim needs a question. */
-function repositoryInfo(nameWithOwner: string): RepositoryInfo {
-  const [owner, name] = nameWithOwner.split('/');
-  return {
-    nameWithOwner,
-    owner,
-    name,
-    url: `https://github.com/${nameWithOwner}`,
-    isArchived: false,
-    isFork: false,
-    isPrivate: true,
-    viewerPermission: 'WRITE',
-    pushedAt: null,
-    defaultBranch: 'main',
-    configPaths: [DEFAULT_CONFIG_PATH],
-  };
-}
-
-/**
- * A harness whose service claims with the real EnvironmentClaims: `answer` is the answer of the user to the question
- * before an entry of an older version is assigned, and `lookUp` the answer of GitHub (by default, GitHub returns the
- * repository to every account).
- */
-function withClaims(
-  answer: (account: GitHubAccount) => boolean,
-  lookUp: (repository: string) => Promise<RepositoryInfo | undefined> = async (repository) => repositoryInfo(repository),
-): {
-  getRepository: ReturnType<typeof vi.fn>;
-  confirm: ReturnType<typeof vi.fn>;
-} {
-  const getRepository = vi.fn(lookUp);
-  const confirm = vi.fn(async (_environment: Environment, account: GitHubAccount) => answer(account));
-  const claims = new EnvironmentClaims({
-    // The registry of the harness that recreate makes next.
-    get registry() {
-      return h.registry;
-    },
-    getRepository,
-    confirm,
-    logger: silentLogger,
-  });
-  recreate({ claims });
-  return { getRepository, confirm };
 }
 
 describe('two GitHub accounts open the same repository (concept D-3)', () => {
@@ -289,7 +243,7 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     const result = await h.service.open(TARGET, options());
     expect(result.environment.owner).toEqual(OTHER_ACCOUNT);
     expect(h.helper.ups).toHaveLength(1);
-    // Its labels name no environment (a version before the labels created it): never recorded, never removed.
+    // Its labels name no environment (created by hand): never recorded, never removed.
     expect(result.environment.additionalVolumes).toBeUndefined();
   });
 
@@ -462,157 +416,6 @@ describe('a lost registry: the named volumes without labels that the container o
     lostRegistry([anonymous, 'shop_db', 'web-cache', 'devenv-acme-web-f0000001', 'gone']);
     expect(await h.service.reconcileFromVolumes()).toBeGreaterThanOrEqual(1);
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
-  });
-});
-
-describe('entries of an older version at Start (concept 7.5, D-3)', () => {
-  it('claims the entry of the repository for the account after the question, and uses it', async () => {
-    const { confirm } = withClaims(() => true);
-    await seedEnvironment(h, { owner: null });
-    const result = await h.service.open(TARGET, options());
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(result.environment.id).toBe(ENV_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect(h.helper.clones).toEqual([]);
-  });
-
-  it('creates an environment of the account when the user declines, and leaves the entry to another account', async () => {
-    const { confirm } = withClaims((account) => account.id === OTHER_ACCOUNT.id);
-    await seedEnvironment(h, { owner: null });
-    const own = (await h.service.open(TARGET, options())).environment;
-    expect(own.id).not.toBe(ENV_ID);
-    expect(h.helper.clones).toHaveLength(1);
-    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
-
-    // The account has an environment of the repository now: the entry is not asked about again.
-    await h.service.open(TARGET, options());
-    expect(confirm).toHaveBeenCalledTimes(1);
-
-    // An account without an environment of the repository can take the entry over.
-    signIn(OTHER_ACCOUNT, OTHER_TOKEN);
-    const claimed = await h.service.open(TARGET, options());
-    expect(confirm).toHaveBeenCalledTimes(2);
-    expect(claimed.environment.id).toBe(ENV_ID);
-    expect(claimed.environment.owner).toEqual(OTHER_ACCOUNT);
-    expect(h.helper.clones).toHaveLength(1);
-  });
-
-  it('creates nothing when the user declines an entry that uses named volumes of the repository, and asks again at the next Start', async () => {
-    const answers = [false, false, true];
-    const { confirm } = withClaims(() => answers.shift() ?? false);
-    await seedEnvironment(h, { owner: null, extra: { additionalVolumes: ['api-node_modules'] } });
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.code).toBe('environmentUnassigned');
-      expect(error.message).toBe(Messages.olderEnvironmentUsesVolumes(REPO));
-    }
-    expect(confirm).toHaveBeenCalledTimes(2);
-    expect(h.helper.clones).toEqual([]);
-    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
-    // Assign at the third Start: the entry is used.
-    const result = await h.service.open(TARGET, options());
-    expect(confirm).toHaveBeenCalledTimes(3);
-    expect(result.environment.id).toBe(ENV_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-  });
-
-  it('does not ask again about a declined entry when the command asked already (Switch branch…, Select configuration…)', async () => {
-    const { confirm } = withClaims(() => false);
-    await seedEnvironment(h, { owner: null, extra: { additionalVolumes: ['api-node_modules'] } });
-    await rejection(h.service.open(TARGET, options()));
-    expect(confirm).toHaveBeenCalledTimes(1);
-    const error = await rejection(h.service.open(TARGET, options({ olderEnvironmentAsked: true })));
-    expect(error.message).toBe(Messages.olderEnvironmentUsesVolumes(REPO));
-    expect(confirm).toHaveBeenCalledTimes(1);
-    await rejection(h.service.open(TARGET, options()));
-    expect(confirm).toHaveBeenCalledTimes(2);
-  });
-
-  it('asks once in one open, also when the restore of a lost registry adds an entry of another repository', async () => {
-    const { confirm } = withClaims(() => false);
-    await seedEnvironment(h, { owner: null });
-    const web = 'e0000001-0000-4000-8000-000000000001';
-    h.docker.volumes.set(resourceName('acme/web', web), { [LABEL_ENVIRONMENT_ID]: web, [LABEL_REPOSITORY]: 'acme/web' });
-    const own = (await h.service.open(TARGET, options())).environment;
-    expect(own.id).not.toBe(ENV_ID);
-    expect(confirm).toHaveBeenCalledTimes(1);
-  });
-
-  it('reads the token for the claim of a command interactively: a new sign-in while GitHub rejects the token', async () => {
-    const { getRepository } = withClaims(() => true);
-    const interactive: boolean[] = [];
-    recreate({
-      claims: h.service['deps'].claims,
-      auth: {
-        getToken: async (options: { interactive: boolean }) => {
-          interactive.push(options.interactive);
-          return options.interactive ? 'gho_new' : TOKEN;
-        },
-        getAccount: async () => ACCOUNT,
-      },
-    });
-    await seedEnvironment(h, { owner: null });
-    await h.service.listConfigurations(ENV_ID, options());
-    expect(interactive).toContain(true);
-    expect(getRepository).toHaveBeenCalledWith(REPO, 'gho_new', undefined);
-    expect((await h.registry.get(ENV_ID))?.owner).toEqual(ACCOUNT);
-  });
-
-  it('creates an environment of the account when GitHub does not return the repository of the entry to it', async () => {
-    const { confirm } = withClaims(() => true, async () => undefined);
-    await seedEnvironment(h, { owner: null });
-    const own = (await h.service.open(TARGET, options())).environment;
-    expect(own.id).not.toBe(ENV_ID);
-    expect(confirm).not.toHaveBeenCalled();
-    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
-  });
-
-  it('refuses Start as not assigned while GitHub cannot be asked about the entry, and creates no second environment', async () => {
-    let online = false;
-    const { confirm } = withClaims(
-      () => true,
-      async (repository) => {
-        if (!online) throw new Error('getaddrinfo ENOTFOUND api.github.com');
-        return repositoryInfo(repository);
-      },
-    );
-    await seedEnvironment(h, { owner: null });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('environmentUnassigned');
-    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect(confirm).not.toHaveBeenCalled();
-    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
-    expect(h.helper.clones).toEqual([]);
-    expect(h.dockerStarts).toBe(0);
-
-    // Try again when GitHub answers: the question comes, and the entry is used.
-    online = true;
-    const result = await h.service.open(TARGET, options());
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(result.environment.id).toBe(ENV_ID);
-    expect(result.environment.owner).toEqual(ACCOUNT);
-    expect(h.helper.clones).toEqual([]);
-  });
-
-  it('opens the environment of the account without asking GitHub or the user about the entry of an older version', async () => {
-    const { getRepository, confirm } = withClaims(() => true);
-    await seedEnvironment(h, { owner: null });
-    const own = await seedEnvironment(h, { id: OTHER_ID });
-    const result = await h.service.open(TARGET, options());
-    expect(result.environment.id).toBe(own.id);
-    expect(getRepository).not.toHaveBeenCalled();
-    expect(confirm).not.toHaveBeenCalled();
-    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
-  });
-
-  it('never claims the entry for an account that has an environment of the repository, also by its ID', async () => {
-    const { confirm } = withClaims(() => true);
-    await seedEnvironment(h, { owner: null });
-    await seedEnvironment(h, { id: OTHER_ID });
-    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-    expect(error.message).toBe(Messages.olderEnvironmentNotAssigned(REPO));
-    expect(confirm).not.toHaveBeenCalled();
-    expect((await h.registry.get(ENV_ID))?.owner).toBeUndefined();
   });
 });
 

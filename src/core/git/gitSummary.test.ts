@@ -152,7 +152,7 @@ describe('review round 9 (D9-1): the ownership fix leaves out the paths that oth
       `${REPO}/x`,
     ]);
     expect(servicePrunePatterns(REPO, undefined)).toEqual([]);
-    // Review round 10 (D10-3): never .git or a path in it (Git writes there as root), also from a record written before.
+    // Review round 10 (D10-3): never .git or a path in it (Git writes there as root), also from a recorded list.
     expect(servicePrunePatterns(REPO, [`${REPO}/.git`, `${REPO}/.git/objects`, `${REPO}/sub/.git`, `${REPO}/.github`, `${REPO}/x.git`])).toEqual([`${REPO}/.github`, `${REPO}/x.git`]);
     // Review round 11, G5: the command holds the ready arguments of find (servicePathArguments), not the patterns.
     expect(ownershipFixCommand(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual([

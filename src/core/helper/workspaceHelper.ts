@@ -798,7 +798,7 @@ export class WorkspaceHelper {
     token: string;
     /**
      * Review round 9 (D9-1): the paths of the repository that the other services of Docker Compose mount
-     * (ComposeBuildRecord.serviceFolders); the restore of the owner leaves them out. Review round 11 (G5):
+     * (Environment.serviceFolders); the restore of the owner leaves them out. Review round 11 (G5):
      * `'repository'` over MAX_SERVICE_FOLDERS (only the files of root get their owner).
      */
     serviceFolders?: ServiceFolders;

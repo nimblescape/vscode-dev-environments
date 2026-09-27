@@ -71,7 +71,7 @@ export const MAX_REFUSED_ITEMS_LENGTH = 4096;
 
 /**
  * The field `refusedUpdate` of a registry entry, when it is valid. Its items at most MAX_REFUSED_ITEMS_LENGTH
- * characters (hotfix review 4, Q3): an older version stored them without a bound, and they are logged and shown.
+ * characters (hotfix review 4, Q3): a registry changed by hand may hold more, and they are logged and shown.
  */
 export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
   const value: unknown = (entry as { refusedUpdate?: unknown }).refusedUpdate;
@@ -446,28 +446,24 @@ export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRe
   const value: unknown = record?.compose;
   if (!isRecord(value) || typeof value.service !== 'string' || value.service === '') return undefined;
   if (!Array.isArray(value.images) || !value.images.every((image) => typeof image === 'string')) return undefined;
-  const serviceImages = Array.isArray(value.serviceImages) && value.serviceImages.every((image) => typeof image === 'string') ? [...value.serviceImages] : undefined;
+  if (!Array.isArray(value.serviceImages) || !value.serviceImages.every((image) => typeof image === 'string')) return undefined;
+  if (typeof value.version !== 'string' || typeof value.inputsHash !== 'string') return undefined;
   return {
     service: value.service,
     images: [...value.images],
-    ...(serviceImages !== undefined ? { serviceImages } : {}),
-    ...(typeof value.version === 'string' ? { version: value.version } : {}),
-    ...(typeof value.inputsHash === 'string' ? { inputsHash: value.inputsHash } : {}),
-    // Review round 9 (D9-1): only a list of texts; the scripts take only the paths below the repository folder.
-    ...(Array.isArray(value.serviceFolders) && value.serviceFolders.every((folder) => typeof folder === 'string')
-      ? { serviceFolders: [...(value.serviceFolders as string[])] }
-      : {}),
+    serviceImages: [...value.serviceImages],
+    version: value.version,
+    inputsHash: value.inputsHash,
   };
 }
 
 /**
- * Review round 9 (D9-1, D9-2): the paths of the repository that the containers of the other services of the Docker
- * Compose environment may mount. Review round 10 (D10-1): Environment.serviceFolders together with the list of a build
- * record of review round 9 (ComposeBuildRecord.serviceFolders); empty for an entry without either.
+ * Review round 9 (D9-1, D9-2), round 10 (D10-1): the paths of the repository that the containers of the other services
+ * of the Docker Compose environment may mount (Environment.serviceFolders); empty for an entry without them.
  */
-export function serviceFoldersOf(env: Pick<Environment, 'buildRecord' | 'serviceFolders'>): string[] {
+export function serviceFoldersOf(env: Pick<Environment, 'serviceFolders'>): string[] {
   const own = Array.isArray(env.serviceFolders) ? env.serviceFolders.filter((folder) => typeof folder === 'string') : [];
-  return [...new Set([...own, ...(composeRecordOf(env.buildRecord)?.serviceFolders ?? [])])];
+  return [...new Set(own)];
 }
 
 /**
@@ -606,7 +602,7 @@ export function verifiedIdentityTargets(candidates: readonly WorkspaceIdentityMo
  * Review round 9 (D9-2): serviceFoldersOf relative to the repository folder, as the user knows them (`./data/postgres`),
  * for the confirmation of Delete. Only the paths below the repository folder.
  */
-export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'buildRecord' | 'serviceFolders'>): string[] {
+export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'serviceFolders'>): string[] {
   const folder = repositoryFolder(env.repository);
   return serviceFoldersOf(env)
     .filter((path) => path.startsWith(`${folder}/`) && path.length > folder.length + 1)
@@ -622,14 +618,14 @@ export function repositoryServiceDataFolders(env: Pick<Environment, 'repository'
  * - `rebaseline`: only the Compose version and with it the printed model differ: no change for the user; the record
  *   takes the new model hash and version;
  * - `unchanged`: otherwise.
- * A record without the hash of the files or the version (written before) compares the model hash alone.
+ * A record that is no valid Docker Compose record (composeRecordOf) compares the model hash alone.
  */
 export function composeConfigurationChange(
   record: Pick<BuildRecord, 'configHash' | 'compose'>,
   current: { configHash: string; inputsHash: string; version: string },
 ): 'changed' | 'unchanged' | 'rebaseline' {
   const compose = composeRecordOf(record as BuildRecord);
-  if (compose?.inputsHash === undefined || compose.version === undefined) return record.configHash === current.configHash ? 'unchanged' : 'changed';
+  if (compose === undefined) return record.configHash === current.configHash ? 'unchanged' : 'changed';
   if (compose.inputsHash !== current.inputsHash) return 'changed';
   if (record.configHash === current.configHash) return compose.version === current.version ? 'unchanged' : 'rebaseline';
   return compose.version === current.version ? 'changed' : 'rebaseline';

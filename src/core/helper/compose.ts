@@ -174,19 +174,19 @@ export interface ComposeModelOutput {
   realPaths: Record<string, string | null>;
   /**
    * Review round 3 (P3-1): the local build contexts and Dockerfiles in the repository that do not exist, without a link
-   * that leads to or through them (a missing file of the repository, not a link out). Missing in older outputs.
+   * that leads to or through them (a missing file of the repository, not a link out).
    */
   missing?: string[];
   /**
    * Review round 8 (P8-2): of each bind mount source in the repository that does not exist (realPaths `null`), the real
    * path of the nearest path above it (or itself, a link that leads nowhere) that exists, when that is a folder; `null`
-   * when it is no folder or cannot be read. Missing in older outputs.
+   * when it is no folder or cannot be read.
    */
   mountAncestors?: Record<string, string | null>;
   /**
    * Review round 10 (D10-2): of each source of mountAncestors whose nearest path is a folder, where the folder lands when
    * the pipeline creates it (CREATE_FOLDERS_SCRIPT, which follows links like the system): the real path of that nearest
-   * folder plus the rest of the path. Missing in older outputs.
+   * folder plus the rest of the path.
    */
   mountCreateTargets?: Record<string, string>;
   /**

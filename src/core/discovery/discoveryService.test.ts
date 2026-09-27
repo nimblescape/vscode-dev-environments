@@ -568,29 +568,34 @@ describe('DiscoveryService.loadStored', () => {
       fetchedAt: '2026-09-24T12:00:00Z',
       viewerLogin: 'octo',
       organizations: ['acme', 3],
-      repositories: [
-        valid,
-        { ...valid, nameWithOwner: 'octo/b', viewerPermission: 'WRITE' },
-        { ...valid, url: 'file:///etc/passwd' },
-        { ...valid, configPaths: [] },
-        { ...valid, viewerPermission: 7 },
-        null,
-      ],
+      repositories: [valid, { ...valid, nameWithOwner: 'octo/b' }, { ...valid, url: 'file:///etc/passwd' }, { ...valid, configPaths: [] }, null],
       hints: [
         { organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' },
         { organization: 'x', kind: 'unknown', url: 'https://github.com/x' },
         { organization: 'y', kind: 'other', url: 'https://evil.example' },
       ],
+      scope: ['Acme'],
+      withoutConfiguration: [{ nameWithOwner: 'octo/c', pushedAt: null, defaultBranch: 'main' }, 3],
     });
     expect(data).toEqual({
       version: 1,
       fetchedAt: '2026-09-24T12:00:00Z',
       viewerLogin: 'octo',
       organizations: ['acme'],
-      // A list of an older version has no permission; it is still valid.
-      repositories: [valid, { ...valid, nameWithOwner: 'octo/b', viewerPermission: 'WRITE' }],
+      repositories: [valid, { ...valid, nameWithOwner: 'octo/b' }],
       hints: [{ organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' }],
+      scope: ['acme'],
+      withoutConfiguration: [{ nameWithOwner: 'octo/c', pushedAt: null, defaultBranch: 'main' }],
     });
+  });
+
+  it('parseDiscoveryData refuses a list without scope or withoutConfiguration: the list is built again', () => {
+    const list = { version: 1, fetchedAt: '2026-09-24T12:00:00Z', viewerLogin: 'octo', organizations: [], repositories: [], hints: [], scope: [], withoutConfiguration: [] };
+    expect(parseDiscoveryData(list)).toBeDefined();
+    const { scope: _scope, ...withoutScope } = list;
+    const { withoutConfiguration: _without, ...withoutChecked } = list;
+    expect(parseDiscoveryData(withoutScope)).toBeUndefined();
+    expect(parseDiscoveryData(withoutChecked)).toBeUndefined();
   });
 });
 
@@ -655,54 +660,19 @@ describe('DiscoveryService single repository queries', () => {
     );
     const info = await service(transport).getRepository('acme/api', TOKEN);
     expect(info).toMatchObject({ nameWithOwner: 'acme/api', owner: 'acme', isArchived: true, configPaths: [] });
-    expect(info?.viewerPermission).toBeUndefined();
     expect(transport.requests[0].query).toBe(REPOSITORY_QUERY);
     expect(await service(transport).getRepository('acme/gone', TOKEN)).toBeUndefined();
   });
 
-  it('getRepository reads the permission of the account (concept 7.5: read access alone assigns no environment)', async () => {
-    expect(REPOSITORY_QUERY).toMatch(/\bviewerPermission\b/);
-    const transport = new FakeGitHub((request) => ({
-      body: {
-        data: {
-          repository: {
-            ...repoNode(`acme/${request.variables.name as string}`, { isPrivate: false }),
-            viewerPermission: request.variables.name === 'api' ? 'READ' : null,
-          },
-        },
-      },
-    }));
-    expect(await service(transport).getRepository('acme/api', TOKEN)).toMatchObject({ isPrivate: false, viewerPermission: 'READ' });
-    expect(await service(transport).getRepository('acme/web', TOKEN)).not.toHaveProperty('viewerPermission');
-  });
-
-  it('getRepository in the quiet mode logs nothing and names the repository in no error (concept 7.5)', async () => {
+  it('getRepository logs the errors of GitHub and names the repository in its error', async () => {
     const replies: Record<string, Reply> = {
       gone: {
         body: { data: { repository: null }, errors: [{ type: 'NOT_FOUND', message: "Could not resolve to a Repository with the name 'acme/gone'." }] },
       },
       limited: { body: { data: null, errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded for acme/limited' }] } },
-      timeout: {
-        body: {
-          data: { repository: null },
-          errors: [{ message: "Something went wrong while executing your query for 'acme/timeout'. This may be the result of a timeout." }],
-        },
-      },
     };
     const transport = new FakeGitHub((request) => replies[request.variables.name as string]);
     const logger = recordingLogger();
-    const quiet = { quiet: true };
-    expect(await service(transport, logger).getRepository('acme/gone', TOKEN, undefined, quiet)).toBeUndefined();
-    await expect(service(transport, logger).getRepository('acme/limited', TOKEN, undefined, quiet)).rejects.toThrow(
-      'GitHub did not answer the query for a repository (RATE_LIMITED).',
-    );
-    await expect(service(transport, logger).getRepository('acme/timeout', TOKEN, undefined, quiet)).rejects.toThrow(
-      'GitHub did not answer the query for a repository (timeout).',
-    );
-    await expect(service(transport, logger).getRepository('acme', TOKEN, undefined, quiet)).rejects.toThrow('Invalid repository name.');
-    expect(logger.lines).toEqual([]);
-
-    // Without the quiet mode, the log and the errors name the repository, as before.
     expect(await service(transport, logger).getRepository('acme/gone', TOKEN)).toBeUndefined();
     expect(logger.lines.join('\n')).toContain('Repository acme/gone: ');
     await expect(service(transport, logger).getRepository('acme/limited', TOKEN)).rejects.toThrow(/acme\/limited/);
@@ -766,6 +736,8 @@ describe('isTrustedOwner', () => {
     organizations: ['Acme-University'],
     repositories: [],
     hints: [],
+    scope: [],
+    withoutConfiguration: [],
   };
 
   it('trusts the user and the organizations of the user, case-insensitively', () => {
