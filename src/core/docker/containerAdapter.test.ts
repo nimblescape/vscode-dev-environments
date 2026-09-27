@@ -1058,6 +1058,47 @@ describe('ContainerAdapter: a Docker CLI that is installed later', () => {
     expect(runner.calls.map((call) => call.file)).toEqual(['/usr/local/bin/docker', '/Applications/Docker.app/Contents/Resources/bin/docker']);
   });
 
+  it('reports the loss of a CLI that it found before to onCliLost (ENOENT), once per loss', async () => {
+    let gone = true;
+    const runner = new FakeRunner((call) => {
+      if (call.file === DOCKER && gone) throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+      return ok('"27.3.1"\n');
+    });
+    const lost: string[] = [];
+    let found: string | undefined;
+    const docker: ContainerAdapter = new ContainerAdapter(runner, DOCKER, {}, silentLogger, 'linux', {
+      findDocker: () => found,
+      onCliLost: () => lost.push(String(docker.dockerPath)),
+    });
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    // Reported after the adapter forgot the path, so that a lookup in the callback looks for the CLI again.
+    expect(lost).toEqual(['undefined']);
+    // Without a CLI there is nothing to lose again.
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    expect(lost).toHaveLength(1);
+    gone = false;
+    found = DOCKER;
+    expect(docker.lookUpCliNow()).toBe(true);
+    await docker.run(['ps']);
+    expect(lost).toHaveLength(1);
+  });
+
+  it('keeps its error when onCliLost throws', async () => {
+    const runner = new FakeRunner(() => {
+      throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+    });
+    const warnings: string[] = [];
+    const logger: Logger = { ...silentLogger, warn: (message: string) => void warnings.push(message) };
+    const docker = new ContainerAdapter(runner, DOCKER, {}, logger, 'linux', {
+      findDocker: () => undefined,
+      onCliLost: () => {
+        throw new Error('boom');
+      },
+    });
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    expect(warnings.some((line) => line.includes('boom'))).toBe(true);
+  });
+
   it('looks for a missing CLI at once with lookUpCliNow, without the waiting time', () => {
     const { docker, lookups, advance } = setup([undefined, undefined, '/opt/docker/bin/docker']);
     expect(docker.lookUpCliNow()).toBe(false);

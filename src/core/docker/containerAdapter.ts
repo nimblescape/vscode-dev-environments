@@ -138,6 +138,13 @@ export interface ContainerAdapterOptions {
    * asked for it: only the checks that run anyway are reported.
    */
   onDaemonStatus?: (running: boolean) => void;
+  /**
+   * With `findDocker`: called when a CLI that was found before cannot be started anymore (ENOENT, for example Docker was
+   * uninstalled or moved while VS Code runs), after the adapter forgot its path. The Docker setup shows the setup in the
+   * sidebar then. The callback should not look the CLI up itself: that would count as the next lookup, and a CLI back
+   * seconds later (for example after Docker Desktop updated itself) would be found only 10 seconds later.
+   */
+  onCliLost?: () => void;
 }
 
 type ObjectKind = 'container' | 'volume' | 'image' | 'network';
@@ -458,6 +465,7 @@ export class ContainerAdapter {
   private readonly findDocker: ContainerAdapterOptions['findDocker'];
   private readonly clock: Clock;
   private readonly onDaemonStatus: ContainerAdapterOptions['onDaemonStatus'];
+  private readonly onCliLost: ContainerAdapterOptions['onCliLost'];
   private lookedUpAt: number | undefined;
 
   /**
@@ -481,6 +489,7 @@ export class ContainerAdapter {
     this.findDocker = options.findDocker;
     this.clock = options.clock ?? systemClock;
     this.onDaemonStatus = options.onDaemonStatus;
+    this.onCliLost = options.onCliLost;
     // The caller has just looked the CLI up.
     this.lookedUpAt = this.clock.now();
   }
@@ -509,9 +518,11 @@ export class ContainerAdapter {
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
-          // For example while Docker Desktop updates itself: the next call looks for the CLI again.
+          // For example while Docker Desktop updates itself: the next call looks for the CLI again (unless `onCliLost`
+          // looks it up first, see ContainerAdapterOptions).
           this.path = undefined;
           this.lookedUpAt = undefined;
+          this.reportCliLost();
         }
         throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled, `${dockerPath}: ${errorMessage(error)}`);
       }
@@ -526,6 +537,14 @@ export class ContainerAdapter {
   lookUpCliNow(): boolean {
     this.lookUpCliIfMissing(true);
     return this.path !== undefined;
+  }
+
+  private reportCliLost(): void {
+    try {
+      this.onCliLost?.();
+    } catch (error) {
+      this.logger.warn(`The lost Docker CLI could not be reported: ${errorMessage(error)}`);
+    }
   }
 
   /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS unless `force` is set. */

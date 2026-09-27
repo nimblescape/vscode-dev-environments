@@ -4,7 +4,7 @@ Open your GitHub repositories in local dev containers with one action.
 
 Dev Environments lists the GitHub repositories that you can access and that contain a Dev Container configuration. **Start** opens a repository in a container on your computer, in the current window. **Start in New Window** opens it in a new window instead, so you can work in several environments at the same time. The extension does the rest for you:
 
-- It starts Docker when Docker is not running.
+- It starts Docker Desktop when it is not running. Docker Engine on Linux needs administrator rights: the extension asks to start it.
 - It downloads the repository into a Docker volume. Your work stays in this volume when the container is created again.
 - Before each connection, it checks for a newer container image and updates the environment if one exists. Without internet access, it skips this check and uses the local image.
 - When you close the window, it stops the container after a short waiting time.
@@ -38,15 +38,15 @@ The first load of the list can take some time with many repositories; the view s
 
 ## Installing Docker
 
-When Docker is not installed, the view shows no repositories, but the steps to set Docker up, each with its button: on Windows **Install WSL 2**, then **Install Docker**. After the installation, your repositories appear in the view, and Docker is started when it is needed. **Open the Setup Guide** opens the walkthrough **Set up Docker for Dev Environments**, which guides you step by step and checks each step off by itself:
+When Docker is not installed, the view shows no repositories, but the steps to set Docker up, each with its button: on Windows **Install WSL 2**, then **Install Docker**. After the installation, your repositories appear in the view, and Docker is started when it is needed. The steps:
 
-1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards).
+1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards). Once WSL 2 is ready, the view shows "✓ WSL 2 is installed." instead of the button.
 2. **Install Docker**:
    - macOS: with Homebrew, `brew install --cask docker-desktop`; without Homebrew, the installer `Docker.dmg` is downloaded from Docker and opens (drag Docker to Applications).
    - Windows: with winget, `winget install --exact --id Docker.DockerDesktop …`; without winget, `Docker Desktop Installer.exe` is downloaded from Docker and starts.
    - Linux (Ubuntu, Debian, Fedora, RHEL, CentOS): Docker Engine from the package repository of Docker, and your user joins the group `docker` (sign in again afterwards). Other distributions: the installation guide of Docker opens.
-3. **Start Docker**. At its first start, Docker Desktop shows its own dialogs once. On Linux, `sudo systemctl enable --now docker` starts the Docker service.
-4. **Sign in with GitHub**.
+3. Docker starts by itself when an environment needs it. Right after the installation, a notification also offers **Start Docker**. At its first start, Docker Desktop shows its own dialogs once. On Linux, **Start Docker** runs `sudo systemctl enable --now docker` in a terminal to start the Docker service.
+4. **Sign in with GitHub** (the button below the steps, while you are not signed in).
 
 Nothing runs without your confirmation: a dialog first lists the exact commands, or the download address and the file. Commands run visibly in a terminal of VS Code, where you enter your password if one is needed. Downloads come only from Docker over HTTPS, and the installers are signed by Docker; your system checks the signature when the installer opens. Settings of the opened workspace do not change what runs in the terminal. If Docker is installed already, nothing is installed. Docker Desktop is free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription (Docker Subscription Service Agreement). The installation works only in a local window, not in a remote window.
 
@@ -92,7 +92,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - Only data in the repository volume survives a rebuild, and also when an update of the extension sets the container up again (the progress says so). Data in other folders of the container, for example the home folder, is lost, unless the configuration stores it in an additional named volume (property `mounts`).
 - Each GitHub account has its own environment of a repository, with its own clone: two accounts that work on the same repository need the disk space for two clones. A configuration whose named volumes have a fixed name (or `${localWorkspaceFolderBasename}-…`) works for one account's environment only; use `${devcontainerId}` in the name to give each environment its own volume.
 - Work that runs in the container after its window has closed, for example a long build in a terminal, ends when the container stops.
-- On Linux with Docker Engine, the extension cannot start the Docker service by itself, because this needs administrator rights. **Start Docker** in the walkthrough runs `sudo systemctl enable --now docker` in a terminal, where you enter your password.
+- On Linux with Docker Engine, the extension cannot start the Docker service by itself, because this needs administrator rights. **Start Docker**, in the notification after the installation and in the message "Docker is not running.", runs `sudo systemctl enable --now docker` in a terminal, where you enter your password. In a remote window, for example one connected over SSH, the message offers no **Start Docker**; it names the command to run.
 - Docker Compose configurations (`dockerComposeFile` and `service`) start the dev container together with the other services, for example a database. The same checks apply to every service: published ports are bound to `127.0.0.1`, and only the dev container gets the repository volume. A service that mounts files or folders of the repository (for example `./init.sql`) gets them from the repository volume (Docker Engine 26 or newer) and can read and change them. Remote `include` and `extends` of compose files do not work. **Delete** removes the containers, networks, and images of the services; the volumes with their data (for example of a database) only when you tick them.
 - With **Select Organizations…**, GitHub is asked only about the selected owners. Your environments of repositories of other owners stay in the list, but without the check whether the repository is still on GitHub. An environment created with an older version of Dev Environments that is not assigned to a GitHub account yet stays hidden while its owner is not selected.
 

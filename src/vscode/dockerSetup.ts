@@ -2,9 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view (the setup in the sidebar), the
-// walkthrough "Set up Docker for Dev Environments", and the commands of the walkthrough. Nothing runs hidden: after a
-// modal confirmation that lists the exact commands, they run in a visible terminal, or the installer of Docker Desktop is
+// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view (the setup in the sidebar) and
+// the commands of its buttons. Nothing runs hidden: after a modal confirmation that lists the exact commands, they run in a visible terminal, or the installer of Docker Desktop is
 // downloaded from desktop.docker.com with a progress notification and opened. The rules are pure functions in
 // src/core/docker/dockerSetup.ts.
 import * as fs from 'fs';
@@ -51,13 +50,13 @@ import { errorMessage, isUserFacingError } from '../core/errors';
 import { Steps } from '../core/messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner } from '../core/ports';
 
-/** The walkthrough of package.json (`contributes.walkthroughs`), with the ID of this extension (publisher.name). */
-export const DOCKER_WALKTHROUGH_ID = 'nimblescape.vscode-dev-environments#dockerSetup';
-// Internal VS Code command (not extension API): opens a walkthrough of the Welcome page. Arguments: the walkthrough ID
-// (`publisher.extension#walkthrough`) and `toSide`.
-export const OPEN_WALKTHROUGH_COMMAND = 'workbench.action.openWalkthrough';
-/** Command of the walkthrough step "Start Docker" (package.json). */
+/**
+ * Command Start Docker (package.json), offered once an installation has put the CLI in place, and as the action of the
+ * error "Docker is not running." (Docker Engine on Linux) in a local window.
+ */
 export const DOCKER_SETUP_START_COMMAND = 'devEnvironments.dockerSetup.start';
+/** Shows the sidebar view (VS Code contributes `<view id>.focus` for each view of package.json). */
+const SHOW_SIDEBAR_COMMAND = 'devEnvironments.repositories.focus';
 /** Name of the terminal of the installation commands. */
 export const INSTALL_TERMINAL_NAME = 'Install Docker';
 const MAC_OPEN = '/usr/bin/open';
@@ -69,6 +68,8 @@ const OS_RELEASE_FILES = ['/etc/os-release', '/usr/lib/os-release'];
 export const DockerSetupUiTexts = {
   /** A terminal of a remote window runs on the remote computer, not on this one. */
   localWindowNeeded: 'Open a local window to install Docker.',
+  /** Start Docker in a remote window. */
+  localWindowNeededToStart: 'Open a local window to start Docker.',
   downloading: 'Downloading Docker Desktop',
   downloadProgress: (receivedMb: number, totalMb: number | undefined) =>
     totalMb === undefined ? `${receivedMb} MB` : `${receivedMb} of ${totalMb} MB`,
@@ -243,9 +244,31 @@ export class DockerSetup implements vscode.Disposable {
     if (this.dockerMissing) this.checkWslInBackground();
   }
 
-  /** Looks for the CLI (ContainerAdapter looks a missing CLI up again, at most every 10 seconds). */
+  /**
+   * Asks ContainerAdapter whether the CLI is found. A missing CLI is looked up again (at most every 10 seconds); a CLI
+   * that was found counts as found until a call of it fails with ENOENT (then ContainerAdapter reports `reportCliLost`).
+   */
   checkCli(): boolean {
     return this.lookUp(() => this.deps.docker.isInstalled());
+  }
+
+  /**
+   * ContainerAdapter option `onCliLost`: a CLI that was found cannot be started anymore. The sidebar shows the setup at
+   * once; no lookup runs here, so the next call of the adapter (or the check every 10 seconds) looks the CLI up again,
+   * for example after Docker Desktop has updated itself.
+   */
+  reportCliLost(): void {
+    this.apply({ kind: 'cli', found: false });
+  }
+
+  /**
+   * Command devEnvironments.dockerSetup.show (action Install Docker… of the error "Docker Desktop is not installed."):
+   * updates the context keys from the adapter (a missing CLI may be found again; a lost CLI was reported already by
+   * `reportCliLost`), then shows the sidebar view.
+   */
+  async show(): Promise<void> {
+    this.checkCli();
+    await vscode.commands.executeCommand(SHOW_SIDEBAR_COMMAND);
   }
 
   /** The result of a `docker info` that ran anyway (ContainerAdapter option `onDaemonStatus`). */
@@ -253,20 +276,14 @@ export class DockerSetup implements vscode.Disposable {
     this.apply({ kind: 'engine', running });
   }
 
-  /** Command devEnvironments.installDocker: opens the walkthrough (only in a local window). */
-  async openWizard(): Promise<void> {
-    if (this.refuseInRemoteWindow()) return;
-    this.checkWslInBackground();
-    await vscode.commands.executeCommand(OPEN_WALKTHROUGH_COMMAND, DOCKER_WALKTHROUGH_ID, false);
-  }
-
   /**
-   * Command devEnvironments.dockerSetup.install (walkthrough step "Install Docker"): the installation plan of this
+   * Command devEnvironments.dockerSetup.install (sidebar button "Install Docker"): the installation plan of this
    * computer, after a modal confirmation. Afterwards, the CLI is looked up every 5 seconds for at most 30 minutes.
    */
   async install(): Promise<void> {
     if (this.refuseInRemoteWindow()) return;
-    // The walkthrough stays reachable after the installation (Welcome page): an installed Docker is never installed again.
+    // The command may run after the installation (for example from an older notification): an installed Docker is never
+    // installed again.
     if (this.dockerAlreadyInstalled()) return;
     const plan = installPlan(await (this.deps.planInput ?? (() => readInstallPlanInput(this.deps.runner, this.deps.platform, this.deps.env)))());
     this.deps.logger.info(`Docker installation: ${describePlan(plan)}`);
@@ -289,12 +306,13 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /**
-   * Command devEnvironments.dockerSetup.start (walkthrough step "Start Docker"): starts Docker Desktop with the
+   * Command devEnvironments.dockerSetup.start (action Start Docker after an installation, and of the error "Docker is not
+   * running." of Docker Engine on Linux): starts Docker Desktop with the
    * documented commands and waits until it is ready. Docker Engine on Linux: `sudo systemctl enable --now docker` in the
    * terminal, after a confirmation.
    */
   async start(): Promise<void> {
-    if (this.refuseInRemoteWindow()) return;
+    if (this.refuseInRemoteWindow(DockerSetupUiTexts.localWindowNeededToStart, 'started')) return;
     try {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: Steps.startingDocker, cancellable: true },
@@ -310,7 +328,7 @@ export class DockerSetup implements vscode.Disposable {
                 signal,
                 onStarting,
               }));
-          return run(abort.signal, () => this.deps.logger.info('Starting Docker from the setup walkthrough.')).finally(() =>
+          return run(abort.signal, () => this.deps.logger.info('Starting Docker from the Docker setup.')).finally(() =>
             subscription.dispose(),
           );
         },
@@ -325,7 +343,7 @@ export class DockerSetup implements vscode.Disposable {
     void vscode.window.showInformationMessage(DockerSetupUiTexts.dockerRunning).then(undefined, () => undefined);
   }
 
-  /** Command devEnvironments.dockerSetup.installWsl (walkthrough step "WSL 2", Windows): `wsl --install` in the terminal. */
+  /** Command devEnvironments.dockerSetup.installWsl (sidebar button "Install WSL 2", Windows): `wsl --install` in the terminal. */
   async installWsl(): Promise<void> {
     if (this.refuseInRemoteWindow()) return;
     if (this.state.wslReady) {
@@ -480,11 +498,11 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /** In a remote window, a terminal would run on the remote computer: the user is asked to open a local window. */
-  private refuseInRemoteWindow(): boolean {
+  private refuseInRemoteWindow(text: string = DockerSetupUiTexts.localWindowNeeded, done = 'installed'): boolean {
     if (vscode.env.remoteName === undefined) return false;
-    this.deps.logger.info(`Docker is installed only from a local window (this window: ${vscode.env.remoteName}).`);
+    this.deps.logger.info(`Docker is ${done} only from a local window (this window: ${vscode.env.remoteName}).`);
     vscode.window
-      .showInformationMessage(DockerSetupUiTexts.localWindowNeeded)
+      .showInformationMessage(text)
       .then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));
     return true;
   }
@@ -562,11 +580,14 @@ export class DockerSetup implements vscode.Disposable {
         this.stopInstallWatch();
         this.offerStart();
       }
+      // Windows: a CLI found at activation skipped `wsl --status`; the setup now shows the step Install WSL 2, so it
+      // needs the state of WSL (review round 3, W3-1). Returns at once on other platforms or while a check runs.
+      if (!this.state.cliFound) this.checkWslInBackground();
     }
     this.updateMissingTimer();
   }
 
-  /** Walkthrough step "Start Docker", offered once the installation has put the CLI in place. */
+  /** Start Docker, offered once the installation has put the CLI in place. */
   private offerStart(): void {
     vscode.window.showInformationMessage(DockerSetupUiTexts.installedStartNow, DockerSetupUiTexts.startDocker).then(
       (choice) => {
