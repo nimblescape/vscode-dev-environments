@@ -64,6 +64,7 @@ import {
   withDevcontainerIdPlaceholder,
   type CliVariables,
 } from './cliVariables';
+import { CLI_ARCH_PLACEHOLDERS, CLI_PLATFORM_VARIABLES, CliDockerfileError, cliBaseImage, parseCliDockerfile } from './cliDockerfile';
 import { GITHUB_CLI_ACCOUNT_REASON, isContainerGitVariable, isGitHubCliAccountVariable } from './containerGit';
 
 export interface HostAccessInput {
@@ -649,7 +650,11 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
   }
   if (input.dockerfileText !== undefined) {
     const { args, target } = singleBuildArguments(build);
-    problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
+    const imageFindings = dockerfileImageFindings(input.dockerfileText, args, target);
+    problems.push(...imageFindings);
+    // Review round 18 (P18-1): the image that the Dev Container CLI reads as the base image of the Dockerfile (not
+    // named when the images of the Dockerfile refuse it already, whatever the switch says).
+    if (usesCliDockerfile(config) && imageFindings.length === 0) problems.push(...singleCliBaseImageCheck(config, input.dockerfileText).findings);
   } else if (input.dockerfileUnreadable !== undefined) {
     problems.push(unsupported(`Dockerfile ${input.dockerfileUnreadable} (it could not be read, so its images cannot be checked)`));
   }
@@ -667,24 +672,29 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
  * object.
  */
 export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
-  const args: Record<string, string> = {};
+  const fromArgs: Record<string, string> = {};
   if (isRecord(build.args)) {
-    for (const [name, value] of Object.entries(build.args)) args[name] = String(value);
+    for (const [name, value] of Object.entries(build.args)) fromArgs[name] = String(value);
   }
+  // Review round 18 (S18-1): a Map, then own properties (Object.fromEntries), so that `--build-arg __proto__=…` of
+  // `build.options`, which the CLI passes to `docker build` as it is, stays an argument. `build.args` above keeps its
+  // assignment: the CLI's parser of devcontainer.json drops a key `__proto__` with a text value too.
+  const args = new Map(Object.entries(fromArgs));
   let target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
   if (Array.isArray(build.options)) {
     for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
       if (flag.value === undefined) continue;
       if (flag.name === '--build-arg') {
         const equals = flag.value.indexOf('=');
-        if (equals < 0) args[flag.value] = `\${${flag.value}}`;
-        else if (equals > 0) args[flag.value.slice(0, equals)] = flag.value.slice(equals + 1);
+        if (equals < 0) args.set(flag.value, `\${${flag.value}}`);
+        else if (equals > 0) args.set(flag.value.slice(0, equals), flag.value.slice(equals + 1));
       } else if (flag.name === '--target') {
         target = flag.value !== '' ? flag.value : undefined;
       }
     }
   }
-  return target !== undefined ? { args, target } : { args };
+  const texts = Object.fromEntries(args);
+  return target !== undefined ? { args: texts, target } : { args: texts };
 }
 
 /** An image reference of a configuration, and how an item names it (for example `FROM image`). */
@@ -756,8 +766,8 @@ function analyzeDockerfileReferences(text: string, args: Readonly<Record<string,
 
 /**
  * The image references of a single container (review round 2, S2-05): `image`, the images of its Dockerfile
- * (dockerfileImageReferences, with `build.args` and `build.target`), and the images of `--build-context` of
- * `build.options`.
+ * (dockerfileImageReferences, with `build.args` and `build.target`), the image that the Dev Container CLI reads as the
+ * base image (review round 18, P18-1: singleCliBaseImageCheck), and the images of `--build-context` of `build.options`.
  */
 export function singleImageReferences(config: Readonly<Record<string, unknown>>, dockerfileText: string | undefined): NamedImageReference[] {
   const references: NamedImageReference[] = [];
@@ -767,6 +777,9 @@ export function singleImageReferences(config: Readonly<Record<string, unknown>>,
     // Review round 3 (S3-2): with the build arguments of `build.options`.
     const { args, target } = singleBuildArguments(build);
     references.push(...dockerfileImageReferences(dockerfileText, args, target));
+    // Review round 18 (P18-1): the image that the Dev Container CLI reads as the base image of the Dockerfile.
+    const cliBase = usesCliDockerfile(config) ? singleCliBaseImageCheck(config, dockerfileText).reference : undefined;
+    if (cliBase !== undefined) references.push(cliBase);
   }
   if (Array.isArray(build.options)) {
     for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
@@ -838,32 +851,136 @@ export function dockerfileImageFindings(text: string, args: Readonly<Record<stri
       });
       continue;
     }
-    const dollar = reference.indexOf('$');
-    if (dollar < 0) {
+    if (!reference.includes('$')) {
       const finding = imageReferenceFinding(reference, what);
       if (finding) findings.push(finding);
       continue;
     }
-    const prefix = reference.slice(0, dollar).trim();
-    if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
-      findings.push({ item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' });
-      continue;
-    }
-    // Review round 5 (S5-1): the texts that the reference can become when its variables that are not resolved are empty
-    // (for example `dev${TARGETVARIANT}env-…`), or give an operand of `:-` or `:+`.
     // Review round 6 (P6-2): a variant that names a stage (by its name, or by its index for `COPY --from` and
     // `RUN --mount from`) is no image, as extractImageReferences leaves out such a resolved text.
     const isStage = (name: string): boolean => (firstStage.get(name) ?? Infinity) < (stagesBefore ?? 0);
     const isImage = (variant: string): boolean => !isStage(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
-    const variants = unresolvedVariants(reference)?.filter(isImage);
-    if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
-      findings.push({
-        item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
-        class: 'protected',
-      });
-    }
+    const finding = unresolvedReferenceFinding(reference, what, isImage);
+    if (finding) findings.push(finding);
   }
   return findings;
+}
+
+/**
+ * The finding of an image reference with a variable that is not resolved (a `$`): refused (`protected`) when the text
+ * before its first `$` already names an image of the namespace of Dev Environments, or when its text holds `devenv`
+ * anywhere (review round 3, S3-4), except behind a registry other than Docker Hub (review round 4, S4-6); and when one of
+ * the texts that it can become (unresolvedVariants, review round 5, S5-1: its variables empty, or giving an operand of
+ * `:-` or `:+`) for which `isImage` holds names such an image or has the form of an image ID. `undefined` otherwise.
+ */
+function unresolvedReferenceFinding(reference: string, what: string, isImage: (variant: string) => boolean = () => true): HostAccessFinding | undefined {
+  const dollar = reference.indexOf('$');
+  const prefix = reference.slice(0, dollar).trim();
+  if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
+    return { item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' };
+  }
+  const variants = unresolvedVariants(reference)?.filter(isImage);
+  if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
+    return {
+      item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
+      class: 'protected',
+    };
+  }
+  return undefined;
+}
+
+/** Review round 18 (P18-1): how an item names the image that the Dev Container CLI reads as the base image (cliBaseImageCheck). */
+export const CLI_BASE_IMAGE_WHAT = 'base image of the Dev Container CLI';
+
+/** Review round 18 (P18-1): the result of cliBaseImageCheck. */
+export interface CliBaseImageCheck {
+  /** The refusals (none of the class `computer`: the switch lifts none of them). */
+  findings: HostAccessFinding[];
+  /** The image to ask Docker about for an image ID (imageIdItems), when it has no finding and no variable. */
+  reference?: NamedImageReference;
+  /** The check of the configuration: the image uses the architecture, which only the runtime check knows. */
+  deferred?: boolean;
+}
+
+/**
+ * Review round 18 (P18-1): the image whose configuration the Dev Container CLI 0.89.0 inspects (and pulls when it is
+ * missing) for the build of a Dockerfile, and whose metadata label (containerEnv, remoteEnv, lifecycle commands, …) it
+ * copies into the environment image, with and without Features (function `Tj`: cliBaseImage, the CLI's `uG`). Its
+ * reader is not Docker's: it can see a FROM line that Docker does not (a line continuation, a heredoc), so the rules on
+ * the images of the Dockerfile (dockerfileImageFindings, of Docker's view) do not cover it. The same rules apply to it:
+ * no image of another environment and no image ID (imageReferenceFinding, and imageIdItems for `reference`), and for a
+ * variable that is not resolved, unresolvedReferenceFinding. It is refused when it cannot be computed (the CLI's reading
+ * fails, or a variable other than the architecture is not resolved).
+ *
+ * `platform`: the platform variables. Without them (the check of the configuration), CLI_PLATFORM_VARIABLES, whose
+ * architecture is not known: an image whose only variables are CLI_ARCH_PLACEHOLDERS is `deferred` to the runtime check
+ * (a per-architecture base image, for example `toolchain:2-${TARGETARCH}`), which evaluates it with the exact values of
+ * the Docker Engine (cliPlatformVariables) and refuses any variable. `dockerView`: the images of Docker's view of the
+ * Dockerfile (dockerfileReferences): an image that is one of them already had these rules, and is not named twice.
+ */
+export function cliBaseImageCheck(
+  text: string,
+  args: Readonly<Record<string, unknown>>,
+  target: unknown,
+  platform?: Readonly<Record<string, string>>,
+  dockerView: readonly string[] = [],
+): CliBaseImageCheck {
+  const what = CLI_BASE_IMAGE_WHAT;
+  let image: string | undefined;
+  try {
+    image = cliBaseImage(parseCliDockerfile(text), args, target as string | undefined, platform ?? CLI_PLATFORM_VARIABLES);
+  } catch (error) {
+    const reason = error instanceof CliDockerfileError ? error.message : 'the Dev Container CLI cannot read the Dockerfile';
+    return { findings: [{ item: `${what} (${reason}, so it cannot be checked)`, class: 'unsupported' }] };
+  }
+  if (image === undefined || image.toLowerCase() === 'scratch') return { findings: [] };
+  if (image.includes('$')) {
+    const cannot: HostAccessFinding = { item: `${what} ${shortReference(image)} (its variables cannot be resolved, so it cannot be checked)`, class: 'unsupported' };
+    if (platform !== undefined) return { findings: [cannot] };
+    const rest = CLI_ARCH_PLACEHOLDERS.reduce((result, placeholder) => result.split(placeholder).join(''), image);
+    if (rest.includes('$')) return { findings: [cannot] };
+    if (image.length > MAX_REFERENCE_LENGTH) return { findings: [tooLongFinding(image, what)] };
+    const finding = unresolvedReferenceFinding(image, what);
+    return finding !== undefined ? { findings: [finding] } : { findings: [], deferred: true };
+  }
+  if (dockerView.some((reference) => reference.trim() === image.trim())) return { findings: [] };
+  const finding = imageReferenceFinding(image, what);
+  if (finding !== undefined) return { findings: [finding] };
+  return { findings: [], reference: { reference: image.trim(), what } };
+}
+
+/**
+ * Review round 18 (P18-1): the images of Docker's view of the Dockerfile `text` with the build arguments `args`
+ * (dockerfileReferences) that the rules on the images of the Dockerfile covered by their text: those without a variable.
+ */
+export function dockerViewImages(text: string, args: Readonly<Record<string, string>>): string[] {
+  return dockerfileReferences(text, args).references.filter(({ reference }) => !reference.includes('$')).map(({ reference }) => reference);
+}
+
+/**
+ * Review round 18 (P18-1): whether the Dev Container CLI builds `config` from a Dockerfile (its `_i`: `dockerFile`, or
+ * `build.dockerfile`, whatever their values).
+ */
+export function usesCliDockerfile(config: Readonly<Record<string, unknown>>): boolean {
+  return 'dockerFile' in config || (isRecord(config.build) && 'dockerfile' in config.build);
+}
+
+/**
+ * Review round 18 (P18-1): cliBaseImageCheck of a single container: the CLI reads its Dockerfile with `build.args` and
+ * `build.target` as devcontainer.json holds them (not `build.options`, which only `docker build` gets). `platform`: see
+ * cliBaseImageCheck. `checked`: the images that the rules covered already (default: Docker's view, dockerViewImages; the
+ * runtime check passes the image references of the check of the configuration, and so does not analyse the Dockerfile
+ * in the extension host).
+ */
+export function singleCliBaseImageCheck(
+  config: Readonly<Record<string, unknown>>,
+  dockerfileText: string,
+  platform?: Readonly<Record<string, string>>,
+  checked?: readonly string[],
+): CliBaseImageCheck {
+  const build = isRecord(config.build) ? config.build : {};
+  const args = (build.args || {}) as Readonly<Record<string, unknown>>;
+  return cliBaseImageCheck(dockerfileText, args, build.target, platform, checked ?? dockerViewImages(dockerfileText, singleBuildArguments(build).args));
 }
 
 /**

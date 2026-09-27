@@ -50,12 +50,75 @@ const CLI_INSTRUCTION = /^\s*(?<instruction>ARG|ENV|USER)\s+(?<name>[^\s=]+)([ =
 const CLI_VARIABLE = /\$\{?(?<variable>[a-zA-Z0-9_]+)(?<isVarExp>:(?<option>-|\+)(?<word>[^}]+))?\}?/g;
 
 /**
- * The values of the platform variables for the CLI's `i` (BUILDPLATFORM and so on): not known here (they come from the
- * Docker Engine), so each is written as the variable itself, and a result that uses one holds a `$`.
+ * Review round 18 (S18-2, P18-3): the platform variables of the CLI's `i` (function `Tj`). The CLI takes them from its
+ * own Node process in the workspace helper, not from the Docker Engine: `{os: yo(process.platform), arch:
+ * mo(process.arch)}` for the build and the target platform, without a variant, so the OS is `linux`, each VARIANT is
+ * empty, the ARCH is the Node architecture of the helper (`x64` written `amd64`), and each PLATFORM is `linux/<arch>`.
+ * cliPlatformVariables gives the exact values for an architecture (the runtime check, which knows the architecture of
+ * the Docker Engine). CLI_PLATFORM_VARIABLES is for the check of the configuration, where the architecture is not known
+ * yet: the OS and the VARIANTs are the CLI's constants; each ARCH (and the architecture in each PLATFORM) is written as
+ * the variable itself, never empty (so `${TARGETARCH:+x}` gives `x`, as in the CLI), and a result that uses it holds a
+ * `$` (CLI_ARCH_PLACEHOLDERS: the runtime check evaluates it with the real architecture).
  */
-export const CLI_PLATFORM_VARIABLES: Readonly<Record<string, string>> = Object.fromEntries(
-  ['BUILDPLATFORM', 'BUILDOS', 'BUILDARCH', 'BUILDVARIANT', 'TARGETPLATFORM', 'TARGETOS', 'TARGETARCH', 'TARGETVARIANT'].map((name) => [name, `\${${name}}`]),
-);
+export const CLI_ARCH_PLACEHOLDERS: readonly string[] = ['${BUILDARCH}', '${TARGETARCH}'];
+
+/** The platform variables of the CLI for the Node architecture `arch` as the CLI writes it (mo: `amd64` for `x64`). */
+export function cliPlatformVariables(arch: string): Readonly<Record<string, string>> {
+  return cliPlatform(arch, arch);
+}
+
+function cliPlatform(buildArch: string, targetArch: string): Readonly<Record<string, string>> {
+  return {
+    BUILDPLATFORM: `linux/${buildArch}`,
+    BUILDOS: 'linux',
+    BUILDARCH: buildArch,
+    BUILDVARIANT: '',
+    TARGETPLATFORM: `linux/${targetArch}`,
+    TARGETOS: 'linux',
+    TARGETARCH: targetArch,
+    TARGETVARIANT: '',
+  };
+}
+
+export const CLI_PLATFORM_VARIABLES: Readonly<Record<string, string>> = cliPlatform(CLI_ARCH_PLACEHOLDERS[0], CLI_ARCH_PLACEHOLDERS[1]);
+
+/**
+ * Review round 18 (P18-3): the architecture that the CLI in the workspace helper writes (mo(process.arch)) for the
+ * architecture of the Docker Engine (`docker version`, Server.Arch, the GOARCH of the engine), on which the helper runs:
+ * Node names `ia32` what Go names `386`, and `ppc64` what Go names `ppc64le`. `undefined` for any other architecture
+ * (fail closed: its Node name is not known).
+ */
+export function cliArchitecture(engineArch: string): string | undefined {
+  const known: Readonly<Record<string, string>> = { amd64: 'amd64', arm64: 'arm64', arm: 'arm', '386': 'ia32', ppc64le: 'ppc64', s390x: 's390x' };
+  const arch = engineArch.trim();
+  return Object.prototype.hasOwnProperty.call(known, arch) ? known[arch] : undefined;
+}
+
+/**
+ * Review round 18 (P18-2): the most line breaks in one run of whitespace. The CLI's expressions start with `^\s*` in
+ * multiline mode, which takes time that grows with the square of such a run (each line start in it scans the rest of
+ * it); a Dockerfile with more (hundreds of blank lines in a row) is not read (CliDockerfileError). With the cap, one
+ * reading costs at most this factor times the length of the text.
+ */
+export const CLI_MAX_BLANK_LINES = 200;
+
+/**
+ * Review round 18 (P18-2): throws CliDockerfileError when `text` has a run of whitespace with more than
+ * CLI_MAX_BLANK_LINES line breaks (the line terminators of JavaScript's `^`: LF, CR, U+2028, U+2029). Linear.
+ */
+export function checkCliDockerfileText(text: string): void {
+  let breaks = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029) {
+      if (++breaks > CLI_MAX_BLANK_LINES) throw new CliDockerfileError('the Dockerfile has too many blank lines in a row');
+    } else if (!WHITESPACE.test(text[i])) {
+      breaks = 0;
+    }
+  }
+}
+
+const WHITESPACE = /^\s$/;
 
 /** `Nj`: the FROM line of a stage. */
 function cliFrom(text: string): CliStage['from'] {
@@ -73,8 +136,13 @@ function cliInstructions(text: string): CliInstruction[] {
   });
 }
 
-/** `EG`: the text split before each FROM line; the part before the first is the preamble. */
+/**
+ * `EG`: the text split before each FROM line; the part before the first is the preamble. Throws CliDockerfileError for a
+ * text of checkCliDockerfileText.
+ */
 export function parseCliDockerfile(text: string): CliDockerfile {
+  // Review round 18 (P18-2): not in quadratic time.
+  checkCliDockerfileText(text);
   const split = /(?=^[\t ]*FROM)/gim;
   const parts = text.split(split);
   // As the CLI: the test runs on the same (global) expression after the split.

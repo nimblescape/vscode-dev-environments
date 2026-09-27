@@ -65,7 +65,8 @@ export const DEVCONTAINER_ID_VARIABLE = 'devcontainerId';
  * Docker, NODE_VERSION and YARN_VERSION of the node base image of resources/helper/Dockerfile), those of the shell of
  * UP_SCRIPT and BUILD_SCRIPT (PWD, OLDPWD, SHLVL, `_`), TERM, and the proxy variables that the Docker CLI adds to
  * `docker run` from its configuration (`proxies` of ~/.docker/config.json). The pipeline passes no other variable to
- * the CLI runs. Case-sensitive, as on Linux.
+ * the CLI runs, except COMPOSE_PROJECT_NAME to those of Docker Compose, whose value it knows (review round 18, D18-1:
+ * helperCliVariables with `env`, not here). Case-sensitive, as on Linux.
  */
 export const HELPER_PROCESS_ENV_NAMES: readonly string[] = [
   ...HELPER_ENV_NAMES,
@@ -115,16 +116,22 @@ export interface CliVariables {
  * workspace file, whose parent is the folder itself, so the label, the user of the image, and the volumes that `up`
  * mounts use the repository folder. Only read-configuration and build read such a folder itself as a workspace file
  * and use `/workspaces` (Ri, Rp); their output is checked as they return it.
+ *
+ * `env` (review round 18, D18-1): the variables that the pipeline passes to the CLI run besides HELPER_KNOWN_ENV, with
+ * their values: `{ COMPOSE_PROJECT_NAME: <project> }` for the runs of a Docker Compose configuration (the helper gets
+ * it with `-e`), so that `${localEnv:COMPOSE_PROJECT_NAME}` is the project name, as in the CLI; nothing for a single
+ * container.
  */
-export function helperCliVariables(repository: string): CliVariables {
+export function helperCliVariables(repository: string, env: Readonly<Record<string, string>> = {}): CliVariables {
   const folder = repositoryFolder(repository);
-  return { localWorkspaceFolder: folder, containerWorkspaceFolder: folder, env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper };
+  return { localWorkspaceFolder: folder, containerWorkspaceFolder: folder, env: { ...HELPER_KNOWN_ENV, ...env }, mayBeSet: mayBeSetInHelper };
 }
 
 /**
  * The variables of the process of the Dev Container CLI in the workspace helper whose values are known (hotfix review 1,
  * N4): HOME. The helper runs as root (resources/helper/Dockerfile has no USER, and helperRunArgs passes no `--user`),
- * so Docker sets HOME=/root; the pipeline passes no variable to the CLI runs.
+ * so Docker sets HOME=/root. The pipeline passes no variable to the CLI runs of a single container; those of Docker
+ * Compose get COMPOSE_PROJECT_NAME (review round 18, D18-1: helperCliVariables with `env`).
  */
 export const HELPER_KNOWN_ENV: Readonly<Record<string, string>> = { HOME: '/root' };
 

@@ -8,7 +8,18 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { CLI_DOCKERFILE_BUDGET, CLI_PLATFORM_VARIABLES, cliBaseImage, cliEnvironment, cliImageUser, parseCliDockerfile } from './cliDockerfile';
+import {
+  CLI_DOCKERFILE_BUDGET,
+  CLI_MAX_BLANK_LINES,
+  CLI_PLATFORM_VARIABLES,
+  CliDockerfileError,
+  cliArchitecture,
+  cliBaseImage,
+  cliEnvironment,
+  cliImageUser,
+  cliPlatformVariables,
+  parseCliDockerfile,
+} from './cliDockerfile';
 
 const CLI_FOLDER = path.resolve(__dirname, '../../../node_modules/@devcontainers/cli');
 const BUNDLE = fs.readFileSync(path.join(CLI_FOLDER, 'dist', 'spec-node', 'devContainersSpecCLI.js'), 'utf8');
@@ -43,12 +54,18 @@ function outcome(run: () => string | undefined): Outcome {
 }
 
 /** Both readings of `dockerfile` for the base image and the user, ours and the CLI's. */
-function compare(dockerfile: string, args: Record<string, unknown>, env: string[], target: string | undefined): void {
-  const platform = { ...CLI_PLATFORM_VARIABLES };
+function compare(
+  dockerfile: string,
+  args: Record<string, unknown>,
+  env: string[],
+  target: string | undefined,
+  ours: Readonly<Record<string, string>> = CLI_PLATFORM_VARIABLES,
+): void {
+  const platform = { ...ours };
   const file = parseCliDockerfile(dockerfile);
-  const label = JSON.stringify({ dockerfile, args, env, target });
-  expect(outcome(() => cliBaseImage(file, { ...args }, target)), label).toEqual(outcome(() => cli.uG(cli.EG(dockerfile), { ...args }, target, platform)));
-  expect(outcome(() => cliImageUser(file, { ...args }, cliEnvironment(env), target)), label).toEqual(
+  const label = JSON.stringify({ dockerfile, args, env, target, platform });
+  expect(outcome(() => cliBaseImage(file, { ...args }, target, ours)), label).toEqual(outcome(() => cli.uG(cli.EG(dockerfile), { ...args }, target, platform)));
+  expect(outcome(() => cliImageUser(file, { ...args }, cliEnvironment(env), target, ours)), label).toEqual(
     outcome(() => cli.QG(cli.EG(dockerfile), { ...args }, ht(env), platform, target)),
   );
 }
@@ -72,6 +89,11 @@ const DOCKERFILES = [
   '',
   'FROM a AS x\nARG A=1\nFROM x\nARG A\nUSER $A\n',
   'ARG A=pre\nFROM alpine\nARG A\nUSER $A-${A:-d}-${NOPE:-d}-${A:+p}\n',
+  // Review round 18 (S18-2, P18-3): the platform variables.
+  'FROM alpine:3.22 AS alpin\nARG EVIL\nUSER $EVIL\nFROM alpin${TARGETVARIANT:+e}\nRUN true\n',
+  'ARG TARGETARCH\nFROM ghcr.io/acme/toolchain:2-${TARGETARCH}\nUSER ${BUILDPLATFORM}:${TARGETOS:-x}${BUILDVARIANT:-v}\n',
+  'FROM alpine AS s-amd64\nUSER a\nFROM alpine AS s-arm64\nUSER b\nFROM s-${TARGETARCH:-x}\n',
+  'FROM --platform=$BUILDPLATFORM golang:1.22 AS b\nFROM mcr.microsoft.com/devcontainers/base:${TARGETOS:-bookworm}${TARGETVARIANT:+-v}\n',
 ];
 const ARGS: Array<Record<string, unknown>> = [
   {},
@@ -139,5 +161,66 @@ describe('cliDockerfile: as Dev Container CLI 0.89.0 reads a Dockerfile (review 
     expect(() => cliImageUser(parseCliDockerfile(lines.join('\n')), {}, {}, undefined)).toThrow();
     expect(Date.now() - started).toBeLessThan(5000);
     expect(CLI_DOCKERFILE_BUDGET.steps).toBeGreaterThan(1000);
+  });
+
+  it('finds the same base image and user as the CLI with the platform variables of each architecture (review round 18, S18-2, P18-3)', () => {
+    for (const arch of ['amd64', 'arm64', 'arm', 'ia32', 'ppc64', 's390x']) {
+      const platform = cliPlatformVariables(arch);
+      for (const dockerfile of DOCKERFILES) for (const args of ARGS) for (const target of [undefined, 'dev', 'a', 'b']) compare(dockerfile, args, ENVS[1], target, platform);
+    }
+  });
+
+  it('writes the platform variables as the CLI computes them from its Node process (review round 18, S18-2, P18-3)', () => {
+    // Tj: BUILDPLATFORM is [os, arch, variant].filter(Boolean).join('/'), VARIANT `variant ?? ''` of {os: yo(platform), arch: mo(arch)}.
+    const tj = BUNDLE.slice(BUNDLE.indexOf('async function Tj('), BUNDLE.indexOf('var EI="devcontainer.metadata"'));
+    expect(tj).toContain('BUILDPLATFORM:[s.os,s.arch,s.variant].filter(Boolean).join("/"),BUILDOS:s.os,BUILDARCH:s.arch,BUILDVARIANT:s.variant??""');
+    expect(BUNDLE).toContain('function mo(e){return e==="x64"?"amd64":e}function yo(e){return e==="win32"?"windows":e}');
+    expect(cliPlatformVariables('arm64')).toEqual({
+      BUILDPLATFORM: 'linux/arm64',
+      BUILDOS: 'linux',
+      BUILDARCH: 'arm64',
+      BUILDVARIANT: '',
+      TARGETPLATFORM: 'linux/arm64',
+      TARGETOS: 'linux',
+      TARGETARCH: 'arm64',
+      TARGETVARIANT: '',
+    });
+    // The check of the configuration: the architecture is not known yet, never empty.
+    expect(CLI_PLATFORM_VARIABLES).toMatchObject({ BUILDOS: 'linux', TARGETOS: 'linux', BUILDVARIANT: '', TARGETVARIANT: '', TARGETARCH: '${TARGETARCH}', TARGETPLATFORM: 'linux/${TARGETARCH}' });
+  });
+
+  it('maps the architecture of the Docker Engine to the Node architecture of the helper (review round 18, P18-3)', () => {
+    expect(['amd64', 'arm64', 'arm', '386', 'ppc64le', 's390x', 'riscv64', 'mips64le', '', 'x64', 'constructor'].map(cliArchitecture)).toEqual([
+      'amd64',
+      'arm64',
+      'arm',
+      'ia32',
+      'ppc64',
+      's390x',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('reads long runs of blank lines in linear time, and refuses more than CLI_MAX_BLANK_LINES in a row (review round 18, P18-2)', () => {
+    const slow = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS dev\nUSER vscode\n' + ' \n'.repeat(60_000) + 'RUN x';
+    let started = Date.now();
+    expect(() => parseCliDockerfile(slow)).toThrow(CliDockerfileError);
+    expect(Date.now() - started).toBeLessThan(500);
+    // Just below the cap, in every form of line break of `^`.
+    for (const newline of ['\n', '\r\n', '\r', '\u2028', '\u2029']) {
+      const breaks = newline === '\r\n' ? CLI_MAX_BLANK_LINES / 2 : CLI_MAX_BLANK_LINES;
+      const blank = `FROM alpine AS dev${newline.repeat(breaks)}USER vscode\n`;
+      expect(cliImageUser(parseCliDockerfile(blank), {}, {}, undefined), JSON.stringify(newline)).toBe('vscode');
+      expect(() => parseCliDockerfile(`FROM alpine${' \t'.repeat(3)}${newline.repeat(breaks + 1)}USER x`)).toThrow(CliDockerfileError);
+    }
+    // Many short runs are fine: the cap is on one run.
+    const many = `FROM alpine AS dev\n${'RUN x\n\n\n'.repeat(20_000)}USER vscode\n`;
+    started = Date.now();
+    expect(cliImageUser(parseCliDockerfile(many), {}, {}, undefined)).toBe('vscode');
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });

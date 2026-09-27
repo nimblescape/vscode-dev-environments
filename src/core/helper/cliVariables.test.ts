@@ -27,6 +27,7 @@ import {
   type CliVariables,
 } from './cliVariables';
 import { helperRunArgs } from './workspaceHelper';
+import { composeMountVolumes } from '../pipeline/pipelineRules';
 
 // Guard (hotfix M1): the substitution functions of Dev Container CLI 0.89.0, copied verbatim from
 // node_modules/@devcontainers/cli/dist/spec-node/devContainersSpecCLI.js (Fo, tg, Hr, za, a_, cN, lN, I_, C_, B_, E_, hN,
@@ -431,5 +432,21 @@ describe('devcontainerIdOf: `${devcontainerId}` as Dev Container CLI 0.89.0 comp
     expect(environmentDevcontainerId(id)).toBe(cliId([`devenv.environment-id=${id}`]));
     expect(environmentDevcontainerId(id)).not.toBe(DEVCONTAINER_ID_PLACEHOLDER);
     expect(environmentDevcontainerId(id)).not.toBe(environmentDevcontainerId('7c1d2e3f-1111-4222-8333-444444444444'));
+  });
+});
+
+describe('helperCliVariables of a Docker Compose run (review round 18, D18-1)', () => {
+  it('knows COMPOSE_PROJECT_NAME, which the pipeline passes to the CLI runs of Docker Compose, with its value', () => {
+    const variables = helperCliVariables('acme/api', { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
+    expect(variables.env).toEqual({ HOME: '/root', COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
+    expect(substituteCliVariables('source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume', variables)).toBe('source=cachedevenv-3f2a9c1e,target=/c,type=volume');
+    const { names } = composeMountVolumes('devenv-3f2a9c1e', [['source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume']], variables);
+    expect(names).toEqual(['devenv-3f2a9c1e_cachedevenv-3f2a9c1e']);
+  });
+
+  it('a single container: COMPOSE_PROJECT_NAME is not set, and no variable of the helper process', () => {
+    expect(helperCliVariables('acme/api').env).toEqual({ HOME: '/root' });
+    expect(substituteCliVariables('cache${localEnv:COMPOSE_PROJECT_NAME}', helperCliVariables('acme/api'))).toBe('cache');
+    expect(HELPER_PROCESS_ENV_NAMES).not.toContain('COMPOSE_PROJECT_NAME');
   });
 });

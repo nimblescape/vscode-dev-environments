@@ -12,6 +12,7 @@ import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
 import { composeAccessReport, composeBuildImageItems, composeBuildUserItems, composeDevBuildImages, type ComposeAccessInput } from './composeAccess';
+import { cliPlatformVariables } from './cliDockerfile';
 import type { HostAccessReport } from './hostAccess';
 
 const PROJECT = 'devenv-3f2a9c1e';
@@ -223,7 +224,11 @@ describe('review round 17 (P17-1, P17-2): the image and the user of the build of
     expect(composeDevBuildImages(model({}), { app: dockerfile }, 'app')).toEqual({ images: [], unresolved: ['registry.example/app:'] });
     expect(composeDevBuildImages(model({}), { app: chain }, 'app')).toEqual({ images: ['gcr.io/private/prod:1'], unresolved: [] });
     // A platform variable in the root image: its value is not known here.
-    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETOS}\n' }, 'app').unresolved).toEqual(['golang:1.22-${TARGETOS}']);
+    // review round 18, S18-2: changed expectation, the OS is the CLI's constant `linux`; the architecture is not known
+    // before the runtime check, which passes the exact values.
+    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETOS}\n' }, 'app')).toEqual({ images: ['golang:1.22-linux'], unresolved: [] });
+    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETARCH}\n' }, 'app').unresolved).toEqual(['golang:1.22-${TARGETARCH}']);
+    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETARCH}\n' }, 'app', cliPlatformVariables('arm64'))).toEqual({ images: ['golang:1.22-arm64'], unresolved: [] });
   });
 
   it('P17-2: a multi-line build argument is allowed without Features, also when USER uses a variable', () => {

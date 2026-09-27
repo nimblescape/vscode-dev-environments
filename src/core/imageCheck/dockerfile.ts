@@ -96,6 +96,21 @@ function markFound(state: Expansion | undefined, found: LookupValue): void {
 }
 
 /**
+ * Review round 18 (S18-1): the build arguments of a `build.args` object (of a Compose model or of devcontainer.json) as
+ * texts: each value that is a text, a number, or a boolean, as `String(value)`; any other value is left out. Built with
+ * own properties (Object.fromEntries), so that an argument named `__proto__` stays an argument, as the Dev Container CLI
+ * and Docker keep it; an assignment would call the setter of Object.prototype and lose it.
+ */
+export function buildArgumentTexts(args: unknown): Record<string, string> {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return {};
+  return Object.fromEntries(
+    Object.entries(args as Record<string, unknown>)
+      .filter(([, value]) => typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+      .map(([name, value]) => [name, String(value)]),
+  );
+}
+
+/**
  * FROM images of a Dockerfile, deduplicated in order: line continuations, comments, parser directives (`escape`);
  * global ARG defaults (ARG before the first FROM), overridden by `buildArgs`; `${VAR}`, `$VAR`, `${VAR:-default}`,
  * `${VAR:+x}`; the `--platform=…` flag. Excludes references to earlier stages (case-insensitive) and `scratch`.

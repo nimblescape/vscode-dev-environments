@@ -12,8 +12,9 @@
 // setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
 // Pure functions, no I/O.
 import * as path from 'path';
+import { buildArgumentTexts } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
-import { CliDockerfileError, cliBaseImage, cliEnvironment, cliImageUser, parseCliDockerfile, type CliDockerfile } from './cliDockerfile';
+import { CliDockerfileError, checkCliDockerfileText, cliBaseImage, cliEnvironment, cliImageUser, parseCliDockerfile } from './cliDockerfile';
 import {
   composeNetworkNames,
   composeVolumeNames,
@@ -31,9 +32,11 @@ import {
   RESERVED_COMPOSE_LABEL,
   RESERVED_LABEL,
   capabilityProblems,
+  cliBaseImageCheck,
   configFolderMountItem,
   configFolderTarget,
   dockerfileImageFindings,
+  dockerViewImages,
   withDockerfileCache,
   dockerfileImageReferences,
   foreignNetworkItem,
@@ -44,6 +47,7 @@ import {
   refusedVariable,
   securityOptionProblems,
   volumeNameFindings,
+  type CliBaseImageCheck,
   type HostAccessClass,
   type HostAccessFinding,
   type HostAccessReport,
@@ -522,15 +526,15 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   // (S5-4): `dockerfile_inline` whatever the context.
   const text = ctx.input.dockerfiles?.[ctx.name];
   if (text !== undefined) {
-    const args: Record<string, string> = {};
-    if (isRecord(value.args)) {
-      for (const [arg, setting] of Object.entries(value.args)) {
-        if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
-      }
-    }
+    // Review round 18 (S18-1): own properties, also for an argument named `__proto__` (the CLI and Docker keep it).
+    const args = buildArgumentTexts(value.args);
     const target = typeof value.target === 'string' && value.target !== '' ? value.target : undefined;
     // Every image that the Dockerfile names: FROM, COPY --from, RUN --mount from, `# syntax` (review round 2, S2-02).
-    problems.push(...dockerfileImageFindings(text, args, target));
+    const imageFindings = dockerfileImageFindings(text, args, target);
+    problems.push(...imageFindings);
+    // Review round 18 (P18-1): the image that the Dev Container CLI reads as the base image of the dev service, with
+    // and without Features (not named when the images of the Dockerfile refuse it already, whatever the switch says).
+    if (ctx.isDev && imageFindings.length === 0) problems.push(...cliBaseImageCheck(text, args, target, undefined, dockerViewImages(text, args)).findings);
   }
   problems.push(...labelProblems(value.labels, 'build '));
   // Review round 16 (Dp): what the Dev Container CLI writes as text into its compose file for the build of the dev service.
@@ -605,19 +609,16 @@ function devBuildPlan(
   model: ComposeModel,
   dockerfiles: Readonly<Record<string, string>>,
   devService: string,
-): { file: CliDockerfile; args: Record<string, unknown>; target: string | undefined } | undefined {
+): { text: string; args: Record<string, unknown>; target: string | undefined } | undefined {
   const service = isRecord(model.services) ? model.services[devService] : undefined;
   const build = isRecord(service) && isRecord(service.build) ? service.build : undefined;
   const text = build !== undefined && Object.prototype.hasOwnProperty.call(dockerfiles, devService) ? dockerfiles[devService] : undefined;
   if (build === undefined || typeof text !== 'string') return undefined;
-  const args: Record<string, unknown> = {};
-  if (isRecord(build.args)) {
-    for (const [arg, setting] of Object.entries(build.args)) {
-      if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
-    }
-  }
+  // Review round 18 (S18-1): own properties, also for an argument named `__proto__`, which the CLI keeps (js-yaml).
+  const args: Record<string, unknown> = buildArgumentTexts(build.args);
   const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
-  return { file: parseCliDockerfile(text), args, target };
+  // Review round 18 (P18-2): read by the callers, within their handling of CliDockerfileError.
+  return { text, args, target };
 }
 
 /**
@@ -626,12 +627,14 @@ function devBuildPlan(
  * variables resolved as the CLI resolves them (cliImageUser: the build arguments, the ARG and ENV instructions, then
  * `env`, the environment of the image of cliBaseImage). Refused when it holds a line break of YAML, or when the CLI's
  * reading cannot be followed (CliDockerfileError, or where the CLI itself fails). `imageEnv`: `undefined` while the
- * image is not inspected yet (the check of the model): the variables of the image then count as not set.
+ * image is not inspected yet (the check of the model): the variables of the image then count as not set. `platform`:
+ * the platform variables (review round 18, S18-2, P18-3: cliPlatformVariables at runtime; CLI_PLATFORM_VARIABLES, with
+ * the architecture not known, in the check of the model).
  */
-function devBuildUserItems(plan: NonNullable<ReturnType<typeof devBuildPlan>>, imageEnv: unknown): string[] {
+function devBuildUserItems(plan: NonNullable<ReturnType<typeof devBuildPlan>>, imageEnv: unknown, platform?: Readonly<Record<string, string>>): string[] {
   let user: string | undefined;
   try {
-    user = cliImageUser(plan.file, plan.args, cliEnvironment(imageEnv), plan.target);
+    user = cliImageUser(parseCliDockerfile(plan.text), plan.args, cliEnvironment(imageEnv), plan.target, platform);
   } catch (error) {
     const reason = error instanceof CliDockerfileError ? error.message : 'the Dev Container CLI cannot read it';
     return [`the USER instruction of the Dockerfile (${reason}, so the user that ${BUILD_TEXT} cannot be checked)`];
@@ -660,6 +663,13 @@ function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string
       problems.push(unsupported(`build target ${JSON.stringify(target)} (${BUILD_TEXT}: only a plain stage name is supported)`));
     }
   } else if (dockerfile !== undefined) {
+    // Review round 18 (P18-2): the CLI's expression takes time that grows with the square of a run of blank lines.
+    try {
+      checkCliDockerfileText(dockerfile);
+    } catch (error) {
+      const reason = error instanceof CliDockerfileError ? error.message : 'the Dev Container CLI cannot read it';
+      return [unsupported(`the Dockerfile (${reason}, so the stage that ${BUILD_TEXT} cannot be checked)`)];
+    }
     const stage = lastStageName(dockerfile);
     if (stage !== undefined && !BUILD_STAGE_NAME.test(stage)) {
       problems.push(unsupported(`the last stage ${JSON.stringify(stage)} of the Dockerfile (${BUILD_TEXT}: only a plain stage name is supported)`));
@@ -681,13 +691,15 @@ function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string
  * Features (`_DEV_CONTAINERS_IMAGE_USER`): for a local build, the one external image at the root of the chain of the
  * target stage, or of the last stage (cliBaseImage, the CLI's `uG`; not the images of other stages, which the build does
  * not use); for a dev service without a build, its image (the build model builds `FROM <image>`). `unresolved`: such an
- * image that uses a platform variable (its value comes from the Docker Engine), that is no valid reference, or that
- * cannot be found as the CLI finds it: its user cannot be checked.
+ * image that uses a variable that is not resolved, that is no valid reference, or that cannot be found as the CLI finds
+ * it: its user cannot be checked. `platform`: the platform variables (review round 18, P18-3: the exact values of the
+ * runtime check, cliPlatformVariables, so that a per-architecture base image is resolved).
  */
 export function composeDevBuildImages(
   model: ComposeModel,
   dockerfiles: Readonly<Record<string, string>>,
   devService: string,
+  platform?: Readonly<Record<string, string>>,
 ): { images: string[]; unresolved: string[] } {
   const service = isRecord(model.services) ? model.services[devService] : undefined;
   if (!isRecord(service)) return { images: [], unresolved: [] };
@@ -699,13 +711,42 @@ export function composeDevBuildImages(
   if (plan === undefined) return { images: [], unresolved: [] };
   let image: string | undefined;
   try {
-    image = cliBaseImage(plan.file, plan.args, plan.target);
+    image = cliBaseImage(parseCliDockerfile(plan.text), plan.args, plan.target, platform);
   } catch {
     return { images: [], unresolved: ['of the target stage of the Dockerfile'] };
   }
   if (image === undefined || image.toLowerCase() === 'scratch') return { images: [], unresolved: [] };
   if (image.includes('$') || !isValidImageReference(image)) return { images: [], unresolved: [image] };
   return { images: [image], unresolved: [] };
+}
+
+/**
+ * Review round 18 (P18-1): cliBaseImageCheck of the build of the dev service `devService` (its Dockerfile of
+ * `dockerfiles`, with its build arguments and its target as the CLI gets them from the model), its items prefixed
+ * `service <name>: `; `undefined` for a dev service without a local build or whose Dockerfile the model run did not
+ * read. `platform`: see cliBaseImageCheck (the runtime check passes the exact values). `checked`: see
+ * singleCliBaseImageCheck.
+ */
+export function composeCliBaseImageCheck(
+  model: ComposeModel,
+  dockerfiles: Readonly<Record<string, string>>,
+  devService: string,
+  platform?: Readonly<Record<string, string>>,
+  checked?: readonly string[],
+): CliBaseImageCheck | undefined {
+  const service = isRecord(model.services) ? model.services[devService] : undefined;
+  const build = isRecord(service) && isRecord(service.build) ? service.build : undefined;
+  const text = build !== undefined && Object.prototype.hasOwnProperty.call(dockerfiles, devService) ? dockerfiles[devService] : undefined;
+  if (build === undefined || typeof text !== 'string') return undefined;
+  const args = buildArgumentTexts(build.args);
+  const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+  const at = `service ${devService}: `;
+  const check = cliBaseImageCheck(text, args, target, platform, checked ?? dockerViewImages(text, args));
+  return {
+    ...check,
+    findings: check.findings.map((finding) => ({ ...finding, item: `${at}${finding.item}` })),
+    ...(check.reference !== undefined ? { reference: { ...check.reference, what: `${at}${check.reference.what}` } } : {}),
+  };
 }
 
 /**
@@ -725,17 +766,19 @@ export function composeBuildImageItems(image: string, config: unknown): string[]
  * Review round 17 (P17-2): the items of the user that the Dev Container CLI 0.89.0 writes into its compose file for the
  * build of the dev service `devService` with Features, computed as the CLI computes it (devBuildUserItems) with the
  * environment of the image of composeDevBuildImages (`imageConfig`, its `Config`; `undefined` without one). Empty for a
- * dev service without a local build (composeBuildImageItems checks the user of its image).
+ * dev service without a local build (composeBuildImageItems checks the user of its image). `platform`: see
+ * devBuildUserItems.
  */
 export function composeBuildUserItems(
   model: ComposeModel,
   dockerfiles: Readonly<Record<string, string>>,
   devService: string,
   imageConfig: unknown,
+  platform?: Readonly<Record<string, string>>,
 ): string[] {
   const plan = devBuildPlan(model, dockerfiles, devService);
   if (plan === undefined) return [];
-  return devBuildUserItems(plan, isRecord(imageConfig) ? imageConfig.Env : undefined);
+  return devBuildUserItems(plan, isRecord(imageConfig) ? imageConfig.Env : undefined, platform);
 }
 
 /** The Dockerfile of a local build, as the model run resolves it (absolute). */
@@ -1031,14 +1074,15 @@ function readComposeFindings(input: ComposeAccessInput): Problem[] {
 /**
  * The image references of the merged model (review round 2, S2-05), for the question whether Docker takes one of them
  * for an image ID (resolvedByImageId): the `image` of each service without a build, the images of the Dockerfile of each
- * service with a local build (`dockerfiles`, with `build.args` and `build.target`), and the images of
+ * service with a local build (`dockerfiles`, with `build.args` and `build.target`), the image that the Dev Container CLI
+ * reads as the base image of the dev service `devService` (review round 18, P18-1: cliBaseImageCheck), and the images of
  * `additional_contexts`. Each named with its service, as composeAccessReport names its items.
  */
-export function composeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
-  return withDockerfileCache(() => readComposeImageReferences(model, dockerfiles));
+export function composeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>, devService?: string): NamedImageReference[] {
+  return withDockerfileCache(() => readComposeImageReferences(model, dockerfiles, devService));
 }
 
-function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
+function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>, devService: string | undefined): NamedImageReference[] {
   const references: NamedImageReference[] = [];
   for (const [name, service] of Object.entries(isRecord(model.services) ? model.services : {})) {
     if (!isRecord(service)) continue;
@@ -1050,14 +1094,13 @@ function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<R
     }
     const text = dockerfiles[name];
     if (text !== undefined) {
-      const args: Record<string, string> = {};
-      if (isRecord(build.args)) {
-        for (const [arg, setting] of Object.entries(build.args)) {
-          if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
-        }
-      }
+      // Review round 18 (S18-1): own properties, also for an argument named `__proto__`.
+      const args = buildArgumentTexts(build.args);
       const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
       for (const reference of dockerfileImageReferences(text, args, target)) references.push({ ...reference, what: `${at}${reference.what}` });
+      // Review round 18 (P18-1): the image that the Dev Container CLI reads as the base image of the dev service.
+      const cliBase = name === devService ? cliBaseImageCheck(text, args, target, undefined, dockerViewImages(text, args)).reference : undefined;
+      if (cliBase !== undefined) references.push({ ...cliBase, what: `${at}${cliBase.what}` });
     }
     if (isRecord(build.additional_contexts)) {
       for (const [key, source] of Object.entries(build.additional_contexts)) {

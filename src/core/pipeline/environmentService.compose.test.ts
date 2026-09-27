@@ -2956,3 +2956,125 @@ describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev 
     expect(error.message.length).toBeLessThan(20_000);
   });
 });
+
+describe('review round 18 of unit 6 (P18-1, P18-3, S18-2): the base image that the Dev Container CLI reads, with the platform of the helper', () => {
+  const TOOLCHAIN = 'ghcr.io/acme/toolchain:2';
+  const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
+  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS base\n';
+
+  /** The dev service builds `dockerfile` with `build` from .devcontainer; `features`: devcontainer.json has a Feature. */
+  function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}, features = true): void {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.app = { build: { context: `${FOLDER}/.devcontainer`, dockerfile: 'Dockerfile', ...build }, command: ['sleep', 'infinity'] };
+      }),
+    );
+    const out = h.helper.composeOutput as ComposeModelOutput;
+    h.helper.composeOutput = {
+      ...out,
+      dockerfiles: { app: dockerfile },
+      realPaths: { ...out.realPaths, [`${FOLDER}/.devcontainer`]: `${FOLDER}/.devcontainer`, [`${FOLDER}/.devcontainer/Dockerfile`]: `${FOLDER}/.devcontainer/Dockerfile` },
+    };
+    if (!features) h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
+  }
+
+  function fresh(): void {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID });
+  }
+
+  it('P18-3: builds a per-architecture base image with Features, and downloads the image of the architecture of the Docker Engine', async () => {
+    for (const [engine, arch] of [['amd64', 'amd64'], ['arm64', 'arm64'], ['386', 'ia32']]) {
+      fresh();
+      h.docker.arch = engine;
+      useDevBuild(`ARG TARGETARCH\nFROM ${TOOLCHAIN}-\${TARGETARCH}\nUSER vscode\n`);
+      await h.service.open(TARGET, options());
+      expect(h.docker.log, engine).toContain(`pull ${TOOLCHAIN}-${arch}`);
+      expect(h.helper.builds, engine).toHaveLength(1);
+    }
+  });
+
+  it('S18-2: follows the stage chain of the architecture of the Docker Engine, and refuses the user that the CLI writes there', async () => {
+    const dockerfile = `FROM alpine:3.22 AS s-amd64\nARG EVIL\nUSER $EVIL\nFROM alpine:3.22 AS s-arm64\nUSER vscode\nFROM s-\${TARGETARCH}\n`;
+    useDevBuild(dockerfile, { args: { EVIL: INJECTION } });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service app: the user "root\\n');
+    expect(h.helper.builds).toEqual([]);
+    fresh();
+    h.docker.arch = 'arm64';
+    useDevBuild(dockerfile, { args: { EVIL: INJECTION } });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('P18-1: refuses an image ID that only the CLI reads, with and without Features, before read-configuration inspects it and before any build', async () => {
+    // Docker builds FROM base; the CLI's reader sees the FROM lines in the continuations, and follows the stage of the
+    // architecture to the image `cafe1234`, which Docker resolves by the ID of a local image.
+    const dockerfile = `${BASE}RUN echo \\\nFROM cafe1234 AS s-amd64\nFROM base\nRUN echo \\\nFROM s-\${TARGETARCH}\n`;
+    for (const features of [true, false]) {
+      fresh();
+      useDevBuild(dockerfile, {}, features);
+      // `cafe1234` is no name of a local image: Docker takes it for the prefix of the ID of devenv-7c1d2e3f:2.
+      h.docker.images.add('cafe1234');
+      h.docker.imageRepoNames.set('cafe1234', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code, String(features)).toBe('hostAccess');
+      expect(error.message).toContain('service app: base image of the Dev Container CLI cafe1234 (an image ID; name the image)');
+      expect(h.helper.readConfigurations.filter((read) => read.merged !== false)).toEqual([]);
+      expect(h.docker.log.filter((line) => line.includes('cafe1234'))).toEqual([]);
+      expect(h.helper.builds).toEqual([]);
+    }
+  });
+
+  it('P18-1: refuses the image of another environment that only the CLI reads, with and without Features', async () => {
+    for (const features of [true, false]) {
+      fresh();
+      useDevBuild(`${BASE}RUN <<EOF\nFROM devenv-0badc0de:3 AS x\nEOF\n`, {}, features);
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message, String(features)).toContain('service app: base image of the Dev Container CLI devenv-0badc0de:3 of another environment');
+      expect(h.helper.builds).toEqual([]);
+    }
+  });
+
+  it('P18-3: refuses a Dockerfile build when the architecture of the Docker Engine is not known, and does not ask for an image', async () => {
+    fresh();
+    h.docker.arch = 'riscv64';
+    useDevBuild(`FROM ${TOOLCHAIN}\n`);
+    let error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain('the architecture riscv64 of the Docker Engine');
+    expect(h.helper.builds).toEqual([]);
+    fresh();
+    h.docker.arch = undefined;
+    useDevBuild(`FROM ${TOOLCHAIN}\n`);
+    error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain(dockerCheckItem('the architecture of the Docker Engine could not be read'));
+    expect(h.helper.builds).toEqual([]);
+    // A dev service with an image: no Dockerfile for the CLI to read.
+    fresh();
+    useCompose(h);
+    h.docker.arch = undefined;
+    await h.service.open(TARGET, options());
+    expect(h.docker.archQueries).toBe(0);
+    expect(h.helper.builds).toHaveLength(1);
+  });
+});
+
+describe('review round 18 of unit 6 (D18-1): `${localEnv:COMPOSE_PROJECT_NAME}` in the mounts of the image metadata', () => {
+  it('declares, creates, and records the volume of the image metadata by the name that the CLI writes (the project name of the environment)', async () => {
+    // The CLI substitutes the metadata at `up`, in the helper that has COMPOSE_PROJECT_NAME (read-configuration has
+    // already substituted devcontainer.json).
+    h.helper.buildMetadata = [{ id: 'ghcr.io/acme/features/cache:1', mounts: ['source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume'] }];
+    await h.service.open(TARGET, options());
+    const key = `cache${PROJECT}`;
+    expect(upModel().volumes ?? {}).toMatchObject({ [key]: { name: `${PROJECT}_${key}`, external: true } });
+    expect(h.docker.volumes.get(`${PROJECT}_${key}`)).toEqual({
+      [LABEL_ENVIRONMENT_ID]: ENV_ID,
+      [LABEL_REPOSITORY]: REPO,
+      [LABEL_OWNER_ID]: ACCOUNT.id,
+      [LABEL_VOLUME]: VOLUME_KIND_COMPOSE,
+    });
+    expect((await h.registry.get(ENV_ID))?.additionalVolumes).toContain(`${PROJECT}_${key}`);
+  });
+});

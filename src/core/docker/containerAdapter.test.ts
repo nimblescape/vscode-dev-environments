@@ -1301,6 +1301,22 @@ describe('ContainerAdapter.engineApiVersion', () => {
   });
 });
 
+describe('ContainerAdapter.engineArchitecture (review round 18, P18-3)', () => {
+  it('reads the architecture of the engine', async () => {
+    const { docker, runner } = adapter(() => ok('arm64\n'));
+    expect(await docker.engineArchitecture()).toBe('arm64');
+    expect(runner.calls[0].args).toEqual(['version', '--format', '{{.Server.Arch}}']);
+  });
+
+  it.each([
+    ['a failed call', fail('Cannot connect to the Docker daemon', 1, '')],
+    ['an output that is no architecture', ok('<no value>\n')],
+  ])('is undefined after %s', async (_name, result) => {
+    const { docker } = adapter(() => result);
+    expect(await docker.engineArchitecture()).toBeUndefined();
+  });
+});
+
 // Unit 6, package C: Delete and a failed first open of a Docker Compose environment remove the whole project.
 describe('ContainerAdapter: the objects of a Docker Compose project', () => {
   it('lists the containers of the project by its label, also those without the label of the environment', async () => {

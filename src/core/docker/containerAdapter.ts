@@ -652,6 +652,26 @@ export class ContainerAdapter {
     return undefined;
   }
 
+  /**
+   * Review round 18 (P18-3): the architecture of the Docker Engine (`docker version --format '{{.Server.Arch}}'`, its
+   * GOARCH, for example `amd64` or `arm64`), on which the workspace helper runs; `undefined` when the engine does not tell
+   * it. Rejects only with an AbortError.
+   */
+  async engineArchitecture(signal?: AbortSignal): Promise<string | undefined> {
+    let result: RunResult;
+    try {
+      result = await this.run(['version', '--format', '{{.Server.Arch}}'], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.logger.warn(`The architecture of the Docker Engine could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+    const arch = result.stdout.trim();
+    if (result.exitCode === 0 && /^[a-z0-9_]{1,32}$/.test(arch)) return arch;
+    this.logger.warn(`The architecture of the Docker Engine could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
+    return undefined;
+  }
+
   /** All containers with the label devenv.environment-id, running or not. */
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));

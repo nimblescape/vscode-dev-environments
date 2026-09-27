@@ -3767,3 +3767,48 @@ describe('review round 12 (D12-2): the ownership fix of a single container leave
     expect((await entry())?.serviceFolders).toBeUndefined();
   });
 });
+
+describe('review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads for the build of a single container', () => {
+  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS x\n';
+
+  function useDockerfile(text: string, build: Record<string, unknown> = {}): void {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', ...build } };
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: text };
+  }
+
+  it('refuses the image of another environment and an image ID that only the CLI reads (a line continuation, a heredoc), before any build', async () => {
+    for (const [text, item] of [
+      [`${BASE}RUN echo \\\nFROM devenv-0badc0de:3 AS x\n`, Messages.hostAccess('base image of the Dev Container CLI devenv-0badc0de:3 of another environment')],
+      [`${BASE}RUN <<EOF\nFROM devenv-0badc0de:3 AS x\nEOF\n`, Messages.hostAccess('base image of the Dev Container CLI devenv-0badc0de:3 of another environment')],
+      [`${BASE}RUN echo \\\nFROM sha256:3f2a9c1e AS x\n`, Messages.unsupportedOptions('base image of the Dev Container CLI sha256:3f2a9c1e (an image ID; name the image)')],
+    ]) {
+      useDockerfile(text);
+      expect((await rejection(h.service.open(TARGET, options()))).message, text).toBe(item);
+    }
+    // A short one: Docker resolves it by the ID of a local image.
+    h.docker.images.add('3f2a');
+    h.docker.imageRepoNames.set('3f2a', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+    useDockerfile(`${BASE}RUN echo \\\nFROM 3f2a AS x\n`);
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('base image of the Dev Container CLI 3f2a (an image ID; name the image)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('builds a per-architecture base image, and refuses one that the architecture of the Docker Engine resolves to an image ID (P18-3)', async () => {
+    useDockerfile('ARG TARGETARCH\nFROM ghcr.io/acme/toolchain:2-${TARGETARCH}\n');
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.archQueries).toBe(1);
+    // Docker builds FROM x; the CLI follows the stage of the architecture to `cafe1234`.
+    h.docker.images.add('cafe1234');
+    h.docker.imageRepoNames.set('cafe1234', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+    useDockerfile(`${BASE}RUN echo \\\nFROM cafe1234 AS s-amd64\nFROM x\nRUN echo \\\nFROM s-\${TARGETARCH}\n`);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.unsupportedOptions('base image of the Dev Container CLI cafe1234 (an image ID; name the image)'));
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('does not ask for the architecture of a configuration with an image', async () => {
+    await h.service.open(TARGET, options());
+    expect(h.docker.archQueries).toBe(0);
+  });
+});

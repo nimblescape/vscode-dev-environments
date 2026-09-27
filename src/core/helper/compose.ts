@@ -12,7 +12,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ConfigReferences } from '../imageCheck/imageCheck';
 import type { HostAccessChecks } from '../hostAccessChecks';
-import { extractBaseImages } from '../imageCheck/dockerfile';
+import { buildArgumentTexts, extractBaseImages } from '../imageCheck/dockerfile';
 import { hasDigest, isOciFeatureReference } from '../imageCheck/reference';
 import {
   CONTAINER_VERSION,
@@ -419,12 +419,8 @@ export function composeReferences(model: ComposeModel, dockerfiles: Readonly<Rec
     if (build) {
       const text = dockerfiles[name];
       if (text === undefined) continue;
-      const args: Record<string, string> = {};
-      if (isRecord(build.args)) {
-        for (const [arg, value] of Object.entries(build.args)) {
-          if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') args[arg] = String(value);
-        }
-      }
+      // Review round 18 (S18-1): own properties, also for an argument named `__proto__`.
+      const args = buildArgumentTexts(build.args);
       const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
       images.push(...extractBaseImages(text, args, { target }));
     } else if (typeof service.image === 'string' && service.image.trim() !== '') {

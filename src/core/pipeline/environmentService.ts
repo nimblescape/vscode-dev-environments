@@ -48,11 +48,13 @@ import {
   composeBuildImageItems,
   composeBuildUserItems,
   cliHasFeatures,
+  composeCliBaseImageCheck,
   composeConfigurationReport,
   composeDevBuildImages,
   composeIgnoredProperties,
   composeMissingBuildPaths,
 } from '../helper/composeAccess';
+import { CLI_PLATFORM_VARIABLES, cliArchitecture, cliPlatformVariables } from '../helper/cliDockerfile';
 import { environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import {
@@ -85,6 +87,10 @@ import {
   volumeLabelOwner,
   MAX_ITEM_LENGTH,
   capped,
+  singleCliBaseImageCheck,
+  usesCliDockerfile,
+  type CliBaseImageCheck,
+  type HostAccessFinding,
   type HostAccessInput,
   type HostAccessReport,
   type NetworkState,
@@ -233,6 +239,7 @@ export type EnvironmentDocker = Pick<
   | 'removeImage'
   | 'listImageTags'
   | 'engineApiVersion'
+  | 'engineArchitecture'
   | 'listProjectContainers'
   | 'listProjectNetworks'
   | 'removeNetwork'
@@ -446,6 +453,11 @@ interface LoadedConfiguration {
   mountedVolumes: string[];
   /** A Docker Compose configuration. */
   compose?: LoadedCompose;
+  /**
+   * Review round 18 (P18-1, P18-3): the platform variables of the Dev Container CLI (cliPlatformVariables of the
+   * architecture of the Docker Engine) with which checkCliBaseImage checked the base image of a Dockerfile build.
+   */
+  cliPlatform?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -727,6 +739,15 @@ function composeBuildFiles(build: ComposeBuildModelRewrite): HelperFiles {
 /** Review round 16 (Dp): whether the configuration names Features (the CLI then builds them into the image). */
 function hasFeatures(config: DevcontainerConfig | undefined): boolean {
   return isRecord(config?.features) && Object.keys(config.features).length > 0;
+}
+
+/**
+ * Review round 18 (P18-1): whether the dev service `service` of the model run `output` builds a Dockerfile that the
+ * model run read (the Dev Container CLI reads it for the build: checkCliBaseImage).
+ */
+function hasComposeDevBuild(output: ComposeModelOutput, service: string): boolean {
+  const dev = isRecord(output.model.services) ? output.model.services[service] : undefined;
+  return isRecord(dev) && isRecord(dev.build) && Object.prototype.hasOwnProperty.call(output.dockerfiles, service);
 }
 
 function isHostAccess(error: unknown): boolean {
@@ -1471,6 +1492,11 @@ export class EnvironmentService {
       this.logger.warn(`The Dockerfile ${dockerfile.missing} of the configuration ${configPath} of ${env.repository} does not exist.`);
       throw new UserFacingError('buildFailed', Messages.buildFileMissing(`the Dockerfile ${dockerfile.missing}`));
     }
+    // Review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads, with the exact platform.
+    const cliPlatform =
+      dockerfile.text !== undefined && usesCliDockerfile(config)
+        ? await this.checkCliBaseImage(ctx, (platform) => singleCliBaseImageCheck(config, dockerfile.text as string, platform, analysis.imageReferences.map((entry) => entry.reference)))
+        : undefined;
     if (merged === undefined) {
       this.logger.info('The merged configuration is not known: the image metadata is checked before the container starts.');
     }
@@ -1484,6 +1510,7 @@ export class EnvironmentService {
       dockerfileText: dockerfile.text,
       references: analysis.references,
       mountedVolumes: mountedVolumeNames(checked),
+      ...(cliPlatform !== undefined ? { cliPlatform } : {}),
     };
   }
 
@@ -1618,7 +1645,7 @@ export class EnvironmentService {
       hostAccessChecks: ctx.hostAccessChecks,
       inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),
     };
-    const { report: composeReport, references } = await this.composeReport(ctx, compose, config);
+    const { report: composeReport, references, imageReferences } = await this.composeReport(ctx, compose, config);
     if (isRefused(composeReport)) {
       this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(composeReport)}`);
       throw new HostAccessError(composeReport);
@@ -1643,6 +1670,11 @@ export class EnvironmentService {
     if (ignored.length > 0) {
       this.logger.info(`The Dev Container CLI ignores ${ignored.join(', ')} of ${configPath} for Docker Compose. They are not used and not checked.`);
     }
+    // Review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads for the build of the dev service,
+    // with the exact platform, before read-configuration, which inspects it for the merged configuration.
+    const cliPlatform = hasComposeDevBuild(output, service)
+      ? await this.checkCliBaseImage(ctx, (platform) => composeCliBaseImageCheck(output.model, output.dockerfiles, service, platform, imageReferences.map((entry) => entry.reference)))
+      : undefined;
     await this.requireVolume(env);
     const read = await helper.readConfiguration({
       volumeName: env.volumeName,
@@ -1680,6 +1712,7 @@ export class EnvironmentService {
       references,
       mountedVolumes: [...new Set([...volumes, ...this.composeMountVolumes(env, compose, compose.mounts).names])],
       compose,
+      ...(cliPlatform !== undefined ? { cliPlatform } : {}),
     };
   }
 
@@ -1693,7 +1726,7 @@ export class EnvironmentService {
     ctx: PipelineContext,
     compose: LoadedCompose,
     config: DevcontainerConfig,
-  ): Promise<{ report: HostAccessReport; references: ConfigReferences }> {
+  ): Promise<{ report: HostAccessReport; references: ConfigReferences; imageReferences: NamedImageReference[] }> {
     const env = ctx.env;
     const names = composeVolumeNames(compose.output.model, compose.project).map((volume) => volume.name);
     const volumes = await this.hostAccessInput(env, {}, names, composeNetworkReferences(compose.output.model, compose.project));
@@ -1735,7 +1768,51 @@ export class EnvironmentService {
         unsupported: capped([...new Set([...configuration.unsupported, ...model.unsupported, ...ids])]),
       },
       references: analysis.references,
+      imageReferences: analysis.imageReferences,
     };
+  }
+
+  /**
+   * Review round 18 (P18-1, P18-3): the image that the Dev Container CLI 0.89.0 inspects (and pulls when it is missing)
+   * for the build of a Dockerfile, and whose metadata label it copies into the environment image (cliBaseImageCheck),
+   * evaluated with the exact platform variables of the CLI in the workspace helper: its architecture is the one of the
+   * Docker Engine (engineArchitecture, cliArchitecture), so that a per-architecture base image is resolved as the CLI
+   * resolves it. Runs for every Dockerfile build (Docker Compose and single container, with and without Features),
+   * before anything inspects or pulls that image. Refused: an image of another environment, an image ID (also by the
+   * answer of Docker, imageIdItems), an image that cannot be computed, and an engine architecture whose name in the CLI
+   * is not known. `check` computes the check for a platform. Returns the platform (LoadedConfiguration.cliPlatform).
+   */
+  private async checkCliBaseImage(
+    ctx: PipelineContext,
+    check: (platform: Readonly<Record<string, string>>) => CliBaseImageCheck | undefined,
+  ): Promise<Readonly<Record<string, string>>> {
+    this.throwIfCancelled(ctx.signal);
+    const engine = await this.deps.docker.engineArchitecture(ctx.signal);
+    this.throwIfCancelled(ctx.signal);
+    if (engine === undefined) throw new AnalysisFailedError({ kind: 'internal', docker: true, reason: 'the architecture of the Docker Engine could not be read' });
+    const arch = cliArchitecture(engine);
+    const findings: HostAccessFinding[] = [];
+    let platform: Readonly<Record<string, string>> = CLI_PLATFORM_VARIABLES;
+    if (arch === undefined) {
+      findings.push({
+        item: `the architecture ${truncated(engine, 64)} of the Docker Engine (the Dev Container CLI reads the base image of the Dockerfile with the name of the architecture in Node, which is not known for it)`,
+        class: 'unsupported',
+      });
+    } else {
+      platform = cliPlatformVariables(arch);
+      const result = check(platform);
+      findings.push(...(result?.findings ?? []));
+      if (findings.length === 0 && result?.reference !== undefined) {
+        for (const item of await this.imageIdItems([result.reference], ctx.signal)) findings.push({ item, class: 'unsupported' });
+      }
+    }
+    if (findings.length === 0) return platform;
+    const report: HostAccessReport = {
+      hostAccess: capped(findings.filter((finding) => finding.class !== 'unsupported').map((finding) => finding.item)),
+      unsupported: capped(findings.filter((finding) => finding.class === 'unsupported').map((finding) => finding.item)),
+    };
+    this.logger.warn(`The Dockerfile of the configuration of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
+    throw new HostAccessError(report);
   }
 
   /**
@@ -1846,7 +1923,8 @@ export class EnvironmentService {
    * left to the CLI.
    */
   private composeMountVolumes(env: Environment, compose: LoadedCompose, mounts: readonly unknown[]): { names: string[]; sources: string[] } {
-    const variables = { ...helperCliVariables(env.repository), devcontainerId: environmentDevcontainerId(env.id) };
+    // Review round 18 (D18-1): with COMPOSE_PROJECT_NAME, which the pipeline passes to the CLI runs of Docker Compose.
+    const variables = { ...helperCliVariables(env.repository, { COMPOSE_PROJECT_NAME: compose.project }), devcontainerId: environmentDevcontainerId(env.id) };
     const { names, sources, skipped } = composeMountVolumes(compose.project, mounts, variables);
     if (skipped.length > 0) {
       this.logger.info(
@@ -2135,7 +2213,7 @@ export class EnvironmentService {
     // Review round 17 (P17-2): Features as the CLI counts them (cliHasFeatures).
     if (loaded.compose !== undefined && cliHasFeatures(loaded.config?.features)) {
       try {
-        await this.checkComposeBuildImages(ctx, loaded.compose);
+        await this.checkComposeBuildImages(ctx, loaded.compose, loaded.cliPlatform);
       } catch (error) {
         if (!isHostAccess(error)) return this.updateFailed(ctx, error, canFallBack, plan.check);
         if (!canFallBack) throw error;
@@ -2290,10 +2368,12 @@ export class EnvironmentService {
    * a user of that image with a line break (composeBuildImageItems), the user that the CLI computes from the USER
    * instruction with the build arguments and the environment of that image when it has one (review round 17, P17-2:
    * composeBuildUserItems), and an image whose variables could not be resolved. Throws a HostAccessError for them.
+   * Review round 18 (P18-3): with the exact platform variables of checkCliBaseImage (`platform`), so that a
+   * per-architecture base image is resolved; without them (no Dockerfile build), the constants of the check.
    */
-  private async checkComposeBuildImages(ctx: PipelineContext, compose: LoadedCompose): Promise<void> {
+  private async checkComposeBuildImages(ctx: PipelineContext, compose: LoadedCompose, platform: Readonly<Record<string, string>> = CLI_PLATFORM_VARIABLES): Promise<void> {
     const { model, dockerfiles } = compose.output;
-    const { images, unresolved } = composeDevBuildImages(model, dockerfiles, compose.service);
+    const { images, unresolved } = composeDevBuildImages(model, dockerfiles, compose.service, platform);
     const items = unresolved.map((image) => `the image ${image} of the dev service (its variables could not be resolved, so the user that the Dev Container CLI writes into its compose file for the build cannot be checked)`);
     let imageConfig: unknown;
     for (const image of images) {
@@ -2309,7 +2389,7 @@ export class EnvironmentService {
       items.push(...composeBuildImageItems(image, config));
       imageConfig = config;
     }
-    if (unresolved.length === 0) items.push(...composeBuildUserItems(model, dockerfiles, compose.service, imageConfig));
+    if (unresolved.length === 0) items.push(...composeBuildUserItems(model, dockerfiles, compose.service, imageConfig, platform));
     if (items.length === 0) return;
     // Review round 17 (P17-3): at most MAX_LISTED_ITEMS, each at most MAX_ITEM_LENGTH characters.
     const report: HostAccessReport = { hostAccess: [], unsupported: capped(items.map((item) => `service ${compose.service}: ${item}`)) };
@@ -3245,8 +3325,10 @@ export class EnvironmentService {
     moreVolumes: readonly string[] = [],
     moreNetworks: readonly string[] = [],
   ): Promise<HostAccessInput> {
-    // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables).
-    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository) };
+    // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables). Review round 18 (D18-1): the
+    // runs of Docker Compose (composeMounts) get COMPOSE_PROJECT_NAME with the project name of the environment.
+    const composeEnv: Record<string, string> = input.composeMounts === true ? { COMPOSE_PROJECT_NAME: composeProjectName(env.id) } : {};
+    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository, composeEnv) };
     const file = await this.deps.registry.read();
     const otherOwner = (owner: GitHubAccount | undefined) => owner === undefined || owner.id !== env.owner?.id;
     const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));
