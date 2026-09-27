@@ -1040,6 +1040,9 @@ export class FakeUi implements PipelineUi {
   configurationKindChangedAnswer: 'rebuildNow' | 'later' = 'later';
   readonly kindQuestions: string[] = [];
   filesMissingAnswer: 'cloneAgain' | 'deleteEnvironment' | undefined = undefined;
+  /** Recreate offer (user request 2026-09-26): the answer to recreateContainer, and its questions. */
+  recreateAnswer = false;
+  readonly recreateQuestions: Array<{ message: string; detail: string }> = [];
   readonly prompts: string[] = [];
   readonly infos: string[] = [];
   readonly warnings: string[] = [];
@@ -1059,6 +1062,12 @@ export class FakeUi implements PipelineUi {
     this.prompts.push(`configurationKindChanged ${repository}`);
     this.kindQuestions.push(message);
     return this.configurationKindChangedAnswer;
+  }
+
+  async recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean> {
+    this.prompts.push(`recreateContainer ${repository}`);
+    this.recreateQuestions.push(question);
+    return this.recreateAnswer;
   }
 
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {

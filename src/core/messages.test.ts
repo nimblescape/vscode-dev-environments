@@ -101,3 +101,21 @@ describe('the messages of a remote Docker host (unit 7)', () => {
     expect(text).toContain('Use the Local Docker');
   });
 });
+
+describe('the recreate offer (user request 2026-09-26)', () => {
+  it.each([false, true])('names what is kept and what is lost (Docker Compose: %s)', (compose) => {
+    const detail = Messages.containerRecreateDetail(compose);
+    expect(detail).toContain('Kept: the repository with its uncommitted changes, unpushed commits, and stashes');
+    expect(detail).toContain('installed packages, changes to the system, and files outside /workspaces and the volumes');
+    expect(detail).toContain('(onCreateCommand, postCreateCommand) run again');
+    expect(detail).toContain('Cancel changes nothing.');
+    expect(Messages.containerRecreateQuestion('acme/api', compose)).toContain('acme/api cannot be started or used');
+  });
+
+  it('says for Docker Compose that only the dev container is recreated, and the other services and all volumes stay', () => {
+    expect(Messages.containerRecreateQuestion('acme/api', true)).toBe('The dev container of acme/api cannot be started or used. Recreate it?');
+    expect(Messages.containerRecreateDetail(true)).toContain('Only the dev container is removed and created again');
+    expect(Messages.containerRecreateDetail(true)).toContain('all volumes of the environment, and the containers of the other services');
+    expect(Messages.containerRecreateDetail(false)).not.toContain('other services');
+  });
+});

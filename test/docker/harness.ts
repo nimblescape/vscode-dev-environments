@@ -194,6 +194,14 @@ export class FakeUi implements PipelineUi {
     return undefined;
   }
 
+  /** Recreate offer (user request 2026-09-26): the answer to recreateContainer; default Cancel. */
+  recreateAnswer = false;
+
+  async recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean> {
+    this.events.push({ kind: 'recreateContainer', text: `${repository}: ${question.message}` });
+    return this.recreateAnswer;
+  }
+
   info(message: string): void {
     this.events.push({ kind: 'info', text: message });
   }

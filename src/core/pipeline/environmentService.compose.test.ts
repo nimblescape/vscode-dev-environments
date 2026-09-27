@@ -18,6 +18,7 @@ import {
   type ComposeModelOutput,
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
+import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
@@ -3237,5 +3238,135 @@ describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.warnings).toEqual([PipelineTexts.lifecycleCommandFailed('postStartCommand')]);
     expect(devContainer()?.state).toBe('running');
+  });
+});
+
+describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
+  const PASSWD_DAMAGED = 'Error response from daemon: unable to find user vscode: no matching entries in passwd file';
+
+  /**
+   * `up` of the existing containers fails because the dev container is damaged: like the CLI, the failed `up` leaves the
+   * containers running, and the check as the remote user fails in the dev container only. The `up` that replaces the dev
+   * container works.
+   */
+  function damageDevContainer(): void {
+    const devId = devContainer()?.id;
+    h.helper.upError = (_image, removeExisting) => (removeExisting ? undefined : new DevcontainerCommandError('devcontainer up', 1, '', PASSWD_DAMAGED));
+    h.helper.beforeUpError = () => {
+      for (const c of h.docker.containersOf(ENV_ID)) {
+        c.state = 'running';
+        c.rawState = 'running';
+      }
+    };
+    h.docker.execHandler = (container, command) => (container === devId && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
+  }
+
+  it('Recreate removes only the dev container (stopped first, never a volume); the database keeps running with its data', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    const dev = devContainer();
+    const db = dbContainer();
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.recreateQuestions).toEqual([{ message: Messages.containerRecreateQuestion(REPO, true), detail: Messages.containerRecreateDetail(true) }]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+    const log = h.docker.log;
+    expect(log.indexOf(`stop ${dev?.id}`)).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf(`stop ${dev?.id}`)).toBeLessThan(log.indexOf(`rm ${dev?.id}`));
+    // The side service is untouched: neither stopped nor removed, the same container, running.
+    expect(log.filter((line) => line.includes(String(db?.id)))).toEqual([]);
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+    expect(log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
+    expect(devContainer()).toMatchObject({ name: NAME, state: 'running', image: IMAGE_1 });
+    expect(devContainer()?.id).not.toBe(dev?.id);
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged);
+  });
+
+  it('a running dev container that the remote user cannot use: only it is recreated', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    const dev = devContainer();
+    const db = dbContainer();
+    h.docker.execHandler = (container, command) => (container === dev?.id && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('Cancel: nothing is removed, startFailed', async () => {
+    await seedCompose();
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    damageDevContainer();
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a refusal of the check before the new dev container: it is not removed', async () => {
+    await seedCompose();
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    // The metadata of the environment image is checked only when `up` creates the dev container.
+    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }, { privileged: true }]) } });
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('hostAccess');
+    // Refused after the question, by the check of the new dev container, before anything was removed.
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a damage text that cannot be tied to the dev container (it does not run, or its check passes): no question', async () => {
+    await seedCompose();
+    // For example the shell of the database container is gone: Compose cannot start it, and the dev container stays stopped.
+    h.helper.upError = () =>
+      new DevcontainerCommandError(
+        'devcontainer up',
+        1,
+        '',
+        'Error response from daemon: failed to create task for container: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "/bin/sh": stat /bin/sh: no such file or directory',
+      );
+
+    const stopped = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(stopped.code).toBe('startFailed');
+    expect(h.logger.infos.some((line) => line.includes('the fault cannot be tied to it'))).toBe(true);
+
+    // The dev container runs after the failed `up`, but its check passes: the fault is another service's.
+    h.helper.beforeUpError = () => {
+      const dev = h.docker.containersOf(ENV_ID).find((c) => c.labels[LABEL_COMPOSE_SERVICE] === undefined);
+      if (dev) dev.state = 'running';
+    };
+    const running = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(running.code).toBe('startFailed');
+    expect(h.docker.execs.some((exec) => exec.command[2] === 'exit 0')).toBe(true);
+
+    expect(h.ui.prompts).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('a failure of a side service that names no damage: no question', async () => {
+    await seedCompose();
+    h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'Error response from daemon: Bind for 127.0.0.1:5432 failed: port is already allocated');
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.prompts).toEqual([]);
   });
 });

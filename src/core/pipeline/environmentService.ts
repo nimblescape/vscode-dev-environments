@@ -182,6 +182,7 @@ import {
   isComposeRecreateLeftoverName,
   COMPOSE_CONTAINER_NUMBER_LABEL,
   COMPOSE_SERVICE_LABEL,
+  isContainerFault,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -445,6 +446,12 @@ const GIT_EXEC_TIMEOUT_MS = 30_000;
 const BRANCH_EXEC_TIMEOUT_MS = 15_000;
 const OWNERSHIP_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_START_TIMEOUT_MS = 60_000;
+/**
+ * Recreate offer: the check of a running container as the remote user (runningContainerFault). `docker exec -u` fails
+ * when /etc/passwd lacks the user, and the shell (which the Dev Container CLI and the Dev Containers extension need) must
+ * start.
+ */
+const CONTAINER_CHECK_COMMAND: readonly string[] = ['/bin/sh', '-c', 'exit 0'];
 // A helper container that a cancel removes can hold the volume for a moment.
 const VOLUME_REMOVE_ATTEMPTS = 3;
 const VOLUME_REMOVE_DELAY_MS = 1_000;
@@ -585,6 +592,12 @@ interface PipelineContext {
    * `up`, removeFailedComposeContainers removes only the others (those that the failed `up` created).
    */
   composeSwitch?: { existing: ReadonlySet<string> };
+  /**
+   * Recreate offer (user request 2026-09-26): the user chose to create the damaged dev container of this Docker Compose
+   * environment again (offerRecreation). runComposeUp removes only that container (never a volume, never another
+   * service) after the checks, right before `up`.
+   */
+  recreateDevContainer?: ContainerInfo;
 }
 
 /** A token together with the account of its session. */
@@ -2380,6 +2393,13 @@ export class EnvironmentService {
     // P-1); buildAndReplace switches it (runUp, runComposeUp).
     if (container?.state === 'running' && !outdated) {
       this.logger.info(`The container ${container.name} runs already.`);
+      // Recreate offer: a running container that the remote user cannot use (for example its /etc/passwd lacks the user,
+      // or a failed `up` of an earlier open left it running) is not opened as it is: the window could not attach.
+      const fault = await this.runningContainerFault(ctx, container, loaded);
+      if (fault !== undefined) {
+        const image = await this.recreationImage(ctx, container, record, imagePresent, loaded, compose);
+        if (image !== undefined) return this.offerRecreation(ctx, container, image, loaded, compose, fault);
+      }
       // D-22: the Dev Container CLI does not call Compose for a running dev container, so a stopped service stays stopped.
       if (compose) await this.startStoppedServices(ctx);
       await this.quietly('record the volumes of the container', () => this.recordContainerVolumes(ctx, compose));
@@ -2440,6 +2460,147 @@ export class EnvironmentService {
       // Review round 1 (P-3): every container of a Docker Compose environment, not only the dev container.
       if (container && !outdated && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container, compose);
       this.logger.error(`The container of ${ctx.env.repository} could not be started.`, error);
+      // Recreate offer: `up` or run-user-commands of the existing container failed because the container itself is
+      // damaged. Never for a container that this run creates (it is created again anyway).
+      if (container && !outdated && (await this.upFailedForContainer(ctx, error))) {
+        // Docker Compose: the fault must be the dev container's (the other services, for example a database, are never
+        // recreated): the check as the remote user in the dev container, which the failed `up` left running, must find
+        // it. When the fault cannot be tied to the dev container, nothing is offered.
+        const cause = compose ? await this.composeDevContainerFault(ctx, loaded) : errorDetail(error);
+        const damaged = compose ? await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName).catch(() => undefined) : container;
+        const recreationImage =
+          cause !== undefined && damaged !== undefined ? await this.recreationImage(ctx, damaged, record, imagePresent, loaded, compose) : undefined;
+        if (recreationImage !== undefined && damaged !== undefined && cause !== undefined) {
+          return this.offerRecreation(ctx, damaged, recreationImage, loaded, compose, cause);
+        }
+      }
+      throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
+    }
+  }
+
+  /**
+   * Recreate offer (user request 2026-09-26): whether a failed `up` of an existing container (or the run-user-commands
+   * after it) failed because the container itself is damaged (isContainerFault): only an error of the Dev Container CLI
+   * (so the workspace helper and Docker ran), not a failed lifecycle command (the configuration's), and only while
+   * Docker answers. Any other failure (Docker not running or not reachable, also on a remote host, a refusal of the
+   * policy, a cancel, a missing image, the network) keeps its message.
+   */
+  private async upFailedForContainer(ctx: PipelineContext, error: unknown): Promise<boolean> {
+    if (this.isCancellation(error, ctx.signal) || !(error instanceof DevcontainerCommandError)) return false;
+    if (lifecycleHookFailure(error.result) !== undefined) return false;
+    return this.isDamagedContainer(ctx, `${error.message}\n${error.stderr}\n${error.stdout}`);
+  }
+
+  /**
+   * Recreate offer, Docker Compose: after a failed `up`, the fault of the dev container (runningContainerFault of the
+   * dev container, when it runs), else `undefined`: a fault of another service, or one of a dev container that did not
+   * start, cannot be told apart from the text of Compose.
+   */
+  private async composeDevContainerFault(ctx: PipelineContext, loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
+    const dev = await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName).catch(() => undefined);
+    if (dev?.state !== 'running') {
+      this.logger.info(`The dev container of ${ctx.env.repository} does not run after the failed start; the fault cannot be tied to it.`);
+      return undefined;
+    }
+    return this.runningContainerFault(ctx, dev, loaded);
+  }
+
+  /** The text names a damaged container (isContainerFault), and Docker still answers: its engine is not the cause. */
+  private async isDamagedContainer(ctx: PipelineContext, text: string): Promise<boolean> {
+    if (!isContainerFault(text)) return false;
+    try {
+      return await this.deps.docker.isRunning(ctx.signal);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      return false;
+    }
+  }
+
+  /**
+   * Recreate offer: `docker exec` of a shell as the remote user in the running container (the Dev Containers extension
+   * attaches as that user). The text of the failure when it names a damaged container (isDamagedContainer), otherwise
+   * `undefined`, also when the remote user is not known or the check itself fails (the open goes on as before).
+   */
+  private async runningContainerFault(ctx: PipelineContext, container: ContainerInfo, loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
+    const user = ctx.env.remoteUser ?? configRemoteUser(loaded?.config, loaded?.compose ? undefined : stringList(loaded?.config.runArgs));
+    if (user === undefined || ctx.helperUnavailable) return undefined;
+    let text: string;
+    try {
+      const result = await this.deps.docker.exec(container.id, CONTAINER_CHECK_COMMAND, { user, timeoutMs: BRANCH_EXEC_TIMEOUT_MS, signal: ctx.signal });
+      if (result.exitCode === 0 || result.timedOut) return undefined;
+      text = `${result.stderr}\n${result.stdout}`.trim();
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.info(`The container ${container.name} could not be checked: ${errorMessage(error)}`);
+      return undefined;
+    }
+    return (await this.isDamagedContainer(ctx, text)) ? text : undefined;
+  }
+
+  /**
+   * Recreate offer: the environment image from which a damaged `container` can be created again without a build (the
+   * image of the build record, else the image of the container), when it exists. `undefined` when the container cannot
+   * be created again here: without the workspace helper, while the configuration is of the other kind than the
+   * environment (configurationOfKind), or for Docker Compose without its configuration (no model).
+   */
+  private async recreationImage(
+    ctx: PipelineContext,
+    container: ContainerInfo,
+    record: BuildRecord | undefined,
+    imagePresent: boolean,
+    loaded: LoadedConfiguration | undefined,
+    compose: boolean,
+  ): Promise<string | undefined> {
+    if (ctx.helperUnavailable || ctx.kindKept || (compose && loaded?.compose === undefined)) return undefined;
+    // Docker Compose: only the dev container of the service that the configuration names is ever recreated.
+    if (compose && container.labels[COMPOSE_SERVICE_LABEL] !== loaded?.compose?.service) return undefined;
+    const image = record && imagePresent ? record.environmentImage : container.image;
+    if (await this.deps.docker.imageExists(image).catch(() => false)) return image;
+    this.logger.info(`The environment image ${image} of ${ctx.env.repository} does not exist; the container cannot be created again without a build.`);
+    return undefined;
+  }
+
+  /**
+   * Recreate offer (user request 2026-09-26): the existing container is damaged (`cause`). The modal question names what
+   * is kept (the repository and all files in the volumes) and what is lost (everything else in the container; the
+   * setup commands run again). Nothing is removed before the answer. Cancel: startFailed with the cause, nothing
+   * changed. Recreate: like the other recreations of an existing container (a container of an older setup), from the
+   * environment image, without a build: `up --remove-existing-container` (the CLI removes the container with `docker rm
+   * -f`, without its volumes); for Docker Compose, runComposeUp first stops and removes only the dev container, after the
+   * checks (PipelineContext.recreateDevContainer), so the other services keep running with their data. No volume is
+   * removed. The busy mark keeps the Session Monitor and other
+   * windows away meanwhile. No safety check of the repository: it stays in the volume.
+   */
+  private async offerRecreation(
+    ctx: PipelineContext,
+    container: ContainerInfo,
+    image: string,
+    loaded: LoadedConfiguration | undefined,
+    compose: boolean,
+    cause: string,
+  ): Promise<ContainerOutcome> {
+    const env = ctx.env;
+    this.logger.warn(`The container ${container.name} of ${env.repository} is damaged, so it cannot be started or used: ${cause}`);
+    const confirmed = await this.deps.ui.recreateContainer(env.repository, {
+      message: Messages.containerRecreateQuestion(env.repository, compose),
+      detail: Messages.containerRecreateDetail(compose),
+    });
+    this.throwIfCancelled(ctx.signal);
+    if (!confirmed) {
+      this.logger.info(`The container ${container.name} of ${env.repository} is not created again. Nothing was changed.`);
+      throw new UserFacingError('startFailed', PipelineTexts.startFailed, `${cause}\nThe container was not created again; nothing was changed.`);
+    }
+    await this.markBusy(ctx, 'rebuild');
+    ctx.steps.step('starting');
+    ctx.steps.detail(Messages.containerRecreatedDamaged);
+    this.logger.info(`The container ${container.name} of ${env.repository} is created again from ${image}; the files in the volumes are kept.`);
+    if (compose) ctx.recreateDevContainer = container;
+    try {
+      const result = await this.runUp(ctx, image, loaded?.config, true, true, loaded?.compose);
+      return { result, created: true };
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      this.logger.error(`The container of ${env.repository} could not be created again from ${image}.`, error);
       throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
     }
   }
@@ -2787,6 +2948,16 @@ export class EnvironmentService {
     const previousService = found !== undefined && replaced === undefined ? found.labels[COMPOSE_SERVICE_LABEL] : undefined;
     if (found !== undefined && previousService !== undefined && previousService !== compose.service) {
       await this.movePreviousDevContainer(ctx, compose, found, previousService, removeExistingContainer);
+    }
+    // Recreate offer: the user chose to create the damaged dev container again. After the checks above (a refusal leaves
+    // it as it is), only it goes: stopped first (D7-1), then `docker rm -f` without its volumes. `up` creates it again;
+    // the containers of the other services and their volumes stay as they are.
+    const damaged = ctx.recreateDevContainer;
+    if (damaged !== undefined) {
+      ctx.recreateDevContainer = undefined;
+      this.logger.info(`The dev container ${damaged.name} of ${env.repository} is removed to be created again. The other services and all volumes are kept.`);
+      await this.stopServiceBeforeRemoval(damaged, env);
+      await docker.removeContainer(damaged.id);
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
     await this.prepareGit(ctx);

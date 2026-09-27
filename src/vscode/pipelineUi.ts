@@ -68,6 +68,13 @@ export class VsCodePipelineUi implements PipelineUi {
     return undefined;
   }
 
+  async recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean> {
+    // The modal adds Cancel, the answer of a dismissed dialog (it removes nothing).
+    const choice = await vscode.window.showWarningMessage(question.message, { modal: true, detail: question.detail }, Actions.recreateContainer);
+    this.logger.info(`${repository}: ${choice === Actions.recreateContainer ? 'Recreate' : 'Cancel'} was chosen.`);
+    return choice === Actions.recreateContainer;
+  }
+
   info(message: string): void {
     if (!this.shouldShow(`info:${message}`)) return;
     this.logger.info(message);

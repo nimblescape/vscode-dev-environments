@@ -303,6 +303,39 @@ export function lifecycleHookFailure(result: DevcontainerResult | undefined): st
   return lifecycleHookName(result.description);
 }
 
+// Messages of Docker (verified on 29.3.1 with runc 1.3) when the existing container itself is damaged, so that it cannot
+// be started or used, while Docker works: its /etc/passwd or /etc/group lacks the user (`docker exec -u`, also when the
+// file is gone), the shell that the Dev Container CLI starts it with is missing or not executable (`docker start` and
+// `docker exec`), or the container is marked for removal (state `dead`). Only an allowlist: a failure that another
+// container of the same image would have as well (a published port in use, a missing bind mount source or device, a
+// missing network, an image of another platform) names none of them.
+const CONTAINER_FAULT_PATTERNS: readonly RegExp[] = [
+  /unable to find (?:user|group) [^\n]*?: no matching entries in (?:passwd|group) file/i,
+  /unable to start container process: [^\n]*?exec: "\/[^"\n]*": (?:stat [^\n]*?: no such file or directory|permission denied)/i,
+  /is marked for removal and cannot be started/i,
+];
+
+// Messages of Docker when its engine does not answer (local, or on a remote host over SSH): never the container's fault.
+const DOCKER_UNREACHABLE_PATTERNS: readonly RegExp[] = [
+  /cannot connect to the docker daemon/i,
+  /error during connect/i,
+  /is the docker daemon running/i,
+  /\bssh: /i,
+  /connection (?:closed|lost)|broken pipe|unexpected eof/i,
+];
+
+/**
+ * Recreate offer (user request 2026-09-26): whether the text of a failed start of an existing container (the output of
+ * `devcontainer up` or `run-user-commands`, or of a `docker exec` in the running container) says that the container
+ * itself is damaged (CONTAINER_FAULT_PATTERNS), so that a new container of the same environment image would work. A
+ * text that also names a failure of the connection to Docker or of the network is never one: when unsure, the pipeline
+ * does not offer to recreate the container.
+ */
+export function isContainerFault(text: string): boolean {
+  if (DOCKER_UNREACHABLE_PATTERNS.some((pattern) => pattern.test(text)) || isNetworkFailure(text)) return false;
+  return CONTAINER_FAULT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /** Technical details of an error for the log and for `UserFacingError.detail`: the message and the end of stderr. */
 export function errorDetail(error: unknown): string {
   const message = errorMessage(error);
