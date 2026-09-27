@@ -153,7 +153,7 @@ export const Messages = {
    * in a compose file, `VOLUME /data` in the image): they are not carried over into the new container
    * (unnamedVolumesNotCarried).
    */
-  containerRecreateDetail: (compose: boolean, unnamedFolders: readonly string[] = []) =>
+  containerRecreateDetail: (compose: boolean, unnamedFolders: readonly string[] = [], withoutConfiguration = false) =>
     (compose
       ? 'Only the dev container is removed and created again from its environment image. The other services, for example a database, keep running with their data. ' +
         'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, the named volumes of the environment, and the containers of the other services. ' +
@@ -162,6 +162,10 @@ export const Messages = {
         'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, and all files in the named volumes of the environment. ' +
         'Lost: everything else in the container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. ') +
     unnamedVolumesNotCarried(unnamedFolders) +
+    // Review round 3: a single container created while the configuration cannot be read.
+    (withoutConfiguration
+      ? 'The configuration cannot be read now, so the new container starts without the runArgs of the configuration (also their mounts) and without its published ports, until the configuration can be read again; then the container is set up again. '
+      : '') +
     'The setup commands of the configuration (onCreateCommand, postCreateCommand) run again. Cancel changes nothing.',
   /**
    * Recreate offer, review round 2 (E1–E3): after Recreate, the direct check before `up` found that Docker Compose would

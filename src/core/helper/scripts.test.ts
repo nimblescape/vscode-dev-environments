@@ -1625,7 +1625,7 @@ describe('COMPOSE_HASH_SCRIPT (recreate offer, review round 2)', () => {
       // A fake `docker` that prints its arguments and the model it finds at the path.
       const bin = path.join(dir, 'bin');
       fs.mkdirSync(bin);
-      fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\necho "db ${'a'.repeat(64)}"\necho "args: $*" >&2\ncat "$5" >&2\n`, { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\necho "db ${'a'.repeat(64)}"\necho "args: $*" >&2\ncat "$7" >&2\n`, { mode: 0o755 });
       const file = path.join(dir, 'override', 'compose.json');
       const result = spawnSync('node', ['-e', COMPOSE_HASH_SCRIPT, file, 'devenv-3f2a9c1e'], {
         input: '{"services":{}}',
@@ -1633,7 +1633,7 @@ describe('COMPOSE_HASH_SCRIPT (recreate offer, review round 2)', () => {
         env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
       });
       expect(result.status).toBe(0);
-      expect(result.stderr).toContain(`args: compose --project-name devenv-3f2a9c1e -f ${file} config --hash *`);
+      expect(result.stderr).toContain(`args: compose --project-name devenv-3f2a9c1e --profile * -f ${file} config --hash *`);
       expect(result.stderr).toContain('{"services":{}}');
       expect(parseComposeHashes(result.stdout)).toEqual(new Map([['db', 'a'.repeat(64)]]));
     } finally {

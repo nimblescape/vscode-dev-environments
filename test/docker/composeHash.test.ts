@@ -37,13 +37,15 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
           labels: { ...labels, 'devenv.host-access': hostAccess },
           volumes: [{ type: 'volume', source: 'data', target: '/data' }],
         },
+        // Review round 3 (G1): a service of a profile (started through runServices).
+        tools: { image: TEST_BASE_IMAGE, command: ['sleep', '602'], labels, profiles: ['debug'] },
       },
       volumes: { data: { name: `${project}_data`, labels } },
     });
   }
 
   function compose(...args: string[]): string {
-    const result = cli.run(['compose', '--project-name', project, '-f', upFile, ...args]);
+    const result = cli.run(['compose', '--project-name', project, '--profile', '*', '-f', upFile, ...args]);
     log.info(`docker compose ${args.join(' ')}: ${result.code} ${result.err}`);
     expect(result.code, result.err).toBe(0);
     return result.out;
@@ -65,7 +67,7 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
   }
 
   afterAll(() => {
-    cli.run(['compose', '--project-name', project, '-f', upFile, 'down', '-v']);
+    cli.run(['compose', '--project-name', project, '--profile', '*', '-f', upFile, 'down', '-v']);
     for (const volume of leftoverVolumes) cli.run(['volume', 'rm', volume]);
   });
 
@@ -80,6 +82,9 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
     const computed = hashes(model('restricted'));
     expect(computed.get('db')).toBe(db?.Config.Labels?.['com.docker.compose.config-hash']);
     expect(computed.get('app')).toBe(app?.Config.Labels?.['com.docker.compose.config-hash']);
+    // Review round 3 (G1): with all profiles, the service of a profile has its hash too, equal to its label.
+    expect(computed.get('tools')).toBe(container('tools')?.Config.Labels?.['com.docker.compose.config-hash']);
+    expect(computed.get('tools')).toMatch(/^[0-9a-f]{64}$/);
     expect(db?.Config.Labels?.['com.docker.compose.image']).toBe(cli.image(TEST_BASE_IMAGE)?.Id);
     // E1: another value of devenv.host-access gives another hash, so Compose would create the container again.
     expect(hashes(model('unrestricted')).get('db')).not.toBe(computed.get('db'));
@@ -87,9 +92,12 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
     // The recreation of the dev container: removed without its volumes, then `up` without --no-recreate.
     const anonymous = (app?.Mounts ?? []).filter((mount) => mount.Type === 'volume' && mount.Destination === '/cache').map((mount) => mount.Name ?? '');
     leftoverVolumes.push(...anonymous.filter((name) => name !== ''));
+    const tools = container('tools')?.Id;
+    expect(tools).toBeDefined();
     cli.ok(['rm', '-f', String(app?.Id)]);
     compose('up', '-d');
     expect(container('db')?.Id).toBe(db?.Id);
+    expect(container('tools')?.Id).toBe(tools);
     expect(container('app')?.Id).not.toBe(app?.Id);
     // V1: the volume without a name of the removed dev container is not carried over; it stays.
     for (const name of anonymous) expect(cli.volume(name)).toBeDefined();

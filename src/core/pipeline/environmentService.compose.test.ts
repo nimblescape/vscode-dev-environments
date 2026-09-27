@@ -3260,6 +3260,9 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
    */
   function damageDevContainer(): void {
     const devId = devContainer()?.id;
+    // Review round 3 (F1): the check runs as the user of the label devcontainer.metadata of the container.
+    const dev = devContainer();
+    if (dev) dev.labels['devcontainer.metadata'] = JSON.stringify([{ remoteUser: 'vscode' }]);
     h.helper.upError = (_image, removeExisting) => (removeExisting ? undefined : new DevcontainerCommandError('devcontainer up', 1, '', PASSWD_DAMAGED));
     h.helper.beforeUpError = () => {
       for (const c of h.docker.containersOf(ENV_ID)) {
@@ -3297,7 +3300,7 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
   });
 
   it('a running dev container that the remote user cannot use: only it is recreated', async () => {
-    await seedCompose({ dev: 'running', db: 'running', dbLabels: DB_IMAGE_ID });
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: DB_IMAGE_ID, devLabels: { 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }]) } });
     const dev = devContainer();
     const db = dbContainer();
     h.docker.execHandler = (container, command) => (container === dev?.id && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
@@ -3359,7 +3362,10 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     // The dev container runs after the failed `up`, but its check passes: the fault is another service's.
     h.helper.beforeUpError = () => {
       const dev = h.docker.containersOf(ENV_ID).find((c) => c.labels[LABEL_COMPOSE_SERVICE] === undefined);
-      if (dev) dev.state = 'running';
+      if (dev) {
+        dev.state = 'running';
+        dev.labels['devcontainer.metadata'] = JSON.stringify([{ remoteUser: 'vscode' }]);
+      }
     };
     const running = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(running.code).toBe('startFailed');
@@ -3451,6 +3457,35 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  describe('review round 3 (G2): another service that shares a namespace or the volumes of another service', () => {
+    // Of a third service `cache` (the policy refuses `pid` and `volumes_from` of the dev service).
+    it.each<[string, (db: Record<string, unknown>) => void, string]>([
+      ['network_mode service:cache', (db) => (db.network_mode = 'service:cache'), 'db: network_mode service:cache'],
+      ['ipc service:cache', (db) => (db.ipc = 'service:cache'), 'db: ipc service:cache'],
+      ['pid service:cache', (db) => (db.pid = 'service:cache'), 'db: pid service:cache'],
+      ['volumes_from cache', (db) => (db.volumes_from = ['cache']), 'db: volumes_from cache'],
+    ])('%s: no question (the direct check could never pass), and the log says why', async (_name, change, item) => {
+      const changed = output((m) => {
+        m.services.cache = { image: DB_IMAGE, command: ['sleep', 'infinity'], networks: { default: null } };
+        if ((m.services.db as Record<string, unknown>).network_mode === undefined) delete m.services.db.networks;
+        change(m.services.db as Record<string, unknown>);
+        if ((m.services.db as Record<string, unknown>).network_mode === undefined) m.services.db.networks = { default: null };
+      });
+      // The build record is of this model: no configuration change, no "Rebuild later".
+      await seedCompose({ dbLabels: DB_IMAGE_ID, record: { configHash: composeConfigHash(CONFIG_TEXT, changed.model, {}) } });
+      useCompose(h, changed);
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts.filter((prompt) => prompt.startsWith('recreateContainer'))).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('share a namespace or the volumes of another service') && line.includes(item))).toBe(true);
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+    });
   });
 
   describe('review round 2 (E1–E3): the direct check of the other services right before up', () => {

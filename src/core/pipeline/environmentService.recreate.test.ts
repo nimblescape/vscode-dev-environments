@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { Messages } from '../messages';
-import { environmentImageName, resourceName } from '../names';
+import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION, environmentImageName, resourceName } from '../names';
 import { abortError } from '../ports';
 import type { DevcontainerResult } from '../types';
 import { PipelineTexts, type RepositoryTarget } from './environmentService';
@@ -187,6 +187,33 @@ describe('recreate offer: a stopped container that cannot be started or used', (
   });
 });
 
+describe('recreate offer, review round 3: a single container while the configuration cannot be read', () => {
+  it('the question says that the runArgs, their mounts, and the published ports stay off until it can be read', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    h.helper.readConfigurationError = new DevcontainerCommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    failFirstUp(PASSWD_DAMAGED);
+    h.ui.recreateAnswer = true;
+
+    await h.service.open(TARGET, options());
+
+    expect(h.ui.recreateQuestions[0].detail).toBe(Messages.containerRecreateDetail(false, [], true));
+    expect(h.ui.recreateQuestions[0].detail).toContain('without the runArgs of the configuration (also their mounts) and without its published ports');
+    expect(h.logger.warnings.some((line) => line.startsWith(`The container of ${REPO} is created without the configuration`))).toBe(true);
+    expect(ups()).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+  });
+
+  it('with a readable configuration, the question does not say so', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    failFirstUp(PASSWD_DAMAGED);
+
+    await rejection(h.service.open(TARGET, options()));
+
+    expect(h.ui.recreateQuestions[0].detail).not.toContain('cannot be read');
+  });
+});
+
 describe('recreate offer, review round 2 (V1): volumes without a name of a single container', () => {
   const NODE_MODULES = '/workspaces/api/node_modules';
   const ANONYMOUS = 'a'.repeat(64);
@@ -282,6 +309,9 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
 });
 
 describe('recreate offer: a running container that the remote user cannot use', () => {
+  /** Review round 3 (F1): the current setup, and the user of the container in its label devcontainer.metadata. */
+  const RUNNING_LABELS = { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }]) };
+
   /** The check of the running container (`docker exec -u <remote user> <id> /bin/sh -c 'exit 0'`) fails for `id`. */
   function failCheck(id: string, stderr: string, exitCode = 1): void {
     h.docker.execHandler = (container, command) => (container === id && command[2] === 'exit 0' ? { exitCode, stderr } : {});
@@ -292,7 +322,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
     ['its shell is not executable', SHELL_NOT_EXECUTABLE],
   ])('%s: Recreate creates it again (the window could not attach to it)', async (_name, stderr) => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const old = h.docker.containersOf(ENV_ID)[0];
     failCheck(old.id, stderr, 126);
     h.ui.recreateAnswer = true;
@@ -309,7 +339,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
 
   it('Cancel: startFailed, the running container stays as it is', async () => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const old = h.docker.containersOf(ENV_ID)[0];
     failCheck(old.id, PASSWD_DAMAGED);
 
@@ -328,7 +358,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
     ['a remote host whose SSH connection broke', 'error during connect: Get "http://docker.example.com/v1.48/containers/json": command [ssh -- build-box docker system dial-stdio] has exited with exit status 255, make sure the URL is valid, and Docker 18.09 or later is installed on the remote host: stderr=ssh: connect to host build-box port 22: Connection refused'],
   ])('%s: not offered, the open goes on as before', async (_name, stderr) => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const old = h.docker.containersOf(ENV_ID)[0];
     failCheck(old.id, stderr);
 
@@ -341,7 +371,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
 
   it('a check that throws (for example a timeout of the process): not offered', async () => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const exec = h.docker.exec.bind(h.docker);
     h.docker.exec = async (container, command, execOptions) => {
       if (command[2] === 'exit 0') throw new Error('spawn docker ETIMEDOUT');
@@ -355,7 +385,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
 
   it('Docker stops answering after the check failed: not offered', async () => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const old = h.docker.containersOf(ENV_ID)[0];
     h.docker.execHandler = (container, command) => {
       if (container !== old.id || command[2] !== 'exit 0') return {};
@@ -371,7 +401,7 @@ describe('recreate offer: a running container that the remote user cannot use', 
 
   it('without the workspace helper (it cannot create a container): not checked, not offered', async () => {
     h = createHarness();
-    await seedEnvironment(h, { container: 'running' });
+    await seedEnvironment(h, { container: 'running', containerLabels: RUNNING_LABELS });
     const old = h.docker.containersOf(ENV_ID)[0];
     failCheck(old.id, PASSWD_DAMAGED);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'offline');
@@ -380,6 +410,53 @@ describe('recreate offer: a running container that the remote user cannot use', 
 
     expect(h.ui.prompts).toEqual([]);
     expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
+  });
+
+  it('review round 3 (F1): a stale user in the registry and a healthy container: checked as the user of the container, no offer', async () => {
+    h = createHarness();
+    // A rebuild changed the user to `node`; an open cancelled before its end left `vscode` recorded.
+    await seedEnvironment(h, {
+      container: 'running',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }, { remoteUser: 'node' }]) },
+    });
+    const old = h.docker.containersOf(ENV_ID)[0];
+    h.docker.execHandler = (container, command, user) =>
+      container === old.id && command[2] === 'exit 0' && user !== 'node' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {};
+
+    const result = await h.service.open(TARGET, options());
+
+    expect(h.docker.execs.find((exec) => exec.command[2] === 'exit 0')?.user).toBe('node');
+    expect(h.ui.prompts).toEqual([]);
+    expect(result.containerName).toBe(NAME);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
+  });
+
+  it('review round 3 (F1): the user of the label is really missing in /etc/passwd: offered', async () => {
+    h = createHarness();
+    await seedEnvironment(h, {
+      container: 'running',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devcontainer.metadata': JSON.stringify([{ containerUser: 'node' }]) },
+      extra: { remoteUser: 'vscode' },
+    });
+    const old = h.docker.containersOf(ENV_ID)[0];
+    h.docker.execHandler = (container, command, user) =>
+      container === old.id && command[2] === 'exit 0' && user === 'node' ? { exitCode: 1, stderr: 'Error response from daemon: unable to find user node: no matching entries in passwd file' } : {};
+
+    await rejection(h.service.open(TARGET, options()));
+
+    expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+  });
+
+  it('review round 3 (F1): a container whose label names no user is not checked', async () => {
+    h = createHarness();
+    await seedEnvironment(h, { container: 'running' });
+    const old = h.docker.containersOf(ENV_ID)[0];
+    h.docker.execHandler = (container, command) => (container === old.id && command[2] === 'exit 0' ? { exitCode: 1, stderr: PASSWD_DAMAGED } : {});
+
+    await h.service.open(TARGET, options());
+
+    expect(h.docker.execs.filter((exec) => exec.command[2] === 'exit 0')).toEqual([]);
+    expect(h.ui.prompts).toEqual([]);
   });
 });
 

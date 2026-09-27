@@ -187,6 +187,8 @@ import {
   COMPOSE_CONFIG_HASH_LABEL,
   COMPOSE_ONEOFF_LABEL,
   isContainerFault,
+  containerMetadataUser,
+  sharedNamespaceServices,
   unnamedVolumeFolders,
   isGitHubTokenRejected,
   isNetworkFailure,
@@ -2543,7 +2545,11 @@ export class EnvironmentService {
    * `undefined`, also when the remote user is not known or the check itself fails (the open goes on as before).
    */
   private async runningContainerFault(ctx: PipelineContext, container: ContainerInfo, loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
-    const user = ctx.env.remoteUser ?? configRemoteUser(loaded?.config, loaded?.compose ? undefined : stringList(loaded?.config.runArgs));
+    // Review round 3 (F1): the user of the container itself (its label devcontainer.metadata, by which the Dev Containers
+    // extension attaches), never the user that the registry recorded (it can be of an earlier container) or that the
+    // configuration names now; when the label does not tell it, there is no check, and no offer.
+    const user = containerMetadataUser(container.labels, helperCliVariables(ctx.env.repository));
+    if (user === undefined) this.logger.info(`The label devcontainer.metadata of ${container.name} names no user; the container is not checked.`);
     if (user === undefined || ctx.helperUnavailable) return undefined;
     let text: string;
     try {
@@ -2672,6 +2678,9 @@ export class EnvironmentService {
       return false;
     };
     if (ctx.modelOfContainers !== true) return refuse('the configuration or the images differ from those of the last build (for example after "Rebuild later" or a failed update).');
+    // Review round 3 (G2): a shared namespace or `volumes_from` of another service never passes the direct check.
+    const shared = sharedNamespaceServices(compose.output.model, compose.service);
+    if (shared.length > 0) return refuse(`other services share a namespace or the volumes of another service (${shared.join('; ')}).`);
     const recorded = composeRecordOf(record);
     if (recorded === undefined || recorded.version !== compose.output.version) return refuse('the version of Docker Compose differs from the one of the last build.');
     const others = (await this.composeContainers(env)).filter((c) => c.labels[COMPOSE_SERVICE_LABEL] !== compose.service);
@@ -2705,10 +2714,16 @@ export class EnvironmentService {
     this.logger.warn(`The container ${container.name} of ${env.repository} is damaged, so it cannot be started or used: ${cause}`);
     // Review round 2 (V1): its volumes without a name are not carried over; the question and the progress name them.
     const unnamed = unnamedVolumeFolders(container);
+    if (!compose && loaded === undefined) {
+      // Review round 3: as for any container that is created without the configuration.
+      this.logger.warn(
+        `The container of ${env.repository} is created without the configuration, which cannot be read. Its runArgs and published ports apply once it can be read; the container is then created again.`,
+      );
+    }
     if (unnamed.length > 0) this.logger.info(`Volumes without a name of ${container.name}, not carried over by a recreation: ${unnamed.join(', ')}.`);
     const confirmed = await this.deps.ui.recreateContainer(env.repository, {
       message: Messages.containerRecreateQuestion(env.repository, compose),
-      detail: Messages.containerRecreateDetail(compose, unnamed),
+      detail: Messages.containerRecreateDetail(compose, unnamed, !compose && loaded === undefined),
     });
     this.throwIfCancelled(ctx.signal);
     if (!confirmed) {

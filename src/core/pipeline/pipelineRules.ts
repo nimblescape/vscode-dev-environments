@@ -444,6 +444,45 @@ export function imageRemoteUser(imageConfig: unknown, runArgs?: readonly unknown
 }
 
 /**
+ * Recreate offer, review round 3 (F1): the remote user of a container by its own label devcontainer.metadata (which the
+ * Dev Container CLI puts on the container it creates, and by which the Dev Containers extension attaches), substituted
+ * as imageRemoteUser does: its `remoteUser`, else its `containerUser`. `undefined` when the label names neither, or the
+ * user holds a variable whose value is not known.
+ */
+export function containerMetadataUser(labels: Readonly<Record<string, string>>, variables?: CliVariables): string | undefined {
+  let entries: unknown;
+  try {
+    entries = JSON.parse(labels['devcontainer.metadata'] ?? 'null');
+  } catch {
+    return undefined;
+  }
+  const named = (Array.isArray(entries) ? entries : [entries]).some(
+    (entry) => isRecord(entry) && (nonEmptyString(entry.remoteUser) !== undefined || nonEmptyString(entry.containerUser) !== undefined),
+  );
+  return named ? imageRemoteUser({ Labels: labels }, undefined, variables) : undefined;
+}
+
+/**
+ * Recreate offer, review round 3 (G2): the other services of a Docker Compose model (not `devService`) that share a
+ * namespace or the volumes of another service (`network_mode`, `ipc`, or `pid` of the form `service:<name>`, or
+ * `volumes_from`), as `<service>: <setting>`. Compose hashes such a reference in its resolved form (`container:<id>`),
+ * so the hash of the model never equals the label of the container, and a new dev container could make Compose create
+ * them again.
+ */
+export function sharedNamespaceServices(model: { services: Record<string, unknown> }, devService: string): string[] {
+  const found: string[] = [];
+  for (const [name, service] of Object.entries(model.services)) {
+    if (name === devService || !isRecord(service)) continue;
+    for (const key of ['network_mode', 'ipc', 'pid']) {
+      const value = service[key];
+      if (typeof value === 'string' && value.startsWith('service:')) found.push(`${name}: ${key} ${value}`);
+    }
+    if (Array.isArray(service.volumes_from) && service.volumes_from.length > 0) found.push(`${name}: volumes_from ${service.volumes_from.join(', ')}`);
+  }
+  return found;
+}
+
+/**
  * The remote user by the configuration alone, when neither `up` nor the image named it: its `remoteUser`, else the last
  * `--user`/`-u` of `runArgs`, else its `containerUser` (the order of imageRemoteUser, without the image). `undefined`
  * when the configuration names none.

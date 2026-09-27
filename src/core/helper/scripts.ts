@@ -944,7 +944,8 @@ export function writeAndRunCommand(p: { repositoryConfig?: string; config?: stri
  * `node -e` script (recreate offer, review round 2): the configuration hash that Docker Compose computes for each
  * service of a model, as it compares it with the label com.docker.compose.config-hash of a container to decide whether
  * `up` creates the container again (`docker compose config --hash '*'`: one line `<service> <hash>` per service).
- * `argv[1]` = the path of the model file (COMPOSE_MODEL_PATH, the path that `up` uses), `argv[2]` = the project name; the
+ * All profiles (`--profile '*'`, review round 3, G1: verified with Compose 5.1.1, the hash of a service with `profiles:`
+ * then equals the label of its container). `argv[1]` = the path of the model file (COMPOSE_MODEL_PATH, the path that `up` uses), `argv[2]` = the project name; the
  * model comes on standard input. It needs no Docker engine and no network (verified with Compose 5.1.1: the hash of a
  * model in another folder and without an engine equals the label of the container that `up` created from it).
  */
@@ -960,7 +961,8 @@ if (!file || path.posix.resolve(file) !== file || !project) {
 }
 fs.mkdirSync(path.posix.dirname(file), { recursive: true, mode: 0o700 });
 fs.writeFileSync(file, fs.readFileSync(0, 'utf8'), { mode: 0o600 });
-const result = spawnSync('docker', ['compose', '--project-name', project, '-f', file, 'config', '--hash', '*'], {
+// Review round 3 (G1): all profiles, so that a service with profiles (started through runServices) has its hash too.
+const result = spawnSync('docker', ['compose', '--project-name', project, '--profile', '*', '-f', file, 'config', '--hash', '*'], {
   encoding: 'utf8',
   maxBuffer: 16 * 1024 * 1024,
 });
