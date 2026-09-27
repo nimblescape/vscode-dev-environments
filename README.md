@@ -24,7 +24,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 
 ## Standing user decisions (2026-09-27)
 
-- **Greenfield (user decision 2026-09-27):** no backward compatibility and no migration paths for now — no handling of old records, old containers, old volume layouts or old settings; no container-version bumps for migration. Existing code that only serves migration may be removed when a unit touches it.
+- **Greenfield (user decision 2026-09-27):** no backward compatibility and no migration paths for now — no handling of old records, old containers, old volume layouts or old settings; no container-version bumps for migration. All existing migration/backward-compatibility code is to be removed (user: "you can remove anything that is migration related because we have not released yet"): a dedicated cleanup PR right after unit 15 (PR #33); inventory in the session scratchpad `migration-inventory.md`.
 - **Trust model.** Repositories are trusted code. The checks are a guard rail on the final configuration (host bind mounts, Docker socket, privileged, capabilities, devices, host namespaces, ports on all addresses), not a sandbox. Untrusted repositories belong in a VM or a separate user account with its own Docker (`docs/concept-vm-isolation.md`, not planned).
 - **No model of the Dev Container CLI's reader**, and no Docker gate.
 - **The Dockerfile check is frozen.** Review rounds do not report, verify, or fix gaps in the image-reference refusals of the Dockerfile (`src/core/imageCheck/dockerfile.ts`, `dockerfileImageFindings`, expansion budgets). Tell every reviewer this in its prompt. Queued: remove those refusals, keep only the `FROM` extraction for the image update check (needs the user's explicit permission in the session; auto mode blocked it once).
@@ -37,6 +37,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 1. Remove the Dockerfile refusals — **merged** (PR #32, f1594dc). Accepted leftover (low, same as before): a devcontainer.json with a JSON syntax slip that the Dev Container CLI tolerates makes a named Dockerfile unreadable for the check, so it is refused as 'could not be read'.
 2. ~~Helper socket follows the Docker context~~ — dropped (user decision 2026-09-27: not worth the complexity; rootless Docker needs `DOCKER_HOST`, as the README says). Branch `fix/helper-socket-context` stays unmerged.
 3. Unit 15: token only in the container's memory (tmpfs) — spec in the session scratchpad `u15/spec.md`.
+3b. Remove all migration code (greenfield cleanup PR).
 4. Unit 11: one policy module, guard rails only (pure refactor).
 5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
 6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
