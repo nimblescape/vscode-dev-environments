@@ -19,12 +19,20 @@ function inFolder(file: string): string {
 }
 
 /**
- * The super options that the kernel shows in /proc/self/mountinfo for TOKEN_TMPFS (`size=1m`, `mode=0700`). On a host
- * with SELinux, the kernel adds its own options in between (`seclabel`, or `context=…` that Docker sets), which change
- * nothing of what the check below looks for; any other difference (for example another size, `uid=`, `nr_inodes=`) is
- * not our tmpfs.
+ * The super options that the kernel shows in /proc/self/mountinfo for TOKEN_TMPFS (`size=1m`, `mode=0700`): each of
+ * them exactly once, in any order. The kernel adds options of its own that change nothing of what the check below looks
+ * for (TOKEN_TMPFS_KERNEL_SUPER_OPTIONS); any other option, or one of these twice (for example another size,
+ * `nr_inodes=`, `uid=1000`), is not our tmpfs.
  */
 export const TOKEN_TMPFS_SUPER_OPTIONS = 'rw,size=1024k,mode=700';
+
+/**
+ * The super options that a kernel may show besides TOKEN_TMPFS_SUPER_OPTIONS for our tmpfs (`*` = any value): the
+ * 64-bit or 32-bit inode numbers of tmpfs (`inode64` on kernels with CONFIG_TMPFS_INODE64, such as the ones of Ubuntu),
+ * SELinux (`seclabel`, or the `context=…` that Docker sets, in quotes when it has a comma), the owner root, no swap, and
+ * no huge pages.
+ */
+export const TOKEN_TMPFS_KERNEL_SUPER_OPTIONS = ['inode64', 'inode32', 'seclabel', 'context=*', 'uid=0', 'gid=0', 'noswap', 'huge=never'];
 
 /**
  * Review of unit 15 (T1, T2, and the mount propagation): shell code (POSIX sh, no awk; dash and BusyBox) with the
@@ -38,49 +46,102 @@ export const TOKEN_TMPFS_SUPER_OPTIONS = 'rw,size=1024k,mode=700';
  * - `stat -f` says tmpfs;
  * - the device of the folder (`stat -c %d`, as major:minor) is on exactly one line of /proc/self/mountinfo, and that
  *   line has the mount point TOKEN_FOLDER, the root `/`, no optional fields (no `shared:`, `master:`: no peer on the
- *   computer), the type tmpfs, the options nosuid, nodev, and noexec, and the super options TOKEN_TMPFS_SUPER_OPTIONS;
+ *   computer), the type tmpfs, the options nosuid, nodev, and noexec, and the super options TOKEN_TMPFS_SUPER_OPTIONS
+ *   (each once) with no others than TOKEN_TMPFS_KERNEL_SUPER_OPTIONS;
  * - no mount on its parents, up to the root of the container, has the mount point TOKEN_FOLDER (a mount stacked on
  *   another one there) or is `shared:` (a mount propagation that would bring our tmpfs to the computer);
  * - no mount point lies below TOKEN_FOLDER (for example a file of the computer at the place of the token file).
+ * When it refuses, `own_tmpfs` writes the rule that failed and the lines of /proc/self/mountinfo of the folder (its
+ * mount point, the mounts below it, and its device) to stderr, for the log: the reason of a refusal on a kernel that
+ * shows the mount otherwise. Only builtins of the shell (no program runs, so none sees the table or the folder).
  * `enter_folder` goes into the folder and ends with the status of `own_tmpfs .`; when the folder cannot be entered (the
  * remote user, its owner after a write, took the rights away), it gives it back to root (as root) and mode 0700 first,
  * only when it is our tmpfs, and ends with 4 when it still cannot be entered.
  */
+const [REQUIRED_RW, REQUIRED_SIZE, REQUIRED_MODE] = TOKEN_TMPFS_SUPER_OPTIONS.split(',');
 const OWN_TMPFS = `dir='${TOKEN_FOLDER}'
+own_tmpfs_refuse() {
+  printf 'Check of %s: %s.\\n' "$dir" "$2" >&2
+  while read -r m_id m_parent m_dev m_root m_point m_options m_rest; do
+    case "$m_point" in
+      "$dir" | "$dir"/*) ;;
+      *) [ -n "$m_want" ] && [ "$m_dev" = "$m_want" ] || continue ;;
+    esac
+    printf 'mountinfo: %s %s %s %s %s %s %s\\n' "$m_id" "$m_parent" "$m_dev" "$m_root" "$m_point" "$m_options" "$m_rest" >&2
+  done < /proc/self/mountinfo
+  return "$1"
+}
+own_tmpfs_super() {
+  m_list="$1,"
+  m_rw=0
+  m_size=0
+  m_mode=0
+  while [ -n "$m_list" ]; do
+    m_opt="\${m_list%%,*}"
+    m_list="\${m_list#*,}"
+    case "$m_opt" in
+      'context="'*)
+        while case "$m_opt" in 'context="'*'"') false ;; *) true ;; esac; do
+          if [ -z "$m_list" ]; then m_why="the super option $m_opt has no end"; return 1; fi
+          m_opt="$m_opt,\${m_list%%,*}"
+          m_list="\${m_list#*,}"
+        done
+        ;;
+    esac
+    case "$m_opt" in
+      '${REQUIRED_RW}') m_rw=$((m_rw + 1)) ;;
+      '${REQUIRED_SIZE}') m_size=$((m_size + 1)) ;;
+      '${REQUIRED_MODE}') m_mode=$((m_mode + 1)) ;;
+      ${TOKEN_TMPFS_KERNEL_SUPER_OPTIONS.map((o) => (o.endsWith('*') ? `'${o.slice(0, -1)}'*` : `'${o}'`)).join(' | ')}) ;;
+      *) m_why="the super option $m_opt is not one of ours or of the kernel"; return 1 ;;
+    esac
+  done
+  if [ "$m_rw:$m_size:$m_mode" != 1:1:1 ]; then
+    m_why='the super options do not have ${REQUIRED_RW}, ${REQUIRED_SIZE}, and ${REQUIRED_MODE} once each'
+    return 1
+  fi
+}
 own_tmpfs() {
-  [ "$(stat -f -c %T "$1" 2>/dev/null)" = tmpfs ] || return 1
-  m_device=$(stat -c %d "$1" 2>/dev/null) || return 2
-  case "$m_device" in '' | *[!0-9]*) return 2 ;; esac
+  m_want=''
+  m_type=$(stat -f -c %T "$1" 2>/dev/null) || m_type=''
+  [ "$m_type" = tmpfs ] || { own_tmpfs_refuse 1 "stat -f shows the type '$m_type', not tmpfs"; return; }
+  m_device=$(stat -c %d "$1" 2>/dev/null) || { own_tmpfs_refuse 2 'stat -c %d fails'; return; }
+  case "$m_device" in '' | *[!0-9]*) own_tmpfs_refuse 2 "stat -c %d shows '$m_device'"; return ;; esac
   m_want="$(( ((m_device >> 8) & 0xfff) | ((m_device >> 32) & ~0xfff) )):$(( (m_device & 0xff) | ((m_device >> 12) & ~0xff) ))"
   m_count=0
   m_parent_id=''
+  m_why=''
   while read -r m_id m_parent m_dev m_root m_point m_options m_rest; do
-    case "$m_point" in "$dir"/*) return 2 ;; esac
+    case "$m_point" in "$dir"/*) m_why="a mount lies below it ($m_point)"; break ;; esac
     [ "$m_dev" = "$m_want" ] || continue
     m_count=$((m_count + 1))
-    [ "$m_point" = "$dir" ] && [ "$m_root" = / ] || return 2
-    case "$m_rest" in '- tmpfs '*) ;; *) return 2 ;; esac
-    case "\${m_rest#- tmpfs * }" in
-      '${TOKEN_TMPFS_SUPER_OPTIONS}' | 'rw,seclabel,${TOKEN_TMPFS_SUPER_OPTIONS.slice(3)}' | 'rw,context='*',${TOKEN_TMPFS_SUPER_OPTIONS.slice(3)}') ;;
-      *) return 2 ;;
+    if [ "$m_point" != "$dir" ]; then m_why="its device $m_want is mounted at $m_point"; break; fi
+    if [ "$m_root" != / ]; then m_why="the root of its mount is $m_root, not /"; break; fi
+    case "$m_rest" in
+      '- tmpfs '*) ;;
+      '- '*) m_why='the type of its mount is not tmpfs'; break ;;
+      *) m_why='its mount has optional fields (a peer or a master)'; break ;;
     esac
-    case ",$m_options," in *,nosuid,*) ;; *) return 2 ;; esac
-    case ",$m_options," in *,nodev,*) ;; *) return 2 ;; esac
-    case ",$m_options," in *,noexec,*) ;; *) return 2 ;; esac
+    own_tmpfs_super "\${m_rest#- tmpfs * }" || break
+    case ",$m_options," in *,nosuid,*) ;; *) m_why='its mount has no nosuid'; break ;; esac
+    case ",$m_options," in *,nodev,*) ;; *) m_why='its mount has no nodev'; break ;; esac
+    case ",$m_options," in *,noexec,*) ;; *) m_why='its mount has no noexec'; break ;; esac
     m_parent_id="$m_parent"
   done < /proc/self/mountinfo
-  [ "$m_count" = 1 ] || return 2
+  if [ -n "$m_why" ]; then own_tmpfs_refuse 2 "$m_why"; return; fi
+  if [ "$m_count" != 1 ]; then own_tmpfs_refuse 2 "its device $m_want is on $m_count lines of /proc/self/mountinfo, not 1"; return; fi
   m_hops=0
   while [ -n "$m_parent_id" ]; do
     m_hops=$((m_hops + 1))
-    [ "$m_hops" -le 100 ] || return 2
+    if [ "$m_hops" -gt 100 ]; then own_tmpfs_refuse 2 'the chain of its parents has more than 100 mounts'; return; fi
     m_next=''
     while read -r m_id m_parent m_dev m_root m_point m_options m_rest; do
       [ "$m_id" = "$m_parent_id" ] || continue
-      [ "$m_point" != "$dir" ] || return 2
-      case " \${m_rest%%- *}" in *' shared:'*) return 2 ;; esac
+      if [ "$m_point" = "$dir" ]; then m_why="it lies on another mount at $dir (mount $m_id)"; break; fi
+      case " \${m_rest%%- *}" in *' shared:'*) m_why="the parent mount $m_id at $m_point is shared: $m_rest"; break ;; esac
       m_next="$m_parent"
     done < /proc/self/mountinfo
+    if [ -n "$m_why" ]; then own_tmpfs_refuse 2 "$m_why"; return; fi
     [ "$m_next" != "$m_parent_id" ] || break
     m_parent_id="$m_next"
   done

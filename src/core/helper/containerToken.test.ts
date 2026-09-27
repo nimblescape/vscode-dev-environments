@@ -398,6 +398,12 @@ describe('review of unit 15 (T1, T2): only into the tmpfs that the override conf
   it.each([
     ['SELinux: seclabel', 'rw,seclabel,size=1024k,mode=700'],
     ['SELinux: the context of Docker', 'rw,context="system_u:object_r:container_file_t:s0:c1,c2",size=1024k,mode=700'],
+    ['CONFIG_TMPFS_INODE64 (Ubuntu): inode64', 'rw,size=1024k,mode=700,inode64'],
+    ['inode32', 'rw,size=1024k,mode=700,inode32'],
+    ['SELinux and inode64', 'rw,seclabel,size=1024k,mode=700,inode64'],
+    ['the context of Docker and inode64', 'rw,context="system_u:object_r:container_file_t:s0:c1,c2",size=1024k,mode=700,inode64'],
+    ['the owner root, no swap, no huge pages', 'rw,size=1024k,mode=700,uid=0,gid=0,inode64,huge=never,noswap'],
+    ['another order', 'rw,mode=700,inode64,size=1024k'],
   ])('accepts our tmpfs with the options of the kernel (%s)', (_name, superOptions) => {
     const env = setup({ mountinfo: (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions }) }) });
     expect(env.write().status).toBe(0);
@@ -433,6 +439,46 @@ describe('review of unit 15 (T1, T2): only into the tmpfs that the override conf
     [
       'T2: a tmpfs with other options of the kernel (nr_inodes)',
       (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,nr_inodes=5,mode=700' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs of another size, with inode64',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=2048k,mode=700,inode64' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs with nr_inodes and inode64',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,nr_inodes=5,mode=700,inode64' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs with the size twice',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,size=1024k,mode=700' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs without its mode',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,inode64' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs of another owner',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,mode=700,uid=1000,inode64' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs read-only',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'ro,size=1024k,mode=700' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs with huge pages',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,mode=700,huge=always' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: an SELinux context without its end quote',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,mode=700,context="a,b' }) }),
       { message: 'is not the tmpfs of the container' },
     ],
     [
@@ -494,6 +540,49 @@ describe('review of unit 15 (T1, T2): only into the tmpfs that the override conf
     expect(result.status).toBe(3);
     expect(result.stderr).toContain('is not the tmpfs of the container');
     expect(fs.readdirSync(env.dir)).toEqual(['kept']);
+  });
+});
+
+describe('the diagnostic of a refused tmpfs (stderr, for the log)', () => {
+  const tmpfs = (dir: string, superOptions: string, options = 'rw,nosuid,nodev,noexec,relatime') =>
+    `106 88 ${DEVICE} / ${dir} ${options} - tmpfs tmpfs ${superOptions}`;
+
+  it.each([
+    ['another size', (dir: string) => mountinfo(dir, { tmpfs: tmpfs(dir, 'rw,size=2048k,mode=700,inode64') }), 'the super option size=2048k is not one of ours or of the kernel'],
+    ['nr_inodes', (dir: string) => mountinfo(dir, { tmpfs: tmpfs(dir, 'rw,size=1024k,nr_inodes=5,mode=700') }), 'the super option nr_inodes=5 is not one of ours or of the kernel'],
+    ['the size twice', (dir: string) => mountinfo(dir, { tmpfs: tmpfs(dir, 'rw,size=1024k,size=1024k,mode=700') }), 'the super options do not have rw, size=1024k, and mode=700 once each'],
+    ['no noexec', (dir: string) => mountinfo(dir, { tmpfs: tmpfs(dir, 'rw,size=1024k,mode=700', 'rw,nosuid,nodev,relatime') }), 'its mount has no noexec'],
+    ['an optional field', (dir: string) => mountinfo(dir, { tmpfs: `106 88 ${DEVICE} / ${dir} rw,nosuid,nodev,noexec,relatime master:3 - tmpfs tmpfs rw,size=1024k,mode=700` }), 'its mount has optional fields'],
+    ['a mount below it', (dir: string) => mountinfo(dir, { extra: [`107 106 254:1 /home/u/file ${dir}/github-token rw,relatime - ext4 /dev/sda1 rw`] }), 'a mount lies below it'],
+    ['a shared parent', (dir: string) => mountinfo(dir, { root: '88 58 0:41 / / rw,relatime shared:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w' }), 'the parent mount 88 at / is shared'],
+    ['its device twice', (dir: string) => mountinfo(dir, { extra: [`120 88 ${DEVICE} / /mnt/copy rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,mode=700`] }), `its device ${DEVICE} is mounted at /mnt/copy`],
+  ])('names the rule that failed and shows the lines of the folder (%s)', (_name, table, rule) => {
+    const env = setup({ mountinfo: table });
+    const written = env.write();
+    expect(written.status).toBe(3);
+    expect(written.stderr).toContain(`Check of ${env.dir}: ${rule}`);
+    expect(written.stderr).toMatch(new RegExp(`^mountinfo: 106 88 ${DEVICE} / ${env.dir} `, 'm'));
+    expect(written.stderr).toContain('is not the tmpfs of the container: another mount lies over it or in it');
+    expect(written.stdout + written.stderr).not.toContain(TOKEN);
+    const removed = env.remove();
+    expect(removed.status).toBe(3);
+    expect(removed.stderr).toContain(`Check of ${env.dir}: ${rule}`);
+    // Only builtins of the shell read the table: no program runs but stat.
+    expect(env.logText().split('\n').filter((line) => line !== '' && !line.startsWith('stat '))).toEqual([]);
+  });
+
+  it('names the type when the folder is no tmpfs', () => {
+    const env = setup({ fsType: 'ext4' });
+    const result = env.write();
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(`Check of ${env.dir}: stat -f shows the type 'ext4', not tmpfs.`);
+    expect(result.stderr).toContain('is not a tmpfs mount of the container');
+  });
+
+  it('says nothing when the folder is our tmpfs (also with inode64)', () => {
+    const env = setup({ mountinfo: (dir) => mountinfo(dir, { tmpfs: tmpfs(dir, 'rw,size=1024k,mode=700,inode64') }) });
+    expect(env.write()).toMatchObject({ status: 0, stderr: '' });
+    expect(env.remove()).toMatchObject({ status: 0, stderr: '' });
   });
 });
 
