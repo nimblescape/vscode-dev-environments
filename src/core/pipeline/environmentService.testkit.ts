@@ -585,6 +585,13 @@ export class FakeHelper implements EnvironmentHelper {
     upsBefore: number;
     tokenWritesBefore: number;
   }> = [];
+  /**
+   * Review PL-1/PL-2: for each runUserCommands, the number of FakeDocker execs before it (to order the execs in the
+   * container, such as HOME_GIT_CONFIG_SCRIPT, against it) and the token it got for the redaction of its output.
+   */
+  readonly userCommandContext: Array<{ execsBefore: number; token?: string }> = [];
+  /** Review PL-1: the token that each `up` got for the redaction of its output. */
+  readonly upTokens: Array<string | undefined> = [];
   /** runUserCommands fails with this error (not a lifecycle failure: that is lifecycleFailure). */
   userCommandsError: Maybe<Error>;
   /** Each readConfiguration, with what a Docker Compose configuration passes. */
@@ -765,8 +772,10 @@ export class FakeHelper implements EnvironmentHelper {
     removeExistingContainer: boolean;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    token?: string;
   }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
+    this.upTokens.push(p.token);
     if (p.override.dockerComposeFile !== undefined) return this.composeUp(p);
     const image = String(p.override.image);
     this.calls.push(`up ${image}${p.removeExistingContainer ? ' --remove-existing-container' : ''}`);
@@ -819,8 +828,10 @@ export class FakeHelper implements EnvironmentHelper {
     containerId: string;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    token?: string;
   }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
+    this.userCommandContext.push({ execsBefore: this.docker.execs.length, token: p.token });
     this.userCommandRuns.push({
       containerId: p.containerId,
       environmentId: p.environmentId,

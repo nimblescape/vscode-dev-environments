@@ -253,6 +253,44 @@ function redact(text: string, secret: string): string {
   return secret.length >= 4 ? text.split(secret).join('***') : text;
 }
 
+/** Review PL-1: a stream that is not redacted line by line holds at most this many characters before it passes them on. */
+const REDACTION_BUFFER_LIMIT = 64 * 1024;
+
+/**
+ * Review PL-1: passes a stream on with `secret` replaced (redact), also when the secret is split across chunks: whole
+ * lines go on at once; a line longer than REDACTION_BUFFER_LIMIT goes on except for its last characters (shorter than
+ * the secret), which wait for the next chunk. flush passes on the rest.
+ */
+class RedactingStream {
+  private buffer = '';
+
+  constructor(
+    private readonly forward: (text: string) => void,
+    private readonly secret: string,
+  ) {}
+
+  write(text: string): void {
+    this.buffer += text;
+    const end = this.buffer.lastIndexOf('\n') + 1;
+    if (end > 0) {
+      this.forward(redact(this.buffer.slice(0, end), this.secret));
+      this.buffer = this.buffer.slice(end);
+    }
+    if (this.buffer.length > REDACTION_BUFFER_LIMIT) {
+      // A secret split at the end starts within its last `length - 1` characters, which stay.
+      const text = redact(this.buffer, this.secret);
+      const keep = Math.min(text.length, Math.max(this.secret.length - 1, 0));
+      this.forward(text.slice(0, text.length - keep));
+      this.buffer = text.slice(text.length - keep);
+    }
+  }
+
+  flush(): void {
+    if (this.buffer) this.forward(redact(this.buffer, this.secret));
+    this.buffer = '';
+  }
+}
+
 /** Git's message for the user: at most 15 lines. */
 function gitMessageFromOutput(text: string): string {
   const lines = text
@@ -713,6 +751,8 @@ export class WorkspaceHelper {
     /** Docker Compose: files for the helper besides the override configuration (our model), and `env` (COMPOSE_PROJECT_NAME). */
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** Review PL-1: removed from the output and from the error (none of the commands of `up` reads it). */
+    token?: string;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -730,6 +770,7 @@ export class WorkspaceHelper {
       return await this.runDevcontainer('devcontainer up', p.volumeName, overrideCommand(args, p.files), {
         input: overrideInput(p.files, p.override),
         env: p.env,
+        secret: p.token,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -754,6 +795,11 @@ export class WorkspaceHelper {
     containerId: string;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /**
+     * Review PL-1: the token in the container, which the lifecycle commands can read: removed from their output and from
+     * the error (the command output of DevcontainerCommandError), also when it is split across chunks.
+     */
+    token: string;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -768,6 +814,7 @@ export class WorkspaceHelper {
       const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, overrideCommand(args, p.files), {
         input: overrideInput(p.files, p.override),
         env: p.env,
+        secret: p.token,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -998,10 +1045,13 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { input?: string; env?: Record<string, string>; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: { input?: string; env?: Record<string, string>; secret?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
-    const stdoutFilter = new ResultLineFilter(output);
+    const secret = options.secret;
+    // Review PL-1: stdout goes on in whole lines (ResultLineFilter), stderr through a RedactingStream.
+    const stdoutFilter = new ResultLineFilter(secret === undefined ? output : this.redactingOutput(output, secret));
+    const stderr = secret === undefined ? undefined : new RedactingStream(output, secret);
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, helperCommand, {
@@ -1009,11 +1059,13 @@ export class WorkspaceHelper {
         env: options.env,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
-        onStderr: output,
+        onStderr: stderr === undefined ? output : (text) => stderr.write(text),
       });
     } finally {
       stdoutFilter.flush();
+      stderr?.flush();
     }
+    if (secret !== undefined) result = { ...result, stdout: redact(result.stdout, secret), stderr: redact(result.stderr, secret) };
     let parsed: DevcontainerResult | undefined;
     try {
       parsed = parseDevcontainerResult(result.stdout);

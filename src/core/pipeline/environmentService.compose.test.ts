@@ -18,6 +18,8 @@ import {
   type ComposeModelOutput,
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
+import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
+import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
@@ -3187,6 +3189,32 @@ describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
     ]);
     expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ container: dev?.id, user: 'root', remoteUser: 'vscode', token: TOKEN })]);
     expect(JSON.stringify(h.helper.userCommandRuns)).not.toContain(TOKEN);
+  });
+
+  it('review PL-2: ~/.gitconfig of the dev container after the token and before run-user-commands; finish does not run it again', async () => {
+    await h.service.open(TARGET, options());
+    const dev = devContainer();
+    const index = (script: string) => h.docker.execs.flatMap((exec, i) => (exec.command[2] === script ? [i] : []));
+    const home = index(HOME_GIT_CONFIG_SCRIPT);
+    const token = index(TOKEN_WRITE_SCRIPT);
+    const [run] = h.helper.userCommandContext;
+    expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.findIndex((call) => call.startsWith('up')));
+    expect(home).toHaveLength(1);
+    expect(h.docker.execs[home[0]]).toMatchObject({ container: dev?.id, user: 'root', command: homeGitConfigCommand('vscode') });
+    expect(token[0]).toBeLessThan(home[0]);
+    expect(home[0]).toBeLessThan(run.execsBefore);
+    expect(run.token).toBe(TOKEN);
+    // The Git version of the new dev container: once, in finish.
+    expect(h.docker.execs.filter((exec) => exec.command[0] === 'git' && exec.command[1] === '--version')).toHaveLength(1);
+  });
+
+  it('review PL-2: a stopped environment gets ~/.gitconfig before run-user-commands too', async () => {
+    await seedCompose();
+    await h.service.openEnvironment(ENV_ID, options());
+    const home = h.docker.execs.flatMap((exec, i) => (exec.command[2] === HOME_GIT_CONFIG_SCRIPT ? [i] : []));
+    expect(home).toHaveLength(1);
+    expect(h.docker.execs[home[0]].container).toBe(devContainer()?.id);
+    expect(home[0]).toBeLessThan(h.helper.userCommandContext[0].execsBefore);
   });
 
   it('a stopped environment: up starts the containers, then run-user-commands in the dev container', async () => {

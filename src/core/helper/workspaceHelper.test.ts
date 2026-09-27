@@ -10,6 +10,7 @@ import type { ImageInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, helperImageTag, type BaseDigestLookup } from './helperImage';
@@ -1129,8 +1130,12 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       override,
       environmentId: '3f2a9c1e-5b7d',
       containerId: 'c1',
+      // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
+      token: TOKEN,
     });
     expect(result).toMatchObject({ outcome: 'success', containerId: 'c1' });
+    // The token is only redacted: it is no argument, variable, or input of the helper.
+    expect(JSON.stringify(docker.calls)).not.toContain(TOKEN);
     const run = docker.runs[0];
     expect(JSON.parse(run.options.input ?? '')).toEqual(override);
     expect(run.args).not.toContain('-e');
@@ -1333,6 +1338,8 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       containerId: 'c1',
       files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
       env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+      // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
+      token: TOKEN,
     });
     const run = docker.runs[0];
     expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
@@ -1385,7 +1392,8 @@ describe('WorkspaceHelper.runUserCommands with a failed lifecycle command (lifec
   }
 
   function runUserCommands(): Promise<unknown> {
-    return createHelper().runUserCommands({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', containerId: CONTAINER_ID });
+    // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
+    return createHelper().runUserCommands({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', containerId: CONTAINER_ID, token: TOKEN });
   }
 
   it('keeps the container that runs, with the description of the CLI', async () => {
@@ -1406,6 +1414,97 @@ describe('WorkspaceHelper.runUserCommands with a failed lifecycle command (lifec
     answer('An error occurred running user commands in the container.', { stdout: '"running"\n' });
     await expect(runUserCommands()).rejects.toBeInstanceOf(DevcontainerCommandError);
     expect(docker.calls.filter((call) => call.args[0] === 'container')).toHaveLength(0);
+  });
+});
+
+describe('review PL-1: the token in the output of run-user-commands and up', () => {
+  const CONTAINER_ID = '4f1c2b3a9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a';
+  const RESULT = '{"outcome":"success","result":"done"}\n';
+
+  /** The helper run sends `stdout` and `stderr` in these chunks (in this order) and ends with `exitCode`. */
+  function streams(p: { stdout?: string[]; stderr?: string[]; exitCode?: number; inspect?: Partial<RunResult> }): void {
+    docker.forwardOutput = false;
+    docker.handler = (args, options) => {
+      if (args[0] !== 'run') return p.inspect ?? {};
+      for (const chunk of p.stderr ?? []) options.onStderr?.(chunk);
+      for (const chunk of p.stdout ?? []) options.onStdout?.(chunk);
+      return { exitCode: p.exitCode ?? 0, stdout: (p.stdout ?? []).join(''), stderr: (p.stderr ?? []).join('') };
+    };
+  }
+
+  function runUserCommands(output: string[]): Promise<unknown> {
+    return createHelper().runUserCommands({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      override: {},
+      environmentId: 'e',
+      containerId: CONTAINER_ID,
+      token: TOKEN,
+      onOutput: (text) => output.push(text),
+    });
+  }
+
+  it('replaces the token in whole lines of stdout and stderr, and keeps the other output in its order', async () => {
+    streams({ stderr: [`+ curl -H "Authorization: token ${TOKEN}" x\n`, 'next\n'], stdout: [`Token: ${TOKEN}\n`, 'done\n', RESULT] });
+    const output: string[] = [];
+    await runUserCommands(output);
+    expect(output.join('')).toBe('+ curl -H "Authorization: token ***" x\nnext\nToken: ***\ndone\n');
+  });
+
+  it('replaces a token split across two chunks of stderr (line-buffered), and passes a last line without a newline on', async () => {
+    const half = TOKEN.length / 2;
+    streams({ stderr: ['first\n  - Token: ', TOKEN.slice(0, half), `${TOKEN.slice(half)} end\nsecond`], stdout: [RESULT] });
+    const output: string[] = [];
+    await runUserCommands(output);
+    expect(output.join('')).not.toContain(TOKEN.slice(0, half));
+    expect(output.join('')).not.toContain(TOKEN.slice(half));
+    expect(output.join('')).toBe('first\n  - Token: *** end\nsecond');
+  });
+
+  it('holds back only a bounded part of a long line without a newline, and still replaces a token split at its end', async () => {
+    const long = 'x'.repeat(70 * 1024);
+    const half = 5;
+    streams({ stderr: [`${long}${TOKEN.slice(0, half)}`, `${TOKEN.slice(half)}\n`], stdout: [RESULT] });
+    const output: string[] = [];
+    await runUserCommands(output);
+    // The long line went on before its end arrived.
+    expect(output.length).toBeGreaterThanOrEqual(2);
+    expect(output[0].length).toBeGreaterThan(64 * 1024);
+    expect(output.join('')).toBe(`${long}***\n`);
+  });
+
+  it('replaces the token in the stdout and stderr of the error (errorDetail, the log)', async () => {
+    const half = 7;
+    const result = { outcome: 'error', message: `Command failed: /bin/sh -c echo ${TOKEN}`, description: 'postCreateCommand from devcontainer.json failed.' };
+    streams({
+      stderr: [`npm ERR! ${TOKEN.slice(0, half)}`, `${TOKEN.slice(half)}\n`],
+      stdout: [`${TOKEN}\n`, `${JSON.stringify(result)}\n`],
+      exitCode: 1,
+      inspect: { stdout: '"exited"\n' },
+    });
+    const output: string[] = [];
+    const error = await runUserCommands(output).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DevcontainerCommandError);
+    const failure = error as DevcontainerCommandError;
+    expect(failure.stderr).toBe('npm ERR! ***\n');
+    expect(failure.stdout).not.toContain(TOKEN);
+    expect(failure.message).not.toContain(TOKEN);
+    expect(failure.result).toMatchObject({ outcome: 'error', containerId: CONTAINER_ID });
+    expect(errorDetail(failure)).not.toContain(TOKEN);
+    expect(output.join('')).toBe('npm ERR! ***\n***\n');
+    expect(logger.lines.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('up replaces the token in its output and its error too', async () => {
+    streams({ stderr: [`a ${TOKEN.slice(0, 4)}`, `${TOKEN.slice(4)} b\n`], stdout: [`${TOKEN}\n`], exitCode: 1 });
+    const output: string[] = [];
+    const error = await createHelper()
+      .up({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', removeExistingContainer: false, token: TOKEN, onOutput: (text) => output.push(text) })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DevcontainerCommandError);
+    expect((error as DevcontainerCommandError).stderr).toBe('a *** b\n');
+    expect((error as DevcontainerCommandError).stdout).toBe('***\n');
+    expect(output.join('')).toBe('a *** b\n***\n');
   });
 });
 

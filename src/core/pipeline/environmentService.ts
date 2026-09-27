@@ -506,6 +506,12 @@ interface PipelineContext {
    */
   tokenWrittenTo?: string;
   /**
+   * Review PL-2: the container whose ~/.gitconfig runUserCommands prepared in this run (HOME_GIT_CONFIG_SCRIPT), before
+   * the lifecycle commands, for Git older than 2.31; finish does not run the script again there (it still checks the
+   * Git version of a new container).
+   */
+  homeGitConfigWrittenTo?: string;
+  /**
    * The Git identity of the account (identityOf), asked for as soon as the session is known, so the question to GitHub
    * runs while Docker starts and the image check runs. Never rejects.
    */
@@ -2614,6 +2620,7 @@ export class EnvironmentService {
         override,
         environmentId: env.id,
         removeExistingContainer,
+        token: ctx.session.token,
         onOutput: this.output,
         signal: ctx.signal,
       });
@@ -2755,6 +2762,7 @@ export class EnvironmentService {
         environmentId: env.id,
         removeExistingContainer,
         ...inputs,
+        token: ctx.session.token,
         onOutput: this.output,
         signal: ctx.signal,
       });
@@ -3108,12 +3116,19 @@ export class EnvironmentService {
     const remoteUser = nonEmptyString(result.remoteUser) ?? env.remoteUser ?? configUser ?? 'root';
     await this.writeGitToken(ctx, containerId, remoteUser);
     ctx.tokenWrittenTo = containerId;
+    // Review PL-2: Git older than 2.31 ignores GIT_CONFIG_COUNT and GIT_CONFIG_GLOBAL and reaches the credential helper of
+    // the container only through ~/.gitconfig, so it is prepared before the commands (the script writes only a missing or
+    // empty file, so also a started container gets it; a failure is logged, and the commands run all the same).
+    await this.runHomeGitConfigScript(ctx, containerId, remoteUser);
+    ctx.homeGitConfigWrittenTo = containerId;
     const commands = await this.deps.helper.runUserCommands({
       volumeName: env.volumeName,
       repository: env.repository,
       environmentId: env.id,
       containerId,
       ...inputs,
+      // Review PL-1: the commands can read the token; the helper removes it from their output and from its errors.
+      token: ctx.session.token,
       onOutput: this.output,
       signal: ctx.signal,
     });
@@ -3421,20 +3436,26 @@ export class EnvironmentService {
   }
 
   /**
-   * Concept section 9, in a new container before the first attach: the ~/.gitconfig of the remote user
+   * Concept section 9, in a new container before the first attach (review PL-2: runUserCommands runs the script before
+   * the lifecycle commands, runHomeGitConfigScript): the ~/.gitconfig of the remote user
    * (HOME_GIT_CONFIG_CONTENT: an include of the configuration of the volume, for Git older than 2.32 and for processes
    * without the variables of the container). Then the Git version of the container (checkGitVersion). A failure is
    * logged. Root may not write into the home folder of the user when the configuration takes rights away from the
    * container (for example `--cap-drop ALL`, concept section 9 "Host access"): then the user writes the file itself.
    */
   private async prepareHomeGitConfig(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    await this.runHomeGitConfigScript(ctx, container, user);
+    await this.checkGitVersion(ctx, container, user);
+  }
+
+  /** The ~/.gitconfig of prepareHomeGitConfig, without the check of the Git version. A failure is logged. */
+  private async runHomeGitConfigScript(ctx: PipelineContext, container: string, user: string): Promise<void> {
     let failure = await this.runHomeGitConfig(ctx, container, user, 'root');
     if (failure !== undefined && !isRootUser(user)) {
       this.logger.info(`The Git configuration of ${user} in the container could not be prepared as root: ${failure}. ${user} prepares it.`);
       failure = await this.runHomeGitConfig(ctx, container, user, user);
     }
     if (failure !== undefined) this.logger.warn(`The Git configuration of ${user} in the container could not be prepared: ${failure}`);
-    await this.checkGitVersion(ctx, container, user);
   }
 
   /** HOME_GIT_CONFIG_SCRIPT for `user`, run as `runAs`. The reason of a failure, or `undefined`. */
@@ -3511,7 +3532,15 @@ export class EnvironmentService {
       // that mounts only the workspace volume, not in the dev container, whose mounts may lie in the folder.
       await this.fixConfigOwnership(ctx, containerRef, remoteUser);
     }
-    if (outcome.created) await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
+    if (outcome.created) {
+      // Review PL-2: runUserCommands prepared ~/.gitconfig already, before the lifecycle commands; the Git version of the
+      // new container is checked here as before (once per new container).
+      if (ctx.homeGitConfigWrittenTo !== undefined && sameContainerId(ctx.homeGitConfigWrittenTo, containerRef)) {
+        await this.checkGitVersion(ctx, containerRef, remoteUser ?? 'root');
+      } else {
+        await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
+      }
+    }
     // Unit 15: the container runs now, so its tmpfs can take the token (at every open: a new sign-in gives a new token).
     // Lifecycle token (user decision 2026-09-27): after `up`, runUserCommands wrote it already, before the lifecycle commands.
     if (ctx.tokenWrittenTo === undefined || !sameContainerId(ctx.tokenWrittenTo, containerRef)) {
