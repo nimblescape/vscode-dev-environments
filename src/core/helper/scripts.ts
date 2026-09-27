@@ -713,10 +713,6 @@ if (process.exitCode === undefined) {
  *   path of the workspace helper (isHelperPath of hostAccess.ts, the same paths here), also after links), and the text
  *   of each such file once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH (readLimited);
  *   parseComposeModelOutput gives each service its text in `dockerfiles`;
- * - `dockerignoreFiles` and `dockerignoreTexts` (review round 20, P20-1): of each such service whose Dockerfile was
- *   read, the real path of `<Dockerfile>.dockerignore` when it is a file in the repository folder, also after links,
- *   and its text once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH;
- *   parseComposeModelOutput gives each service its text in `dockerignores`;
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
  *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
  *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
@@ -820,25 +816,6 @@ const readDockerfile = (file) => {
     return undefined;
   }
 };
-// Review round 20 (P20-1): the .dockerignore of a Dockerfile (<Dockerfile>.dockerignore next to it, which BuildKit
-// prefers to the one of the context), when it and its real path are in the repository folder and it is a file; each
-// once, by its real path (dockerignoreTexts), at most one character more than MAX_DOCKERFILE_LENGTH. Returns the real
-// path of the text, or undefined.
-const dockerignoreTexts = {};
-const readDockerignore = (dockerfile) => {
-  const file = dockerfile + '.dockerignore';
-  if (!inside(file)) return undefined;
-  const real = realPath(file);
-  if (real === null || !inside(real)) return undefined;
-  if (Object.prototype.hasOwnProperty.call(dockerignoreTexts, real)) return real;
-  try {
-    if (!fs.statSync(real).isFile()) return undefined;
-    dockerignoreTexts[real] = readLimited(real, ${MAX_DOCKERFILE_LENGTH});
-    return real;
-  } catch {
-    return undefined;
-  }
-};
 const main = () => {
   const version = compose(['version', '--short']);
   if (version.status !== 0) return failure(version, 'docker compose version');
@@ -871,7 +848,6 @@ const main = () => {
   const model = value === 'a$$b' ? unescape(printed) : printed;
   const dockerfiles = {};
   const dockerfileFiles = {};
-  const dockerignoreFiles = {};
   const realPaths = {};
   const missing = [];
   // Review round 9 (S9-1): a Set, so that many services cost linear time.
@@ -909,10 +885,6 @@ const main = () => {
         if (!missingSeen.has(file) && missingInRepository(file)) addMissing(file);
         const real = readDockerfile(file);
         if (real !== undefined) dockerfileFiles[name] = real;
-        // Review round 20 (P20-1): the pipeline writes the checked Dockerfile of the dev service to a file of its own,
-        // and this file next to it.
-        const ignore = real === undefined ? undefined : readDockerignore(file);
-        if (ignore !== undefined) dockerignoreFiles[name] = ignore;
       }
     }
     for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
@@ -957,8 +929,6 @@ const main = () => {
     dockerfiles,
     dockerfileFiles,
     dockerfileTexts,
-    dockerignoreFiles,
-    dockerignoreTexts,
     realPaths,
     missing,
     mountAncestors,

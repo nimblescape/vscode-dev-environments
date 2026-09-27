@@ -652,45 +652,6 @@ export class ContainerAdapter {
     return undefined;
   }
 
-  /**
-   * Review round 18 (P18-3): the architecture of the Docker Engine (`docker version --format '{{.Server.Arch}}'`, its
-   * GOARCH, for example `amd64` or `arm64`), on which the workspace helper runs; `undefined` when the engine does not tell
-   * it. Rejects only with an AbortError.
-   */
-  async engineArchitecture(signal?: AbortSignal): Promise<string | undefined> {
-    let result: RunResult;
-    try {
-      result = await this.run(['version', '--format', '{{.Server.Arch}}'], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      this.logger.warn(`The architecture of the Docker Engine could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
-    const arch = result.stdout.trim();
-    if (result.exitCode === 0 && /^[a-z0-9_]{1,32}$/.test(arch)) return arch;
-    this.logger.warn(`The architecture of the Docker Engine could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
-    return undefined;
-  }
-
-  /**
-   * Review round 19 (P19-1): the architecture of a local image (`docker image inspect --format '{{.Architecture}}'`, for
-   * example `amd64`); `undefined` when the image does not exist or does not tell it. Rejects only with an AbortError.
-   */
-  async imageArchitecture(reference: string, signal?: AbortSignal): Promise<string | undefined> {
-    let result: RunResult;
-    try {
-      result = await this.run(['image', 'inspect', '--format', '{{.Architecture}}', reference], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      this.logger.warn(`The architecture of the image ${reference} could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
-    const arch = result.stdout.trim();
-    if (result.exitCode === 0 && /^[a-z0-9_]{1,32}$/.test(arch)) return arch;
-    this.logger.warn(`The architecture of the image ${reference} could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
-    return undefined;
-  }
-
   /** All containers with the label devenv.environment-id, running or not. */
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));
@@ -1108,7 +1069,7 @@ export class ContainerAdapter {
   }
 
   /**
-   * `docker build -t <tag> -f <dockerfile> [--platform p] [--pull] [--no-cache] [--label k=v]… [--build-arg k=v]… <context>`.
+   * `docker build -t <tag> -f <dockerfile> [--pull] [--no-cache] [--label k=v]… [--build-arg k=v]… <context>`.
    * `pull`: pull the base images even if they exist locally; `noCache`: build every step again. Docker moves the tag
    * only when the build succeeds. Throws CommandError.
    */
@@ -1120,16 +1081,10 @@ export class ContainerAdapter {
     buildArgs?: Record<string, string>;
     pull?: boolean;
     noCache?: boolean;
-    /** Review round 19 (P19-1): `--platform` (the helper image: `linux/<architecture of the Docker Engine>`). */
-    platform?: string;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
-    const flags = [
-      ...(options.platform !== undefined ? ['--platform', options.platform] : []),
-      ...(options.pull ? ['--pull'] : []),
-      ...(options.noCache ? ['--no-cache'] : []),
-    ];
+    const flags = [...(options.pull ? ['--pull'] : []), ...(options.noCache ? ['--no-cache'] : [])];
     this.logger.info(`Building image ${options.tag}${flags.length > 0 ? ` (${flags.join(' ')})` : ''}.`);
     const onOutput = options.onOutput ?? ((text: string) => this.logger.output(text));
     const args = [

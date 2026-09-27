@@ -78,6 +78,14 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - If you save after such a change, the editor shows the current list of `settings.json` and asks: **Load settings.json** shows that list and drops your unsaved edits; **Save Mine** replaces that one value with your entries; **Cancel** changes nothing and keeps your edits. Entries are never merged one by one. If `settings.json` changes again while this question is open, it asks again. If the value in `settings.json` is not a list, Save asks the same way before it replaces it.
 - **Cancel**, or closing the tab, discards your changes; a Save that is still waiting then writes nothing.
 
+## Trust model
+
+A repository that you open is code that you run. Its build, its lifecycle commands, its Features, and the extensions in its container run with the rights of the container, have network access, and share the kernel of your computer. VS Code keeps channels to your computer open (see [Hardening your computer](#hardening-your-computer)).
+
+The checks of Dev Environments refuse the common and obvious grants of your computer: bind mounts of your files, the Docker socket, privileged mode, capabilities, devices, host namespaces, and ports on all addresses. They are a guard rail against mistakes and copied templates, not a sandbox. The user in the container is chosen by the repository's configuration (`remoteUser`, `containerUser`, or the image), often a user without root rights that can use `sudo`; Dev Environments does not change it.
+
+Open only repositories that you trust. For others, use a virtual machine or a separate user account with its own Docker.
+
 ## Known limits
 
 - The first open of a repository needs internet access: for the download of the repository and of the images.
@@ -88,6 +96,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - Values of `${localEnv:…}` variables of your computer are not passed to the environment. They are empty or have their default value; `HOME`, `PATH`, `HOSTNAME`, `NODE_VERSION`, and `YARN_VERSION` get the values of the workspace helper (for example, `HOME` is `/root`).
 - Git in the container older than version 2.32 reads the Git configuration of the environment only through `~/.gitconfig`, which the image must not bring with content of its own. Git older than version 2.9 may use the Git credentials of your computer; the extension warns about it.
 - The Dev Containers extension and VS Code keep some channels to your computer open, for example the SSH and GPG agent sockets, a socket of the Dev Containers extension that answers requests for the Git and Docker credentials of your computer, the opening of URLs, and the clipboard. Git in the environment does not use these sockets, but a program that looks for them can. For full isolation, use a separate user account on your computer or a virtual machine (see [Hardening your computer](#hardening-your-computer)).
+- Within one Docker, a repository can build from or copy out of the local images of other environments through Dockerfile forms that the Dev Container CLI reads differently from Docker. Until a separate builder for each account closes this, do not open repositories that you do not trust on a computer where other accounts' environments hold data that you need to protect.
 - Every container can reach the ports on localhost of your computer through `host.docker.internal`, also the ports that VS Code forwards for other environments. Ports on `127.0.0.1` are protected against your network, not against other containers.
 - Only data in the repository volume survives a rebuild, and also when an update of the extension sets the container up again (the progress says so). Data in other folders of the container, for example the home folder, is lost, unless the configuration stores it in an additional named volume (property `mounts`).
 - Each GitHub account has its own environment of a repository, with its own clone: two accounts that work on the same repository need the disk space for two clones. A configuration whose named volumes have a fixed name (or `${localWorkspaceFolderBasename}-…`) works for one account's environment only; use `${devcontainerId}` in the name to give each environment its own volume.

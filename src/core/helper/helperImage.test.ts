@@ -24,7 +24,6 @@ import {
   HELPER_UNUSED_LIMIT_MS,
   ensureHelperImage,
   helperImageTag,
-  helperPlatform,
   recordHelperImageUse,
   registryBaseDigest,
   type BaseDigestLookup,
@@ -100,20 +99,7 @@ class FakeDocker implements HelperImageDocker {
     this.builds.push(options);
     // Docker moves the tag only after a successful build.
     await this.buildHandler(options);
-    const id = this.addImage([options.tag], { helper: options.labels?.['devenv.helper'] === 'true' });
-    this.architectures.set(id, options.platform !== undefined ? options.platform.split('/')[1] : this.defaultArchitecture);
-  }
-
-  /** Review round 19 (P19-1): the architecture of each image by ID; a build without `--platform` gets defaultArchitecture. */
-  readonly architectures = new Map<string, string>();
-  /** The default platform of `docker build` (as with DOCKER_DEFAULT_PLATFORM). */
-  defaultArchitecture = 'amd64';
-  readonly architectureQueries: string[] = [];
-
-  async imageArchitecture(reference: string): Promise<string | undefined> {
-    this.architectureQueries.push(reference);
-    const id = this.idOf(reference);
-    return id === undefined ? undefined : this.architectures.get(id);
+    this.addImage([options.tag], { helper: options.labels?.['devenv.helper'] === 'true' });
   }
 
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {
@@ -252,70 +238,6 @@ describe('ensureHelperImage', () => {
     expect(content).not.toMatch(/^\s*RUN\s+--mount/m);
     const docker = new FakeDocker();
     expect(await ensureHelperImage(docker, file)).toBe(helperImageTag(content));
-  });
-});
-
-describe('review round 19 (P19-1): the helper image of the architecture of the Docker Engine', () => {
-  const CONTENT = 'FROM node:22-bookworm-slim\n';
-
-  it('names the platform in the tag, and only then', () => {
-    expect(helperImageTag(CONTENT, '0.89.0', 'linux/arm64')).not.toBe(helperImageTag(CONTENT, '0.89.0'));
-    expect(helperImageTag(CONTENT, '0.89.0', 'linux/arm64')).not.toBe(helperImageTag(CONTENT, '0.89.0', 'linux/amd64'));
-    expect(helperImageTag(CONTENT, '0.89.0', undefined)).toBe(helperImageTag(CONTENT, '0.89.0'));
-    expect(helperPlatform('arm64')).toBe('linux/arm64');
-    expect(helperPlatform(undefined)).toBeUndefined();
-  });
-
-  for (const statePath of [false, true]) {
-    const state = (): { statePath?: string } => {
-      if (!statePath) return {};
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
-      tempDirs.push(dir);
-      return { statePath: path.join(dir, 'helper.json') };
-    };
-
-    it(`builds for the platform, and does not reuse an image of another platform (${statePath ? 'with' : 'without'} a state file)`, async () => {
-      const file = dockerfile(CONTENT);
-      const docker = new FakeDocker();
-      // An arm64 engine with DOCKER_DEFAULT_PLATFORM=linux/amd64: the image of before (no platform in the tag) is amd64.
-      const old = docker.addImage([helperImageTag(CONTENT)]);
-      docker.architectures.set(old, 'amd64');
-      const tag = await ensureHelperImage(docker, file, { platform: 'linux/arm64', ...state() });
-      expect(tag).toBe(helperImageTag(CONTENT, DEVCONTAINER_CLI_VERSION, 'linux/arm64'));
-      expect(docker.builds).toHaveLength(1);
-      expect(docker.builds[0]).toMatchObject({ tag, platform: 'linux/arm64' });
-      expect(docker.architectureQueries).toEqual([tag]);
-      // The normal case: the image exists and is of the platform.
-      expect(await ensureHelperImage(docker, file, { platform: 'linux/arm64', ...state() })).toBe(tag);
-      expect(docker.builds).toHaveLength(1);
-    });
-
-    it(`refuses an image of another architecture under the tag of the platform (${statePath ? 'with' : 'without'} a state file)`, async () => {
-      const file = dockerfile(CONTENT);
-      const docker = new FakeDocker();
-      const tag = helperImageTag(CONTENT, DEVCONTAINER_CLI_VERSION, 'linux/arm64');
-      docker.architectures.set(docker.addImage([tag]), 'amd64');
-      await expect(ensureHelperImage(docker, file, { platform: 'linux/arm64', ...state() })).rejects.toThrow(
-        `The workspace helper image ${tag} is for the architecture amd64, not for arm64, the architecture of the Docker Engine.`,
-      );
-      // A build that does not follow --platform, and an image whose architecture cannot be read.
-      const other = new FakeDocker();
-      other.buildHandler = async (options) => {
-        delete options.platform;
-      };
-      await expect(ensureHelperImage(other, file, { platform: 'linux/arm64', ...state() })).rejects.toThrow('is for the architecture amd64, not for arm64');
-      const unknown = new FakeDocker();
-      unknown.addImage([tag]);
-      await expect(ensureHelperImage(unknown, file, { platform: 'linux/arm64', ...state() })).rejects.toThrow('is for the architecture (unknown), not for arm64');
-    });
-  }
-
-  it('without the architecture of the engine: no platform, no check (as before)', async () => {
-    const file = dockerfile(CONTENT);
-    const docker = new FakeDocker();
-    expect(await ensureHelperImage(docker, file)).toBe(helperImageTag(CONTENT));
-    expect(docker.builds[0].platform).toBeUndefined();
-    expect(docker.architectureQueries).toEqual([]);
   });
 });
 

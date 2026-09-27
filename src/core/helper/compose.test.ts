@@ -8,7 +8,6 @@ import { CONTAINER_VERSION, composeProjectName, environmentImageRepository } fro
 import {
   COMPOSE_BUILD_CONTEXT,
   COMPOSE_DEV_DOCKERFILE,
-  COMPOSE_DEV_DOCKERIGNORE,
   COMPOSE_MODEL_PATH,
   WORKSPACE_VOLUME_KEY,
   builtServiceImages,
@@ -1041,7 +1040,6 @@ describe('review round 20 (P20-1): the Dockerfile of a local build of the dev se
       expect(built.devDockerfile, String(dollarEscaped)).toBe(TEXT);
       // The context stays (escaped once, as every text); the Dockerfile is ours.
       expect(built.model.services.app.build, String(dollarEscaped)).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' } });
-      expect(built).not.toHaveProperty('devDockerignore');
     }
   });
 
@@ -1051,46 +1049,9 @@ describe('review round 20 (P20-1): the Dockerfile of a local build of the dev se
     expect(built.model.services.app.build).toEqual({ context: `${REPO}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
   });
 
-  it('copies the .dockerignore of the Dockerfile next to the written Dockerfile', () => {
-    const built = composeBuildModel(templateModel(), params({ dockerfiles: { app: TEXT }, dockerignores: { app: 'node_modules\n', db: 'x\n' } }));
-    expect(built.devDockerignore).toBe('node_modules\n');
-    expect(COMPOSE_DEV_DOCKERIGNORE).toBe(`${COMPOSE_DEV_DOCKERFILE}.dockerignore`);
-    // A dockerfile_inline has none (Compose reads the .dockerignore of the context).
-    const inline = fileBuild({ context: REPO, dockerfile_inline: TEXT });
-    expect(composeBuildModel(inline, params({ dockerfiles: { app: TEXT }, dockerignores: { app: 'x\n' } }))).not.toHaveProperty('devDockerignore');
-  });
-
   it('throws for a local build of the dev service whose Dockerfile the model run did not read (fail closed)', () => {
     expect(() => composeBuildModel(templateModel(), params({ dockerfiles: { db: TEXT } }))).toThrow(/service app: build/);
     expect(() => composeBuildModel(templateModel(), params({ dockerfiles: undefined }))).toThrow(/service app: build/);
-  });
-});
-
-describe('review round 20 (P20-1): the .dockerignore files of the model run', () => {
-  const base = { version: '2.40.3', dollarEscaped: true, model: { services: {} }, dockerfiles: {}, realPaths: {} };
-
-  it('gives each service its text, and refuses an output whose names and texts do not match', () => {
-    const line = JSON.stringify({ ...base, dockerignoreFiles: { app: '/r/i', web: '/r/i' }, dockerignoreTexts: { '/r/i': 'dist\n' } });
-    expect(parseComposeModelOutput(line)).toMatchObject({ dockerignores: { app: 'dist\n', web: 'dist\n' } });
-    expect(parseComposeModelOutput(JSON.stringify(base))).not.toHaveProperty('dockerignores');
-    for (const bad of [
-      { dockerignoreFiles: { app: '/r/j' }, dockerignoreTexts: { '/r/i': 'x' } },
-      { dockerignoreFiles: { app: '/r/i' }, dockerignoreTexts: { '/r/i': 3 } },
-      { dockerignoreFiles: { app: '/r/i' } },
-      { dockerignoreFiles: [], dockerignoreTexts: {} },
-    ]) {
-      expect(() => parseComposeModelOutput(JSON.stringify({ ...base, ...bad })), JSON.stringify(bad)).toThrow('invalid Compose model');
-    }
-  });
-
-  it('counts them with the Dockerfiles for the limit of the extension host', () => {
-    const text = 'x'.repeat(20 * 1024 * 1024);
-    expect(composeModelLimit({ services: {} }, { a: text }, { a: text })).toBe(`more than ${32 * 1024 * 1024} characters of Dockerfiles and .dockerignore files of the services`);
-    expect(composeModelLimit({ services: {} }, { a: text }, { a: 'dist\n' })).toBeUndefined();
-  });
-
-  it('composeBuildModel refuses a .dockerignore of the dev service that is too large', () => {
-    expect(() => composeBuildModel(templateModel(), params({ dockerignores: { app: 'x'.repeat(1024 * 1024 + 1) } }))).toThrow(/too large/);
   });
 });
 

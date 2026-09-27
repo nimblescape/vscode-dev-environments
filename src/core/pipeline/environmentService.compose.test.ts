@@ -10,7 +10,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import {
   COMPOSE_DEV_DOCKERFILE,
-  COMPOSE_DEV_DOCKERIGNORE,
   COMPOSE_MODEL_PATH,
   WORKSPACE_VOLUME_KEY,
   composeConfigHash,
@@ -586,9 +585,9 @@ describe('existing Docker Compose environment', () => {
     await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST } } });
     h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
     await h.service.openEnvironment(ENV_ID, options());
-    // review round 16, Dp: the image of the dev service is not here, so it is downloaded before the build, whose user
-    // (with Features) the Dev Container CLI writes into its compose file for the build (checkComposeBuildImages).
-    expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([`pull ${DB_IMAGE}`, `pull ${BASE_IMAGE}`]);
+    // slim-down: the image of the dev service is no longer downloaded before the build for the removed check of the user
+    // that the Dev Container CLI writes into its compose file (checkComposeBuildImages); only the changed image is pulled.
+    expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([`pull ${DB_IMAGE}`]);
     expect(h.helper.calls.filter((call) => call.startsWith('build') || call.startsWith('up'))).toEqual([
       `build ${IMAGE_2}`,
       `up ${IMAGE_2} --remove-existing-container`,
@@ -2720,40 +2719,7 @@ describe('review round 15 of unit 6 (K3, K4): the ownership fixes after up', () 
   });
 });
 
-describe('review round 16 of unit 6 (Dp): the user that the Dev Container CLI writes into its compose file for the build', () => {
-  const USER = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
-
-  it('refuses an image of the dev service whose user has a line break, before the build, also with the checks off', async () => {
-    for (const off of [false, true]) {
-      h.cleanup();
-      h = createHarness({ newEnvironmentId: () => ENV_ID });
-      useCompose(h);
-      if (off) h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
-      h.docker.imageConfigs.set(BASE_IMAGE, { User: USER });
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.code).toBe('hostAccess');
-      // review round 17, P17-3: the item is truncated to MAX_ITEM_LENGTH characters (its start and its end stay).
-      expect(error.message).toContain(`service app: the user ${JSON.stringify(USER).slice(0, 40)}`);
-      expect(error.message).toContain('a line break is not supported)');
-      expect(h.helper.builds).toEqual([]);
-      expect(h.helper.ups).toEqual([]);
-    }
-  });
-
-  it('checks the image after its download, and builds with a plain user', async () => {
-    h.docker.imageConfigs.set(BASE_IMAGE, { User: 'vscode' });
-    await h.service.open(TARGET, options());
-    expect(h.docker.log.indexOf(`pull ${BASE_IMAGE}`)).toBeGreaterThanOrEqual(0);
-    expect(h.helper.builds).toHaveLength(1);
-  });
-
-  it('does not inspect the images without Features (the CLI writes no user then)', async () => {
-    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
-    h.docker.imageConfigs.set(BASE_IMAGE, { User: USER });
-    await h.service.open(TARGET, options());
-    expect(h.helper.builds).toHaveLength(1);
-  });
-
+describe('review round 16 of unit 6 (Dp): the stage that the Dev Container CLI writes into its compose file for the build', () => {
   it('refuses a build target of the dev service with a line break before any build', async () => {
     useCompose(
       h,
@@ -2909,35 +2875,6 @@ describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev 
     }
   });
 
-  it('P17-2: with Features, refuses before the build a user that the USER line resolves to a line break, from an argument or the environment of the image', async () => {
-    useDevBuild(`FROM ${DEV_IMAGE}\nARG USERNAME=vscode\nUSER $USERNAME\n`, { args: { USERNAME: INJECTION } });
-    let error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('hostAccess');
-    expect(error.message).toContain('service app: the user "root\\n');
-    expect(error.message).toContain('kerfile (a line break;');
-    expect(h.helper.builds).toEqual([]);
-
-    h.cleanup();
-    h = createHarness({ newEnvironmentId: () => ENV_ID });
-    useDevBuild(`FROM ${DEV_IMAGE}\nENV U=\${EVIL}\nUSER \${U}\n`);
-    h.docker.images.add(DEV_IMAGE);
-    h.docker.imageConfigs.set(DEV_IMAGE, { User: 'vscode', Env: [`EVIL=${INJECTION}`] });
-    error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('hostAccess');
-    expect(error.message).toContain('service app: the user "root\\n');
-    expect(error.message).toContain('kerfile (a line break;');
-    expect(h.helper.builds).toEqual([]);
-
-    // The same variable of the image, not used by the USER line: the build goes on.
-    h.cleanup();
-    h = createHarness({ newEnvironmentId: () => ENV_ID });
-    useDevBuild(`FROM ${DEV_IMAGE}\nUSER vscode\n`);
-    h.docker.images.add(DEV_IMAGE);
-    h.docker.imageConfigs.set(DEV_IMAGE, { User: 'vscode', Env: [`EVIL=${INJECTION}`] });
-    await h.service.open(TARGET, options());
-    expect(h.helper.builds).toHaveLength(1);
-  });
-
   it('P17-3: a refusal of hundreds of services lists at most MAX_LISTED_ITEMS items of at most MAX_ITEM_LENGTH characters', async () => {
     useCompose(
       h,
@@ -2957,110 +2894,6 @@ describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev 
     expect(report.unsupported.at(-1)).toMatch(/^and \d+ more$/);
     expect(items.length).toBeLessThanOrEqual(2 * (MAX_LISTED_ITEMS + 1));
     expect(error.message.length).toBeLessThan(20_000);
-  });
-});
-
-describe('review round 18 of unit 6 (P18-1, P18-3, S18-2): the base image that the Dev Container CLI reads, with the platform of the helper', () => {
-  const TOOLCHAIN = 'ghcr.io/acme/toolchain:2';
-  const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
-  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS base\n';
-
-  /** The dev service builds `dockerfile` with `build` from .devcontainer; `features`: devcontainer.json has a Feature. */
-  function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}, features = true): void {
-    useCompose(
-      h,
-      output((m) => {
-        m.services.app = { build: { context: `${FOLDER}/.devcontainer`, dockerfile: 'Dockerfile', ...build }, command: ['sleep', 'infinity'] };
-      }),
-    );
-    const out = h.helper.composeOutput as ComposeModelOutput;
-    h.helper.composeOutput = {
-      ...out,
-      dockerfiles: { app: dockerfile },
-      realPaths: { ...out.realPaths, [`${FOLDER}/.devcontainer`]: `${FOLDER}/.devcontainer`, [`${FOLDER}/.devcontainer/Dockerfile`]: `${FOLDER}/.devcontainer/Dockerfile` },
-    };
-    if (!features) h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
-  }
-
-  function fresh(): void {
-    h.cleanup();
-    h = createHarness({ newEnvironmentId: () => ENV_ID });
-  }
-
-  it('P18-3: builds a per-architecture base image with Features, and downloads the image of the architecture of the Docker Engine', async () => {
-    for (const [engine, arch] of [['amd64', 'amd64'], ['arm64', 'arm64'], ['386', 'ia32']]) {
-      fresh();
-      h.docker.arch = engine;
-      useDevBuild(`ARG TARGETARCH\nFROM ${TOOLCHAIN}-\${TARGETARCH}\nUSER vscode\n`);
-      await h.service.open(TARGET, options());
-      expect(h.docker.log, engine).toContain(`pull ${TOOLCHAIN}-${arch}`);
-      expect(h.helper.builds, engine).toHaveLength(1);
-    }
-  });
-
-  it('S18-2: follows the stage chain of the architecture of the Docker Engine, and refuses the user that the CLI writes there', async () => {
-    const dockerfile = `FROM alpine:3.22 AS s-amd64\nARG EVIL\nUSER $EVIL\nFROM alpine:3.22 AS s-arm64\nUSER vscode\nFROM s-\${TARGETARCH}\n`;
-    useDevBuild(dockerfile, { args: { EVIL: INJECTION } });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('hostAccess');
-    expect(error.message).toContain('service app: the user "root\\n');
-    expect(h.helper.builds).toEqual([]);
-    fresh();
-    h.docker.arch = 'arm64';
-    useDevBuild(dockerfile, { args: { EVIL: INJECTION } });
-    await h.service.open(TARGET, options());
-    expect(h.helper.builds).toHaveLength(1);
-  });
-
-  it('P18-1: refuses an image ID that only the CLI reads, with and without Features, before read-configuration inspects it and before any build', async () => {
-    // Docker builds FROM base; the CLI's reader sees the FROM lines in the continuations, and follows the stage of the
-    // architecture to the image `cafe1234`, which Docker resolves by the ID of a local image.
-    const dockerfile = `${BASE}RUN echo \\\nFROM cafe1234 AS s-amd64\nFROM base\nRUN echo \\\nFROM s-\${TARGETARCH}\n`;
-    for (const features of [true, false]) {
-      fresh();
-      useDevBuild(dockerfile, {}, features);
-      // `cafe1234` is no name of a local image: Docker takes it for the prefix of the ID of devenv-7c1d2e3f:2.
-      h.docker.images.add('cafe1234');
-      h.docker.imageRepoNames.set('cafe1234', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.code, String(features)).toBe('hostAccess');
-      expect(error.message).toContain('service app: base image of the Dev Container CLI cafe1234 (an image ID; name the image)');
-      expect(h.helper.readConfigurations.filter((read) => read.merged !== false)).toEqual([]);
-      expect(h.docker.log.filter((line) => line.includes('cafe1234'))).toEqual([]);
-      expect(h.helper.builds).toEqual([]);
-    }
-  });
-
-  it('P18-1: refuses the image of another environment that only the CLI reads, with and without Features', async () => {
-    for (const features of [true, false]) {
-      fresh();
-      useDevBuild(`${BASE}RUN <<EOF\nFROM devenv-0badc0de:3 AS x\nEOF\n`, {}, features);
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.message, String(features)).toContain('service app: base image of the Dev Container CLI devenv-0badc0de:3 of another environment');
-      expect(h.helper.builds).toEqual([]);
-    }
-  });
-
-  it('P18-3: refuses a Dockerfile build when the architecture of the Docker Engine is not known, and does not ask for an image', async () => {
-    fresh();
-    h.docker.arch = 'riscv64';
-    useDevBuild(`FROM ${TOOLCHAIN}\n`);
-    let error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toContain('the architecture riscv64 of the Docker Engine');
-    expect(h.helper.builds).toEqual([]);
-    fresh();
-    h.docker.arch = undefined;
-    useDevBuild(`FROM ${TOOLCHAIN}\n`);
-    error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toContain(dockerCheckItem('the architecture of the Docker Engine could not be read'));
-    expect(h.helper.builds).toEqual([]);
-    // A dev service with an image: no Dockerfile for the CLI to read.
-    fresh();
-    useCompose(h);
-    h.docker.arch = undefined;
-    await h.service.open(TARGET, options());
-    expect(h.docker.archQueries).toBe(0);
-    expect(h.helper.builds).toHaveLength(1);
   });
 });
 
@@ -3163,7 +2996,7 @@ describe('review round 19 of unit 6 (S19-1): the configuration hash of an enviro
   });
 });
 
-describe('review round 20 of unit 6 (P20-1, S20-1): the Dockerfile and the build arguments of the dev service as the Dev Container CLI reads them', () => {
+describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev service', () => {
   const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS base\n';
 
   /** The dev service builds `dockerfile` (a file of the repository whose name has a $) with `build`. */
@@ -3183,66 +3016,19 @@ describe('review round 20 of unit 6 (P20-1, S20-1): the Dockerfile and the build
     };
   }
 
-  function fresh(): void {
-    h.cleanup();
-    h = createHarness({ newEnvironmentId: () => ENV_ID });
-  }
-
-  it('P20-1: read-configuration and build get the checked Dockerfile text at COMPOSE_DEV_DOCKERFILE, and its .dockerignore next to it', async () => {
+  it('P20-1: read-configuration and build get the checked Dockerfile text at COMPOSE_DEV_DOCKERFILE', async () => {
+    // slim-down: the copy of the <Dockerfile>.dockerignore is removed (it never took effect).
     const dockerfile = `${BASE}RUN echo $HOME\n`;
-    useDevBuild(dockerfile, {}, { dockerignores: { app: 'node_modules\n' } });
+    useDevBuild(dockerfile);
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
     const reads = h.helper.readConfigurations.filter((read) => read.files !== undefined);
     expect(reads.length).toBeGreaterThan(0);
     for (const files of [h.helper.builds[0].files, ...reads.map((read) => read.files)]) {
       expect(files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
-      expect(files?.[COMPOSE_DEV_DOCKERIGNORE]).toBe('node_modules\n');
+      expect(Object.keys(files ?? {}).filter((file) => file.endsWith('.dockerignore'))).toEqual([]);
       const written = JSON.parse(files?.[COMPOSE_MODEL_PATH] ?? 'null') as ComposeModel;
       expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
     }
-    // Without a .dockerignore of the Dockerfile, none is written (the one of the context applies).
-    fresh();
-    useDevBuild(dockerfile);
-    await h.service.open(TARGET, options());
-    expect(h.helper.builds[0].files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
-    expect(h.helper.builds[0].files).not.toHaveProperty(COMPOSE_DEV_DOCKERIGNORE);
-  });
-
-  it('P20-1: refuses a .dockerignore of the dev service that is too large, before any build', async () => {
-    useDevBuild(`${BASE}`, {}, { dockerignores: { app: 'x'.repeat(1024 * 1024 + 1) } });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('hostAccess');
-    expect(h.logger.warnings.some((line) => line.includes('is too large to check: a .dockerignore of the Dockerfile of the dev service'))).toBe(true);
-    expect(h.helper.builds).toEqual([]);
-  });
-
-  it('S20-1: refuses the image of another environment that only the CLI reads, through an argument that an escaping Compose prints with $$', async () => {
-    const dockerfile = `ARG B\n${BASE}RUN <<EOF\nFROM \${B:+devenv-0badc0de:3} AS y\nEOF\n`;
-    for (const features of [true, false]) {
-      fresh();
-      useDevBuild(dockerfile, { args: { B: '$X' } });
-      if (!features) h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.message, String(features)).toContain('service app: base image of the Dev Container CLI devenv-0badc0de:3 of another environment');
-      expect(h.helper.builds).toEqual([]);
-    }
-  });
-
-  it('S20-1: the runtime check inspects the image that the CLI reads through such an argument, and only with an escaping Compose', async () => {
-    const OTHER = 'ghcr.io/acme/other:1';
-    const dockerfile = `ARG B\n${BASE}RUN <<EOF\nFROM \${B:+${OTHER}} AS y\nEOF\n`;
-    useDevBuild(dockerfile, { args: { B: '$X' } });
-    h.checker.outcome = checked({ [OTHER]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST, 'mcr.microsoft.com/devcontainers/base:bookworm': DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
-    await h.service.open(TARGET, options());
-    expect(h.docker.log).toContain(`pull ${OTHER}`);
-    fresh();
-    useDevBuild(dockerfile, { args: { B: '$X' } }, { dollarEscaped: false });
-    h.checker.outcome = checked({ [OTHER]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST, 'mcr.microsoft.com/devcontainers/base:bookworm': DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
-    // The CLI reads `$X` unescaped: a variable that is not resolved, refused as before (review round 17).
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toContain('its variables could not be resolved');
-    expect(h.docker.log).not.toContain(`pull ${OTHER}`);
-    expect(h.helper.builds).toEqual([]);
   });
 });

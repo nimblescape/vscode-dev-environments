@@ -4,15 +4,13 @@
 
 // Review round 16 (Dp): the Dev Container CLI 0.89.0 writes a compose file for the build of the dev service (function
 // `Dp`), with the build arguments of its Dockerfile of Features as text: `- _DEV_CONTAINERS_BASE_IMAGE=<stage>` (the
-// target of the build, or the name of the last stage of the Dockerfile) and, with Features,
-// `- _DEV_CONTAINERS_IMAGE_USER=<user>` (the USER of the target stage, or the user of its image). A line break there adds
-// keys to the build (for example `ssh` or `secrets` with a file of the workspace helper) or to the dev service.
+// target of the build, or the name of the last stage of the Dockerfile). A line break there adds keys to the build (for
+// example `ssh` or `secrets` with a file of the workspace helper) or to the dev service.
 import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import { composeAccessReport, composeBuildImageItems, composeBuildUserItems, composeDevBuildImages, type ComposeAccessInput } from './composeAccess';
-import { cliPlatformVariables } from './cliDockerfile';
+import { composeAccessReport, type ComposeAccessInput } from './composeAccess';
 import type { HostAccessReport } from './hostAccess';
 
 const PROJECT = 'devenv-3f2a9c1e';
@@ -75,48 +73,6 @@ describe('review round 16 (Dp): the build of the dev service as the Dev Containe
     expect(report({}, 'FROM alpine\n')).toEqual(NONE);
   });
 
-  it('refuses a build argument with a line break when a USER instruction uses a variable', () => {
-    const dockerfile = 'FROM alpine\nARG U=vscode\nUSER ${U}\n';
-    const args = { U: 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token' };
-    // review round 17, P17-2: the user that the CLI computes is named (with Features, the default of the input).
-    expect(report({ args }, dockerfile, false).unsupported).toEqual([
-      `service app: the user ${JSON.stringify(args.U)} of the USER instruction of the Dockerfile (a line break; the Dev Container CLI writes it into its compose file for the build as it is)`,
-    ]);
-    // Without a variable in USER, the arguments do not reach the text (a CA certificate, for example).
-    expect(report({ args }, 'FROM alpine\nARG U\nUSER vscode\n')).toEqual(NONE);
-    expect(report({ args: { U: 'vscode' } }, dockerfile)).toEqual(NONE);
-  });
-
-  it('names the image of the dev service whose user the CLI may write', () => {
-    const build = (dockerfile: string, args: Record<string, string> = {}, target?: string) =>
-      composeDevBuildImages(model({ args, ...(target !== undefined ? { target } : {}) }), { app: dockerfile }, 'app');
-    // review round 17, P17-1: only the root of the chain of the target (or last) stage, as the CLI's uG; no userVariables.
-    expect(build('FROM node:22 AS base\nFROM base\nUSER node\n')).toEqual({ images: ['node:22'], unresolved: [] });
-    expect(build('ARG V=22\nFROM node:${V}\nFROM scratch\nUSER $U\n')).toEqual({ images: [], unresolved: [] });
-    expect(build('ARG V=22\nFROM node:${V} AS a\nFROM scratch\nUSER $U\n', {}, 'a')).toEqual({ images: ['node:22'], unresolved: [] });
-    // An unset variable is empty, as for the CLI; a form that the CLI reads otherwise than Docker is not a valid reference.
-    expect(build('FROM node:${NOPE}\n')).toEqual({ images: [], unresolved: ['node:'] });
-    expect(build('FROM node:${A:?x}\n').unresolved).toEqual(['node::?x}']);
-    // Image only: the build model builds `FROM <image>`.
-    expect(composeDevBuildImages({ services: { app: { image: ' alpine:3.22 ' } } }, {}, 'app')).toEqual({ images: ['alpine:3.22'], unresolved: [] });
-  });
-
-  it('refuses the user of an image with a line break, and the user that the CLI computes with its environment', () => {
-    const user = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
-    // review round 17, P17-2: composeBuildImageItems checks the user of the image; the environment counts through
-    // composeBuildUserItems, only as far as the USER instruction uses it.
-    expect(composeBuildImageItems('evil:1', { User: user, Env: ['PATH=/bin'] })).toEqual([
-      `the user ${JSON.stringify(user)} of the image evil:1 (the Dev Container CLI writes it into its compose file for the build as it is: a line break is not supported)`,
-    ]);
-    expect(composeBuildImageItems('evil:1', { User: 'vscode', Env: ['U=a\u2028b', 'PATH=/bin'] })).toEqual([]);
-    const withUser = model({});
-    expect(composeBuildUserItems(withUser, { app: 'FROM evil:1\nUSER $U\n' }, 'app', { User: 'vscode', Env: ['U=a\u2028b', 'PATH=/bin'] })).toEqual([
-      'the user "a\u2028b" of the USER instruction of the Dockerfile (a line break; the Dev Container CLI writes it into its compose file for the build as it is)',
-    ]);
-    expect(composeBuildUserItems(withUser, { app: 'FROM evil:1\nUSER vscode\n' }, 'app', { Env: ['U=a\nb'] })).toEqual([]);
-    for (const plain of ['', 'root', '1000:1000', 'vscode']) expect(composeBuildImageItems('ok:1', { User: plain }), plain).toEqual([]);
-    expect(composeBuildImageItems('ok:1', null)).toEqual([]);
-  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -177,8 +133,8 @@ describe('guard (review round 16, Dp): the compose file of the vendored CLI for 
       const allowed = report({ target: stage }).unsupported.length === 0;
       if (!allowed) continue;
       for (const user of texts) {
-        // composeBuildImageItems: the user of an image without a line break (the USER of a Dockerfile has none either).
-        if (composeBuildImageItems('x', { User: user }).length > 0) continue;
+        // slim-down: the user is no longer checked (the check of the user that the CLI computes is removed); the texts
+        // here have no line break, as before.
         const parsed = yaml.load(buildOverride(stage, user)) as { services: { app: Record<string, Record<string, unknown>> } };
         expect(Object.keys(parsed)).toEqual(['services']);
         expect(Object.keys(parsed.services)).toEqual(['app']);
@@ -195,12 +151,12 @@ describe('guard (review round 16, Dp): the compose file of the vendored CLI for 
   });
 });
 
-describe('review round 17 (P17-1, P17-2): the image and the user of the build of the dev service as the CLI computes them', () => {
+describe('review round 17 (P17-2): multi-line build arguments, and the stage name', () => {
   const CA_CERT = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
   const USER_DOCKERFILE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm\nARG USERNAME=vscode\nARG EXTRA_CA_CERT\nRUN echo "$EXTRA_CA_CERT" > /x.crt\nUSER $USERNAME\n';
   const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
 
-  function reportWith(build: Record<string, unknown>, dockerfile: string, features: boolean, checksOn = true): HostAccessReport {
+  function reportWith(build: Record<string, unknown>, dockerfile: string, checksOn = true): HostAccessReport {
     const input: ComposeAccessInput = {
       model: model(build),
       devService: 'app',
@@ -209,68 +165,20 @@ describe('review round 17 (P17-1, P17-2): the image and the user of the build of
       ownVolume: 'devenv-acme-api-3f2a9c1e',
       engineApiVersion: '1.47',
       dockerfiles: { app: dockerfile },
-      features,
     };
     return composeAccessReport(input, checksOn);
   }
 
-  it('P17-1: only the root image of the chain of the target stage, not the images of later stages', () => {
-    const dockerfile = 'ARG VARIANT=3.12\nFROM mcr.microsoft.com/devcontainers/python:${VARIANT} AS dev\nFROM gcr.io/private/prod:1 AS prod\nFROM registry.example/app:${TAG} AS release\n';
-    expect(composeDevBuildImages(model({ target: 'dev' }), { app: dockerfile }, 'app')).toEqual({ images: ['mcr.microsoft.com/devcontainers/python:3.12'], unresolved: [] });
-    // Through stages that build on each other, to the external image at the root.
-    const chain = 'FROM node:22 AS base\nFROM base AS dev\nUSER node\nFROM gcr.io/private/prod:1 AS prod\n';
-    expect(composeDevBuildImages(model({ target: 'dev' }), { app: chain }, 'app')).toEqual({ images: ['node:22'], unresolved: [] });
-    // Without a target: the chain of the last stage.
-    expect(composeDevBuildImages(model({}), { app: dockerfile }, 'app')).toEqual({ images: [], unresolved: ['registry.example/app:'] });
-    expect(composeDevBuildImages(model({}), { app: chain }, 'app')).toEqual({ images: ['gcr.io/private/prod:1'], unresolved: [] });
-    // A platform variable in the root image: its value is not known here.
-    // review round 18, S18-2: changed expectation, the OS is the CLI's constant `linux`; the architecture is not known
-    // before the runtime check, which passes the exact values.
-    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETOS}\n' }, 'app')).toEqual({ images: ['golang:1.22-linux'], unresolved: [] });
-    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETARCH}\n' }, 'app').unresolved).toEqual(['golang:1.22-${TARGETARCH}']);
-    expect(composeDevBuildImages(model({}), { app: 'FROM golang:1.22-${TARGETARCH}\n' }, 'app', cliPlatformVariables('arm64'))).toEqual({ images: ['golang:1.22-arm64'], unresolved: [] });
+  it('P17-2: a multi-line build argument is allowed, also when USER uses a variable', () => {
+    expect(reportWith({ args: { USERNAME: 'vscode', EXTRA_CA_CERT: CA_CERT } }, USER_DOCKERFILE)).toEqual(NONE);
+    expect(reportWith({ args: { USERNAME: INJECTION } }, USER_DOCKERFILE)).toEqual(NONE);
   });
 
-  it('P17-2: a multi-line build argument is allowed without Features, also when USER uses a variable', () => {
-    expect(reportWith({ args: { USERNAME: 'vscode', EXTRA_CA_CERT: CA_CERT } }, USER_DOCKERFILE, false)).toEqual(NONE);
-    expect(reportWith({ args: { USERNAME: INJECTION } }, USER_DOCKERFILE, false)).toEqual(NONE);
-  });
-
-  it('P17-2: with Features, a multi-line build argument that the USER line does not use is allowed', () => {
-    expect(reportWith({ args: { USERNAME: 'vscode', EXTRA_CA_CERT: CA_CERT } }, USER_DOCKERFILE, true)).toEqual(NONE);
-    expect(reportWith({ args: { EXTRA_CA_CERT: CA_CERT } }, 'FROM alpine\nARG EXTRA_CA_CERT\nENV C=$EXTRA_CA_CERT\nUSER vscode\n', true)).toEqual(NONE);
-  });
-
-  it('P17-2: with Features, a line break that reaches the USER line is refused, directly or through ARG and ENV, whatever the switch says', () => {
-    const item = (user: string) =>
-      `service app: the user ${JSON.stringify(user)} of the USER instruction of the Dockerfile (a line break; the Dev Container CLI writes it into its compose file for the build as it is)`;
-    for (const checksOn of [true, false]) {
-      expect(reportWith({ args: { USERNAME: INJECTION, EXTRA_CA_CERT: CA_CERT } }, USER_DOCKERFILE, true, checksOn).unsupported).toEqual([item(INJECTION)]);
-    }
-    const chain = 'ARG BASE=alpine\nFROM ${BASE} AS base\nARG X\nENV U=${X}-user\nFROM base AS dev\nUSER ${U}\n';
-    expect(reportWith({ args: { X: 'a b' } }, chain, true).unsupported).toEqual([item('a b-user')]);
-    expect(reportWith({ args: { X: 'a b' } }, chain, false)).toEqual(NONE);
-    // A default of the expansion is a word of the Dockerfile, which has no line break.
-    expect(reportWith({ args: { X: 'a\nb' } }, 'FROM alpine\nARG X\nUSER ${X:+vscode}\n', true)).toEqual(NONE);
-  });
-
-  it('P17-2: the stage name and U+0085 stay refused without Features', () => {
-    expect(reportWith({ target: TARGET_VECTOR }, DOCKERFILE, false).unsupported).toContain(
+  it('P17-2: the stage name and U+0085 stay refused', () => {
+    expect(reportWith({ target: TARGET_VECTOR }, DOCKERFILE).unsupported).toContain(
       `service app: build target ${JSON.stringify(TARGET_VECTOR)} (the Dev Container CLI writes it into its compose file for the build as it is: only a plain stage name is supported)`,
     );
-    expect(reportWith({}, 'FROM alpine AS a\u0085      ssh:\nRUN true\n', false).unsupported.length).toBe(2);
+    expect(reportWith({}, 'FROM alpine AS a\u0085      ssh:\nRUN true\n').unsupported.length).toBe(2);
   });
 
-  it('P17-2: the environment of the image counts only as far as the USER line uses it', () => {
-    const image = { User: 'vscode', Env: ['PATH=/bin', 'EVIL=a\nb', 'NAME=dev'] };
-    expect(composeBuildUserItems(model({}), { app: 'FROM alpine\nUSER vscode\n' }, 'app', image)).toEqual([]);
-    expect(composeBuildUserItems(model({}), { app: 'FROM alpine\nUSER $NAME\n' }, 'app', image)).toEqual([]);
-    expect(composeBuildUserItems(model({}), { app: 'FROM alpine\nENV U=$EVIL\nUSER ${U}\n' }, 'app', image)).toEqual([
-      'the user "a\\nb" of the USER instruction of the Dockerfile (a line break; the Dev Container CLI writes it into its compose file for the build as it is)',
-    ]);
-    // An ARG with a value of the build shadows the environment of the image.
-    expect(composeBuildUserItems(model({ args: { EVIL: 'ok' } }), { app: 'FROM alpine\nARG EVIL\nUSER $EVIL\n' }, 'app', image)).toEqual([]);
-    // A Dockerfile that the CLI's reading cannot follow is refused as not checked.
-    expect(composeBuildUserItems(model({ target: 'constructor' }), { app: 'FROM alpine AS a\nUSER x\n' }, 'app', image)[0]).toContain('cannot be checked');
-  });
 });

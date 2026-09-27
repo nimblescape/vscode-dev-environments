@@ -337,12 +337,8 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
     expect(hostAccessReport(dockerfile(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'OTHER=1'] })).hostAccess).toEqual([
       'FROM image devenv-abcd1234:1 of another environment',
     ]);
-    // review round 18, P18-1: changed expectation, Docker builds FROM alpine:3.22, but the Dev Container CLI reads the
-    // Dockerfile with build.args only: it inspects devenv-abcd1234:1 and copies its metadata into the image.
-    expect(hostAccessReport(dockerfile(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'BASE=alpine:3.22'] }))).toEqual({
-      hostAccess: ['base image of the Dev Container CLI devenv-abcd1234:1 of another environment'],
-      unsupported: [],
-    });
+    // slim-down: the base image that only the Dev Container CLI reads is no longer checked; Docker builds FROM alpine:3.22.
+    expect(hostAccessReport(dockerfile(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'BASE=alpine:3.22'] }))).toEqual({ hostAccess: [], unsupported: [] });
     expect(hostAccessReport(dockerfile(text, { args: { BASE: 'alpine:3.21' }, options: ['--build-arg', 'BASE=alpine:3.22'] }))).toEqual({ hostAccess: [], unsupported: [] });
   });
 
@@ -463,11 +459,8 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
 
   it('allows a pattern operator that gives another image (S4-3)', () => {
     expect(classes(dockerfile('ARG V=3.22.1\nFROM alpine:${V%.*}\n'))).toEqual([]);
-    // review round 18, P18-1: changed expectation, the Dev Container CLI's reader has no pattern operators: it reads
-    // `${A` and keeps the rest, and inspects (or pulls) the image `devenv-abcd1234:1#devenv-abcd1234:1}alpine`.
-    expect(classes(dockerfile('ARG A=devenv-abcd1234:1\nFROM ${A#devenv-abcd1234:1}alpine\n'))).toEqual([
-      'protected: base image of the Dev Container CLI devenv-abcd1234:1#devenv-abcd1234:1}alpine of another environment',
-    ]);
+    // slim-down: Docker's view only (the Dev Container CLI's reading of the pattern operator is no longer checked).
+    expect(classes(dockerfile('ARG A=devenv-abcd1234:1\nFROM ${A#devenv-abcd1234:1}alpine\n'))).toEqual([]);
     expect(classes(dockerfile('ARG A=abcd1234:1\nFROM ${A#abcd1234:1}alpine\n'))).toEqual([]);
   });
 
@@ -491,12 +484,8 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   });
 
   it('gives the image ID check the evaluated references (S4-3, S2-05)', () => {
-    // review round 18, P18-1: changed expectation, also the image that the Dev Container CLI reads (its reader has no
-    // pattern operators; the check of the image references refuses it as no valid reference).
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=abcdef12x\nFROM ${A%x}\n')).toEqual([
-      { reference: 'abcdef12', what: 'FROM image' },
-      { reference: 'abcdef12x%x}', what: 'base image of the Dev Container CLI' },
-    ]);
+    // slim-down: Docker's view only (the image that the Dev Container CLI reads is no longer a reference).
+    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=abcdef12x\nFROM ${A%x}\n')).toEqual([{ reference: 'abcdef12', what: 'FROM image' }]);
   });
 
   it.each([
@@ -617,12 +606,8 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
   it('expands a name of Unicode letters that is not set to the empty text, as BuildKit does (S5-1)', () => {
     expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'FROM dev$éenv-abcd1234:1\n')).toEqual([{ reference: 'dev-abcd1234:1', what: 'FROM image' }]);
     // `$0` in a replacement is a name too: BuildKit gives `aline`.
-    // review round 18, P18-1: changed expectation, also the image that the Dev Container CLI reads (`${A`, then `/p/`,
-    // then `$0}`, a variable that is not set).
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=alpine\nFROM ${A/p/$0}\n')).toEqual([
-      { reference: 'aline', what: 'FROM image' },
-      { reference: 'alpine/p/', what: 'base image of the Dev Container CLI' },
-    ]);
+    // slim-down: Docker's view only (the image that the Dev Container CLI reads is no longer a reference).
+    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=alpine\nFROM ${A/p/$0}\n')).toEqual([{ reference: 'aline', what: 'FROM image' }]);
   });
 
   it.each([
@@ -744,10 +729,9 @@ describe('review round 6 of unit 6 (S6-1, P6-2)', () => {
       expect(ms).toBeLessThan(1000);
     }
     // 32 levels are evaluated.
-    // review round 18, P18-1: changed expectation, Docker's view is evaluated; the Dev Container CLI's reader stops at
-    // the first `}` and leaves the rest with its `$` as the base image, which cannot be checked (the CLI fails on it).
+    // slim-down: Docker's view only (no finding of the base image that the Dev Container CLI reads).
     const allowed = hostAccessClassification(dockerfile(template.replace('NEST', nest(32, name))));
-    expect(allowed.filter((finding) => finding.class === 'unsupported' && !finding.item.startsWith('base image of the Dev Container CLI'))).toEqual([]);
+    expect(allowed.filter((finding) => finding.class === 'unsupported')).toEqual([]);
   });
 
   it('gives no variants for a nesting deeper than 32 levels, without an exception (S6-1)', () => {

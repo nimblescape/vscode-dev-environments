@@ -189,16 +189,6 @@ export class FakeDocker implements EnvironmentDocker {
     return this.apiVersion;
   }
 
-  /** Review round 18 (P18-3): the architecture of the Docker Engine (engineArchitecture). `undefined`: not told. */
-  arch: string | undefined = 'amd64';
-  /** How often engineArchitecture was asked. */
-  archQueries = 0;
-
-  async engineArchitecture(): Promise<string | undefined> {
-    this.archQueries++;
-    return this.arch;
-  }
-
   async isRunning(): Promise<boolean> {
     return this.running;
   }

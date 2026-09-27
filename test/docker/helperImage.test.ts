@@ -15,7 +15,6 @@ import {
   HELPER_CLEANUP_INTERVAL_MS,
   HELPER_UNUSED_LIMIT_MS,
   helperImageTag,
-  helperPlatform,
   registryBaseDigest,
   type BaseDigestLookup,
 } from '../../src/core/helper/helperImage';
@@ -66,14 +65,6 @@ class RunScopedDocker implements HelperDocker {
     return this.docker.imageId(reference);
   }
 
-  engineArchitecture(signal?: AbortSignal): Promise<string | undefined> {
-    return this.docker.engineArchitecture(signal);
-  }
-
-  imageArchitecture(reference: string, signal?: AbortSignal): Promise<string | undefined> {
-    return this.docker.imageArchitecture(reference, signal);
-  }
-
   async buildImage(options: Parameters<ContainerAdapter['buildImage']>[0]): Promise<void> {
     this.builds.push({ tag: options.tag, pull: options.pull === true, noCache: options.noCache === true });
     await this.docker.buildImage(options);
@@ -114,8 +105,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
   const dockerfilePath = path.join(run.runDir, 'tiny-helper', 'Dockerfile');
   // The label makes the tag unique to the run; RUN gives each build without cache a new image.
   const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN date > /built-at', `LABEL ${TEST_RUN_LABEL}=${run.runId}`, ''].join('\n');
-  // Review round 19 (P19-1): the tag names the platform of the engine.
-  const tag = helperImageTag(dockerfile, undefined, helperPlatform(cli.ok(['version', '--format', '{{.Server.Arch}}'])));
+  const tag = helperImageTag(dockerfile);
   const statePath = path.join(run.runDir, 'helper-state', 'helper.json');
   const timings = new Timings();
   let userHelperImages: string[] = [];

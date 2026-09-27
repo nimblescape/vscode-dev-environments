@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { helperImageTag, helperPlatform, registryBaseDigest } from '../../src/core/helper/helperImage';
+import { helperImageTag, registryBaseDigest } from '../../src/core/helper/helperImage';
 import { readHelperState } from '../../src/core/helper/helperState';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import type { HttpTransport } from '../../src/core/http';
@@ -129,8 +129,7 @@ describe('open pipeline on a seeded environment', () => {
   function helperWithDueCheck(transport: HttpTransport, name: string) {
     const statePath = path.join(run.runDir, `${name}-helper-state`, 'helper.json');
     const content = fs.readFileSync(HELPER_DOCKERFILE, 'utf8');
-    // Review round 19 (P19-1): the tag names the platform of the engine.
-    const tag = helperImageTag(content, undefined, helperPlatform(cli.ok(['version', '--format', '{{.Server.Arch}}'])));
+    const tag = helperImageTag(content);
     const eightDaysAgo = new Date(Date.now() - 8 * DAY_MS).toISOString();
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     const record = { baseImage: extractBaseImages(content)[0], baseDigest: FAKE_DIGEST, checkedAt: eightDaysAgo, lastUsedAt: eightDaysAgo };

@@ -50,7 +50,7 @@ export const HELPER_TOMBSTONE_MS = 90 * DAY_MS;
 /** The part of ContainerAdapter that the helper image needs. */
 export type HelperImageDocker = Pick<
   ContainerAdapter,
-  'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage' | 'imageArchitecture'
+  'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage'
 >;
 
 /**
@@ -89,43 +89,16 @@ export function registryBaseDigest(
 }
 
 /**
- * `devenv-helper:<first 12 hex characters of sha256(Dockerfile content + CLI version [+ platform])>`.
- * Line endings are normalized, so that a checkout with CRLF line endings gives the same tag. Review round 19 (P19-1):
- * with the platform of the build (`linux/<architecture of the Docker Engine>`), so that an image of that tag built for
- * another platform (for example with DOCKER_DEFAULT_PLATFORM) is never reused.
+ * `devenv-helper:<first 12 hex characters of sha256(Dockerfile content + CLI version)>`.
+ * Line endings are normalized, so that a checkout with CRLF line endings gives the same tag.
  */
-export function helperImageTag(dockerfileContent: string, cliVersion: string = DEVCONTAINER_CLI_VERSION, platform?: string): string {
+export function helperImageTag(dockerfileContent: string, cliVersion: string = DEVCONTAINER_CLI_VERSION): string {
   const hash = crypto
     .createHash('sha256')
     .update(dockerfileContent.replace(/\r\n/g, '\n'))
-    .update(cliVersion);
-  if (platform !== undefined) hash.update(`\0platform=${platform}`);
-  return `${HELPER_IMAGE_REPOSITORY}:${hash.digest('hex').slice(0, 12)}`;
-}
-
-/**
- * Review round 19 (P19-1): the platform of the helper image for the architecture `engineArch` of the Docker Engine
- * (ContainerAdapter.engineArchitecture), `linux/<arch>`; `undefined` when the engine did not tell it (the image is then
- * built and run for Docker's default platform, and the check of the base image that the Dev Container CLI reads
- * refuses any Dockerfile build, because it needs the architecture).
- */
-export function helperPlatform(engineArch: string | undefined): string | undefined {
-  return engineArch === undefined ? undefined : `linux/${engineArch}`;
-}
-
-/**
- * Review round 19 (P19-1): the Dev Container CLI in the helper takes TARGETARCH and BUILDARCH from the architecture of
- * its Node process, and the checks of the pipeline take them from the Docker Engine (checkCliBaseImage). So the helper
- * image must be of the architecture of `platform`: an image of another one is refused (an error of the helper, not a
- * refusal of the configuration). Throws Error.
- */
-async function checkHelperArchitecture(docker: HelperImageDocker, tag: string, platform: string, signal?: AbortSignal): Promise<void> {
-  const expected = platform.slice(platform.indexOf('/') + 1);
-  const actual = await docker.imageArchitecture(tag, signal);
-  if (actual === expected) return;
-  throw new Error(
-    `The workspace helper image ${tag} is for the architecture ${actual ?? '(unknown)'}, not for ${expected}, the architecture of the Docker Engine. Remove the image (docker image rm ${tag}) and try again.`,
-  );
+    .update(cliVersion)
+    .digest('hex');
+  return `${HELPER_IMAGE_REPOSITORY}:${hash.slice(0, 12)}`;
 }
 
 /** `create`: a missing tag is built; `refresh`: an existing tag is built again from a new base image. */
@@ -155,11 +128,6 @@ export interface EnsureHelperImageOptions {
   checkBaseImage?: boolean;
   /** Called right before a build of the helper image. */
   onBuild?: (kind: HelperBuildKind) => void;
-  /**
-   * Review round 19 (P19-1): the platform of the image (helperPlatform): it is built with `--platform`, its tag names
-   * it (helperImageTag), and an image of another architecture is refused (checkHelperArchitecture).
-   */
-  platform?: string;
   /**
    * Called with the check of the base image when it starts. It runs in the background, after this function returned; the
    * promise never rejects (for tests, and for callers that want to wait for it).
@@ -210,8 +178,7 @@ export async function ensureHelperImage(
   options: EnsureHelperImageOptions = {},
 ): Promise<string> {
   const content = await fs.promises.readFile(dockerfilePath, 'utf8');
-  const platform = options.platform;
-  const tag = helperImageTag(content, DEVCONTAINER_CLI_VERSION, platform);
+  const tag = helperImageTag(content);
   const build = (flags: BuildFlags): Promise<void> =>
     docker.buildImage({
       tag,
@@ -219,20 +186,17 @@ export async function ensureHelperImage(
       context: path.dirname(dockerfilePath),
       labels: { [LABEL_HELPER]: 'true' },
       buildArgs: { DEVCONTAINER_CLI_VERSION },
-      ...(platform !== undefined ? { platform } : {}),
       ...flags,
       onOutput: options.onOutput,
       signal: options.signal,
     });
   if (options.statePath === undefined) {
-    if (!(await docker.imageExists(tag))) {
-      options.onBuild?.('create');
-      await build({});
-    }
-    if (platform !== undefined) await checkHelperArchitecture(docker, tag, platform, options.signal);
+    if (await docker.imageExists(tag)) return tag;
+    options.onBuild?.('create');
+    await build({});
     return tag;
   }
-  await ensureWithState({
+  return ensureWithState({
     docker,
     tag,
     statePath: options.statePath,
@@ -242,8 +206,6 @@ export async function ensureHelperImage(
     logger: options.logger ?? silentLogger,
     build,
   });
-  if (platform !== undefined) await checkHelperArchitecture(docker, tag, platform, options.signal);
-  return tag;
 }
 
 /**

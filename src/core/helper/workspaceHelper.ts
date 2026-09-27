@@ -35,7 +35,6 @@ import {
 import {
   HELPER_LAST_USED_INTERVAL_MS,
   ensureHelperImage,
-  helperPlatform,
   recordHelperImageUse,
   type BaseDigestLookup,
   type HelperBuildKind,
@@ -62,7 +61,7 @@ import {
 /** The part of ContainerAdapter that the helper uses. A ContainerAdapter fits. */
 export type HelperDocker = Pick<
   ContainerAdapter,
-  'run' | 'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage' | 'engineArchitecture' | 'imageArchitecture'
+  'run' | 'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage'
 >;
 
 /** Result of WorkspaceHelper.up. */
@@ -179,8 +178,6 @@ export interface HelperRunSpec {
    * read files of the repository with a tool that follows its references (the model run of Docker Compose).
    */
   hideConfigFolder?: boolean;
-  /** Review round 19 (P19-1): `--platform` of the run (the platform of the helper image, helperPlatform). */
-  platform?: string;
   command: readonly string[];
 }
 
@@ -213,7 +210,6 @@ export function helperRunArgs(spec: HelperRunSpec): string[] {
     );
   }
   if (spec.network === false) args.push('--network', 'none');
-  if (spec.platform !== undefined) args.push('--platform', spec.platform);
   if (spec.secrets) args.push('--tmpfs', `${SECRETS_FOLDER}:rw,noexec,nosuid,nodev,size=1m,mode=0700`);
   for (const [name, value] of Object.entries(spec.env)) args.push('-e', `${name}=${value}`);
   args.push(spec.tag, ...spec.command);
@@ -363,8 +359,6 @@ export class WorkspaceHelper {
   /** When the cached image promise resolved, and its tag. */
   private imageReadyAt: number | undefined;
   private imageTag: string | undefined;
-  /** Review round 19 (P19-1): the platform of each tag that ensureHelperImage gave (helperPlatform), for its runs. */
-  private readonly imagePlatforms = new Map<string, string | undefined>();
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
@@ -890,27 +884,18 @@ export class WorkspaceHelper {
       else await this.recordUse(now);
     }
     if (!this.imagePromise) {
-      // Review round 19 (P19-1): built and run for the architecture of the Docker Engine, which the checks of the
-      // pipeline use for the platform variables of the Dev Container CLI (which takes them from Node in the helper).
-      const ensure = async (): Promise<string> => {
-        const platform = helperPlatform(await this.deps.docker.engineArchitecture(options.signal));
-        const tag = await ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
-          onOutput: options.onOutput ?? this.logOutput,
-          signal: options.signal,
-          statePath: this.deps.statePath,
-          baseDigest: this.deps.baseDigest,
-          maintain: recheck,
-          checkBaseImage: options.checkBaseImage,
-          onBuild: options.onBuild,
-          onBaseImageCheck: this.deps.onBaseImageCheck,
-          clock: this.clock,
-          logger: this.deps.logger,
-          ...(platform !== undefined ? { platform } : {}),
-        });
-        this.imagePlatforms.set(tag, platform);
-        return tag;
-      };
-      const promise: Promise<string> = ensure().then(
+      const promise: Promise<string> = ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
+        onOutput: options.onOutput ?? this.logOutput,
+        signal: options.signal,
+        statePath: this.deps.statePath,
+        baseDigest: this.deps.baseDigest,
+        maintain: recheck,
+        checkBaseImage: options.checkBaseImage,
+        onBuild: options.onBuild,
+        onBaseImageCheck: this.deps.onBaseImageCheck,
+        clock: this.clock,
+        logger: this.deps.logger,
+      }).then(
         (tag) => {
           if (this.imagePromise === promise) {
             this.imageReadyAt = this.clock.now();
@@ -1054,7 +1039,6 @@ export class WorkspaceHelper {
       docker: options.docker !== false,
       network: options.network !== false,
       hideConfigFolder: options.hideConfigFolder === true,
-      ...(this.imagePlatforms.get(tag) !== undefined ? { platform: this.imagePlatforms.get(tag) } : {}),
       command,
     });
     const envNames = Object.keys(env);

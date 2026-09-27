@@ -44,7 +44,7 @@ function contextEndpoint(dockerPath: string): string | undefined {
 export default async function setup(project: TestProject): Promise<() => void> {
   // Vitest sets the compile-time constants of vitest.docker.config.ts only in the test workers, not here.
   Object.assign(globalThis, { __DEVCONTAINER_CLI_VERSION__: devcontainerCliVersion() });
-  const { helperImageTag, helperPlatform } = await import('../../src/core/helper/helperImage');
+  const { helperImageTag } = await import('../../src/core/helper/helperImage');
   const dockerPath = findDockerCli(process.env, process.platform);
   if (!dockerPath) throw new Error('The Docker tests need the Docker CLI, and it was not found.');
   const runId = crypto.randomBytes(4).toString('hex');
@@ -67,14 +67,7 @@ export default async function setup(project: TestProject): Promise<() => void> {
   console.log(`Docker tests: run ${runId}, engine ${info.out}, logs in ${runDir}`);
 
   const helperDockerfile = fs.readFileSync(HELPER_DOCKERFILE, 'utf8');
-  // Review round 19 (P19-1): the helper tag names the platform of the engine.
-  const arch = cli.run(['version', '--format', '{{.Server.Arch}}']).out.trim();
-  const allowedTags = [
-    helperImageTag(helperDockerfile, undefined, helperPlatform(arch === '' ? undefined : arch)),
-    ...extractBaseImages(helperDockerfile),
-    TEST_BASE_IMAGE,
-    OLD_GIT_BASE_IMAGE,
-  ];
+  const allowedTags = [helperImageTag(helperDockerfile), ...extractBaseImages(helperDockerfile), TEST_BASE_IMAGE, OLD_GIT_BASE_IMAGE];
 
   return () => {
     // The test files remove their objects themselves; this is the safety net after a crash.
