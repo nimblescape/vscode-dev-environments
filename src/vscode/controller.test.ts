@@ -1681,10 +1681,11 @@ describe('Window roles', () => {
     ['helperFailed', Messages.helperFailed],
   ] as const) {
     it(`role A: closes the connection to a container of an older version that the failed pipeline did not make again (${code})`, async () => {
-      // Concept section 9: that container uses the Git of the computer; the window must not attach to it.
+      // Concept section 9: that container lacks the current setup; the window must not attach to it.
+      // Versions reset to 1 (user decision 2026-09-27): an older setup is a label other than 1 below it, or none.
       const env = environment();
       await h.registry.add(env);
-      h.docker.findContainer.mockResolvedValue(containerInfo(code === 'cancelled' ? undefined : '1'));
+      h.docker.findContainer.mockResolvedValue(containerInfo(code === 'cancelled' ? undefined : '0'));
       h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError(code, message));
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
       await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
@@ -1705,7 +1706,8 @@ describe('Window roles', () => {
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);
-    h.docker.findContainer.mockResolvedValue(containerInfo('1'));
+    // Versions reset to 1 (user decision 2026-09-27).
+    h.docker.findContainer.mockResolvedValue(containerInfo('0'));
     await run('start', row('acme/api', env));
     expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
     // The pipeline does not replace the container under this window; a Start from the empty window makes a new one.

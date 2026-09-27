@@ -200,7 +200,8 @@ describe('buildOverrideConfig', () => {
       // unit 15: changed expectation, the tmpfs of the token at the end.
       runArgs: [
         '--label',
-        'devenv.container-version=4',
+        // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
+        'devenv.container-version=1',
         '--label',
         'com.docker.compose.project=',
         '--label',
@@ -281,7 +282,7 @@ describe('buildOverrideConfig', () => {
       '127.0.0.1:8080:80',
       '--label',
       // unit 15: changed expectation, the tmpfs of the token at the end.
-      'devenv.container-version=4',
+      'devenv.container-version=1',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',
@@ -318,7 +319,7 @@ describe('buildOverrideConfig', () => {
       ...shifting,
       '--label',
       // unit 15: changed expectation, the tmpfs of the token at the end.
-      'devenv.container-version=4',
+      'devenv.container-version=1',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',

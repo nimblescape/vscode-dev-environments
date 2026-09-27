@@ -18,20 +18,13 @@ import { parseJson, readJsonTolerantSync, readTextFileSync, retryTransientSync }
 export const MONITOR_LOCK_STALE_MS = 120_000;
 
 /**
- * Protocol version of the Session Monitor (review finding F2 of PR #26). A window that finds a live monitor of a known,
- * older version asks it to exit (monitor.exit) and starts the current one, which waits for it (`waitForRetiringMonitor`).
- * A monitor whose version is unknown (no version file, or the file cannot be read) is left alone. Bump the version
- * whenever a monitor of the previous version would decide wrongly with the files that a window of this version writes.
- *
- * - 1 (no version file): monitors before Keep Running When Closed; they would stop kept environments. The extension was
- *   not published with them, so no window asks them to exit. A restart of VS Code alone does not retire such a monitor:
- *   it ends only when no window is alive, no pending connection file is fresh (2 minutes), and no waiting time runs
- *   (30 seconds by default), and before it ends it stops kept environments one last time. After an update from such a
- *   version: quit VS Code, wait at least the waiting time (up to 2 minutes after a connection was opened), or until
- *   `<global storage>/monitor.log` shows "Session Monitor ends", then reopen VS Code and start kept environments again.
- * - 2: knows `keepRunning` of the registry, writes monitor.version, and ends on a request in monitor.exit.
+ * Protocol version of the Session Monitor. Each monitor writes it to monitor.version. A window that finds a live monitor
+ * of a known, older version asks it to exit (monitor.exit) and starts the current one, which waits for it
+ * (`waitForRetiringMonitor`). A monitor whose version is unknown (no version file, or the file cannot be read) is left
+ * alone. Raise the version whenever a monitor of the previous version would decide wrongly with the files that a window
+ * of this version writes.
  */
-export const MONITOR_PROTOCOL_VERSION = 2;
+export const MONITOR_PROTOCOL_VERSION = 1;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */
 const INCOMPLETE_LOCK_MS = 5_000;
@@ -149,8 +142,8 @@ export function runningMonitor(
 
 /**
  * Writes monitor.version for the monitor `pid` (a JSON object `{ pid, version }`), atomically, and retries transient
- * file errors (Windows). The file is separate from monitor.lock because monitors and windows of version 1 accept only a
- * bare process ID in the lock file. Throws for file system errors.
+ * file errors (Windows). The file is separate from monitor.lock, which holds only the bare process ID, so that the lock
+ * stays the same across protocol versions. Throws for file system errors.
  */
 export function writeMonitorVersion(versionFile: string, pid: number = process.pid, version = MONITOR_PROTOCOL_VERSION): void {
   retryTransientSync(() => writeJsonAtomicSync(versionFile, { pid, version }));

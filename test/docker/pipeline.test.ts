@@ -625,8 +625,8 @@ describe('open pipeline on a seeded environment', () => {
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
   });
 
-  it('a container of an older version (without the label devenv.container-version) is created again, without a build', async () => {
-    // A container as the first version of the extension created it: the ID label, the workspace volume, no version label.
+  it('a container without the label devenv.container-version is not current and is created again, without a build', async () => {
+    // A container of an older setup: the ID label, the workspace volume, no version label.
     cli.ok(['rm', '-f', containerName]);
     const oldId = cli.ok([
       'create',

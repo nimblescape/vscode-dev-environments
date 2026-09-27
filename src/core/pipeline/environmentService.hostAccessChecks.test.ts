@@ -103,7 +103,8 @@ describe('host access checks off for the repository', () => {
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
     // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
+    expect(runArgs).toEqual(['--label', 'devenv.container-version=1', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     // The labels of the override configuration pass the policy also with the checks on.
     // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
     expect(hostAccessProblems({ config: { runArgs }, ownVolume: environment.volumeName, overrideConfiguration: true })).toEqual([]);
@@ -127,7 +128,7 @@ describe('host access checks off for the repository', () => {
       '/dev/fuse',
       '--label',
       // unit 15: changed expectation, the tmpfs of the token at the end.
-      'devenv.container-version=4',
+      'devenv.container-version=1',
       '--label',
       'devenv.host-access=unrestricted',
       // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
@@ -159,7 +160,7 @@ describe('host access checks off for the repository', () => {
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
     // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=1', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     expect(override.appPort).toEqual([3000, '5000:5000', '0.0.0.0:6000:6000']);
   });
 
@@ -239,7 +240,7 @@ describe('host access checks on again (containerIsCurrent)', () => {
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
     // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     expect(h.progress.details).toEqual([Messages.containerHostAccessChecksOn]);
     expect(h.logger.infos.some((line) => line.includes('was created while the host access checks were off. They are on now'))).toBe(true);
     // The next open starts it as it is.
@@ -279,7 +280,7 @@ describe('host access checks on again (containerIsCurrent)', () => {
   it('does not let the merged configuration of such a container block the open that creates it again', async () => {
     // The CLI merges the metadata of the existing container, which holds what the checks allowed while they were off.
     await seedEnvironment(h, { container: 'stopped', containerLabels: UNRESTRICTED_LABELS });
-    h.helper.merged = { privileged: true, runArgs: ['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted'] };
+    h.helper.merged = { privileged: true, runArgs: ['--label', 'devenv.container-version=1', '--label', 'devenv.host-access=unrestricted'] };
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.ups.map((up) => [up.image, up.removeExistingContainer])).toEqual([[IMAGE_1, true]]);
     expect(h.docker.containersOf(ENV_ID)[0].labels[LABEL_HOST_ACCESS]).toBeUndefined();

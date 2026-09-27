@@ -47,15 +47,11 @@ export const LABEL_COMPOSE_SERVICE = 'devenv.compose-service';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
 export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
 /**
- * Version of the container setup. 2: container-only Git (concept section 9). 3: the documented settings of the Dev
- * Containers extension for the container (no copy of the Git configuration of the computer, no forwarding credential
- * helpers, no sign-in of the GitHub CLI; devContainersSettings in devContainers.ts), which it reads from the label
- * devcontainer.metadata only at the first attach of a new container, and only the documented variables of Git and
- * Docker (no more GIT_CONFIG_PARAMETERS, GNUPGHOME, and SSH_AUTH_SOCK). 4: the GitHub CLI reads its configuration from the volume (GH_CONFIG_DIR, GH_CONFIG_FOLDER), where
- * it is signed in with the account that owns the environment. A container with an older version (or without the label) is
- * created again from its environment image.
+ * Version of the container setup. A container without the label, or with an older value, is not current
+ * (containerIsCurrent): it is created again from its environment image, and the volume stays. Raise it when a change of
+ * the setup needs existing containers to be created again.
  */
-export const CONTAINER_VERSION = 4;
+export const CONTAINER_VERSION = 1;
 /**
  * Container label: `unknown` when the container was created without the configuration of the repository (it could not
  * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
