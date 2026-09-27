@@ -87,7 +87,7 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - The host access checks are on for every repository by default. For a repository that you trust, **Turn Off Host Access Checks…** in its context menu turns them off after a warning: its configuration, Features, and base image may then use the files of your computer (bind mounts), the Docker socket (which gives full control of Docker and of every other environment, also of other GitHub accounts), privileged mode, capabilities and security options, devices and GPUs, published ports on all network addresses (they are no longer bound to `127.0.0.1`), and the volumes of other programs. The volumes of your other environments and of other GitHub accounts, the variables of Git and of the GitHub CLI, `initializeCommand`, the labels of Dev Environments, and the options that Dev Environments does not support stay refused. The row shows `host access unrestricted`, and the log says so at every start. **Turn On Host Access Checks** turns them on again: at the next start, a container that was made without them is made again, if the configuration passes the checks; otherwise the start stops with the usual message.
 - Values of `${localEnv:…}` variables of your computer are not passed to the environment. They are empty or have their default value; `HOME`, `PATH`, `HOSTNAME`, `NODE_VERSION`, and `YARN_VERSION` get the values of the workspace helper (for example, `HOME` is `/root`).
 - Git in the container older than version 2.32 reads the Git configuration of the environment only through `~/.gitconfig`, which the image must not bring with content of its own. Git older than version 2.9 may use the Git credentials of your computer; the extension warns about it.
-- The Dev Containers extension and VS Code keep some channels to your computer open, for example the SSH and GPG agent sockets, a socket of the Dev Containers extension that answers requests for the Git and Docker credentials of your computer, the opening of URLs, and the clipboard. Git in the environment does not use these sockets, but a program that looks for them can. For full isolation, use a separate user account on your computer or a virtual machine.
+- The Dev Containers extension and VS Code keep some channels to your computer open, for example the SSH and GPG agent sockets, a socket of the Dev Containers extension that answers requests for the Git and Docker credentials of your computer, the opening of URLs, and the clipboard. Git in the environment does not use these sockets, but a program that looks for them can. For full isolation, use a separate user account on your computer or a virtual machine (see [Hardening your computer](#hardening-your-computer)).
 - Every container can reach the ports on localhost of your computer through `host.docker.internal`, also the ports that VS Code forwards for other environments. Ports on `127.0.0.1` are protected against your network, not against other containers.
 - Only data in the repository volume survives a rebuild, and also when an update of the extension sets the container up again (the progress says so). Data in other folders of the container, for example the home folder, is lost, unless the configuration stores it in an additional named volume (property `mounts`).
 - Each GitHub account has its own environment of a repository, with its own clone: two accounts that work on the same repository need the disk space for two clones. A configuration whose named volumes have a fixed name (or `${localWorkspaceFolderBasename}-…`) works for one account's environment only; use `${devcontainerId}` in the name to give each environment its own volume.
@@ -95,6 +95,38 @@ Nothing runs without your confirmation: a dialog first lists the exact commands,
 - On Linux with Docker Engine, the extension cannot start the Docker service by itself, because this needs administrator rights. **Start Docker** in the walkthrough runs `sudo systemctl enable --now docker` in a terminal, where you enter your password.
 - Docker Compose configurations are not supported yet.
 - With **Select Organizations…**, GitHub is asked only about the selected owners. Your environments of repositories of other owners stay in the list, but without the check whether the repository is still on GitHub. An environment created with an older version of Dev Environments that is not assigned to a GitHub account yet stays hidden while its owner is not selected.
+
+## Hardening your computer
+
+The Dev Containers extension and VS Code keep some channels from the container to your computer open (see [Known limits](#known-limits)). No setting filters them. A firewall does not help either: inside the container they are Unix sockets, files without an address or port, and between the container and your computer they travel inside the connection of the window (the `docker exec` stream through Docker). What you can do is keep things of value away from the end of each channel on your computer, and have your computer ask before it gives something out. Per channel:
+
+**Git configuration, Git and Docker credentials, and the GitHub CLI.** Dev Environments already switches these off for its own containers: it sets `dev.containers.copyGitConfig` (also under the old key `remote.containers.copyGitConfig`), `dev.containers.gitCredentialHelperConfigLocation`, `dev.containers.dockerCredentialHelper`, and `dev.containers.githubCLILoginWithToken` for each container. To make this the default for your other dev containers too, put this into your user `settings.json`:
+
+```json
+"dev.containers.copyGitConfig": false,
+"dev.containers.gitCredentialHelperConfigLocation": "none",
+"dev.containers.dockerCredentialHelper": false,
+"dev.containers.githubCLILoginWithToken": false
+```
+
+The socket that answers credential requests stays open, and a program in the container that looks for it can still ask. On macOS, the Git credential helper `osxkeychain` gives out a stored password without asking once you chose **Always Allow**. For the items that matter, open Keychain Access, and in the item's **Access Control** select **Confirm before allowing access**: you then see a prompt for each read, and can deny it.
+
+**SSH agent.** This is the biggest exposure. The Dev Containers extension forwards your SSH agent into every container when one runs as VS Code starts. There is no setting to turn this off; it is an open feature request ([#11413](https://github.com/microsoft/vscode-remote-release/issues/11413)). According to that request, `"SSH_AUTH_SOCK": ""` in `remoteEnv` does not stop it either. What works:
+
+- Start VS Code without an agent. On macOS and Linux, quit VS Code, then start it with `env -u SSH_AUTH_SOCK code`. This affects every window, also your local work.
+- Or keep the agent, but have it ask: `ssh-add -c` loads a key that needs your confirmation at each use. 1Password and Secretive can also ask for approval.
+- Load only the keys that you need, for a short time: `ssh-add -t 1h`.
+
+**GPG agent.** It is forwarded when the container has `gpg` and your computer runs an agent. Use a short cache time in `gpg-agent.conf` (for example `default-cache-ttl 60`) and a pinentry that asks for the passphrase. Do not keep a key unlocked while a container that you do not trust is open.
+
+**WSL and Wayland (Windows and Linux).** Two user settings of the Dev Containers extension:
+
+- `"dev.containers.forwardWSLServices": false` stops forwarding the SSH and GPG agents of WSL. Some users report that the SSH agent still reaches the container ([#9897](https://github.com/microsoft/vscode-remote-release/issues/9897)), so also follow the steps for the SSH agent above.
+- `"dev.containers.mountWaylandSocket": false` stops mounting your Wayland display into containers that the Dev Containers extension creates.
+
+**Ports, browser, and clipboard.** With `"remote.autoForwardPorts": false` and `"remote.localPortHost": "localhost"` (the default) in your user settings, VS Code forwards fewer ports on its own, and only on localhost. Extensions and some URLs can still forward ports. Dev Environments already refuses repositories that set another `remote.localPortHost`. No setting limits the opening of URLs in your browser; if this worries you, make a separate browser profile your default browser. No setting limits the clipboard either: do not copy secrets while a container that you do not trust is open.
+
+**Everything else.** The only real boundary is a separate user account on your computer, or a virtual machine, for VS Code and Docker: then nothing of yours is at the end of the channels. With Docker Desktop, Enhanced Container Isolation (Business subscription) also hardens the container side.
 
 ## Privacy
 
