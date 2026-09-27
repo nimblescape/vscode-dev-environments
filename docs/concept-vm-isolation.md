@@ -15,7 +15,8 @@ every version (see "Known limits" and "Hardening your computer" in the README, a
 A boundary does not need that prediction. If each GitHub account has its own Docker, inside its own virtual
 machine, the images, containers, volumes, and build cache of other accounts are not reachable, whatever the
 configuration says. GitHub Codespaces works this way: each codespace runs in its own newly built virtual machine with
-its own isolated network, and the configuration is not judged.
+its own isolated network, and the configuration is not judged. (Codespaces separates each codespace; this concept
+separates accounts, so the environments of one account still share their Docker.)
 
 ## Idea
 
@@ -36,8 +37,9 @@ its own isolated network, and the configuration is not judged.
 - The workspace helper also mounts the engine's socket by path, guessed as `/var/run/docker.sock` (a `unix://` path
   from `DOCKER_HOST` only on Linux). A rootless Docker has its socket at `/run/user/<uid>/docker.sock`, so the socket
   path must come from the endpoint.
-- The Dev Containers extension chooses one endpoint for all of VS Code, not per window. A way to make each window
-  attach through its account's endpoint has to be found first (to be checked).
+- Whether the Dev Containers extension can use a different endpoint per window is to be checked: the documented
+  setting `containers.environment` (of the Container Tools extension, honored by Dev Containers) can be set per
+  workspace, but then a repository's own workspace settings could change it too, so it would need a guard.
 
 ## Possible VM providers
 
@@ -45,11 +47,11 @@ its own isolated network, and the configuration is not judged.
 |---|---|---|
 | macOS | Lima or Colima (Apple Virtualization framework, the default on current macOS) | One instance or profile per VM, each with its own Docker behind a forwarded socket. Switch off the default home-folder share. |
 | Linux | Lima with QEMU/KVM | The same tool as on macOS. Lighter alternatives: rootless Docker in a separate user account, or Kata Containers (a small VM per container, needs KVM). |
-| Windows | A separate WSL 2 distribution with its own Docker | Simple, but all WSL 2 distributions run in one VM: they share the kernel, the network (localhost), and the devices; only files, processes, and Docker are separate. Windows drives are mounted into each distribution unless automount is switched off in `wsl.conf`. A real VM needs Hyper-V: Lima's usual Windows driver (`wsl2`, experimental) is only another WSL distribution; a separate VM is possible with Lima's `hcs` driver (Hyper-V, experimental, Lima 2.3 or later, Windows 11) or with QEMU. |
+| Windows | A separate WSL 2 distribution with its own Docker | Simple, but not a boundary for the files of the computer. All WSL 2 distributions run in one VM: they share the kernel, the network (localhost), and the devices; only files, processes, and Docker are separate. Windows drives are mounted into each distribution (automount), and each distribution can start Windows programs as the Windows user (interop). Both can be switched off in `wsl.conf`, but root inside the distribution — which a container that reaches that distribution's Docker gets easily — can mount the drives again by hand. A real VM needs Hyper-V: Lima's usual Windows driver (`wsl2`, experimental) is only another WSL distribution; Lima's `hcs` driver (Hyper-V, experimental, Lima 2.3 or later, Windows 11) runs a real VM, but today only one instance at a time, only in plain mode (Docker reached over SSH, no forwarded socket), and from an administrator shell, so it does not yet give a VM per account; QEMU remains. |
 
 ## What it protects, and what not
 
-- Protected (with the home-folder share switched off): the files and the Docker of the computer, and the images,
+- Protected (with the home-folder share switched off; not with a WSL 2 distribution, see the Windows row): the files and the Docker of the computer, and the images,
   containers, volumes, and build cache of other accounts. The image and Dockerfile checks become a second line; the
   host access checks stay as a guard rail.
 - Not protected:
