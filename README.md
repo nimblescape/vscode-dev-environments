@@ -49,7 +49,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
    - PR 1 merged 2026-09-27 as #38 (fa1553e): context per host `devenv-remote-<8 hex sha256(host)>`, operations pinned via DOCKER_CONTEXT, SSH BatchMode pre-check, Windows taskkill tree kill. Accepted low leftovers: taskkill no fallback when it starts but fails; controller containerRuns/containerOutdated/removeGitToken may still read on an unsupported endpoint.
    - PR 2 merged 2026-09-27 as #39 (1b79236): remote Session Monitor container (newest heartbeat record decides, no record → never touched, setting remoteStopAfterMinutes 5..1440 default 10), heartbeats with seq and clear-only full sync, shared-engine check, Close and Keep Running (keepRunningOnce), monitor volume guarded. Five review rounds; accepted low leftovers listed in the PR body. Original plan: Session Monitor as a container on the remote host; heartbeats every 30 s carry the keep-running flag, a switch of the option is sent at once; stops after a time limit (default 10 min, setting) without heartbeat unless keep-running. New one-off command "Close and Keep Running" (local and remote).
    - Live checks: Dev Containers attaches through the context; port forwarding; stop on close; whether Docker Desktop resets the context; Windows ssh.exe; a real rootless engine.
-6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
+6. Offer to recreate the container (in progress, branch feat/recreate-offer). 7. Fix "Bad progress location" — **merged** (PR #40, fa7287a). 8. Slow repository list.
 
 Deferred: Docker per account (Docker-in-Docker, rootless per user), builder isolation, VMs.
 
