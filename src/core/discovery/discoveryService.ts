@@ -426,6 +426,8 @@ interface RefreshRun {
   limiter: RequestLimiter;
   /** Aborts every request of the refresh at its first failure (`failure`), or when the signal of the caller aborts. */
   controller: AbortController;
+  /** The requests of the refresh that did not settle yet, also those that wait for a slot. */
+  pending: Set<Promise<unknown>>;
   failure?: { error: unknown };
   onAbort: () => void;
   requests: number;
@@ -517,6 +519,25 @@ export class DiscoveryService {
   async refresh(token: string, accountId: string, signal?: AbortSignal): Promise<DiscoveryData> {
     const logins = scopeLogins(this.options.scope?.() ?? []);
     const run = this.newRun(token, accountId, normalizeScope(logins), DISCOVERY_CONCURRENCY, signal);
+    try {
+      return await this.refreshRun(run, logins);
+    } catch (error) {
+      // A failed refresh stops all its requests (also the lookups that it started, and the pages of other owners), and
+      // rejects only when they settled: the next refresh, which the sidebar starts only after this one, never runs
+      // beside them, so no more than DISCOVERY_CONCURRENCY requests run at the same time.
+      if (!run.failure && !isAbortError(error)) run.failure = { error };
+      run.controller.abort();
+      await settle(run.pending);
+      if (signal?.aborted) throw abortError();
+      throw run.failure ? run.failure.error : error;
+    } finally {
+      signal?.removeEventListener('abort', run.onAbort);
+    }
+  }
+
+  /** The refresh of `refresh` within its run. */
+  private async refreshRun(run: RefreshRun, logins: string[]): Promise<DiscoveryData> {
+    const accountId = run.accountId;
     // Concept 7.4: with a stored list, only new and changed repositories get the (slow) configuration lookups. The
     // results do not depend on the scope, so a list of another scope helps too; it is never shown for this scope.
     const previous = await this.loadStored(accountId).catch(() => undefined);
@@ -524,23 +545,16 @@ export class DiscoveryService {
     // Concept 7.4: on a refresh, the few new and changed repositories are read right after their page (they come first,
     // last push first), so their lookups overlap with the rest of the list. The first load fills batches of 50.
     run.lookups.flushEachPage = detections !== undefined;
-    let scan: ScanResult;
-    try {
-      scan = logins.length === 0 ? await this.scanAll(run, accountId, detections) : await this.scanScope(run, accountId, logins, detections);
-      await run.lookups.finish();
-    } catch (error) {
-      if (signal?.aborted) throw abortError();
-      throw run.failure ? run.failure.error : error;
-    } finally {
-      signal?.removeEventListener('abort', run.onAbort);
-    }
+    const scan = logins.length === 0 ? await this.scanAll(run, accountId, detections) : await this.scanScope(run, accountId, logins, detections);
+    await run.lookups.finish();
     if (run.lookups.count > 0) {
       this.logger.info(
         `Repository list: configurations of ${run.lookups.count} ${detections ? 'new or changed ' : ''}repositories read with ${run.lookupRequests} requests.`,
       );
     }
 
-    const organizations = await this.collectOrganizations(scan.organizations, run, signal);
+    // Every request of the run observes its signal, which an abort of `signal` reaches too.
+    const organizations = await this.collectOrganizations(scan.organizations, run, run.controller.signal);
     const hints = new HintCollector(scan.viewerLogin);
     for (const { error, data, organization } of run.errors) hints.add(error, data, organization);
     if (hints.unattributed > 0) {
@@ -552,7 +566,7 @@ export class DiscoveryService {
         ),
         hints,
         run,
-        signal,
+        run.controller.signal,
       );
     }
     for (const owner of scan.missingOwners) hints.addNotFound(owner);
@@ -836,6 +850,7 @@ export class DiscoveryService {
       scope,
       limiter: new RequestLimiter(concurrency),
       controller,
+      pending: new Set(),
       onAbort,
       requests: 0,
       requestsByKind: { list: 0, lookup: 0, other: 0 },
@@ -922,6 +937,8 @@ export class DiscoveryService {
 
   /** Gives the repositories found so far to the listeners of onPartialResult. A failing listener is logged. */
   private reportPartial(run: RefreshRun): void {
+    // A refresh that failed or was aborted reports nothing more: its requests may still settle after it rejected.
+    if (run.controller.signal.aborted) return;
     if (run.firstRepositoryMs === undefined && run.collectors.some((collector) => collector.hasConfiguration())) {
       run.firstRepositoryMs = Math.max(0, this.clock.now() - run.started);
     }
@@ -959,7 +976,7 @@ export class DiscoveryService {
     signal: AbortSignal | undefined,
     kind: RequestKind,
   ): Promise<{ data?: T; errors?: GraphQLError[] }> {
-    return run.limiter.run(async () => {
+    const request = run.limiter.run(async () => {
       run.requests++;
       run.requestsByKind[kind]++;
       const started = this.clock.now();
@@ -969,6 +986,10 @@ export class DiscoveryService {
         run.requestMs[kind] += Math.max(0, this.clock.now() - started);
       }
     }, kind);
+    run.pending.add(request);
+    const forget = () => run.pending.delete(request);
+    request.then(forget, forget);
+    return request;
   }
 
   /**
@@ -1247,6 +1268,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asArray<T>(value: T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : [];
+}
+
+/** Waits until every request of `pending` settled, also those that start meanwhile. */
+async function settle(pending: Set<Promise<unknown>>): Promise<void> {
+  while (pending.size > 0) await Promise.allSettled([...pending]);
 }
 
 function errorText(error: unknown): string {

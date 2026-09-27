@@ -664,3 +664,87 @@ describe('the request pattern of a refresh (concept 7.4): list pages beside the 
     expect(names(result.withoutConfiguration)).toEqual(scoped.filter((item) => !item.config).map((item) => item.nameWithOwner));
   });
 });
+
+describe('a failed refresh stops its requests (review round 1)', () => {
+  /**
+   * Answers the matching list page (or page of an owner) with HTTP 403, and counts the requests whose signal was aborted
+   * while GitHub answered them (the fake answers them anyway, like a server that does not notice the abort in time).
+   */
+  function failingPage(match: (variables: Record<string, unknown>) => boolean): HttpTransport & { aborted: number } {
+    const transport = {
+      aborted: 0,
+      request: async (request: HttpRequest, signal?: AbortSignal): Promise<HttpResponse> => {
+        const parsed = JSON.parse(request.body ?? '{}') as GraphQLRequest;
+        if (!parsed.query.startsWith('query Configurations(') && match(parsed.variables)) {
+          return { status: 403, headers: {}, body: '{"message":"Resource not accessible"}' };
+        }
+        const response = await github.request(request);
+        if (signal?.aborted) transport.aborted++;
+        return response;
+      },
+    };
+    return transport;
+  }
+
+  /** A stored list of `count` repositories, then 5 pushed repositories on every page of 100. */
+  async function storedWithChanges(count: number, owner = 'acme'): Promise<FakeRepository[]> {
+    const repos = Array.from({ length: count }, (_, i) => repo(`${owner}/r${i}`));
+    github.repos = repos;
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    return repos.map((item, i) => (i % 100 < 5 ? { ...item, pushedAt: '2026-09-24T10:00:00Z' } : item));
+  }
+
+  it('aborts the lookups it started, rejects only when they settled, and reports no part after that', async () => {
+    github.repos = await storedWithChanges(500);
+    github.lookupDelayMs = 60;
+    github.requests.length = 0;
+    github.peak = 0;
+    const transport = failingPage((variables) => variables.cursor === '300');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    const stored = fs.readFileSync(file, 'utf8');
+    const error = await discovery.refresh(TOKEN, ACCOUNT_ID).catch((reason: unknown) => reason);
+    expect(String(error)).toMatch(/HTTP status 403: Resource not accessible/);
+    // Batches of pages 1 to 3 ran when page 4 failed: all were aborted and settled before the refresh rejected.
+    expect(github.lookups().length).toBeGreaterThan(0);
+    expect(github.open).toBe(0);
+    expect(transport.aborted).toBeGreaterThan(0);
+    expect(fs.readFileSync(file, 'utf8')).toBe(stored);
+
+    // The next refresh, started at once, never runs beside requests of the failed one.
+    const result = await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+    expect(result.repositories).toHaveLength(500);
+  });
+
+  it('reports no part of the failed refresh after it rejected', async () => {
+    github.repos = await storedWithChanges(500);
+    github.lookupDelayMs = 60;
+    const transport = failingPage((variables) => variables.cursor === '300');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    const parts: number[] = [];
+    discovery.onPartialResult(({ data }) => parts.push(data.repositories.length));
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/403/);
+    const before = parts.length;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(parts).toHaveLength(before);
+  });
+
+  it('stops the pages of the other owners of a scope and their lookups too', async () => {
+    owners = ['acme', 'beta'];
+    const acme = await storedWithChanges(300, 'acme');
+    github.repos = [...acme, ...Array.from({ length: 300 }, (_, i) => repo(`beta/b${i}`, true, i % 100 < 5 ? '2026-09-24T10:00:00Z' : '2026-09-20T10:00:00Z'))];
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    github.repos = github.repos.map((item) => ({ ...item, pushedAt: item.pushedAt === '2026-09-24T10:00:00Z' ? '2026-09-25T10:00:00Z' : item.pushedAt }));
+    github.lookupDelayMs = 60;
+    github.listDelayMs = 10;
+    github.peak = 0;
+    const transport = failingPage((variables) => variables.login === 'acme' && variables.cursor === '100');
+    const discovery = new DiscoveryService(new GitHubApi(transport), () => file, recordingLogger(), clock, { scope: () => owners });
+    await expect(discovery.refresh(TOKEN, ACCOUNT_ID)).rejects.toThrow(/403/);
+    expect(github.open).toBe(0);
+    expect(transport.aborted).toBeGreaterThan(0);
+    // The next refresh, started at once, never runs beside requests of the failed one.
+    await service().refresh(TOKEN, ACCOUNT_ID);
+    expect(github.peak).toBeLessThanOrEqual(DISCOVERY_CONCURRENCY);
+  });
+});
