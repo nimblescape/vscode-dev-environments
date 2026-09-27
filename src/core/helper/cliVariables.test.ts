@@ -332,39 +332,67 @@ describe('the known variables of the helper process (hotfix review 1, N4)', () =
   });
 });
 
-// Guard (hotfix review 4, Q1): the rule of Dev Container CLI 0.89.0 for the folder of `--workspace-folder` (Ri, Rp),
-// copied verbatim from the bundle. A folder whose posix extension is `.code-workspace` (case-sensitive) is read as a
-// workspace file: localWorkspaceFolder is its parent folder.
+// Guard (hotfix review 4, Q1; hotfix review 5, A5-1): the workspace folder of Dev Container CLI 0.89.0 at `up`.
+// read-configuration and build call Ri on the folder of `--workspace-folder` itself: a folder whose posix extension is
+// `.code-workspace` (case-sensitive) is read as a workspace file, and they use its parent folder. `up` (kW) calls Ri
+// on `<folder>/<basename>` for such a folder, whose parent is the folder itself: at `up`, localWorkspaceFolder is the
+// repository folder for every name. Both are sliced from the bundle and must still read as below.
 const CLI_WORKSPACE_SOURCE =
   'function Ri(e,A){if(Rp(A)){let t=e.dirname(A);return{isWorkspaceFile:!0,workspaceOrFolderPath:A,rootFolderPath:t,configFolderPath:t}}' +
   'return{isWorkspaceFile:!1,workspaceOrFolderPath:A,rootFolderPath:A,configFolderPath:A}}function Rp(e){return TG.extname(e)===".code-workspace"}';
+// kW (`up`): a = cliHost.cwd, the resolved `--workspace-folder`; A = { hostPath } of the same folder.
+const CLI_UP_WORKSPACE_EXPRESSION = 'E=A&&Ri(g.path,Rp(A.hostPath)?g.path.join(a,OG.basename(A.hostPath)):a)';
 
-describe('helperCliVariables: the workspace folder as the CLI reads --workspace-folder (hotfix review 4, Q1)', () => {
+type WorkspaceOf = (folder: string) => { rootFolderPath: string };
+
+describe('helperCliVariables: the workspace folder as `devcontainer up` uses it (hotfix review 4, Q1; hotfix review 5, A5-1)', () => {
   const bundle = fs.readFileSync(path.join(CLI_FOLDER, 'dist', 'spec-node', 'devContainersSpecCLI.js'), 'utf8');
-  const ri = new Function('TG', `${CLI_WORKSPACE_SOURCE}\nreturn Ri;`)(path.posix) as (
-    pathModule: typeof path.posix,
-    folder: string,
-  ) => { rootFolderPath: string };
+  // Ri and Rp, sliced from the bundle.
+  const riStart = bundle.indexOf('function Ri(e,A)');
+  const riEnd = bundle.indexOf('}', bundle.indexOf('function Rp(e)', riStart)) + 1;
+  const riSource = bundle.slice(riStart, riEnd);
+  const { Ri, Rp } = new Function('TG', `${riSource}\nreturn { Ri, Rp };`)(path.posix) as {
+    Ri: (pathModule: typeof path.posix, folder: string) => { rootFolderPath: string };
+    Rp: (folder: string) => boolean;
+  };
+  // The expression of kW, sliced from the bundle.
+  const kwStart = bundle.indexOf('E=A&&Ri(g.path,');
+  const kwSource = bundle.slice(kwStart, bundle.indexOf(':a)', kwStart) + 3);
+  const upWorkspace: WorkspaceOf = (folder) =>
+    new Function('Ri', 'Rp', 'OG', 'g', 'a', 'A', `let ${kwSource}; return E;`)(Ri, Rp, path.posix, { path: path.posix }, folder, { hostPath: folder });
+  const readConfigurationWorkspace: WorkspaceOf = (folder) => Ri(path.posix, folder);
 
-  it('the copy is the code of the installed CLI', () => {
-    expect(bundle.includes(CLI_WORKSPACE_SOURCE)).toBe(true);
+  it('the slices are the code of the installed CLI', () => {
+    expect(riSource).toBe(CLI_WORKSPACE_SOURCE);
+    expect(kwSource).toBe(CLI_UP_WORKSPACE_EXPRESSION);
+    expect(bundle.includes(`a=g.cwd,${CLI_UP_WORKSPACE_EXPRESSION},`)).toBe(true);
   });
 
-  it.each(['acme/x.code-workspace', 'acme/.code-workspace', 'acme/plain', 'acme/x.CODE-WORKSPACE'])(
-    '%s: the same workspace folders and results as the CLI',
-    (repository) => {
-      const folder = `/workspaces/${repository.split('/')[1]}`;
-      const variables = helperCliVariables(repository);
-      expect(variables.localWorkspaceFolder).toBe(ri(path.posix, folder).rootFolderPath);
+  it.each(['x.code-workspace', 'a.b.code-workspace', '.code-workspace', 'plain', 'x.CODE-WORKSPACE', 'a.code-workspace.git'])(
+    'acme/%s: the same workspace folders and results as `up`',
+    (name) => {
+      const folder = `/workspaces/${name}`;
+      const variables = helperCliVariables(`acme/${name}`);
+      const up = upWorkspace(folder).rootFolderPath;
+      expect(up).toBe(folder);
+      expect(variables.localWorkspaceFolder).toBe(up);
       expect(variables.containerWorkspaceFolder).toBe(folder);
       const value = 'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/x|${localWorkspaceFolder}|${containerWorkspaceFolderBasename}';
-      const context = { localWorkspaceFolder: ri(path.posix, folder).rootFolderPath, containerWorkspaceFolder: folder, env: { HOME: '/root' } };
+      const context = { localWorkspaceFolder: up, containerWorkspaceFolder: folder, env: { HOME: '/root' } };
       expect(substituteCliVariables(value, variables)).toBe(cliUp(value, context));
     },
   );
 
-  it('a repository named *.code-workspace: localWorkspaceFolderBasename is `workspaces`', () => {
-    expect(substituteCliVariables('${localWorkspaceFolderBasename}-node_modules', helperCliVariables('acme/x.code-workspace'))).toBe('workspaces-node_modules');
+  it('read-configuration and build use /workspaces for a folder named *.code-workspace, `up` does not', () => {
+    expect(readConfigurationWorkspace('/workspaces/x.code-workspace').rootFolderPath).toBe('/workspaces');
+    expect(readConfigurationWorkspace('/workspaces/a.b.code-workspace').rootFolderPath).toBe('/workspaces');
+    expect(readConfigurationWorkspace('/workspaces/x.CODE-WORKSPACE').rootFolderPath).toBe('/workspaces/x.CODE-WORKSPACE');
+    expect(upWorkspace('/workspaces/x.code-workspace').rootFolderPath).toBe('/workspaces/x.code-workspace');
+  });
+
+  it('a repository named *.code-workspace: localWorkspaceFolderBasename is the repository name', () => {
+    // hotfix review 5, A5-1: was `workspaces-node_modules` (read-configuration's folder); `up` uses the repository folder.
+    expect(substituteCliVariables('${localWorkspaceFolderBasename}-node_modules', helperCliVariables('acme/x.code-workspace'))).toBe('x.code-workspace-node_modules');
     expect(substituteCliVariables('${localWorkspaceFolderBasename}', helperCliVariables('acme/.code-workspace'))).toBe('.code-workspace');
     expect(substituteCliVariables('${localWorkspaceFolderBasename}', helperCliVariables('acme/x.CODE-WORKSPACE'))).toBe('x.CODE-WORKSPACE');
   });

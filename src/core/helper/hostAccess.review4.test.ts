@@ -15,11 +15,14 @@ describe('hotfix review 4, Q1: a repository named *.code-workspace', () => {
     const variables = helperCliVariables('mallory/evil.code-workspace');
     const input = { ownVolume: 'devenv-evil.code-workspace-11111111', environment: { id: 'attackerenv', ownerId: '1' }, variables };
     const metadata = [{ mounts: ['type=volume,source=${localWorkspaceFolderBasename}-node_modules,target=/x'] }];
-    expect(mountedVolumeNames({ ...input, metadata })).toEqual(['workspaces-node_modules']);
+    // hotfix review 5, A5-1: `up` mounts evil.code-workspace-node_modules (the repository folder), not workspaces-node_modules.
+    expect(mountedVolumeNames({ ...input, metadata })).toEqual(['evil.code-workspace-node_modules']);
     const victim = { 'devenv.environment-id': 'victimenv', 'devenv.owner-id': '2', 'devenv.volume': 'additional' };
-    const report = hostAccessReport({ ...input, metadata, volumeLabels: { 'workspaces-node_modules': victim } }, false);
+    // hotfix review 5, A5-1: the volume that `up` mounts.
+    const report = hostAccessReport({ ...input, metadata, volumeLabels: { 'evil.code-workspace-node_modules': victim } }, false);
     expect(report.hostAccess).toHaveLength(1);
-    expect(report.hostAccess[0]).toContain('workspaces-node_modules');
+    // hotfix review 5, A5-1: the item names the volume that `up` mounts.
+    expect(report.hostAccess[0]).toContain('evil.code-workspace-node_modules');
   });
 });
 

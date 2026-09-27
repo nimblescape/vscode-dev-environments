@@ -79,8 +79,10 @@ export interface HostAccessInput {
   environment?: { id: string; ownerId?: string };
   /**
    * The variables of the Dev Container CLI at `up` (helperCliVariables in ./cliVariables.ts): the image metadata is
-   * checked as the CLI substitutes it before it passes it to Docker. `config` and `merged` are the output of
-   * read-configuration, substituted once already, and are checked as they are (hotfix review 1). Without it, the
+   * checked as the CLI substitutes it before it passes it to Docker, with the repository folder for
+   * `${localWorkspaceFolder}`, as `up` uses it for every repository name (hotfix review 5, A5-1). `config` and `merged`
+   * are the output of read-configuration, substituted once already (for a repository named `*.code-workspace` with
+   * `/workspaces`, read-configuration's folder), and are checked as they are (hotfix review 1). Without it, the
    * workspace folders are not known, and the variables of the process are those of the workspace helper
    * (HELPER_KNOWN_ENV, mayBeSetInHelper).
    */

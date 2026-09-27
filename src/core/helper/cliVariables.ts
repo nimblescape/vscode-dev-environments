@@ -18,8 +18,11 @@
 // - The text between the braces is split at every `:`: the first part is the name, the others are the arguments.
 // - `env` and `localEnv`: the variable of the CLI process named by the first argument; when it is not set, the second
 //   argument (the default, which cannot hold a `:`), otherwise ''. Without an argument, the CLI stops with an error.
-// - `localWorkspaceFolder`: the folder of `--workspace-folder`, or its parent folder when its extension is
-//   `.code-workspace` (Ri, Rp; hotfix review 4, Q1); `localWorkspaceFolderBasename`: its posix basename.
+// - `localWorkspaceFolder`: at `up`, the folder of `--workspace-folder`, for every name (kW: for a folder whose
+//   extension is `.code-workspace` it reads `<folder>/<basename>` as the workspace file, whose parent is the folder
+//   itself). read-configuration and build read such a folder itself as a workspace file and use its parent folder,
+//   `/workspaces` in the helper (Ri, Rp; hotfix review 5, A5-1).
+//   `localWorkspaceFolderBasename`: its posix basename.
 // - `containerWorkspaceFolder`: the workspaceFolder of the configuration (for `up` with an override configuration: the
 //   one of the override configuration, itself substituted first); `containerWorkspaceFolderBasename`: its basename.
 // - Other names (also `containerEnv` for a new container) stay as they are written.
@@ -106,21 +109,15 @@ export interface CliVariables {
  * is the same folder (buildOverrideConfig). No value of a variable of the process is known: the variables of
  * HELPER_PROCESS_ENV_NAMES may be set, every other one is not.
  *
- * localWorkspaceFolder is the folder as the CLI reads `--workspace-folder` (cliWorkspaceFolder, hotfix review 4, Q1):
- * for a repository named `*.code-workspace` it is `/workspaces`, not the folder of the repository.
+ * localWorkspaceFolder is the repository folder for every repository name, as `up` uses it (hotfix review 5, A5-1):
+ * for a `--workspace-folder` whose extension is `.code-workspace`, `up` (kW) reads `<folder>/<basename>` as the
+ * workspace file, whose parent is the folder itself, so the label, the user of the image, and the volumes that `up`
+ * mounts use the repository folder. Only read-configuration and build read such a folder itself as a workspace file
+ * and use `/workspaces` (Ri, Rp); their output is checked as they return it.
  */
 export function helperCliVariables(repository: string): CliVariables {
   const folder = repositoryFolder(repository);
-  return { localWorkspaceFolder: cliWorkspaceFolder(folder), containerWorkspaceFolder: folder, env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper };
-}
-
-/**
- * The localWorkspaceFolder of the Dev Container CLI 0.89.0 for `--workspace-folder folder` (Ri, Rp; hotfix review 4,
- * Q1): a folder whose posix extension is exactly `.code-workspace` (case-sensitive; `.code-workspace` alone has none)
- * is read as a workspace file, and the CLI uses its parent folder; any other folder is used as it is.
- */
-export function cliWorkspaceFolder(folder: string): string {
-  return path.posix.extname(folder) === '.code-workspace' ? path.posix.dirname(folder) : folder;
+  return { localWorkspaceFolder: folder, containerWorkspaceFolder: folder, env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper };
 }
 
 /**
