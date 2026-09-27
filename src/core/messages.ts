@@ -147,26 +147,41 @@ export const Messages = {
     compose
       ? `The dev container of ${repository} cannot be started or used. Recreate it?`
       : `The container of ${repository} cannot be started or used. Recreate it?`,
-  /** Recreate offer: what stays and what is lost (the volumes are never removed). */
-  containerRecreateDetail: (compose: boolean) =>
-    compose
+  /**
+   * Recreate offer: what stays and what is lost (the volumes are never removed). Review round 2 (V1): `unnamedFolders`
+   * are the folders of the damaged container that are volumes without a name (for example `- /workspaces/api/node_modules`
+   * in a compose file, `VOLUME /data` in the image): they are not carried over into the new container
+   * (unnamedVolumesNotCarried).
+   */
+  containerRecreateDetail: (compose: boolean, unnamedFolders: readonly string[] = []) =>
+    (compose
       ? 'Only the dev container is removed and created again from its environment image. The other services, for example a database, keep running with their data. ' +
-        'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, all volumes of the environment, and the containers of the other services. ' +
-        'Lost: everything else in the dev container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. ' +
-        'The setup commands of the configuration (onCreateCommand, postCreateCommand) run again. Cancel changes nothing.'
+        'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, the named volumes of the environment, and the containers of the other services. ' +
+        'Lost: everything else in the dev container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. '
       : 'The container of the environment is removed and created again from its environment image. ' +
-        'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, and all files in the volumes of the environment. ' +
-        'Lost: everything else in the container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. ' +
-        'The setup commands of the configuration (onCreateCommand, postCreateCommand) run again. Cancel changes nothing.',
+        'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, and all files in the named volumes of the environment. ' +
+        'Lost: everything else in the container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. ') +
+    unnamedVolumesNotCarried(unnamedFolders) +
+    'The setup commands of the configuration (onCreateCommand, postCreateCommand) run again. Cancel changes nothing.',
+  /**
+   * Recreate offer, review round 2 (E1–E3): after Recreate, the direct check before `up` found that Docker Compose would
+   * also create the containers of other services again (`services`): nothing is changed.
+   */
+  composeServicesWouldBeRecreated: (services: string) =>
+    `The dev container was not created again: Docker Compose would also create the containers of other services again (${services}), which the question promised to keep. Nothing was changed. Rebuild the environment instead.`,
   /**
    * Recreate offer, review round 1 (D1): after Recreate, the environment was changed meanwhile (for example by another
    * window): nothing is created again.
    */
   containerChangedMeanwhile:
     'The environment was changed in the meantime, for example in another window. The container was not created again, and nothing was changed. Try again.',
-  /** Recreate offer: the progress detail after the confirmation, as for the other recreations (concept 6.5). */
-  containerRecreatedDamaged:
-    'The container of the environment could not be started, so it is set up again. Your files in the repository and in the volumes are kept. Files in other folders of the container, for example in the home folder, are removed.',
+  /**
+   * Recreate offer: the progress detail after the confirmation, as for the other recreations (concept 6.5), with the
+   * folders in volumes without a name (containerRecreateDetail).
+   */
+  containerRecreatedDamaged: (unnamedFolders: readonly string[] = []) =>
+    'The container of the environment could not be started, so it is set up again. Your files in the repository and in the named volumes are kept. Files in other folders of the container, for example in the home folder, are removed. ' +
+    unnamedVolumesNotCarried(unnamedFolders).trim(),
   /**
    * The modal question of Turn Off Host Access Checks… (concept section 9 "Host access", user request 2026-09-26), with
    * what the configuration of the repository can then use (hostAccessChecksOffDetail).
@@ -265,6 +280,15 @@ export const Messages = {
   otherDockerHost: (repository: string, environmentHost: string, currentHost: string) =>
     `The environment of ${repository} is on ${describeHost(environmentHost)}, but Docker is set to ${describeHost(currentHost)}. Nothing was changed.`,
 } as const;
+
+/**
+ * Recreate offer, review round 2 (V1): the sentence about the folders of the damaged container that are volumes without
+ * a name, or '' without such folders. Ends with a space.
+ */
+function unnamedVolumesNotCarried(folders: readonly string[]): string {
+  if (folders.length === 0) return '';
+  return `These folders are volumes without a name, which are not carried over: in the new container they start as the image has them (often empty), and their old content stays in a Docker volume without a name: ${listSome(folders)}. `;
+}
 
 function describeHost(host: string): string {
   return host === '' ? 'the local Docker' : host;

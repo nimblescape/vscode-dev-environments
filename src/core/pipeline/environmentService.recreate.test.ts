@@ -106,7 +106,7 @@ describe('recreate offer: a stopped container that cannot be started or used', (
     // The lifecycle commands run in the new container (onCreateCommand and postCreateCommand again), with the token.
     expect(h.helper.userCommandRuns.at(-1)?.containerId).toBe(containers[0].id);
     // The progress says what is lost, as for the other recreations (concept 6.5).
-    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged);
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged());
     expectVolumesKept();
     // The busy mark of the recreation is gone.
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
@@ -184,6 +184,50 @@ describe('recreate offer: a stopped container that cannot be started or used', (
     expect(ups()).toEqual([`up ${IMAGE_1}`]);
     expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
     expectVolumesKept();
+  });
+});
+
+describe('recreate offer, review round 2 (V1): volumes without a name of a single container', () => {
+  const NODE_MODULES = '/workspaces/api/node_modules';
+  const ANONYMOUS = 'a'.repeat(64);
+
+  it('the question and the progress name their folders; nothing removes them (the CLI removes the container without -v)', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    const old = h.docker.containersOf(ENV_ID)[0];
+    h.docker.containers.set(old.id, {
+      ...old,
+      mountTargets: [
+        { type: 'volume', volume: NAME, target: '/workspaces' },
+        { type: 'volume', volume: ANONYMOUS, target: NODE_MODULES },
+        { type: 'volume', volume: 'cache', target: '/cache' },
+        { type: 'tmpfs', target: '/run/devenv' },
+      ],
+    });
+    h.docker.volumes.set(ANONYMOUS, {});
+    failFirstUp(PASSWD_DAMAGED);
+    h.ui.recreateAnswer = true;
+
+    await h.service.open(TARGET, options());
+
+    const detail = h.ui.recreateQuestions[0].detail;
+    expect(detail).toBe(Messages.containerRecreateDetail(false, [NODE_MODULES]));
+    expect(detail).toContain(`old content stays in a Docker volume without a name: ${NODE_MODULES}.`);
+    expect(detail).toContain('all files in the named volumes');
+    expect(detail).not.toContain('/cache');
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged([NODE_MODULES]));
+    expectVolumesKept();
+    expect(h.docker.volumes.has(ANONYMOUS)).toBe(true);
+  });
+
+  it('without such volumes the question names none', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    failFirstUp(PASSWD_DAMAGED);
+
+    await rejection(h.service.open(TARGET, options()));
+
+    expect(h.ui.recreateQuestions[0].detail).not.toContain('without a name');
   });
 });
 

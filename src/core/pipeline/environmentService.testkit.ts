@@ -4,6 +4,7 @@
 
 // In-memory fakes for the tests of the environment service: Docker, workspace helper, image check, and user interface.
 // The registry and the session files are the real ones, in a temporary folder. Only test files import this module.
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -504,6 +505,11 @@ export interface FakeFiles {
 
 type Maybe<T> = T | undefined;
 
+/** Recreate offer, review round 2: the configuration hash of a service in the fakes (Compose computes its own). */
+export function fakeServiceHash(service: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(service ?? null)).digest('hex');
+}
+
 export class FakeHelper implements EnvironmentHelper {
   /** Calls in order, for example `clone main`, `build devenv-3f2a9c1e:1`, `up devenv-3f2a9c1e:1 --remove-existing-container`. */
   readonly calls: string[] = [];
@@ -821,6 +827,22 @@ export class FakeHelper implements EnvironmentHelper {
    * failure (lifecycleFailure of the image of the container) as the CLI reports it: an error whose result names the
    * container (WorkspaceHelper.runUserCommands adds it), or with lifecycleFailureReport `result`, the kept container.
    */
+  /**
+   * Recreate offer, review round 2: the configuration hashes of composeServiceHashes by service, or an error. Default:
+   * fakeServiceHash of each service of the model, which the containers that composeUp creates carry too.
+   */
+  serviceHashes: Record<string, string> | Error | undefined;
+  readonly hashModels: string[] = [];
+
+  async composeServiceHashes(p: { model: string; project: string }): Promise<Map<string, string>> {
+    this.calls.push(`composeServiceHashes ${p.project}`);
+    this.hashModels.push(p.model);
+    if (this.serviceHashes instanceof Error) throw this.serviceHashes;
+    if (this.serviceHashes !== undefined) return new Map(Object.entries(this.serviceHashes));
+    const model = JSON.parse(p.model) as ComposeModel;
+    return new Map(Object.entries(model.services).map(([name, service]) => [name, fakeServiceHash(service)]));
+  }
+
   async runUserCommands(p: {
     volumeName: string;
     override: Record<string, unknown>;
@@ -923,7 +945,9 @@ export class FakeHelper implements EnvironmentHelper {
           'com.docker.compose.project': project,
           'com.docker.compose.service': name,
           'com.docker.compose.container-number': '1',
-          'com.docker.compose.config-hash': 'hash',
+          // Recreate offer, review round 2: as Compose, the hash of the service in the model and the ID of its image.
+          'com.docker.compose.config-hash': fakeServiceHash(model.services[name]),
+          'com.docker.compose.image': this.docker.imageIds.get(serviceImage) ?? `sha256:image-of-${serviceImage}`,
         },
       });
       if (volumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes });

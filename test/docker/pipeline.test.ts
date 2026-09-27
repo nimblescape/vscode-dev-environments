@@ -826,7 +826,7 @@ describe('open pipeline on a seeded environment', () => {
     const result = await timings.measure('damaged container, Recreate', () => offline.openEnvironment(environmentId, { progress }), () => progress.summary());
 
     expect(ui.since(events).filter((event) => event.kind === 'recreateContainer')).toHaveLength(1);
-    expect(progress.details).toContain(Messages.containerRecreatedDamaged);
+    expect(progress.details).toContain(Messages.containerRecreatedDamaged());
     expect(progress.steps).not.toContain('preparing');
     const container = cli.container(containerName);
     expect(container?.Id).not.toBe(damagedId);

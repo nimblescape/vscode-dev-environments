@@ -940,6 +940,50 @@ export function writeAndRunCommand(p: { repositoryConfig?: string; config?: stri
   return ['node', '-e', WRITE_AND_RUN_SCRIPT, OVERRIDE_FOLDER, p.repositoryConfig ?? '', p.config ?? '', ...args];
 }
 
+/**
+ * `node -e` script (recreate offer, review round 2): the configuration hash that Docker Compose computes for each
+ * service of a model, as it compares it with the label com.docker.compose.config-hash of a container to decide whether
+ * `up` creates the container again (`docker compose config --hash '*'`: one line `<service> <hash>` per service).
+ * `argv[1]` = the path of the model file (COMPOSE_MODEL_PATH, the path that `up` uses), `argv[2]` = the project name; the
+ * model comes on standard input. It needs no Docker engine and no network (verified with Compose 5.1.1: the hash of a
+ * model in another folder and without an engine equals the label of the container that `up` created from it).
+ */
+export const COMPOSE_HASH_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const file = process.argv[1];
+const project = process.argv[2];
+if (!file || path.posix.resolve(file) !== file || !project) {
+  process.stderr.write('Invalid arguments.\n');
+  process.exit(2);
+}
+fs.mkdirSync(path.posix.dirname(file), { recursive: true, mode: 0o700 });
+fs.writeFileSync(file, fs.readFileSync(0, 'utf8'), { mode: 0o600 });
+const result = spawnSync('docker', ['compose', '--project-name', project, '-f', file, 'config', '--hash', '*'], {
+  encoding: 'utf8',
+  maxBuffer: 16 * 1024 * 1024,
+});
+process.stdout.write(result.stdout || '');
+process.stderr.write((result.stderr || '') + (result.error ? result.error.message + '\n' : ''));
+process.exitCode = typeof result.status === 'number' ? result.status : 1;
+`;
+
+/** `node -e` command of COMPOSE_HASH_SCRIPT. */
+export function composeHashCommand(modelPath: string, project: string): string[] {
+  return ['node', '-e', COMPOSE_HASH_SCRIPT, modelPath, project];
+}
+
+/** The output of COMPOSE_HASH_SCRIPT: service name → configuration hash. Lines that are no `<name> <hash>` are skipped. */
+export function parseComposeHashes(stdout: string): Map<string, string> {
+  const hashes = new Map<string, string>();
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^(\S+) ([0-9a-f]{64})$/.exec(line.trim());
+    if (match) hashes.set(match[1], match[2]);
+  }
+  return hashes;
+}
+
 /** `node -e` command of COMPOSE_MODEL_SCRIPT for the compose files (absolute paths) of a configuration. */
 export function composeModelCommand(repoFolder: string, files: readonly string[]): string[] {
   return ['node', '-e', COMPOSE_MODEL_SCRIPT, repoFolder, ...files];

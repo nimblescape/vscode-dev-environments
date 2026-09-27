@@ -336,6 +336,18 @@ export function isContainerFault(text: string): boolean {
   return CONTAINER_FAULT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/**
+ * Recreate offer, review round 2 (V1): the folders of `container` that are volumes without a name (Docker names such a
+ * volume with 64 hexadecimal digits: `- /workspaces/api/node_modules` of a compose file, `VOLUME /data` of the image, a
+ * mount without a source). The recreation does not carry them over: the question and the progress name them.
+ */
+export function unnamedVolumeFolders(container: Pick<ContainerInfo, 'mountTargets'>): string[] {
+  const folders = (container.mountTargets ?? [])
+    .filter((mount) => mount.type === 'volume' && mount.volume !== undefined && /^[0-9a-f]{64}$/.test(mount.volume))
+    .map((mount) => mount.target);
+  return [...new Set(folders)].sort();
+}
+
 /** Technical details of an error for the log and for `UserFacingError.detail`: the message and the end of stderr. */
 export function errorDetail(error: unknown): string {
   const message = errorMessage(error);
@@ -682,6 +694,8 @@ export function isComposeContainer(labels: Readonly<Record<string, string>>, pro
 /** Labels that Docker Compose puts on the containers that it creates (not on images): isComposeContainer. */
 export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-number';
 export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
+/** Recreate offer, review round 2: label of a one-off container of `docker compose run` (`True`); `up` leaves it. */
+export const COMPOSE_ONEOFF_LABEL = 'com.docker.compose.oneoff';
 
 /**
  * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the

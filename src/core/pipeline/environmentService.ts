@@ -43,6 +43,7 @@ import {
   composeVolumeNames,
   resolveComposeFiles,
   type ComposeBuildModelRewrite,
+  type ComposeModel,
   type ComposeModelOutput,
   type ComposeRewriteParams,
 } from '../helper/compose';
@@ -183,7 +184,10 @@ import {
   COMPOSE_CONTAINER_NUMBER_LABEL,
   COMPOSE_SERVICE_LABEL,
   COMPOSE_IMAGE_LABEL,
+  COMPOSE_CONFIG_HASH_LABEL,
+  COMPOSE_ONEOFF_LABEL,
   isContainerFault,
+  unnamedVolumeFolders,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -264,6 +268,7 @@ export type EnvironmentHelper = Pick<
   | 'listConfigurations'
   | 'readConfiguration'
   | 'composeModel'
+  | 'composeServiceHashes'
   | 'build'
   | 'up'
   | 'runUserCommands'
@@ -2578,6 +2583,59 @@ export class EnvironmentService {
   }
 
   /**
+   * Recreate offer, review round 2 (E1–E3): right before the `up` that creates the removed dev container again, and
+   * before anything is removed, the direct check that Docker Compose leaves every other service as it is. Without its
+   * dev container, the CLI runs `docker compose up` without `--no-recreate`, and Compose creates a container again when its
+   * label com.docker.compose.config-hash differs from the hash of its service in the model, or its label
+   * com.docker.compose.image from the ID of the image of the service now. So for each container of another service of
+   * the project (not a one-off container) that the model has: the hash that the Compose of the workspace helper (the one
+   * that runs `up`) computes from exactly `model` (WorkspaceHelper.composeServiceHashes) must equal its label, and the
+   * local ID of the image of the service must equal its image label. The hashes of one Compose binary cover every change
+   * of the model (the host access checks, a changed configuration) and of the hash method (another Compose version); the
+   * image ID covers a tag that moved (also while the question was open). A difference, a missing label, or an error:
+   * startFailed (composeServicesWouldBeRecreated), and nothing is changed.
+   */
+  private async requireOtherServicesKept(ctx: PipelineContext, compose: LoadedCompose, model: ComposeModel): Promise<void> {
+    const env = ctx.env;
+    const others = (await this.composeContainers(env)).filter(
+      (c) => c.labels[COMPOSE_SERVICE_LABEL] !== compose.service && c.labels[COMPOSE_ONEOFF_LABEL] !== 'True' && model.services[c.labels[COMPOSE_SERVICE_LABEL] ?? ''] !== undefined,
+    );
+    if (others.length === 0) return;
+    const problems: Array<{ name: string; why: string }> = [];
+    let hashes: Map<string, string> | undefined;
+    try {
+      hashes = await this.deps.helper.composeServiceHashes({
+        volumeName: env.volumeName,
+        repository: env.repository,
+        model: JSON.stringify(model, null, 2),
+        project: compose.project,
+        signal: ctx.signal,
+      });
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The configuration hashes of the services of ${env.repository} could not be computed: ${errorDetail(error)}`);
+    }
+    for (const other of others) {
+      const service = other.labels[COMPOSE_SERVICE_LABEL] ?? '';
+      const expected = hashes?.get(service);
+      const actual = other.labels[COMPOSE_CONFIG_HASH_LABEL];
+      if (expected === undefined || actual !== expected) {
+        problems.push({ name: service, why: `the container ${other.name} has the configuration hash ${actual ?? '(none)'}, the model of this start gives ${expected ?? '(not known)'}` });
+        continue;
+      }
+      const reference = typeof model.services[service].image === 'string' ? (model.services[service].image as string) : other.image;
+      const imageId = await this.deps.docker.imageId(reference).catch(() => undefined);
+      if (imageId === undefined || other.labels[COMPOSE_IMAGE_LABEL] !== imageId) {
+        problems.push({ name: service, why: `the container ${other.name} has the image ${other.labels[COMPOSE_IMAGE_LABEL] ?? '(none)'}, ${reference} is ${imageId ?? 'missing'} now` });
+      }
+    }
+    if (problems.length === 0) return;
+    for (const problem of problems) this.logger.warn(`Docker Compose would create the service ${problem.name} of ${env.repository} again: ${problem.why}.`);
+    this.logger.info(`The dev container of ${env.repository} is not created again; nothing was changed.`);
+    throw new UserFacingError('startFailed', PipelineTexts.startFailed, Messages.composeServicesWouldBeRecreated(listSome([...new Set(problems.map((p) => p.name))])));
+  }
+
+  /**
    * Review round 1 of the recreate offer (D1): after the answer and with the busy mark of this run, the container of the
    * environment (for Docker Compose its dev container) is still the damaged one (the same ID), and the image of the
    * recreation (of the build record of the current entry when it exists, else of the container) is still `image`.
@@ -2645,9 +2703,12 @@ export class EnvironmentService {
   ): Promise<ContainerOutcome> {
     const env = ctx.env;
     this.logger.warn(`The container ${container.name} of ${env.repository} is damaged, so it cannot be started or used: ${cause}`);
+    // Review round 2 (V1): its volumes without a name are not carried over; the question and the progress name them.
+    const unnamed = unnamedVolumeFolders(container);
+    if (unnamed.length > 0) this.logger.info(`Volumes without a name of ${container.name}, not carried over by a recreation: ${unnamed.join(', ')}.`);
     const confirmed = await this.deps.ui.recreateContainer(env.repository, {
       message: Messages.containerRecreateQuestion(env.repository, compose),
-      detail: Messages.containerRecreateDetail(compose),
+      detail: Messages.containerRecreateDetail(compose, unnamed),
     });
     this.throwIfCancelled(ctx.signal);
     if (!confirmed) {
@@ -2660,7 +2721,7 @@ export class EnvironmentService {
     // created again; otherwise nothing is changed.
     await this.requireUnchangedSinceQuestion(ctx, container, image);
     ctx.steps.step('starting');
-    ctx.steps.detail(Messages.containerRecreatedDamaged);
+    ctx.steps.detail(Messages.containerRecreatedDamaged(unnamed));
     this.logger.info(`The container ${container.name} of ${env.repository} is created again from ${image}; the files in the volumes are kept.`);
     if (compose) ctx.recreateDevContainer = container;
     try {
@@ -2668,6 +2729,8 @@ export class EnvironmentService {
       return { result, created: true };
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      // Review round 2 (E1–E3): the direct check refused it (requireOtherServicesKept), with its own detail.
+      if (isUserFacingError(error) && error.code === 'startFailed') throw error;
       this.logger.error(`The container of ${env.repository} could not be created again from ${image}.`, error);
       throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
     }
@@ -3018,11 +3081,13 @@ export class EnvironmentService {
       await this.movePreviousDevContainer(ctx, compose, found, previousService, removeExistingContainer);
     }
     // Recreate offer: the user chose to create the damaged dev container again. After the checks above (a refusal leaves
-    // it as it is), only it goes: stopped first (D7-1), then `docker rm -f` without its volumes. `up` creates it again;
-    // the containers of the other services and their volumes stay as they are.
+    // it as it is), and only when Docker Compose would leave every other service as it is (review round 2:
+    // requireOtherServicesKept, with this very model), only it goes: stopped first (D7-1), then `docker rm -f` without
+    // its volumes. `up` creates it again; the containers of the other services and their volumes stay as they are.
     const damaged = ctx.recreateDevContainer;
     if (damaged !== undefined) {
       ctx.recreateDevContainer = undefined;
+      await this.requireOtherServicesKept(ctx, compose, model);
       this.logger.info(`The dev container ${damaged.name} of ${env.repository} is removed to be created again. The other services and all volumes are kept.`);
       await this.stopServiceBeforeRemoval(damaged, env);
       await docker.removeContainer(damaged.id);

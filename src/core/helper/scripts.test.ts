@@ -12,6 +12,9 @@ import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
   COMPOSE_FILES_MAX_AGE_MS,
+  COMPOSE_HASH_SCRIPT,
+  composeHashCommand,
+  parseComposeHashes,
   COMPOSE_MODEL_SCRIPT,
   CREDENTIAL_HELPER,
   GIT_FILES_SCRIPT,
@@ -1612,5 +1615,40 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     }
     expect(fs.existsSync(path.join(dir, 'out', 'x'))).toBe(false);
     expect(fs.existsSync(path.join(dir, 'nowhere'))).toBe(false);
+  });
+});
+
+describe('COMPOSE_HASH_SCRIPT (recreate offer, review round 2)', () => {
+  it('writes the model to the path of up and runs docker compose config --hash with the project name', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-hash-'));
+    try {
+      // A fake `docker` that prints its arguments and the model it finds at the path.
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\necho "db ${'a'.repeat(64)}"\necho "args: $*" >&2\ncat "$5" >&2\n`, { mode: 0o755 });
+      const file = path.join(dir, 'override', 'compose.json');
+      const result = spawnSync('node', ['-e', COMPOSE_HASH_SCRIPT, file, 'devenv-3f2a9c1e'], {
+        input: '{"services":{}}',
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain(`args: compose --project-name devenv-3f2a9c1e -f ${file} config --hash *`);
+      expect(result.stderr).toContain('{"services":{}}');
+      expect(parseComposeHashes(result.stdout)).toEqual(new Map([['db', 'a'.repeat(64)]]));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('parses one `<service> <hash>` per line and skips anything else', () => {
+    const hash = 'b'.repeat(64);
+    expect(parseComposeHashes(`app ${hash}\r\nwarning: something\n\ndb ${hash}\nshort 1234\n`)).toEqual(
+      new Map([
+        ['app', hash],
+        ['db', hash],
+      ]),
+    );
+    expect(composeHashCommand('/tmp/devenv-override/compose.json', 'p')).toEqual(['node', '-e', COMPOSE_HASH_SCRIPT, '/tmp/devenv-override/compose.json', 'p']);
   });
 });

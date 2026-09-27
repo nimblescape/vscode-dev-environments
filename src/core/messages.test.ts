@@ -112,10 +112,24 @@ describe('the recreate offer (user request 2026-09-26)', () => {
     expect(Messages.containerRecreateQuestion('acme/api', compose)).toContain('acme/api cannot be started or used');
   });
 
-  it('says for Docker Compose that only the dev container is recreated, and the other services and all volumes stay', () => {
+  it('says for Docker Compose that only the dev container is recreated, and the other services and the named volumes stay', () => {
     expect(Messages.containerRecreateQuestion('acme/api', true)).toBe('The dev container of acme/api cannot be started or used. Recreate it?');
     expect(Messages.containerRecreateDetail(true)).toContain('Only the dev container is removed and created again');
-    expect(Messages.containerRecreateDetail(true)).toContain('all volumes of the environment, and the containers of the other services');
+    expect(Messages.containerRecreateDetail(true)).toContain('the named volumes of the environment, and the containers of the other services');
     expect(Messages.containerRecreateDetail(false)).not.toContain('other services');
+  });
+});
+
+describe('the recreate offer, review round 2 (V1): volumes without a name', () => {
+  it('names their folders in the question and in the progress, and keeps only the named volumes', () => {
+    for (const compose of [false, true]) {
+      const detail = Messages.containerRecreateDetail(compose, ['/workspaces/api/node_modules', '/data']);
+      expect(detail).toContain('named volumes');
+      expect(detail).toContain('not carried over');
+      expect(detail).toContain('Docker volume without a name: /workspaces/api/node_modules, /data.');
+      expect(detail).not.toContain('all volumes');
+    }
+    expect(Messages.containerRecreatedDamaged(['/data'])).toContain('without a name: /data.');
+    expect(Messages.containerRecreatedDamaged()).not.toContain('without a name');
   });
 });

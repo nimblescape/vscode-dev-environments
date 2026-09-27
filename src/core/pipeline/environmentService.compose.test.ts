@@ -3243,8 +3243,15 @@ describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
 
 describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
   const PASSWD_DAMAGED = 'Error response from daemon: unable to find user vscode: no matching entries in passwd file';
-  /** Review round 1 (D2): Compose labels each container with the ID of its image; the fake image ID of DB_IMAGE. */
-  const DB_IMAGE_ID = { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}` };
+  /**
+   * Review round 1 (D2): Compose labels each container with the ID of its image (the fake image ID of DB_IMAGE); review
+   * round 2: and with the configuration hash of its service (serviceHashes of the fake helper, set below).
+   */
+  const DB_IMAGE_ID = { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' };
+
+  beforeEach(() => {
+    h.helper.serviceHashes = { app: 'hash-of-app', db: 'hash-of-db' };
+  });
 
   /**
    * `up` of the existing containers fails because the dev container is damaged: like the CLI, the failed `up` leaves the
@@ -3286,7 +3293,7 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
     expect(devContainer()).toMatchObject({ name: NAME, state: 'running', image: IMAGE_1 });
     expect(devContainer()?.id).not.toBe(dev?.id);
-    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged);
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged());
   });
 
   it('a running dev container that the remote user cannot use: only it is recreated', async () => {
@@ -3444,5 +3451,104 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  describe('review round 2 (E1–E3): the direct check of the other services right before up', () => {
+    /** A first open creates the containers as Compose does (their labels: the hash of the model, the image ID). */
+    async function openedEnvironment(): Promise<{ devId: string; dbId: string }> {
+      h.helper.serviceHashes = undefined;
+      await h.service.open(TARGET, options());
+      for (const c of h.docker.containersOf(ENV_ID)) {
+        c.state = 'stopped';
+        c.rawState = 'exited';
+      }
+      h.ui.prompts.length = 0;
+      h.docker.log.length = 0;
+      return { devId: String(devContainer()?.id), dbId: String(dbContainer()?.id) };
+    }
+
+    async function expectRefusedAfterAnswer(dbId: string, devId: string): Promise<void> {
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('startFailed');
+      expect(error.detail).toBe(Messages.composeServicesWouldBeRecreated('db'));
+      expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+      // Nothing was stopped or removed; no `up` replaced anything.
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+      expect(dbContainer()?.id).toBe(dbId);
+      expect(devContainer()?.id).toBe(devId);
+      expect(h.helper.calls.filter((call) => call.includes('--remove-existing-container'))).toEqual([]);
+      expect(h.logger.warnings.some((line) => line.startsWith(`Docker Compose would create the service db of ${REPO} again`))).toBe(true);
+      expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    }
+
+    it('the happy path: the hashes of the exact up model and the image IDs match; only the dev container is recreated', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+
+      await h.service.openEnvironment(ENV_ID, options());
+
+      // The hashes come from the model that `up` got.
+      expect(h.helper.hashModels.at(-1)).toBe(h.helper.ups.at(-1)?.files?.[COMPOSE_MODEL_PATH]);
+      expect(h.helper.calls.indexOf(`composeServiceHashes ${PROJECT}`)).toBeLessThan(h.helper.calls.lastIndexOf(`up ${IMAGE_1} --remove-existing-container`));
+      expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${devId}`]);
+      expect(dbContainer()?.id).toBe(dbId);
+      expect(devContainer()?.id).not.toBe(devId);
+    });
+
+    it('E1: the host access checks were turned off after the containers were created: no recreation, nothing removed', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('E2: a build record rewritten without new containers, but the database container from an older Compose (another hash)', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      const db = h.docker.containers.get(dbId);
+      if (db) db.labels['com.docker.compose.config-hash'] = 'hash-of-an-older-compose';
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('E3: the tag of the database image moves while the question is open: no recreation, nothing removed', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateContainer = async (repository) => {
+        h.ui.prompts.push(`recreateContainer ${repository}`);
+        // Another environment pulled a newer postgres:16.
+        h.docker.imageIds.set(DB_IMAGE, 'sha256:a-newer-postgres');
+        return true;
+      };
+      await expectRefusedAfterAnswer(dbId, devId);
+    });
+
+    it('a container without the hash label, or a failed hash computation: no recreation', async () => {
+      const { devId, dbId } = await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      h.helper.serviceHashes = new CommandError('docker compose config --hash', 1, '', 'unknown flag: --hash');
+      await expectRefusedAfterAnswer(dbId, devId);
+      expect(h.logger.warnings.some((line) => line.includes('could not be computed'))).toBe(true);
+    });
+  });
+
+  it('review round 2 (V1): the folders of the dev container in volumes without a name are named; nothing removes them', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running', dbLabels: DB_IMAGE_ID });
+    const dev = devContainer();
+    const anonymous = 'b'.repeat(64);
+    if (dev) h.docker.containers.set(dev.id, { ...dev, mountTargets: [{ type: 'volume', volume: anonymous, target: `${FOLDER}/node_modules` }] });
+    h.docker.volumes.set(anonymous, {});
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+
+    await h.service.openEnvironment(ENV_ID, options());
+
+    expect(h.ui.recreateQuestions[0].detail).toBe(Messages.containerRecreateDetail(true, [`${FOLDER}/node_modules`]));
+    expect(h.progress.details).toContain(Messages.containerRecreatedDamaged([`${FOLDER}/node_modules`]));
+    expect(h.docker.volumes.has(anonymous)).toBe(true);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
   });
 });

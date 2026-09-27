@@ -18,6 +18,7 @@ import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
+  COMPOSE_HASH_SCRIPT,
   COMPOSE_MODEL_SCRIPT,
   CREATE_FOLDERS_SCRIPT,
   GIT_FILES_SCRIPT,
@@ -1260,6 +1261,21 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
     expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT, '/workspaces/api', ...files]);
     expect(COMPOSE_MODEL_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it('composeServiceHashes (recreate offer, review round 2): the hash script on the model at the path of up, without the Docker socket and network', async () => {
+    const hash = 'c'.repeat(64);
+    docker.handler = () => ({ stdout: `app ${hash}\ndb ${hash}\n` });
+    const hashes = await createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{"services":{}}', project: 'devenv-3f2a9c1e' });
+    expect(docker.runs[0].options.input).toBe('{"services":{}}');
+    expect(hashes).toEqual(new Map([['app', hash], ['db', hash]]));
+    const run = docker.runs[0];
+    expect(hasDockerAccess(run.args)).toBe(false);
+    expect(hasNoNetwork(run.args)).toBe(true);
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_HASH_SCRIPT, COMPOSE_MODEL_PATH, 'devenv-3f2a9c1e']);
+    docker.handler = () => ({ exitCode: 1, stderr: 'unknown flag: --hash' });
+    await expect(createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{}', project: 'p' })).rejects.toBeInstanceOf(CommandError);
   });
 
   it('composeModel returns the message of Docker Compose, and throws when the helper fails', async () => {
