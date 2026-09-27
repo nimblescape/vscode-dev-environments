@@ -328,9 +328,13 @@ ${extra}volumes:
     const entry = await registry.get(app.id);
     expect(entry?.buildRecord).toMatchObject({
       environmentImage: `${environmentImageRepository(app.id)}:1`,
-      // Review round 9 (D9-1): the paths of the repository that db mounts, which the ownership fixes leave out.
-      compose: { service: 'app', images: [`${app.project}-app`], serviceFolders: [`${app.folder}/seed`, `${app.folder}/init.sql`] },
+      compose: { service: 'app', images: [`${app.project}-app`] },
     });
+    // Review round 10, F1/F3 (was D9-1): the paths that other services mount are on the entry, not the build record, and
+    // read-only mounts are not recorded: db mounts seed and init.sql read-only, so neither is left out of the ownership fixes.
+    expect(entry?.buildRecord?.compose).not.toHaveProperty('serviceFolders');
+    expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/seed`]));
+    expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/init.sql`]));
     expect(entry?.buildRecord?.images).toHaveProperty([TEST_BASE_IMAGE]);
     expect(entry?.additionalVolumes).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
   });
