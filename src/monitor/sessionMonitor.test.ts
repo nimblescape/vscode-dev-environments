@@ -313,4 +313,27 @@ describe('sessionMonitor bundle', () => {
     },
     20_000,
   );
+  // CI of PR #27 (2026-09-27): the start line was logged before the signal handlers were installed, so a SIGTERM right
+  // after it could end the monitor by the default action of the signal (exit code null, lock left behind).
+  it.skipIf(process.platform === 'win32')(
+    'ends cleanly on SIGTERM sent right after its start line',
+    async () => {
+      for (let run = 0; run < 10; run++) {
+        const root = storageRoot();
+        writeLiveWindow(root);
+        const child = start([root]);
+        const exit = exitOf(child);
+        // Polls on every turn of the event loop, so the signal follows the start line as closely as possible.
+        const until = Date.now() + 10_000;
+        while (!readLog(root).includes('Session Monitor started')) {
+          if (Date.now() > until) throw new Error('Timeout while waiting for the start line.');
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        child.kill('SIGTERM');
+        expect(await exit).toBe(0);
+        expect(fs.existsSync(path.join(root, 'monitor.lock'))).toBe(false);
+      }
+    },
+    60_000,
+  );
 });

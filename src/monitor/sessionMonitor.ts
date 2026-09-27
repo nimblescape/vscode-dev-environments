@@ -78,9 +78,6 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
 
   const release = (): void => releaseMonitorLock(paths.monitorLock);
   process.once('exit', release);
-  logger.info(
-    `Session Monitor started (protocol version ${MONITOR_PROTOCOL_VERSION}, Node.js ${process.version}, ${process.platform}).`,
-  );
 
   let exitRequested = false;
   // Checked in every tick (refreshLock): a window of a newer version asks this monitor to exit. It ends after its
@@ -122,6 +119,11 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
   process.on('SIGHUP', onHangUp);
   process.on('uncaughtException', onFatal);
   process.on('unhandledRejection', onFatal);
+  // Logged only after the signal handlers are in place: a SIGTERM that follows this line must end the monitor cleanly,
+  // not by the default action of the signal (which leaves the lock and the exit code unset).
+  logger.info(
+    `Session Monitor started (protocol version ${MONITOR_PROTOCOL_VERSION}, Node.js ${process.version}, ${process.platform}).`,
+  );
 
   try {
     const reason = await loop.run();
