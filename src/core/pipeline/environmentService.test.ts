@@ -12,6 +12,7 @@ import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { hostAccessProblems } from '../helper/hostAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
   ANALYSIS_FAILED_ITEM,
   analysisFailure,
@@ -2822,7 +2823,7 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('refuses the image of another environment, also with the registry of Docker Hub, and FROM it (S4)', async () => {
+  it('refuses the image of another environment, also with the registry of Docker Hub, and allows FROM it (S4)', async () => {
     h.helper.config = { image: 'docker.io/library/devenv-7c1d2e3f:2' };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 of another environment'));
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
@@ -2831,32 +2832,60 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
       dockerfilePath: '.devcontainer/Dockerfile',
       dockerfileText: 'FROM devenv-7c1d2e3f:2\n',
     };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
-    expect(h.helper.builds).toEqual([]);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`.
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('checks the Dockerfile at the path that the resolved configuration names (review round 2, S2-01)', async () => {
+  it('reads the Dockerfile at the path that the resolved configuration names for the update check (review round 2, S2-01)', async () => {
     // The text names the Dockerfile with a variable of the computer; the CLI resolves it (here to its default).
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
     h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
-    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
-    expect(h.helper.builds).toEqual([]);
-    // Its FROM images are the references of the image check too.
-    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM node:24\n' };
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`.
     await h.service.open(TARGET, options());
-    expect(h.checker.calls.at(-1)?.images).toEqual(['node:24']);
+    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
+    expect(h.helper.builds).toHaveLength(1);
+    // Its FROM images are the references of the image check.
+    expect(h.checker.calls.at(-1)?.images).toEqual(['devenv-7c1d2e3f:2']);
   });
 
-  it('refuses a configured Dockerfile that cannot be read (review round 2, S2-01)', async () => {
+  it('refuses a configured Dockerfile that cannot be read as protected, whatever the switch says (review round 2, S2-01; U2)', async () => {
     h.helper.config = { build: { dockerfile: 'missing.Dockerfile' } };
     // Review round 3, P3-1: changed setup, a Dockerfile that exists but cannot be read (for example a link out of the
     // repository); a missing one is an error of the configuration (the tests of review round 3).
     h.helper.unreadableDockerfiles = ['.devcontainer/missing.Dockerfile'];
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.unsupportedOptions('Dockerfile missing.Dockerfile (it could not be read, so its images cannot be checked)'));
+    // review, U1/U2: refused again (protected), not for its images: the CLI and BuildKit in the workspace helper would
+    // read the file that the link points to (for example the token) as the Dockerfile.
+    const item = 'Dockerfile missing.Dockerfile (the Dockerfile is a link out of the repository or could not be read)';
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(item));
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(item));
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a Dockerfile longer than MAX_DOCKERFILE_LENGTH as not supported, and allows a normal one (U1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    // What READ_FILES_SCRIPT returns of a longer Dockerfile: MAX_DOCKERFILE_LENGTH + 1 characters.
+    const long = `FROM alpine\n#${'x'.repeat(MAX_DOCKERFILE_LENGTH - 12)}`;
+    expect(long.length).toBe(MAX_DOCKERFILE_LENGTH + 1);
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': long };
+    const item = `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions(item));
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions(item));
+    expect(h.helper.builds).toEqual([]);
+    // Exactly MAX_DOCKERFILE_LENGTH characters, and a normal Dockerfile: built.
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': long.slice(0, -1) };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows a normal Dockerfile (U1, U2)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\nRUN echo hi\n' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 
   it('refuses an image that Docker would find by the prefix of its ID, and allows an image named with hexadecimal characters (review round 2, S2-05)', async () => {
@@ -2865,11 +2894,12 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
     h.helper.config = { image: 'a1b2c3d4' };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('image a1b2c3d4 (an image ID; name the image)'));
-    // In the Dockerfile too.
+    // Not in the Dockerfile. Dockerfile refusals removed (user decision 2026-09-27): before, `COPY --from image a1b2c3d4
+    // (an image ID; name the image)`.
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
     h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine\nCOPY --from=a1b2c3d4 /a /a\n' };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('COPY --from image a1b2c3d4 (an image ID; name the image)'));
-    expect(h.helper.builds).toEqual([]);
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
     // An image whose name is `a1b2c3d4`: Docker names it by that name.
     h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['a1b2c3d4:latest'], repoDigests: [] });
     h.helper.config = { image: 'a1b2c3d4' };
@@ -3548,7 +3578,7 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
     expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
   });
 
-  it('still refuses a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1)', async () => {
+  it('refuses a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1, U2)', async () => {
     await seedEnvironment(h, { container: 'stopped', record: { configHash: configHash(MISSING_TEXT) } });
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT };
     for (const [dockerfile, unreadable] of [
@@ -3558,11 +3588,14 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
       h.helper.config = { build: { dockerfile } };
       h.helper.dockerfiles = {};
       h.helper.unreadableDockerfiles = [...unreadable];
+      // review, U1/U2: refused again (protected), as before the Dockerfile refusals were removed (then as not supported,
+      // for its images): the CLI would read the file that it points to as the Dockerfile.
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('hostAccess');
-      expect(error.message).toBe(Messages.unsupportedOptions(`Dockerfile ${dockerfile} (it could not be read, so its images cannot be checked)`));
+      expect(error.message).toBe(Messages.hostAccess(`Dockerfile ${dockerfile} (the Dockerfile is a link out of the repository or could not be read)`));
     }
     expect(h.helper.ups).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
   });
 
   it('detects a change of the Dockerfile that the configuration names with a variable (P3-2)', async () => {
@@ -3582,14 +3615,14 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
     expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
   });
 
-  it('checks the images of a Dockerfile with the build arguments and target of build.options (S3-2)', async () => {
+  it('allows the images of a Dockerfile with the build arguments and target of build.options (S3-2)', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile' };
     h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'ARG BASE=alpine:3.22\nFROM ${BASE} AS a\nFROM devenv-7c1d2e3f:2 AS b\n' };
     h.helper.config = { build: { dockerfile: 'Dockerfile', args: { BASE: 'alpine:3.22' }, options: ['--build-arg', 'BASE=devenv-7c1d2e3f:1'] } };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(
-      Messages.hostAccess('FROM image devenv-7c1d2e3f:1 of another environment, FROM image devenv-7c1d2e3f:2 of another environment'),
-    );
-    expect(h.helper.builds).toEqual([]);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:1 of another environment,
+    // FROM image devenv-7c1d2e3f:2 of another environment`.
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 });
 
@@ -3733,8 +3766,10 @@ describe('review round 9 (S9-1, S9-3): the bounds of the extension host', () => 
 
   it('asks Docker about the image IDs of all references with one call, and not at all when the configuration is refused (S9-3)', async () => {
     await seedEnvironment(h, { container: 'stopped' });
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "build": { "dockerfile": "Dockerfile" } }`, dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: `FROM ${BASE_IMAGE}\n` };
-    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    // Dockerfile refusals removed (user decision 2026-09-27): changed setup, the FROM image of a Dockerfile is no image
+    // reference for this question any more; the `image` and a `--build-context` image of the configuration are.
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${BASE_IMAGE}" }` };
+    h.helper.config = { image: BASE_IMAGE, build: { options: ['--build-context', 'tools=docker-image://alpine:3.22'] } };
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
     expect(h.docker.imageInspections).toHaveLength(1);
     h.docker.imageInspections.length = 0;
@@ -3776,15 +3811,14 @@ describe('review round 19 (S19-4, P19-2): the checks of a single container befor
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: text };
   }
 
-  it('S19-4: a refused image of the Dockerfile leads to no read of the merged configuration', async () => {
-    // slim-down: the base image that only the Dev Container CLI reads is no longer checked; a FROM image that Docker
-    // reads keeps the order of the reads under test.
+  it('S19-4: an image of another environment in the Dockerfile is allowed, and the merged configuration is read after the checks', async () => {
     useDockerfile(`${BASE}FROM devenv-0badc0de:3 AS y\n`);
     h.helper.merged = { privileged: false };
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.hostAccess('FROM image devenv-0badc0de:3 of another environment'));
-    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }]);
-    expect(h.helper.builds).toEqual([]);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-0badc0de:3 of another environment`,
+    // and no read of the merged configuration.
+    await h.service.open(TARGET, options());
+    expect(h.helper.readConfigurations.slice(0, 2)).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }, { configPath: DEFAULT_CONFIG_PATH }]);
+    expect(h.helper.builds).toHaveLength(1);
   });
 
   it('S19-4: a refused configuration leads to no read of the merged configuration, and the merged one is still checked', async () => {

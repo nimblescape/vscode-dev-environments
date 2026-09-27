@@ -14,15 +14,7 @@
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
 import * as path from 'path';
-import {
-  analyzeDockerfileImages,
-  cutAtSpace,
-  MAX_NESTING,
-  MAX_REFERENCE_LENGTH,
-  SHELL_NAME,
-  type DockerfileImages,
-  type ImageReferenceKind,
-} from '../imageCheck/dockerfile';
+import { MAX_DOCKERFILE_LENGTH, MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
   COMPOSE_CLEARED_LABELS,
@@ -107,13 +99,17 @@ export interface HostAccessInput {
   /** The folder of the repository in the workspace helper (for example `/workspaces/api`), for isHelperPath. */
   repositoryFolder?: string;
   /**
-   * The Dockerfile of a single container, read at the path that the configuration names after the CLI resolved its
-   * variables (review round 2, S2-01): the images that it names (dockerfileImageFindings).
+   * The length of the Dockerfile of a single container, read at the path that the configuration names after the CLI
+   * resolved its variables (review round 2, S2-01), at most MAX_DOCKERFILE_LENGTH + 1 characters (READ_FILES_SCRIPT).
+   * A longer Dockerfile is refused as not supported (U1): the configuration hash would see only its start. Its content
+   * is not checked (Dockerfile refusals removed, user decision 2026-09-27).
    */
-  dockerfileText?: string;
+  dockerfileLength?: number;
   /**
-   * The Dockerfile that the configuration of a single container names, when it could not be read (review round 2,
-   * S2-01): refused as not supported, because the images that it names would escape the checks.
+   * The Dockerfile that the configuration of a single container names (as written), when it exists but could not be
+   * read (U2): a link out of the repository (for example into the folder with the token or the cache volume), a real
+   * path outside of it, or a path with a variable that is not resolved. Refused whatever the switch says (`protected`):
+   * the CLI and BuildKit in the workspace helper would read that file as the Dockerfile.
    */
   dockerfileUnreadable?: string;
   /**
@@ -510,11 +506,7 @@ function applicable(problems: readonly Problem[], checksOn: boolean): Problem[] 
   return checksOn ? [...problems] : problems.filter((problem) => problem.class !== 'computer');
 }
 
-function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
-  return withDockerfileCache(() => readHostAccessFindings(input, checksOn));
-}
-
-function readHostAccessFindings(original: HostAccessInput, checksOn: boolean): Problem[] {
+function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Problem[] {
   // First, and alone (hotfix review 2, P2): the other checks take more than linear time on some texts.
   const tooLong = textLengthProblems(original);
   if (tooLong.length > 0) return tooLong;
@@ -589,7 +581,7 @@ function readHostAccessFindings(original: HostAccessInput, checksOn: boolean): P
   // of the owner account: stays refused with the checks off.
   for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(environmentProblems(source));
   // The build of a single container: no folder of the workspace helper as its context or Dockerfile, and no image of
-  // another environment (as image, FROM image, or additional context). Not the merged configuration: it holds the
+  // another environment (as image, or additional context). Not the merged configuration: it holds the
   // values of the configuration, and the image of an existing container.
   if (input.config) add(singleBuildProblems(input.config, input));
   return [...problems.values()];
@@ -619,13 +611,16 @@ function secondPassProblems(what: string, entries: readonly unknown[]): Problem[
  * (isHelperPath) stays refused whatever the switch says; the CLI builds in the helper, where the cache volume, the
  * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
  * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
- * of the computer), and the check does not resolve its links. `image`, and the images of the Dockerfile: no image of
- * another environment, and no image ID (imageReferenceFinding), with the build arguments and the target of `build.args`,
- * `build.target`, and `build.options` as the CLI passes them (singleBuildArguments, review round 3, S3-2).
+ * of the computer), and the check does not resolve its links. `image`: no image of another environment, and no image
+ * ID (imageReferenceFinding). The content of the Dockerfile is not checked (Dockerfile refusals removed, user decision
+ * 2026-09-27): it runs as trusted code. The Dockerfile itself is: a Dockerfile that is a link out of the repository or
+ * could not be read is refused whatever the switch says (dockerfileUnreadable, U2), and one longer than
+ * MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength, U1).
  */
 function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
   const problems: Problem[] = [];
   const build = isRecord(config.build) ? config.build : {};
+  let dockerfileRefused = false;
   if (input.configFolder !== undefined && input.repositoryFolder !== undefined) {
     const repository = input.repositoryFolder;
     const context = typeof build.context === 'string' ? build.context : typeof config.context === 'string' ? config.context : undefined;
@@ -635,11 +630,24 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
       // (path.posix.resolve against the folder of the configuration), so `x://../../devenv-cache` is a folder.
       if (value === undefined || value.trim() === '') continue;
       const resolved = path.posix.resolve(input.configFolder, value.trim());
-      if (isHelperPath(resolved, repository)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+      if (isHelperPath(resolved, repository)) {
+        problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+        if (what === 'Dockerfile') dockerfileRefused = true;
+      }
       else if (what === 'build context' && resolved !== repository && !resolved.startsWith(`${repository}/`)) {
         problems.push(guarded(`${what} ${value} (outside of the repository)`));
       }
     }
+  }
+  // U2: a Dockerfile that exists but could not be read (a link out of the repository, a real path outside of it), unless
+  // its path as written is refused already. Checked on the path that the CLI resolved, whatever the switch says.
+  if (input.dockerfileUnreadable !== undefined && !dockerfileRefused) {
+    problems.push(guarded(`Dockerfile ${input.dockerfileUnreadable} (the Dockerfile is a link out of the repository or could not be read)`));
+  }
+  // U1: a size limit, not a check of the content: the configuration hash sees at most MAX_DOCKERFILE_LENGTH + 1
+  // characters, so an edit after them would offer no rebuild.
+  if (input.dockerfileLength !== undefined && input.dockerfileLength > MAX_DOCKERFILE_LENGTH) {
+    problems.push(unsupported(`the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`));
   }
   if (typeof config.image === 'string') {
     const finding = imageReferenceFinding(config.image);
@@ -651,49 +659,7 @@ function singleBuildProblems(config: Record<string, unknown>, input: HostAccessI
       if (isRecord(value)) problems.push(unsupported(`build.args ${name} (an object; the value of a build argument is a text)`));
     }
   }
-  if (input.dockerfileText !== undefined) {
-    const { args, target } = singleBuildArguments(build);
-    problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
-  } else if (input.dockerfileUnreadable !== undefined) {
-    problems.push(unsupported(`Dockerfile ${input.dockerfileUnreadable} (it could not be read, so its images cannot be checked)`));
-  }
   return problems;
-}
-
-/**
- * The build arguments and the target of the build of a single container as `docker build` gets them (review round 3,
- * S3-2): the CLI 0.89.0 passes `--target` of `build.target`, then `--build-arg` of each `build.args`, then
- * `build.options`, and the last value of an argument or of the target wins. `--build-arg NAME` without a value takes the
- * value of the variable NAME of the workspace helper, or (buildx drops it when the helper has no such variable) the
- * earlier value or the default of the ARG: it stays `${NAME}` here, and buildArgOptionProblems refuses it (review round
- * 4, S4-1). Review round 5 (S5-2): each value of `build.args` as the CLI's template literal `${k}=${v}` makes it a
- * text (`String(value)`: an array gives its items with commas, `null` gives `null`); singleBuildProblems refuses an
- * object.
- */
-export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
-  const fromArgs: Record<string, string> = {};
-  if (isRecord(build.args)) {
-    for (const [name, value] of Object.entries(build.args)) fromArgs[name] = String(value);
-  }
-  // Review round 18 (S18-1): a Map, then own properties (Object.fromEntries), so that `--build-arg __proto__=…` of
-  // `build.options`, which the CLI passes to `docker build` as it is, stays an argument. `build.args` above keeps its
-  // assignment: the CLI's parser of devcontainer.json drops a key `__proto__` with a text value too.
-  const args = new Map(Object.entries(fromArgs));
-  let target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
-  if (Array.isArray(build.options)) {
-    for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
-      if (flag.value === undefined) continue;
-      if (flag.name === '--build-arg') {
-        const equals = flag.value.indexOf('=');
-        if (equals < 0) args.set(flag.value, `\${${flag.value}}`);
-        else if (equals > 0) args.set(flag.value.slice(0, equals), flag.value.slice(equals + 1));
-      } else if (flag.name === '--target') {
-        target = flag.value !== '' ? flag.value : undefined;
-      }
-    }
-  }
-  const texts = Object.fromEntries(args);
-  return target !== undefined ? { args: texts, target } : { args: texts };
 }
 
 /** An image reference of a configuration, and how an item names it (for example `FROM image`). */
@@ -703,80 +669,14 @@ export interface NamedImageReference {
 }
 
 /**
- * The image references that a Dockerfile names without a variable that is not resolved (extractImageReferences), for
- * the question whether Docker takes one of them for an image ID (resolvedByImageId, review round 2, S2-05).
- * `_target`: not used (review round 3, S3-3, see dockerfileImageFindings).
+ * The image references of a single container (review round 2, S2-05): `image`, and the images of `--build-context` of
+ * `build.options`. The images of its Dockerfile are not asked about (Dockerfile refusals removed, user decision
+ * 2026-09-27).
  */
-export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
-  return dockerfileReferences(text, args)
-    .references.filter(({ reference, unchecked, tooLong }) => !reference.includes('$') && unchecked === undefined && tooLong === undefined)
-    .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
-}
-
-/**
- * Every image reference of the Dockerfile (extractImageReferences) of all stages, whatever the target (review round 3,
- * S3-3: the target stage can use a later stage with `COPY --from`), and the frontend that the build argument
- * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
- */
-function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
-  // Review round 8 (S8-4): one analysis for each Dockerfile and its build arguments within one check.
-  const cache = activeDockerfileCache;
-  const key = cache !== undefined ? JSON.stringify([text, Object.entries(args).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))]) : '';
-  const cached = cache?.get(key);
-  if (cached !== undefined) return cached;
-  const images = analyzeDockerfileReferences(text, args);
-  cache?.set(key, images);
-  return images;
-}
-
-/**
- * Review round 8 (S8-4): the analyses of the Dockerfiles (dockerfileReferences) of the check that runs, by the text and
- * the build arguments (the target does not matter, see dockerfileImageFindings); `undefined` outside of one.
- */
-let activeDockerfileCache: Map<string, DockerfileImages> | undefined;
-
-/**
- * Runs `fn` as one check (review round 8, S8-4): a Dockerfile that several services (or the report and the image
- * references) read with the same build arguments is analysed once. Nested calls share the cache of the outer one.
- */
-export function withDockerfileCache<T>(fn: () => T): T {
-  if (activeDockerfileCache !== undefined) return fn();
-  activeDockerfileCache = new Map();
-  try {
-    return fn();
-  } finally {
-    activeDockerfileCache = undefined;
-  }
-}
-
-function analyzeDockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
-  const images = analyzeDockerfileImages(text, { ...args }, { withStages: true });
-  // Review round 7 (S7-2): a Dockerfile that is too large is refused (dockerfileImageFindings), BUILDKIT_SYNTAX with it;
-  // review round 8 (S8-2): so is one that is too complex.
-  if (images.tooLarge === true || images.tooComplex === true) return images;
-  const references = images.references;
-  // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
-  const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
-  if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
-    references.unshift({ reference: syntax, kind: 'syntax' });
-  }
-  return images;
-}
-
-/**
- * The image references of a single container (review round 2, S2-05): `image`, the images of its Dockerfile
- * (dockerfileImageReferences, with `build.args` and `build.target`), and the images of `--build-context` of
- * `build.options`.
- */
-export function singleImageReferences(config: Readonly<Record<string, unknown>>, dockerfileText: string | undefined): NamedImageReference[] {
+export function singleImageReferences(config: Readonly<Record<string, unknown>>): NamedImageReference[] {
   const references: NamedImageReference[] = [];
   if (typeof config.image === 'string' && config.image.trim() !== '') references.push({ reference: config.image.trim(), what: 'image' });
   const build = isRecord(config.build) ? config.build : {};
-  if (dockerfileText !== undefined) {
-    // Review round 3 (S3-2): with the build arguments of `build.options`.
-    const { args, target } = singleBuildArguments(build);
-    references.push(...dockerfileImageReferences(dockerfileText, args, target));
-  }
   if (Array.isArray(build.options)) {
     for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
       if (flag.name !== '--build-context' || flag.value === undefined) continue;
@@ -785,208 +685,6 @@ export function singleImageReferences(config: Readonly<Record<string, unknown>>,
     }
   }
   return references;
-}
-
-/** How an item names an image of a Dockerfile, by where the Dockerfile names it. */
-const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
-  FROM: 'FROM image',
-  'COPY --from': 'COPY --from image',
-  'RUN --mount from': 'RUN --mount image',
-  syntax: 'syntax image',
-};
-
-/**
- * The images that a Dockerfile names (extractImageReferences: FROM, `COPY --from`, `RUN --mount=…,from=`, the
- * directive `# syntax=`, and the build argument BUILDKIT_SYNTAX) that a configuration may not use (imageReferenceFinding,
- * D-17, review round 2, S2-02). The stages of the whole file count, whatever `_target` says (review round 3, S3-3). A
- * reference whose variable could not be resolved is refused when the text before its first `$` already names an image of
- * the namespace of Dev Environments (for example `devenv-$SUFFIX`), or when its text holds `devenv` anywhere (review
- * round 3, S3-4: for example `devenv${TARGETVARIANT}-…`, where the variable is empty on most platforms); any other one
- * cannot be told apart and is left. Review round 4: the rule on `devenv` anywhere does not apply to a reference with a
- * registry other than Docker Hub before the first `$` (S4-6, namedRegistry); the pattern operators of variables are
- * evaluated, and a form that cannot be evaluated is refused (S4-3, DockerfileImageReference.unchecked); a frontend
- * (`# syntax=`, BUILDKIT_SYNTAX) other than the official Dockerfile frontends is refused (S4-4, isOfficialFrontend).
- */
-export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
-  const findings: HostAccessFinding[] = [];
-  const images = dockerfileReferences(text, args);
-  // Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS.
-  if (images.tooLarge === true) return [{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }];
-  // Review round 8 (S8-2): its expansions made more than MAX_EXPANDED_CHARACTERS characters.
-  if (images.tooComplex === true) return [{ item: 'Dockerfile (the Dockerfile is too complex to check)', class: 'unsupported' }];
-  // Review round 7 (S7-2): each stage name once, with the index of its first FROM (a reference names the first
-  // `stagesBefore` of them as stages), instead of a Set for each reference.
-  const firstStage = new Map<string, number>();
-  images.stageNames.forEach((name, index) => {
-    if (!firstStage.has(name)) firstStage.set(name, index);
-  });
-  for (const { reference, kind, unchecked, tooLong, tooComplex, stagesBefore } of images.references) {
-    const what = DOCKERFILE_IMAGE_WHAT[kind];
-    if (unchecked === 'protected') {
-      findings.push({ item: `${what} ${shortReference(reference)} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
-      continue;
-    }
-    // Review round 6 (S6-1): before the variants, whose number grows with the length.
-    if (tooLong === true || reference.length > MAX_REFERENCE_LENGTH) {
-      findings.push(tooLongFinding(reference, what));
-      continue;
-    }
-    // Review round 7 (S7-1): the Dockerfile ran out of the budget of the pattern matcher.
-    if (tooComplex === true) {
-      findings.push({ item: `${what} ${shortReference(reference)} (the Dockerfile is too complex to check)`, class: 'unsupported' });
-      continue;
-    }
-    if (unchecked === 'unsupported') {
-      findings.push({ item: `${what} ${reference} (uses a variable form that Dev Environments cannot check)`, class: 'unsupported' });
-      continue;
-    }
-    if (kind === 'syntax' && !isOfficialFrontend(reference) && (reference.includes('$') || imageReferenceFinding(reference, what) === undefined)) {
-      findings.push({
-        item: `${what} ${reference} (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)`,
-        class: 'protected',
-      });
-      continue;
-    }
-    if (!reference.includes('$')) {
-      const finding = imageReferenceFinding(reference, what);
-      if (finding) findings.push(finding);
-      continue;
-    }
-    // Review round 6 (P6-2): a variant that names a stage (by its name, or by its index for `COPY --from` and
-    // `RUN --mount from`) is no image, as extractImageReferences leaves out such a resolved text.
-    const isStage = (name: string): boolean => (firstStage.get(name) ?? Infinity) < (stagesBefore ?? 0);
-    const isImage = (variant: string): boolean => !isStage(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
-    const finding = unresolvedReferenceFinding(reference, what, isImage);
-    if (finding) findings.push(finding);
-  }
-  return findings;
-}
-
-/**
- * The finding of an image reference with a variable that is not resolved (a `$`): refused (`protected`) when the text
- * before its first `$` already names an image of the namespace of Dev Environments, or when its text holds `devenv`
- * anywhere (review round 3, S3-4), except behind a registry other than Docker Hub (review round 4, S4-6); and when one of
- * the texts that it can become (unresolvedVariants, review round 5, S5-1: its variables empty, or giving an operand of
- * `:-` or `:+`) for which `isImage` holds names such an image or has the form of an image ID. `undefined` otherwise.
- */
-function unresolvedReferenceFinding(reference: string, what: string, isImage: (variant: string) => boolean = () => true): HostAccessFinding | undefined {
-  const dollar = reference.indexOf('$');
-  const prefix = reference.slice(0, dollar).trim();
-  if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
-    return { item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' };
-  }
-  const variants = unresolvedVariants(reference)?.filter(isImage);
-  if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
-    return {
-      item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
-      class: 'protected',
-    };
-  }
-  return undefined;
-}
-
-/**
- * Review round 5 (S5-1): the form of an image ID or of a prefix of one (`sha256:<hex>`, hexadecimal characters), for a
- * text that a reference with a variable that is not resolved can become. Docker takes a prefix of an ID too.
- */
-const IMAGE_ID_FORM = /^(?:sha256:)?[0-9a-f]+$/i;
-/** The most texts that unresolvedVariants makes; a reference with more cannot be checked. */
-const MAX_VARIANTS = 256;
-
-/** Review round 6 (S6-1): a reference in an item, cut after 64 characters. */
-function shortReference(reference: string): string {
-  return reference.length > 64 ? `${reference.slice(0, 64)}…` : reference;
-}
-
-/** Review round 6 (S6-1): the finding of a reference longer than MAX_REFERENCE_LENGTH. */
-function tooLongFinding(reference: string, what: string): HostAccessFinding {
-  return { item: `${what} ${shortReference(reference.trim())} (the image reference is too long)`, class: 'unsupported' };
-}
-
-/**
- * The texts that an expanded image reference (extractImageReferences) can become through its variables that are not
- * resolved (review round 5, S5-1): each such variable (`$NAME`, `${NAME…}`, names as SHELL_NAME reads them) is left out,
- * and a `${NAME:-word}`, `${NAME-word}`, `${NAME:+word}`, or `${NAME+word}` also gives its word (with its own variants).
- * A `$` without a name stays. `undefined` for more than MAX_VARIANTS texts, or for a nesting of `${…}` deeper than
- * MAX_NESTING (review round 6, S6-1). The text between two variables is added in one step (review round 6, S6-1).
- */
-export function unresolvedVariants(reference: string, level = 0): string[] | undefined {
-  if (level > MAX_NESTING) return undefined;
-  let variants: string[] = [''];
-  const append = (options: readonly string[]): boolean => {
-    const next = new Set<string>();
-    for (const variant of variants) for (const option of options) next.add(variant + option);
-    variants = [...next];
-    return variants.length <= MAX_VARIANTS;
-  };
-  let i = 0;
-  while (i < reference.length) {
-    const char = reference[i];
-    if (char !== '$') {
-      const next = reference.indexOf('$', i);
-      const end = next < 0 ? reference.length : next;
-      if (!append([reference.slice(i, end)])) return undefined;
-      i = end;
-      continue;
-    }
-    if (reference[i + 1] === '{') {
-      let depth = 1;
-      let j = i + 2;
-      for (; j < reference.length && depth > 0; j++) {
-        if (reference[j] === '$' && reference[j + 1] === '{') {
-          depth++;
-          j++;
-        } else if (reference[j] === '}') depth--;
-      }
-      const inner = reference.slice(i + 2, depth === 0 ? j - 1 : reference.length);
-      const name = SHELL_NAME.exec(inner)?.[0] ?? '';
-      const operator = /^:?[-+]/.exec(inner.slice(name.length))?.[0];
-      const options = [''];
-      if (operator !== undefined) {
-        const word = unresolvedVariants(inner.slice(name.length + operator.length), level + 1);
-        if (word === undefined) return undefined;
-        options.push(...word);
-      }
-      if (!append(options)) return undefined;
-      i = j;
-      continue;
-    }
-    const name = SHELL_NAME.exec(reference.slice(i + 1))?.[0];
-    if (name === undefined) {
-      if (!append(['$'])) return undefined;
-      i++;
-      continue;
-    }
-    i += 1 + name.length;
-  }
-  return variants;
-}
-
-/** The registries of Docker Hub, whose images Docker keeps under their short names (`devenv-…` is local then). */
-const DOCKER_HUB_HOSTS: ReadonlySet<string> = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
-
-/**
- * Whether a reference names a registry other than Docker Hub before its first `/`, and its first variable (`dollar`)
- * comes after that `/` (review round 4, S4-6): such an image is never a local image of Dev Environments, whatever the
- * variable gives (`ghcr.io/example/devenv-base:${TARGETARCH}`). A registry host has a `.` or a `:` (`localhost:5000`).
- */
-function namedRegistry(reference: string, dollar: number): boolean {
-  const slash = reference.indexOf('/');
-  if (slash <= 0 || dollar < slash) return false;
-  const host = reference.slice(0, slash).trim().toLowerCase();
-  return /[.:]/.test(host) && !DOCKER_HUB_HOSTS.has(host);
-}
-
-/**
- * Whether a frontend (`# syntax=`, BUILDKIT_SYNTAX) is one of the official Dockerfile frontends (review round 4, S4-4):
- * `docker/dockerfile` or `docker/dockerfile-upstream` of Docker Hub (also written with `docker.io/`, `index.docker.io/`,
- * or `registry-1.docker.io/`), with any tag (also the `-labs` ones) and any digest. Any other frontend is a program of
- * its own that builds with the images of the local store, also those of other environments (D-17).
- */
-export function isOfficialFrontend(reference: string): boolean {
-  return /^(?:(?:docker\.io|index\.docker\.io|registry-1\.docker\.io)\/)?docker\/dockerfile(?:-upstream)?(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?$/.test(
-    reference.trim(),
-  );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1065,6 +763,16 @@ export function localImageRepository(reference: string): string {
     .replace(/:[^/]*$/, '')
     .replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '')
     .replace(/^library\//, '');
+}
+
+/** Review round 6 (S6-1): a reference in an item, cut after 64 characters. */
+function shortReference(reference: string): string {
+  return reference.length > 64 ? `${reference.slice(0, 64)}…` : reference;
+}
+
+/** Review round 6 (S6-1): the finding of a reference longer than MAX_REFERENCE_LENGTH. */
+function tooLongFinding(reference: string, what: string): HostAccessFinding {
+  return { item: `${what} ${shortReference(reference.trim())} (the image reference is too long)`, class: 'unsupported' };
 }
 
 /**

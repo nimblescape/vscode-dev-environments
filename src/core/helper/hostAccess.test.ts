@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { devContainersSettings } from '../devContainers';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -14,6 +15,7 @@ import {
 } from '../names';
 import { helperCliVariables, mayBeSetInHelper, substituteCliVariables, unresolvedCliVariables } from './cliVariables';
 import { GITHUB_CLI_ACCOUNT_REASON, containerEnvironment, remoteEnvironment } from './containerGit';
+import { runAnalysisJob } from './configurationAnalysis';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_LISTED_ITEMS,
@@ -1147,20 +1149,50 @@ describe('foreignNetworkItem and runArgsNetworks', () => {
 });
 
 describe('the Dockerfile of a single container (review round 2, S2-01)', () => {
-  it('refuses a configured Dockerfile that could not be read as not supported', () => {
-    expect(hostAccessReport({ config: { build: { dockerfile: 'x' } }, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' })).toEqual({
-      hostAccess: [],
-      unsupported: ['Dockerfile ${localEnv:X}/Dockerfile (it could not be read, so its images cannot be checked)'],
+  it('refuses a configured Dockerfile that could not be read as protected; the update check has no FROM images of it', () => {
+    // review, U1/U2: before the Dockerfile refusals were removed, `Dockerfile ${localEnv:X}/Dockerfile (it could not be
+    // read, so its images cannot be checked)` (unsupported); now refused as protected, whatever the switch says: the CLI
+    // would read the file that a link out of the repository points to as the Dockerfile. The pipeline passes
+    // dockerfileUnreadable (resolvedDockerfile).
+    const config = { build: { dockerfile: '${localEnv:X}/Dockerfile' } };
+    for (const checksOn of [true, false]) {
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' }, checksOn, config });
+      expect(analysis.report).toEqual({ hostAccess: ['Dockerfile ${localEnv:X}/Dockerfile (the Dockerfile is a link out of the repository or could not be read)'], unsupported: [] });
+      expect(analysis.references.images).toEqual([]);
+    }
+    // Without dockerfileUnreadable (the Dockerfile was read, or the configuration names none): nothing is refused.
+    expect(runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config }).report).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  const HELPER = { configFolder: '/workspaces/api/.devcontainer', repositoryFolder: '/workspaces/api' };
+
+  it('U2: refuses a Dockerfile that is a link out of the repository (to the token or the cache volume), also with the checks off', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)';
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' }, checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
+    }
+    expect(hostAccessClassification({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' })).toEqual([{ item, class: 'protected' }]);
+    // A path of the workspace helper as written is named once, as such.
+    const cache = { build: { dockerfile: '/devenv-cache/x' } };
+    expect(hostAccessReport({ config: cache, ownVolume: OWN, ...HELPER, dockerfileUnreadable: '/devenv-cache/x' }, false)).toEqual({
+      hostAccess: ['Dockerfile /devenv-cache/x (a folder of the workspace helper)'],
+      unsupported: [],
     });
-    // The text, when it was read, is checked instead.
-    expect(hostAccessReport({ config: {}, ownVolume: OWN, dockerfileText: 'FROM devenv-11111111:1', dockerfileUnreadable: 'x' }).hostAccess).toEqual([
-      'FROM image devenv-11111111:1 of another environment',
-    ]);
+  });
+
+  it('U1: refuses a Dockerfile of MAX_DOCKERFILE_LENGTH + 1 characters as not supported, and allows a normal one', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH + 1 }, checksOn)).toEqual({ hostAccess: [], unsupported: [item] });
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH }, checksOn)).toEqual({ hostAccess: [], unsupported: [] });
+    }
   });
 });
 
 describe('the images that the Dockerfile of a single container names (review round 2, S2-02)', () => {
-  it('refuses the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
+  it('allows the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
     const dockerfileText = [
       '# syntax=docker.io/library/devenv-11111111:9',
       'FROM alpine AS base',
@@ -1170,14 +1202,14 @@ describe('the images that the Dockerfile of a single container names (review rou
       'RUN --mount=type=cache,from=devenv-44444444,target=/c true',
       'COPY --from=$IMAGE /d /d',
     ].join('\n');
-    const expected = [
-      'syntax image docker.io/library/devenv-11111111:9 of another environment',
-      'FROM image devenv-22222222${TARGETVARIANT} of another environment (a variable that is not resolved)',
-      'COPY --from image devenv-33333333:1 of another environment',
-      'RUN --mount image devenv-44444444 of another environment',
-    ];
+    const config = { build: { dockerfile: 'Dockerfile' } };
     for (const checksOn of [true, false]) {
-      expect(hostAccessReport({ config: { build: { dockerfile: 'Dockerfile' } }, ownVolume: OWN, dockerfileText }, checksOn)).toEqual({ hostAccess: expected, unsupported: [] });
+      // Dockerfile refusals removed (user decision 2026-09-27): before, the syntax, FROM, COPY --from, and RUN --mount images were refused (protected).
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn, config, dockerfileText });
+      expect(analysis.report).toEqual({ hostAccess: [], unsupported: [] });
+      expect(analysis.imageReferences).toEqual([]);
+      // The update check reads the FROM images it can resolve.
+      expect(analysis.references.images).toEqual(['alpine']);
     }
   });
 });

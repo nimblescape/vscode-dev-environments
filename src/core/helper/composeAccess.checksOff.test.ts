@@ -126,7 +126,9 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['the folder of the Docker socket as build context', input(service('db', { build: { context: '/var/run' } })), 'service db: build context /var/run', 'protected'],
   ['a context outside that links to the cache volume', input(service('db', { build: { context: '/opt/ctx' } }), { realPaths: { '/opt/ctx': '/devenv-cache/x' } }), 'service db: build context /opt/ctx', 'protected'],
   ['a Dockerfile in the cache volume', input(service('db', { build: { context: REPO, dockerfile: '/devenv-cache/Dockerfile' } })), 'service db: Dockerfile /devenv-cache/Dockerfile', 'protected'],
-  ['a local build whose Dockerfile could not be read', input(service('db', { build: { context: REPO } }), { dockerfiles: {} }), `service db: Dockerfile ${REPO}/Dockerfile (it could not be read, so its images cannot be checked)`, 'unsupported'],
+  // Dockerfile refusals removed (user decision 2026-09-27): changed row, only the Dockerfile of the dev service must be
+  // read (the build writes its text); before, any local build whose Dockerfile could not be read was refused.
+  ['a dev service whose Dockerfile could not be read', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: {} }), `service app: Dockerfile ${REPO}/Dockerfile (it could not be read, and the dev service is built from the text that Dev Environments read)`, 'unsupported'],
   // Review round 1, S4: images of other environments, however they are written, and image IDs.
   ['the image of another environment with index.docker.io', input(service('db', { image: 'index.docker.io/library/devenv-11111111:3' })), 'service db: image index.docker.io/library/devenv-11111111:3 of another environment', 'protected'],
   ['the image of another environment with registry-1.docker.io', input(service('db', { image: 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64) })), `service db: image registry-1.docker.io/devenv-11111111-db@sha256:${'a'.repeat(64)} of another environment`, 'protected'],
@@ -134,24 +136,7 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // Review round 2 (S2-05): changed row, a short prefix of an ID may be a name (the pipeline asks Docker); 64 hexadecimal
   // characters are an ID by their form.
   ['a long image ID', input(service('db', { image: 'b'.repeat(64) })), `service db: image ${'b'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
-  ['FROM the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM docker.io/devenv-11111111:2 AS base\nFROM base\n' } }), 'service db: FROM image docker.io/devenv-11111111:2 of another environment', 'protected'],
-  ['FROM the image of another environment through a build argument', input(service('db', { build: { context: REPO, args: { BASE: 'devenv-11111111:2' } } }), { dockerfiles: { db: 'ARG BASE=alpine\nFROM $BASE\n' } }), 'service db: FROM image devenv-11111111:2 of another environment', 'protected'],
-  ['FROM the image of another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'FROM devenv-11111111:2' } }), { dockerfiles: { db: 'FROM devenv-11111111:2' } }), 'service db: FROM image devenv-11111111:2 of another environment', 'protected'],
   ['an additional context of the image of another environment', input(service('db', { build: { context: REPO, additional_contexts: { base: 'docker-image://devenv-11111111:2' } } })), 'service db: build additional_contexts base image devenv-11111111:2 of another environment', 'protected'],
-  // Review round 2 (S2-02): every image that a Dockerfile names, also with a variable that is not resolved.
-  ['COPY --from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111:2 /a /a\n' } }), 'service db: COPY --from image devenv-11111111:2 of another environment', 'protected'],
-  ['RUN --mount from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nRUN --mount=type=bind,from=docker.io/devenv-11111111,target=/a true\n' } }), 'service db: RUN --mount image docker.io/devenv-11111111 of another environment', 'protected'],
-  ['the syntax directive with the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=devenv-11111111:1\nFROM alpine\n' } }), 'service db: syntax image devenv-11111111:1 of another environment', 'protected'],
-  // Review round 4 (S4-4): only the official Dockerfile frontends.
-  ['a custom frontend in the syntax directive', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=docker.io/attacker/frontend:1\nFROM alpine\n' } }), 'service db: syntax image docker.io/attacker/frontend:1 (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)', 'protected'],
-  ['a custom frontend in BUILDKIT_SYNTAX', input(service('db', { build: { context: REPO, args: { BUILDKIT_SYNTAX: 'ghcr.io/x/frontend' } } }), { dockerfiles: { db: 'FROM alpine\n' } }), 'service db: syntax image ghcr.io/x/frontend (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)', 'protected'],
-  // Review round 4 (S4-3): a pattern operator is evaluated as BuildKit evaluates it.
-  ['FROM another environment behind a pattern operator', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'ARG A=devenv-11111111:1x\nFROM ${A%x}\n' } }), 'service db: FROM image devenv-11111111:1 of another environment', 'protected'],
-  // Review round 4 (S4-1): an argument without a value (`args: [BASE]` without the variable) is dropped, so the default
-  // of the ARG applies, and the model gives it as null: the default is checked.
-  ['FROM another environment by the default of an argument without a value', input(service('db', { build: { context: REPO, args: { BASE: null } } }), { dockerfiles: { db: 'ARG BASE=devenv-11111111:1\nFROM $BASE\n' } }), 'service db: FROM image devenv-11111111:1 of another environment', 'protected'],
-  ['FROM another environment with a variable that is not resolved', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM devenv-11111111${TARGETVARIANT}\n' } }), 'service db: FROM image devenv-11111111${TARGETVARIANT} of another environment (a variable that is not resolved)', 'protected'],
-  ['COPY --from another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'x' } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111 /a /a' } }), 'service db: COPY --from image devenv-11111111 of another environment', 'protected'],
   // Review round 2 (S2-03): the files and folders that the build client reads in the workspace helper.
   ['an additional context in the cache volume', input(service('db', { build: { context: REPO, additional_contexts: { x: '/devenv-cache' } } })), 'service db: build additional_contexts x=/devenv-cache', 'protected'],
   ['an additional context that links to the folder with the token', input(service('db', { build: { context: REPO, additional_contexts: { x: `${REPO}/ctx` } } }), { realPaths: { [`${REPO}/ctx`]: '/workspaces/.devenv+' } }), `service db: build additional_contexts x=${REPO}/ctx (a link to /workspaces/.devenv+, outside of the repository)`, 'protected'],
@@ -225,6 +210,33 @@ describe('composeAccessClassification', () => {
     const checked = input(() => undefined);
     expect(composeAccessReport(checked, false)).toEqual({ hostAccess: [], unsupported: [] });
     expect(composeAccessClassification(checked)).toEqual([]);
+  });
+});
+
+// Dockerfile refusals removed (user decision 2026-09-27): the former rows of the Dockerfile images of the table (each
+// was refused, protected or unsupported); now allowed, with the checks on and off.
+describe('the Dockerfiles of the services are not checked', () => {
+  const ALLOWED = { hostAccess: [], unsupported: [] };
+  it.each<[string, ComposeAccessInput]>([
+    ['a local build whose Dockerfile could not be read', input(service('db', { build: { context: REPO } }), { dockerfiles: {} })],
+    ['FROM the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM docker.io/devenv-11111111:2 AS base\nFROM base\n' } })],
+    ['FROM the image of another environment through a build argument', input(service('db', { build: { context: REPO, args: { BASE: 'devenv-11111111:2' } } }), { dockerfiles: { db: 'ARG BASE=alpine\nFROM $BASE\n' } })],
+    ['FROM the image of another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'FROM devenv-11111111:2' } }), { dockerfiles: { db: 'FROM devenv-11111111:2' } })],
+    ['COPY --from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111:2 /a /a\n' } })],
+    ['RUN --mount from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nRUN --mount=type=bind,from=docker.io/devenv-11111111,target=/a true\n' } })],
+    ['the syntax directive with the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=devenv-11111111:1\nFROM alpine\n' } })],
+    ['a custom frontend in the syntax directive', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=docker.io/attacker/frontend:1\nFROM alpine\n' } })],
+    ['a custom frontend in BUILDKIT_SYNTAX', input(service('db', { build: { context: REPO, args: { BUILDKIT_SYNTAX: 'ghcr.io/x/frontend' } } }), { dockerfiles: { db: 'FROM alpine\n' } })],
+    ['FROM another environment behind a pattern operator', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'ARG A=devenv-11111111:1x\nFROM ${A%x}\n' } })],
+    ['FROM another environment by the default of an argument without a value', input(service('db', { build: { context: REPO, args: { BASE: null } } }), { dockerfiles: { db: 'ARG BASE=devenv-11111111:1\nFROM $BASE\n' } })],
+    ['FROM another environment with a variable that is not resolved', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM devenv-11111111${TARGETVARIANT}\n' } })],
+    ['COPY --from another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'x' } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111 /a /a' } })],
+    ['FROM the image of another environment for the dev service', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: { app: 'FROM devenv-11111111:2\n' } })],
+  ])('allows %s', (_name, checked) => {
+    // Dockerfile refusals removed (user decision 2026-09-27).
+    expect(composeAccessClassification(checked)).toEqual([]);
+    expect(composeAccessReport(checked)).toEqual(ALLOWED);
+    expect(composeAccessReport(checked, false)).toEqual(ALLOWED);
   });
 });
 

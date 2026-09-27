@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Review round 8 (structural fix of the parser DoS class): the host access analysis of the configuration of a repository
-// (hostAccessReport, composeAccessReport, and the images of its Dockerfiles) as jobs that run in a worker thread with
+// (hostAccessReport, composeAccessReport, and the FROM images of its Dockerfiles for the update check) as jobs that run in a worker thread with
 // limits of time and memory (configurationAnalysisRunner.ts, configurationAnalysisWorker.ts). A Dockerfile or a Compose
 // model of a repository is hostile input: however its text is analysed, the extension host must not freeze or crash on
 // it. A job that fails (too slow, too much memory, a crash) refuses the configuration: never allowed on a failure.
@@ -16,7 +16,6 @@ import { composeAccessReport, composeImageReferences, type ComposeAccessInput } 
 import {
   hostAccessReport,
   singleImageReferences,
-  withDockerfileCache,
   type HostAccessInput,
   type HostAccessReport,
   type NamedImageReference,
@@ -71,8 +70,8 @@ export type AnalysisJob =
   /** hostAccessReport alone (devcontainer.json, the merged configuration, the runArgs of Docker, the image metadata). */
   | { kind: 'hostAccess'; input: HostAccessInput; checksOn: boolean }
   /**
-   * A single container: hostAccessReport (with its Dockerfile), the image references for the question of image IDs
-   * (singleImageReferences), and the references of the image check (collectReferences, the FROM images).
+   * A single container: hostAccessReport, the image references for the question of image IDs (singleImageReferences),
+   * and the references of the image check (collectReferences, with the FROM images of its Dockerfile).
    */
   | { kind: 'single'; input: HostAccessInput; checksOn: boolean; config: DevcontainerConfig; dockerfileText?: string }
   /**
@@ -117,29 +116,26 @@ export function transferableJob<J extends AnalysisJob>(job: J): J {
 
 /** Runs a job in this thread (the worker runs it with runAnalysisJob too). Throws what the analysis throws. */
 export function runAnalysisJob<J extends AnalysisJob>(job: J): AnalysisResult<J> {
-  // One analysis of each Dockerfile for the whole job (review round 8, S8-4).
-  return withDockerfileCache(() => {
-    switch (job.kind) {
-      case 'hostAccess':
-        return { report: hostAccessReport(job.input, job.checksOn) } as AnalysisResult<J>;
-      case 'single':
-        return {
-          report: hostAccessReport(job.input, job.checksOn),
-          imageReferences: singleImageReferences(job.config, job.dockerfileText),
-          references: collectReferences(job.config, job.dockerfileText),
-        } as AnalysisResult<J>;
-      case 'compose': {
-        const dockerfiles = job.input.dockerfiles ?? {};
-        return {
-          report: composeAccessReport(job.input, job.checksOn),
-          imageReferences: composeImageReferences(job.input.model, dockerfiles),
-          references: composeReferences(job.input.model, dockerfiles, job.features),
-        } as AnalysisResult<J>;
-      }
-      default:
-        throw new Error(`Unknown analysis job ${String((job as { kind?: unknown }).kind)}.`);
+  switch (job.kind) {
+    case 'hostAccess':
+      return { report: hostAccessReport(job.input, job.checksOn) } as AnalysisResult<J>;
+    case 'single':
+      return {
+        report: hostAccessReport(job.input, job.checksOn),
+        imageReferences: singleImageReferences(job.config),
+        references: collectReferences(job.config, job.dockerfileText),
+      } as AnalysisResult<J>;
+    case 'compose': {
+      const dockerfiles = job.input.dockerfiles ?? {};
+      return {
+        report: composeAccessReport(job.input, job.checksOn),
+        imageReferences: composeImageReferences(job.input.model),
+        references: composeReferences(job.input.model, dockerfiles, job.features),
+      } as AnalysisResult<J>;
     }
-  });
+    default:
+      throw new Error(`Unknown analysis job ${String((job as { kind?: unknown }).kind)}.`);
+  }
 }
 
 /**

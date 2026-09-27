@@ -12,7 +12,7 @@
 // setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { buildArgumentTexts } from '../imageCheck/dockerfile';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
 import { WORKSPACES_ROOT } from '../names';
 import {
@@ -34,9 +34,6 @@ import {
   capabilityProblems,
   configFolderMountItem,
   configFolderTarget,
-  dockerfileImageFindings,
-  withDockerfileCache,
-  dockerfileImageReferences,
   foreignNetworkItem,
   imageReferenceFinding,
   isHelperPath,
@@ -72,9 +69,13 @@ export interface ComposeAccessInput extends VolumeInput {
   /** ComposeModelOutput.mountAncestors (review round 8, P8-2): the nearest folders of bind mount sources that do not exist. */
   mountAncestors?: Readonly<Record<string, string | null>>;
   /**
-   * ComposeModelOutput.dockerfiles: the FROM images of each local build are checked (no image of another environment),
-   * and a local build whose Dockerfile could not be read is refused (its images would escape the image check).
-   * Without it, neither is checked.
+   * ComposeModelOutput.dockerfiles: the Dockerfile of the dev service, for the texts that the Dev Container CLI writes
+   * into its compose file (devBuildTextProblems); the build of the dev service writes this text (composeBuildModel), so
+   * a dev service whose Dockerfile could not be read is refused. A Dockerfile of any service longer than
+   * MAX_DOCKERFILE_LENGTH is refused (U1: the configuration hash sees only the text that was read). The content of the
+   * Dockerfiles is not checked (Dockerfile refusals removed, user decision 2026-09-27). The Dockerfile of another service
+   * that could not be read is not refused for that (a link of it out of the repository is, by localPathProblems); the
+   * update check and the configuration hash skip it. Without it, nothing of them is checked.
    */
   dockerfiles?: Readonly<Record<string, string>>;
   /**
@@ -663,8 +664,10 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   const contextProblems =
     context === undefined ? [access(`build context ${String(value.context)}`)] : remote || contextMissing ? [] : localPathProblems(`build context ${context}`, context, ctx);
   problems.push(...contextProblems);
-  // Review round 5 (S5-4): the Dockerfile of a remote context is not read, so its images cannot be checked (until each
-  // build has a builder of its own).
+  // Review round 5 (S5-4): a remote context is not supported. Its Dockerfile is not checked either way (Dockerfile
+  // refusals removed, user decision 2026-09-27), but the checks of the context value itself (for example
+  // `docker-image://` or `oci-layout://` with a path of the workspace helper) and the build of the dev service from the
+  // Dockerfile text that Dev Environments read (composeBuildModel) need a local context.
   if (remote) problems.push(unsupported(`build context ${context} (a remote build context is not supported yet)`));
   if (!remote && !contextMissing && context !== undefined && isUnset(value.dockerfile_inline) && !isMissing(dockerfilePath(context, value), ctx)) {
     const dockerfile = typeof value.dockerfile === 'string' ? value.dockerfile : undefined;
@@ -676,23 +679,24 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
       (problem) => dockerfile !== undefined || contextProblems.length === 0 || (!contextGuarded && problem.class !== 'computer'),
     );
     problems.push(...fileProblems);
-    // A Dockerfile that the model run could not read: its FROM images would escape the image check and the rule on the
-    // images of other environments (a refusal that the switch lifts does not excuse it).
+    // The Dockerfile of the dev service that the model run could not read: the build writes the text that was read
+    // (composeBuildModel), and the texts that the CLI writes into its compose file come from it (devBuildTextProblems).
+    // A refusal that the switch lifts does not excuse it. The Dockerfile of another service that could not be read is
+    // not refused for that (Dockerfile refusals removed, user decision 2026-09-27): a link of it out of the repository is
+    // refused by localPathProblems, and otherwise the update check and the configuration hash skip it.
     const dockerfiles = ctx.input.dockerfiles;
     const refused = [...contextProblems, ...fileProblems].some((problem) => problem.class !== 'computer');
-    if (dockerfiles !== undefined && !refused && !Object.prototype.hasOwnProperty.call(dockerfiles, ctx.name)) {
-      problems.push(unsupported(`Dockerfile ${file} (it could not be read, so its images cannot be checked)`));
+    if (ctx.isDev && dockerfiles !== undefined && !refused && !Object.prototype.hasOwnProperty.call(dockerfiles, ctx.name)) {
+      problems.push(unsupported(`Dockerfile ${file} (it could not be read, and the dev service is built from the text that Dev Environments read)`));
     }
   }
-  // The images that the build uses (FROM and the others of the Dockerfile or of `dockerfile_inline`). Review round 5
-  // (S5-4): `dockerfile_inline` whatever the context.
+  // The Dockerfile (or `dockerfile_inline`) of the dev service, for devBuildTextProblems.
   const text = ctx.input.dockerfiles?.[ctx.name];
-  if (text !== undefined) {
-    // Review round 18 (S18-1): own properties, also for an argument named `__proto__` (the CLI and Docker keep it).
-    const args = buildArgumentTexts(value.args);
-    const target = typeof value.target === 'string' && value.target !== '' ? value.target : undefined;
-    // Every image that the Dockerfile names: FROM, COPY --from, RUN --mount from, `# syntax` (review round 2, S2-02).
-    problems.push(...dockerfileImageFindings(text, args, target));
+  // U1: a size limit for every service with a Dockerfile that was read, not a check of its content: the model run reads
+  // at most one character more than MAX_DOCKERFILE_LENGTH, and the configuration hash sees only that text, so an edit
+  // after it would offer no rebuild. The dev service has its own reason (devBuildTextProblems).
+  if (!ctx.isDev && text !== undefined && text.length > MAX_DOCKERFILE_LENGTH) {
+    problems.push(unsupported(`the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`));
   }
   problems.push(...labelProblems(value.labels, 'build '));
   // Review round 16 (Dp): what the Dev Container CLI writes as text into its compose file for the build of the dev service.
@@ -751,9 +755,13 @@ function lastStageName(dockerfile: string): string | undefined {
  * the last stage of the Dockerfile (`DQ`). It writes it with and without Features, so a stage name that is no plain name
  * and a Dockerfile with a line break of YAML that the CLI reads as part of a name or value (NEL) are refused, whatever
  * the switch says. A line break in such a text would add keys to the build or to the dev service (for example `ssh` with
- * a file of the workspace helper).
+ * a file of the workspace helper). A Dockerfile longer than MAX_DOCKERFILE_LENGTH is refused too: the model run reads
+ * at most one character more, and the build writes the text that it read (composeBuildModel), which would be cut.
  */
 function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string | undefined): Problem[] {
+  if (dockerfile !== undefined && dockerfile.length > MAX_DOCKERFILE_LENGTH) {
+    return [unsupported(`the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the dev service is built from the text that Dev Environments read)`)];
+  }
   const problems: Problem[] = [];
   const target = build.target;
   if (target !== undefined && target !== null && target !== '') {
@@ -1095,8 +1103,7 @@ export function composeAccessClassification(input: ComposeAccessInput): HostAcce
 }
 
 function composeFindings(input: ComposeAccessInput): Problem[] {
-  // Review round 8 (S8-4): services that build the same Dockerfile with the same arguments share one analysis.
-  return withDockerfileCache(() => readComposeFindings(input));
+  return readComposeFindings(input);
 }
 
 function readComposeFindings(input: ComposeAccessInput): Problem[] {
@@ -1140,15 +1147,11 @@ function readComposeFindings(input: ComposeAccessInput): Problem[] {
 
 /**
  * The image references of the merged model (review round 2, S2-05), for the question whether Docker takes one of them
- * for an image ID (resolvedByImageId): the `image` of each service without a build, the images of the Dockerfile of each
- * service with a local build (`dockerfiles`, with `build.args` and `build.target`), and the images of
- * `additional_contexts`. Each named with its service, as composeAccessReport names its items.
+ * for an image ID (resolvedByImageId): the `image` of each service without a build, and the images of
+ * `additional_contexts`. Each named with its service, as composeAccessReport names its items. The images of the
+ * Dockerfiles are not asked about (Dockerfile refusals removed, user decision 2026-09-27).
  */
-export function composeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
-  return withDockerfileCache(() => readComposeImageReferences(model, dockerfiles));
-}
-
-function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): NamedImageReference[] {
+export function composeImageReferences(model: ComposeModel): NamedImageReference[] {
   const references: NamedImageReference[] = [];
   for (const [name, service] of Object.entries(isRecord(model.services) ? model.services : {})) {
     if (!isRecord(service)) continue;
@@ -1157,13 +1160,6 @@ function readComposeImageReferences(model: ComposeModel, dockerfiles: Readonly<R
     if (!build) {
       if (typeof service.image === 'string' && service.image.trim() !== '') references.push({ reference: service.image.trim(), what: `${at}image` });
       continue;
-    }
-    const text = dockerfiles[name];
-    if (text !== undefined) {
-      // Review round 18 (S18-1): own properties, also for an argument named `__proto__`.
-      const args = buildArgumentTexts(build.args);
-      const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
-      for (const reference of dockerfileImageReferences(text, args, target)) references.push({ ...reference, what: `${at}${reference.what}` });
     }
     if (isRecord(build.additional_contexts)) {
       for (const [key, source] of Object.entries(build.additional_contexts)) {

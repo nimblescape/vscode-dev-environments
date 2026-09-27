@@ -120,15 +120,17 @@ describe('the open pipeline with the host access analysis in the worker (review 
     ]);
   });
 
-  it('refuses a Dockerfile whose expansions grow without bound (S8-2), within 2 s', async () => {
+  it('allows a Dockerfile whose expansions grow without bound (S8-2), within 2 s', async () => {
     const worker = harness();
     const head = `ARG B0=€€€€€€€€€€€€€€€€\n${Array.from({ length: 13 }, (_, i) => `ARG B${i + 1}=\${B${i}}\${B${i}}`).join('\n')}\n`;
     const body = Array.from({ length: 200 }, (_, l) => `ARG ${Array.from({ length: 50 }, (_, k) => `X${l * 50 + k}=a$B13`).join(' ')}`).join('\n');
     withDockerfile(worker, `${head}${body}\nFROM alpine\n`);
     const start = performance.now();
-    const error = await rejection(worker.service.open(TARGET, { progress: worker.progress }));
+    await worker.service.open(TARGET, { progress: worker.progress });
     expect(performance.now() - start).toBeLessThan(2000);
-    expect(error.message).toBe(Messages.unsupportedOptions('Dockerfile (the Dockerfile is too complex to check)'));
-    expect(worker.helper.builds).toEqual([]);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile (the Dockerfile is too complex to check)`;
+    // the update check skips it (no base images).
+    expect(worker.helper.builds).toHaveLength(1);
+    expect(worker.checker.calls.at(-1)?.images ?? []).toEqual([]);
   });
 });

@@ -8,8 +8,10 @@ import { describe, expect, it } from 'vitest';
 import { collectReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
 import { composeReferences, type ComposeModel } from './compose';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { composeAccessReport, composeImageReferences, type ComposeAccessInput } from './composeAccess';
-import { hostAccessReport, singleImageReferences, type HostAccessReport } from './hostAccess';
+import { runAnalysisJob } from './configurationAnalysis';
+import { singleImageReferences, type HostAccessReport } from './hostAccess';
 
 const PROJECT = 'devenv-3f2a9c1e';
 const REPO = '/workspaces/api';
@@ -51,23 +53,28 @@ describe('review round 18 (S18-1): a build argument named __proto__', () => {
     expect(Object.keys(args)).toEqual(['__proto__']);
   });
 
-  it('Docker Compose: refuses FROM the image of another environment through it', () => {
+  it('Docker Compose: allows FROM the image of another environment through it', () => {
     const report = composeAccessReport(input({ args: protoArgs('devenv-0badc0de:3') }, 'ARG __proto__\nFROM $__proto__\n'));
-    expect(refused(report).join('\n')).toContain('devenv-0badc0de:3 of another environment');
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `… devenv-0badc0de:3 of another environment`.
+    expect(refused(report)).toEqual([]);
   });
 
-  it('Docker Compose: the image references and the references of the image check hold its image', () => {
+  it('Docker Compose: the references of the image check hold its image', () => {
     const m = model({ args: protoArgs('cafe1234') });
-    expect(composeImageReferences(m, { app: 'ARG __proto__\nFROM $__proto__\n' }).map((entry) => entry.reference)).toContain('cafe1234');
+    // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile images are no image references for the
+    // question of image IDs any more (before: `cafe1234`).
+    expect(composeImageReferences(m)).toEqual([]);
     expect(composeReferences(m, { app: 'ARG __proto__\nFROM $__proto__\n' }, undefined).images).toContain('cafe1234');
   });
 
-  it('single container: `--build-arg __proto__=…` of build.options reaches the check (the CLI passes build.options to docker build)', () => {
+  it('single container: `--build-arg __proto__=…` of build.options is allowed with the Dockerfile', () => {
     const config = { build: { dockerfile: 'Dockerfile', options: ['--build-arg', '__proto__=devenv-0badc0de:3'] } };
-    const report = hostAccessReport({ config, ownVolume: 'devenv-acme-api-3f2a9c1e', dockerfileText: 'ARG __proto__\nFROM $__proto__\n' });
-    expect(refused(report).join('\n')).toContain('devenv-0badc0de:3 of another environment');
-    const references = singleImageReferences({ build: { dockerfile: 'Dockerfile', options: ['--build-arg', '__proto__=cafe1234'] } }, 'ARG __proto__\nFROM $__proto__\n');
-    expect(references.map((entry) => entry.reference)).toContain('cafe1234');
+    const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: 'devenv-acme-api-3f2a9c1e' }, checksOn: true, config, dockerfileText: 'ARG __proto__\nFROM $__proto__\n' });
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `… devenv-0badc0de:3 of another environment`, and
+    // `cafe1234` was an image reference for the question of image IDs.
+    expect(refused(analysis.report)).toEqual([]);
+    expect(analysis.imageReferences).toEqual([]);
+    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile', options: ['--build-arg', '__proto__=cafe1234'] } })).toEqual([]);
   });
 
   it('single container: the image check reads it from build.args of a parsed configuration', () => {
@@ -76,13 +83,49 @@ describe('review round 18 (S18-1): a build argument named __proto__', () => {
   });
 });
 
-describe('Docker\'s view: an image of the Dockerfile is named once', () => {
-  const single = (dockerfile: string) => hostAccessReport({ config: { build: { dockerfile: 'Dockerfile' } }, ownVolume: 'devenv-acme-api-3f2a9c1e', dockerfileText: dockerfile });
+describe('Docker\'s view: an image of the Dockerfile', () => {
+  const config = { build: { dockerfile: 'Dockerfile' } };
+  const single = (dockerfile: string) =>
+    runAnalysisJob({ kind: 'single', input: { config, ownVolume: 'devenv-acme-api-3f2a9c1e' }, checksOn: true, config, dockerfileText: dockerfile });
 
-  it('names an image of another environment and an image reference once', () => {
-    expect(refused(single('FROM devenv-7c1d2e3f:2\n'))).toEqual(['FROM image devenv-7c1d2e3f:2 of another environment']);
-    expect(refused(composeAccessReport(input({}, 'FROM devenv-7c1d2e3f:2\n')))).toEqual(['service app: FROM image devenv-7c1d2e3f:2 of another environment']);
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'FROM cafe1234\n')).toEqual([{ reference: 'cafe1234', what: 'FROM image' }]);
+  it('allows an image of another environment, and names it only for the update check', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`
+    // (single and Compose), and `cafe1234` was an image reference for the question of image IDs.
+    expect(refused(single('FROM devenv-7c1d2e3f:2\n').report)).toEqual([]);
+    expect(refused(composeAccessReport(input({}, 'FROM devenv-7c1d2e3f:2\n')))).toEqual([]);
+    expect(single('FROM cafe1234\n').imageReferences).toEqual([]);
+    expect(single('FROM cafe1234\n').references.images).toEqual(['cafe1234']);
+  });
+
+  it('refuses a Dockerfile of the dev service that is longer than the model run reads (the build writes the text it read)', () => {
+    const long = `FROM alpine\n# ${'x'.repeat(MAX_DOCKERFILE_LENGTH)}\n`;
+    expect(composeAccessReport(input({}, long)).unsupported).toEqual([
+      `service app: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the dev service is built from the text that Dev Environments read)`,
+    ]);
+    expect(composeAccessReport(input({}, long), false).unsupported).toHaveLength(1);
+    // review, U1/U2: the same Dockerfile of another service is refused too (a size limit): the configuration hash sees
+    // only the text that the model run read, so an edit after it would offer no rebuild.
+    const other: ComposeAccessInput = { ...input({}, 'FROM alpine\n'), model: { name: PROJECT, services: { ...model({}).services, db: { build: { context: REPO } } } }, dockerfiles: { app: 'FROM alpine\n', db: long } };
+    expect(composeAccessReport(other)).toEqual({
+      hostAccess: [],
+      unsupported: [`service db: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`],
+    });
+  });
+
+  it('U1: refuses a Dockerfile of a side service of MAX_DOCKERFILE_LENGTH + 1 characters, whatever the switch says', () => {
+    const long = `FROM alpine\n#${'x'.repeat(MAX_DOCKERFILE_LENGTH - 12)}`;
+    expect(long.length).toBe(MAX_DOCKERFILE_LENGTH + 1);
+    const side = (text: string): ComposeAccessInput => ({
+      ...input({}, 'FROM alpine\n'),
+      model: { name: PROJECT, services: { ...model({}).services, db: { build: { context: REPO } } } },
+      dockerfiles: { app: 'FROM alpine\n', db: text },
+    });
+    const item = `service db: the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    expect(composeAccessReport(side(long)).unsupported).toEqual([item]);
+    expect(composeAccessReport(side(long), false).unsupported).toEqual([item]);
+    // A Dockerfile of exactly MAX_DOCKERFILE_LENGTH characters, and a normal one, are allowed.
+    expect(composeAccessReport(side(long.slice(0, -1)))).toEqual({ hostAccess: [], unsupported: [] });
+    expect(composeAccessReport(side('FROM alpine\nRUN echo hi\n'))).toEqual({ hostAccess: [], unsupported: [] });
   });
 });
 
