@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { helperCliVariables, resolveCliVariables } from './cliVariables';
-import { hostAccessReport, mountedVolumeNames } from './hostAccess';
+import { hostAccessReport, mountedVolumeNames } from '../policy';
 
 const bundle = fs.readFileSync(path.resolve(__dirname, '../../../node_modules/@devcontainers/cli/dist/spec-node/devContainersSpecCLI.js'), 'utf8');
 

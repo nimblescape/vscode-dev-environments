@@ -2,15 +2,15 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Host access policy for Docker Compose configurations (concept section 9 "Host access", implementation notes section
-// "Docker Compose"): the rules of hostAccess.ts for every service of the merged model that `docker compose config`
+// The container policy for Docker Compose configurations (concept section 9 "Host access", implementation notes section
+// "Docker Compose"): the rules of ./single.ts for every service of the merged model that `docker compose config`
 // prints (all profiles), not only for the dev service, because Compose starts them all with the Docker engine of the
-// computer. An allow-list, like RUN_FLAGS: a key that the policy does not know is refused as not supported, because a
-// new key of Compose can reach the computer. The mounts and the ports are decided by the functions of compose.ts that
-// the rewrite uses too, so the check and the model that runs cannot disagree. Each refused item has the class of the
-// switch of the host access checks (HostAccessClass of hostAccess.ts, container-restrictions.md section 12), as the same
-// setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
-// Pure functions, no I/O.
+// computer. An allow-list, like RUN_FLAGS (./flags.ts): a key that the policy does not know is refused as not supported,
+// because a new key of Compose can reach the computer. The mounts and the ports are decided by the functions of
+// ./rewrites.ts that the model rewrite (../helper/compose.ts) uses too, so the check and the model that runs cannot
+// disagree. Each refused item has the class of the switch of the host access checks (HostAccessClass, ./report.ts,
+// container-restrictions.md section 12), as the same setting has for a single container: with the checks off for the
+// repository, only the class `computer` is lifted. Pure functions, no I/O.
 import * as path from 'path';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
@@ -18,14 +18,14 @@ import { WORKSPACES_ROOT } from '../names';
 import {
   composeNetworkNames,
   composeVolumeNames,
-  decideServiceMount,
-  decideServicePort,
   durationSeconds,
-  isOtherEnvironmentProjectName,
   WORKSPACE_VOLUME_KEY,
   type ComposeModel,
-  type ComposeMountContext,
-} from './compose';
+} from '../helper/composeModel';
+import { localContextPath } from './dockerFlags';
+import { imageReferenceFinding, type NamedImageReference } from './images';
+import { access, guarded, unsupported, type HostAccessFinding, type HostAccessReport, type Problem } from './report';
+import { decideServiceMount, decideServicePort, type ComposeMountContext } from './rewrites';
 import {
   LOG_DRIVERS,
   LOG_OPTIONS,
@@ -34,19 +34,11 @@ import {
   capabilityProblems,
   configFolderMountItem,
   configFolderTarget,
-  foreignNetworkItem,
-  imageReferenceFinding,
   isHelperPath,
-  localContextPath,
   refusedVariable,
   securityOptionProblems,
-  volumeNameFindings,
-  type HostAccessClass,
-  type HostAccessFinding,
-  type HostAccessReport,
-  type NamedImageReference,
-  type VolumeInput,
-} from './hostAccess';
+} from './rules';
+import { foreignNetworkItem, isOtherEnvironmentProjectName, volumeNameFindings, type VolumeInput } from './volumes';
 
 export interface ComposeAccessInput extends VolumeInput {
   /** The merged model (ComposeModelOutput.model). */
@@ -85,17 +77,6 @@ export interface ComposeAccessInput extends VolumeInput {
   missing?: readonly string[];
 }
 
-interface Problem {
-  item: string;
-  class: HostAccessClass;
-}
-
-/** Access to the computer: lifted while the host access checks are off (HostAccessClass `computer`). */
-const access = (item: string): Problem => ({ item, class: 'computer' });
-/** Refused whatever the switch says (HostAccessClass `protected`): account separation, the token, the owner account. */
-const guarded = (item: string): Problem => ({ item, class: 'protected' });
-const unsupported = (item: string): Problem => ({ item, class: 'unsupported' });
-
 /** A refusal of decideServiceMount or decideServicePort as a problem with its class. */
 function decisionProblem(decision: { item: string; kind: 'hostAccess' | 'unsupported'; guarded?: true }): Problem {
   if (decision.kind === 'unsupported') return unsupported(decision.item);
@@ -130,14 +111,11 @@ function labelProblems(labels: unknown, where: string): Problem[] {
     .map((key) => unsupported(`${where}label ${key}`));
 }
 
-/** imageReferenceFinding of hostAccess.ts as a problem: the image of another environment (D-17), or an image ID. */
+/** imageReferenceFinding of ./images.ts as a problem: the image of another environment (D-17), or an image ID. */
 function imageProblems(reference: string, what: string): Problem[] {
   const finding = imageReferenceFinding(reference, what);
   return finding ? [finding] : [];
 }
-
-// A Go duration in seconds (in compose.ts since review round 8, for the cap of stop_grace_period in rewriteModel).
-export { durationSeconds };
 
 function isInside(file: string, folder: string): boolean {
   return file === folder || file.startsWith(`${folder}/`);
@@ -1082,7 +1060,7 @@ function findings(problems: readonly Problem[]): Problem[] {
  * policy does not know (implementation notes, section "Docker Compose", rule table), in two lists as hostAccessReport:
  * the top level (project name, volumes, networks, secrets, configs, unknown keys), then each service, its items
  * prefixed `service <name>: `. The dev service must be in the model, and so must each name of `runServices`.
- * `checksOn`: the switch of the repository (../hostAccessChecks.ts); `false` leaves out the items of the class
+ * `checksOn`: the switch of the repository (./hostAccessChecks.ts); `false` leaves out the items of the class
  * `computer` (composeAccessClassification), exactly as hostAccessReport does for a single container.
  */
 export function composeAccessReport(input: ComposeAccessInput, checksOn = true): HostAccessReport {
@@ -1193,4 +1171,21 @@ export function composeIgnoredProperties(config: Readonly<Record<string, unknown
   for (const key of ['runArgs', 'appPort', 'workspaceMount']) if (config[key] !== undefined) ignored.push(key);
   if (isRecord(config.build) && config.build.options !== undefined) ignored.push('build.options');
   return ignored;
+}
+
+/**
+ * A configuration without the properties that the Dev Container CLI ignores for Docker Compose (composeIgnoredProperties:
+ * runArgs, appPort, workspaceMount, build.options): the host access policy does not refuse what has no effect.
+ */
+export function withoutComposeIgnored(config: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...config };
+  delete result.runArgs;
+  delete result.appPort;
+  delete result.workspaceMount;
+  if (isRecord(result.build) && 'options' in result.build) {
+    const build = { ...result.build };
+    delete build.options;
+    result.build = build;
+  }
+  return result;
 }

@@ -6,10 +6,10 @@
 // token (/run/devenv) by its other name /var/run/devenv, or bring it to the computer with a shared mount propagation.
 // The real protection is the check of the write in the container (containerToken.test.ts); these give a clear message.
 import { describe, expect, it } from 'vitest';
-import type { ComposeMountContext, ComposeModel } from './compose';
-import { decideServiceMount } from './compose';
-import { composeAccessClassification, type ComposeAccessInput } from './composeAccess';
+import type { ComposeModel } from './compose';
 import {
+  decideServiceMount,
+  composeAccessClassification,
   configFolderTarget,
   hostAccessClassification,
   hostAccessReport,
@@ -17,8 +17,10 @@ import {
   sharedPropagationItem,
   tokenPropagationTarget,
   volumeFlagOptions,
+  type ComposeMountContext,
+  type ComposeAccessInput,
   type HostAccessInput,
-} from './hostAccess';
+} from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 const PROJECT = 'devenv-3f2a9c1e';

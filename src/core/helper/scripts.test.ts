@@ -39,9 +39,9 @@ import {
 import { MAX_SERVICE_REAL_PATHS } from '../git/gitSummary';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } from './compose';
-import { composeAccessReport, type ComposeAccessInput } from './composeAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
+import { composeAccessReport, type ComposeAccessInput } from '../policy';
 
 function hasProgram(name: string, args: string[]): boolean {
   return !spawnSync(name, args, { stdio: 'ignore' }).error;

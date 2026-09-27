@@ -540,7 +540,7 @@ const main = () => {
   }
   // Review round 3 (P3-1), U2: a link out of the repository (a real path outside of it, for example the folder with the
   // token or the cache volume) is not read: without a text or dockerfileMissing, the extension refuses the Dockerfile
-  // whatever the switch says (hostAccess.ts, dockerfileUnreadable).
+  // whatever the switch says (../policy/single.ts, dockerfileUnreadable).
   const real = realPath(dockerfileFile);
   const rootReal = realPath(root);
   if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
@@ -663,7 +663,7 @@ if (process.exitCode === undefined) {
  * - `dockerfiles`: the `build.dockerfile_inline` of each service that has one;
  * - `dockerfileFiles` and `dockerfileTexts` (review round 9, S9-2): of each other service with a local build, the real
  *   path of its Dockerfile (when it is in the repository folder, also after links, or when it is outside of it and no
- *   path of the workspace helper (isHelperPath of hostAccess.ts, the same paths here), also after links), and the text
+ *   path of the workspace helper (isHelperPath of ../policy/rules.ts, the same paths here), also after links), and the text
  *   of each such file once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH (readLimited);
  *   parseComposeModelOutput gives each service its text in `dockerfiles`;
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
@@ -705,7 +705,7 @@ const realPath = (file) => {
     return null;
   }
 };
-// The paths of isHelperPath (hostAccess.ts): the root, the cache volume, the folder with the token, the folders of the
+// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the folder with the token, the folders of the
 // kernel (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one
 // of them. (The Docker socket of isHelperPath is not mounted in this run; the check refuses a Dockerfile there anyway.)
 const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
@@ -715,7 +715,7 @@ const isHelperPath = (file) => {
   if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
-// The folder of a local additional context (localContextPath of hostAccess.ts): the path, or the path of an OCI layout.
+// The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts): the path, or the path of an OCI layout.
 const localFolder = (source) => {
   const text = String(source).trim();
   const oci = /^oci-layout:\/\/(.*)$/i.exec(text);

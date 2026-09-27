@@ -10,10 +10,9 @@ import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';
 import { composeMountVolumeName } from '../helper/compose';
-import { isAnonymousVolumeName, runArgsUser, truncated } from '../helper/hostAccess';
+import { isAnonymousVolumeName, runArgsUser, truncated, type HostAccessChecks } from '../policy';
 import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import type { HostAccessChecks } from '../hostAccessChecks';
 import {
   CONTAINER_CONFIG_UNKNOWN,
   CONTAINER_VERSION,
@@ -41,7 +40,7 @@ export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
  * (label devenv.container-config=unknown) is not current either: it lacks the runArgs and appPort of the configuration.
  * While the configuration cannot be read, such a container is current, so it is only started and not created again at
  * every open.
- * `hostAccessChecks`: the switch of the repository now (hostAccessChecks in ../hostAccessChecks.ts). While the checks
+ * `hostAccessChecks`: the switch of the repository now (hostAccessChecks in ../policy/hostAccessChecks.ts). While the checks
  * are on, a container that was created while they were off (label devenv.host-access=unrestricted,
  * isUnrestrictedContainer) is not current: the pipeline creates it again once the checks pass, and never starts it as
  * it is. While they are off, the label does not matter: a container created with the checks on has less access.

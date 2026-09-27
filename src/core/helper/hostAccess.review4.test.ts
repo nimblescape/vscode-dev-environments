@@ -6,7 +6,7 @@
 // normalized, so that the truncation of an item cannot hide what the mount reaches).
 import { describe, expect, it } from 'vitest';
 import { helperCliVariables } from './cliVariables';
-import { MAX_ITEM_LENGTH, hostAccessReport, mountedVolumeNames } from './hostAccess';
+import { MAX_ITEM_LENGTH, hostAccessReport, mountedVolumeNames } from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 

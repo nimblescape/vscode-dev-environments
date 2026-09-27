@@ -7,8 +7,14 @@
 // other containers stays refused whatever the switch of the host access checks says.
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import { composeAccessClassification, composeAccessReport, type ComposeAccessInput } from './composeAccess';
-import { hostAccessClassification, type HostAccessFinding, type HostAccessInput } from './hostAccess';
+import {
+  composeAccessClassification,
+  composeAccessReport,
+  hostAccessClassification,
+  type ComposeAccessInput,
+  type HostAccessFinding,
+  type HostAccessInput,
+} from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';

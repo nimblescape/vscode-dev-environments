@@ -11,7 +11,6 @@ import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
-import { hostAccessProblems } from '../helper/hostAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
@@ -70,6 +69,7 @@ import {
   CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { hostAccessProblems } from '../policy';
 
 const TARGET: RepositoryTarget = {
   repository: REPO,

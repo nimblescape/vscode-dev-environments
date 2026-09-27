@@ -5,10 +5,10 @@
 // The switch of the host access checks, per repository (concept section 8 and section 9 "Host access", user request
 // 2026-09-26: "application of the security policy shall be configurable per repository, by default it is on"). The user
 // setting devEnvLauncher.hostAccessChecksOff lists the repositories whose configuration may use the computer; for every
-// other repository the checks are on. The open pipeline reads the switch at each open and passes it to the host access
-// policy (hostAccessReport in helper/hostAccess.ts), which then lifts only the refusals of access to the computer.
+// other repository the checks are on. The open pipeline reads the switch at each open and passes it to the container
+// policy (checkContainer in ./index.ts), which then lifts only the refusals of access to the computer.
 // Pure functions, no I/O.
-import type { ExtensionSettings } from './types';
+import type { ExtensionSettings } from '../types';
 
 /** Whether the host access policy refuses the settings that need access to the computer, for one repository. */
 export type HostAccessChecks = 'on' | 'off';

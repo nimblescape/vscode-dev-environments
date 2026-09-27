@@ -10,12 +10,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
-import { composeAccessReport } from '../../src/core/helper/composeAccess';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { composeProjectName } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext } from './harness';
+import { composeAccessReport } from '../../src/core/policy';
 
 const ENVIRONMENT_ID = 'c0ffee00-0000-4000-8000-000000000000';
 const PROJECT = composeProjectName(ENVIRONMENT_ID);

@@ -320,7 +320,7 @@ export interface ExtensionSettings {
   refreshIntervalMinutes: number;
   /**
    * Repositories (`owner/name`, valid entries only, trimmed) whose host access checks are off (concept section 8 and
-   * section 9 "Host access"; hostAccessChecks in hostAccessChecks.ts). Only the user setting counts.
+   * section 9 "Host access"; hostAccessChecks in policy/hostAccessChecks.ts). Only the user setting counts.
    */
   hostAccessChecksOff: string[];
   /**

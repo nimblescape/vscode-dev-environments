@@ -17,14 +17,11 @@ import {
   containerGitSupport,
   gitIdentity,
   homeGitConfigCommand,
-  isContainerGitVariable,
-  isGitHubCliAccountVariable,
-  GITHUB_CLI_ACCOUNT_VARIABLES,
   isGitHubLogin,
   parseGitVersion,
   remoteEnvironment,
 } from './containerGit';
-import { hostAccessProblems } from './hostAccess';
+import { GITHUB_CLI_ACCOUNT_VARIABLES, hostAccessProblems, isContainerGitVariable, isGitHubCliAccountVariable } from '../policy';
 
 const hasGit = !spawnSync('git', ['--version'], { stdio: 'ignore' }).error;
 /** Optional: the path of an old Git (for example 2.30.2) that the credential tests run with too. */

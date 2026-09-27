@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { TOKEN_TMPFS, containerHostname } from '../names';
 import { buildOverrideConfig } from './devcontainerCli';
-import { runArgsDecideHostname } from './hostAccess';
+import { runArgsDecideHostname } from '../policy';
 
 const base = { environmentImage: 'i:1', volumeName: 'devenv-acme-api-3f2a9c1e', repositoryName: 'module-oop', containerName: 'devenv-acme-api-3f2a9c1e' };
 

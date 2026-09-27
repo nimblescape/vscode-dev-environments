@@ -3,18 +3,17 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import type { ComposeModel } from './compose';
+import { durationSeconds, type ComposeModel } from './compose';
+import { TOKEN_TMPFS } from '../names';
 import {
   composeAccessReport,
   composeConfigurationReport,
   composeIgnoredProperties,
   composeMissingBuildPaths,
-  durationSeconds,
+  GITHUB_CLI_ACCOUNT_REASON,
   type ComposeAccessInput,
-} from './composeAccess';
-import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
-import type { HostAccessReport } from './hostAccess';
-import { TOKEN_TMPFS } from '../names';
+  type HostAccessReport,
+} from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';

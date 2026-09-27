@@ -19,7 +19,6 @@ import {
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
-import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../helper/hostAccess';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
 import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, OWNERSHIP_FIX_SCRIPT, servicePathArguments } from '../git/gitSummary';
@@ -63,6 +62,7 @@ import {
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, repositoryServiceDataFolders } from './pipelineRules';
 import { parseJsonc } from '../jsonc';
+import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../policy';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
