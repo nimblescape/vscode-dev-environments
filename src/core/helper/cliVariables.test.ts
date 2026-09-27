@@ -7,13 +7,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
+  HELPER_KNOWN_ENV,
   HELPER_PROCESS_ENV_NAMES,
+  MAX_CLI_TEXT_LENGTH,
   helperCliVariables,
   mayBeSetInHelper,
   substituteCliVariables,
+  textLengths,
   unresolvedCliVariables,
+  variableMatches,
   type CliVariables,
 } from './cliVariables';
+import { helperRunArgs } from './workspaceHelper';
 
 // Guard (hotfix M1): the substitution functions of Dev Container CLI 0.89.0, copied verbatim from
 // node_modules/@devcontainers/cli/dist/spec-node/devContainersSpecCLI.js (Fo, tg, Hr, za, a_, cN, lN, I_, C_, B_, E_, hN,
@@ -157,12 +162,15 @@ describe(`cliVariables: as Dev Container CLI ${CLI_VERSION} substitutes (hotfix 
 describe('cliVariables: the process of the CLI in the workspace helper (hotfix M1)', () => {
   it('leaves the variables that may be set in the helper, whose values are not known', () => {
     const variables: CliVariables = helperCliVariables('acme/api');
-    for (const name of ['HOME', 'PATH', 'HOSTNAME', 'NODE_VERSION', 'YARN_VERSION', 'PWD', 'SHLVL', 'TERM', 'HTTP_PROXY', 'no_proxy']) {
+    // hotfix review 1, N4: HOME is known (/root, HELPER_KNOWN_ENV), the others may be set.
+    for (const name of ['PATH', 'HOSTNAME', 'NODE_VERSION', 'YARN_VERSION', 'PWD', 'OLDPWD', 'SHLVL', '_', 'TERM', 'HTTP_PROXY', 'no_proxy']) {
       expect(mayBeSetInHelper(name)).toBe(true);
       expect(substituteCliVariables(`\${localEnv:${name}:devenv-other-abcdef12}`, variables)).toBe(`\${localEnv:${name}:devenv-other-abcdef12}`);
       expect(substituteCliVariables(`\${env:${name}}`, variables)).toBe(`\${env:${name}}`);
     }
     expect(HELPER_PROCESS_ENV_NAMES).toContain('HOME');
+    expect(mayBeSetInHelper('HOME')).toBe(true);
+    expect(substituteCliVariables('${localEnv:HOME:devenv-other-abcdef12}|${env:HOME}', variables)).toBe('/root|/root');
   });
 
   it('resolves the other variables to their default or to an empty text, as the CLI does for a variable that is not set', () => {
@@ -171,8 +179,9 @@ describe('cliVariables: the process of the CLI in the workspace helper (hotfix M
     // Case-sensitive, as on Linux.
     expect(mayBeSetInHelper('home')).toBe(false);
     expect(substituteCliVariables('${localEnv:NOPE:x}|${localEnv:USERPROFILE}|${localEnv:home:y}', variables)).toBe('x||y');
-    // The common bind mount of the .ssh folder: HOME stays, USERPROFILE (Windows) is not set in the helper.
-    expect(substituteCliVariables('source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh', variables)).toBe('source=${localEnv:HOME}/.ssh');
+    // The common bind mount of the .ssh folder: HOME is /root (hotfix review 1, N4), USERPROFILE (Windows) is not set in
+    // the helper.
+    expect(substituteCliVariables('source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh', variables)).toBe('source=/root/.ssh');
   });
 
   it('uses the repository folder for both workspace folders, as the pipeline runs up', () => {
@@ -195,5 +204,75 @@ describe('unresolvedCliVariables (hotfix M1)', () => {
     ['plain', []],
   ])('%s', (text, expected) => {
     expect(unresolvedCliVariables(text)).toEqual(expected);
+  });
+});
+
+// Hotfix review 1, N5: the pattern /\$\{(.*?)\}/g of the CLI takes quadratic time on `${${${…` without `}`. The module
+// finds the same matches with a linear scan.
+describe('variableMatches: the matches of the pattern of the CLI in linear time (hotfix review 1, N5)', () => {
+  const PATTERN = /\$\{(.*?)\}/g;
+  const regexMatches = (text: string) => [...text.matchAll(PATTERN)].map((match) => ({ start: match.index, end: match.index + match[0].length, inner: match[1] }));
+  // A small random generator with a fixed seed, so a failure can be repeated.
+  let seed = 20260927;
+  const random = (n: number): number => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const PIECES = ['$', '{', '}', '${', ':', 'env', 'localEnv', 'NOPE', 'HOME', 'x', '\n', '\r', '\u2028', '\u2029', 'devcontainerId', '$$', '}}', ' '];
+  const randomText = (): string => Array.from({ length: random(24) }, () => PIECES[random(PIECES.length)]).join('');
+
+  it('finds the matches of the pattern, for 20000 random texts', () => {
+    for (let i = 0; i < 20000; i++) {
+      const text = randomText();
+      expect(variableMatches(text), JSON.stringify(text)).toEqual(regexMatches(text));
+    }
+  });
+
+  it('substitutes as the CLI, for 5000 random texts', () => {
+    const context = { localWorkspaceFolder: REPOSITORY_FOLDER, containerWorkspaceFolder: REPOSITORY_FOLDER, env: ENV };
+    for (let i = 0; i < 5000; i++) {
+      const text = randomText();
+      let expected: unknown;
+      try {
+        expected = cliUp(text, context, ID_LABELS);
+      } catch {
+        // ${env} without a name: the CLI stops with an error (see above).
+        continue;
+      }
+      expect(substituteCliVariables(text, { ...context, devcontainerId: cli.Q_(ID_LABELS) }), JSON.stringify(text)).toBe(expected);
+    }
+  });
+
+  it.each<[string, string]>([
+    ['${ without }', '${'.repeat(200_000)],
+    ['${ with } after a line break', '${'.repeat(200_000) + '\n}'],
+    ['$ and {', '${${$'.repeat(100_000)],
+  ])('takes linear time: %s', (_name, text) => {
+    const start = Date.now();
+    variableMatches(text);
+    unresolvedCliVariables(text);
+    substituteCliVariables(text, helperCliVariables('acme/api'));
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('textLengths (hotfix review 1, N5)', () => {
+  it('counts string values and keys, without recursion', () => {
+    expect(textLengths({ ab: ['cde', 1, null, { f: 'ghij' }] })).toEqual({ longest: 4, total: 10 });
+    let deep: unknown = 'x';
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    expect(textLengths(deep)).toEqual({ longest: 1, total: 1 });
+    expect(textLengths('y'.repeat(MAX_CLI_TEXT_LENGTH + 1)).longest).toBe(MAX_CLI_TEXT_LENGTH + 1);
+  });
+});
+
+describe('the known variables of the helper process (hotfix review 1, N4)', () => {
+  it('HOME is /root: the helper runs as root', () => {
+    expect(HELPER_KNOWN_ENV).toEqual({ HOME: '/root' });
+    const dockerfile = fs.readFileSync(path.resolve(__dirname, '../../../resources/helper/Dockerfile'), 'utf8');
+    expect(dockerfile).not.toMatch(/^\s*USER\b/im);
+    expect(dockerfile).not.toMatch(/^\s*ENV\s+HOME\b/im);
+    const args = helperRunArgs({ tag: 't', volumeName: 'v', socketPath: '/var/run/docker.sock', containerName: 'c', env: {}, secrets: false, command: ['sh'] });
+    expect(args.filter((arg) => arg === '--user' || arg === '-u' || arg.startsWith('--user=') || arg.startsWith('HOME='))).toEqual([]);
   });
 });

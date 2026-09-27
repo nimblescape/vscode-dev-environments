@@ -1638,9 +1638,13 @@ export class EnvironmentService {
       appPort: config?.appPort,
       hostAccessChecks: ctx.hostAccessChecks,
     });
-    // Concept section 9 "Host access": the arguments that Docker gets, after the changes of the override configuration,
-    // pass the policy too (the check of the configuration covers them as the repository wrote them).
-    const finalRunArgs = hostAccessReport(await this.hostAccessInput(env, { config: { runArgs: override.runArgs } }), checksOn);
+    // Concept section 9 "Host access": the arguments and published ports that Docker gets, after the changes of the
+    // override configuration, pass the policy too (the check of the configuration covers them as read-configuration
+    // returned them; the CLI substitutes both again at `up`, hotfix review 1).
+    const finalRunArgs = hostAccessReport(
+      await this.hostAccessInput(env, { config: { runArgs: override.runArgs, appPort: override.appPort } }),
+      checksOn,
+    );
     // What Docker gets: its last --user decides the user of the container (imageRemoteUser).
     const dockerRunArgs = stringList(override.runArgs) ?? [];
     if (isRefused(finalRunArgs)) {

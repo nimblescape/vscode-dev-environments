@@ -12,7 +12,7 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../names';
-import { helperCliVariables } from './cliVariables';
+import { helperCliVariables, mayBeSetInHelper, substituteCliVariables, unresolvedCliVariables } from './cliVariables';
 import { GITHUB_CLI_ACCOUNT_REASON, containerEnvironment, remoteEnvironment } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
@@ -989,7 +989,11 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
   const input = (where: Where, mounts: unknown[], withVariables = true): HostAccessInput => {
     const base = { ownVolume: OWN, ...(withVariables ? { variables } : {}) };
     if (where === 'metadata') return { ...base, metadata: [{ id: 'base' }, { mounts }] };
-    return { ...base, [where]: { mounts } };
+    // hotfix review 1: the configuration and the merged configuration are the output of read-configuration, which the
+    // CLI has substituted once already, and the checks read them as they are. Here they are substituted once with the
+    // variables of the pipeline (the variables of the helper process whose values are not known stay, as if
+    // read-configuration had left them).
+    return { ...base, [where]: { mounts: substituteCliVariables(mounts, base.variables ?? { mayBeSet: mayBeSetInHelper }) } };
   };
 
   describe.each<Where>(['metadata', 'config', 'merged'])('in the %s', (where) => {
@@ -1008,7 +1012,8 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
 
     it.each<[string, unknown, string, string?]>([
       ['a variable of the helper process in a volume name', 'source=${localEnv:HOSTNAME},target=/x,type=volume', '${localEnv:HOSTNAME}'],
-      ['a variable of the helper process with a default', 'source=${env:HOME:devenv-other-abcdef12},target=/x,type=volume', '${env:HOME:devenv-other-abcdef12}'],
+      // hotfix review 1, N4: HOME is known in the helper (/root), so TERM, which may be set.
+      ['a variable of the helper process with a default', 'source=${env:TERM:devenv-other-abcdef12},target=/x,type=volume', '${env:TERM:devenv-other-abcdef12}'],
       ['a variable of the helper process in a target', 'source=cache,target=${localEnv:PATH},type=volume', '${localEnv:PATH}'],
       ['a variable of the helper process in the object form', { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' }, '${localEnv:HOSTNAME}'],
       ['a variable of the helper process without a type', 'source=${localEnv:HOSTNAME},target=/x', '${localEnv:HOSTNAME}'],
@@ -1020,9 +1025,11 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
         'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume',
       ],
       ['${env} without a name (the CLI stops)', 'source=${env},target=/x,type=volume', '${env}'],
-      ['a tmpfs with a variable of the helper process', 'type=tmpfs,target=${localEnv:HOME}/t', '${localEnv:HOME}'],
+      // hotfix review 1, N4: HOME is known in the helper (/root), so PWD, which may be set.
+      ['a tmpfs with a variable of the helper process', 'type=tmpfs,target=${localEnv:PWD}/t', '${localEnv:PWD}'],
     ])('does not support %s, with the checks on and off', (_name, mount, variable, resolved) => {
-      const text = resolved ?? (typeof mount === 'string' ? mount : JSON.stringify(mount));
+      // hotfix review 1, N6: an object is named by the --mount text that the CLI makes of it.
+      const text = resolved ?? (typeof mount === 'string' ? mount : 'type=volume,src=${localEnv:HOSTNAME},dst=/x');
       for (const checksOn of [true, false]) {
         expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({
           hostAccess: [],
@@ -1059,7 +1066,8 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
 
     it('keeps the bind mounts of ${localEnv:HOME} as access to the computer: allowed with the checks off', () => {
       const mounts = ['source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached', { source: '${localEnv:HOME}/.aws', target: '/a', type: 'bind' }];
-      expect(hostAccessProblems(input(where, mounts))).toEqual(['bind mount ${localEnv:HOME}/.ssh', 'bind mount ${localEnv:HOME}/.aws']);
+      // hotfix review 1, N4: HOME is /root in the helper.
+      expect(hostAccessProblems(input(where, mounts))).toEqual(['bind mount /root/.ssh', 'bind mount /root/.aws']);
       expect(hostAccessProblems(input(where, mounts), false)).toEqual([]);
       // A path without a type is a bind mount too.
       expect(hostAccessProblems(input(where, ['source=${localEnv:HOME}/.m2,target=/m2']), false)).toEqual([]);
@@ -1080,7 +1088,9 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
     ['--mount with a default', ['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume'], [FOREIGN]],
     ['-v with a default', ['-v', '${env:NOPE:devenv-helper-cache}:/c'], [HELPER_CACHE]],
     ['--volume= with the basename', ['--volume=devenv-${localWorkspaceFolderBasename}-abcdef12:/x'], ['volume devenv-api-abcdef12 of another environment']],
-  ])('refuses %s in runArgs, with the checks on and off', (_name, runArgs, items) => {
+  ])('refuses %s in runArgs, with the checks on and off', (_name, raw, items) => {
+    // hotfix review 1: the runArgs as read-configuration returns them (substituted once).
+    const runArgs = substituteCliVariables(raw, variables);
     for (const checksOn of [true, false]) {
       expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs } }, checksOn)).toEqual(items);
       expect(hostAccessProblems({ ownVolume: OWN, variables, merged: { runArgs } }, checksOn)).toEqual(items);
@@ -1088,22 +1098,27 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
   });
 
   it('does not support a variable of the helper process in a volume of runArgs, and keeps bind mounts as access to the computer', () => {
-    // In -v, the colon of the variable hides where the source ends, so a -v with such a variable is not supported, also
-    // for a path (read-configuration has resolved ${localEnv:HOME} in the runArgs of the configuration already).
+    // hotfix review 1, N1-N3: a variable left in the runArgs of read-configuration is resolved again at `up`, so any
+    // such entry is not supported, also in a bind mount (named as an entry of runArgs).
     const runArgs = ['-v', '${localEnv:HOSTNAME}:/c', '--mount', 'type=volume,src=${env:PATH},dst=/p', '-v', '${localEnv:HOME}/.ssh:/s'];
     expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, false)).toEqual({
       hostAccess: [],
       unsupported: [
-        'volume "${localEnv:HOSTNAME}:/c" uses ${localEnv:HOSTNAME}, which cannot be checked',
-        'mount "type=volume,src=${env:PATH},dst=/p" uses ${env:PATH}, which cannot be checked',
-        'volume "${localEnv:HOME}/.ssh:/s" uses ${localEnv:HOME}, which cannot be checked',
+        'runArgs "${localEnv:HOSTNAME}:/c" uses ${localEnv:HOSTNAME}, which cannot be checked',
+        'runArgs "type=volume,src=${env:PATH},dst=/p" uses ${env:PATH}, which cannot be checked',
+        'runArgs "${localEnv:HOME}/.ssh:/s" uses ${localEnv:HOME}, which cannot be checked',
       ],
     });
-    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } })).toEqual([
-      'bind mount ${localEnv:HOME}/.ssh',
+    const leftBind = 'runArgs "type=bind,src=${localEnv:HOME}/.ssh,dst=/s" uses ${localEnv:HOME}, which cannot be checked';
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } })).toEqual([leftBind]);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } }, false)).toEqual([leftBind]);
+    // As read-configuration returns it, the bind mount is access to the computer.
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } })).toEqual(['bind mount /root/.ssh']);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } }, false)).toEqual([]);
+    expect(runArgsProblems(['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x'], OWN)).toEqual([
+      'runArgs "source=${localEnv:NOPE:devenv-other-abcdef12},target=/x" uses ${localEnv:NOPE:devenv-other-abcdef12}, which cannot be checked',
     ]);
-    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } }, false)).toEqual([]);
-    expect(runArgsProblems(['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x'], OWN)).toEqual([FOREIGN]);
+    expect(runArgsProblems(['--mount', 'source=devenv-other-abcdef12,target=/x'], OWN)).toEqual([FOREIGN]);
   });
 
   it('checks the other properties of the metadata as the CLI resolves them', () => {
@@ -1149,5 +1164,210 @@ describe('host access policy: names of variables (hotfix GH)', () => {
     ['a space in the value only', ['-e', 'A=b c'], { hostAccess: [], unsupported: [] }],
   ])('runArgs: %s, with the checks on and off', (_name, runArgs, expected) => {
     for (const checksOn of [true, false]) expect(hostAccessReport({ ownVolume: OWN, config: { runArgs } }, checksOn)).toEqual(expected);
+  });
+});
+
+// Hotfix review 1: Dev Container CLI 0.89.0 substitutes the runArgs and the appPort of the override configuration a
+// second time at `up` (read-configuration substituted them once already), and it substitutes the image metadata at
+// `up`. The findings N1 to N6 of the review, with the vectors of the reviewers and verifiers.
+describe('host access policy: what the Dev Container CLI substitutes again at up (hotfix review 1)', () => {
+  const variables = helperCliVariables('acme/api');
+  const FOREIGN_NAME = 'devenv-other-abcdef12';
+  // The process of the CLI in the helper: `docker run -i` without `-t` (no TERM), no OLDPWD, `_`, or proxy variables.
+  const HELPER_PROCESS = { HOME: '/root', PATH: '/usr/local/bin:/usr/bin:/bin', HOSTNAME: '0123456789ab', NODE_VERSION: '24.1.0', YARN_VERSION: '1.22.22' };
+  /** What read-configuration returns: the configuration substituted once by the CLI in the helper (T1). */
+  const readConfiguration = <T>(raw: T): T =>
+    substituteCliVariables(raw, { localWorkspaceFolder: '/workspaces/api', containerWorkspaceFolder: '/workspaces/api', env: HELPER_PROCESS });
+  const leftover = (kind: string, text: string, left: string): string => `${kind} ${JSON.stringify(text)} uses ${left}, which cannot be checked`;
+  const both = (check: (checksOn: boolean) => void): void => {
+    for (const checksOn of [true, false]) check(checksOn);
+  };
+
+  describe('N1: a type that a variable of the helper process adds to a bind mount', () => {
+    it.each<[string, unknown, string, string]>([
+      [
+        'the label, a string',
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${localEnv:TERM:type=volume}`,
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${localEnv:TERM:type=volume}`,
+        '${localEnv:TERM:type=volume}',
+      ],
+      [
+        'the label, the object form',
+        { type: 'bind', source: FOREIGN_NAME, target: '/y,${localEnv:TERM:type=volume}' },
+        `type=bind,src=${FOREIGN_NAME},dst=/y,\${localEnv:TERM:type=volume}`,
+        '${localEnv:TERM:type=volume}',
+      ],
+      [
+        'the label, OLDPWD',
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${env:OLDPWD:type=volume}`,
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${env:OLDPWD:type=volume}`,
+        '${env:OLDPWD:type=volume}',
+      ],
+      [
+        'the label, a path in the default of a volume source',
+        `type=volume,source=\${env:TERM:${FOREIGN_NAME}}\${env:TERM::/}`,
+        `type=volume,source=\${env:TERM:${FOREIGN_NAME}}\${env:TERM::/}`,
+        `\${env:TERM:${FOREIGN_NAME}}, \${env:TERM::/}`,
+      ],
+    ])('refuses %s, with the checks on and off', (_name, mount, text, left) => {
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover('mount', text, left)],
+        });
+      });
+    });
+
+    it.each<[string, string]>([
+      ['TERM', `type=bind,source=${FOREIGN_NAME},target=/y,$\${env:NOPE:{}env:TERM:type=volume}`],
+      ['OLDPWD', `type=bind,source=${FOREIGN_NAME},target=/y,$\${env:NOPE:{}env:OLDPWD:type=volume}`],
+      ['a path in the default of a volume source', `type=volume,source=$\${env:NOPE:{}env:TERM:${FOREIGN_NAME}}$\${env:NOPE:{}env:TERM::/}`],
+    ])('refuses a --mount of runArgs that the second substitution makes a volume (%s), with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(['--mount', raw]);
+      expect(runArgs[1]).toContain('${env:');
+      both((checksOn) => {
+        for (const where of ['config', 'merged'] as const) {
+          const report = hostAccessReport({ ownVolume: OWN, variables, [where]: { runArgs } }, checksOn);
+          expect(report.unsupported).toContain(leftover('runArgs', runArgs[1], unresolvedCliVariables(runArgs[1]).join(', ')));
+        }
+      });
+    });
+  });
+
+  describe('N2: a name of -e, --env, or --label that the second substitution makes', () => {
+    it.each<[string, string[]]>([
+      ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
+      ['the joined -e form', ['-e$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
+      ['--env=', ['--env=$${env:NOPE:{}env:TERM:GITHUB_TOKEN}=attacker']],
+      ['--label of Dev Environments', ['--label', '$${env:NOPE:{}env:TERM:devenv.container-version}=999']],
+    ])('refuses %s, with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(raw);
+      const entry = runArgs[runArgs.length - 1];
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover('runArgs', entry, unresolvedCliVariables(entry).join(', '))],
+        });
+      });
+    });
+  });
+
+  describe('N3: a published port or a removed flag that the second substitution makes', () => {
+    it.each<[string, Record<string, unknown>, string, string]>([
+      ['-p', { runArgs: ['-p', '${localEnv:A:$}{localEnv:B:8080}'] }, 'runArgs', '${localEnv:B:8080}'],
+      ['--publish=', { runArgs: ['--publish=${localEnv:A:$}{localEnv:B:8080}'] }, 'runArgs', '--publish=${localEnv:B:8080}'],
+      ['appPort', { appPort: '${localEnv:A:$}{localEnv:B:9090}' }, 'appPort', '${localEnv:B:9090}'],
+      ['appPort, a list', { appPort: [3000, '${localEnv:A:$}{localEnv:B:9090}'] }, 'appPort', '${localEnv:B:9090}'],
+      ['--rm', { runArgs: ['${localEnv:A:$}{localEnv:B:--rm}'] }, 'runArgs', '${localEnv:B:--rm}'],
+      ['--user', { runArgs: ['--user', '${localEnv:A:$}{localEnv:B:0}'] }, 'runArgs', '${localEnv:B:0}'],
+    ])('refuses %s, with the checks on and off', (_name, raw, kind, entry) => {
+      const config = readConfiguration(raw);
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, config }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover(kind, entry, entry.replace(/^--publish=/, ''))],
+        });
+      });
+    });
+
+    it('refuses the values of the override configuration too (the final check before up)', () => {
+      const config = readConfiguration({ runArgs: ['-p', '${localEnv:A:$}{localEnv:B:8080}'], appPort: '${localEnv:A:$}{localEnv:B:9090}' });
+      const override = buildOverrideConfig({ environmentImage: 'img', volumeName: OWN, repositoryName: 'api', containerName: 'c', runArgs: config.runArgs as string[], appPort: config.appPort });
+      expect(override.appPort).toEqual(['${localEnv:B:9090}']);
+      expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs: override.runArgs, appPort: override.appPort } }).unsupported).toEqual([
+        leftover('runArgs', '${localEnv:B:8080}', '${localEnv:B:8080}'),
+        leftover('appPort', '${localEnv:B:9090}', '${localEnv:B:9090}'),
+      ]);
+    });
+  });
+
+  describe('the double substitution on main (checks on): variables without a value in the helper', () => {
+    it.each<[string, string[]]>([
+      ['--mount of another environment', ['--mount', `type=volume,source=$\${env:NOPE:{}env:NOPE2:${FOREIGN_NAME}},target=/y`]],
+      ['-v of another environment', ['-v', `$\${env:NOPE:{}env:NOPE2:${FOREIGN_NAME}}:/y`]],
+      ['-v of the helper cache', ['-v', `$\${env:NOPE:{}env:NOPE2:${HELPER_CACHE_VOLUME}}:/y`]],
+      ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:NOPE2:GH_TOKEN}=x']],
+      ['--label', ['--label', '$${env:NOPE:{}env:NOPE2:devenv.environment-id}=x']],
+    ])('refuses %s, with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(raw);
+      const entry = runArgs[runArgs.length - 1];
+      expect(entry).toContain('${env:NOPE2:');
+      both((checksOn) => {
+        for (const where of ['config', 'merged'] as const) {
+          const report = hostAccessReport({ ownVolume: OWN, variables, [where]: { runArgs } }, checksOn);
+          expect(report.unsupported).toContain(leftover('runArgs', entry, unresolvedCliVariables(entry).join(', ')));
+        }
+        expect(runArgsProblems(runArgs, OWN)).toContain(leftover('runArgs', entry, unresolvedCliVariables(entry).join(', ')));
+      });
+    });
+
+    it('allows ${devcontainerId} and ordinary values in runArgs', () => {
+      const runArgs = readConfiguration(['--init', '-e', 'FOO=bar', '--label', 'x=${devcontainerId}', '-v', 'cache-${devcontainerId}:/c', '-p', '8080:80', '--cap-add', 'SYS_PTRACE']);
+      both((checksOn) => expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs, appPort: [3000, '8081:81'] } }, checksOn)).toEqual([]));
+    });
+  });
+
+  describe('N3: the other readers of runArgs see what Docker gets', () => {
+    it('a --user, --hostname, or --network that the second substitution makes is refused before runArgsUser, runArgsDecideHostname, and imageRemoteUser read it', () => {
+      for (const raw of [['--user', '${localEnv:A:$}{localEnv:B:0}'], ['--hostname', '${localEnv:A:$}{localEnv:B:x}'], ['--network', '${localEnv:A:$}{localEnv:B:host}']]) {
+        const runArgs = readConfiguration(raw);
+        both((checksOn) => expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, checksOn).unsupported).toEqual([leftover('runArgs', runArgs[1], runArgs[1])]));
+      }
+    });
+  });
+
+  describe('N4: ${localEnv:HOME} of the helper (/root)', () => {
+    it.each<[string, unknown]>([
+      ['a volume target', 'source=m2-${devcontainerId},target=${localEnv:HOME}/.m2,type=volume'],
+      ['a volume target, object form', { type: 'volume', source: 'm2-${devcontainerId}', target: '${localEnv:HOME}/.m2' }],
+      ['a tmpfs target', 'type=tmpfs,target=${localEnv:HOME}/.cache'],
+    ])('allows %s in the label, with the checks on and off', (_name, mount) => {
+      both((checksOn) => expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }, checksOn)).toEqual([]));
+    });
+
+    it('keeps the bind mounts of ${localEnv:HOME}/.ssh: /root/.ssh, allowed with the checks off', () => {
+      const mounts = ['source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached'];
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] })).toEqual(['bind mount /root/.ssh']);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] }, false)).toEqual([]);
+      // In the configuration, read-configuration has resolved it already.
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: readConfiguration({ mounts }) }, false)).toEqual([]);
+    });
+  });
+
+  describe('N5: long texts', () => {
+    it('refuses a label of 300 KB of "${" quickly', () => {
+      const metadata = [{ customizations: { x: '${'.repeat(150_000) } }];
+      const start = Date.now();
+      both((checksOn) => {
+        const report = hostAccessReport({ ownVolume: OWN, variables, metadata }, checksOn);
+        expect(report.unsupported).toEqual(['a text longer than 256 KB in the image metadata']);
+      });
+      mountedVolumeNames({ ownVolume: OWN, variables, metadata });
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+  });
+
+  describe('N6: the object form in the message', () => {
+    it('shows the text that the CLI passes to docker run', () => {
+      const mount = { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' };
+      expect(hostAccessReport({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }).unsupported).toEqual([
+        leftover('mount', 'type=volume,src=${localEnv:HOSTNAME},dst=/x', '${localEnv:HOSTNAME}'),
+      ]);
+    });
+  });
+
+  it('keeps the common patterns working', () => {
+    const mounts = [
+      'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume',
+      { source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' },
+      'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume',
+      'source=projectname-bashhistory,target=/commandhistory,type=volume',
+    ];
+    const runArgs = ['--init', '-e', 'FOO=bar', '--memory', '4g'];
+    both((checksOn) => {
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] }, checksOn)).toEqual([]);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: readConfiguration({ mounts, runArgs }) }, checksOn)).toEqual([]);
+    });
+    expect(mountedVolumeNames({ ownVolume: OWN, variables, config: readConfiguration({ mounts }) })).toEqual(['api-node_modules', 'projectname-bashhistory']);
   });
 });

@@ -9,7 +9,12 @@
 //
 // How the CLI substitutes (devContainersSpecCLI.js of 0.89.0, functions Fo, za, lN, I_, C_, hN, tg, E_):
 // - The pattern /\$\{(.*?)\}/g, applied to the string values (not the keys) of objects and arrays, recursively. The
-//   result of a replacement is not read again in the same pass.
+//   result of a replacement is not read again in the same pass. This module finds the same matches with a linear scan
+//   (variableMatches): the pattern itself takes quadratic time on a text such as `${${${…` without `}` (hotfix review 1,
+//   N5).
+// - What read-configuration returns is substituted once. At `up`, the CLI substitutes the override configuration again
+//   (its runArgs and appPort come from that output, so they are substituted twice), and each entry of the image
+//   metadata once.
 // - The text between the braces is split at every `:`: the first part is the name, the others are the arguments.
 // - `env` and `localEnv`: the variable of the CLI process named by the first argument; when it is not set, the second
 //   argument (the default, which cannot hold a `:`), otherwise ''. Without an argument, the CLI stops with an error.
@@ -23,8 +28,14 @@ import * as path from 'path';
 import { HELPER_ENV_NAMES } from './localEnv';
 import { repositoryFolder } from '../names';
 
-/** The pattern of the Dev Container CLI. */
-const VARIABLE = /\$\{(.*?)\}/g;
+/**
+ * The longest text (a string value or key) that the checks read, and the most text in one source (the configuration,
+ * the merged configuration, or the whole image metadata), in characters (hotfix review 1, N5). Longer texts are not
+ * supported: the Dev Container CLI would spend minutes on them in the helper (its pattern takes quadratic time). Real
+ * labels hold a few kilobytes; a Feature's metadata rarely more than a few dozen.
+ */
+export const MAX_CLI_TEXT_LENGTH = 256 * 1024;
+export const MAX_CLI_SOURCE_LENGTH = 1024 * 1024;
 
 /** Names that the Dev Container CLI resolves (or would resolve for an existing container: `containerEnv`). */
 const CLI_VARIABLE_NAMES: readonly string[] = [
@@ -93,8 +104,15 @@ export interface CliVariables {
  */
 export function helperCliVariables(repository: string): CliVariables {
   const folder = repositoryFolder(repository);
-  return { localWorkspaceFolder: folder, containerWorkspaceFolder: folder, mayBeSet: mayBeSetInHelper };
+  return { localWorkspaceFolder: folder, containerWorkspaceFolder: folder, env: HELPER_KNOWN_ENV, mayBeSet: mayBeSetInHelper };
 }
+
+/**
+ * The variables of the process of the Dev Container CLI in the workspace helper whose values are known (hotfix review 1,
+ * N4): HOME. The helper runs as root (resources/helper/Dockerfile has no USER, and helperRunArgs passes no `--user`),
+ * so Docker sets HOME=/root; the pipeline passes no variable to the CLI runs.
+ */
+export const HELPER_KNOWN_ENV: Readonly<Record<string, string>> = { HOME: '/root' };
 
 /** Whether the process of the Dev Container CLI in the workspace helper may have the variable `name` (HELPER_PROCESS_ENV_NAMES). */
 export function mayBeSetInHelper(name: string): boolean {
@@ -118,12 +136,68 @@ function mapStrings(value: unknown, replace: (text: string) => string): unknown 
   return value;
 }
 
+/** A match of the pattern /\$\{(.*?)\}/g of the CLI: `text.slice(start, end)`, with the text between the braces. */
+interface VariableMatch {
+  start: number;
+  end: number;
+  inner: string;
+}
+
+/** A line terminator, which `.` of the pattern of the CLI does not match. */
+const LINE_TERMINATOR = /[\n\r\u2028\u2029]/g;
+
+/**
+ * The matches of the pattern /\$\{(.*?)\}/g of the CLI in `text`, in order, as String.prototype.replace finds them, in
+ * linear time (hotfix review 1, N5): a match starts at a `${` and ends at the first `}` after it, when no line terminator
+ * comes before that `}`; the search goes on after the match. A `${` without such a `}` is no match, and neither is any
+ * other `${` before the next line terminator (its first `}` comes after that terminator too).
+ */
+export function variableMatches(text: string): VariableMatch[] {
+  const matches: VariableMatch[] = [];
+  // The first `}` and the first line terminator at or after a position; the positions only grow, so each is found once.
+  let close: number | undefined;
+  let lineEnd: number | undefined;
+  const closeFrom = (position: number): number => {
+    if (close === undefined || (close !== -1 && close < position)) close = text.indexOf('}', position);
+    return close;
+  };
+  const lineEndFrom = (position: number): number => {
+    if (lineEnd === undefined || (lineEnd !== -1 && lineEnd < position)) {
+      LINE_TERMINATOR.lastIndex = position;
+      const found = LINE_TERMINATOR.exec(text);
+      lineEnd = found ? found.index : -1;
+    }
+    return lineEnd;
+  };
+  let position = 0;
+  while (position < text.length) {
+    const start = text.indexOf('${', position);
+    if (start < 0) break;
+    const end = closeFrom(start + 2);
+    if (end < 0) break;
+    const terminator = lineEndFrom(start + 2);
+    if (terminator >= 0 && terminator < end) {
+      position = terminator + 1;
+      continue;
+    }
+    matches.push({ start, end: end + 1, inner: text.slice(start + 2, end) });
+    position = end + 1;
+  }
+  return matches;
+}
+
 /** One pass of the CLI over a text: `resolve(match, name, args)` for each expression. */
 function substituteText(text: string, resolve: (match: string, name: string, args: string[]) => string): string {
-  return text.replace(VARIABLE, (match: string, inner: string) => {
-    const parts = inner.split(':');
-    return resolve(match, parts[0], parts.slice(1));
-  });
+  const matches = variableMatches(text);
+  if (matches.length === 0) return text;
+  let result = '';
+  let position = 0;
+  for (const match of matches) {
+    const parts = match.inner.split(':');
+    result += text.slice(position, match.start) + resolve(text.slice(match.start, match.end), parts[0], parts.slice(1));
+    position = match.end;
+  }
+  return result + text.slice(position);
 }
 
 /**
@@ -177,10 +251,41 @@ export function substituteCliVariables<T>(value: T, variables: CliVariables): T 
  */
 export function unresolvedCliVariables(text: string): string[] {
   const found: string[] = [];
-  for (const match of text.matchAll(VARIABLE)) {
-    const name = nameOf(match[1]);
+  for (const match of variableMatches(text)) {
+    const name = nameOf(match.inner);
     if (name === DEVCONTAINER_ID_VARIABLE || !CLI_VARIABLE_NAMES.includes(name)) continue;
-    if (!found.includes(match[0])) found.push(match[0]);
+    const expression = text.slice(match.start, match.end);
+    if (!found.includes(expression)) found.push(expression);
   }
   return found;
+}
+
+/**
+ * The length of the longest text in `value` (string values and keys of objects, entries of arrays) and the sum of all,
+ * in characters, without recursion (hotfix review 1, N5: MAX_CLI_TEXT_LENGTH, MAX_CLI_SOURCE_LENGTH).
+ */
+export function textLengths(value: unknown): { longest: number; total: number } {
+  let longest = 0;
+  let total = 0;
+  const count = (text: string): void => {
+    longest = Math.max(longest, text.length);
+    total += text.length;
+  };
+  const pending: unknown[] = [value];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (typeof next === 'string') count(next);
+    else if (next !== null && typeof next === 'object' && !seen.has(next)) {
+      seen.add(next);
+      if (Array.isArray(next)) for (const entry of next) pending.push(entry);
+      else {
+        for (const [key, entry] of Object.entries(next)) {
+          count(key);
+          pending.push(entry);
+        }
+      }
+    }
+  }
+  return { longest, total };
 }
