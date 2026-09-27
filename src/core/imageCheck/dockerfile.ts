@@ -5,6 +5,8 @@
 // Base images of a Dockerfile (concept 7.7, implementation notes 9).
 // Follows the Dockerfile parser of BuildKit where it matters for FROM: parser directives, line continuations,
 // comments, heredocs, global ARGs, and variable substitution.
+// Frozen (user decision, 2026-09-27): the refusals of image references are a best-effort guard rail, not a security
+// boundary (README, "Security: what to expect"). Gaps in them are accepted and not fixed; do not extend them.
 
 /** ARGs that BuildKit defines automatically in the global scope. Their values depend on the build platform. */
 const PLATFORM_ARGS = new Set([
