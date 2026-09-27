@@ -33,7 +33,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 
 ## Agreed order of the open items (user: "go with this plan", 2026-09-27)
 
-1. Remove the Dockerfile refusals (single container and Compose); keep the FROM extraction for the update check — branch `feat/drop-dockerfile-refusals`.
+1. Remove the Dockerfile refusals — **merged** (PR #32, f1594dc). Accepted leftover (low, same as before): a devcontainer.json with a JSON syntax slip that the Dev Container CLI tolerates makes a named Dockerfile unreadable for the check, so it is refused as 'could not be read'.
 2. ~~Helper socket follows the Docker context~~ — dropped (user decision 2026-09-27: not worth the complexity; rootless Docker needs `DOCKER_HOST`, as the README says). Branch `fix/helper-socket-context` stays unmerged.
 3. Unit 15: token only in the container's memory (tmpfs) — spec in the session scratchpad `u15/spec.md`.
 4. Unit 11: one policy module, guard rails only (pure refactor).
