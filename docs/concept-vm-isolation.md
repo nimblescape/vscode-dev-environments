@@ -1,6 +1,6 @@
-# Concept: a Docker in a VM per account (not planned yet)
+# Concept: a Docker in a VM per account, locally and on a remote machine (not planned yet)
 
-Status: idea, kept for later. Nothing here is implemented. The facts about the VM tools below come from general
+Status: idea, kept for later, for local and remote Docker hosts. Nothing here is implemented. The facts about the VM tools below come from general
 knowledge and were not checked when this was written; check them before any work starts.
 
 ## Why
@@ -48,10 +48,33 @@ network, and the configuration is not judged.
 - Memory: about 1 to 2 GB for each running VM; disk: every VM stores its own images.
 - A slower first start, a VM image to keep up to date, and port forwarding through the VM.
 
-## Limit: the remote case
+## The remote case: VMs on the remote machine
 
-This does not help when the Docker runs on one remote machine that all accounts share (unit 7, a remote Docker
-host). There is only one Docker there. Separating accounts on that machine would need something on the machine
-itself, for example one rootless Docker per user account there, a container runtime that runs each container in its
-own small VM (Kata Containers, gVisor), or VMs on that machine; each of these needs control over the remote machine.
-Until then, the remote case keeps the shared Docker and the trust model applies.
+With a remote Docker host (unit 7) there is one machine, and today one shared Docker on it. The same boundary can be
+built on that machine: instead of one Docker, the machine runs one VM (or one separated Docker) per GitHub account,
+and Dev Environments reaches each through SSH.
+
+**How Dev Environments would use it.** Dev Environments already talks to Docker only through an endpoint. For a
+remote machine, the endpoint of an account becomes `ssh://<user>@<machine>` plus the Docker socket of that account's
+VM. Dev Environments asks the machine over SSH to create or start that VM, then points `DOCKER_HOST` (or a Docker
+context) at it; the VS Code window attaches through the same endpoint.
+
+**Ways to run a VM per account on the remote machine (to be checked):**
+
+| Way | What the machine needs | Isolation |
+|---|---|---|
+| Lima on Linux (`limactl create/start/stop`), each instance with its own Docker | KVM: a physical machine, or a cloud VM with nested virtualization | A VM per account, as locally. The same tool as on macOS and Linux computers. |
+| libvirt/QEMU (`virsh`) with a small VM image that runs Docker | KVM | The same, with more setup; fits machines that already use libvirt or Proxmox. |
+| Kata Containers or gVisor as the runtime of the one Docker | KVM (Kata) or nothing extra (gVisor) | Each container gets its own small VM or user-space kernel. It isolates containers from the machine, but images and build cache stay shared between accounts. |
+| One Linux user per account, each with its own rootless Docker (`ssh://devenv-<account>@<machine>`) | Nothing extra | No VM: the kernel is shared. The images, containers, volumes, and build cache of the accounts are separate, and none of them runs as root. The lightest and most portable way. |
+
+**A small agent on the machine.** Creating users or VMs needs rights on the machine. Dev Environments should not get
+a root shell for this. A small, audited helper on the machine (for example a command allowed in `authorized_keys` or
+`sudoers`) can offer exactly "create, start, stop, remove the VM or Docker of account X" and nothing else.
+
+**If the remote machine is itself a cloud VM**, nested virtualization must be switched on for Lima, libvirt, and
+Kata; otherwise only gVisor or the rootless Docker per user work.
+
+**Costs and open points:** memory and disk per VM on the machine; starting VMs on demand and stopping idle ones;
+updates of the VM images; how the machine's owner limits accounts (quotas); and how ports reach the computer through
+SSH. Until one of these ways is built, the remote machine keeps one shared Docker and the trust model applies.
