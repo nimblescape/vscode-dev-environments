@@ -110,6 +110,15 @@ const settings: ExtensionSettings = {
   hostAccessChecksOff: [],
 };
 
+/** Lifecycle token (user decision 2026-09-27): the files in the dev container where the lifecycle commands note each run. */
+const POST_CREATE_LOG = '/tmp/devenv-post-create';
+const POST_START_LOG = '/tmp/devenv-post-start';
+
+/** A lifecycle command that appends `present` to `log` when the token file is there and not empty, else `missing`. */
+function lifecycleTokenCommand(log: string): string {
+  return `if test -s ${GITHUB_TOKEN_FILE}; then echo present; else echo missing; fi >> ${log}`;
+}
+
 describe('open pipeline on a seeded environment', () => {
   const { run, env, cli, log } = dockerTestContext('pipeline');
   const runner = new NodeProcessRunner();
@@ -303,6 +312,9 @@ describe('open pipeline on a seeded environment', () => {
         runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
         // Without an address: the extension publishes it on 127.0.0.1 only (concept section 9 "Host access").
         appPort: [`${hostPort}:${CONTAINER_PORT}`],
+        // Lifecycle token (user decision 2026-09-27): each run notes whether the token was there.
+        postCreateCommand: lifecycleTokenCommand(POST_CREATE_LOG),
+        postStartCommand: lifecycleTokenCommand(POST_START_LOG),
       },
       null,
       2,
@@ -412,6 +424,9 @@ describe('open pipeline on a seeded environment', () => {
     expect(execIn(REMOTE_USER, `touch ${FOLDER}/.git/write-test && rm ${FOLDER}/.git/write-test && echo ok`)).toBe('ok');
     expect(helperContainers()).toEqual([]);
     expect(ui.since(events)).toEqual([]);
+    // Lifecycle token (user decision 2026-09-27): postCreateCommand and postStartCommand ran once each, with the token.
+    expect(execIn(REMOTE_USER, `cat ${POST_CREATE_LOG}`)).toBe('present');
+    expect(execIn(REMOTE_USER, `cat ${POST_START_LOG}`)).toBe('present');
   });
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
@@ -601,6 +616,9 @@ describe('open pipeline on a seeded environment', () => {
     expect(untrackedFileKept()).toBe(true);
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);
     expect(ui.since(events)).toEqual([]);
+    // Lifecycle token (user decision 2026-09-27): postStartCommand ran again, with the token; postCreateCommand did not.
+    expect(execIn(REMOTE_USER, `cat ${POST_CREATE_LOG}`)).toBe('present');
+    expect(execIn(REMOTE_USER, `cat ${POST_START_LOG}`).split('\n')).toEqual(['present', 'present']);
   });
 
   it('unit 15: after stop and start, the open writes the token into the memory of the container again', () => {

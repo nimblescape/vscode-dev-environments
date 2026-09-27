@@ -17,6 +17,7 @@ import {
   readConfigurationArgs,
   stripNameArgs,
   tryParseDevcontainerResult,
+  runUserCommandsArgs,
   upArgs,
 } from './devcontainerCli';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
@@ -83,9 +84,35 @@ describe('argument builders', () => {
       HELPER_CACHE_FOLDER,
       '--update-remote-user-uid-default',
       'never',
+      // lifecycle token (user decision 2026-09-27): up runs no lifecycle command; run-user-commands runs them after the token.
+      '--skip-post-create',
       '--skip-post-attach',
     ]);
     expect(upArgs({ ...base, removeExistingContainer: true })).toEqual([...args, '--remove-existing-container']);
+  });
+
+  it('run-user-commands with the inputs of up and the container of its result (lifecycle token, user decision 2026-09-27)', () => {
+    expect(
+      runUserCommandsArgs({
+        workspaceFolder: '/workspaces/api',
+        overrideConfigPath: '/tmp/devenv-override/devcontainer.json',
+        idLabel: 'devenv.environment-id=3f2a',
+        containerId: 'c0ffee',
+      }),
+    ).toEqual([
+      'run-user-commands',
+      '--workspace-folder',
+      '/workspaces/api',
+      '--override-config',
+      '/tmp/devenv-override/devcontainer.json',
+      '--id-label',
+      'devenv.environment-id=3f2a',
+      '--container-id',
+      'c0ffee',
+      '--user-data-folder',
+      HELPER_CACHE_FOLDER,
+      '--skip-post-attach',
+    ]);
   });
 });
 

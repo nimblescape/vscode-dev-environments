@@ -3175,3 +3175,39 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     });
   });
 });
+
+describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
+  it('first open: up, the token into the dev container, then run-user-commands with the model and the project of up', async () => {
+    await h.service.open(TARGET, options());
+    const dev = devContainer();
+    expect(dev?.name).toBe(NAME);
+    const up = h.helper.ups[0];
+    expect(h.helper.userCommandRuns).toEqual([
+      { containerId: dev?.id, environmentId: ENV_ID, override: up.override, files: up.files, env: { COMPOSE_PROJECT_NAME: PROJECT }, upsBefore: 1, tokenWritesBefore: 1 },
+    ]);
+    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ container: dev?.id, user: 'root', remoteUser: 'vscode', token: TOKEN })]);
+    expect(JSON.stringify(h.helper.userCommandRuns)).not.toContain(TOKEN);
+  });
+
+  it('a stopped environment: up starts the containers, then run-user-commands in the dev container', async () => {
+    await seedCompose();
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.userCommandRuns).toEqual([expect.objectContaining({ containerId: devContainer()?.id, upsBefore: 1, tokenWritesBefore: 1 })]);
+  });
+
+  it('a running dev container: no up and no run-user-commands', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.userCommandRuns).toEqual([]);
+    expect(h.docker.tokenWrites()).toHaveLength(1);
+  });
+
+  it('a lifecycle command that fails in run-user-commands: the existing warning, the environment opens', async () => {
+    await seedCompose();
+    h.helper.lifecycleFailure = () => 'postStartCommand from devcontainer.json failed.';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([PipelineTexts.lifecycleCommandFailed('postStartCommand')]);
+    expect(devContainer()?.state).toBe('running');
+  });
+});

@@ -52,6 +52,8 @@ import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const INIT_SQL = 'select 1;';
 const SEED_TEXT = 'seed data';
+/** Lifecycle token (user decision 2026-09-27): the file in the dev container where postCreateCommand notes its run. */
+const POST_CREATE_LOG = '/tmp/devenv-post-create';
 
 /** Writes the files of `$2` (JSON: relative path → text) into the repository folder `$1` and commits them, as root. */
 const SEED_SCRIPT = `set -eu
@@ -164,6 +166,8 @@ ${extra}volumes:
       workspaceFolder: target.folder,
       // A named volume of `mounts`: the Dev Container CLI declares it in the project; our model declares it external.
       mounts,
+      // Lifecycle token (user decision 2026-09-27): notes whether the token was there when the command ran.
+      postCreateCommand: `if test -s ${GITHUB_TOKEN_FILE}; then echo present; else echo missing; fi >> ${POST_CREATE_LOG}`,
     });
     const files = {
       [CONFIG_PATH]: devcontainerJson,
@@ -383,6 +387,8 @@ ${extra}volumes:
     );
     expect(entry?.buildRecord?.images).toHaveProperty([TEST_BASE_IMAGE]);
     expect(entry?.additionalVolumes).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
+    // Lifecycle token (user decision 2026-09-27): postCreateCommand ran once in the dev container, with the token.
+    expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
   });
 
   it('Stop stops both containers; the next open starts them again without a build', async () => {
@@ -400,6 +406,8 @@ ${extra}volumes:
     expect(cli.container(dbContainer())?.State.Running).toBe(true);
     expect(cli.lines(['image', 'ls', '--format', '{{.Tag}}', environmentImageRepository(app.id)])).toEqual(['1']);
     expect((await registry.get(app.id))?.buildRecord?.buildNumber).toBe(1);
+    // Lifecycle token (user decision 2026-09-27): run-user-commands after the start does not run postCreateCommand again.
+    expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
   });
 
   it('Delete removes the containers, the network, and the images of the project, and only the ticked data volumes', async () => {

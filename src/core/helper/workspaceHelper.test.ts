@@ -1113,8 +1113,45 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       '/devenv-cache',
       '--update-remote-user-uid-default',
       'never',
+      // lifecycle token (user decision 2026-09-27): up runs no lifecycle command; run-user-commands runs them after the token.
+      '--skip-post-create',
       '--skip-post-attach',
       '--remove-existing-container',
+    ]);
+  });
+
+  it('runUserCommands passes the override configuration on stdin and names the container of up (lifecycle token)', async () => {
+    docker.handler = () => ({ stdout: '{"outcome":"success","result":"done"}\n' });
+    const override = { image: 'devenv-3f2a9c1e:2', shutdownAction: 'none' };
+    const result = await createHelper().runUserCommands({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      override,
+      environmentId: '3f2a9c1e-5b7d',
+      containerId: 'c1',
+    });
+    expect(result).toMatchObject({ outcome: 'success', containerId: 'c1' });
+    const run = docker.runs[0];
+    expect(JSON.parse(run.options.input ?? '')).toEqual(override);
+    expect(run.args).not.toContain('-e');
+    expect(commandOf(run.args)).toEqual([
+      'sh',
+      '-c',
+      UP_SCRIPT,
+      'sh',
+      OVERRIDE_CONFIG_PATH,
+      'run-user-commands',
+      '--workspace-folder',
+      '/workspaces/api',
+      '--override-config',
+      OVERRIDE_CONFIG_PATH,
+      '--id-label',
+      'devenv.environment-id=3f2a9c1e-5b7d',
+      '--container-id',
+      'c1',
+      '--user-data-folder',
+      '/devenv-cache',
+      '--skip-post-attach',
     ]);
   });
 
@@ -1285,6 +1322,40 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     });
   });
 
+  it('runUserCommands with files writes them with the override configuration and passes the project name (lifecycle token)', async () => {
+    docker.handler = () => ({ stdout: '{"outcome":"success","result":"done"}\n' });
+    const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app', shutdownAction: 'none' };
+    await createHelper().runUserCommands({
+      volumeName: 'vol',
+      repository: 'acme/api',
+      override,
+      environmentId: '3f2a9c1e-5b7d',
+      containerId: 'c1',
+      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
+      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+    });
+    const run = docker.runs[0];
+    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    const command = commandOf(run.args);
+    expect(command.slice(0, 7)).toEqual(['node', '-e', WRITE_AND_RUN_SCRIPT, '/tmp/devenv-override', '', '', 'run-user-commands']);
+    expect(command.slice(7)).toEqual([
+      '--workspace-folder',
+      '/workspaces/api',
+      '--override-config',
+      OVERRIDE_CONFIG_PATH,
+      '--id-label',
+      'devenv.environment-id=3f2a9c1e-5b7d',
+      '--container-id',
+      'c1',
+      '--user-data-folder',
+      '/devenv-cache',
+      '--skip-post-attach',
+    ]);
+    expect(JSON.parse(run.options.input ?? '')).toEqual({
+      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}', [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
+    });
+  });
+
   it.each<[string, string]>([
     ['a file outside the override folder', '/tmp/other/compose.json'],
     ['a file with ..', '/tmp/devenv-override/../x.json'],
@@ -1301,6 +1372,40 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       }),
     ).rejects.toThrow(/Invalid helper file/);
     expect(docker.runs).toHaveLength(0);
+  });
+});
+
+describe('WorkspaceHelper.runUserCommands with a failed lifecycle command (lifecycle token, user decision 2026-09-27)', () => {
+  const CONTAINER_ID = '4f1c2b3a9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a';
+
+  /** The result of the CLI: run-user-commands names no container. */
+  function answer(description: string, inspect: Partial<RunResult>): void {
+    const stdout = `${JSON.stringify({ outcome: 'error', message: 'Command failed: /bin/sh -c npm install', description })}\n`;
+    docker.handler = (args) => (args[0] === 'run' ? { exitCode: 1, stdout } : inspect);
+  }
+
+  function runUserCommands(): Promise<unknown> {
+    return createHelper().runUserCommands({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', containerId: CONTAINER_ID });
+  }
+
+  it('keeps the container that runs, with the description of the CLI', async () => {
+    const description = 'postCreateCommand from devcontainer.json failed.';
+    answer(description, { stdout: '"running"\n' });
+    await expect(runUserCommands()).resolves.toEqual({ outcome: 'success', containerId: CONTAINER_ID, lifecycleCommandFailure: description });
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes(description))).toBe(true);
+  });
+
+  it('throws the error with the container ID when the container does not run', async () => {
+    answer('postStartCommand from devcontainer.json failed.', { stdout: '"exited"\n' });
+    const error = await runUserCommands().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DevcontainerCommandError);
+    expect(error).toMatchObject({ command: 'devcontainer run-user-commands', result: { containerId: CONTAINER_ID } });
+  });
+
+  it('throws for other errors without asking Docker', async () => {
+    answer('An error occurred running user commands in the container.', { stdout: '"running"\n' });
+    await expect(runUserCommands()).rejects.toBeInstanceOf(DevcontainerCommandError);
+    expect(docker.calls.filter((call) => call.args[0] === 'container')).toHaveLength(0);
   });
 });
 

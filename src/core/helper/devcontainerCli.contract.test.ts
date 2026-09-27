@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { buildArgs, isLifecycleCommandFailure, readConfigurationArgs, upArgs } from './devcontainerCli';
+import { buildArgs, isLifecycleCommandFailure, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
 import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, buildCommand, upCommand, writeAndRunCommand } from './scripts';
 
 const CLI_FOLDER = path.resolve(__dirname, '../../../node_modules/@devcontainers/cli');
@@ -176,6 +176,19 @@ describe('options of the helper against `devcontainer <command> --help`', () => 
     expect(contractProblems(args, documentedOptions('up'))).toEqual([]);
   });
 
+  // Lifecycle token (user decision 2026-09-27): the lifecycle commands run with run-user-commands, through the scripts of up.
+  it('run-user-commands, through UP_SCRIPT and WRITE_AND_RUN_SCRIPT', () => {
+    const options = documentedOptions('run-user-commands');
+    const builderArgs = runUserCommandsArgs({ workspaceFolder: folder, overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel, containerId: 'c0ffee' });
+    expect(builderArgs[0]).toBe('run-user-commands');
+    const single = argsThroughScript(upCommand(path.join(tempDir(), 'override', 'devcontainer.json'), builderArgs), '{}');
+    expect(single).toEqual(builderArgs);
+    expect(contractProblems(single, options)).toEqual([]);
+    const compose = throughWriteAndRun(writeAndRunCommand({}, builderArgs));
+    expect(compose).toEqual(builderArgs);
+    expect(contractProblems(compose, options)).toEqual([]);
+  });
+
   it('contractProblems finds each kind of problem', () => {
     const options = new Map<string, DocumentedOption>([
       ['--flag', { boolean: true }],
@@ -225,6 +238,30 @@ describe('text of a failed lifecycle command in the CLI bundle', () => {
     for (const text of examples) {
       expect(isLifecycleCommandFailure({ outcome: 'error', containerId: 'c1', description: text }), text).toBe(true);
     }
+  });
+});
+
+describe('the lifecycle commands in the CLI bundle (lifecycle token, user decision 2026-09-27)', () => {
+  const bundle = fs.readFileSync(CLI_BUNDLE, 'utf8');
+
+  // What `up --skip-post-create` and `run-user-commands` do in CLI 0.89.0 (devcontainerCli.ts, runUserCommandsArgs).
+  it.each<[string, string]>([
+    // up: --skip-post-create switches the lifecycle hooks off, so no lifecycle command runs and no marker is written.
+    ['the option of up', '"skip-post-create":S'],
+    ['up without the lifecycle hooks', 'postCreateEnabled:!S,skipNonBlocking:M,prebuild:x'],
+    ['the lifecycle hooks only when enabled', 'e.lifecycleHook.enabled&&await Sd(e,r,A,s,g,C,!1)'],
+    // run-user-commands: always with the lifecycle hooks; they are its result.
+    ['run-user-commands with the lifecycle hooks', 'postCreateEnabled:!0,skipNonBlocking:l,prebuild:f'],
+    ['the result of run-user-commands', 'return{outcome:"success",result:await Sd('],
+    // Its error result names no container: WorkspaceHelper.runUserCommands adds the container of `up`.
+    ['the error result of run-user-commands', '{outcome:"error",message:L.message,description:L.description,dispose:H}'],
+    // The markers: onCreate, updateContent, postCreate once per container, postStart once per start.
+    ['the markers of the create commands', '`.${i}Marker`'],
+    ['the marker of postStartCommand', '".postStartCommandMarker"'],
+    // postAttachCommand stays with the Dev Containers extension (--skip-post-attach).
+    ['postAttachCommand only without --skip-post-attach', 'e.skipPostAttach||await S_(e,A,t,r,n)'],
+  ])('%s', (_name, text) => {
+    expect(bundle.split(text).length - 1, text).toBe(1);
   });
 });
 

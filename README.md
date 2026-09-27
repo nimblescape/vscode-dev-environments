@@ -114,7 +114,7 @@ The user in the container is chosen by the repository (`remoteUser`, `containerU
 - For a Docker Compose build with Features, the user that the Dev Container CLI writes into its compose file is not checked.
 - An `ENV` of an image, or an environment file of the repository, can set variables that the checks refuse in the configuration, for example `GH_TOKEN`.
 - An image or a program in the container can change the settings of VS Code in the container, for example to forward ports on all addresses.
-- While the container runs, the GitHub token of the environment is readable by every program in the container that runs as its user or as root, and by everyone who can use your Docker (`docker exec`). The commands that the repository runs when its container is created or started (`postCreateCommand`, `postStartCommand`) run before the token is written and cannot use it.
+- While the container runs, the GitHub token of the environment is readable by every program in the container that runs as its user or as root, and by everyone who can use your Docker (`docker exec`). This includes the commands that the repository runs when its container is created or started (`onCreateCommand`, `updateContentCommand`, `postCreateCommand`, `postStartCommand`): Dev Environments writes the token before they run, so they can use Git and the GitHub CLI as the owner account.
 - With the checks off, a configuration can join the network of another container (`--network container:<name>`, `network_mode: container:`), also the dev container of another environment, and use the volumes of other containers.
 - With the checks off, a configuration can use the Docker socket. It then controls Docker and every other environment, also their tokens.
 

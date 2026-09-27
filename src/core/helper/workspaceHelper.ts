@@ -29,6 +29,7 @@ import {
   isLifecycleCommandFailure,
   parseDevcontainerResult,
   readConfigurationArgs,
+  runUserCommandsArgs,
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
@@ -348,6 +349,19 @@ function writeAndRunInput(files: HelperFiles | undefined, override: Record<strin
   if (override !== undefined) all[OVERRIDE_CONFIG_PATH] = JSON.stringify(override, null, 2);
   checkHelperFiles(all);
   return JSON.stringify({ files: all });
+}
+
+/**
+ * The helper command of `up` and `run-user-commands`: UP_SCRIPT with the override configuration on stdin, or, with
+ * `files` (Docker Compose: our model), WRITE_AND_RUN_SCRIPT.
+ */
+function overrideCommand(args: readonly string[], files: HelperFiles | undefined): string[] {
+  return files !== undefined ? writeAndRunCommand({}, args) : upCommand(OVERRIDE_CONFIG_PATH, args);
+}
+
+/** The standard input of overrideCommand. */
+function overrideInput(files: HelperFiles | undefined, override: Record<string, unknown>): string {
+  return files !== undefined ? writeAndRunInput(files, override) : JSON.stringify(override, null, 2);
 }
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
@@ -684,6 +698,8 @@ export class WorkspaceHelper {
   /**
    * devcontainer up with the override configuration. The override configuration is passed on stdin and written to a
    * temporary file inside the helper. SKIP_POST_ATTACH_ARG (V-1). Throws DevcontainerCommandError.
+   * Lifecycle token (user decision 2026-09-27): with SKIP_POST_CREATE_ARG, `up` runs no lifecycle command; runUserCommands
+   * runs them once the token is in the container.
    * A failed lifecycle command (isLifecycleCommandFailure) does not throw when its container runs: like the Dev
    * Containers extension, which connects and reports the failed command, the container is kept (concept 7.6, 7.7).
    * The result then has outcome 'success', the container ID, and `lifecycleCommandFailure`.
@@ -711,20 +727,70 @@ export class WorkspaceHelper {
       `Starting the container of ${p.repository}${p.removeExistingContainer ? ' (replacing the existing container)' : ''}.`,
     );
     try {
-      const command = p.files !== undefined ? writeAndRunCommand({}, args) : upCommand(OVERRIDE_CONFIG_PATH, args);
-      return await this.runDevcontainer('devcontainer up', p.volumeName, command, {
-        input: p.files !== undefined ? writeAndRunInput(p.files, p.override) : JSON.stringify(p.override, null, 2),
+      return await this.runDevcontainer('devcontainer up', p.volumeName, overrideCommand(args, p.files), {
+        input: overrideInput(p.files, p.override),
         env: p.env,
         onOutput: p.onOutput,
         signal: p.signal,
       });
     } catch (error) {
-      if (!(error instanceof DevcontainerCommandError) || !isLifecycleCommandFailure(error.result)) throw error;
-      const { containerId, description } = error.result;
-      if (!(await this.containerRuns(containerId, p.signal))) throw error;
-      this.deps.logger.warn(`${description} The container ${containerId.slice(0, 12)} of ${p.repository} runs and is kept.`);
-      return { outcome: 'success', containerId, lifecycleCommandFailure: description };
+      return this.keptAfterLifecycleFailure(error, p.repository, p.signal);
     }
+  }
+
+  /**
+   * Lifecycle token (user decision 2026-09-27): `devcontainer run-user-commands` (runUserCommandsArgs) for the container
+   * `containerId` that `up` returned, with the same inputs as `up` (the override configuration, and for Docker Compose
+   * `files` and `env`), so the CLI runs the lifecycle commands that `up` skipped, as `up` would have run them (its
+   * markers in the container skip what ran already). Throws DevcontainerCommandError. A failed lifecycle command whose
+   * container runs does not throw (as for up): the result has `lifecycleCommandFailure`. The CLI's result of a failed
+   * command names no container; the error gets `containerId`, so that it reads as the error of `up`.
+   */
+  async runUserCommands(p: {
+    volumeName: string;
+    repository: string;
+    override: Record<string, unknown>;
+    environmentId: string;
+    containerId: string;
+    files?: HelperFiles;
+    env?: Record<string, string>;
+    onOutput?: (text: string) => void;
+    signal?: AbortSignal;
+  }): Promise<UpResult> {
+    const args = runUserCommandsArgs({
+      workspaceFolder: this.repositoryFolder(p.repository),
+      overrideConfigPath: OVERRIDE_CONFIG_PATH,
+      idLabel: environmentIdLabel(p.environmentId),
+      containerId: p.containerId,
+    });
+    this.deps.logger.info(`Running the lifecycle commands of ${p.repository} in the container ${p.containerId.slice(0, 12)}.`);
+    try {
+      const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, overrideCommand(args, p.files), {
+        input: overrideInput(p.files, p.override),
+        env: p.env,
+        onOutput: p.onOutput,
+        signal: p.signal,
+      });
+      return { ...result, containerId: p.containerId };
+    } catch (error) {
+      if (error instanceof DevcontainerCommandError && error.result !== undefined && error.result.containerId === undefined) {
+        const withContainer = new DevcontainerCommandError(error.command, error.exitCode, error.stdout, error.stderr, {
+          ...error.result,
+          containerId: p.containerId,
+        });
+        return this.keptAfterLifecycleFailure(withContainer, p.repository, p.signal);
+      }
+      return this.keptAfterLifecycleFailure(error, p.repository, p.signal);
+    }
+  }
+
+  /** The result for a failed lifecycle command whose container runs (up, runUserCommands); rethrows anything else. */
+  private async keptAfterLifecycleFailure(error: unknown, repository: string, signal: AbortSignal | undefined): Promise<UpResult> {
+    if (!(error instanceof DevcontainerCommandError) || !isLifecycleCommandFailure(error.result)) throw error;
+    const { containerId, description } = error.result;
+    if (!(await this.containerRuns(containerId, signal))) throw error;
+    this.deps.logger.warn(`${description} The container ${containerId.slice(0, 12)} of ${repository} runs and is kept.`);
+    return { outcome: 'success', containerId, lifecycleCommandFailure: description };
   }
 
   /**
