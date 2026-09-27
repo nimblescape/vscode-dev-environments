@@ -29,6 +29,7 @@ import {
   isLifecycleCommandFailure,
   parseDevcontainerResult,
   readConfigurationArgs,
+  runUserCommandsArgs,
   tryParseDevcontainerResult,
   upArgs,
 } from './devcontainerCli';
@@ -252,6 +253,44 @@ function redact(text: string, secret: string): string {
   return secret.length >= 4 ? text.split(secret).join('***') : text;
 }
 
+/** Review PL-1: a stream that is not redacted line by line holds at most this many characters before it passes them on. */
+const REDACTION_BUFFER_LIMIT = 64 * 1024;
+
+/**
+ * Review PL-1: passes a stream on with `secret` replaced (redact), also when the secret is split across chunks: whole
+ * lines go on at once; a line longer than REDACTION_BUFFER_LIMIT goes on except for its last characters (shorter than
+ * the secret), which wait for the next chunk. flush passes on the rest.
+ */
+class RedactingStream {
+  private buffer = '';
+
+  constructor(
+    private readonly forward: (text: string) => void,
+    private readonly secret: string,
+  ) {}
+
+  write(text: string): void {
+    this.buffer += text;
+    const end = this.buffer.lastIndexOf('\n') + 1;
+    if (end > 0) {
+      this.forward(redact(this.buffer.slice(0, end), this.secret));
+      this.buffer = this.buffer.slice(end);
+    }
+    if (this.buffer.length > REDACTION_BUFFER_LIMIT) {
+      // A secret split at the end starts within its last `length - 1` characters, which stay.
+      const text = redact(this.buffer, this.secret);
+      const keep = Math.min(text.length, Math.max(this.secret.length - 1, 0));
+      this.forward(text.slice(0, text.length - keep));
+      this.buffer = text.slice(text.length - keep);
+    }
+  }
+
+  flush(): void {
+    if (this.buffer) this.forward(redact(this.buffer, this.secret));
+    this.buffer = '';
+  }
+}
+
 /** Git's message for the user: at most 15 lines. */
 function gitMessageFromOutput(text: string): string {
   const lines = text
@@ -348,6 +387,19 @@ function writeAndRunInput(files: HelperFiles | undefined, override: Record<strin
   if (override !== undefined) all[OVERRIDE_CONFIG_PATH] = JSON.stringify(override, null, 2);
   checkHelperFiles(all);
   return JSON.stringify({ files: all });
+}
+
+/**
+ * The helper command of `up` and `run-user-commands`: UP_SCRIPT with the override configuration on stdin, or, with
+ * `files` (Docker Compose: our model), WRITE_AND_RUN_SCRIPT.
+ */
+function overrideCommand(args: readonly string[], files: HelperFiles | undefined): string[] {
+  return files !== undefined ? writeAndRunCommand({}, args) : upCommand(OVERRIDE_CONFIG_PATH, args);
+}
+
+/** The standard input of overrideCommand. */
+function overrideInput(files: HelperFiles | undefined, override: Record<string, unknown>): string {
+  return files !== undefined ? writeAndRunInput(files, override) : JSON.stringify(override, null, 2);
 }
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
@@ -684,6 +736,8 @@ export class WorkspaceHelper {
   /**
    * devcontainer up with the override configuration. The override configuration is passed on stdin and written to a
    * temporary file inside the helper. SKIP_POST_ATTACH_ARG (V-1). Throws DevcontainerCommandError.
+   * Lifecycle token (user decision 2026-09-27): with SKIP_POST_CREATE_ARG, `up` runs no lifecycle command; runUserCommands
+   * runs them once the token is in the container.
    * A failed lifecycle command (isLifecycleCommandFailure) does not throw when its container runs: like the Dev
    * Containers extension, which connects and reports the failed command, the container is kept (concept 7.6, 7.7).
    * The result then has outcome 'success', the container ID, and `lifecycleCommandFailure`.
@@ -697,6 +751,8 @@ export class WorkspaceHelper {
     /** Docker Compose: files for the helper besides the override configuration (our model), and `env` (COMPOSE_PROJECT_NAME). */
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** Review PL-1: removed from the output and from the error (none of the commands of `up` reads it). */
+    token?: string;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -711,20 +767,77 @@ export class WorkspaceHelper {
       `Starting the container of ${p.repository}${p.removeExistingContainer ? ' (replacing the existing container)' : ''}.`,
     );
     try {
-      const command = p.files !== undefined ? writeAndRunCommand({}, args) : upCommand(OVERRIDE_CONFIG_PATH, args);
-      return await this.runDevcontainer('devcontainer up', p.volumeName, command, {
-        input: p.files !== undefined ? writeAndRunInput(p.files, p.override) : JSON.stringify(p.override, null, 2),
+      return await this.runDevcontainer('devcontainer up', p.volumeName, overrideCommand(args, p.files), {
+        input: overrideInput(p.files, p.override),
         env: p.env,
+        secret: p.token,
         onOutput: p.onOutput,
         signal: p.signal,
       });
     } catch (error) {
-      if (!(error instanceof DevcontainerCommandError) || !isLifecycleCommandFailure(error.result)) throw error;
-      const { containerId, description } = error.result;
-      if (!(await this.containerRuns(containerId, p.signal))) throw error;
-      this.deps.logger.warn(`${description} The container ${containerId.slice(0, 12)} of ${p.repository} runs and is kept.`);
-      return { outcome: 'success', containerId, lifecycleCommandFailure: description };
+      return this.keptAfterLifecycleFailure(error, p.repository, p.signal);
     }
+  }
+
+  /**
+   * Lifecycle token (user decision 2026-09-27): `devcontainer run-user-commands` (runUserCommandsArgs) for the container
+   * `containerId` that `up` returned, with the same inputs as `up` (the override configuration, and for Docker Compose
+   * `files` and `env`), so the CLI runs the lifecycle commands that `up` skipped, as `up` would have run them (its
+   * markers in the container skip what ran already). Throws DevcontainerCommandError. A failed lifecycle command whose
+   * container runs does not throw (as for up): the result has `lifecycleCommandFailure`. The CLI's result of a failed
+   * command names no container; the error gets `containerId`, so that it reads as the error of `up`.
+   */
+  async runUserCommands(p: {
+    volumeName: string;
+    repository: string;
+    override: Record<string, unknown>;
+    environmentId: string;
+    containerId: string;
+    files?: HelperFiles;
+    env?: Record<string, string>;
+    /**
+     * Review PL-1: the token in the container, which the lifecycle commands can read: removed from their output and from
+     * the error (the command output of DevcontainerCommandError), also when it is split across chunks.
+     */
+    token: string;
+    onOutput?: (text: string) => void;
+    signal?: AbortSignal;
+  }): Promise<UpResult> {
+    const args = runUserCommandsArgs({
+      workspaceFolder: this.repositoryFolder(p.repository),
+      overrideConfigPath: OVERRIDE_CONFIG_PATH,
+      idLabel: environmentIdLabel(p.environmentId),
+      containerId: p.containerId,
+    });
+    this.deps.logger.info(`Running the lifecycle commands of ${p.repository} in the container ${p.containerId.slice(0, 12)}.`);
+    try {
+      const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, overrideCommand(args, p.files), {
+        input: overrideInput(p.files, p.override),
+        env: p.env,
+        secret: p.token,
+        onOutput: p.onOutput,
+        signal: p.signal,
+      });
+      return { ...result, containerId: p.containerId };
+    } catch (error) {
+      if (error instanceof DevcontainerCommandError && error.result !== undefined && error.result.containerId === undefined) {
+        const withContainer = new DevcontainerCommandError(error.command, error.exitCode, error.stdout, error.stderr, {
+          ...error.result,
+          containerId: p.containerId,
+        });
+        return this.keptAfterLifecycleFailure(withContainer, p.repository, p.signal);
+      }
+      return this.keptAfterLifecycleFailure(error, p.repository, p.signal);
+    }
+  }
+
+  /** The result for a failed lifecycle command whose container runs (up, runUserCommands); rethrows anything else. */
+  private async keptAfterLifecycleFailure(error: unknown, repository: string, signal: AbortSignal | undefined): Promise<UpResult> {
+    if (!(error instanceof DevcontainerCommandError) || !isLifecycleCommandFailure(error.result)) throw error;
+    const { containerId, description } = error.result;
+    if (!(await this.containerRuns(containerId, signal))) throw error;
+    this.deps.logger.warn(`${description} The container ${containerId.slice(0, 12)} of ${repository} runs and is kept.`);
+    return { outcome: 'success', containerId, lifecycleCommandFailure: description };
   }
 
   /**
@@ -932,10 +1045,13 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { input?: string; env?: Record<string, string>; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: { input?: string; env?: Record<string, string>; secret?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
-    const stdoutFilter = new ResultLineFilter(output);
+    const secret = options.secret;
+    // Review PL-1: stdout goes on in whole lines (ResultLineFilter), stderr through a RedactingStream.
+    const stdoutFilter = new ResultLineFilter(secret === undefined ? output : this.redactingOutput(output, secret));
+    const stderr = secret === undefined ? undefined : new RedactingStream(output, secret);
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, helperCommand, {
@@ -943,11 +1059,13 @@ export class WorkspaceHelper {
         env: options.env,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
-        onStderr: output,
+        onStderr: stderr === undefined ? output : (text) => stderr.write(text),
       });
     } finally {
       stdoutFilter.flush();
+      stderr?.flush();
     }
+    if (secret !== undefined) result = { ...result, stdout: redact(result.stdout, secret), stderr: redact(result.stderr, secret) };
     let parsed: DevcontainerResult | undefined;
     try {
       parsed = parseDevcontainerResult(result.stdout);

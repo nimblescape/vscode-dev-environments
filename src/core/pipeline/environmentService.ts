@@ -262,6 +262,7 @@ export type EnvironmentHelper = Pick<
   | 'composeModel'
   | 'build'
   | 'up'
+  | 'runUserCommands'
   | 'gitSummary'
   | 'switchBranch'
   | 'prepareGit'
@@ -499,6 +500,17 @@ interface PipelineContext {
   session: GitHubSession;
   /** The token and the Git configuration were written into the volume in this run. */
   gitPrepared: boolean;
+  /**
+   * Lifecycle token (user decision 2026-09-27): the container into which runUserCommands wrote the token in this run,
+   * before the lifecycle commands; finish does not write it again there.
+   */
+  tokenWrittenTo?: string;
+  /**
+   * Review PL-2: the container whose ~/.gitconfig runUserCommands prepared in this run (HOME_GIT_CONFIG_SCRIPT), before
+   * the lifecycle commands, for Git older than 2.31; finish does not run the script again there (it still checks the
+   * Git version of a new container).
+   */
+  homeGitConfigWrittenTo?: string;
   /**
    * The Git identity of the account (identityOf), asked for as soon as the session is known, so the question to GitHub
    * runs while Docker starts and the image check runs. Never rejects.
@@ -2561,7 +2573,7 @@ export class EnvironmentService {
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
     // After the ownership fix (the files get the owner of the repository folder), and before `up`, so that the lifecycle
-    // commands have the token and the Git configuration.
+    // commands have the Git configuration (the token goes into the container after `up`, before them: runUserCommands).
     await this.prepareGit(ctx);
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
     // of the other services have too, so they go first. Review round 3 (D3-1): also the containers of other services that
@@ -2608,9 +2620,12 @@ export class EnvironmentService {
         override,
         environmentId: env.id,
         removeExistingContainer,
+        token: ctx.session.token,
         onOutput: this.output,
         signal: ctx.signal,
       });
+      // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
+      result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
@@ -2735,18 +2750,24 @@ export class EnvironmentService {
       repositoryName: splitRepository(env.repository).name,
     });
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
+    const inputs = {
+      override,
+      files: { [COMPOSE_MODEL_PATH]: JSON.stringify(model, null, 2) },
+      env: { COMPOSE_PROJECT_NAME: compose.project },
+    };
     try {
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
         repository: env.repository,
-        override,
         environmentId: env.id,
         removeExistingContainer,
-        files: { [COMPOSE_MODEL_PATH]: JSON.stringify(model, null, 2) },
-        env: { COMPOSE_PROJECT_NAME: compose.project },
+        ...inputs,
+        token: ctx.session.token,
         onOutput: this.output,
         signal: ctx.signal,
       });
+      // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
+      result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
@@ -3074,9 +3095,52 @@ export class EnvironmentService {
   }
 
   /**
-   * `up` failed because a lifecycle command failed (lifecycleHookFailure), and the container that it created or started
-   * runs: the result for that container, with the description of the CLI in `lifecycleCommandFailure`. Otherwise
-   * `undefined`. (WorkspaceHelper.up returns such a result itself; this covers an `up` that reports it as an error.)
+   * Lifecycle token (user decision 2026-09-27): after `up --skip-post-create` (upArgs), the token goes into the container
+   * of `result` (writeGitToken: a failure is a warning, and the commands run without the token, as before), then
+   * `devcontainer run-user-commands` runs the lifecycle commands with the inputs of `up` (WorkspaceHelper.runUserCommands),
+   * as `up` would have run them. The result of `up`, with `lifecycleCommandFailure` when a command failed and the container
+   * runs (WorkspaceHelper.runUserCommands); throws the other failures, which the callers handle as failures of `up`
+   * (keptAfterLifecycleFailure covers a failed command reported as an error). A result of `up` that reports a failed
+   * command, or has no container, is returned as it is. `configUser`: the remote user of the configuration, when `up` names
+   * none (as finish reads it).
+   */
+  private async runUserCommands(
+    ctx: PipelineContext,
+    result: DevcontainerResult & { lifecycleCommandFailure?: unknown },
+    inputs: { override: Record<string, unknown>; files?: Record<string, string>; env?: Record<string, string> },
+    configUser: string | undefined,
+  ): Promise<DevcontainerResult & { lifecycleCommandFailure?: unknown }> {
+    const containerId = nonEmptyString(result.containerId);
+    if (containerId === undefined || nonEmptyString(result.lifecycleCommandFailure) !== undefined) return result;
+    const env = ctx.env;
+    const remoteUser = nonEmptyString(result.remoteUser) ?? env.remoteUser ?? configUser ?? 'root';
+    await this.writeGitToken(ctx, containerId, remoteUser);
+    ctx.tokenWrittenTo = containerId;
+    // Review PL-2: Git older than 2.31 ignores GIT_CONFIG_COUNT and GIT_CONFIG_GLOBAL and reaches the credential helper of
+    // the container only through ~/.gitconfig, so it is prepared before the commands (the script writes only a missing or
+    // empty file, so also a started container gets it; a failure is logged, and the commands run all the same).
+    await this.runHomeGitConfigScript(ctx, containerId, remoteUser);
+    ctx.homeGitConfigWrittenTo = containerId;
+    const commands = await this.deps.helper.runUserCommands({
+      volumeName: env.volumeName,
+      repository: env.repository,
+      environmentId: env.id,
+      containerId,
+      ...inputs,
+      // Review PL-1: the commands can read the token; the helper removes it from their output and from its errors.
+      token: ctx.session.token,
+      onOutput: this.output,
+      signal: ctx.signal,
+    });
+    const failure = nonEmptyString(commands.lifecycleCommandFailure);
+    return failure === undefined ? result : { ...result, lifecycleCommandFailure: failure };
+  }
+
+  /**
+   * `up` or run-user-commands failed because a lifecycle command failed (lifecycleHookFailure), and the container that it
+   * created or started runs: the result for that container, with the description of the CLI in `lifecycleCommandFailure`.
+   * Otherwise `undefined`. (WorkspaceHelper.up and runUserCommands return such a result themselves; this covers one that
+   * is reported as an error.)
    */
   private async keptAfterLifecycleFailure(
     ctx: PipelineContext,
@@ -3372,20 +3436,26 @@ export class EnvironmentService {
   }
 
   /**
-   * Concept section 9, in a new container before the first attach: the ~/.gitconfig of the remote user
+   * Concept section 9, in a new container before the first attach (review PL-2: runUserCommands runs the script before
+   * the lifecycle commands, runHomeGitConfigScript): the ~/.gitconfig of the remote user
    * (HOME_GIT_CONFIG_CONTENT: an include of the configuration of the volume, for Git older than 2.32 and for processes
    * without the variables of the container). Then the Git version of the container (checkGitVersion). A failure is
    * logged. Root may not write into the home folder of the user when the configuration takes rights away from the
    * container (for example `--cap-drop ALL`, concept section 9 "Host access"): then the user writes the file itself.
    */
   private async prepareHomeGitConfig(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    await this.runHomeGitConfigScript(ctx, container, user);
+    await this.checkGitVersion(ctx, container, user);
+  }
+
+  /** The ~/.gitconfig of prepareHomeGitConfig, without the check of the Git version. A failure is logged. */
+  private async runHomeGitConfigScript(ctx: PipelineContext, container: string, user: string): Promise<void> {
     let failure = await this.runHomeGitConfig(ctx, container, user, 'root');
     if (failure !== undefined && !isRootUser(user)) {
       this.logger.info(`The Git configuration of ${user} in the container could not be prepared as root: ${failure}. ${user} prepares it.`);
       failure = await this.runHomeGitConfig(ctx, container, user, user);
     }
     if (failure !== undefined) this.logger.warn(`The Git configuration of ${user} in the container could not be prepared: ${failure}`);
-    await this.checkGitVersion(ctx, container, user);
   }
 
   /** HOME_GIT_CONFIG_SCRIPT for `user`, run as `runAs`. The reason of a failure, or `undefined`. */
@@ -3462,9 +3532,20 @@ export class EnvironmentService {
       // that mounts only the workspace volume, not in the dev container, whose mounts may lie in the folder.
       await this.fixConfigOwnership(ctx, containerRef, remoteUser);
     }
-    if (outcome.created) await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
+    if (outcome.created) {
+      // Review PL-2: runUserCommands prepared ~/.gitconfig already, before the lifecycle commands; the Git version of the
+      // new container is checked here as before (once per new container).
+      if (ctx.homeGitConfigWrittenTo !== undefined && sameContainerId(ctx.homeGitConfigWrittenTo, containerRef)) {
+        await this.checkGitVersion(ctx, containerRef, remoteUser ?? 'root');
+      } else {
+        await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
+      }
+    }
     // Unit 15: the container runs now, so its tmpfs can take the token (at every open: a new sign-in gives a new token).
-    await this.writeGitToken(ctx, containerRef, remoteUser ?? 'root');
+    // Lifecycle token (user decision 2026-09-27): after `up`, runUserCommands wrote it already, before the lifecycle commands.
+    if (ctx.tokenWrittenTo === undefined || !sameContainerId(ctx.tokenWrittenTo, containerRef)) {
+      await this.writeGitToken(ctx, containerRef, remoteUser ?? 'root');
+    }
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.
     this.throwIfCancelled(ctx.signal);
@@ -3489,9 +3570,9 @@ export class EnvironmentService {
   }
 
   /**
-   * Implementation notes 7 "Ownership", before the container exists: the helper clones as root, and `devcontainer up`
-   * runs onCreateCommand and postCreateCommand as the remote user when it creates the container. A command that writes
-   * to the repository (for example `npm install`) would fail, and with it the open. So the files get their owner first,
+   * Implementation notes 7 "Ownership", before the container exists: the helper clones as root, and the lifecycle
+   * commands (run-user-commands after `up`) run onCreateCommand and postCreateCommand as the remote user in a new
+   * container. A command that writes to the repository (for example `npm install`) would fail, and with it the open. So the files get their owner first,
    * in a short-lived container of the environment image, which knows the user. The fix after `up` (fixOwnership) stays
    * for files that `up` itself creates as root. A failure is logged, it does not fail the pipeline.
    * Assumption (V-10): the environment image has sh, id, find, and chown, and its label devcontainer.metadata names the

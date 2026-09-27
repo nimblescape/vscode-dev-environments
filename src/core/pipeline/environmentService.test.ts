@@ -120,6 +120,11 @@ async function rejection(promise: Promise<unknown>): Promise<UserFacingError> {
   throw new Error('The promise did not reject.');
 }
 
+/** The ownership fix after `up` in the dev container (OWNERSHIP_FIX_SCRIPT as root). */
+function isOwnershipFix(exec: { user?: string; command: readonly string[] }): boolean {
+  return exec.user === 'root' && exec.command[2] === OWNERSHIP_FIX_SCRIPT;
+}
+
 /** A git summary script run through docker exec: 4 lines. */
 function gitExecOutput(branch: string, counts = [0, 0, 0]): string {
   return `${branch}\n${counts.join('\n')}\n`;
@@ -192,7 +197,8 @@ describe('open: first open', () => {
     expect(env!.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0 });
     expect(result.environment.id).toBe(id);
 
-    const ownership = h.docker.execs.find((e) => e.user === 'root');
+    // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+    const ownership = h.docker.execs.find(isOwnershipFix);
     expect(ownership?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     // The configuration folder of the container gets the remote user too (written before `up`). Review round 15, K3: in a
     // helper container that mounts only the workspace volume, with the numeric IDs of the remote user (before: a second
@@ -370,7 +376,8 @@ describe('open: first open', () => {
     expect(run.args[0]).toBe('-c');
     expect(run.args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     // The fix after up stays, for files that up itself creates as root.
-    expect(h.docker.execs.some((e) => e.user === 'root')).toBe(true);
+    // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+    expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
   });
 
   it('gives the cloned files to the user of --user in runArgs when no remoteUser is set (rule of the Dev Container CLI)', async () => {
@@ -413,7 +420,8 @@ describe('open: first open', () => {
       await h.service.open(TARGET, options());
       expect(h.docker.runs).toEqual([]);
       expect(h.logger.infos.some((line) => line.includes('is not known before the container is created'))).toBe(true);
-      expect(h.docker.execs.find((e) => e.user === 'root')?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+      // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+      expect(h.docker.execs.find(isOwnershipFix)?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     });
 
     it('does not store the text of the label as the remote user after a failed lifecycle command', async () => {
@@ -575,8 +583,9 @@ describe('open: existing environment', () => {
     expect(env?.gitSummary).toMatchObject({ branch: 'feature-y', uncommittedFiles: 3, unpushedCommits: 4, stashes: 1 });
     expect(env?.buildRecord?.environmentImage).toBe(IMAGE_1);
     // No ownership fix for a container that only starts. unit 15: changed expectation, the only exec as root is the write
-    // of the token into its memory.
-    expect(h.docker.execs.some((e) => e.user === 'root' && e.command[2] !== TOKEN_WRITE_SCRIPT)).toBe(false);
+    // of the token into its memory. review, PL-1/PL-2: and ~/.gitconfig before the lifecycle commands (the script writes
+    // only a missing or empty file).
+    expect(h.docker.execs.some((e) => e.user === 'root' && e.command[2] !== TOKEN_WRITE_SCRIPT && e.command[2] !== HOME_GIT_CONFIG_SCRIPT)).toBe(false);
     expect(h.docker.tokenWrites()).toHaveLength(1);
     expect(await pendingIds()).toEqual([ENV_ID]);
     expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
@@ -672,7 +681,8 @@ describe('open: existing environment', () => {
     expect(upIndex).toBeGreaterThan(h.helper.calls.indexOf(`build ${IMAGE_2}`));
     expect(h.docker.log.indexOf(`rmi ${IMAGE_1}`)).toBeGreaterThan(h.docker.log.indexOf(`pull ${BASE_IMAGE}`));
     // A replaced container gets the ownership fix.
-    expect(h.docker.execs.some((e) => e.user === 'root')).toBe(true);
+    // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+    expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
     expect(h.progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
   });
 
@@ -777,7 +787,8 @@ describe('open: existing environment', () => {
     expect(h.helper.calls.filter((c) => c.startsWith('up') || c.startsWith('build'))).toEqual([`up ${IMAGE_1}`]);
     expect(h.docker.containersOf(ENV_ID)[0]).toMatchObject({ name: NAME, state: 'running' });
     // A new container gets the ownership fix.
-    expect(h.docker.execs.find((e) => e.user === 'root')?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+    expect(h.docker.execs.find(isOwnershipFix)?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
   });
 
   it('builds a removed environment image again', async () => {
@@ -864,7 +875,8 @@ describe('open: existing environment', () => {
       expect(h.helper.clones).toEqual([{ volumeName: NAME, repository: REPO, branch: 'main', token: TOKEN }]);
       expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
       expect(h.docker.runs.map((run) => run.image)).toEqual([IMAGE_1]);
-      expect(h.docker.execs.some((e) => e.user === 'root')).toBe(true);
+      // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+      expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 0 });
     });
 
@@ -1335,8 +1347,11 @@ describe('open: existing environment', () => {
     expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
     expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
     // No ownership fix for the old container. unit 15: changed expectation, the write of the token (which gives its files
-    // to the remote user with chown) is no ownership fix.
-    expect(h.docker.execs.some((e) => e.command[2] !== TOKEN_WRITE_SCRIPT && e.command.join(' ').includes('chown'))).toBe(false);
+    // to the remote user with chown) is no ownership fix. review, PL-1/PL-2: nor is ~/.gitconfig before the lifecycle
+    // commands (HOME_GIT_CONFIG_SCRIPT gives only a file that it creates to the remote user).
+    expect(
+      h.docker.execs.some((e) => e.command[2] !== TOKEN_WRITE_SCRIPT && e.command[2] !== HOME_GIT_CONFIG_SCRIPT && e.command.join(' ').includes('chown')),
+    ).toBe(false);
   });
 
   it('creates the container again from the image of the old container when a replacement without record fails', async () => {
@@ -1607,7 +1622,8 @@ describe('open: failed lifecycle command', () => {
     expect(h.docker.images.has(image)).toBe(true);
     expect(h.docker.containersOf(env.id)).toEqual([expect.objectContaining({ state: 'running', image })]);
     expect(env.remoteUser).toBe('node');
-    expect(h.docker.execs.find((e) => e.user === 'root')?.command.slice(-2)).toEqual(['/workspaces/api', 'node']);
+    // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
+    expect(h.docker.execs.find(isOwnershipFix)?.command.slice(-2)).toEqual(['/workspaces/api', 'node']);
     expect(h.ui.warnings).toEqual([PipelineTexts.lifecycleCommandFailed('postCreateCommand')]);
   });
 
@@ -2542,7 +2558,10 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     await seedEnvironment(h, { container: 'stopped' });
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
-    expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(false);
+    // review, PL-1/PL-2: ~/.gitconfig once, before the lifecycle commands (the script writes only a missing or empty
+    // file), and no check of the Git version (only a new container gets it, as before).
+    expect(h.docker.execs.filter((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toHaveLength(1);
+    expect(h.docker.execs.some((e) => e.command[0] === 'git' && e.command[1] === '--version')).toBe(false);
     expect(h.progress.details).not.toContain(Messages.containerRecreated);
   });
 
@@ -3772,5 +3791,171 @@ describe('review round 19 (S19-4, P19-2): the checks of a single container befor
     useDockerfile('ARG BASE\nFROM ${BASE}\n', { options: ['--build-arg', `BASE=${BASE_IMAGE}`] });
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
+  });
+});
+
+describe('lifecycle token (user decision 2026-09-27): up --skip-post-create, the token, then run-user-commands', () => {
+  const POST_CREATE_FAILED = 'postCreateCommand from devcontainer.json failed.';
+
+  describe('review PL-2: ~/.gitconfig before run-user-commands (Git older than 2.31 reads the credential helper only there)', () => {
+    const isHome = (exec: { command: readonly string[] }) => exec.command[2] === HOME_GIT_CONFIG_SCRIPT;
+    const isVersion = (exec: { command: readonly string[] }) => exec.command[0] === 'git' && exec.command[1] === '--version';
+
+    /** Indexes in FakeDocker.execs: the token writes, the ~/.gitconfig runs, the Git version checks, and each run-user-commands. */
+    function timeline() {
+      const indexes = (match: (exec: (typeof h.docker.execs)[number]) => boolean) =>
+        h.docker.execs.flatMap((exec, index) => (match(exec) ? [index] : []));
+      return {
+        token: indexes((exec) => exec.command[2] === TOKEN_WRITE_SCRIPT),
+        home: indexes(isHome),
+        version: indexes(isVersion),
+        userCommands: h.helper.userCommandContext.map((run) => run.execsBefore),
+      };
+    }
+
+    it('first open: prepareGit, up, the token, ~/.gitconfig, then run-user-commands; finish does not run the script again', async () => {
+      const result = await h.service.open(TARGET, options());
+      const container = h.docker.containersOf(result.environment.id)[0];
+      const calls = h.helper.calls;
+      expect(calls.indexOf('prepareGit')).toBeGreaterThanOrEqual(0);
+      expect(calls.indexOf('prepareGit')).toBeLessThan(calls.findIndex((call) => call.startsWith('up')));
+      const t = timeline();
+      expect(t.token).toHaveLength(1);
+      expect(t.home).toHaveLength(1);
+      expect(t.userCommands).toHaveLength(1);
+      expect(t.token[0]).toBeLessThan(t.home[0]);
+      expect(t.home[0]).toBeLessThan(t.userCommands[0]);
+      // As root, for the remote user of the token write, in the container of `up`.
+      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: homeGitConfigCommand('vscode') });
+      // The Git version of the new container is still checked once, after run-user-commands (in finish).
+      expect(t.version).toHaveLength(1);
+      expect(t.version[0]).toBeGreaterThan(t.userCommands[0]);
+    });
+
+    it('a stopped container: ~/.gitconfig again before run-user-commands (the script keeps an existing file), no Git version check', async () => {
+      await seedEnvironment(h);
+      const container = h.docker.containersOf(ENV_ID)[0];
+      await h.service.open(TARGET, options());
+      const t = timeline();
+      expect(t.home).toHaveLength(1);
+      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: homeGitConfigCommand('vscode') });
+      expect(t.token[0]).toBeLessThan(t.home[0]);
+      expect(t.home[0]).toBeLessThan(t.userCommands[0]);
+      expect(t.version).toEqual([]);
+    });
+
+    it('warns about old Git once per new container, as before, and not when the container is only started again', async () => {
+      h.docker.execHandler = (_container, command) => (command[0] === 'git' && command[1] === '--version' ? { stdout: 'git version 2.8.6\n' } : {});
+      await h.service.open(TARGET, options());
+      expect(h.ui.warnings).toEqual([Messages.oldGit('2.8.6')]);
+      expect(timeline().version).toHaveLength(1);
+      // Stopped and opened again: the script runs again (it keeps the file), the version is not checked again.
+      for (const container of h.docker.containers.values()) {
+        container.state = 'stopped';
+        container.rawState = 'exited';
+      }
+      h.ui.warnings.length = 0;
+      await h.service.open(TARGET, options());
+      expect(h.ui.warnings).toEqual([]);
+      expect(timeline().version).toHaveLength(1);
+      expect(timeline().home).toHaveLength(2);
+    });
+
+    it('a failed ~/.gitconfig does not keep the lifecycle commands from running (a logged warning, as before)', async () => {
+      h.docker.execHandler = (_container, command) => (command[2] === HOME_GIT_CONFIG_SCRIPT ? { exitCode: 2, stderr: 'denied' } : {});
+      await h.service.open(TARGET, options());
+      expect(h.helper.userCommandRuns).toHaveLength(1);
+      // Root, then the remote user; not again in finish.
+      expect(timeline().home).toHaveLength(2);
+      expect(h.logger.warnings).toContain('The Git configuration of vscode in the container could not be prepared: denied');
+      expect(h.ui.warnings).toEqual([]);
+    });
+  });
+
+  it('review PL-1: up and run-user-commands get the token of the session for the redaction of their output', async () => {
+    await h.service.open(TARGET, options());
+    expect(h.helper.upTokens).toEqual([TOKEN]);
+    expect(h.helper.userCommandContext.map((run) => run.token)).toEqual([TOKEN]);
+  });
+
+  it('first open: writes the token after up and before run-user-commands, which gets the inputs of up', async () => {
+    const result = await h.service.open(TARGET, options());
+    const env = result.environment;
+    const container = h.docker.containersOf(env.id)[0];
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.helper.userCommandRuns).toEqual([
+      { containerId: container.id, environmentId: env.id, override: h.helper.ups[0].override, upsBefore: 1, tokenWritesBefore: 1 },
+    ]);
+    // The token is written once, into the container of `up`, as the remote user that `up` reports.
+    expect(h.docker.tokenWrites()).toEqual([{ container: container.id, user: 'root', remoteUser: 'vscode', login: 'octo', token: TOKEN }]);
+    expect(JSON.stringify(h.helper.userCommandRuns)).not.toContain(TOKEN);
+    expect(h.ui.warnings).toEqual([]);
+  });
+
+  it('a stopped container: up starts it, then run-user-commands (its markers decide: postStartCommand runs again)', async () => {
+    await seedEnvironment(h);
+    const container = h.docker.containersOf(ENV_ID)[0];
+    await h.service.open(TARGET, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.helper.userCommandRuns).toEqual([expect.objectContaining({ containerId: container.id, upsBefore: 1, tokenWritesBefore: 1 })]);
+    expect(h.docker.tokenWrites()).toHaveLength(1);
+  });
+
+  it('a running container: neither up nor run-user-commands (no create command runs again); the token is written', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.userCommandRuns).toEqual([]);
+    expect(h.docker.tokenWrites()).toHaveLength(1);
+  });
+
+  it('an update: run-user-commands in the new container, after the token', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    await h.service.open(TARGET, options());
+    const container = h.docker.containersOf(ENV_ID)[0];
+    expect(container.image).toBe(IMAGE_2);
+    expect(h.helper.userCommandRuns).toEqual([expect.objectContaining({ containerId: container.id, upsBefore: 1, tokenWritesBefore: 1 })]);
+  });
+
+  it('a failed token write: the lifecycle commands run all the same, with the existing warning', async () => {
+    h.docker.execHandler = (_container, command) => (command[2] === TOKEN_WRITE_SCRIPT ? { exitCode: 1, stderr: 'no tmpfs' } : {});
+    const result = await h.service.open(TARGET, options());
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(h.ui.warnings).toEqual([Messages.gitSetupFailed]);
+    expect(await pendingIds()).toEqual([result.environment.id]);
+  });
+
+  it('a lifecycle command that fails in run-user-commands: the existing warning, the environment opens', async () => {
+    await seedEnvironment(h);
+    h.helper.lifecycleFailure = () => POST_CREATE_FAILED;
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(h.ui.warnings).toEqual([PipelineTexts.lifecycleCommandFailed('postCreateCommand')]);
+    expect(await pendingIds()).toEqual([ENV_ID]);
+  });
+
+  it('a failed lifecycle command whose container does not run: startFailed (with Try again), as for up', async () => {
+    await seedEnvironment(h);
+    h.helper.userCommandsError = new DevcontainerCommandError('devcontainer run-user-commands', 1, '', '', {
+      outcome: 'error',
+      description: POST_CREATE_FAILED,
+      containerId: 'container-gone',
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.warnings).toEqual([]);
+    expect(await pendingIds()).toEqual([]);
+  });
+
+  it('another failure of run-user-commands fails the open as a failure of up', async () => {
+    await seedEnvironment(h);
+    h.helper.userCommandsError = new DevcontainerCommandError('devcontainer run-user-commands', 1, '', '', {
+      outcome: 'error',
+      description: 'An error occurred running user commands in the container.',
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.ui.warnings).toEqual([]);
   });
 });

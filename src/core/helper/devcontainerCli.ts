@@ -73,11 +73,20 @@ export function buildArgs(p: { workspaceFolder: string; configPath: string; imag
 }
 
 /**
+ * Argument of `devcontainer up` (lifecycle token, user decision 2026-09-27): `up` runs no lifecycle command (CLI 0.89.0:
+ * `postCreateEnabled: !skipPostCreate`, and `lifecycleHook.enabled && await runLifecycleHooks(…)`: no onCreateCommand,
+ * updateContentCommand, postCreateCommand, postStartCommand, postAttachCommand, no marker). They run afterwards with
+ * `devcontainer run-user-commands` (runUserCommandsArgs), once the token is in the container.
+ */
+export const SKIP_POST_CREATE_ARG = '--skip-post-create';
+
+/**
  * Arguments of `devcontainer up` with the override configuration (it replaces the repository configuration; everything
  * else comes from the label devcontainer.metadata of the environment image).
  * `--update-remote-user-uid-default never`: the "local" user of the CLI is root in the helper, so a UID update is
  * meaningless, and it would build an additional image `<name>-uid` at each container creation. The files of the
  * volume get their owner through ownershipFixCommand instead.
+ * SKIP_POST_CREATE_ARG: the lifecycle commands run with run-user-commands after the token was written.
  */
 export function upArgs(p: {
   workspaceFolder: string;
@@ -97,10 +106,39 @@ export function upArgs(p: {
     HELPER_CACHE_FOLDER,
     '--update-remote-user-uid-default',
     'never',
+    SKIP_POST_CREATE_ARG,
     SKIP_POST_ATTACH_ARG,
   ];
   if (p.removeExistingContainer) args.push('--remove-existing-container');
   return args;
+}
+
+/**
+ * Arguments of `devcontainer run-user-commands` (lifecycle token, user decision 2026-09-27): the lifecycle commands that
+ * `up` skipped (SKIP_POST_CREATE_ARG), with the same workspace folder, override configuration, and id label as `up`, so
+ * the CLI reads the same configuration (merged with the label devcontainer.metadata of the container) and resolves
+ * `${devcontainerId}` the same way. `--container-id`: the container of the result of `up` (with Docker Compose, the
+ * containers of the other services carry the id label too). CLI 0.89.0 runs onCreateCommand, updateContentCommand,
+ * postCreateCommand (each once per container: a marker with the creation time in ~/.devcontainer of the remote user),
+ * and postStartCommand (once per start: a marker with the start time), and stops at the first that fails.
+ * SKIP_POST_ATTACH_ARG: postAttachCommand stays with the Dev Containers extension, as for `up`. It has no option of the
+ * UID update (always `never`).
+ */
+export function runUserCommandsArgs(p: { workspaceFolder: string; overrideConfigPath: string; idLabel: string; containerId: string }): string[] {
+  return [
+    'run-user-commands',
+    '--workspace-folder',
+    p.workspaceFolder,
+    '--override-config',
+    p.overrideConfigPath,
+    '--id-label',
+    p.idLabel,
+    '--container-id',
+    p.containerId,
+    '--user-data-folder',
+    HELPER_CACHE_FOLDER,
+    SKIP_POST_ATTACH_ARG,
+  ];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -141,7 +179,8 @@ const LIFECYCLE_FAILURE =
   /^(?:.+ of )?(?:onCreateCommand|updateContentCommand|postCreateCommand|postStartCommand|postAttachCommand) from .+ failed\.$/;
 
 /**
- * Whether the result of `devcontainer up` reports a failed lifecycle command of a container that exists.
+ * Whether the result of `devcontainer up` (or of `run-user-commands`, whose result WorkspaceHelper.runUserCommands
+ * completes with the container ID) reports a failed lifecycle command of a container that exists.
  * Assumption (V-10): when a lifecycle command exits with a code other than 0, CLI 0.89.0 skips the further commands,
  * ends `up` with exit code 1 and the result `{ outcome: 'error', containerId, description: '… from … failed.' }`, and
  * leaves the container running. initializeCommand runs before the container starts, so it is not one of them.

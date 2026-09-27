@@ -530,12 +530,14 @@ export class FakeHelper implements EnvironmentHelper {
   upFailsBeforeRemoval = false;
   /**
    * A lifecycle command fails after `up` created or started the container, which keeps running: the description of the
-   * CLI, for example `postStartCommand from devcontainer.json failed.`
+   * CLI, for example `postStartCommand from devcontainer.json failed.` (lifecycle token, user decision 2026-09-27: in
+   * runUserCommands).
    */
   lifecycleFailure: (image: string) => Maybe<string> = () => undefined;
   /**
-   * How `up` reports a lifecycle failure: `error` as the CLI does (DevcontainerCommandError with the JSON result), or
-   * `result` as WorkspaceHelper.up does for a running container (outcome success with `lifecycleCommandFailure`).
+   * How runUserCommands reports a lifecycle failure: `error` as the CLI does (DevcontainerCommandError with the JSON
+   * result), or `result` as WorkspaceHelper.runUserCommands does for a running container (outcome success with
+   * `lifecycleCommandFailure`).
    */
   lifecycleFailureReport: 'error' | 'result' = 'error';
   gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
@@ -570,6 +572,28 @@ export class FakeHelper implements EnvironmentHelper {
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
   }> = [];
+  /**
+   * Lifecycle token (user decision 2026-09-27): each runUserCommands, with the inputs it got, the number of `up` calls
+   * before it, and the token writes into its container before it (FakeDocker.tokenWrites).
+   */
+  readonly userCommandRuns: Array<{
+    containerId: string;
+    environmentId: string;
+    override: Record<string, unknown>;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+    upsBefore: number;
+    tokenWritesBefore: number;
+  }> = [];
+  /**
+   * Review PL-1/PL-2: for each runUserCommands, the number of FakeDocker execs before it (to order the execs in the
+   * container, such as HOME_GIT_CONFIG_SCRIPT, against it) and the token it got for the redaction of its output.
+   */
+  readonly userCommandContext: Array<{ execsBefore: number; token?: string }> = [];
+  /** Review PL-1: the token that each `up` got for the redaction of its output. */
+  readonly upTokens: Array<string | undefined> = [];
+  /** runUserCommands fails with this error (not a lifecycle failure: that is lifecycleFailure). */
+  userCommandsError: Maybe<Error>;
   /** Each readConfiguration, with what a Docker Compose configuration passes. */
   readonly readConfigurations: Array<{
     configPath: string;
@@ -748,8 +772,10 @@ export class FakeHelper implements EnvironmentHelper {
     removeExistingContainer: boolean;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    token?: string;
   }): Promise<DevcontainerResult> {
     this.mount(p.volumeName);
+    this.upTokens.push(p.token);
     if (p.override.dockerComposeFile !== undefined) return this.composeUp(p);
     const image = String(p.override.image);
     this.calls.push(`up ${image}${p.removeExistingContainer ? ' --remove-existing-container' : ''}`);
@@ -785,13 +811,45 @@ export class FakeHelper implements EnvironmentHelper {
       }
       containerId = created.id;
     }
-    const failure = this.lifecycleFailure(image);
-    if (failure !== undefined) {
-      if (this.lifecycleFailureReport === 'result') return { outcome: 'success', containerId, lifecycleCommandFailure: failure } as DevcontainerResult;
-      const result: DevcontainerResult = { outcome: 'error', message: 'Command failed: /bin/sh -c npm run db:migrate', description: failure, containerId };
-      throw new DevcontainerCommandError('devcontainer up', 1, `${JSON.stringify(result)}\n`, 'npm ERR! code 1', result);
-    }
+    // Lifecycle token (user decision 2026-09-27): `up --skip-post-create` runs no lifecycle command; lifecycleFailure
+    // fails in runUserCommands.
     return { outcome: 'success', containerId, remoteUser: this.remoteUser, remoteWorkspaceFolder: workspaceFolder };
+  }
+
+  /**
+   * Lifecycle token (user decision 2026-09-27): `devcontainer run-user-commands` in the container of `up`. A lifecycle
+   * failure (lifecycleFailure of the image of the container) as the CLI reports it: an error whose result names the
+   * container (WorkspaceHelper.runUserCommands adds it), or with lifecycleFailureReport `result`, the kept container.
+   */
+  async runUserCommands(p: {
+    volumeName: string;
+    override: Record<string, unknown>;
+    environmentId: string;
+    containerId: string;
+    files?: Readonly<Record<string, string>>;
+    env?: Record<string, string>;
+    token?: string;
+  }): Promise<DevcontainerResult> {
+    this.mount(p.volumeName);
+    this.userCommandContext.push({ execsBefore: this.docker.execs.length, token: p.token });
+    this.userCommandRuns.push({
+      containerId: p.containerId,
+      environmentId: p.environmentId,
+      override: p.override,
+      ...(p.files !== undefined ? { files: p.files } : {}),
+      ...(p.env !== undefined ? { env: p.env } : {}),
+      upsBefore: this.ups.length,
+      tokenWritesBefore: this.docker.tokenWrites().filter((write) => write.container === p.containerId).length,
+    });
+    if (this.userCommandsError) throw this.userCommandsError;
+    const container = this.docker.containers.get(p.containerId);
+    const failure = container !== undefined ? this.lifecycleFailure(container.image) : undefined;
+    if (failure !== undefined) {
+      if (this.lifecycleFailureReport === 'result') return { outcome: 'success', containerId: p.containerId, lifecycleCommandFailure: failure } as DevcontainerResult;
+      const result: DevcontainerResult = { outcome: 'error', message: 'Command failed: /bin/sh -c npm run db:migrate', description: failure, containerId: p.containerId };
+      throw new DevcontainerCommandError('devcontainer run-user-commands', 1, `${JSON.stringify(result)}\n`, 'npm ERR! code 1', result);
+    }
+    return { outcome: 'success', containerId: p.containerId };
   }
 
   /**
@@ -915,11 +973,7 @@ export class FakeHelper implements EnvironmentHelper {
       }
       create(name, `${project}-${name}-1`, String(definition.image), definition.labels, volumeNames(definition.volumes));
     }
-    const failure = this.lifecycleFailure(image);
-    if (failure !== undefined) {
-      const result: DevcontainerResult = { outcome: 'error', message: 'Command failed', description: failure, containerId };
-      throw new DevcontainerCommandError('devcontainer up', 1, `${JSON.stringify(result)}\n`, 'failed', result);
-    }
+    // Lifecycle token (user decision 2026-09-27): lifecycleFailure fails in runUserCommands.
     return {
       outcome: 'success',
       containerId,
