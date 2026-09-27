@@ -116,7 +116,7 @@ The user in the container is chosen by the repository (`remoteUser`, `containerU
 - The GitHub token of the environment is readable by every program in the container.
 - With the checks off, a configuration can use the Docker socket. It then controls Docker and every other environment, also their tokens.
 
-Open only repositories that you trust. For others, use a virtual machine, or a separate user account with its own Docker (see [Hardening your computer](#hardening-your-computer)). A concept for a Docker in a virtual machine per GitHub account (`docs/concept-vm-isolation.md`) describes a possible future direction; it is not planned.
+Open only repositories that you trust. For others, use a virtual machine, or a separate user account with its own Docker (see [Hardening your computer](#hardening-your-computer)). A concept for a Docker in a virtual machine per GitHub account ([docs/concept-vm-isolation.md](docs/concept-vm-isolation.md)) describes a possible future direction; it is not planned.
 
 ## Known limits
 
