@@ -182,17 +182,17 @@ describe('the Docker setup in the sidebar welcome view', () => {
       expect(view.contents).not.toContain(REMOVED_COMMAND);
       expect(view.contents).not.toContain('Setup Guide');
     }
-    const after = welcome.filter((view) => view.contents.startsWith('After the installation'));
+    const after = welcome.filter((view) => view.contents.startsWith('Your repositories appear here once Docker is installed'));
     expect(after).toEqual([
       {
         view: 'devEnvironments.repositories',
-        contents: 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.',
+        contents: 'Your repositories appear here once Docker is installed. Dev Environments starts Docker when needed.',
         when: `${DockerContextKeys.setupRequired} && !isLinux`,
       },
       {
         // Docker Engine on Linux needs administrator rights to start: the error offers Start Docker instead.
         view: 'devEnvironments.repositories',
-        contents: 'After the installation, your repositories appear here. When Docker Engine is not running, Dev Environments asks to start it.',
+        contents: 'Your repositories appear here once Docker is installed. Dev Environments asks to start Docker Engine when needed.',
         when: `${DockerContextKeys.setupRequired} && isLinux`,
       },
     ]);
@@ -215,9 +215,9 @@ describe('the Docker setup in the sidebar welcome view', () => {
       `${DockerContextKeys.setupRequired} && isWindows`,
     ]);
     for (const view of desktopSteps) {
-      expect(view.contents).toContain(
-        '[Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/)',
-      );
+      // User decision 2026-09-27: shorter text; the license terms stay named and linked.
+      expect(view.contents).toContain('free for personal use, education, non-commercial open source, and small businesses');
+      expect(view.contents).toContain('(https://www.docker.com/legal/docker-subscription-service-agreement/)');
     }
   });
 });
