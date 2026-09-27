@@ -39,7 +39,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 3. Unit 15: token only in the container's memory (tmpfs) — **merged** (PR #33, 23bcb6e). Open question to the user: should lifecycle commands get the token (write first, then `devcontainer run-user-commands`)?
 3b. Remove all migration code — **merged** (PR #34, 0cdd350).
 3c. **Merged** (PR #35, 882f626): versions reset (user decision 2026-09-27): keep the container setup version label and the Session Monitor protocol version, both reset to 1 (history removed); fix the docs that say the token is "never on a disk" (a tmpfs can be swapped). Branch `chore/reset-versions`.
-4b. After unit 11 (user decision 2026-09-27: "agree"): lifecycle commands get the token again — `devcontainer up --skip-post-create`, write the token, then `devcontainer run-user-commands`.
+4b. **Merged** (PR #37, 3cf8986): lifecycle commands get the token again — `devcontainer up --skip-post-create`, write the token, then `devcontainer run-user-commands`.
 4. **Merged** (PR #36, b15f434): Unit 11: one policy module, guard rails only (pure refactor).
 5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
 6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
