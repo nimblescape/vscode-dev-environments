@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import { GITHUB_CLI_ACCOUNT_REASON } from '../helper/containerGit';
+import { helperCliVariables, substituteCliVariables } from '../helper/cliVariables';
 import { runArgsProblems } from '../helper/hostAccess';
 import { Messages } from '../messages';
 import {
@@ -356,5 +357,203 @@ describe('a refused update and the switch (concept 7.7)', () => {
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.builds).toHaveLength(2);
     expect((await refusedUpdate())?.hostAccessChecks).toBeUndefined();
+  });
+});
+
+// Hotfix M1: the Dev Container CLI substitutes the variables of the image metadata at `up`. A Dockerfile's own LABEL
+// devcontainer.metadata reaches the image when the CLI adds no label of its own, and the merged configuration is not
+// checked for a container that was created with the checks off: the check of the image metadata before `up` must see the
+// values that Docker gets.
+/** What read-configuration returns in the helper: the configuration substituted once (no TERM or OLDPWD in the helper). */
+function readConfiguration<T>(raw: T): T {
+  return substituteCliVariables(raw, { ...helperCliVariables(REPO), env: { HOME: '/root', PATH: '/usr/bin', HOSTNAME: '0123456789ab' }, mayBeSet: undefined });
+}
+
+describe('variables of the Dev Container CLI in the image metadata (hotfix M1)', () => {
+  const VECTORS: Array<[string, string | { source: string; target: string; type: string }, string]> = [
+    ['a default of an unset ${localEnv:…}', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', 'volume devenv-other-abcdef12 of another environment'],
+    ['a default of an unset ${env:…}', 'source=${env:NOPE:devenv-helper-cache},target=/c,type=volume', 'volume devenv-helper-cache of the workspace helper'],
+    ['the object form', { source: '${localEnv:NOPE:devenv-other-abcdef12}', target: '/x', type: 'volume' }, 'volume devenv-other-abcdef12 of another environment'],
+    ['a name built from the basename', 'source=devenv-${localWorkspaceFolderBasename}-abcdef12,target=/x,type=volume', 'volume devenv-api-abcdef12 of another environment'],
+  ];
+
+  describe.each<[string, boolean]>([
+    ['checks on', true],
+    ['checks off', false],
+  ])('%s', (_mode, on) => {
+    beforeEach(() => {
+      if (on) checksOn();
+      else checksOff(REPO);
+    });
+
+    it.each(VECTORS)('refuses %s that only the label of the image names (a LABEL of the Dockerfile), before up', async (_name, mount, item) => {
+      // The configuration and the merged configuration are clean; the built image carries the mount.
+      h.helper.buildMetadata = [{ id: 'dockerfile-label', mounts: [mount] }];
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toHaveLength(1);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it.each(VECTORS)('refuses %s in the configuration, before any build', async (_name, mount, item) => {
+      // hotfix review 1: as read-configuration returns it (substituted once); the checks read it as it is.
+      h.helper.config = { image: BASE_IMAGE, mounts: [readConfiguration(mount)] };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toEqual([]);
+    });
+
+    it.each(VECTORS)('refuses %s in the merged configuration, before any build', async (_name, mount, item) => {
+      // hotfix review 1: as read-configuration returns it (substituted once); the checks read it as it is.
+      h.helper.merged = { mounts: [readConfiguration(mount)] };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.builds).toEqual([]);
+    });
+
+    it('does not support a volume named by a variable of the workspace helper process', async () => {
+      await seedEnvironment(h, { container: null });
+      const mount = 'source=${localEnv:HOSTNAME:devenv-other-abcdef12},target=/x,type=volume';
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [mount] }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.unsupportedOptions(`mount ${JSON.stringify(mount)} uses \${localEnv:HOSTNAME:devenv-other-abcdef12}, which cannot be checked`));
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('keeps the common patterns working, and creates the resolved volume with the labels of the environment before up', async () => {
+      await seedEnvironment(h, { container: null });
+      const nodeModules = 'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume';
+      h.helper.config = { image: BASE_IMAGE };
+      h.docker.imageConfigs.set(
+        IMAGE_1,
+        imageConfigWithUser('vscode', [
+          { id: 'docker-in-docker', mounts: [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }] },
+          { mounts: [nodeModules, 'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume'] },
+        ]),
+      );
+      let createdAtUp: string[] = [];
+      const up = h.helper.up.bind(h.helper);
+      h.helper.up = async (p) => {
+        createdAtUp = h.docker.log.filter((line) => line.startsWith('volume create'));
+        return up(p);
+      };
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(createdAtUp).toEqual(['volume create api-node_modules']);
+    });
+  });
+
+  it('refuses the vectors in the image metadata of a container created with the checks off, whose merged configuration is not checked', async () => {
+    for (const [, mount, item] of VECTORS) {
+      h.cleanup();
+      h = createHarness();
+      await seedEnvironment(h, { container: 'stopped', containerLabels: UNRESTRICTED_LABELS });
+      h.helper.merged = { mounts: [mount] };
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'base' }, { mounts: [mount] }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.hostAccess(item));
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    }
+  });
+
+  it('allows the bind mount ${localEnv:HOME}/.ssh of the image metadata with the checks off, and refuses it with the checks on', async () => {
+    const ssh = 'source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached';
+    await seedEnvironment(h, { container: null });
+    h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ mounts: [ssh] }]));
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    // hotfix review 1, N4: HOME is /root in the helper.
+    expect(error.message).toBe(Messages.hostAccess('bind mount /root/.ssh'));
+    checksOff(REPO);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+});
+
+// Hotfix review 1: Dev Container CLI 0.89.0 substitutes the runArgs and appPort of the override configuration again at
+// `up`, so what read-configuration returns must hold no variable that the CLI resolves there; and it substitutes the
+// label devenv.metadata once at `up`.
+describe('what the Dev Container CLI substitutes again at up (hotfix review 1)', () => {
+  const leftover = (kind: string, text: string, left: string): string => `${kind} ${JSON.stringify(text)} uses ${left}, which cannot be checked`;
+
+  describe.each<[string, boolean]>([
+    ['checks on', true],
+    ['checks off', false],
+  ])('%s', (_mode, on) => {
+    beforeEach(() => {
+      if (on) checksOn();
+      else checksOff(REPO);
+    });
+
+    it.each<[string, Record<string, unknown>, string, string]>([
+      [
+        'a --mount of another environment (main: $${env:NOPE:{}env:NOPE2:…})',
+        { runArgs: ['--mount', 'type=volume,source=$${env:NOPE:{}env:NOPE2:devenv-other-abcdef12},target=/y'] },
+        'runArgs',
+        'type=volume,source=${env:NOPE2:devenv-other-abcdef12},target=/y',
+      ],
+      ['a -v of the helper cache', { runArgs: ['-v', '$${env:NOPE:{}env:NOPE2:devenv-helper-cache}:/y'] }, 'runArgs', '${env:NOPE2:devenv-helper-cache}:/y'],
+      ['-e GH_TOKEN', { runArgs: ['-e', '$${env:NOPE:{}env:NOPE2:GH_TOKEN}=x'] }, 'runArgs', '${env:NOPE2:GH_TOKEN}=x'],
+      [
+        'a bind mount that TERM makes a volume (N1)',
+        { runArgs: ['--mount', 'type=bind,source=devenv-other-abcdef12,target=/y,$${env:NOPE:{}env:TERM:type=volume}'] },
+        'runArgs',
+        'type=bind,source=devenv-other-abcdef12,target=/y,${env:TERM:type=volume}',
+      ],
+      ['-e GH_TOKEN with TERM (N2)', { runArgs: ['-e', '$${env:NOPE:{}env:TERM:GH_TOKEN}=x'] }, 'runArgs', '${env:TERM:GH_TOKEN}=x'],
+      ['-p on all addresses (N3)', { runArgs: ['-p', '${localEnv:A:$}{localEnv:B:8080}'] }, 'runArgs', '${localEnv:B:8080}'],
+      ['--rm (N3)', { runArgs: ['${localEnv:A:$}{localEnv:B:--rm}'] }, 'runArgs', '${localEnv:B:--rm}'],
+      ['appPort on all addresses (N3)', { appPort: '${localEnv:A:$}{localEnv:B:9090}' }, 'appPort', '${localEnv:B:9090}'],
+    ])('refuses %s that read-configuration leaves for the second substitution, before any build', async (_name, raw, kind, entry) => {
+      h.helper.config = readConfiguration({ image: BASE_IMAGE, ...raw });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.unsupportedOptions(leftover(kind, entry, entry.match(/\$\{[^}]*\}/)![0])));
+      expect(h.helper.builds).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('refuses a bind mount of the label that TERM makes a volume (N1), before up', async () => {
+      await seedEnvironment(h, { container: null });
+      const mount = 'type=bind,source=devenv-other-abcdef12,target=/y,${localEnv:TERM:type=volume}';
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', mounts: [mount] }]));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.message).toBe(Messages.unsupportedOptions(leftover('mount', mount, '${localEnv:TERM:type=volume}')));
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('allows ${localEnv:HOME} in the target of a volume and a tmpfs of the label (N4)', async () => {
+      await seedEnvironment(h, { container: null });
+      h.docker.imageConfigs.set(
+        IMAGE_1,
+        imageConfigWithUser('vscode', [{ id: 'feature', mounts: ['source=m2-${devcontainerId},target=${localEnv:HOME}/.m2,type=volume', 'type=tmpfs,target=${localEnv:HOME}/.cache'] }]),
+      );
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+
+    it('refuses a label of 300 KB of "${" quickly (N5), before up', async () => {
+      await seedEnvironment(h, { container: null });
+      h.docker.imageConfigs.set(IMAGE_1, imageConfigWithUser('vscode', [{ id: 'feature', customizations: { x: '${'.repeat(150_000) } }]));
+      const start = Date.now();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(error.message).toBe(Messages.unsupportedOptions('a text longer than 256 KB in the image metadata'));
+      expect(h.helper.ups).toEqual([]);
+    });
+  });
+
+  it('opens with ordinary runArgs, appPort, and ${devcontainerId}', async () => {
+    h.helper.config = readConfiguration({
+      image: BASE_IMAGE,
+      runArgs: ['--init', '-e', 'FOO=bar', '-v', 'cache-${devcontainerId}:/c', '-p', '8080:80'],
+      appPort: [3000],
+      mounts: ['source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume'],
+    });
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+    const override = h.helper.ups[0].override;
+    expect(override.runArgs).toEqual(expect.arrayContaining(['-v', 'cache-${devcontainerId}:/c', '-p', '127.0.0.1:8080:80']));
+    expect(override.appPort).toEqual(['127.0.0.1:3000:3000']);
   });
 });

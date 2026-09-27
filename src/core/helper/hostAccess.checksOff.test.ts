@@ -37,7 +37,15 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   // Files of the computer.
   ['a bind mount in mounts', input(mount('source=/Users/x,target=/x,type=bind')), 'bind mount /Users/x', 'computer'],
   ['a bind mount of the Docker socket', input(mount('source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind')), 'bind mount /var/run/docker.sock', 'computer'],
-  ['a bind mount of ${localWorkspaceFolder}', input(mount('source=${localWorkspaceFolder}/.cache,target=/c,type=bind')), 'bind mount ${localWorkspaceFolder}/.cache', 'computer'],
+  // hotfix review 1, N1: read-configuration returns ${localWorkspaceFolder} resolved (the repository folder in the
+  // helper); a variable left in a mount, also a bind mount, is not supported.
+  ['a bind mount of ${localWorkspaceFolder}', input(mount('source=/workspaces/api/.cache,target=/c,type=bind')), 'bind mount /workspaces/api/.cache', 'computer'],
+  [
+    'a bind mount with ${localWorkspaceFolder} left',
+    input(mount('source=${localWorkspaceFolder}/.cache,target=/c,type=bind')),
+    'mount "source=${localWorkspaceFolder}/.cache,target=/c,type=bind" uses ${localWorkspaceFolder}, which cannot be checked',
+    'unsupported',
+  ],
   ['a bind mount in the object form', input(mount({ source: '/Users/x', target: '/x', type: 'bind' })), 'bind mount /Users/x', 'computer'],
   ['a path as the source of a volume', input(mount('source=/Users/x,target=/x,type=volume')), 'bind mount /Users/x', 'computer'],
   ['a bind mount without a source', input(mount('type=bind,target=/x')), 'bind mount', 'computer'],
