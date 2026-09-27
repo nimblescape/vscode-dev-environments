@@ -20,7 +20,7 @@ The last row is what the options below improve: shorter lifetime, fewer reposito
 ## Constraints
 
 - Several VS Code windows at the same time, and AI agents that keep working in a container after its window disconnects.
-- The containers may run on a remote Docker host (setting `devEnvLauncher.dockerHost`). The computer of the user may sleep or hibernate, so nothing on the computer (not the extension, not the Session Monitor) can renew a token while agents work on the remote host. **Renewal must run where the containers run, or on a service that is always on.**
+- The containers may run on a remote Docker host (the current Docker context, unit 7). The computer of the user may sleep or hibernate, so nothing on the computer (not the extension, not the Session Monitor) can renew a token while agents work on the remote host. **Renewal must run where the containers run, or on a service that is always on.**
 - The sign-in of VS Code (the GitHub authentication provider) gives only the long-lived OAuth token; it cannot issue short-lived or repository-scoped tokens.
 
 ## Background: GitHub Apps

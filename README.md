@@ -13,7 +13,7 @@ Dev Environments lists the GitHub repositories that you can access and that cont
 ## Requirements
 
 - Visual Studio Code 1.90 or later.
-- Docker: Docker Desktop on macOS, Windows (with WSL 2), or Linux, or Docker Engine on Linux. Without Docker, the extension offers to install it (see below).
+- Docker: Docker Desktop on macOS, Windows (with WSL 2), or Linux, or Docker Engine on Linux. Without Docker, the extension offers to install it (see below). Docker can also run on another computer that you reach over SSH (see [Remote Docker host](#remote-docker-host)).
 - A GitHub account.
 - The Dev Containers extension. You do not need to install it yourself: VS Code installs it together with this extension.
 
@@ -120,6 +120,31 @@ The user in the container is chosen by the repository (`remoteUser`, `containerU
 
 Open only repositories that you trust. For others, use a virtual machine, or a separate user account with its own Docker (see [Hardening your computer](#hardening-your-computer)). A concept for a Docker in a virtual machine per GitHub account ([docs/concept-vm-isolation.md](docs/concept-vm-isolation.md)) describes a possible future direction; it is not planned.
 
+## Remote Docker host
+
+Your environments can run in Docker on another computer, for example a build server or a stronger machine in your network, reached over SSH. VS Code, this extension, and your GitHub sign-in stay on your computer; the containers, volumes, and images are on the other computer. The remote Docker host is the current [Docker context](https://docs.docker.com/engine/manage-resources/contexts/): Docker, Docker Compose, the Dev Container CLI, the Dev Containers extension, and Dev Environments all follow it. Dev Environments has no setting of its own for it, sets no `DOCKER_HOST`, and writes no setting of the Dev Containers extension.
+
+**Set-up.**
+
+1. On the other computer: install Docker Engine, and let your SSH user use it (on Linux, add it to the group `docker`, or use rootless Docker, see below). On your computer, the Docker CLI is needed (Docker Desktop brings it).
+2. Make sure that `ssh <host>` works in a terminal **without a question**: your key is loaded in the SSH agent (`ssh-add`) or named with `IdentityFile`, and you have accepted the host key once. Dev Environments never asks for a password and never accepts a host key for you: an unknown host key fails with a message that asks you to run `ssh <host>` once in a terminal.
+3. Run **Dev Environments: Use a Remote Docker Host…**. It lists the hosts of your SSH config (`~/.ssh/config`, on Windows `%USERPROFILE%\.ssh\config`, with its `Include` files; host patterns such as `*.example.com` are left out), with their `HostName` and `User`. The last entry, **Enter an SSH address…**, takes `user@host` or `user@host:port` (an IPv6 address in brackets, `[2001:db8::1]:22`).
+4. Dev Environments tests the connection (`docker -H ssh://<host> info`), then asks: "All Docker tools on this computer will use <host> until you switch back." After your confirmation, it remembers the current context, creates (or updates) the context `devenv-remote` with `ssh://<host>`, and makes it the current context.
+5. **Dev Environments: Use the Local Docker** switches back to the context that was current before (or `default`).
+
+**What to know.**
+
+- One Docker host at a time. The view, the switcher, the status bar, and every command show and act only on the environments of the current Docker host; the others are hidden until you switch back, and nothing is ever done to them from another host. Each environment records its host. A repository gets its own environment on each host.
+- Two names of the same computer (an SSH alias and `user@address`, or two aliases) count as two hosts.
+- The context changes for every Docker tool of your user on this computer, also in terminals. If `DOCKER_HOST` or `DOCKER_CONTEXT` is set for VS Code, the context has no effect, and the commands say so.
+- Docker Desktop may set its own context again when it starts or updates. When a window of an environment of the other host opens again (for example from **Open Recent**), Dev Environments says "This environment is on <host>, but Docker is set to <current>. Use <host> again?"; the button switches back, after the same test and question.
+- When the host cannot be reached, the message says why ("The Docker host <host> cannot be reached." with the reason: the computer does not answer, SSH could not log in, the host key is unknown, Docker is not installed or not running there). Docker Desktop is never started for a remote host, and the Docker installation is not offered.
+- Published ports are bound to `127.0.0.1` of the **other computer** (its loopback), not of yours. Reach them through the port forwarding of VS Code (the Ports view, `forwardPorts`), which works over the connection of the window. `host.docker.internal` exists only with Docker Desktop; on a Docker Engine it points nowhere unless a configuration adds it.
+- The GitHub token goes into the memory (tmpfs) of the container on the other computer, through `docker exec` over SSH, never onto its disk. Root and every member of the group `docker` on that computer can read it, as on your own computer.
+- Rootless Docker on the other computer is supported: Dev Environments detects it and reads the socket folder of your SSH user once (`$XDG_RUNTIME_DIR/docker.sock`). Its limits: no published ports below 1024, Docker-in-Docker needs set-up on that computer, and resource limits need cgroup v2 there.
+- The Session Monitor stops the environments of the remote host after their windows closed, through the same context, while your computer is online and Docker is set to that host.
+- Each Docker call opens an SSH connection. `ControlMaster auto` with `ControlPersist` in your SSH config makes them faster.
+
 ## Known limits
 
 - The first open of a repository needs internet access: for the download of the repository and of the images.
@@ -175,7 +200,7 @@ The socket that answers credential requests stays open, and a program in the con
 
 **Ports, browser, and clipboard.** With `"remote.autoForwardPorts": false` and `"remote.localPortHost": "localhost"` (the default) in your user settings, VS Code forwards fewer ports on its own, and by default only on localhost. Extensions and some URLs can still forward ports. While its host access checks are on, Dev Environments refuses a configuration that sets another `remote.localPortHost`. An image or a program in the container can still set it in the settings of the container, which win over yours. No setting limits the opening of URLs in your browser; if this worries you, make a separate browser profile your default browser. No setting limits the clipboard either: do not copy secrets while a container that you do not trust is open.
 
-**Everything else.** The only real boundary is a separate user account on your computer, or a virtual machine, for VS Code and Docker: then nothing of yours is at the end of the channels. On Linux, this separate account must not be in the group `docker` (which the Docker installation of Dev Environments adds your user to): that group gives root rights on the computer and access to the containers of all users. Give the account its own rootless Docker (Docker's "Rootless mode") instead, and add `export DOCKER_HOST=unix:///run/user/<UID>/docker.sock` (`<UID>`: the output of `id -u` in that account) to a file that its login reads (for example `~/.profile`, or `~/.bash_profile` if that file exists, as on RHEL and CentOS; with zsh `~/.zprofile`; sign out and in afterwards): Dev Environments mounts the Docker socket into its helper container from the path in `DOCKER_HOST`, otherwise from `/var/run/docker.sock`; the Docker context alone is not enough. In that account, do not use the Docker installation or **Start Docker** of Dev Environments, and do not add the account to the group `docker`: they set up the system Docker. Or use a virtual machine. With Docker Desktop, Enhanced Container Isolation (Business subscription) also hardens the container side.
+**Everything else.** The only real boundary is a separate user account on your computer, or a virtual machine, for VS Code and Docker: then nothing of yours is at the end of the channels. On Linux, this separate account must not be in the group `docker` (which the Docker installation of Dev Environments adds your user to): that group gives root rights on the computer and access to the containers of all users. Give the account its own rootless Docker (Docker's "Rootless mode") instead, and add `export DOCKER_HOST=unix:///run/user/<UID>/docker.sock` (`<UID>`: the output of `id -u` in that account) to a file that its login reads (for example `~/.profile`, or `~/.bash_profile` if that file exists, as on RHEL and CentOS; with zsh `~/.zprofile`; sign out and in afterwards): Dev Environments mounts the Docker socket into its helper container from the path in `DOCKER_HOST` or of the current Docker context, otherwise from `/var/run/docker.sock`. In that account, do not use the Docker installation or **Start Docker** of Dev Environments, and do not add the account to the group `docker`: they set up the system Docker. Or use a virtual machine. With Docker Desktop, Enhanced Container Isolation (Business subscription) also hardens the container side.
 
 ## Privacy
 
