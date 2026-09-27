@@ -36,7 +36,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 
 1. Remove the Dockerfile refusals — **merged** (PR #32, f1594dc). Accepted leftover (low, same as before): a devcontainer.json with a JSON syntax slip that the Dev Container CLI tolerates makes a named Dockerfile unreadable for the check, so it is refused as 'could not be read'.
 2. ~~Helper socket follows the Docker context~~ — dropped (user decision 2026-09-27: not worth the complexity; rootless Docker needs `DOCKER_HOST`, as the README says). Branch `fix/helper-socket-context` stays unmerged.
-3. Unit 15: token only in the container's memory (tmpfs) — spec in the session scratchpad `u15/spec.md`.
+3. Unit 15: token only in the container's memory (tmpfs) — **merged** (PR #33, 23bcb6e). Open question to the user: should lifecycle commands get the token (write first, then `devcontainer run-user-commands`)?
 3b. Remove all migration code (greenfield cleanup PR).
 4. Unit 11: one policy module, guard rails only (pure refactor).
 5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
