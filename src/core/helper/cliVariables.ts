@@ -31,9 +31,10 @@
 //   is not known before `up` (hotfix review 2, P6).
 // - `${containerEnv:…}` is resolved only for the lifecycle commands of an existing container (Hr), never in the
 //   arguments of `docker run` (hotfix review 2, P4).
+import * as crypto from 'crypto';
 import * as path from 'path';
 import { HELPER_ENV_NAMES } from './localEnv';
-import { repositoryFolder } from '../names';
+import { environmentIdLabel, repositoryFolder } from '../names';
 
 /**
  * The longest text (a string value or key) that the checks read, and the most text in one source (the configuration,
@@ -285,6 +286,31 @@ export function resolveCliVariables<T>(value: T, variables: CliVariables): { val
 /** The second pass of the CLI (tg): every expression named `devcontainerId`, with or without arguments, becomes `id`. */
 function devcontainerIdPass(value: unknown, id: string): unknown {
   return mapStrings(value, (text) => substituteText(text, (match, name) => (name === DEVCONTAINER_ID_VARIABLE ? id : match)));
+}
+
+/**
+ * The ID of the container that the Dev Container CLI 0.89.0 puts in place of `${devcontainerId}` for the id labels
+ * `idLabels` (`--id-label`, each `<name>=<value>`), as its function `Q_` computes it from the object that its function
+ * `ht` makes of them (a label without `=` is dropped; a later label of the same name wins): the SHA-256 of the JSON of
+ * that object with its keys sorted, as a number in base 32, padded to 52 characters with `0` (review round 17, D17-1).
+ */
+export function devcontainerIdOf(idLabels: readonly string[]): string {
+  const labels: Record<string, string> = {};
+  for (const label of idLabels) {
+    const index = label.indexOf('=');
+    if (index !== -1) labels[label.substring(0, index)] = label.substring(index + 1);
+  }
+  const json = JSON.stringify(labels, Object.keys(labels).sort());
+  const hash = crypto.createHash('sha256').update(Buffer.from(json, 'utf-8')).digest();
+  return BigInt(`0x${hash.toString('hex')}`).toString(32).padStart(52, '0');
+}
+
+/**
+ * `${devcontainerId}` of the containers of the environment `environmentId`: the pipeline passes the single id label
+ * environmentIdLabel to read-configuration and `up` (review round 17, D17-1).
+ */
+export function environmentDevcontainerId(environmentId: string): string {
+  return devcontainerIdOf([environmentIdLabel(environmentId)]);
 }
 
 /**

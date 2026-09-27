@@ -17,7 +17,9 @@ import {
   type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
+import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
+import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../helper/hostAccess';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
 import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, OWNERSHIP_FIX_SCRIPT, servicePathArguments } from '../git/gitSummary';
@@ -2727,7 +2729,9 @@ describe('review round 16 of unit 6 (Dp): the user that the Dev Container CLI wr
       h.docker.imageConfigs.set(BASE_IMAGE, { User: USER });
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('hostAccess');
-      expect(error.message).toContain(`service app: the user ${JSON.stringify(USER)} of the image ${BASE_IMAGE}`);
+      // review round 17, P17-3: the item is truncated to MAX_ITEM_LENGTH characters (its start and its end stay).
+      expect(error.message).toContain(`service app: the user ${JSON.stringify(USER).slice(0, 40)}`);
+      expect(error.message).toContain('a line break is not supported)');
       expect(h.helper.builds).toEqual([]);
       expect(h.helper.ups).toEqual([]);
     }
@@ -2792,5 +2796,163 @@ describe('review round 16 of unit 6 (L1): values that the Dev Container CLI writ
     h.helper.buildMetadata = [{ id: 'ghcr.io/devcontainers/features/docker-in-docker:2', entrypoint: '/usr/local/share/docker-init.sh', containerEnv: { DOCKER_BUILDKIT: '1' } }, { containerUser: 'vscode' }];
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
+  });
+});
+
+describe('review round 17 of unit 6 (D17-1): volumes of `mounts` with variables of the Dev Container CLI', () => {
+  // `${devcontainerId}` of the environment, as the CLI computes it from `--id-label` (checked against the CLI's own
+  // function in cliVariables.test.ts).
+  const ID = environmentDevcontainerId(ENV_ID);
+  const COMPOSE_KEY = /^[a-zA-Z0-9._-]+$/;
+  const DIND = `dind-var-lib-docker-${ID}`;
+  const labels = { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id };
+
+  function buildModel(index = -1): ComposeModel {
+    return JSON.parse(h.helper.builds.at(index)?.files?.[COMPOSE_MODEL_PATH] ?? 'null') as ComposeModel;
+  }
+
+  function useMetadataMounts(): void {
+    h.helper.buildMetadata = [
+      { id: 'ghcr.io/devcontainers/features/docker-in-docker:2', mounts: [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }] },
+      { id: 'ghcr.io/acme/features/cache:1', mounts: ['source=${localWorkspaceFolderBasename}-node_modules,target=/nm,type=volume'] },
+    ];
+  }
+
+  it('declares the volumes of the image metadata in the up model by the names that the CLI writes', async () => {
+    useMetadataMounts();
+    await h.service.open(TARGET, options());
+    const volumes = upModel().volumes ?? {};
+    expect(Object.keys(volumes).filter((key) => !COMPOSE_KEY.test(key))).toEqual([]);
+    expect(volumes).toMatchObject({
+      [DIND]: { name: `${PROJECT}_${DIND}`, external: true },
+      'api-node_modules': { name: `${PROJECT}_api-node_modules`, external: true },
+    });
+    expect(ID).toMatch(/^[0-9a-v]{52}$/);
+    // Never the placeholder of the checks: the CLI writes the real ID.
+    expect(JSON.stringify(upModel())).not.toContain(DEVCONTAINER_ID_PLACEHOLDER);
+    expect([...h.docker.volumes.keys()].filter((name) => name.includes(DEVCONTAINER_ID_PLACEHOLDER))).toEqual([]);
+  });
+
+  it('creates, records, and lists the volume of the docker-in-docker Feature like the other volumes of the project, and Delete removes it when ticked', async () => {
+    useMetadataMounts();
+    await h.service.open(TARGET, options());
+    expect(h.docker.volumes.get(`${PROJECT}_${DIND}`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    expect(h.docker.volumes.get(`${PROJECT}_api-node_modules`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(expect.arrayContaining([`${PROJECT}_${DIND}`, `${PROJECT}_api-node_modules`]));
+    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(expect.arrayContaining([`${PROJECT}_${DIND}`, `${PROJECT}_api-node_modules`]));
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [`${PROJECT}_${DIND}`] });
+    expect(h.docker.volumes.has(`${PROJECT}_${DIND}`)).toBe(false);
+    expect(h.docker.volumes.has(`${PROJECT}_api-node_modules`)).toBe(true);
+  });
+
+  it('declares a `${devcontainerId}` volume of devcontainer.json in the build model with the real ID', async () => {
+    // read-configuration leaves `${devcontainerId}` as written while no container exists.
+    h.helper.files = {
+      [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace('"source=cache,target=/cache,type=volume"', '"source=hist-${devcontainerId},target=/hist,type=volume"') },
+    };
+    await h.service.open(TARGET, options());
+    for (const m of [buildModel(), upModel()]) {
+      const volumes = m.volumes ?? {};
+      expect(Object.keys(volumes).filter((key) => !COMPOSE_KEY.test(key))).toEqual([]);
+      expect(volumes).toMatchObject({ [`hist-${ID}`]: { name: `${PROJECT}_hist-${ID}`, external: true } });
+      expect(JSON.stringify(m)).not.toContain(DEVCONTAINER_ID_PLACEHOLDER);
+    }
+    expect(h.docker.volumes.get(`${PROJECT}_hist-${ID}`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+  });
+});
+
+describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev service and the size of a refusal', () => {
+  const DEV_IMAGE = 'mcr.microsoft.com/devcontainers/python:3.12';
+  const PRIVATE_IMAGE = 'registry.corp.example/prod/base:1';
+  const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
+
+  /** The dev service builds `dockerfile` with `build` (target, args) from .devcontainer. */
+  function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}): void {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.app = { build: { context: `${FOLDER}/.devcontainer`, dockerfile: 'Dockerfile', ...build }, command: ['sleep', 'infinity'] };
+      }),
+    );
+    const out = h.helper.composeOutput as ComposeModelOutput;
+    h.helper.composeOutput = {
+      ...out,
+      dockerfiles: { app: dockerfile },
+      realPaths: { ...out.realPaths, [`${FOLDER}/.devcontainer`]: `${FOLDER}/.devcontainer`, [`${FOLDER}/.devcontainer/Dockerfile`]: `${FOLDER}/.devcontainer/Dockerfile` },
+    };
+    h.checker.outcome = checked({ [DEV_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST }, { [FEATURE]: FEATURE_DIGEST });
+  }
+
+  it('P17-1: pulls and inspects only the image of the target chain; later stages (a private image, an unresolved tag) are neither pulled nor refused', async () => {
+    useDevBuild(`FROM ${DEV_IMAGE} AS dev\nRUN true\nFROM ${PRIVATE_IMAGE} AS prod\nFROM registry.example/app\${TAG} AS release\n`, { target: 'dev' });
+    h.docker.pullError = (reference) => (reference === PRIVATE_IMAGE ? new CommandError(`docker pull ${reference}`, 1, '', 'denied') : undefined);
+    await h.service.open(TARGET, options());
+    expect(h.docker.log).toContain(`pull ${DEV_IMAGE}`);
+    expect(h.docker.log.filter((line) => line.includes(PRIVATE_IMAGE) || line.includes('registry.example/app'))).toEqual([]);
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it('P17-2: opens with a multi-line CA certificate build argument and USER $USERNAME, with and without Features', async () => {
+    const dockerfile = `FROM ${DEV_IMAGE}\nARG USERNAME=vscode\nARG EXTRA_CA_CERT\nRUN echo "$EXTRA_CA_CERT" > /x.crt\nUSER $USERNAME\n`;
+    const args = { USERNAME: 'vscode', EXTRA_CA_CERT: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----' };
+    for (const features of [true, false]) {
+      h.cleanup();
+      h = createHarness({ newEnvironmentId: () => ENV_ID });
+      useDevBuild(dockerfile, { args });
+      if (!features) h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
+      await h.service.open(TARGET, options());
+      expect(h.helper.builds, String(features)).toHaveLength(1);
+    }
+  });
+
+  it('P17-2: with Features, refuses before the build a user that the USER line resolves to a line break, from an argument or the environment of the image', async () => {
+    useDevBuild(`FROM ${DEV_IMAGE}\nARG USERNAME=vscode\nUSER $USERNAME\n`, { args: { USERNAME: INJECTION } });
+    let error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service app: the user "root\\n');
+    expect(error.message).toContain('kerfile (a line break;');
+    expect(h.helper.builds).toEqual([]);
+
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID });
+    useDevBuild(`FROM ${DEV_IMAGE}\nENV U=\${EVIL}\nUSER \${U}\n`);
+    h.docker.images.add(DEV_IMAGE);
+    h.docker.imageConfigs.set(DEV_IMAGE, { User: 'vscode', Env: [`EVIL=${INJECTION}`] });
+    error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service app: the user "root\\n');
+    expect(error.message).toContain('kerfile (a line break;');
+    expect(h.helper.builds).toEqual([]);
+
+    // The same variable of the image, not used by the USER line: the build goes on.
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID });
+    useDevBuild(`FROM ${DEV_IMAGE}\nUSER vscode\n`);
+    h.docker.images.add(DEV_IMAGE);
+    h.docker.imageConfigs.set(DEV_IMAGE, { User: 'vscode', Env: [`EVIL=${INJECTION}`] });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('P17-3: a refusal of hundreds of services lists at most MAX_LISTED_ITEMS items of at most MAX_ITEM_LENGTH characters', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        for (let i = 0; i < 300; i++) m.services[`s${i}`] = { image: DB_IMAGE, privileged: true, [`zz${'k'.repeat(1000)}${i}`]: 1 };
+      }),
+    );
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    const items = (error as UserFacingError & { items: readonly string[] }).items;
+    const report = (error as UserFacingError & { report: { hostAccess: string[]; unsupported: string[] } }).report;
+    for (const list of [report.hostAccess, report.unsupported]) {
+      expect(list.length).toBeLessThanOrEqual(MAX_LISTED_ITEMS + 1);
+      // MAX_ITEM_LENGTH characters of the item and the `…` in their middle (truncated, as in hostAccess.review3.test.ts).
+      for (const item of list) expect(item.length, item).toBeLessThanOrEqual(MAX_ITEM_LENGTH + 1);
+    }
+    expect(report.unsupported.at(-1)).toMatch(/^and \d+ more$/);
+    expect(items.length).toBeLessThanOrEqual(2 * (MAX_LISTED_ITEMS + 1));
+    expect(error.message.length).toBeLessThan(20_000);
   });
 });

@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
 import { supportsVolumeSubpath } from '../../src/core/helper/compose';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
@@ -119,6 +120,7 @@ describe('open pipeline for a Docker Compose configuration', () => {
   // Review round 15 (K1): a `mounts` entry that the Dev Container CLI would write as a bind of the Docker socket.
   const tmpfsSource = environment('devenv-test/tmpfs-source-compose');
   const TMPFS_SOURCE_MOUNT = 'type=tmpfs,src=/var/run/docker.sock,dst=/var/run/docker.sock';
+  const HISTORY_MOUNT = 'source=history-${devcontainerId},target=/history,type=volume';
   let apiVersion: string;
 
   /** The compose file: `db` publishes a port without an address and mounts a folder and a file of the repository. */
@@ -220,7 +222,8 @@ ${extra}volumes:
     paths.ensureDirectoriesSync();
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     log.info(`Docker Engine API ${apiVersion}`);
-    await seed(app, composeFile());
+    // Review round 17 (D17-1): with a volume named with `${devcontainerId}`, which read-configuration leaves as written.
+    await seed(app, composeFile(), ['source=cache,target=/cache,type=volume', HISTORY_MOUNT]);
     // The privileged line goes into the db service; the replace must match (review round 7 put `restart` before `ports`).
     const refusedFile = composeFile('').replace('    restart: unless-stopped\n    ports:', '    restart: unless-stopped\n    privileged: true\n    ports:');
     expect(refusedFile).toContain('privileged: true');
@@ -301,6 +304,10 @@ ${extra}volumes:
     expect(dev?.Mounts.find((mount) => mount.Destination === '/cache')).toMatchObject({ Type: 'volume', Name: `${app.project}_cache` });
     // D-7 (package C): a volume of the project, like the data of the services: `compose`, never shared.
     expect(cli.volume(`${app.project}_cache`)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // Review round 17 (D17-1): the `${devcontainerId}` volume by the name that the CLI computes, created with the labels.
+    const history = `${app.project}_history-${environmentDevcontainerId(app.id)}`;
+    expect(dev?.Mounts.find((mount) => mount.Destination === '/history')).toMatchObject({ Type: 'volume', Name: history });
+    expect(cli.volume(history)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
     // Compose kept our declaration `external: true` for it and for the project volume: it created no volume and warned
     // about none that it did not create.
     expect(fs.readFileSync(log.file, 'utf8')).not.toContain('was not created by Docker Compose');
@@ -400,13 +407,15 @@ ${extra}volumes:
     ]);
     expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]).length).toBeGreaterThan(0);
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`]).length).toBeGreaterThan(0);
-    expect(await service.removableServiceDataVolumes(app.id)).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
+    // Review round 17 (D17-1): with the `${devcontainerId}` volume, which Delete lists like the other volumes of the project.
+    const history = `${app.project}_history-${environmentDevcontainerId(app.id)}`;
+    expect(await service.removableServiceDataVolumes(app.id)).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`, history]));
     // Review round 7 (D7-1): a running db is stopped (its stop time) before `docker rm -f`, so that it shuts down cleanly.
     const db = dbContainer();
     cli.ok(['start', db]);
     const logBefore = fs.readFileSync(log.file, 'utf8').length;
 
-    await service.delete(app.id, { progress: new RecordingProgress(), additionalVolumesToRemove: [`${app.project}_cache`] });
+    await service.delete(app.id, { progress: new RecordingProgress(), additionalVolumesToRemove: [`${app.project}_cache`, history] });
 
     const deleteLog = fs.readFileSync(log.file, 'utf8').slice(logBefore);
     expect(deleteLog.indexOf(`Stopping container ${db}`)).toBeGreaterThanOrEqual(0);
@@ -420,6 +429,7 @@ ${extra}volumes:
     expect(cli.volume(app.name)).toBeUndefined();
     // Ticked: removed. Not ticked: the data of the database stays.
     expect(cli.volume(`${app.project}_cache`)).toBeUndefined();
+    expect(cli.volume(history)).toBeUndefined();
     expect(cli.volume(`${app.project}_dbdata`)).toBeDefined();
     expect(await registry.get(app.id)).toBeUndefined();
   });

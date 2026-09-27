@@ -12,8 +12,8 @@
 // setting has for a single container: with the checks off for the repository, only the class `computer` is lifted.
 // Pure functions, no I/O.
 import * as path from 'path';
-import { analyzeDockerfileImages } from '../imageCheck/dockerfile';
 import { isOciFeatureReference } from '../imageCheck/reference';
+import { CliDockerfileError, cliBaseImage, cliEnvironment, cliImageUser, parseCliDockerfile, type CliDockerfile } from './cliDockerfile';
 import {
   composeNetworkNames,
   composeVolumeNames,
@@ -39,6 +39,7 @@ import {
   foreignNetworkItem,
   imageReferenceFinding,
   isHelperPath,
+  isValidImageReference,
   localContextPath,
   refusedVariable,
   securityOptionProblems,
@@ -53,6 +54,11 @@ import {
 export interface ComposeAccessInput extends VolumeInput {
   /** The merged model (ComposeModelOutput.model). */
   model: ComposeModel;
+  /**
+   * Review round 17 (P17-2): whether devcontainer.json has Features (cliHasFeatures): only then does the Dev Container
+   * CLI write the user of the build of the dev service into its compose file (devBuildTextProblems). Default: true.
+   */
+  features?: boolean;
   /** `service` of devcontainer.json. */
   devService: string;
   /** `runServices` of devcontainer.json, when it has one. */
@@ -528,7 +534,7 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   }
   problems.push(...labelProblems(value.labels, 'build '));
   // Review round 16 (Dp): what the Dev Container CLI writes as text into its compose file for the build of the dev service.
-  if (ctx.isDev) problems.push(...devBuildTextProblems(value, text));
+  if (ctx.isDev) problems.push(...devBuildTextProblems(value, text, ctx.input.features !== false));
   for (const [key, setting] of Object.entries(value)) {
     if (BUILD_ALLOWED.has(key) || isExtension(key) || isUnset(setting)) continue;
     if (['ssh', 'secrets', 'entitlements', 'privileged'].includes(key)) problems.push(access(`build ${key}`));
@@ -570,8 +576,6 @@ const YAML_LINE_BREAK = /[\r\n\u0085\u2028\u2029]/;
 /** Review round 16 (Dp): the last FROM line of a Dockerfile, and its stage name, read as the CLI 0.89.0 reads them (`yj`, `Fj`). */
 const CLI_FROM_LINE = /^(?<line>\s*FROM.*)/gim;
 const CLI_FROM = /FROM\s+(?<platform>--platform=\S+\s+)?(?<image>"?[^\s]+"?)(\s+AS\s+(?<label>[^\s]+))?/i;
-/** Review round 16 (Dp): a USER instruction with a variable (the CLI resolves it with the build arguments and the environment). */
-const USER_WITH_VARIABLE = /^\s*USER\s+\S*\$/im;
 const BUILD_TEXT = 'the Dev Container CLI writes it into its compose file for the build as it is';
 
 /**
@@ -585,17 +589,70 @@ function lastStageName(dockerfile: string): string | undefined {
 }
 
 /**
+ * Review round 17 (P17-2): whether the Dev Container CLI 0.89.0 builds with Features for the `features` of
+ * devcontainer.json (function `dQ`: `Object.keys(e.features||{}).length`; the pipeline passes no additional Features).
+ */
+export function cliHasFeatures(features: unknown): boolean {
+  return Object.keys((features || {}) as object).length > 0;
+}
+
+/**
+ * Review round 17 (P17-1, P17-2): the Dockerfile of the build of the dev service as the Dev Container CLI reads it, with
+ * its build arguments (as a plain object, as the CLI gets them from the model) and its target; `undefined` for a dev
+ * service without a local build or whose Dockerfile the model run did not read.
+ */
+function devBuildPlan(
+  model: ComposeModel,
+  dockerfiles: Readonly<Record<string, string>>,
+  devService: string,
+): { file: CliDockerfile; args: Record<string, unknown>; target: string | undefined } | undefined {
+  const service = isRecord(model.services) ? model.services[devService] : undefined;
+  const build = isRecord(service) && isRecord(service.build) ? service.build : undefined;
+  const text = build !== undefined && Object.prototype.hasOwnProperty.call(dockerfiles, devService) ? dockerfiles[devService] : undefined;
+  if (build === undefined || typeof text !== 'string') return undefined;
+  const args: Record<string, unknown> = {};
+  if (isRecord(build.args)) {
+    for (const [arg, setting] of Object.entries(build.args)) {
+      if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
+    }
+  }
+  const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+  return { file: parseCliDockerfile(text), args, target };
+}
+
+/**
+ * Review round 17 (P17-2): the items of the user that the Dev Container CLI 0.89.0 writes into its compose file for the
+ * build with Features (`_DEV_CONTAINERS_IMAGE_USER`, function `Tj`): the USER of the chain of the target stage with its
+ * variables resolved as the CLI resolves them (cliImageUser: the build arguments, the ARG and ENV instructions, then
+ * `env`, the environment of the image of cliBaseImage). Refused when it holds a line break of YAML, or when the CLI's
+ * reading cannot be followed (CliDockerfileError, or where the CLI itself fails). `imageEnv`: `undefined` while the
+ * image is not inspected yet (the check of the model): the variables of the image then count as not set.
+ */
+function devBuildUserItems(plan: NonNullable<ReturnType<typeof devBuildPlan>>, imageEnv: unknown): string[] {
+  let user: string | undefined;
+  try {
+    user = cliImageUser(plan.file, plan.args, cliEnvironment(imageEnv), plan.target);
+  } catch (error) {
+    const reason = error instanceof CliDockerfileError ? error.message : 'the Dev Container CLI cannot read it';
+    return [`the USER instruction of the Dockerfile (${reason}, so the user that ${BUILD_TEXT} cannot be checked)`];
+  }
+  if (user !== undefined && YAML_LINE_BREAK.test(user)) {
+    return [`the user ${JSON.stringify(user)} of the USER instruction of the Dockerfile (a line break; ${BUILD_TEXT})`];
+  }
+  return [];
+}
+
+/**
  * Review round 16 (Dp): the Dev Container CLI 0.89.0 writes a compose file for the build of the dev service (function
  * `Dp`) with `- _DEV_CONTAINERS_BASE_IMAGE=<stage>` in `build.args`, as text: the stage is `build.target`, or the name of
- * the last stage of the Dockerfile (`DQ`). With Features, it also writes `- _DEV_CONTAINERS_IMAGE_USER=<user>`, the user
- * of the target stage: its USER instruction with the variables resolved (the build arguments, the ARG and ENV values of
- * the Dockerfile, the environment of the image), or the user of its image (composeBuildImageItems checks the images). A
- * line break in such a text would add keys to the build or to the dev service (for example `ssh` with a file of the
- * workspace helper): refused, whatever the switch says. So are a stage name that is no plain name, a Dockerfile with a
- * line break of YAML that the CLI reads as part of a name or value (NEL), and, when a USER instruction uses a variable,
- * a build argument with a line break.
+ * the last stage of the Dockerfile (`DQ`). It writes it with and without Features, so a stage name that is no plain name
+ * and a Dockerfile with a line break of YAML that the CLI reads as part of a name or value (NEL) are refused, whatever
+ * the switch says. With Features (`features`), it also writes `- _DEV_CONTAINERS_IMAGE_USER=<user>`, the user of the
+ * target stage (review round 17, P17-2: devBuildUserItems, the text that the CLI computes, with the variables of the
+ * image not set here; composeBuildUserItems checks it again with the environment of the image). A line break in such a
+ * text would add keys to the build or to the dev service (for example `ssh` with a file of the workspace helper).
  */
-function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string | undefined): Problem[] {
+function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string | undefined, features: boolean): Problem[] {
   const problems: Problem[] = [];
   const target = build.target;
   if (target !== undefined && target !== null && target !== '') {
@@ -611,73 +668,74 @@ function devBuildTextProblems(build: Record<string, unknown>, dockerfile: string
   if (dockerfile !== undefined && /[\u0085]/.test(dockerfile)) {
     problems.push(unsupported(`the Dockerfile, which holds the character U+0085 (${BUILD_TEXT}: a line break in a name or value is not supported)`));
   }
-  if (dockerfile !== undefined && USER_WITH_VARIABLE.test(dockerfile) && isRecord(build.args)) {
-    for (const [name, setting] of Object.entries(build.args)) {
-      if (typeof setting === 'string' && YAML_LINE_BREAK.test(setting)) {
-        problems.push(unsupported(`build.args ${name} (a line break; the USER instruction of the Dockerfile uses a variable, and ${BUILD_TEXT})`));
-      }
-    }
+  if (features && dockerfile !== undefined && problems.length === 0) {
+    const plan = devBuildPlan({ services: { dev: { build } } } as ComposeModel, { dev: dockerfile }, 'dev');
+    if (plan !== undefined) problems.push(...devBuildUserItems(plan, undefined).map(unsupported));
   }
   return problems;
 }
 
 /**
- * Review round 16 (Dp): the images whose user and environment the Dev Container CLI 0.89.0 may write into its compose
- * file for the build of the dev service `devService` (`_DEV_CONTAINERS_IMAGE_USER`, with Features): the FROM images of
- * its Dockerfile (all stages, a superset of the chain of the target), or its image when it has no build (the build
- * model builds `FROM <image>`); `unresolved`: FROM images with a variable that could not be resolved (their user cannot
- * be checked); `userVariables`: whether a USER instruction uses a variable, so that the environment of the image counts.
+ * Review round 16 (Dp), review round 17 (P17-1): the image whose configuration the Dev Container CLI 0.89.0 inspects for
+ * the build of the dev service `devService`, and from which it takes the user that it writes into its compose file with
+ * Features (`_DEV_CONTAINERS_IMAGE_USER`): for a local build, the one external image at the root of the chain of the
+ * target stage, or of the last stage (cliBaseImage, the CLI's `uG`; not the images of other stages, which the build does
+ * not use); for a dev service without a build, its image (the build model builds `FROM <image>`). `unresolved`: such an
+ * image that uses a platform variable (its value comes from the Docker Engine), that is no valid reference, or that
+ * cannot be found as the CLI finds it: its user cannot be checked.
  */
 export function composeDevBuildImages(
   model: ComposeModel,
   dockerfiles: Readonly<Record<string, string>>,
   devService: string,
-): { images: string[]; unresolved: string[]; userVariables: boolean } {
+): { images: string[]; unresolved: string[] } {
   const service = isRecord(model.services) ? model.services[devService] : undefined;
-  if (!isRecord(service)) return { images: [], unresolved: [], userVariables: false };
-  const build = isRecord(service.build) ? service.build : undefined;
-  if (!build) {
+  if (!isRecord(service)) return { images: [], unresolved: [] };
+  if (!isRecord(service.build)) {
     const image = typeof service.image === 'string' ? service.image.trim() : '';
-    return { images: image === '' ? [] : [image], unresolved: [], userVariables: false };
+    return { images: image === '' ? [] : [image], unresolved: [] };
   }
-  const text = dockerfiles[devService];
-  if (text === undefined) return { images: [], unresolved: [], userVariables: false };
-  const args: Record<string, string> = {};
-  if (isRecord(build.args)) {
-    for (const [arg, setting] of Object.entries(build.args)) {
-      if (typeof setting === 'string' || typeof setting === 'number' || typeof setting === 'boolean') args[arg] = String(setting);
-    }
+  const plan = devBuildPlan(model, dockerfiles, devService);
+  if (plan === undefined) return { images: [], unresolved: [] };
+  let image: string | undefined;
+  try {
+    image = cliBaseImage(plan.file, plan.args, plan.target);
+  } catch {
+    return { images: [], unresolved: ['of the target stage of the Dockerfile'] };
   }
-  const images = new Set<string>();
-  const unresolved = new Set<string>();
-  for (const reference of analyzeDockerfileImages(text, args, { withStages: true }).references) {
-    if (reference.kind !== 'FROM') continue;
-    if (reference.reference.includes('$') || reference.unchecked !== undefined) unresolved.add(reference.reference);
-    else if (reference.reference.toLowerCase() !== 'scratch') images.add(reference.reference);
-  }
-  return { images: [...images], unresolved: [...unresolved], userVariables: USER_WITH_VARIABLE.test(text) };
+  if (image === undefined || image.toLowerCase() === 'scratch') return { images: [], unresolved: [] };
+  if (image.includes('$') || !isValidImageReference(image)) return { images: [], unresolved: [image] };
+  return { images: [image], unresolved: [] };
 }
 
 /**
- * Review round 16 (Dp): the items of the image `image` (its `Config`, `docker image inspect`) whose text the Dev
- * Container CLI 0.89.0 may write into its compose file for the build of the dev service: a user with a line break of
- * YAML, and, when a USER instruction of the Dockerfile uses a variable (`userVariables`), a variable of its environment
- * with one. Not supported, whatever the switch says.
+ * Review round 16 (Dp): the item of the image `image` (its `Config`, `docker image inspect`) whose user the Dev Container
+ * CLI 0.89.0 may write into its compose file for the build of the dev service (the user of the image, when the Dockerfile
+ * names none): a user with a line break of YAML. Not supported, whatever the switch says.
  */
-export function composeBuildImageItems(image: string, config: unknown, userVariables: boolean): string[] {
-  const items: string[] = [];
+export function composeBuildImageItems(image: string, config: unknown): string[] {
   const settings = isRecord(config) ? config : {};
   if (typeof settings.User === 'string' && YAML_LINE_BREAK.test(settings.User)) {
-    items.push(`the user ${JSON.stringify(settings.User)} of the image ${image} (${BUILD_TEXT}: a line break is not supported)`);
+    return [`the user ${JSON.stringify(settings.User)} of the image ${image} (${BUILD_TEXT}: a line break is not supported)`];
   }
-  if (userVariables && Array.isArray(settings.Env)) {
-    for (const entry of settings.Env) {
-      if (typeof entry !== 'string' || !YAML_LINE_BREAK.test(entry)) continue;
-      const name = entry.includes('=') ? entry.slice(0, entry.indexOf('=')) : entry;
-      items.push(`the variable ${JSON.stringify(name)} of the image ${image} (a line break; the USER instruction of the Dockerfile uses a variable, and ${BUILD_TEXT})`);
-    }
-  }
-  return items;
+  return [];
+}
+
+/**
+ * Review round 17 (P17-2): the items of the user that the Dev Container CLI 0.89.0 writes into its compose file for the
+ * build of the dev service `devService` with Features, computed as the CLI computes it (devBuildUserItems) with the
+ * environment of the image of composeDevBuildImages (`imageConfig`, its `Config`; `undefined` without one). Empty for a
+ * dev service without a local build (composeBuildImageItems checks the user of its image).
+ */
+export function composeBuildUserItems(
+  model: ComposeModel,
+  dockerfiles: Readonly<Record<string, string>>,
+  devService: string,
+  imageConfig: unknown,
+): string[] {
+  const plan = devBuildPlan(model, dockerfiles, devService);
+  if (plan === undefined) return [];
+  return devBuildUserItems(plan, isRecord(imageConfig) ? imageConfig.Env : undefined);
 }
 
 /** The Dockerfile of a local build, as the model run resolves it (absolute). */

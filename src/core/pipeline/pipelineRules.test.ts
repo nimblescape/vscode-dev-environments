@@ -5,10 +5,11 @@
 import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
-import { helperCliVariables } from '../helper/cliVariables';
+import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import {
   baseImageKey,
   composeContainerOrder,
+  COMPOSE_VOLUME_KEY,
   composeMountVolumes,
   composeConfigurationChange,
   composeRecordOf,
@@ -559,7 +560,31 @@ describe('Docker Compose rules (unit 6)', () => {
         undefined,
         [{ source: 'cache', target: '/other', type: 'volume' }],
       ]),
-    ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'] });
+      // review round 17, D17-1: with the sources that are no key of a Compose volume.
+    ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'], skipped: [] });
+  });
+
+  it('composeMountVolumes: sources substituted as the CLI does at up, with the real ID; the rest is skipped (review round 17, D17-1)', () => {
+    const id = environmentDevcontainerId('3f2a9c1e-0000-4000-8000-000000000001');
+    const variables = { ...helperCliVariables('acme/api'), devcontainerId: id };
+    const mounts = [
+      [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }],
+      ['source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume'],
+      // A variable of the process whose value is not known, and a name that Compose does not accept as a key.
+      ['source=${localEnv:TERM}-x,target=/x,type=volume', 'source=a@b,target=/y,type=volume'],
+      { source: 'shared-${localEnv:TERM}', target: '/s', type: 'volume', external: true },
+    ];
+    expect(composeMountVolumes('devenv-3f2a9c1e', mounts, variables)).toEqual({
+      names: [`devenv-3f2a9c1e_dind-var-lib-docker-${id}`, 'devenv-3f2a9c1e_api-node_modules'],
+      sources: [`dind-var-lib-docker-${id}`, 'api-node_modules'],
+      skipped: ['${localEnv:TERM}-x', 'a@b', 'shared-${localEnv:TERM}'],
+    });
+    // Without the variables, a source with `${…}` is never a volume of the model (and never the placeholder of the checks).
+    const raw = composeMountVolumes('devenv-3f2a9c1e', mounts);
+    expect(raw.sources).toEqual([]);
+    expect(raw.names).toEqual([]);
+    expect(JSON.stringify(composeMountVolumes('devenv-3f2a9c1e', mounts, variables))).not.toContain(DEVCONTAINER_ID_PLACEHOLDER);
+    for (const source of composeMountVolumes('devenv-3f2a9c1e', mounts, variables).sources) expect(source).toMatch(COMPOSE_VOLUME_KEY);
   });
 });
 

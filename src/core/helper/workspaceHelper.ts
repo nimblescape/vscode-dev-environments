@@ -15,9 +15,9 @@ import {
   CONFIG_FOLDER,
   HELPER_CACHE_VOLUME,
   HELPER_DOCKER_SOCKET,
-  LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
   WORKSPACES_ROOT,
+  environmentIdLabel,
   splitRepository,
 } from '../names';
 import { isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
@@ -554,7 +554,7 @@ export class WorkspaceHelper {
     const args = readConfigurationArgs({
       workspaceFolder: folder,
       configPath: `${folder}/${checkConfigPath(p.configPath)}`,
-      idLabel: `${LABEL_ENVIRONMENT_ID}=${p.environmentId}`,
+      idLabel: environmentIdLabel(p.environmentId),
       merged,
       overrideConfigPath: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined,
     });
@@ -705,7 +705,7 @@ export class WorkspaceHelper {
     const args = upArgs({
       workspaceFolder: folder,
       overrideConfigPath: OVERRIDE_CONFIG_PATH,
-      idLabel: `${LABEL_ENVIRONMENT_ID}=${p.environmentId}`,
+      idLabel: environmentIdLabel(p.environmentId),
       removeExistingContainer: p.removeExistingContainer,
     });
     this.deps.logger.info(

@@ -125,7 +125,7 @@ export class FakeDocker implements EnvironmentDocker {
   /** The names of each `docker volume inspect` (inspectVolumes). */
   readonly volumeInspections: string[][] = [];
   /** `Config` of `docker image inspect` per image. Default: no labels, no user. */
-  readonly imageConfigs = new Map<string, { User?: string; Labels?: Record<string, string> }>();
+  readonly imageConfigs = new Map<string, { User?: string; Env?: string[]; Labels?: Record<string, string> }>();
   /** `docker run` calls: the image and the arguments after it. */
   readonly runs: Array<{ image: string; args: readonly string[]; all: readonly string[] }> = [];
   runError: Maybe<Error>;

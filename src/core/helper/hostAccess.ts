@@ -483,7 +483,7 @@ export function truncated(text: string, max: number): string {
  * after the items are without duplicates and the placeholder of an ID is named as the configuration writes it (add in
  * hostAccessFindings), so that both see the whole text.
  */
-function capped(items: readonly string[]): string[] {
+export function capped(items: readonly string[]): string[] {
   const listed = items.slice(0, MAX_LISTED_ITEMS).map((item) => truncated(item, MAX_ITEM_LENGTH));
   return items.length <= MAX_LISTED_ITEMS ? listed : [...listed, `and ${items.length - MAX_LISTED_ITEMS} more`];
 }

@@ -651,22 +651,46 @@ export function composeContainerOrder<T extends { labels: Readonly<Record<string
 }
 
 /**
+ * What Docker Compose accepts as the key of a top-level volume (compose-go schema, `volumes` patternProperties; Compose
+ * does not interpolate keys). Review round 17 (D17-1).
+ */
+export const COMPOSE_VOLUME_KEY = /^[a-zA-Z0-9._-]+$/;
+
+/**
  * The named volumes of the `mounts` of devcontainer.json, of the merged configuration, and of the image metadata in a
  * Docker Compose configuration (each argument is one `mounts` value: a list, or a single mount). The Dev Container CLI
  * puts them into the project (`<project>_<source>`, composeMountVolumeName), unless the mount says `external`:
  * - `names`: their Docker names, which the pipeline creates before `up` with the labels of the environment;
  * - `sources`: the sources of the project volumes, which our model declares as external volumes (mountVolumeSources).
+ * Review round 17 (D17-1): each mount is first substituted with `variables` as the CLI substitutes it at `up`
+ * (helperCliVariables with the real `${devcontainerId}` of the environment, environmentDevcontainerId; never
+ * DEVCONTAINER_ID_PLACEHOLDER), so that the names are those that the CLI writes. A source (or the name of an external
+ * mount) that is still no valid key of a Compose volume (COMPOSE_VOLUME_KEY: for example a `${localEnv:…}` whose value
+ * is not known) is left out of both lists and returned in `skipped`: our model does not name it, the pipeline does not
+ * create it, and it never reaches a command; the CLI writes it into its compose file as it is.
  */
-export function composeMountVolumes(project: string, mounts: readonly unknown[]): { names: string[]; sources: string[] } {
+export function composeMountVolumes(
+  project: string,
+  mounts: readonly unknown[],
+  variables?: CliVariables,
+): { names: string[]; sources: string[]; skipped: string[] } {
   const names = new Set<string>();
   const sources = new Set<string>();
+  const skipped = new Set<string>();
   for (const value of mounts) {
-    for (const mount of Array.isArray(value) ? value : value === undefined || value === null ? [] : [value]) {
+    for (const written of Array.isArray(value) ? value : value === undefined || value === null ? [] : [value]) {
+      const mount = variables !== undefined ? resolveCliVariables(written, variables).value : written;
       const name = composeMountVolumeName(project, mount);
       if (name === undefined) continue;
+      const external = isRecord(mount) && mount.external === true;
+      const source = external ? name : name.slice(project.length + 1);
+      if (!COMPOSE_VOLUME_KEY.test(source)) {
+        skipped.add(source);
+        continue;
+      }
       names.add(name);
-      if (name.startsWith(`${project}_`) && !(isRecord(mount) && mount.external === true)) sources.add(name.slice(project.length + 1));
+      if (!external) sources.add(source);
     }
   }
-  return { names: [...names], sources: [...sources] };
+  return { names: [...names], sources: [...sources], skipped: [...skipped] };
 }

@@ -6,6 +6,14 @@
 import * as crypto from 'crypto';
 
 export const LABEL_ENVIRONMENT_ID = 'devenv.environment-id';
+
+/**
+ * The `--id-label` of every run of the Dev Container CLI for the environment `environmentId` (read-configuration and
+ * `up`): the CLI computes `${devcontainerId}` from it (environmentDevcontainerId in ./helper/cliVariables.ts).
+ */
+export function environmentIdLabel(environmentId: string): string {
+  return `${LABEL_ENVIRONMENT_ID}=${environmentId}`;
+}
 export const LABEL_REPOSITORY = 'devenv.repository';
 /** Volume label: the GitHub user ID of the account that created the environment (concept 7.5). */
 export const LABEL_OWNER_ID = 'devenv.owner-id';

@@ -46,12 +46,14 @@ import {
 } from '../helper/compose';
 import {
   composeBuildImageItems,
+  composeBuildUserItems,
+  cliHasFeatures,
   composeConfigurationReport,
   composeDevBuildImages,
   composeIgnoredProperties,
   composeMissingBuildPaths,
 } from '../helper/composeAccess';
-import { helperCliVariables } from '../helper/cliVariables';
+import { environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import {
   ANALYSIS_FAILED_ITEM,
@@ -81,6 +83,8 @@ import {
   runArgsNetworks,
   truncated,
   volumeLabelOwner,
+  MAX_ITEM_LENGTH,
+  capped,
   type HostAccessInput,
   type HostAccessReport,
   type NetworkState,
@@ -1674,7 +1678,7 @@ export class EnvironmentService {
       configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
       config,
       references,
-      mountedVolumes: [...new Set([...volumes, ...composeMountVolumes(project, compose.mounts).names])],
+      mountedVolumes: [...new Set([...volumes, ...this.composeMountVolumes(env, compose, compose.mounts).names])],
       compose,
     };
   }
@@ -1706,6 +1710,8 @@ export class EnvironmentService {
       ...(volumes.networks !== undefined ? { networks: volumes.networks } : {}),
       dockerfiles: compose.output.dockerfiles,
       model: compose.output.model,
+      // Review round 17 (P17-2): only with Features does the CLI write the user of the build.
+      features: cliHasFeatures(config.features),
       devService: compose.service,
       runServices: config.runServices,
       project: compose.project,
@@ -1721,10 +1727,12 @@ export class EnvironmentService {
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
     // Review round 9 (S9-3): only when the configuration is not refused already.
     const ids = isRefused(model) || isRefused(configuration) ? [] : await this.imageIdItems(analysis.imageReferences, ctx.signal);
+    // Review round 17 (P17-3): each list at most MAX_LISTED_ITEMS, each item at most MAX_ITEM_LENGTH characters, after
+    // the merge and without duplicates (a model with hundreds of services would otherwise make a message of megabytes).
     return {
       report: {
-        hostAccess: [...configuration.hostAccess, ...model.hostAccess],
-        unsupported: [...new Set([...configuration.unsupported, ...model.unsupported, ...ids])],
+        hostAccess: capped([...new Set([...configuration.hostAccess, ...model.hostAccess])]),
+        unsupported: capped([...new Set([...configuration.unsupported, ...model.unsupported, ...ids])]),
       },
       references: analysis.references,
     };
@@ -1779,9 +1787,10 @@ export class EnvironmentService {
     }
     // Review round 13 (P13-1): the configuration is refused for them anyway (like the isRefused short-circuit of the
     // callers): no inspect, so that no failure of Docker for another reference hides the refusal.
+    // Review round 17 (P17-3): at most MAX_LISTED_ITEMS items, each at most MAX_ITEM_LENGTH characters (capped).
     if (invalid.length > 0) {
-      this.logger.warn(`Image references that are not valid: ${invalid.join(', ')}.`);
-      return invalid;
+      this.logger.warn(`Image references that are not valid: ${capped(invalid).join(', ')}.`);
+      return capped(invalid);
     }
     const distinct = [...new Set(named.map((entry) => entry.reference))];
     if (distinct.length === 0) return [];
@@ -1809,23 +1818,42 @@ export class EnvironmentService {
     const byId = new Set(imageIdResolvedReferences(distinct.filter((reference) => !transientSet.has(reference)), images));
     // Review round 13 (P13-1): only a definitive answer (`invalid`) becomes an item; a transient one never does.
     const notChecked = new Set(unchecked.filter((entry) => entry.reason === 'invalid').map((entry) => entry.reference));
-    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
+    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${capped([...notChecked]).join(', ')}.`);
     const items = named.flatMap((entry) => [
       ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
       ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
     ]);
     if (transient.length > 0) {
-      const shown = transient.slice(0, 5).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
+      const shown = transient.slice(0, 5).map((reference) => truncated(reference, MAX_ITEM_LENGTH)).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
       // Review round 13 (P13-1): a definitive refusal is not hidden by a failure of Docker for another reference: the
       // configuration is refused for it anyway (and an update refused for it is remembered); the failure is logged.
       if (items.length > 0) {
         this.logger.warn(`Docker could not check the image references ${shown}; the configuration is refused for the others.`);
-        return items;
+        return capped(items);
       }
       // Review round 12 (P12-1): a text of its own (dockerCheckItem), not the one of an analysis that could not run.
       throw new AnalysisFailedError({ kind: 'internal', docker: true, reason: shown });
     }
-    return items;
+    return capped(items);
+  }
+
+  /**
+   * Review round 17 (D17-1): the named volumes of the `mounts` values `mounts` of a Docker Compose configuration
+   * (composeMountVolumes), substituted as the Dev Container CLI substitutes them at `up`: the variables of the workspace
+   * helper (helperCliVariables, as the host access policy resolves them) and the real `${devcontainerId}` of the
+   * environment (environmentDevcontainerId), so that our model declares, and the pipeline creates with the labels of
+   * the environment, the volumes that the CLI writes. A source that is still no key of a Compose volume is logged and
+   * left to the CLI.
+   */
+  private composeMountVolumes(env: Environment, compose: LoadedCompose, mounts: readonly unknown[]): { names: string[]; sources: string[] } {
+    const variables = { ...helperCliVariables(env.repository), devcontainerId: environmentDevcontainerId(env.id) };
+    const { names, sources, skipped } = composeMountVolumes(compose.project, mounts, variables);
+    if (skipped.length > 0) {
+      this.logger.info(
+        `Volumes of mounts of ${env.repository} whose names are not known before the start (${listSome(skipped.map((source) => JSON.stringify(truncated(source, MAX_ITEM_LENGTH))), 20, ', ')}) are left to the Dev Container CLI: they are not declared in the Docker Compose model and not created with the labels of the environment.`,
+      );
+    }
+    return { names, sources };
   }
 
   /** What composeBuildModel and composeUpModel need to know about the environment. */
@@ -2104,7 +2132,8 @@ export class EnvironmentService {
 
     // Review round 16 (Dp): the user of the images of the dev service, which the Dev Container CLI writes as text into its
     // compose file for the build (with Features), after the downloads, before the build.
-    if (loaded.compose !== undefined && hasFeatures(loaded.config)) {
+    // Review round 17 (P17-2): Features as the CLI counts them (cliHasFeatures).
+    if (loaded.compose !== undefined && cliHasFeatures(loaded.config?.features)) {
       try {
         await this.checkComposeBuildImages(ctx, loaded.compose);
       } catch (error) {
@@ -2255,16 +2284,18 @@ export class EnvironmentService {
 
   /**
    * Review round 16 (Dp): with Features, the Dev Container CLI 0.89.0 writes the user of the target stage of the dev
-   * service into its compose file for the build as text (`- _DEV_CONTAINERS_IMAGE_USER=<user>`, function `Dp`): the USER
-   * instruction of the Dockerfile (devBuildTextProblems checks it with the build arguments), or the user of the image of
-   * the stage. So the images of the dev service (composeDevBuildImages) are inspected (downloaded first when they are not
-   * here, as the build would), and a user, or with a USER instruction that uses a variable a variable of the environment,
-   * with a line break is refused (composeBuildImageItems), as is a FROM image whose variables could not be resolved.
-   * Throws a HostAccessError for them.
+   * service into its compose file for the build as text (`- _DEV_CONTAINERS_IMAGE_USER=<user>`, function `Dp`). It
+   * inspects one image for it (review round 17, P17-1: composeDevBuildImages, the root of the chain of the target stage,
+   * as the CLI's `uG`; not the images of other stages), downloaded first when it is not here, as the CLI would. Refused:
+   * a user of that image with a line break (composeBuildImageItems), the user that the CLI computes from the USER
+   * instruction with the build arguments and the environment of that image when it has one (review round 17, P17-2:
+   * composeBuildUserItems), and an image whose variables could not be resolved. Throws a HostAccessError for them.
    */
   private async checkComposeBuildImages(ctx: PipelineContext, compose: LoadedCompose): Promise<void> {
-    const { images, unresolved, userVariables } = composeDevBuildImages(compose.output.model, compose.output.dockerfiles, compose.service);
+    const { model, dockerfiles } = compose.output;
+    const { images, unresolved } = composeDevBuildImages(model, dockerfiles, compose.service);
     const items = unresolved.map((image) => `the image ${image} of the dev service (its variables could not be resolved, so the user that the Dev Container CLI writes into its compose file for the build cannot be checked)`);
+    let imageConfig: unknown;
     for (const image of images) {
       this.throwIfCancelled(ctx.signal);
       let config: unknown;
@@ -2275,10 +2306,13 @@ export class EnvironmentService {
         await this.pull(ctx, image, false, new Set());
         config = await this.imageConfig(image, ctx.signal);
       }
-      items.push(...composeBuildImageItems(image, config, userVariables));
+      items.push(...composeBuildImageItems(image, config));
+      imageConfig = config;
     }
+    if (unresolved.length === 0) items.push(...composeBuildUserItems(model, dockerfiles, compose.service, imageConfig));
     if (items.length === 0) return;
-    const report: HostAccessReport = { hostAccess: [], unsupported: items.map((item) => `service ${compose.service}: ${item}`) };
+    // Review round 17 (P17-3): at most MAX_LISTED_ITEMS, each at most MAX_ITEM_LENGTH characters.
+    const report: HostAccessReport = { hostAccess: [], unsupported: capped(items.map((item) => `service ${compose.service}: ${item}`)) };
     this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);
   }
@@ -2289,7 +2323,7 @@ export class EnvironmentService {
    * builds `<project>-<service>`, which the CLI tags as the environment image), and the project name of the environment.
    */
   private composeBuildOptions(env: Environment, compose: LoadedCompose): { override: Record<string, unknown>; files: HelperFiles; env: Record<string, string> } {
-    const mounts = composeMountVolumes(compose.project, compose.mounts);
+    const mounts = this.composeMountVolumes(env, compose, compose.mounts);
     const build = composeBuildModel(compose.output.model, this.composeParams(env, compose, mounts.sources));
     return {
       override: composeConfigOverride(compose.raw, COMPOSE_MODEL_PATH),
@@ -2784,7 +2818,8 @@ export class EnvironmentService {
       if (creates || this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The metadata of ${image} could not be read: ${errorMessage(error)}`);
     }
-    const mounts = composeMountVolumes(compose.project, [...compose.mounts, ...metadata.map((entry) => (isRecord(entry) ? entry.mounts : undefined))]);
+    // Review round 17 (D17-1): the metadata as written in the label, substituted as the CLI substitutes it at `up`.
+    const mounts = this.composeMountVolumes(env, compose, [...compose.mounts, ...metadata.map((entry) => (isRecord(entry) ? entry.mounts : undefined))]);
     if (creates) {
       const { report } = await this.composeReport(ctx, compose, config ?? {});
       if (isRefused(report)) {
@@ -3103,7 +3138,9 @@ export class EnvironmentService {
    * volumes of other environments of the same owner are recorded (recordedVolumes). An existing volume keeps its labels
    * (Docker does not change them). A name with `${devcontainerId}` is not among them: the Dev Container
    * CLI 0.89.0 resolves it only at `up` (read-configuration substitutes it only for an existing container), so Docker
-   * creates that volume without labels, and it is never the environment's. A volume that cannot be created is logged:
+   * creates that volume without labels, and it is never the environment's (for a single container; the volumes of the
+   * `mounts` of Docker Compose come with the real ID, composeMountVolumes, review round 17, D17-1). A volume that cannot
+   * be created is logged:
    * Docker creates it at `up` without the labels, and Delete keeps it.
    */
   private async createAdditionalVolumes(ctx: PipelineContext, names: readonly string[], labelsOf?: (name: string) => Record<string, string>): Promise<void> {
