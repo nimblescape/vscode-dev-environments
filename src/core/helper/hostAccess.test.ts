@@ -400,7 +400,8 @@ describe('host access policy: the runArgs that Docker gets', () => {
     // Review round 2 (D2-1): changed expectation, the override configuration also sets the labels of Docker Compose empty.
     const tail = [
       '--label',
-      'devenv.container-version=4',
+      // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
+      'devenv.container-version=1',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -496,7 +497,7 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       '--rm',
       '--label',
       // unit 15: changed expectation, the tmpfs of the token, which the check accepts.
-      'devenv.container-version=4',
+      'devenv.container-version=1',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -613,10 +614,10 @@ describe('host access policy: properties of the configuration, the merged config
 
   it('checks the variables in the repository configuration and the image metadata, not in the merged configuration', () => {
     // The merged configuration of a container that the extension created holds the values of its override configuration,
-    // also those of container version 2 (GIT_CONFIG_PARAMETERS, GNUPGHOME, an empty SSH_AUTH_SOCK), whose containers the
-    // pipeline creates again after this check.
-    const version2 = { ...containerEnvironment(), GIT_CONFIG_PARAMETERS: "'credential.helper='", GNUPGHOME: '/workspaces/.devenv+/gnupg' };
-    const merged = { containerEnv: version2, remoteEnv: { ...remoteEnvironment(), ...version2, SSH_AUTH_SOCK: '' } };
+    // also those of an older container setup (here GIT_CONFIG_PARAMETERS, GNUPGHOME, an empty SSH_AUTH_SOCK), whose
+    // containers the pipeline creates again after this check.
+    const olderSetup = { ...containerEnvironment(), GIT_CONFIG_PARAMETERS: "'credential.helper='", GNUPGHOME: '/workspaces/.devenv+/gnupg' };
+    const merged = { containerEnv: olderSetup, remoteEnv: { ...remoteEnvironment(), ...olderSetup, SSH_AUTH_SOCK: '' } };
     expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
     // A Feature or the base image: the values that the extension does not set itself would reach Git.
     const metadata = [{ id: 'feature', containerEnv: { GIT_CONFIG_PARAMETERS: "'credential.helper=store'", GNUPGHOME: '/g' } }, { remoteEnv: { DOCKER_CONFIG: '/d', SSH_AUTH_SOCK: '/a' } }];

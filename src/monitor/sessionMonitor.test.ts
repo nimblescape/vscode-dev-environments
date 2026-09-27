@@ -140,7 +140,8 @@ describe('sessionMonitor bundle', () => {
     expect(readLog(root)).not.toContain('Session Monitor started');
   }, 20_000);
 
-  // Review finding F2 of PR #26: monitor protocol version, and the hand-over from an older monitor.
+  // Monitor protocol version, and the hand-over from an older monitor. Versions reset to 1 (user decision 2026-09-27):
+  // this monitor of version 1 is the one that a window of a future version 2 asks to exit.
   it.skipIf(process.platform === 'win32')(
     'writes its protocol version next to the lock, and ends after its step when a window asks it to exit',
     async () => {
@@ -149,7 +150,7 @@ describe('sessionMonitor bundle', () => {
       const child = start([root]);
       const exit = exitOf(child);
       await waitFor(() => readLog(root).includes('Session Monitor started'));
-      expect(JSON.parse(fs.readFileSync(path.join(root, 'monitor.version'), 'utf8'))).toEqual({ pid: child.pid, version: 2 });
+      expect(JSON.parse(fs.readFileSync(path.join(root, 'monitor.version'), 'utf8'))).toEqual({ pid: child.pid, version: 1 });
       fs.writeFileSync(path.join(root, 'monitor.exit'), JSON.stringify({ pid: child.pid, requestedAt: new Date().toISOString() }));
       expect(await exit).toBe(0);
       expect(readLog(root)).toContain('A window of a newer version asked this Session Monitor to exit.');
@@ -169,7 +170,8 @@ describe('sessionMonitor bundle', () => {
       const olderExit = exitOf(older);
       const lock = path.join(root, 'monitor.lock');
       fs.writeFileSync(lock, `${older.pid}\n`);
-      // Of a known, older version: a request for a monitor without a version is left over (round-2 review of PR #26).
+      // Of a known version (version 1, which a window of a future version 2 retires): a request for a monitor without a
+      // version is left over (round-2 review of PR #26).
       fs.writeFileSync(path.join(root, 'monitor.version'), JSON.stringify({ pid: older.pid, version: 1 }));
       fs.writeFileSync(path.join(root, 'monitor.exit'), JSON.stringify({ pid: older.pid, requestedAt: new Date().toISOString() }));
       const child = start([root]);

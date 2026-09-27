@@ -36,7 +36,7 @@ export const ControllerTexts = {
   /** The window kept its connection after it left an environment that it must not use (for example Cancel on unsaved files). */
   stillConnected: (repository: string) =>
     `This window is still connected to the environment of ${repository}, which it must not use. Save your files: the window closes its connection again.`,
-  /** Concept section 9: a container of an older version uses the Git of the computer. */
+  /** Concept section 9: a container of an older version lacks the current setup. */
   outdatedContainerClosed: (repository: string) =>
     `The container of ${repository} was made by an older version of Dev Environments and cannot be used. This window closes its connection. Start ${repository} again to make a new container.`,
   /**
