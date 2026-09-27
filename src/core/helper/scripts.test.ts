@@ -844,6 +844,55 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     expect(fs.lstatSync(path.join(repo, 'data/PG_VERSION')).uid).toBe(999);
   });
 
+  it('protects the real path of a service path behind a link of the repository too (review round 12, P12-2)', () => {
+    let repoFolder = '';
+    const result = runSwitch({ fetchExit: 0, switchExit: 0 }, (repo) => {
+      repoFolder = repo;
+      // A restored entry: the path as the container of db mounts it (VolumeOptions.Subpath), ./data -> storage/pg.
+      fs.mkdirSync(path.join(repo, 'storage/pg'), { recursive: true });
+      fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+      return [`${repo}/data`];
+    });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Before: only `-path <repo>/data -o -path <repo>/data/*`; find does not follow the link, and the data of Postgres
+    // under storage/pg was given to the owner of the repository.
+    const inPaths = `-path ${repoFolder}/data -o -path ${repoFolder}/data/* -o -path ${repoFolder}/storage/pg -o -path ${repoFolder}/storage/pg/*`;
+    expect(result.log).toContain(`find ${repoFolder} -xdev ( ( ${inPaths} ) -user 0 -o ! ( ${inPaths} ) ( ! -user 1000 -o ! -group 1000 ) ) -exec chown -h 1000:1000`);
+  });
+
+  it.skipIf(process.getuid?.() !== 0)('leaves the data behind a link alone with the real find and chown (review round 12, P12-2)', () => {
+    const dir = tempDir();
+    const bin = path.join(dir, 'bin');
+    const secrets = path.join(dir, 'secrets');
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(secrets);
+    fs.mkdirSync(path.join(repo, 'storage/pg/base'), { recursive: true });
+    fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+    for (const file of ['storage/pg/PG_VERSION', 'storage/pg/base/1']) fs.writeFileSync(path.join(repo, file), '16');
+    fs.chownSync(repo, 1000, 1000);
+    for (const file of ['storage/pg', 'storage/pg/base', 'storage/pg/base/1', 'storage/pg/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    const tool = (name: string, body: string) => {
+      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(bin, name), 0o755);
+    };
+    tool('awk', 'exit 0');
+    tool('stat', 'echo 1000:1000');
+    tool('git', ['while [ "$1" = -c ]; do shift 2; done', 'case "$1" in', `  switch) echo a > '${repo}/storage/readme.md' ;;`, 'esac'].join('\n'));
+    const script = SWITCH_BRANCH_SCRIPT.split(SECRETS_FOLDER).join(secrets);
+    // The restored entry names only the path of the mount (liveServiceFolders), not its real path.
+    const result = spawnSync('sh', ['-c', script, ...switchBranchCommand(repo, 'dev', 'acme/api', [`${repo}/data`]).slice(3)], {
+      encoding: 'utf8',
+      input: 'gho_secret',
+      env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Before: 1000 (the data of Postgres was given to the owner of the repository at each Switch branch…).
+    for (const file of ['storage/pg', 'storage/pg/base', 'storage/pg/base/1', 'storage/pg/PG_VERSION']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(999);
+    for (const file of ['storage', 'storage/readme.md', 'data']) expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(1000);
+  });
+
   it('restores the owner and does not switch when the fetch fails', () => {
     const result = runSwitch({ fetchExit: 128, switchExit: 0 });
     expect(result.status).toBe(1);

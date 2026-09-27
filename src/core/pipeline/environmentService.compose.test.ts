@@ -17,7 +17,7 @@ import {
   type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
-import { ANALYSIS_FAILED_ITEM, analysisInternalItem } from '../helper/configurationAnalysis';
+import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
 import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, servicePathArguments } from '../git/gitSummary';
@@ -2090,7 +2090,9 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
 });
 
 describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a refusal from a failure to check', () => {
-  const INTERNAL = Messages.configurationCheckInternal(analysisInternalItem(`Docker could not inspect the image references ${BASE_IMAGE}, ${DB_IMAGE}`));
+  // Review round 12, P12-1: a text of its own for a check that Docker could not answer (before: the internal error, which
+  // said "reinstall Dev Environments").
+  const INTERNAL = Messages.configurationCheckDocker(dockerCheckItem(`${BASE_IMAGE}, ${DB_IMAGE}`));
 
   /** Makes the `n`th inspectImageNames (counted from 1) fail as `failure`; the others answer. */
   function failInspection(n: number, failure: (references: readonly string[]) => void): void {
@@ -2115,7 +2117,8 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     await h.service.openEnvironment(ENV_ID, options());
     // Before: remembered as a refused update ("needs access to your computer"), and never built again.
     expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
-    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(analysisInternalItem(`Docker could not inspect the image references ${BASE_IMAGE}, ${DB_IMAGE}`))]);
+    // Review round 12, P12-1: dockerCheckItem in place of analysisInternalItem.
+    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(dockerCheckItem(`${BASE_IMAGE}, ${DB_IMAGE}`))]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
     expect(devContainer()?.state).toBe('running');
     // The next open, with Docker healthy again, builds the update again.
@@ -2142,6 +2145,8 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('hostAccess');
     expect(error.message).toBe(INTERNAL);
+    // Review round 12, P12-1: the text of a check that Docker could not answer, without "reinstall".
+    expect(error.message).toBe(`Docker could not check the image references (${BASE_IMAGE}, ${DB_IMAGE}). Check that Docker is running and try again.`);
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
   });
@@ -2358,5 +2363,55 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     expect(checks.length).toBeGreaterThan(1);
     // The record before `up` held DATA and the first 999 earlier paths.
     expect(checks.flatMap((e) => e.command.slice(4))).toHaveLength(MAX_SERVICE_FOLDERS - 1);
+  });
+});
+
+describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev container leaves its other mounts below the repository alone', () => {
+  const PGDATA = `${FOLDER}/.pgdata`;
+
+  /** The arguments after `sh -c <script> sh` of the ownership fixes of the repository folder with `docker exec`. */
+  function fixArguments(): string[][] {
+    return h.docker.execs
+      .filter((e) => e.user === 'root' && e.command[0] === 'sh' && e.command[2].includes('chown') && e.command[4] === FOLDER)
+      .map((e) => e.command.slice(4));
+  }
+
+  it('protects the target of a volume that the dev service shares with db, without recording it', async () => {
+    // pgdata:/workspaces/api/.pgdata in the dev service, pgdata:/var/lib/postgresql/data in db: one local volume, on the
+    // file system of the workspace volume, so `find -xdev` goes into it.
+    useCompose(
+      h,
+      output((m) => {
+        m.services.app.volumes = [...(m.services.app.volumes as unknown[]), { type: 'volume', source: 'pgdata', target: `${PGDATA}/`, volume: {} }];
+      }),
+    );
+    await h.service.open(TARGET, options());
+    // Before: [FOLDER, 'vscode'] alone, and the files of Postgres (uid 999) in the volume were given to vscode.
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [PGDATA])]]);
+    // Not a path of the workspace volume: neither recorded nor named for Delete.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual([]);
+  });
+
+  it('adds the mounts of devcontainer.json (read with docker inspect) after the paths of the services, and falls back to the whole repository when the container cannot be read', async () => {
+    h.helper.containerMounts = [
+      { type: 'volume', volume: 'api-node_modules', target: `${FOLDER}/node_modules` },
+      { type: 'tmpfs', target: `${FOLDER}/tmp` },
+      { type: 'bind', target: '/home/vscode/.ssh' },
+    ];
+    await h.service.open(TARGET, options());
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`, `${FOLDER}/tmp`])]]);
+
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID });
+    useCompose(h);
+    // The inspect after `up` fails.
+    const find = h.docker.findContainer.bind(h.docker);
+    h.docker.findContainer = async (id: string, name: string) => {
+      if (h.helper.ups.length > 0) throw new Error('Cannot connect to the Docker daemon');
+      return find(id, name);
+    };
+    await h.service.open(TARGET, options());
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, 'repository')]]);
   });
 });

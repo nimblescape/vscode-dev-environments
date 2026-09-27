@@ -441,7 +441,9 @@ export function serviceFoldersOf(env: Pick<Environment, 'buildRecord' | 'service
  * environment, for example of `docker compose run`, counts as another service), from their mounts of subpaths of the
  * workspace volume `volumeName` (ContainerInfo.volumeSubpaths): the subpath joined to WORKSPACES_ROOT, where the dev
  * container and the helper mount the volume. As composeUpModel records them: not a read-only mount, and only a path
- * below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them).
+ * below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them). Only the path as
+ * Docker has it, not the real path behind a link of the repository: review round 12 (P12-2), the ownership fixes resolve
+ * the paths in the volume themselves (SERVICE_OWNER_FIX).
  */
 export function liveServiceFolders(
   containers: ReadonlyArray<Pick<ContainerInfo, 'name' | 'labels' | 'volumeSubpaths'>>,
@@ -453,6 +455,25 @@ export function liveServiceFolders(
     .filter((mount) => mount.volume === env.volumeName && !mount.readOnly)
     .map((mount) => path.posix.join(WORKSPACES_ROOT, mount.subpath));
   return serviceFolderPaths(repositoryFolder(env.repository), paths);
+}
+
+/**
+ * Review round 12 (D12-2): the paths of the repository at which the dev container `container` mounts something else than
+ * the workspace volume (a named volume, such as a `node_modules` volume or one that another service shares, an anonymous
+ * volume, a tmpfs, or a bind mount; of the Docker Compose model, of the `mounts` of devcontainer.json, or of runArgs), as
+ * `docker inspect` reads them (ContainerInfo.mountTargets). `find -xdev` stays only out of other file systems, and a
+ * local named volume lies on the file system of the workspace volume: the ownership fix in the dev container leaves
+ * these paths to their owners (only the files of root change: the folder of a new volume that Docker created as root
+ * still gets the remote user). Only paths below the repository folder (serviceFolderPaths filters them).
+ */
+export function devMountFolders(
+  container: Pick<ContainerInfo, 'mountTargets'> | undefined,
+  env: Pick<Environment, 'repository' | 'volumeName'>,
+): string[] {
+  const targets = (container?.mountTargets ?? [])
+    .filter((mount) => !(mount.type === 'volume' && mount.volume === env.volumeName) && mount.target.startsWith('/'))
+    .map((mount) => path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1'));
+  return serviceFolderPaths(repositoryFolder(env.repository), targets);
 }
 
 /**

@@ -42,6 +42,11 @@ export interface AnalysisFailure {
   kind: AnalysisFailureKind;
   /** For the log, for example `it took longer than 10000 ms`. */
   reason: string;
+  /**
+   * Review round 12 (P12-1): with `internal`, Docker could not answer the check of the image references (a timeout, a
+   * daemon that cannot be reached): dockerCheckItem, not analysisInternalItem. It behaves as any `internal` failure.
+   */
+  docker?: boolean;
 }
 
 /** Review round 9 (P9-2): the item of an analysis that could not run (AnalysisFailure `internal`). */
@@ -49,9 +54,15 @@ export function analysisInternalItem(reason: string): string {
   return `The configuration check failed to start (internal error): ${reason}`;
 }
 
-/** The refused item of a failed analysis: ANALYSIS_FAILED_ITEM, or analysisInternalItem. */
+/** Review round 12 (P12-1): the item of a check of the image references that Docker could not answer. */
+export function dockerCheckItem(reason: string): string {
+  return `Docker could not check the image references (${reason})`;
+}
+
+/** The refused item of a failed analysis: ANALYSIS_FAILED_ITEM, analysisInternalItem, or dockerCheckItem. */
 export function analysisFailureItem(failure: AnalysisFailure): string {
-  return failure.kind === 'internal' ? analysisInternalItem(failure.reason) : ANALYSIS_FAILED_ITEM;
+  if (failure.kind !== 'internal') return ANALYSIS_FAILED_ITEM;
+  return failure.docker === true ? dockerCheckItem(failure.reason) : analysisInternalItem(failure.reason);
 }
 
 /** One analysis of the host access policy. */

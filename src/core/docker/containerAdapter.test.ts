@@ -794,6 +794,26 @@ describe('images', () => {
       expect(runner.calls).toHaveLength(6);
     });
 
+    it('takes the answers of go-digest and of the length of a name for answers about the reference (review round 12, P12-1)', async () => {
+      const upper = `alpine@sha256:${'A'.repeat(64)}`;
+      const short = `alpine@sha256:${'a'.repeat(40)}`;
+      const md5 = `alpine@md5:${'a'.repeat(32)}`;
+      const long = `${'a'.repeat(250)}:1`;
+      const { docker } = adapter(
+        daemon({
+          [upper]: 'Error response from daemon: invalid checksum digest format',
+          [short]: 'Error response from daemon: invalid checksum digest length',
+          [md5]: 'Error response from daemon: unsupported digest algorithm',
+          [long]: 'Error response from daemon: invalid reference format: repository name (library/aaa…) must not be more than 255 characters',
+        }),
+      );
+      const result = await docker.inspectImageNames([upper, short, md5, long, 'postgres:16']);
+      // Before: transient, and the open failed with the internal error ("reinstall Dev Environments") at each attempt.
+      expect(unchecked(result)).toEqual([`${upper} invalid`, `${short} invalid`, `${md5} invalid`, `${long} invalid`]);
+      const single = adapter(daemon({ 'x:1': 'Error response from daemon: repository name must not be more than 255 characters' }));
+      expect(unchecked(await single.docker.inspectImageNames(['x:1']))).toEqual(['x:1 invalid']);
+    });
+
     it('asks no more after a daemon error of a batch, and names every reference transient', async () => {
       const references = Array.from({ length: 250 }, (_, i) => `r${i}:1`);
       const { docker, runner } = adapter(daemon({ 'r0:1': 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?' }));
@@ -1279,6 +1299,29 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
     expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
       ['ps', '-a'],
       ['container', 'inspect'],
+    ]);
+  });
+
+  it('reads the targets of the mounts of a container (review round 12, D12-2)', async () => {
+    const dev = {
+      ...containerJson({ id: 'dev1', name: 'acme-api-3f2a9c1e', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      HostConfig: { Tmpfs: { '/workspaces/api/tmp': 'rw' } },
+      Mounts: [
+        { Type: 'volume', Name: 'acme-api-3f2a9c1e', Source: '/var/lib/docker/volumes/acme-api-3f2a9c1e/_data', Destination: '/workspaces', RW: true },
+        { Type: 'volume', Name: 'devenv-3f2a9c1e_pgdata', Source: '/var/lib/docker/volumes/devenv-3f2a9c1e_pgdata/_data', Destination: '/workspaces/api/.pgdata', RW: true },
+        { Type: 'bind', Source: '/home/me/.ssh', Destination: '/home/vscode/.ssh', RW: false },
+        { Type: 'tmpfs', Destination: '/run/x' },
+        { Type: 'volume', Name: 'broken' },
+      ],
+    };
+    const { docker } = adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['dev1'])) : ok(inspectOutput([dev]))));
+    const [container] = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(container.mountTargets).toEqual([
+      { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+      { type: 'volume', volume: 'devenv-3f2a9c1e_pgdata', target: '/workspaces/api/.pgdata' },
+      { type: 'bind', target: '/home/vscode/.ssh' },
+      { type: 'tmpfs', target: '/run/x' },
+      { type: 'tmpfs', target: '/workspaces/api/tmp' },
     ]);
   });
 

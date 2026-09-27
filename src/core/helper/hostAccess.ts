@@ -986,10 +986,59 @@ export function imageUncheckedItem(reference: string, what = 'image'): string {
  * Review round 11 (G2): whether `reference` follows Docker's reference grammar (github.com/distribution/reference, as
  * parseImageReference reads it: lowercase path components, the separators `.`, `_`, `__`, and `-`, a tag of at most 128
  * characters, a digest), written without surrounding whitespace. Conservative: a reference that the grammar rejects is
- * never accepted, whatever Docker would make of it.
+ * never accepted, whatever Docker would make of it. Review round 12 (P12-1): also the rules of go-digest for the digest
+ * (isValidDigest), and the bound of 255 characters on the normalized name (normalizedImageName), as Docker checks them.
  */
 export function isValidImageReference(reference: string): boolean {
-  return reference === reference.trim() && parseImageReference(reference) !== undefined;
+  if (reference !== reference.trim() || parseImageReference(reference) === undefined) return false;
+  // Review round 12 (P12-1): what Docker checks beyond the grammar of parseImageReference (which other callers use).
+  const at = reference.indexOf('@');
+  if (at >= 0 && !isValidDigest(reference.slice(at + 1))) return false;
+  let name = at >= 0 ? reference.slice(0, at) : reference;
+  const colon = name.lastIndexOf(':');
+  if (colon > name.lastIndexOf('/')) name = name.slice(0, colon);
+  return normalizedImageName(name).length <= IMAGE_NAME_MAX_LENGTH;
+}
+
+/** Review round 12 (P12-1): the most characters of the normalized name of an image (distribution/reference). */
+const IMAGE_NAME_MAX_LENGTH = 255;
+
+/**
+ * Review round 12 (P12-1): the digest algorithms that Docker accepts (go-digest, with the lengths of their lowercase hex
+ * encodings): any other algorithm, length, or uppercase hex is refused ("unsupported digest algorithm", "invalid checksum
+ * digest length", "invalid checksum digest format").
+ */
+const DIGEST_HEX_LENGTHS: ReadonlyMap<string, number> = new Map([
+  ['sha256', 64],
+  ['sha384', 96],
+  ['sha512', 128],
+]);
+
+function isValidDigest(digest: string): boolean {
+  const colon = digest.indexOf(':');
+  const length = colon > 0 ? DIGEST_HEX_LENGTHS.get(digest.slice(0, colon)) : undefined;
+  const hex = digest.slice(colon + 1);
+  return length !== undefined && hex.length === length && /^[0-9a-f]+$/.test(hex);
+}
+
+/**
+ * Review round 12 (P12-1): the name of an image reference (without tag and digest) as Docker normalizes it before it
+ * checks its length (distribution/reference ParseNormalizedNamed): a name without a registry, or on `docker.io` or
+ * `index.docker.io`, becomes `docker.io/<path>`, with `library/` before a path of one component.
+ */
+function normalizedImageName(name: string): string {
+  const slash = name.indexOf('/');
+  let domain: string | undefined;
+  let path = name;
+  if (slash > 0) {
+    const first = name.slice(0, slash);
+    if (/[.:]/.test(first) || first === 'localhost' || first !== first.toLowerCase()) {
+      domain = first;
+      path = name.slice(slash + 1);
+    }
+  }
+  if (domain !== undefined && domain !== 'docker.io' && domain !== 'index.docker.io') return `${domain}/${path}`;
+  return `docker.io/${path.includes('/') ? path : `library/${path}`}`;
 }
 
 /** Review round 11 (G2): the item of an image reference that is not valid in Docker's grammar: not supported. */

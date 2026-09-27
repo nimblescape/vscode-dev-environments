@@ -45,6 +45,21 @@ export interface ContainerInfo {
    * repository files that the pipeline rewrote to the workspace volume.
    */
   volumeSubpaths?: VolumeSubpathMount[];
+  /**
+   * Review round 12 (D12-2): the targets of the mounts of the container in it (`Mounts`: volumes, bind mounts, tmpfs;
+   * and the tmpfs of `HostConfig.Tmpfs`), for the ownership fix in the dev container (devMountFolders).
+   */
+  mountTargets?: MountTarget[];
+}
+
+/** Review round 12 (D12-2): a mount of a container (ContainerInfo.mountTargets). */
+export interface MountTarget {
+  /** `volume`, `bind`, `tmpfs`, … */
+  type: string;
+  /** The name of a named volume. */
+  volume?: string;
+  /** The path in the container (`Destination`). */
+  target: string;
 }
 
 /** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
@@ -177,9 +192,12 @@ export interface ImageInspection {
  * Review round 11 (G1): the errors of `docker image inspect` about a reference itself, matched loosely: an invalid
  * reference ("invalid reference format", "repository name must be lowercase", "invalid tag format"), and an ID prefix
  * that matches several images (the classic image store: "multiple IDs found with provided prefix"; the containerd image
- * store: "ambiguous reference", "ambiguous image", "multiple images match").
+ * store: "ambiguous reference", "ambiguous image", "multiple images match"). Review round 12 (P12-1): also the errors
+ * of go-digest ("invalid checksum digest format", "invalid checksum digest length", "unsupported digest algorithm") and
+ * of the length of a name ("repository name must not be more than 255 characters").
  */
-const IMAGE_REFERENCE_ERROR = /invalid reference|reference format|must be lowercase|invalid (repository|tag|digest|image)|ambiguous|multiple (ids|images|digests|matches)|matches multiple|more than one/i;
+const IMAGE_REFERENCE_ERROR =
+  /invalid reference|reference format|must be lowercase|invalid (repository|tag|digest|image)|checksum digest|digest algorithm|must not be more than|ambiguous|multiple (ids|images|digests|matches)|matches multiple|more than one/i;
 
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
 export function parseJsonLines(stdout: string): unknown[] {
@@ -259,8 +277,21 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
       ...(Array.isArray(value.Mounts) ? value.Mounts : []),
       ...(isRecord(value.HostConfig) && Array.isArray(value.HostConfig.Mounts) ? value.HostConfig.Mounts : []),
     ]),
+    mountTargets: mountTargets(value.Mounts, isRecord(value.HostConfig) ? value.HostConfig.Tmpfs : undefined),
     created: typeof value.Created === 'string' ? value.Created : '',
   };
+}
+
+/** Review round 12 (D12-2): the mounts of `docker container inspect` with their targets (ContainerInfo.mountTargets). */
+function mountTargets(mounts: unknown, tmpfs: unknown): MountTarget[] {
+  const result: MountTarget[] = [];
+  for (const mount of Array.isArray(mounts) ? mounts : []) {
+    if (!isRecord(mount) || typeof mount.Destination !== 'string' || mount.Destination === '' || typeof mount.Type !== 'string') continue;
+    const volume = mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : undefined;
+    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination });
+  }
+  if (isRecord(tmpfs)) for (const target of Object.keys(tmpfs)) if (target !== '') result.push({ type: 'tmpfs', target });
+  return result;
 }
 
 function mountedVolumes(mounts: unknown): string[] {
@@ -308,7 +339,7 @@ export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths } = container;
+  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths, mountTargets } = container;
   return {
     id,
     name,
@@ -318,6 +349,7 @@ function publicInfo(container: InspectedContainer): ContainerInfo {
     image,
     ...(volumes && volumes.length > 0 ? { volumes } : {}),
     ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
+    ...(mountTargets && mountTargets.length > 0 ? { mountTargets } : {}),
   };
 }
 

@@ -86,6 +86,12 @@ export const Messages = {
    */
   configurationCheckInternal: (item: string) => `${item}. Try again; if it fails again, reinstall Dev Environments.`,
   /**
+   * Review round 12 (P12-1): Docker could not answer the check of the image references (a timeout, a daemon that cannot
+   * be reached): no fault of the configuration, nor of the installation. The item is dockerCheckItem of
+   * helper/configurationAnalysis.ts.
+   */
+  configurationCheckDocker: (item: string) => `${item}. Check that Docker is running and try again.`,
+  /**
    * Review round 9 (P9-1): the check of the new environment image of an update failed (not a refusal of the policy): the
    * old one starts, and the next open tries the update again. The item says why (ANALYSIS_FAILED_ITEM or
    * analysisInternalItem).

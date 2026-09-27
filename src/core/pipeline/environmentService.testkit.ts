@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
-import { isDevContainer, type ContainerInfo, type ImageInspection, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { isDevContainer, type ContainerInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -463,6 +463,11 @@ export class FakeHelper implements EnvironmentHelper {
   switchError: Maybe<Error>;
   /** Named volumes that a container created by `up` mounts besides the workspace volume. */
   containerVolumes: string[] = [];
+  /**
+   * Review round 12 (D12-2): the mounts of the dev container that `up` creates, as `docker inspect` reads them
+   * (ContainerInfo.mountTargets). For Docker Compose, the volumes of the dev service of the model come first.
+   */
+  containerMounts: MountTarget[] = [];
   prepareGitError: Maybe<Error>;
   /** More entries of the label devcontainer.metadata of a built image (for example of a Feature). */
   buildMetadata: Array<Record<string, unknown>> = [];
@@ -704,6 +709,9 @@ export class FakeHelper implements EnvironmentHelper {
       });
       const created = this.docker.addContainer({ environmentId: p.environmentId, name, state: 'running', image, labels });
       if (this.containerVolumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes: [p.volumeName, ...this.containerVolumes] });
+      if (this.containerMounts.length > 0) {
+        this.docker.containers.set(created.id, { ...(this.docker.containers.get(created.id) ?? created), mountTargets: [...this.containerMounts] });
+      }
       containerId = created.id;
     }
     const failure = this.lifecycleFailure(image);
@@ -801,6 +809,16 @@ export class FakeHelper implements EnvironmentHelper {
     } else {
       const volumes = [...volumeNames(dev.volumes), ...this.containerVolumes];
       containerId = create(service, String(dev.container_name), image, dev.labels, volumes).id;
+      // Review round 12 (D12-2): the mounts of the dev service, as `docker inspect` reads them.
+      const mountTargets: MountTarget[] = [
+        ...(Array.isArray(dev.volumes) ? dev.volumes : []).flatMap((entry: { type?: string; source?: string; target?: string }) => {
+          if (typeof entry.target !== 'string' || typeof entry.type !== 'string') return [];
+          const name = entry.type === 'volume' && entry.source ? (entry.source === WORKSPACE_VOLUME_KEY ? p.volumeName : model.volumes?.[entry.source]?.name) : undefined;
+          return [{ type: entry.type, ...(typeof name === 'string' ? { volume: name } : {}), target: entry.target }];
+        }),
+        ...this.containerMounts,
+      ];
+      if (mountTargets.length > 0) this.docker.containers.set(containerId, { ...this.docker.containers.get(containerId)!, mountTargets });
     }
     const runServices = Array.isArray(p.override.runServices) ? (p.override.runServices as string[]) : Object.keys(model.services);
     for (const name of runServices) {

@@ -17,6 +17,7 @@ import {
   errorDetail,
   configRemoteUser,
   containerUserName,
+  devMountFolders,
   imageRemoteUser,
   imagesToPull,
   isComposeContainer,
@@ -516,5 +517,33 @@ describe('Docker Compose rules (unit 6)', () => {
         [{ source: 'cache', target: '/other', type: 'volume' }],
       ]),
     ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'] });
+  });
+});
+
+describe('devMountFolders (review round 12, D12-2)', () => {
+  const env = { repository: 'acme/api', volumeName: 'acme-api-3f2a9c1e' };
+  it('names the targets below the repository of every mount but the workspace volume', () => {
+    expect(
+      devMountFolders(
+        {
+          mountTargets: [
+            { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+            { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces/api/src' },
+            { type: 'volume', volume: 'node_modules', target: '/workspaces/api/node_modules/' },
+            { type: 'volume', target: '/workspaces/api/.cache//x' },
+            { type: 'tmpfs', target: '/workspaces/api/tmp' },
+            { type: 'bind', target: '/workspaces/api/node_modules/sub' },
+            { type: 'bind', target: '/workspaces/api' },
+            { type: 'bind', target: '/workspaces/api/../other' },
+            { type: 'volume', volume: 'x', target: '/workspaces/api/.git/x' },
+            { type: 'volume', volume: 'y', target: 'relative' },
+            { type: 'bind', target: '/home/vscode' },
+          ],
+        },
+        env,
+      ),
+    ).toEqual(['/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp']);
+    expect(devMountFolders(undefined, env)).toEqual([]);
+    expect(devMountFolders({}, env)).toEqual([]);
   });
 });

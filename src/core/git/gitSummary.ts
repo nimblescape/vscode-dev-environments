@@ -47,6 +47,12 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
 `;
 
 /**
+ * Review round 12 (P12-2): the most real paths that service_owner_fix adds for paths of the services behind a link;
+ * beyond it, the whole repository counts as a path of the services.
+ */
+export const MAX_SERVICE_REAL_PATHS = 64;
+
+/**
  * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner> <find arguments…>` of the
  * ownership fixes: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each file that does
  * not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount (the test "in a path of
@@ -55,6 +61,14 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
  * Postgres, uid 999) keeps its owner. A service that runs as root keeps its access to files of another owner (unless its
  * capabilities are dropped). Review round 11 (G5): the arguments come ready from servicePathArguments (built in linear
  * time), in place of the shell loop of round 9 that rebuilt `"$@"` for each pattern (quadratic: 5000 paths took 51 s).
+ *
+ * Review round 12 (P12-2): `find` does not follow links, so a path of a service behind a link of the repository (a mount
+ * of `./data`, where `data -> storage/pg`) would not protect its data under the real path. So each path of the test (the
+ * argument after `-path` that is not a `<path>/*` pattern) is resolved in the volume (`cd -P`, a builtin, for a folder;
+ * `readlink -f` otherwise), and a real path that differs, lies in the folder (not the folder itself, not in `.git`), is
+ * added to the test too: both paths are protected. The paths stay arguments (no shell text is built from them). A path
+ * with a character that `-path` reads as a pattern (then written with `\`), a real path with one, or more than
+ * MAX_SERVICE_REAL_PATHS real paths: the whole folder counts as a path of the services (only the files of root change).
  */
 export const SERVICE_OWNER_FIX = `service_owner_fix() {
   folder="$1"
@@ -62,7 +76,49 @@ export const SERVICE_OWNER_FIX = `service_owner_fix() {
   fix_gid="$3"
   fix_owner="$4"
   shift 4
-  if [ "$#" -gt 0 ]; then
+  whole=''
+  added=0
+  here=$PWD
+  previous=''
+  for arg do
+    if [ "$previous" = '-path' ]; then
+      case $arg in
+        */\\*) ;;
+        *\\\\*) whole=1 ;;
+        *)
+          real=''
+          if [ -d "$arg" ]; then
+            if cd -P "$arg" 2>/dev/null; then real=$PWD; fi
+          elif [ -e "$arg" ] || [ -L "$arg" ]; then
+            real=$(readlink -f "$arg" 2>/dev/null) || real=''
+          fi
+          if [ -n "$real" ] && [ "$real" != "$arg" ]; then
+            case $real in
+              "$folder"/*)
+                case "/\${real#"$folder"/}/" in
+                  */.git/*) ;;
+                  *[[\\\\*?]*) whole=1 ;;
+                  *)
+                    if [ "$added" -ge ${MAX_SERVICE_REAL_PATHS} ]; then
+                      whole=1
+                    else
+                      set -- "$@" -o -path "$real" -o -path "$real/*"
+                      added=$((added + 1))
+                    fi
+                    ;;
+                esac
+                ;;
+            esac
+          fi
+          ;;
+      esac
+    fi
+    previous=$arg
+  done
+  cd "$here" 2>/dev/null || :
+  if [ -n "$whole" ]; then
+    find "$folder" -xdev -user 0 -exec chown -h "$fix_owner" {} +
+  elif [ "$#" -gt 0 ]; then
     find "$folder" -xdev \\( \\( "$@" \\) -user 0 -o ! \\( "$@" \\) \\( ! -user "$fix_uid" -o ! -group "$fix_gid" \\) \\) -exec chown -h "$fix_owner" {} +
   else
     find "$folder" -xdev \\( ! -user "$fix_uid" -o ! -group "$fix_gid" \\) -exec chown -h "$fix_owner" {} +
@@ -95,29 +151,89 @@ export const MAX_SERVICE_ARGUMENT_CHARACTERS = process.platform === 'win32' ? 24
 export type ServiceFolders = readonly string[] | 'repository';
 
 /**
+ * Review round 12 (S12-1): the longest path of the services (in characters) and the most segments below the repository
+ * folder of one path that the ownership fixes name one by one. A longer or deeper path counts as overflow (like more than
+ * MAX_SERVICE_FOLDERS paths): the whole repository counts as a path of the services, so its data never loses its owner.
+ */
+export const MAX_SERVICE_PATH_LENGTH = 4096;
+export const MAX_SERVICE_PATH_DEPTH = 256;
+
+/** Review round 12 (S12-1): a path of serviceFolderPaths over MAX_SERVICE_PATH_LENGTH or MAX_SERVICE_PATH_DEPTH. */
+export function isOverlongServicePath(repoFolder: string, folder: string): boolean {
+  if (folder.length > MAX_SERVICE_PATH_LENGTH) return true;
+  let depth = 1;
+  for (let i = folder.indexOf('/', repoFolder.length + 1); i !== -1; i = folder.indexOf('/', i + 1)) {
+    if (++depth > MAX_SERVICE_PATH_DEPTH) return true;
+  }
+  return false;
+}
+
+interface PathNode {
+  children?: Map<string, PathNode>;
+  terminal?: boolean;
+}
+
+/**
  * Review round 9 (D9-1): of `folders`, the paths of the repository that the other services of Docker Compose mount
  * (Environment.serviceFolders), which the ownership fixes leave out with their content: a service such as a database
  * gives its data files its own owner, and would not start with others. Only absolute paths below `repoFolder` (never the
  * folder itself, which would leave out everything); review round 10 (D10-3): never `.git` or a path in it (also of a
  * record written before), where Git writes as root. Review round 11 (G5): without duplicates, and without a path below
- * another path of the list (its test `-path <path>/*` covers it). In the order of `folders`; linear in their length.
+ * another path of the list (its test `-path <path>/*` covers it). In the order of `folders`. Review round 12 (S12-1):
+ * linear in the total length of the paths (a tree of their segments, in place of a lookup of each ancestor); a path over
+ * MAX_SERVICE_PATH_LENGTH or MAX_SERVICE_PATH_DEPTH (isOverlongServicePath) stays in the list unless a path of the list
+ * covers it, and makes the callers treat the list as overflow (boundServiceFolders, servicePathArguments).
  */
 export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined): string[] {
-  const valid: string[] = [];
+  // Segments without a place in the list: empty, `.`, `..`, `.git`.
+  const invalidSegment = /(?:^|\/)(?:|\.|\.\.|\.git)(?:\/|$)/;
+  const valid: Array<{ folder: string; segments: string[] | undefined }> = [];
   const seen = new Set<string>();
   for (const folder of folders ?? []) {
     if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`) || seen.has(folder)) continue;
-    const segments = folder.slice(repoFolder.length + 1).split('/');
-    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' || segment === '.git')) continue;
+    const relative = folder.slice(repoFolder.length + 1);
+    if (invalidSegment.test(relative)) continue;
     seen.add(folder);
-    valid.push(folder);
+    // A path over the bounds is not split: it never covers another one (it is never an ancestor of one within the
+    // bounds, and the callers treat the list as overflow anyway), so only the paths within the bounds go into the tree.
+    valid.push({ folder, segments: isOverlongServicePath(repoFolder, folder) ? undefined : relative.split('/') });
   }
-  return valid.filter((folder) => {
-    for (let slash = folder.lastIndexOf('/'); slash > repoFolder.length; slash = folder.lastIndexOf('/', slash - 1)) {
-      if (seen.has(folder.slice(0, slash))) return false;
+  const root: PathNode = {};
+  for (const { segments } of valid) {
+    if (segments === undefined) continue;
+    let node = root;
+    for (const segment of segments) {
+      node.children ??= new Map();
+      let child = node.children.get(segment);
+      if (child === undefined) node.children.set(segment, (child = {}));
+      node = child;
     }
-    return true;
-  });
+    node.terminal = true;
+  }
+  // Whether a path of the list is an ancestor of `folder`: a walk down the tree along its segments (for a path over the
+  // bounds, one segment at a time from the string, at most MAX_SERVICE_PATH_DEPTH of them).
+  const covered = ({ folder, segments }: { folder: string; segments: string[] | undefined }): boolean => {
+    let node: PathNode | undefined = root;
+    if (segments !== undefined) {
+      for (let i = 0; i < segments.length - 1; i++) {
+        node = node.children?.get(segments[i]);
+        if (node === undefined) return false;
+        if (node.terminal) return true;
+      }
+      return false;
+    }
+    let start = repoFolder.length + 1;
+    for (let depth = 0; depth < MAX_SERVICE_PATH_DEPTH; depth++) {
+      const end = folder.indexOf('/', start);
+      if (end === -1) return false;
+      node = node.children?.get(folder.slice(start, end));
+      if (node === undefined) return false;
+      if (node.terminal) return true;
+      start = end + 1;
+    }
+    return false;
+  };
+  return valid.filter((entry) => !covered(entry)).map((entry) => entry.folder);
 }
 
 /**
@@ -140,7 +256,12 @@ export function boundServiceFolders(
   overflow = false,
 ): { folders: string[]; overflow: boolean } {
   const paths = serviceFolderPaths(repoFolder, groups.flatMap((group) => group ?? []));
-  return { folders: paths.slice(0, MAX_SERVICE_FOLDERS), overflow: overflow || paths.length > MAX_SERVICE_FOLDERS };
+  // Review round 12 (S12-1): a path over the bounds is overflow; it is not recorded (the recorded overflow covers it).
+  const within = paths.filter((path) => !isOverlongServicePath(repoFolder, path));
+  return {
+    folders: within.slice(0, MAX_SERVICE_FOLDERS),
+    overflow: overflow || within.length > MAX_SERVICE_FOLDERS || within.length < paths.length,
+  };
 }
 
 /** Escapes the characters that `find -path` reads as a pattern (`*`, `?`, `[`, `\`), so a pattern matches only its path. */
@@ -151,15 +272,16 @@ function findPathPattern(path: string): string {
 /**
  * Review round 9 (D9-1), round 11 (G5): the arguments of `find` of the test "in a path of a service" for
  * service_owner_fix, `-path <pattern> -o -path <pattern>/* -o …` (without parentheses; none without paths), each pattern
- * one argument (never shell text), built in linear time. With `'repository'`, more than MAX_SERVICE_FOLDERS paths, or
- * more than MAX_SERVICE_ARGUMENT_CHARACTERS characters: the test of the whole repository folder, so that only the files
+ * one argument (never shell text), built in linear time. With `'repository'`, more than MAX_SERVICE_FOLDERS paths, a
+ * path over the bounds of isOverlongServicePath (review round 12, S12-1), or more than MAX_SERVICE_ARGUMENT_CHARACTERS
+ * characters: the test of the whole repository folder, so that only the files
  * of root get their owner.
  */
 export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined): string[] {
   const whole = () => ['-path', findPathPattern(repoFolder), '-o', '-path', `${findPathPattern(repoFolder)}/*`];
   if (folders === 'repository') return whole();
   const paths = serviceFolderPaths(repoFolder, folders);
-  if (paths.length > MAX_SERVICE_FOLDERS) return whole();
+  if (paths.length > MAX_SERVICE_FOLDERS || paths.some((path) => isOverlongServicePath(repoFolder, path))) return whole();
   const args: string[] = [];
   let characters = 0;
   for (const path of paths) {
@@ -193,10 +315,13 @@ export function parseExistingPaths(stdout: string): string[] {
 
 /**
  * Changes the owner of every file in `$1` that does not belong to the user `$2` (and its primary group) to that user.
- * `chown -h` changes a symbolic link itself, never its target, and `-xdev` stays out of other mounts, so that no file
- * outside of the workspace volume changes. Review round 9 (D9-1): the paths of the test `$3`… (servicePathArguments)
- * and their content are left out; review round 10 (D10-3): except their files and folders of root (SERVICE_OWNER_FIX).
- * Works with GNU and BusyBox tools.
+ * `chown -h` changes a symbolic link itself, never its target, and `-xdev` stays out of other file systems (a bind mount
+ * of the computer, a tmpfs). Review round 12 (D12-2): not out of a local named volume that the dev container mounts
+ * below `$1`, which lies on the file system of the workspace volume: the fix after `up` passes such mounts as paths of
+ * the test (EnvironmentService.withDevMountFolders, devMountFolders). Review round 9 (D9-1): the paths of the test
+ * `$3`… (servicePathArguments) and their content are left out; review round 10 (D10-3): except their files and folders
+ * of root (SERVICE_OWNER_FIX); review round 12 (P12-2): also their real paths behind links. Works with GNU and BusyBox
+ * tools.
  */
 export const OWNERSHIP_FIX_SCRIPT = `set -eu
 dir="$1"

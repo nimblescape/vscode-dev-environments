@@ -26,6 +26,7 @@ import {
   resolvedByImageId,
   imageIdResolvedReferences,
   isHelperPath,
+  isValidImageReference,
   isLoopbackAddress,
   isOwnVolume,
   isSameOwnerAdditionalVolume,
@@ -1316,5 +1317,59 @@ describe('imageIdResolvedReferences (review round 9, S9-3)', () => {
     // A hexadecimal name that is a tag of an image is its name.
     expect(imageIdResolvedReferences(['a1b2c3'], [{ id: ID, repoTags: ['a1b2c3:latest'], repoDigests: [] }])).toEqual([]);
     expect(imageIdResolvedReferences(['a1b2c3'], [])).toEqual([]);
+  });
+});
+
+describe('isValidImageReference (review round 12, P12-1): the digest rules of go-digest and the length of the normalized name', () => {
+  it('accepts the digests of sha256, sha384, and sha512 in lowercase hex of their length', () => {
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(64)}`)).toBe(true);
+    expect(isValidImageReference(`alpine@sha384:${'b'.repeat(96)}`)).toBe(true);
+    expect(isValidImageReference(`alpine:3@sha512:${'0'.repeat(128)}`)).toBe(true);
+    expect(isValidImageReference(`ghcr.io/o/r@sha256:${'f'.repeat(64)}`)).toBe(true);
+  });
+
+  it('refuses another algorithm, another length, or uppercase hex', () => {
+    // Before: accepted by the grammar, and Docker's answer counted as transient (the internal error at every open).
+    expect(isValidImageReference(`alpine@sha256:${'A'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(63)}A`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(40)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(65)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha384:${'a'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha512:${'a'.repeat(96)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha1:${'a'.repeat(40)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@md5:${'a'.repeat(32)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@SHA256:${'a'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256+b64:${'a'.repeat(64)}`)).toBe(false);
+  });
+
+  it('applies the bound of 255 characters to the normalized name (docker.io/library/<name> on Docker Hub)', () => {
+    // docker.io/library/ has 18 characters: 237 characters of name are 255 in all.
+    expect(isValidImageReference('a'.repeat(237))).toBe(true);
+    expect(isValidImageReference(`${'a'.repeat(237)}:tag`)).toBe(true);
+    // Before: accepted (the grammar bounds the name as written, 238 characters).
+    expect(isValidImageReference('a'.repeat(238))).toBe(false);
+    expect(isValidImageReference(`${'a'.repeat(238)}:1@sha256:${'a'.repeat(64)}`)).toBe(false);
+    // docker.io/<path>, without library/, for a path of two components; index.docker.io becomes docker.io.
+    expect(isValidImageReference(`o/${'a'.repeat(243)}`)).toBe(true);
+    expect(isValidImageReference(`o/${'a'.repeat(244)}`)).toBe(false);
+    expect(isValidImageReference(`index.docker.io/o/${'a'.repeat(200)}`)).toBe(true);
+    expect(isValidImageReference(`index.docker.io/${'a'.repeat(237)}`)).toBe(true);
+    expect(isValidImageReference(`index.docker.io/${'a'.repeat(238)}`)).toBe(false);
+    expect(isValidImageReference(`docker.io/${'a'.repeat(238)}`)).toBe(false);
+    // Another registry: the name as written.
+    expect(isValidImageReference(`ghcr.io/${'a'.repeat(247)}`)).toBe(true);
+    expect(isValidImageReference(`ghcr.io/${'a'.repeat(248)}`)).toBe(false);
+  });
+
+  it('still accepts the references of real configurations', () => {
+    for (const reference of [
+      'localhost:5000/foo/bar:v1',
+      '[::1]:5000/foo',
+      'Registry.Example.com:443/a__b/c-d--e:TAG_1.x',
+      'mcr.microsoft.com/devcontainers/typescript-node:1-20-bookworm',
+      'postgres:16',
+    ]) {
+      expect([reference, isValidImageReference(reference)]).toEqual([reference, true]);
+    }
   });
 });

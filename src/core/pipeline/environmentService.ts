@@ -152,6 +152,7 @@ import {
   composeMountVolumes,
   composeRecordOf,
   serviceFoldersOf,
+  devMountFolders,
   liveServiceFolders,
   repositoryServiceDataFolders,
   configHash,
@@ -775,10 +776,17 @@ class HostAccessError extends UserFacingError {
 class AnalysisFailedError extends HostAccessError {
   constructor(readonly failure: AnalysisFailure) {
     const item = analysisFailureItem(failure);
-    super({ hostAccess: [], unsupported: [item] }, failure.kind === 'internal' ? Messages.configurationCheckInternal(item) : Messages.configurationTooComplex(item));
+    super(
+      { hostAccess: [], unsupported: [item] },
+      failure.kind !== 'internal'
+        ? Messages.configurationTooComplex(item)
+        : failure.docker === true
+          ? Messages.configurationCheckDocker(item)
+          : Messages.configurationCheckInternal(item),
+    );
   }
 
-  /** The text for the user: ANALYSIS_FAILED_ITEM, or analysisInternalItem. */
+  /** The text for the user: ANALYSIS_FAILED_ITEM, analysisInternalItem, or dockerCheckItem. */
   get item(): string {
     return analysisFailureItem(this.failure);
   }
@@ -1763,7 +1771,8 @@ export class EnvironmentService {
     const transient = unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference);
     if (transient.length > 0) {
       const shown = transient.slice(0, 5).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
-      throw new AnalysisFailedError({ kind: 'internal', reason: `Docker could not inspect the image references ${shown}` });
+      // Review round 12 (P12-1): a text of its own (dockerCheckItem), not the one of an analysis that could not run.
+      throw new AnalysisFailedError({ kind: 'internal', docker: true, reason: shown });
     }
     const byId = new Set(imageIdResolvedReferences(distinct, images));
     const notChecked = new Set(unchecked.map((entry) => entry.reference));
@@ -3364,8 +3373,9 @@ export class EnvironmentService {
     // Review round 11 (G3, G4, G5): the paths of the services from facts, written back after each `up`.
     const serviceFolders = await this.refreshServiceFolders(ctx, containerRef, loaded);
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
-      // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner).
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser, serviceFolders);
+      // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner). Review
+      // round 12 (D12-2): nor the paths where the dev container mounts other volumes.
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, await this.withDevMountFolders(ctx, containerName, serviceFolders));
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
       // is still root when the ownership fix before `up` did not run or failed.
       await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
@@ -3413,7 +3423,13 @@ export class EnvironmentService {
       if (isRootUser(user)) return;
       this.logger.info(`Giving the files in ${folder} to ${user} before the container is created.`);
       // Review round 9 (D9-1): after a new clone, no service has run on the files yet: every file gets its owner (also the
-      // source folders that a service mounts). After a resumed clone, the paths of the services are left out.
+      // source folders that a service mounts). After a resumed clone, the paths of the services are left out. Review
+      // round 12 (D12-1): on the path of a single container, runComposeUp has not computed them: from the facts
+      // (serviceFolderFacts: the recorded paths and those of the existing containers), as for Switch branch….
+      if (ctx.resumedClone === true && ctx.serviceFolders === undefined) {
+        const facts = await this.serviceFolderFacts(env, []);
+        ctx.serviceFolders = facts.overflow ? 'repository' : facts.folders;
+      }
       const [shell, ...args] = ownershipFixCommand(folder, user, ctx.resumedClone === true ? ctx.serviceFolders : undefined);
       await docker.runChecked(
         [
@@ -3440,6 +3456,28 @@ export class EnvironmentService {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed before the container was created: ${errorDetail(error)}`);
     }
+  }
+
+  /**
+   * Review round 12 (D12-2): `serviceFolders` with the paths of the repository at which the dev container mounts something
+   * else than the workspace volume (devMountFolders, from `docker inspect` of the dev container: this covers the model of
+   * Docker Compose, the `mounts` of devcontainer.json, and runArgs, for a single container too). They are not recorded:
+   * they matter only in the dev container, where they are mounted. When the dev container cannot be read, the whole
+   * repository (only the files of root change).
+   */
+  private async withDevMountFolders(ctx: PipelineContext, containerName: string, serviceFolders: ServiceFolders | undefined): Promise<ServiceFolders | undefined> {
+    if (serviceFolders === 'repository') return serviceFolders;
+    let mounts: string[];
+    try {
+      mounts = devMountFolders(await this.deps.docker.findContainer(ctx.env.id, containerName), ctx.env);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);
+      return 'repository';
+    }
+    if (mounts.length === 0) return serviceFolders;
+    const bounded = boundServiceFolders(repositoryFolder(ctx.env.repository), [serviceFolders, mounts]);
+    return bounded.overflow ? 'repository' : bounded.folders;
   }
 
   /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */

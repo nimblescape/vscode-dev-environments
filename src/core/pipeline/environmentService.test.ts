@@ -1350,6 +1350,16 @@ describe('open: existing environment', () => {
       expect((await entry())?.busy).toBeUndefined();
     });
 
+    it('leaves the recorded service folders out of the fix before up of a resumed clone of a single container (review round 12, D12-1)', async () => {
+      const pg = `/workspaces/${REPO.split('/')[1]}/pgdata`;
+      await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate, serviceFolders: [pg] } });
+      await h.service.open(TARGET, options());
+      const before = h.docker.runs.find((run) => run.args[0] === '-c');
+      expect(before).toBeDefined();
+      expect(before!.args).toContain(pg);
+      expect(before!.args).toContain(`${pg}/*`);
+    });
+
     it('restores the mark of the ended window when the resumed clone is cancelled', async () => {
       await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
       const controller = new AbortController();
@@ -3641,5 +3651,25 @@ describe('review round 9 (S9-1, S9-3): the bounds of the extension host', () => 
     await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'hostAccess' });
     // Before: one `docker image inspect` per reference, also for a refused configuration.
     expect(h.docker.imageInspections).toEqual([]);
+  });
+});
+
+describe('review round 12 (D12-2): the ownership fix of a single container leaves its other mounts below the repository alone', () => {
+  it('protects the target of a volume of the mounts of devcontainer.json, not the workspace volume', async () => {
+    // For example "mounts": ["source=pgdata,target=${containerWorkspaceFolder}/.pgdata,type=volume"], a volume that
+    // another container uses too.
+    h.helper.containerMounts = [
+      { type: 'volume', volume: NAME, target: '/workspaces' },
+      { type: 'volume', volume: 'pgdata', target: '/workspaces/api/.pgdata' },
+      { type: 'volume', target: '/workspaces/api/../elsewhere' },
+      { type: 'bind', target: '/workspaces/api' },
+    ];
+    await h.service.open(TARGET, options());
+    const fix = h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT && e.command[4] === '/workspaces/api');
+    // Before: ['/workspaces/api', 'vscode'] alone: the files of the volume were given to vscode.
+    expect(fix.map((e) => e.command.slice(4))).toEqual([
+      ['/workspaces/api', 'vscode', '-path', '/workspaces/api/.pgdata', '-o', '-path', '/workspaces/api/.pgdata/*'],
+    ]);
+    expect((await entry())?.serviceFolders).toBeUndefined();
   });
 });

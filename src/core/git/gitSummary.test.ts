@@ -12,6 +12,9 @@ import {
   OWNERSHIP_FIX_SCRIPT,
   MAX_SERVICE_ARGUMENT_CHARACTERS,
   MAX_SERVICE_FOLDERS,
+  MAX_SERVICE_PATH_DEPTH,
+  MAX_SERVICE_PATH_LENGTH,
+  MAX_SERVICE_REAL_PATHS,
   boundServiceFolders,
   gitSummaryCommand,
   ownershipFixCommand,
@@ -445,6 +448,165 @@ describe('review round 11 (G3, G5): the list of the paths of the services, bound
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     expect(performance.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe('review round 12 (S12-1): the nested-path filter in linear time, with bounds of length and depth', () => {
+  const REPO = '/workspaces/repo';
+  const WHOLE = ['-path', REPO, '-o', '-path', `${REPO}/*`];
+
+  it('filters 1000 paths at depth 2000 in well under 100 ms, as overflow', () => {
+    const deep = Array.from({ length: 1000 }, (_, i) => `${REPO}/${'a/'.repeat(2000)}x${i}`);
+    let started = performance.now();
+    const list = serviceFolderPaths(REPO, deep);
+    // Before: 6 s for serviceFolderPaths alone (the lookup of each ancestor, O(depth x length) per path).
+    expect(performance.now() - started).toBeLessThan(100);
+    started = performance.now();
+    const bounded = boundServiceFolders(REPO, [deep, deep, deep]);
+    const args = servicePathArguments(REPO, deep);
+    // Before: about 12 s together.
+    expect(performance.now() - started).toBeLessThan(500);
+    // Never dropped: the paths over the bounds stay in the list, and make it overflow.
+    expect(list).toHaveLength(1000);
+    expect(bounded).toEqual({ folders: [], overflow: true });
+    expect(args).toEqual(WHOLE);
+  });
+
+  it('filters 1000 long paths within the bounds in linear time', () => {
+    // Depth 251 and about 4000 characters each: at the bounds.
+    const deep = `${REPO}/${'abcdefghijklmno/'.repeat(250)}`;
+    const paths = Array.from({ length: 1000 }, (_, i) => `${deep}x${i}`);
+    let started = performance.now();
+    const list = serviceFolderPaths(REPO, paths);
+    // Before: several seconds (a lookup of each of the 250 ancestors of each path).
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(list).toEqual(paths);
+    // With a path that covers them all, after them: only it stays.
+    started = performance.now();
+    expect(serviceFolderPaths(REPO, [...paths, `${REPO}/abcdefghijklmno`])).toEqual([`${REPO}/abcdefghijklmno`]);
+    expect(serviceFolderPaths(REPO, [...paths, `${deep}x1/y`, deep.slice(0, -1)])).toEqual([deep.slice(0, -1)]);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it('treats a path over the length or depth bound as overflow, unless a path of the list covers it', () => {
+    const long = `${REPO}/${'x'.repeat(MAX_SERVICE_PATH_LENGTH)}`;
+    const deep = `${REPO}/${'d/'.repeat(MAX_SERVICE_PATH_DEPTH)}e`;
+    const atDepth = `${REPO}/${'d/'.repeat(MAX_SERVICE_PATH_DEPTH - 1)}e`;
+    expect(boundServiceFolders(REPO, [[`${REPO}/pg`, long]])).toEqual({ folders: [`${REPO}/pg`], overflow: true });
+    expect(boundServiceFolders(REPO, [[deep, `${REPO}/pg`]])).toEqual({ folders: [`${REPO}/pg`], overflow: true });
+    expect(servicePathArguments(REPO, [`${REPO}/pg`, deep])).toEqual(WHOLE);
+    // At the bound, a path is named on its own.
+    expect(boundServiceFolders(REPO, [[atDepth]])).toEqual({ folders: [atDepth], overflow: false });
+    expect(servicePathArguments(REPO, [atDepth])).toEqual(['-path', atDepth, '-o', '-path', `${atDepth}/*`]);
+    // Covered by a path of the list: its test `-path <path>/*` names it.
+    expect(boundServiceFolders(REPO, [[deep, `${REPO}/d`]])).toEqual({ folders: [`${REPO}/d`], overflow: false });
+    expect(boundServiceFolders(REPO, [[`${REPO}/${'x'.repeat(MAX_SERVICE_PATH_LENGTH)}/y`, `${REPO}/${'x'.repeat(10)}`]])).toMatchObject({ overflow: true });
+  });
+
+  it('keeps the results for normal inputs, in the input order', () => {
+    expect(serviceFolderPaths(REPO, [`${REPO}/b/c`, `${REPO}/a`, `${REPO}/b`, `${REPO}/a/x`, `${REPO}/a-b`, `${REPO}/a b/c`, `${REPO}/b/c`])).toEqual([
+      `${REPO}/a`,
+      `${REPO}/b`,
+      `${REPO}/a-b`,
+      `${REPO}/a b/c`,
+    ]);
+    expect(serviceFolderPaths(REPO, [`${REPO}/a/b/c`, `${REPO}/a/b`, `${REPO}/a/bc`])).toEqual([`${REPO}/a/b`, `${REPO}/a/bc`]);
+  });
+});
+
+describe('review round 12 (P12-2): the ownership fix resolves the paths of the services behind links', () => {
+  /** Runs the ownership fix with a fake `find` that prints its arguments (one per line), and `id` that prints 4242. */
+  function findArguments(repo: string, folders: string[] | 'repository'): string[] {
+    const bin = path.join(path.dirname(repo), 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'find'), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o755 });
+    const [file, ...args] = ownershipFixCommand(repo, 'someone', folders);
+    const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    return result.stdout.split('\n').slice(0, -1);
+  }
+  const test = (paths: string[]) => paths.flatMap((p, i) => [...(i > 0 ? ['-o'] : []), '-path', p, '-o', '-path', `${p}/*`]);
+  const fix = (repo: string, inPaths: string[]) => [repo, '-xdev', '(', '(', ...inPaths, ')', '-user', '0', '-o', '!', '(', ...inPaths, ')', '(', '!', '-user', '4242', '-o', '!', '-group', '4242', ')', ')', '-exec', 'chown', '-h', '4242:4242', '{}', '+'];
+
+  function repository(): string {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['storage/pg', 'lib/x', '.git/objects']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'storage/app.conf'), 'x');
+    return repo;
+  }
+
+  it('adds the real path of a folder and of a file behind a link, in the repository', () => {
+    const repo = repository();
+    fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+    fs.symlinkSync(`${repo}/storage/app.conf`, path.join(repo, 'app.conf'));
+    // A path below a link, and a path without a link (unchanged).
+    fs.symlinkSync('storage', path.join(repo, 'store'));
+    expect(findArguments(repo, [`${repo}/data`, `${repo}/app.conf`, `${repo}/store/pg`, `${repo}/lib/x`])).toEqual(
+      fix(repo, [
+        ...test([`${repo}/data`, `${repo}/app.conf`, `${repo}/store/pg`, `${repo}/lib/x`]),
+        '-o',
+        ...test([`${repo}/storage/pg`, `${repo}/storage/app.conf`, `${repo}/storage/pg`]),
+      ]),
+    );
+  });
+
+  it('adds no real path outside the repository, of the repository itself, or in .git', () => {
+    const repo = repository();
+    const outside = path.join(path.dirname(repo), 'outside');
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(repo, 'out'));
+    fs.symlinkSync('.', path.join(repo, 'self'));
+    fs.symlinkSync('.git/objects', path.join(repo, 'objects'));
+    fs.symlinkSync('missing', path.join(repo, 'dangling'));
+    const folders = [`${repo}/out`, `${repo}/self`, `${repo}/objects`, `${repo}/nothing`];
+    expect(findArguments(repo, folders)).toEqual(fix(repo, test(folders)));
+    // A link that leads nowhere: its target in the repository (readlink -f) is protected too.
+    expect(findArguments(repo, [`${repo}/dangling`])).toEqual(fix(repo, [...test([`${repo}/dangling`]), '-o', ...test([`${repo}/missing`])]));
+  });
+
+  it('counts the whole repository as a path of the services for a real path with a pattern character, or too many', () => {
+    const repo = repository();
+    fs.mkdirSync(path.join(repo, 'st*rage'));
+    fs.symlinkSync('st*rage', path.join(repo, 'data'));
+    const onlyRoot = [repo, '-xdev', '-user', '0', '-exec', 'chown', '-h', '4242:4242', '{}', '+'];
+    expect(findArguments(repo, [`${repo}/data`])).toEqual(onlyRoot);
+    // A path of a service with a pattern character (escaped with a backslash for -path): it cannot be resolved as written.
+    expect(findArguments(repo, [`${repo}/st*rage`])).toEqual(onlyRoot);
+    const links = Array.from({ length: MAX_SERVICE_REAL_PATHS + 1 }, (_, i) => {
+      fs.mkdirSync(path.join(repo, `real/${i}`), { recursive: true });
+      fs.symlinkSync(`real/${i}`, path.join(repo, `link-${i}`));
+      return `${repo}/link-${i}`;
+    });
+    expect(findArguments(repo, links)).toEqual(onlyRoot);
+    expect(findArguments(repo, links.slice(0, MAX_SERVICE_REAL_PATHS)).filter((arg) => arg.startsWith(`${repo}/real/`))).toHaveLength(4 * MAX_SERVICE_REAL_PATHS);
+    // 'repository' stays the whole repository.
+    expect(findArguments(repo, 'repository')).toEqual(fix(repo, ['-path', repo, '-o', '-path', `${repo}/*`]));
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 12 (D12-2): the ownership fix with the mounts of the dev container, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives the folder of a new node_modules volume the user, and leaves the files of db in a shared volume alone', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src', 'node_modules/left-pad', '.pgdata/base']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'node_modules/left-pad/index.js', 'node_modules/.other', '.pgdata/PG_VERSION', '.pgdata/base/1']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The files of Postgres (uid 999) in the volume that db shares; a file of another user in node_modules.
+    for (const file of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    fs.chownSync(path.join(repo, 'node_modules/.other'), 1234, 1234);
+    // The paths as withDevMountFolders adds them (devMountFolders of the mounts of the dev container).
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.pgdata`, `${repo}/node_modules`]);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // The folder that Docker created as root for the volume, and what root wrote in it, get the user.
+    for (const name of ['.', 'src', 'src/a.ts', 'node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    // Before (without the paths): 'nobody' too.
+    for (const name of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    expect(uidOf(path.join(repo, 'node_modules/.other'))).toBe(1234);
   });
 });
 
