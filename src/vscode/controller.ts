@@ -630,7 +630,14 @@ export class Controller implements vscode.Disposable {
         const changes = summary ? formatChanges(summary) : '';
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.
-        const repositoryData = repositoryServiceDataFolders((await this.deps.registry.get(environment.id)) ?? environment);
+        // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
+        // of an entry that was restored from its volumes, without a record).
+        const repositoryData = [
+          ...new Set([
+            ...repositoryServiceDataFolders((await this.deps.registry.get(environment.id)) ?? environment),
+            ...(await this.deps.service.repositoryServiceData(environment.id).catch(() => [])),
+          ]),
+        ];
         const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
         if (changes !== '') {
           const choice = await vscode.window.showWarningMessage(

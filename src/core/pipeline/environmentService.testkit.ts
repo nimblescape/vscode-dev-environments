@@ -7,9 +7,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
+import { isDevContainer, type ContainerInfo, type ImageInspection, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
-import { COMPOSE_MODEL_PATH, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
+import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import type { CheckOutcome, ConfigReferences } from '../imageCheck/imageCheck';
@@ -112,6 +113,8 @@ export class FakeDocker implements EnvironmentDocker {
   readonly pulls: Array<{ reference: string; credentials?: PullCredentials }> = [];
   pullError: (reference: string, credentials?: PullCredentials) => Error | undefined = () => undefined;
   execHandler: (container: string, command: readonly string[], user?: string) => Partial<RunResult> = () => ({});
+  /** Review round 11 (G3): paths of the workspace volume that do not exist (EXISTING_PATHS_SCRIPT leaves them out). */
+  readonly missingPaths = new Set<string>();
   /** Volumes that `docker volume rm` refuses to remove. */
   readonly volumesInUse = new Set<string>();
   /** The names of each `docker volume inspect` (inspectVolumes). */
@@ -246,7 +249,9 @@ export class FakeDocker implements EnvironmentDocker {
     options: { user?: string; signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<RunResult> {
     this.execs.push({ container, command, user: options.user, signal: options.signal });
-    const result: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...this.execHandler(container, command, options.user) };
+    // Review round 11 (G3): the check of the recorded paths of the services prints those that exist.
+    const existing = command[2] === EXISTING_PATHS_SCRIPT ? command.slice(4).filter((folder) => !this.missingPaths.has(folder)).map((folder) => `${folder}\0`).join('') : '';
+    const result: RunResult = { exitCode: 0, stdout: existing, stderr: '', timedOut: false, ...this.execHandler(container, command, options.user) };
     // Like the process runner: an abort during the call kills the process and rejects.
     if (options.signal?.aborted) throw abortError();
     return result;
@@ -294,18 +299,28 @@ export class FakeDocker implements EnvironmentDocker {
    * imageRepoNames does not name has the reference as its tag (or digest); its ID is imageIds, a hexadecimal reference
    * padded to an ID, or `sha256:image-of-<reference>`.
    */
-  /** Review round 10 (P10-1): references that Docker cannot inspect (for example "invalid reference format"). */
+  /**
+   * Review round 10 (P10-1): references that Docker cannot inspect (for example "invalid reference format"). Review round
+   * 11 (G1): with the reason `invalid`.
+   */
   readonly uninspectableImages = new Set<string>();
+  /**
+   * Review round 11 (G1): references whose inspect fails without an answer about them (a timeout, a daemon that cannot
+   * be reached): the reason `transient`. `'all'`: every reference.
+   */
+  transientImages: Set<string> | 'all' = new Set<string>();
 
-  async inspectImageNames(references: readonly string[]): Promise<{ images: Array<{ id: string; repoTags: string[]; repoDigests: string[] }>; unchecked: string[] }> {
+  async inspectImageNames(references: readonly string[]): Promise<ImageInspection> {
     this.imageInspections.push([...references]);
+    const transient = (reference: string) => this.transientImages === 'all' || this.transientImages.has(reference);
+    if (references.some(transient)) return { images: [], unchecked: references.map((reference) => ({ reference, reason: 'transient' })) };
     const images = references
       .filter((reference) => this.images.has(reference) && !this.uninspectableImages.has(reference))
       .map((reference) => ({
         id: this.imageIds.get(reference) ?? (/^[0-9a-f]+$/.test(reference) ? `sha256:${reference.padEnd(64, '0')}` : `sha256:image-of-${reference}`),
         ...(this.imageRepoNames.get(reference) ?? (reference.includes('@') ? { repoTags: [], repoDigests: [reference] } : { repoTags: [reference], repoDigests: [] })),
       }));
-    return { images, unchecked: references.filter((reference) => this.uninspectableImages.has(reference)) };
+    return { images, unchecked: references.filter((reference) => this.uninspectableImages.has(reference)).map((reference) => ({ reference, reason: 'invalid' })) };
   }
 
   async imageExists(reference: string): Promise<boolean> {
@@ -338,7 +353,15 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   /** `labels` default: the label devenv.container-version of the current setup. */
-  addContainer(p: { environmentId: string; name: string; state: ContainerState; image: string; labels?: Record<string, string> }): ContainerInfo {
+  addContainer(p: {
+    environmentId: string;
+    name: string;
+    state: ContainerState;
+    image: string;
+    labels?: Record<string, string>;
+    /** Review round 11 (G4): as `docker inspect` reads them (HostConfig.Mounts). */
+    volumeSubpaths?: ContainerInfo['volumeSubpaths'];
+  }): ContainerInfo {
     const id = `container-${++this.counter}`;
     const container: ContainerInfo = {
       id,
@@ -347,6 +370,7 @@ export class FakeDocker implements EnvironmentDocker {
       rawState: p.state === 'running' ? 'running' : 'exited',
       labels: { ...(p.labels ?? { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION) }), [LABEL_ENVIRONMENT_ID]: p.environmentId },
       image: p.image,
+      ...(p.volumeSubpaths !== undefined ? { volumeSubpaths: p.volumeSubpaths } : {}),
     };
     this.containers.set(id, container);
     return container;
@@ -737,6 +761,12 @@ export class FakeHelper implements EnvironmentHelper {
       (Array.isArray(entries) ? entries : [])
         .map((entry: { type?: string; source?: string }) => (entry.type === 'volume' && entry.source ? model.volumes?.[entry.source]?.name : undefined))
         .filter((name): name is string => typeof name === 'string');
+    const subpathMounts = (entries: unknown): NonNullable<ContainerInfo['volumeSubpaths']> =>
+      (Array.isArray(entries) ? entries : []).flatMap((entry: { type?: string; source?: string; read_only?: boolean; volume?: { subpath?: string } }) =>
+        entry.type === 'volume' && entry.source === WORKSPACE_VOLUME_KEY && typeof entry.volume?.subpath === 'string'
+          ? [{ volume: p.volumeName, subpath: entry.volume.subpath, readOnly: entry.read_only === true }]
+          : [],
+      );
     const create = (name: string, containerName: string, serviceImage: string, labels: unknown, volumes: string[]): ContainerInfo => {
       if (!this.docker.images.has(serviceImage)) throw new DevcontainerCommandError('devcontainer up', 1, '', `Error: No such image: ${serviceImage}`);
       const created = this.docker.addContainer({
@@ -756,7 +786,12 @@ export class FakeHelper implements EnvironmentHelper {
         },
       });
       if (volumes.length > 0) this.docker.containers.set(created.id, { ...created, volumes });
-      return created;
+      // Review round 11 (G3, G4): the subpaths of the workspace volume that the service mounts, as Docker inspects them.
+      if (name !== service) {
+        const volumeSubpaths = subpathMounts(model.services[name]?.volumes);
+        if (volumeSubpaths.length > 0) this.docker.containers.set(created.id, { ...(this.docker.containers.get(created.id) ?? created), volumeSubpaths });
+      }
+      return this.docker.containers.get(created.id) ?? created;
     };
     let containerId: string;
     if (existing && !p.removeExistingContainer) {
@@ -801,9 +836,9 @@ export class FakeHelper implements EnvironmentHelper {
   }
 
   /** Review round 9 (D9-1): the serviceFolders of each switchBranch. */
-  readonly switchServiceFolders: Array<readonly string[] | undefined> = [];
+  readonly switchServiceFolders: Array<ServiceFolders | undefined> = [];
 
-  async switchBranch(p: { volumeName: string; branch: string; token: string; serviceFolders?: readonly string[] }): Promise<void> {
+  async switchBranch(p: { volumeName: string; branch: string; token: string; serviceFolders?: ServiceFolders }): Promise<void> {
     this.mount(p.volumeName);
     this.calls.push(`switchBranch ${p.branch}`);
     this.switchServiceFolders.push(p.serviceFolders);

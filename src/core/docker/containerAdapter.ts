@@ -10,10 +10,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
-import { IMAGE_INSPECT_BATCH } from '../helper/analysisLimits';
+import { IMAGE_INSPECT_BATCH, MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 import { Messages } from '../messages';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
+  abortError,
   isAbortError,
   systemClock,
   type Clock,
@@ -38,6 +39,20 @@ export interface ContainerInfo {
   image: string;
   /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
   volumes?: string[];
+  /**
+   * Review round 11 (G3, G4): the subpaths of named volumes that the container mounts (`HostConfig.Mounts`, and
+   * `Mounts`, with `Type` volume and `VolumeOptions.Subpath`), as Docker Compose creates them for a bind mount of
+   * repository files that the pipeline rewrote to the workspace volume.
+   */
+  volumeSubpaths?: VolumeSubpathMount[];
+}
+
+/** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
+export interface VolumeSubpathMount {
+  volume: string;
+  /** Relative to the root of the volume, as Docker has it (for example `api/data/postgres`). */
+  subpath: string;
+  readOnly: boolean;
 }
 
 export interface VolumeInfo {
@@ -142,13 +157,29 @@ export interface ImageNames {
   repoDigests: string[];
 }
 
+/**
+ * Review round 11 (G1): why inspectImageNames could not check a reference. `invalid`: Docker's answer is about the
+ * reference itself ("invalid reference format", or an image ID prefix that matches more than one image), the same at
+ * every call. `transient`: the answer says nothing about the reference (a timeout, a daemon that cannot be reached or
+ * fails, an unknown error, a Docker CLI that cannot be started, or a reference beyond MAX_IMAGE_INSPECT_SINGLE_CALLS).
+ */
+export type ImageUncheckedReason = 'invalid' | 'transient';
+
 /** The result of inspectImageNames (review round 10, P10-1). */
 export interface ImageInspection {
   /** The local images that the references found. */
   images: ImageNames[];
-  /** The references that Docker could not inspect for another reason than a missing image. */
-  unchecked: string[];
+  /** The references that Docker could not inspect for another reason than a missing image, each with its reason. */
+  unchecked: Array<{ reference: string; reason: ImageUncheckedReason }>;
 }
+
+/**
+ * Review round 11 (G1): the errors of `docker image inspect` about a reference itself, matched loosely: an invalid
+ * reference ("invalid reference format", "repository name must be lowercase", "invalid tag format"), and an ID prefix
+ * that matches several images (the classic image store: "multiple IDs found with provided prefix"; the containerd image
+ * store: "ambiguous reference", "ambiguous image", "multiple images match").
+ */
+const IMAGE_REFERENCE_ERROR = /invalid reference|reference format|must be lowercase|invalid (repository|tag|digest|image)|ambiguous|multiple (ids|images|digests|matches)|matches multiple|more than one/i;
 
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
 export function parseJsonLines(stdout: string): unknown[] {
@@ -224,6 +255,10 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
     labels: toLabels(isRecord(config) ? config.Labels : undefined),
     image,
     volumes: mountedVolumes(value.Mounts),
+    volumeSubpaths: volumeSubpathMounts([
+      ...(Array.isArray(value.Mounts) ? value.Mounts : []),
+      ...(isRecord(value.HostConfig) && Array.isArray(value.HostConfig.Mounts) ? value.HostConfig.Mounts : []),
+    ]),
     created: typeof value.Created === 'string' ? value.Created : '',
   };
 }
@@ -233,6 +268,24 @@ function mountedVolumes(mounts: unknown): string[] {
   return mounts
     .filter((mount): mount is Record<string, unknown> => isRecord(mount) && mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '')
     .map((mount) => mount.Name as string);
+}
+
+/**
+ * Review round 11 (G3, G4): the volume mounts with a subpath of `docker container inspect` (`HostConfig.Mounts` has
+ * `Source`, the name of the volume; `Mounts` has `Name`), without duplicates.
+ */
+function volumeSubpathMounts(mounts: readonly unknown[]): VolumeSubpathMount[] {
+  const result = new Map<string, VolumeSubpathMount>();
+  for (const mount of mounts) {
+    if (!isRecord(mount) || mount.Type !== 'volume' || !isRecord(mount.VolumeOptions)) continue;
+    const subpath = mount.VolumeOptions.Subpath;
+    const volume = typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : mount.Source;
+    if (typeof subpath !== 'string' || subpath === '' || typeof volume !== 'string' || volume === '') continue;
+    const readOnly = mount.ReadOnly === true || mount.RW === false;
+    const key = `${volume}\0${subpath}\0${readOnly}`;
+    if (!result.has(key)) result.set(key, { volume, subpath, readOnly });
+  }
+  return [...result.values()];
 }
 
 function toVolumeInfo(value: unknown): VolumeInfo | undefined {
@@ -255,8 +308,17 @@ export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, volumes } = container;
-  return { id, name, state, rawState, labels, image, ...(volumes && volumes.length > 0 ? { volumes } : {}) };
+  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths } = container;
+  return {
+    id,
+    name,
+    state,
+    rawState,
+    labels,
+    image,
+    ...(volumes && volumes.length > 0 ? { volumes } : {}),
+    ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
+  };
 }
 
 /** Newest first; a running container before a stopped one. */
@@ -726,39 +788,72 @@ export class ContainerAdapter {
    * Review round 9 (S9-3): the ID, tags, and digests of the local images that `references` name, with one `docker image
    * inspect` per IMAGE_INSPECT_BATCH references (not one per reference), in the order that Docker prints them (the
    * order of the references; a missing one is left out). Which reference found which image: imageIdResolvedReferences.
-   * Review round 10 (P10-1): when Docker fails for a batch for another reason than missing images only (every line of
-   * stderr "No such image"), for example an invalid reference, the references of that batch are inspected one by one;
-   * `unchecked` names each one whose own inspect fails for another reason than a missing image (and each reference of a
-   * batch that ran out of time), which the caller must not take for a missing image. Never throws for a failed inspect.
+   * Review round 10 (P10-1): when Docker fails for a batch only for missing references (every line of stderr "No such
+   * image") and references that it takes for invalid (IMAGE_REFERENCE_ERROR), the references of that batch are
+   * inspected one by one; `unchecked` names each one whose own inspect fails for another reason than a missing image,
+   * which the caller must not take for a missing image.
+   * Review round 11 (G1, G2): each unchecked reference has its reason (ImageUncheckedReason). After the first timeout,
+   * or the first failure that is neither a missing nor an invalid reference (a daemon that cannot be reached, an
+   * unknown error, an answer that cannot be read, a Docker CLI that cannot be started), of a batch or of a single
+   * reference, it asks no more: that reference and all that are not checked yet are `transient`. At most
+   * MAX_IMAGE_INSPECT_SINGLE_CALLS single calls; the references beyond are `transient`. `signal` is passed to each call
+   * and checked between them. Throws only an AbortError (when `signal` aborts); every other failure is in `unchecked`.
    */
-  async inspectImageNames(references: readonly string[]): Promise<ImageInspection> {
+  async inspectImageNames(references: readonly string[], signal?: AbortSignal): Promise<ImageInspection> {
     const images: ImageNames[] = [];
-    const unchecked: string[] = [];
-    const inspect = async (batch: readonly string[]): Promise<'done' | 'failed' | 'timedOut'> => {
+    const unchecked: ImageInspection['unchecked'] = [];
+    type Outcome = 'done' | 'invalid' | 'transient';
+    const inspect = async (batch: readonly string[]): Promise<Outcome> => {
+      if (signal?.aborted) throw abortError();
       const args = ['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--', ...batch];
-      const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
-      if (result.timedOut) return 'timedOut';
-      if (result.exitCode !== 0 && !this.onlyMissing(result, 'image')) return 'failed';
+      let result: RunResult;
+      try {
+        result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) throw error;
+        this.logger.warn(`docker image inspect failed: ${errorMessage(error)}`);
+        return 'transient';
+      }
+      if (result.timedOut) return 'transient';
+      if (result.exitCode !== 0 && !this.onlyMissing(result, 'image')) {
+        // Only missing and invalid references: which ones are invalid, the single calls tell.
+        const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
+        const aboutReferences = errors.length > 0 && errors.every((line) => MISSING_PATTERNS.image.test(line) || IMAGE_REFERENCE_ERROR.test(line));
+        return aboutReferences && errors.some((line) => IMAGE_REFERENCE_ERROR.test(line)) ? 'invalid' : 'transient';
+      }
       const found: ImageNames[] = [];
       const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
       for (const value of parseJsonLines(result.stdout)) {
-        if (!isRecord(value) || typeof value.id !== 'string') return 'failed';
+        if (!isRecord(value) || typeof value.id !== 'string') return 'transient';
         found.push({ id: value.id, repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) });
       }
       images.push(...found);
       return 'done';
     };
+    const giveUp = (from: number): ImageInspection => {
+      unchecked.push(...references.slice(from).map((reference) => ({ reference, reason: 'transient' as const })));
+      return { images, unchecked };
+    };
+    let singleCalls = 0;
     for (let start = 0; start < references.length; start += IMAGE_INSPECT_BATCH) {
       const batch = references.slice(start, start + IMAGE_INSPECT_BATCH);
       const outcome = await inspect(batch);
       if (outcome === 'done') continue;
-      // A daemon that does not answer in time would not answer each reference either.
-      if (outcome === 'timedOut' || batch.length === 1) {
-        unchecked.push(...batch);
+      // A daemon that does not answer (in time) would not answer each reference either.
+      if (outcome === 'transient') return giveUp(start);
+      if (batch.length === 1) {
+        unchecked.push({ reference: batch[0], reason: 'invalid' });
         continue;
       }
-      for (const reference of batch) {
-        if ((await inspect([reference])) !== 'done') unchecked.push(reference);
+      for (let index = 0; index < batch.length; index++) {
+        if (singleCalls >= MAX_IMAGE_INSPECT_SINGLE_CALLS) {
+          this.logger.warn(`docker image inspect: more than ${MAX_IMAGE_INSPECT_SINGLE_CALLS} references to inspect one by one.`);
+          return giveUp(start + index);
+        }
+        singleCalls++;
+        const single = await inspect([batch[index]]);
+        if (single === 'transient') return giveUp(start + index);
+        if (single === 'invalid') unchecked.push({ reference: batch[index], reason: 'invalid' });
       }
     }
     return { images, unchecked };

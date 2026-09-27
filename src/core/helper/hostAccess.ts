@@ -982,6 +982,21 @@ export function imageUncheckedItem(reference: string, what = 'image'): string {
   return `${what} ${reference.trim()} (the image reference could not be checked)`;
 }
 
+/**
+ * Review round 11 (G2): whether `reference` follows Docker's reference grammar (github.com/distribution/reference, as
+ * parseImageReference reads it: lowercase path components, the separators `.`, `_`, `__`, and `-`, a tag of at most 128
+ * characters, a digest), written without surrounding whitespace. Conservative: a reference that the grammar rejects is
+ * never accepted, whatever Docker would make of it.
+ */
+export function isValidImageReference(reference: string): boolean {
+  return reference === reference.trim() && parseImageReference(reference) !== undefined;
+}
+
+/** Review round 11 (G2): the item of an image reference that is not valid in Docker's grammar: not supported. */
+export function imageInvalidReferenceItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (not a valid image reference)`;
+}
+
 /** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
 export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
   return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);

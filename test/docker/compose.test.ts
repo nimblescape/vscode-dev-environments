@@ -335,6 +335,15 @@ ${extra}volumes:
     expect(entry?.buildRecord?.compose).not.toHaveProperty('serviceFolders');
     expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/seed`]));
     expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/init.sql`]));
+    // Review round 11 (G3, G4): the inspect of the db container (with the list of the containers of the project) yields
+    // its subpaths of the workspace volume, read-only, as the list of the paths of the services reads them.
+    const listed = (await docker.listProjectContainers(app.project)).find((container) => container.id.startsWith(db));
+    expect(listed?.volumeSubpaths).toEqual(
+      expect.arrayContaining([
+        { volume: app.name, subpath: path.posix.relative('/workspaces', `${app.folder}/seed`), readOnly: true },
+        { volume: app.name, subpath: path.posix.relative('/workspaces', `${app.folder}/init.sql`), readOnly: true },
+      ]),
+    );
     expect(entry?.buildRecord?.images).toHaveProperty([TEST_BASE_IMAGE]);
     expect(entry?.additionalVolumes).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
   });

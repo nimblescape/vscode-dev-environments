@@ -9,7 +9,7 @@
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { gitSummaryCommand, parseGitSummaryOutput } from '../git/gitSummary';
+import { gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
 import {
   CONFIG_FOLDER,
@@ -815,9 +815,10 @@ export class WorkspaceHelper {
     token: string;
     /**
      * Review round 9 (D9-1): the paths of the repository that the other services of Docker Compose mount
-     * (ComposeBuildRecord.serviceFolders); the restore of the owner leaves them out.
+     * (ComposeBuildRecord.serviceFolders); the restore of the owner leaves them out. Review round 11 (G5):
+     * `'repository'` over MAX_SERVICE_FOLDERS (only the files of root get their owner).
      */
-    serviceFolders?: readonly string[];
+    serviceFolders?: ServiceFolders;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {

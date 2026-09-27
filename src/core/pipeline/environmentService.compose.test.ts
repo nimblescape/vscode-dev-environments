@@ -7,7 +7,7 @@
 // before each `up` that creates containers, the build and up models, the volumes, the labels, the image check over all
 // services, update, rebuild, refused update, and start and stop of all containers.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { UserFacingError } from '../errors';
+import { CommandError, UserFacingError } from '../errors';
 import {
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
@@ -17,9 +17,10 @@ import {
   type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
-import { ANALYSIS_FAILED_ITEM } from '../helper/configurationAnalysis';
+import { ANALYSIS_FAILED_ITEM, analysisInternalItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
+import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, servicePathArguments } from '../git/gitSummary';
 import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
@@ -1824,7 +1825,8 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     await h.service.open(TARGET, options());
     // Before: `[FOLDER, 'vscode']`: the fix after `up` (db has run) gave the data of Postgres to vscode.
     // Review round 10, D10-3: without the read-only INIT_SQL (before: [FOLDER, 'vscode', SOURCE, INIT_SQL]).
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE]]);
+    // Review round 11, G5: the ready arguments of find (before: [FOLDER, 'vscode', SOURCE]).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SOURCE])]]);
     // The fix before `up` of the new clone: no service has run on the files yet, so every file gets its owner.
     const before = h.docker.runs.filter((run) => run.all.includes('--entrypoint'));
     expect(before).toHaveLength(1);
@@ -1840,8 +1842,8 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
     // Review round 10, D10-3: without the read-only INIT_SQL (before: [FOLDER, 'vscode', SOURCE, INIT_SQL] and
-    // [[SOURCE, INIT_SQL]]).
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE]]);
+    // [[SOURCE, INIT_SQL]]). Review round 11, G5: the ready arguments of find (before: [FOLDER, 'vscode', SOURCE]).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SOURCE])]]);
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
     expect(h.helper.switchServiceFolders).toEqual([[SOURCE]]);
   });
@@ -1889,16 +1891,19 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     expect(h.helper.ups.map((up) => up.removeExistingContainer)).toEqual([false]);
     const entry = await h.registry.get(ENV_ID);
     // Before: [NEW] (in the build record), and the next Switch branch… gave the live data in OLD to the dev user.
-    expect(entry?.serviceFolders).toEqual([OLD, NEW]);
+    // Review round 11, G3: the paths of the model first, then the recorded ones (before: [OLD, NEW]).
+    expect(entry?.serviceFolders).toEqual([NEW, OLD]);
     expect(entry?.buildRecord?.compose?.serviceFolders).toBeUndefined();
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([OLD, NEW]);
-    // The question of Delete names both.
-    expect(repositoryServiceDataFolders(entry!)).toEqual(['./data/pg', './pgdata']);
+    // Review round 11, G3: in the order of the record (before: [OLD, NEW]).
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW, OLD]);
+    // The question of Delete names both. Review round 11, G3: in the order of the record (before: ['./data/pg', './pgdata']).
+    expect(repositoryServiceDataFolders(entry!)).toEqual(['./pgdata', './data/pg']);
     // Another start with the same model changes nothing.
     h.docker.containersOf(ENV_ID).forEach((container) => (container.state = 'stopped'));
     await h.service.openEnvironment(ENV_ID, options());
-    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([OLD, NEW]);
+    // Review round 11, G3: in the order of the record (before: [OLD, NEW]).
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW, OLD]);
   });
 
   it('records the folders before a first up that fails, so that Switch branch… leaves them out', async () => {
@@ -1919,11 +1924,15 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW]);
   });
 
-  it('replaces the list when no container of another service exists before up', async () => {
+  it('replaces the list when no container of another service exists before up (review round 11, G3: and the old folder is gone)', async () => {
     await seedCompose({ dev: 'stopped', db: null, record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceFolders: [OLD] } } as Partial<BuildRecord> });
     withNewFolder();
+    // Review round 11, G3: OLD is kept only while it exists in the volume (before: dropped because no container of
+    // another service existed, although its data may still be there); here it no longer exists.
+    h.docker.missingPaths.add(OLD);
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW]);
+    h.docker.missingPaths.clear();
     // With the db container of NEW, a model with OLD adds OLD.
     const out = output((m) => {
       m.services.db.volumes = [{ type: 'bind', source: OLD, target: '/var/lib/postgresql/data', bind: {} }];
@@ -1932,7 +1941,8 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     useCompose(h, out);
     h.docker.containersOf(ENV_ID).forEach((container) => (container.state = 'stopped'));
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
-    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW, OLD]);
+    // Review round 11, G3: the paths of the model first, then those that the db container mounts (before: [NEW, OLD]).
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([OLD, NEW]);
   });
 });
 
@@ -2061,17 +2071,292 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
       h,
       output((m) => {
         m.services.cache = { image: '3f2a1b9c' };
-        m.services.unused = { image: 'foo/Bar' };
+        // Review round 11, G2: foo/Bar is now refused before any inspect (not a valid image reference); a reference
+        // that Docker's grammar allows but Docker cannot inspect (an image ID prefix of several images) takes its place.
+        m.services.unused = { image: 'a1b2' };
       }),
     );
     h.docker.images.add('3f2a1b9c');
     h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
-    h.docker.uninspectableImages.add('foo/Bar');
+    h.docker.uninspectableImages.add('a1b2');
     const error = await rejection(h.service.open(TARGET, options()));
     // Before: the batch failed for foo/Bar ("invalid reference format"), and no reference of it was checked.
     expect(error.code).toBe('hostAccess');
     expect(error.message).toContain('service cache: image 3f2a1b9c (an image ID; name the image)');
-    expect(error.message).toContain('service unused: image foo/Bar (the image reference could not be checked)');
+    // Review round 11, G2: a1b2 in place of foo/Bar.
+    expect(error.message).toContain('service unused: image a1b2 (the image reference could not be checked)');
     expect(h.helper.builds).toEqual([]);
+  });
+});
+
+describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a refusal from a failure to check', () => {
+  const INTERNAL = Messages.configurationCheckInternal(analysisInternalItem(`Docker could not inspect the image references ${BASE_IMAGE}, ${DB_IMAGE}`));
+
+  /** Makes the `n`th inspectImageNames (counted from 1) fail as `failure`; the others answer. */
+  function failInspection(n: number, failure: (references: readonly string[]) => void): void {
+    const original = h.docker.inspectImageNames.bind(h.docker);
+    let calls = 0;
+    h.docker.inspectImageNames = async (references: readonly string[]) => {
+      calls++;
+      if (calls === n) failure(references);
+      try {
+        return await original(references);
+      } finally {
+        h.docker.transientImages = new Set();
+        h.docker.uninspectableImages.clear();
+      }
+    };
+  }
+
+  it('does not remember an update whose check before `up` timed out (G1)', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
+    // The inspect at the load answers; the one before the `up` of the new image (composeReport) times out.
+    failInspection(2, () => (h.docker.transientImages = 'all'));
+    await h.service.openEnvironment(ENV_ID, options());
+    // Before: remembered as a refused update ("needs access to your computer"), and never built again.
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(analysisInternalItem(`Docker could not inspect the image references ${BASE_IMAGE}, ${DB_IMAGE}`))]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(devContainer()?.state).toBe('running');
+    // The next open, with Docker healthy again, builds the update again.
+    h.helper.builds.length = 0;
+    devContainer()!.state = 'stopped';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds).toHaveLength(1);
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+  });
+
+  it('starts the existing environment when the daemon fails at the load (G1)', async () => {
+    await seedCompose();
+    h.docker.transientImages = 'all';
+    await h.service.openEnvironment(ENV_ID, options());
+    // Before: refused with "Change the configuration of the repository", and nothing started.
+    expect(h.ui.warnings).toEqual([INTERNAL]);
+    expect(devContainer()?.state).toBe('running');
+    expect(dbContainer()?.state).toBe('running');
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('does not use a new configuration whose images Docker could not inspect (G1)', async () => {
+    h.docker.transientImages = 'all';
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(INTERNAL);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('still refuses, and remembers, an update with a reference that Docker calls invalid (G1)', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_OLD, [DB_IMAGE]: DB_DIGEST } } });
+    // For example an image ID prefix that matches several images.
+    failInspection(2, () => h.docker.uninspectableImages.add(DB_IMAGE));
+    await h.service.openEnvironment(ENV_ID, options());
+    const entry = await h.registry.get(ENV_ID);
+    expect(entry?.refusedUpdate).toMatchObject({ configHash: HASH, items: `service db: image ${DB_IMAGE} (the image reference could not be checked)` });
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('refuses a reference that is not valid in Docker\'s grammar before any inspect (G2)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: 'foo/Bar' };
+        m.services.web = { image: 'redis:-1' };
+      }),
+    );
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service cache: image foo/Bar (not a valid image reference)');
+    expect(error.message).toContain('service web: image redis:-1 (not a valid image reference)');
+    // Before: inspected with the other references, then one by one.
+    expect(h.docker.imageInspections.flat()).not.toContain('foo/Bar');
+    expect(h.docker.imageInspections).toEqual([[BASE_IMAGE, DB_IMAGE]]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('passes the cancellation to the inspect (G2)', async () => {
+    const controller = new AbortController();
+    h.docker.inspectImageNames = async (_references: readonly string[], signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      controller.abort();
+      throw abortError();
+    };
+    const error = await rejection(h.service.open(TARGET, { ...options(), signal: controller.signal }));
+    expect(error.code).toBe('cancelled');
+  });
+});
+
+describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from facts', () => {
+  const PGDATA = `${FOLDER}/pgdata`;
+  const DATA = `${FOLDER}/data/pg`;
+
+  /** The default model with db's data in `folder` (a folder that exists). */
+  function withModelFolder(folder: string): void {
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: folder, target: '/var/lib/postgresql/data', bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [folder]: folder };
+    useCompose(h, out);
+  }
+
+  /** The arguments after `sh -c <script> sh` of the ownership fixes of the repository folder with `docker exec`. */
+  function fixArguments(): string[][] {
+    return h.docker.execs
+      .filter((e) => e.user === 'root' && e.command[0] === 'sh' && e.command[2].includes('chown') && e.command[4] === FOLDER)
+      .map((e) => e.command.slice(4));
+  }
+
+  async function record(folders: string[]): Promise<void> {
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.serviceFolders = folders;
+    });
+  }
+
+  function stopAll(): void {
+    h.docker.containersOf(ENV_ID).forEach((container) => (container.state = 'stopped'));
+  }
+
+  it('keeps a folder of an earlier model while it exists, after the containers of the services were removed (G3)', async () => {
+    // The db container of the earlier model (./pgdata) was removed while it was stopped (`docker container prune`).
+    await seedCompose({ dev: 'stopped', db: null });
+    await record([PGDATA]);
+    withModelFolder(DATA);
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    // Before: [DATA]: no container of another service existed before `up`, so the list was replaced, the fix after `up`
+    // gave the data of Postgres in ./pgdata to vscode, and Delete no longer named it.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA, PGDATA]);
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [DATA, PGDATA])]]);
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg', './pgdata']);
+    // Once ./pgdata is gone from the volume, the next `up` drops it.
+    h.docker.missingPaths.add(PGDATA);
+    stopAll();
+    await h.service.openEnvironment(ENV_ID, options());
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg']);
+    // The check ran as root in the dev container, with the recorded paths that nothing else names.
+    const checks = h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT);
+    expect(checks.map((e) => [e.user, e.command.slice(4)])).toEqual([
+      ['root', [PGDATA]],
+      ['root', [PGDATA]],
+    ]);
+  });
+
+  it('keeps the recorded folders when the configuration became a single container, while they exist (G3)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await record([PGDATA]);
+    h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
+    h.docker.images.add(`${PROJECT}-app`);
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
+    // Before: cleared (no container of another service is left), although the data of Postgres is still in ./pgdata.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([PGDATA]);
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./pgdata']);
+    h.docker.missingPaths.add(PGDATA);
+    stopAll();
+    await h.service.openEnvironment(ENV_ID, options());
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
+  });
+
+  it('keeps the recorded list when the containers cannot be read after up (never shrinks on an error)', async () => {
+    await seedCompose({ dev: 'stopped', db: null });
+    await record([PGDATA]);
+    h.docker.missingPaths.add(PGDATA);
+    withModelFolder(DATA);
+    const up = h.helper.up.bind(h.helper);
+    const list = h.docker.listProjectContainers.bind(h.docker);
+    let broken = false;
+    h.helper.up = async (p) => {
+      const result = await up(p);
+      broken = true;
+      return result;
+    };
+    h.docker.listProjectContainers = async (project: string) => {
+      if (broken) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+      return list(project);
+    };
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA, PGDATA]);
+    expect(h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT)).toEqual([]);
+    // Switch branch… and Delete too.
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([DATA, PGDATA]);
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg', './pgdata']);
+  });
+
+  it('Switch branch… of a restored entry leaves alone the folder that the running db mounts (G4)', async () => {
+    // An entry without a record (restored from its volumes), and a db container that mounts ./data/pg, as Docker
+    // inspects it (HostConfig.Mounts with VolumeOptions.Subpath).
+    await seedEnvironment(h, {
+      container: 'running',
+      record: null,
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app' },
+    });
+    h.docker.addContainer({
+      environmentId: ENV_ID,
+      name: `${PROJECT}-db-1`,
+      state: 'running',
+      image: DB_IMAGE,
+      labels: { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db' },
+      volumeSubpaths: [
+        { volume: NAME, subpath: 'api/data/pg', readOnly: false },
+        // Not a path of the services: read-only, another volume, outside of the repository, .git.
+        { volume: NAME, subpath: 'api/init.sql', readOnly: true },
+        { volume: 'other-volume', subpath: 'api/x', readOnly: false },
+        { volume: NAME, subpath: 'other/x', readOnly: false },
+        { volume: NAME, subpath: 'api/.git', readOnly: false },
+      ],
+    });
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    // Before: [] (the documented limit): the restore of the owner gave the live data of Postgres to the dev user.
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([DATA]);
+    expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg']);
+  });
+
+  it('fills the paths of a restored entry from the mounts of the containers that it finds (G4)', async () => {
+    h.docker.volumes.set(NAME, { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.addContainer({
+      environmentId: ENV_ID,
+      name: NAME,
+      state: 'stopped',
+      image: IMAGE_1,
+      labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app' },
+    });
+    h.docker.addContainer({
+      environmentId: ENV_ID,
+      name: `${PROJECT}-db-1`,
+      state: 'stopped',
+      image: DB_IMAGE,
+      labels: { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db' },
+      volumeSubpaths: [{ volume: NAME, subpath: 'api/data/pg', readOnly: false }],
+    });
+    expect(await h.service.reconcileFromVolumes()).toBe(1);
+    // Before: no list: Switch branch… and the ownership fixes left nothing out until the next `up`.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
+  });
+
+  it(`records at most ${MAX_SERVICE_FOLDERS} paths, and changes only the files of root beyond them (G5)`, async () => {
+    // For example ./data/${HOSTNAME}: a new path at each open, and the folders of the earlier runs still exist.
+    await seedCompose({ dev: 'stopped', db: null });
+    const earlier = Array.from({ length: MAX_SERVICE_FOLDERS }, (_, i) => `${FOLDER}/data/host-${i}`);
+    await record(earlier);
+    withModelFolder(DATA);
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    const entry = await h.registry.get(ENV_ID);
+    // Before: 1001 paths, and one more at each open, without a bound.
+    expect(entry?.serviceFolders).toHaveLength(MAX_SERVICE_FOLDERS);
+    expect(entry?.serviceFolders?.[0]).toBe(DATA);
+    expect(entry?.serviceFoldersOverflow).toBe(true);
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', '-path', FOLDER, '-o', '-path', `${FOLDER}/*`]]);
+    expect(h.logger.warnings.some((line) => line.includes(`More than ${MAX_SERVICE_FOLDERS} paths of ${REPO}`))).toBe(true);
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders.at(-1)).toBe('repository');
+    // The existence check of the recorded paths goes in calls of a bounded command line.
+    const checks = h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT);
+    expect(checks.length).toBeGreaterThan(1);
+    // The record before `up` held DATA and the first 999 earlier paths.
+    expect(checks.flatMap((e) => e.command.slice(4))).toHaveLength(MAX_SERVICE_FOLDERS - 1);
   });
 });

@@ -47,27 +47,14 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
 `;
 
 /**
- * Review round 9 (D9-1): shell text that turns the positional parameters (the patterns of servicePrunePatterns) into
- * arguments of `find`, each pattern one argument (never shell text). Review round 10 (D10-3): the test "in a path of a
- * service", `-path <pattern> -o -path <pattern>/* -o …` (without parentheses; empty without patterns), in place of
- * `-path <pattern> -prune -o`: the ownership fixes still go into these paths, for the files of root (SERVICE_OWNER_FIX).
- * After it, `"$@"` holds these arguments only. The `for` list is expanded once, before `set --` changes the parameters.
- */
-export const SERVICE_PATH_ARGUMENTS = `count=$#
-for pattern do
-  if [ "$#" -gt "$count" ]; then set -- "$@" -o; fi
-  set -- "$@" -path "$pattern" -o -path "$pattern/*"
-done
-shift "$count"
-`;
-
-/**
- * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner>` of the ownership fixes,
- * after SERVICE_PATH_ARGUMENTS: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each
- * file that does not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount
- * (`"$@"`); in those, only to the files and folders of root (uid 0): the workspace helper writes as root (a clone, the
- * `git switch` of Switch branch…), while the data of a service (for example of Postgres, uid 999) keeps its owner. A
- * service that runs as root keeps its access to files of another owner (unless its capabilities are dropped).
+ * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner> <find arguments…>` of the
+ * ownership fixes: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each file that does
+ * not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount (the test "in a path of
+ * a service" of servicePathArguments, `"$@"`); in those, only to the files and folders of root (uid 0): the workspace
+ * helper writes as root (a clone, the `git switch` of Switch branch…), while the data of a service (for example of
+ * Postgres, uid 999) keeps its owner. A service that runs as root keeps its access to files of another owner (unless its
+ * capabilities are dropped). Review round 11 (G5): the arguments come ready from servicePathArguments (built in linear
+ * time), in place of the shell loop of round 9 that rebuilt `"$@"` for each pattern (quadratic: 5000 paths took 51 s).
  */
 export const SERVICE_OWNER_FIX = `service_owner_fix() {
   folder="$1"
@@ -84,28 +71,130 @@ export const SERVICE_OWNER_FIX = `service_owner_fix() {
 `;
 
 /**
- * Review round 9 (D9-1): the `find -path` patterns of the paths of the repository that the other services of Docker
- * Compose mount (ComposeBuildRecord.serviceFolders), which the ownership fixes leave out with their content: a service
- * such as a database gives its data files its own owner, and would not start with others. Only absolute paths below
- * `repoFolder` (never the folder itself, which would leave out everything); the characters that `-path` reads as a
- * pattern (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path. Review round 10 (D10-3): never
- * `.git` or a path in it (also of a record written before), where Git writes as root.
+ * Review round 11 (G5): the most paths of the repository that the ownership fixes leave to the services (a list of
+ * serviceFolderPaths). Over it, the whole repository counts as a path of the services (servicePathArguments): only the
+ * files of root get their owner, so no data of a service loses its owner.
  */
-export function servicePrunePatterns(repoFolder: string, folders: readonly string[] | undefined): string[] {
-  const patterns = new Set<string>();
+export const MAX_SERVICE_FOLDERS = 1000;
+
+/**
+ * Review round 11 (G5): the most characters of the arguments of servicePathArguments. The command line of `docker exec`
+ * and `docker run` on this computer holds them, together with the script (a few KiB), and so does the `execve` in the
+ * container: on Windows a command line has at most 32767 characters, so 24 KiB there (about 300 paths of 30
+ * characters); on Linux and macOS ARG_MAX (2 MiB on Linux, one argument at most 128 KiB; 1 MiB on macOS; both with the
+ * environment) is far above 256 KiB (1000 paths of up to about 120 characters). Over it, as over MAX_SERVICE_FOLDERS,
+ * the whole repository counts as a path of the services.
+ */
+export const MAX_SERVICE_ARGUMENT_CHARACTERS = process.platform === 'win32' ? 24 * 1024 : 256 * 1024;
+
+/**
+ * Review round 11 (G3, G5): the paths of the repository that the ownership fixes leave to the services: a list
+ * (serviceFolderPaths filters it), or `'repository'`: more than MAX_SERVICE_FOLDERS, so that only the files of root in the
+ * whole repository get their owner.
+ */
+export type ServiceFolders = readonly string[] | 'repository';
+
+/**
+ * Review round 9 (D9-1): of `folders`, the paths of the repository that the other services of Docker Compose mount
+ * (Environment.serviceFolders), which the ownership fixes leave out with their content: a service such as a database
+ * gives its data files its own owner, and would not start with others. Only absolute paths below `repoFolder` (never the
+ * folder itself, which would leave out everything); review round 10 (D10-3): never `.git` or a path in it (also of a
+ * record written before), where Git writes as root. Review round 11 (G5): without duplicates, and without a path below
+ * another path of the list (its test `-path <path>/*` covers it). In the order of `folders`; linear in their length.
+ */
+export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined): string[] {
+  const valid: string[] = [];
+  const seen = new Set<string>();
   for (const folder of folders ?? []) {
-    if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`)) continue;
+    if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`) || seen.has(folder)) continue;
     const segments = folder.slice(repoFolder.length + 1).split('/');
     if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' || segment === '.git')) continue;
-    patterns.add(folder.replace(/[\\*?[]/g, '\\$&'));
+    seen.add(folder);
+    valid.push(folder);
   }
-  return [...patterns];
+  return valid.filter((folder) => {
+    for (let slash = folder.lastIndexOf('/'); slash > repoFolder.length; slash = folder.lastIndexOf('/', slash - 1)) {
+      if (seen.has(folder.slice(0, slash))) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Review round 9 (D9-1): the `find -path` patterns of serviceFolderPaths: the characters that `-path` reads as a pattern
+ * (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path.
+ */
+export function servicePrunePatterns(repoFolder: string, folders: readonly string[] | undefined): string[] {
+  return serviceFolderPaths(repoFolder, folders).map(findPathPattern);
+}
+
+/**
+ * Review round 11 (G3, G5): the paths of `groups` (in their order: the paths of the model and those that containers
+ * mount first, then the recorded ones), as serviceFolderPaths filters them, at most MAX_SERVICE_FOLDERS. `overflow`: there
+ * were more (or `overflow` was set before, since the paths beyond the bound are not recorded): the ownership fixes then
+ * leave the whole repository to the services (`'repository'`, ServiceFolders).
+ */
+export function boundServiceFolders(
+  repoFolder: string,
+  groups: ReadonlyArray<readonly string[] | undefined>,
+  overflow = false,
+): { folders: string[]; overflow: boolean } {
+  const paths = serviceFolderPaths(repoFolder, groups.flatMap((group) => group ?? []));
+  return { folders: paths.slice(0, MAX_SERVICE_FOLDERS), overflow: overflow || paths.length > MAX_SERVICE_FOLDERS };
+}
+
+/** Escapes the characters that `find -path` reads as a pattern (`*`, `?`, `[`, `\`), so a pattern matches only its path. */
+function findPathPattern(path: string): string {
+  return path.replace(/[\\*?[]/g, '\\$&');
+}
+
+/**
+ * Review round 9 (D9-1), round 11 (G5): the arguments of `find` of the test "in a path of a service" for
+ * service_owner_fix, `-path <pattern> -o -path <pattern>/* -o …` (without parentheses; none without paths), each pattern
+ * one argument (never shell text), built in linear time. With `'repository'`, more than MAX_SERVICE_FOLDERS paths, or
+ * more than MAX_SERVICE_ARGUMENT_CHARACTERS characters: the test of the whole repository folder, so that only the files
+ * of root get their owner.
+ */
+export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined): string[] {
+  const whole = () => ['-path', findPathPattern(repoFolder), '-o', '-path', `${findPathPattern(repoFolder)}/*`];
+  if (folders === 'repository') return whole();
+  const paths = serviceFolderPaths(repoFolder, folders);
+  if (paths.length > MAX_SERVICE_FOLDERS) return whole();
+  const args: string[] = [];
+  let characters = 0;
+  for (const path of paths) {
+    const pattern = findPathPattern(path);
+    if (args.length > 0) args.push('-o');
+    args.push('-path', pattern, '-o', '-path', `${pattern}/*`);
+    characters += 2 * pattern.length + 20;
+    if (characters > MAX_SERVICE_ARGUMENT_CHARACTERS) return whole();
+  }
+  return args;
+}
+
+/**
+ * Review round 11 (G3): prints each of the paths `$1`… that exists (also a link that leads nowhere), each followed by a
+ * NUL character. Runs as root, so that a folder of a service that others may not read does not hide a path.
+ */
+export const EXISTING_PATHS_SCRIPT = `for p do
+  if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\\0' "$p"; fi
+done
+`;
+
+/** Review round 11 (G3): the command of EXISTING_PATHS_SCRIPT for `docker exec -u root`. */
+export function existingPathsCommand(paths: readonly string[]): string[] {
+  return ['sh', '-c', EXISTING_PATHS_SCRIPT, 'sh', ...paths];
+}
+
+/** Review round 11 (G3): the paths of the output of EXISTING_PATHS_SCRIPT. */
+export function parseExistingPaths(stdout: string): string[] {
+  return stdout.split('\0').filter((path) => path !== '');
 }
 
 /**
  * Changes the owner of every file in `$1` that does not belong to the user `$2` (and its primary group) to that user.
  * `chown -h` changes a symbolic link itself, never its target, and `-xdev` stays out of other mounts, so that no file
- * outside of the workspace volume changes. Review round 9 (D9-1): the paths of the patterns `$3`… (servicePrunePatterns)
+ * outside of the workspace volume changes. Review round 9 (D9-1): the paths of the test `$3`… (servicePathArguments)
  * and their content are left out; review round 10 (D10-3): except their files and folders of root (SERVICE_OWNER_FIX).
  * Works with GNU and BusyBox tools.
  */
@@ -114,7 +203,7 @@ dir="$1"
 uid=$(id -u "$2")
 gid=$(id -g "$2")
 shift 2
-${SERVICE_OWNER_FIX}${SERVICE_PATH_ARGUMENTS}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+${SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
 
 /**
@@ -154,6 +243,6 @@ export function gitSummaryCommand(repoFolder: string): string[] {
  * Command for `docker exec -u root` in the dev container after its first creation (implementation notes 7 "Ownership"):
  * the helper clones as root, so the files get the user and the primary group of `remoteUser`.
  */
-export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: readonly string[]): string[] {
-  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePrunePatterns(repoFolder, serviceFolders)];
+export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders): string[] {
+  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders)];
 }

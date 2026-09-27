@@ -199,6 +199,8 @@ interface Harness {
     openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
     stop: ReturnType<typeof vi.fn<(id: string) => Promise<void>>>;
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
+    /** Review round 11 (G3, G4). */
+    repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     switchBranch: ReturnType<typeof vi.fn<(id: string, branch: string, options: OperationOptions) => Promise<void>>>;
     configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean | ConfigurationKindChange>>>;
@@ -277,6 +279,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     openEnvironment: vi.fn(async (id: string) => openResult((await registry.get(id)) ?? environment())),
     stop: vi.fn(async () => {}),
     safetyCheck: vi.fn(async () => undefined),
+    repositoryServiceData: vi.fn(async () => []),
     delete: vi.fn(async () => {}),
     switchBranch: vi.fn(async () => {}),
     configurationChanged: vi.fn(async () => false),
@@ -1117,6 +1120,26 @@ describe('Delete', () => {
     expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
       `${Messages.deleteUnsaved('acme/api', '1 uncommitted')} ${Messages.deleteRepositoryServiceData('./data/postgres, ./init.sql')}`,
     );
+  });
+
+  it('names the paths that the containers of the services mount also without a record (review round 11, G3, G4)', async () => {
+    const env = environment({ serviceFolders: ['/workspaces/api/pgdata'] });
+    await h.registry.add(env);
+    // For example an entry restored from its volumes, whose db container mounts ./data/pg (EnvironmentService.repositoryServiceData).
+    h.service.repositoryServiceData.mockResolvedValueOnce(['./pgdata', './data/pg']);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', env));
+    // Before: only the recorded ./pgdata.
+    expect(h.service.repositoryServiceData).toHaveBeenCalledWith(ENV_ID);
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
+      `${Messages.deleteConfirm('acme/api')} ${Messages.deleteRepositoryServiceData('./pgdata, ./data/pg')}`,
+    );
+    // Without an answer of Docker, the recorded paths.
+    fakeVscode.window.showWarningMessage.mockReset();
+    h.service.repositoryServiceData.mockRejectedValueOnce(new Error('Docker is not running'));
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', env));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(`${Messages.deleteConfirm('acme/api')} ${Messages.deleteRepositoryServiceData('./pgdata')}`);
   });
 
   it('offers only the additional volumes that Delete would remove, and asks nothing when there are none', async () => {

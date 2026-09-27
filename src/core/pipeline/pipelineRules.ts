@@ -4,8 +4,11 @@
 
 // Pure decisions and helpers of the open pipeline (concept 7.6, 7.7, 7.12). No I/O.
 import * as crypto from 'crypto';
+import * as path from 'path';
+import type { ContainerInfo } from '../docker/containerAdapter';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
+import { serviceFolderPaths } from '../git/gitSummary';
 import { composeMountVolumeName } from '../helper/compose';
 import { runArgsUser } from '../helper/hostAccess';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
@@ -17,7 +20,9 @@ import {
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_CONFIG,
   LABEL_CONTAINER_VERSION,
+  LABEL_ENVIRONMENT_ID,
   LABEL_HOST_ACCESS,
+  WORKSPACES_ROOT,
   repositoryFolder,
 } from '../names';
 import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
@@ -427,6 +432,27 @@ export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRe
 export function serviceFoldersOf(env: Pick<Environment, 'buildRecord' | 'serviceFolders'>): string[] {
   const own = Array.isArray(env.serviceFolders) ? env.serviceFolders.filter((folder) => typeof folder === 'string') : [];
   return [...new Set([...own, ...(composeRecordOf(env.buildRecord)?.serviceFolders ?? [])])];
+}
+
+/**
+ * Review round 11 (G3, G4): the paths of the repository that the existing containers of the other services of the
+ * Docker Compose environment mount (not the dev container: the container with the name of the environment, or with the
+ * label of the environment and without devenv.compose-service; a container of the project without the labels of the
+ * environment, for example of `docker compose run`, counts as another service), from their mounts of subpaths of the
+ * workspace volume `volumeName` (ContainerInfo.volumeSubpaths): the subpath joined to WORKSPACES_ROOT, where the dev
+ * container and the helper mount the volume. As composeUpModel records them: not a read-only mount, and only a path
+ * below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them).
+ */
+export function liveServiceFolders(
+  containers: ReadonlyArray<Pick<ContainerInfo, 'name' | 'labels' | 'volumeSubpaths'>>,
+  env: Pick<Environment, 'repository' | 'volumeName' | 'containerName'>,
+): string[] {
+  const paths = containers
+    .filter((container) => container.name !== env.containerName && !(LABEL_ENVIRONMENT_ID in container.labels && container.labels[LABEL_COMPOSE_SERVICE] === undefined))
+    .flatMap((container) => container.volumeSubpaths ?? [])
+    .filter((mount) => mount.volume === env.volumeName && !mount.readOnly)
+    .map((mount) => path.posix.join(WORKSPACES_ROOT, mount.subpath));
+  return serviceFolderPaths(repositoryFolder(env.repository), paths);
 }
 
 /**

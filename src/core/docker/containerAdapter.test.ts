@@ -15,7 +15,9 @@ import {
   parseJsonLines,
   registryLoginConfig,
   toLabels,
+  type ImageInspection,
 } from './containerAdapter';
+import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 
 interface Call {
   file: string;
@@ -704,7 +706,8 @@ describe('images', () => {
     expect(unchecked).toEqual([]);
     expect(found[0]).toEqual({ id: 'sha256:4', repoTags: ['r0:1'], repoDigests: [] });
     // Review round 10, P10-1: before, it threw for the whole batch; now the reference that Docker cannot inspect is named.
-    expect(await docker.inspectImageNames(['broken'])).toEqual({ images: [], unchecked: ['broken'] });
+    // Review round 11, G1: with its reason; a daemon that cannot be reached says nothing about the reference.
+    expect(await docker.inspectImageNames(['broken'])).toEqual({ images: [], unchecked: [{ reference: 'broken', reason: 'transient' }] });
     expect(await docker.inspectImageNames([])).toEqual({ images: [], unchecked: [] });
   });
 
@@ -730,7 +733,8 @@ describe('images', () => {
       const { docker, runner } = adapter(daemon);
       const result = await docker.inspectImageNames(['foo/Bar', '3f2a1b9c', 'postgres:16']);
       // Before: a CommandError for the batch, and the pipeline checked none of them.
-      expect(result.unchecked).toEqual(['foo/Bar']);
+      // Review round 11, G1: with its reason.
+      expect(result.unchecked).toEqual([{ reference: 'foo/Bar', reason: 'invalid' }]);
       expect(result.images.map((image) => image.id)).toEqual([ID, `sha256:${'1'.repeat(64)}`]);
       expect(runner.calls).toHaveLength(4);
     });
@@ -739,7 +743,8 @@ describe('images', () => {
       const { docker, runner } = adapter(daemon);
       const result = await docker.inspectImageNames(['gone:1', 'foo/Bar', '3f2a1b9c']);
       // Before: "No such image" anywhere in stderr counted as missing, and foo/Bar was left unchecked without a word.
-      expect(result.unchecked).toEqual(['foo/Bar']);
+      // Review round 11, G1: with its reason.
+      expect(result.unchecked).toEqual([{ reference: 'foo/Bar', reason: 'invalid' }]);
       expect(result.images.map((image) => image.id)).toEqual([ID]);
       expect(runner.calls).toHaveLength(4);
     });
@@ -749,8 +754,121 @@ describe('images', () => {
       expect((await docker.inspectImageNames(['gone:1', 'postgres:16'])).unchecked).toEqual([]);
       expect(runner.calls).toHaveLength(1);
       const slow = adapter(() => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }));
-      expect(await slow.docker.inspectImageNames(['a:1', 'b:1'])).toEqual({ images: [], unchecked: ['a:1', 'b:1'] });
+      // Review round 11, G1: with their reason.
+      expect(await slow.docker.inspectImageNames(['a:1', 'b:1'])).toEqual({
+        images: [],
+        unchecked: [
+          { reference: 'a:1', reason: 'transient' },
+          { reference: 'b:1', reason: 'transient' },
+        ],
+      });
       expect(slow.runner.calls).toHaveLength(1);
+    });
+  });
+
+  describe('review round 11 (G1, G2): why a reference was not checked, and the bounds of the single calls', () => {
+    const line = (ref: string) => JSON.stringify({ id: `sha256:${'1'.repeat(64)}`, repoTags: [ref], repoDigests: [] });
+    /** Like Docker 27: the references in `answers` fail with their text; the others are found. */
+    function daemon(answers: Record<string, string>): Handler {
+      return (call) => {
+        const refs = call.args.slice(call.args.indexOf('--') + 1);
+        const errors = refs.filter((ref) => answers[ref] !== undefined).map((ref) => answers[ref]);
+        const stdout = refs.filter((ref) => answers[ref] === undefined).map((ref) => `${line(ref)}\n`).join('');
+        return errors.length === 0 ? ok(stdout) : { exitCode: 1, stdout, stderr: `${errors.join('\n')}\n`, timedOut: false };
+      };
+    }
+    const unchecked = (result: ImageInspection) => result.unchecked.map((entry) => `${entry.reference} ${entry.reason}`);
+
+    it('takes an invalid reference and an ambiguous ID prefix of both image stores for answers about the reference', async () => {
+      const { docker, runner } = adapter(
+        daemon({
+          'foo/Bar': 'Error response from daemon: invalid reference format: repository name (library/foo/Bar) must be lowercase',
+          a1b2: 'Error response from daemon: multiple IDs found with provided prefix: a1b2',
+          c3d4: 'Error response from daemon: ambiguous reference: c3d4',
+          gone: 'Error response from daemon: No such image: gone:latest',
+        }),
+      );
+      const result = await docker.inspectImageNames(['foo/Bar', 'a1b2', 'c3d4', 'gone', 'postgres:16']);
+      expect(unchecked(result)).toEqual(['foo/Bar invalid', 'a1b2 invalid', 'c3d4 invalid']);
+      expect(result.images).toHaveLength(1);
+      expect(runner.calls).toHaveLength(6);
+    });
+
+    it('asks no more after a daemon error of a batch, and names every reference transient', async () => {
+      const references = Array.from({ length: 250 }, (_, i) => `r${i}:1`);
+      const { docker, runner } = adapter(daemon({ 'r0:1': 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?' }));
+      const result = await docker.inspectImageNames(references);
+      // Before: the batch was inspected one by one (100 calls), then the next batches.
+      expect(runner.calls).toHaveLength(1);
+      expect(result.unchecked).toHaveLength(250);
+      expect(result.unchecked.every((entry) => entry.reason === 'transient')).toBe(true);
+    });
+
+    it('asks no more after a timed-out batch', async () => {
+      const references = Array.from({ length: 250 }, (_, i) => `r${i}:1`);
+      const { docker, runner } = adapter((call) => (call.args.includes('r100:1') ? { exitCode: null, stdout: '', stderr: '', timedOut: true } : daemon({})(call)));
+      const result = await docker.inspectImageNames(references);
+      // Before: the third batch was asked too (and each batch after a timeout waited up to 60 s).
+      expect(runner.calls).toHaveLength(2);
+      expect(result.images).toHaveLength(100);
+      expect(unchecked(result)).toEqual(references.slice(100).map((ref) => `${ref} transient`));
+    });
+
+    it('stops the single calls at the first daemon error or unknown answer', async () => {
+      const { docker, runner } = adapter(daemon({ 'a:1': 'Error response from daemon: multiple IDs found with provided prefix: a', 'b:1': 'error during connect: EOF' }));
+      const result = await docker.inspectImageNames(['a:1', 'b:1', 'c:1', 'd:1']);
+      // The batch mixes an answer about a reference with a connection error: no single calls.
+      expect(runner.calls).toHaveLength(1);
+      expect(unchecked(result)).toEqual(['a:1 transient', 'b:1 transient', 'c:1 transient', 'd:1 transient']);
+      let calls = 0;
+      const flaky = adapter((call) => {
+        calls++;
+        // The batch fails for an invalid reference; the second single call hits a daemon that restarts.
+        if (calls === 3) return fail('Error response from daemon: something unknown happened');
+        return daemon({ 'x/Y': 'invalid reference format' })(call);
+      });
+      const second = await flaky.docker.inspectImageNames(['x/Y', 'b:1', 'c:1', 'd:1']);
+      expect(flaky.runner.calls).toHaveLength(3);
+      expect(unchecked(second)).toEqual(['x/Y invalid', 'b:1 transient', 'c:1 transient', 'd:1 transient']);
+    });
+
+    it(`makes at most ${MAX_IMAGE_INSPECT_SINGLE_CALLS} single calls; the references beyond are transient`, async () => {
+      // One reference of each batch that Docker calls invalid: before, all 1000 references were inspected one by one.
+      const references = Array.from({ length: 1000 }, (_, i) => (i % 100 === 0 ? `bad${i}` : `r${i}:1`));
+      const answers = Object.fromEntries(references.filter((ref) => ref.startsWith('bad')).map((ref) => [ref, 'Error response from daemon: invalid reference format']));
+      const { docker, runner } = adapter(daemon(answers));
+      const result = await docker.inspectImageNames(references);
+      expect(runner.calls).toHaveLength(2 + MAX_IMAGE_INSPECT_SINGLE_CALLS);
+      // The first batch uses up the single calls; the second batch fails too, and its references and all after it are
+      // not checked.
+      expect(unchecked(result).slice(0, 2)).toEqual(['bad0 invalid', 'bad100 transient']);
+      expect(result.unchecked.filter((entry) => entry.reason === 'transient')).toHaveLength(900);
+      expect(result.images).toHaveLength(99);
+    });
+
+    it('passes the signal to each call and stops between the single calls when it aborts', async () => {
+      const controller = new AbortController();
+      const { docker, runner } = adapter((call) => {
+        if (runner.calls.length === 3) controller.abort();
+        return daemon({ 'x/Y': 'invalid reference format' })(call);
+      });
+      const error = await docker.inspectImageNames(['x/Y', 'b:1', 'c:1', 'd:1', 'e:1'], controller.signal).catch((e: unknown) => e);
+      expect(isAbortError(error)).toBe(true);
+      // Before: all four single calls ran, without the signal.
+      expect(runner.calls).toHaveLength(3);
+      expect(runner.calls.every((call) => call.options.signal === controller.signal)).toBe(true);
+    });
+
+    it('does not throw when the Docker CLI cannot be started (dockerNotInstalled)', async () => {
+      const runner = new FakeRunner(() => ok());
+      const docker = new ContainerAdapter(runner, undefined, {}, silentLogger, 'linux');
+      // Before: the UserFacingError of run, although the doc comment said "Never throws".
+      expect(unchecked(await docker.inspectImageNames(['a:1', 'b:1']))).toEqual(['a:1 transient', 'b:1 transient']);
+      expect(runner.calls).toHaveLength(0);
+      const gone = adapter(() => {
+        throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+      });
+      expect(unchecked(await gone.docker.inspectImageNames(['a:1']))).toEqual(['a:1 transient']);
     });
   });
 
@@ -1131,6 +1249,37 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
     });
     expect((await docker.listProjectContainers('devenv-3f2a9c1e')).map((c) => c.id)).toEqual(['run1']);
     expect(runner.calls[0].args).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=com.docker.compose.project=devenv-3f2a9c1e', '--format', '{{json .ID}}']);
+  });
+
+  it('reads the subpaths of volumes that each container mounts, with one inspect for all (review round 11, G3, G4)', async () => {
+    const db = {
+      ...containerJson({ id: 'db1', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      // As Docker 27 prints a container that Compose created with a volume subpath: HostConfig.Mounts names the volume in
+      // Source; Mounts (the mount points) has no subpath.
+      HostConfig: {
+        Mounts: [
+          { Type: 'volume', Source: 'acme-api-3f2a9c1e', Target: '/var/lib/postgresql/data', VolumeOptions: { NoCopy: true, Subpath: 'api/data/pg' } },
+          { Type: 'volume', Source: 'acme-api-3f2a9c1e', Target: '/init.sql', ReadOnly: true, VolumeOptions: { Subpath: 'api/init.sql' } },
+          { Type: 'volume', Source: 'devenv-3f2a9c1e_cache', Target: '/cache', VolumeOptions: {} },
+          { Type: 'bind', Source: '/etc/hosts', Target: '/x' },
+        ],
+      },
+      Mounts: [{ Type: 'volume', Name: 'acme-api-3f2a9c1e', Source: '/var/lib/docker/volumes/acme-api-3f2a9c1e/_data', Destination: '/var/lib/postgresql/data', RW: true }],
+    };
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db1', 'dev1']));
+      return ok(inspectOutput([db, containerJson({ id: 'dev1', name: 'acme-api-3f2a9c1e', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } })]));
+    });
+    const containers = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(containers[0].volumeSubpaths).toEqual([
+      { volume: 'acme-api-3f2a9c1e', subpath: 'api/data/pg', readOnly: false },
+      { volume: 'acme-api-3f2a9c1e', subpath: 'api/init.sql', readOnly: true },
+    ]);
+    expect(containers[1].volumeSubpaths).toBeUndefined();
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ['ps', '-a'],
+      ['container', 'inspect'],
+    ]);
   });
 
   it('lists the networks of the project by its label', async () => {

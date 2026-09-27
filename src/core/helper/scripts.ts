@@ -13,7 +13,7 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // The only copies in the volume are the token file of the dev container and the sign-in of the GitHub CLI there
 // (GIT_FILES_SCRIPT, both mode 0600); REMOVE_GIT_TOKEN_SCRIPT removes both.
-import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, SERVICE_PATH_ARGUMENTS, servicePrunePatterns } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, servicePathArguments, type ServiceFolders } from '../git/gitSummary';
 import { CONFIG_FOLDER, GH_CONFIG_FOLDER, GH_HOSTS_FILE, GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
@@ -145,8 +145,8 @@ echo "The repository is in $target."
 `;
 
 /**
- * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find
- * -path` patterns of the paths that the other services of Docker Compose mount (servicePrunePatterns), which the
+ * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find`
+ * test of the paths that the other services of Docker Compose mount (servicePathArguments, review round 11), which the
  * restore of the owner leaves out with their content, except (review round 10, D10-3) their files and folders of root,
  * which `git switch` wrote (SERVICE_OWNER_FIX). Token on stdin.
  * Fetches the branches of https://github.com/<owner>/<repository>.git into refs/remotes/origin (the same result as
@@ -161,7 +161,7 @@ dir="$1"
 branch="$2"
 repo="$3"
 shift 3
-${SERVICE_OWNER_FIX}${SERVICE_PATH_ARGUMENTS}check_repository "$repo"
+${SERVICE_OWNER_FIX}check_repository "$repo"
 check_branch "$branch"
 if [ -z "$branch" ]; then
   fail 2 'No branch name.'
@@ -937,8 +937,8 @@ export function removeGitTokenCommand(): string[] {
 }
 
 /** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */
-export function switchBranchCommand(repoFolder: string, branch: string, repository: string, serviceFolders?: readonly string[]): string[] {
-  return ['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', repoFolder, branch, repository, ...servicePrunePatterns(repoFolder, serviceFolders)];
+export function switchBranchCommand(repoFolder: string, branch: string, repository: string, serviceFolders?: ServiceFolders): string[] {
+  return ['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', repoFolder, branch, repository, ...servicePathArguments(repoFolder, serviceFolders)];
 }
 
 export function listConfigsCommand(repoFolder: string): string[] {

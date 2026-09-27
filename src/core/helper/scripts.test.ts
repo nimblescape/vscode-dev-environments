@@ -787,11 +787,16 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     // Review round 10, D10-3: in these paths the files of root get the owner too (before: `-path P -prune -o` for each).
     const inPaths = `-path ${repoFolder}/data/postgres -o -path ${repoFolder}/data/postgres/* -o -path ${repoFolder}/-data/my db -o -path ${repoFolder}/-data/my db/*`;
     expect(result.log).toContain(`find ${repoFolder} -xdev ( ( ${inPaths} ) -user 0 -o ! ( ${inPaths} ) ( ! -user 1000 -o ! -group 1000 ) ) -exec chown -h 1000:1000`);
+    // Review round 11, G5: the ready arguments of find (servicePathArguments), in place of the patterns.
     expect(switchBranchCommand('/workspaces/api', 'dev', 'acme/api', ['/workspaces/api/data/postgres']).slice(4)).toEqual([
       '/workspaces/api',
       'dev',
       'acme/api',
+      '-path',
       '/workspaces/api/data/postgres',
+      '-o',
+      '-path',
+      '/workspaces/api/data/postgres/*',
     ]);
   });
 

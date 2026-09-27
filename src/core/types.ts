@@ -122,8 +122,19 @@ export interface Environment {
    * a container may still mount a path of it: an `up` adds the paths of its model; only an `up` before which no
    * container of another service exists (all of them were removed) replaces it. The ownership fixes after `up` and of
    * Switch branch… leave the data of the services there alone, and the question of Delete names them.
+   * Review round 11 (G3, G4, G5): the record of the list that the pipeline computes from facts at each `up`
+   * (boundServiceFolders): the paths of the model, the paths that the existing containers of the other services mount
+   * (their volume subpaths), and the recorded paths of earlier models while they still exist in the volume; at most
+   * MAX_SERVICE_FOLDERS. Before an `up` it only grows (a failed `up` leaves the containers of the earlier models); after
+   * it, a path that no model, no container, and no file names any more is dropped. reconcileFromVolumes fills it from
+   * the mounts of the containers that it finds.
    */
   serviceFolders?: string[];
+  /**
+   * Review round 11 (G5): the list had more than MAX_SERVICE_FOLDERS paths, so not all are recorded: the ownership fixes
+   * leave the whole repository to the services (only the files of root get their owner). It stays set.
+   */
+  serviceFoldersOverflow?: boolean;
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
   /**

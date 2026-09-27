@@ -11,7 +11,16 @@ import { isBusyMarkLive } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { gitSummaryCommand, ownershipFixCommand, parseGitSummaryOutput } from '../git/gitSummary';
+import {
+  MAX_SERVICE_FOLDERS,
+  boundServiceFolders,
+  existingPathsCommand,
+  gitSummaryCommand,
+  ownershipFixCommand,
+  parseExistingPaths,
+  parseGitSummaryOutput,
+  type ServiceFolders,
+} from '../git/gitSummary';
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
 import {
   COMPOSE_DEV_DOCKERFILE,
@@ -48,6 +57,8 @@ import {
   foreignVolumeName,
   imageIdItem,
   imageUncheckedItem,
+  imageInvalidReferenceItem,
+  isValidImageReference,
   imageReferenceFinding,
   imageIdResolvedReferences,
   type NamedImageReference,
@@ -141,6 +152,8 @@ import {
   composeMountVolumes,
   composeRecordOf,
   serviceFoldersOf,
+  liveServiceFolders,
+  repositoryServiceDataFolders,
   configHash,
   containerIsCurrent,
   digestReference,
@@ -462,7 +475,12 @@ interface PipelineContext {
    * Review round 9 (D9-1): the paths of the repository that the other services of the Docker Compose model of this run
    * mount (composeUpModel's `serviceFolders`), set by runComposeUp.
    */
-  serviceFolders?: string[];
+  modelServiceFolders?: string[];
+  /**
+   * Review round 11 (G3, G4, G5): what the ownership fix after a resumed clone leaves to the services, computed by
+   * runComposeUp before `up` (the paths of the model, of the existing containers, and the recorded ones).
+   */
+  serviceFolders?: ServiceFolders;
   /** This run holds a busy mark. */
   busy: boolean;
   /** The workspace helper image could not be prepared (for example offline after an extension update). */
@@ -776,6 +794,9 @@ function tooLargeError(reason: string): AnalysisFailedError {
   // Review round 10 (P10-3): a size limit, which the same configuration always exceeds.
   return new AnalysisFailedError({ kind: 'size', reason });
 }
+
+/** Review round 11 (G3): the most characters of the paths of one EXISTING_PATHS_SCRIPT call (existingServiceFolders). */
+const EXISTING_PATHS_CHARACTERS = 16 * 1024;
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
 const VIEWER_TIMEOUT_MS = 5_000;
@@ -1704,37 +1725,56 @@ export class EnvironmentService {
    * also one of another environment. A reference whose image does not exist locally is left (the pull or the build
    * fails, or it is pulled by its name). Review round 10 (P10-1): a reference that Docker cannot inspect for another
    * reason is refused too (imageUncheckedItem).
+   * Review round 11 (G1, G2): a reference that is not valid in Docker's grammar is refused before any inspect
+   * (imageInvalidReferenceItem). Only a definitive answer of Docker about a reference (`invalid`) is an item of the
+   * configuration (remembered when it refuses an update); when Docker could not answer (`transient`: a timeout, a daemon
+   * that cannot be reached, an unknown error), the check failed: AnalysisFailedError of kind `internal` (P9-1: still no
+   * new or changed configuration is used, an existing environment starts, and a refused update is not remembered).
    */
   private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
     const named: NamedImageReference[] = [];
+    const invalid: string[] = [];
     const seen = new Set<string>();
     for (const entry of references) {
       if (seen.has(`${entry.what} ${entry.reference}`) || imageReferenceFinding(entry.reference, entry.what) !== undefined) continue;
       seen.add(`${entry.what} ${entry.reference}`);
-      named.push(entry);
+      if (isValidImageReference(entry.reference)) named.push(entry);
+      else invalid.push(imageInvalidReferenceItem(entry.reference, entry.what));
     }
+    if (invalid.length > 0) this.logger.warn(`Image references that are not valid: ${invalid.join(', ')}.`);
     const distinct = [...new Set(named.map((entry) => entry.reference))];
-    if (distinct.length === 0) return [];
+    if (distinct.length === 0) return invalid;
     // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
     if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
     this.throwIfCancelled(signal);
     // Review round 10 (P10-1): a reference that Docker cannot inspect (for another reason than a missing image) is
     // refused as not checked, never left: one invalid reference no longer leaves the others of its batch unchecked
-    // (inspectImageNames inspects them one by one), and an answer that cannot be read leaves none of them.
-    const { images, unchecked } = await this.deps.docker
-      .inspectImageNames(distinct)
-      .catch((error: unknown) => {
-        this.logger.warn(`The local images of the image references could not be read: ${errorMessage(error)}`);
-        return { images: [], unchecked: distinct };
-      });
+    // (inspectImageNames inspects them one by one). Review round 11 (G1, G2): inspectImageNames throws only when
+    // cancelled; the catch is for a Docker port that throws anyway.
+    const { images, unchecked } = await this.deps.docker.inspectImageNames(distinct, signal).catch((error: unknown) => {
+      if (this.isCancellation(error, signal)) {
+        this.throwIfCancelled(signal);
+        throw error;
+      }
+      this.logger.warn(`The local images of the image references could not be read: ${errorMessage(error)}`);
+      return { images: [], unchecked: distinct.map((reference) => ({ reference, reason: 'transient' as const })) };
+    });
     this.throwIfCancelled(signal);
+    const transient = unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference);
+    if (transient.length > 0) {
+      const shown = transient.slice(0, 5).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
+      throw new AnalysisFailedError({ kind: 'internal', reason: `Docker could not inspect the image references ${shown}` });
+    }
     const byId = new Set(imageIdResolvedReferences(distinct, images));
-    const notChecked = new Set(unchecked);
+    const notChecked = new Set(unchecked.map((entry) => entry.reference));
     if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
-    return named.flatMap((entry) => [
-      ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
-      ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
-    ]);
+    return [
+      ...invalid,
+      ...named.flatMap((entry) => [
+        ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
+        ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
+      ]),
+    ];
   }
 
   /** What composeBuildModel and composeUpModel need to know about the environment. */
@@ -2571,13 +2611,8 @@ export class EnvironmentService {
       ctx.steps.detail(Messages.containerComposeReplaced);
       await this.removeComposeServices(ctx);
     }
-    // Review round 10 (D10-1): no container of another service is left, so none mounts a path of the repository.
-    if (serviceFoldersOf(ctx.env).length > 0) {
-      await this.updateEntry(ctx, (entry) => {
-        delete entry.serviceFolders;
-        if (entry.buildRecord && isRecord(entry.buildRecord.compose)) delete entry.buildRecord.compose.serviceFolders;
-      });
-    }
+    // Review round 11 (G3): the recorded paths of the services stay (before, round 10 cleared them here): their data is
+    // still in the volume. finish drops those that no longer exist.
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
       result = await this.deps.helper.up({
@@ -2666,8 +2701,12 @@ export class EnvironmentService {
       configPath: env.configPath,
     });
     // Review round 10 (D10-1): before `up` (also before the first build record, so that a failed `up` leaves them
-    // recorded); the recorded list only shrinks when no container of another service exists before this `up`.
-    await this.recordServiceFolders(ctx, serviceFolders ?? [], !(await this.otherServiceContainersExist(env, compose)));
+    // recorded). Review round 11 (G3, G4): with the paths that the existing containers mount; the list never shrinks
+    // before `up` (after it, finish drops what nothing names any more).
+    ctx.modelServiceFolders = serviceFolders ?? [];
+    const before = await this.serviceFolderFacts(ctx.env, ctx.modelServiceFolders);
+    ctx.serviceFolders = before.overflow ? 'repository' : before.folders;
+    await this.recordServiceFolders(ctx, before);
     if (rewrites.length > 0) {
       this.logger.info(`Changed in the Docker Compose model of ${env.repository}: ${rewrites.map((rewrite) => `${rewrite.item} (${rewrite.reason})`).join(', ')}.`);
     }
@@ -2732,45 +2771,143 @@ export class EnvironmentService {
   }
 
   /**
-   * Review round 9 (D9-1): the paths of the repository that the other services of the model of this `up` mount
-   * (composeUpModel's `serviceFolders`): kept for the ownership fix after `up`, and recorded for Switch branch… and Delete.
-   * Review round 10 (D10-1): in Environment.serviceFolders, written before `up` whether or not a build record exists; with
-   * `replace` false (a container of another service exists, which `up` may keep with the mounts of an earlier model, for
-   * example `up --no-recreate` after "Rebuild later", or a failed `up`) the union of the recorded list and `folders`, so
-   * the list never shrinks while such a container may mount a path of it; with `replace` (no such container exists: every
-   * one that `up` creates has the mounts of this model) `folders`. The list of a build record of review round 9 is taken
-   * over into it.
+   * Review round 11 (G3, G4, G5): the paths of the repository that the ownership fixes leave to the services, computed
+   * from facts (boundServiceFolders), in this order: `model` (the paths of the model of this run, with their real
+   * paths), the paths that the existing containers of the other services mount (liveServiceFolders; read with the list of
+   * the containers, one `docker inspect` for all of them), and the recorded paths (Environment.serviceFolders, of earlier
+   * runs). With `existing` (after `up`, in the running dev container), a recorded path that neither the model nor a
+   * container names is kept only while it still exists in the volume (existingServiceFolders). When the containers cannot
+   * be read, the recorded list is kept whole: it never shrinks on an error.
    */
-  private async recordServiceFolders(ctx: PipelineContext, folders: string[], replace: boolean): Promise<void> {
-    const recorded = serviceFoldersOf(ctx.env);
-    const next = [...new Set(replace ? folders : [...recorded, ...folders])];
-    ctx.serviceFolders = next;
+  private async serviceFolderFacts(
+    env: Environment,
+    model: readonly string[],
+    existing?: { ctx: PipelineContext; container: string },
+  ): Promise<{ folders: string[]; overflow: boolean }> {
+    const repoFolder = repositoryFolder(env.repository);
+    let live: string[] | undefined;
+    try {
+      live = liveServiceFolders(await this.composeContainers(env), env);
+    } catch (error) {
+      if (existing !== undefined && this.isCancellation(error, existing.ctx.signal)) throw error;
+      this.logger.warn(`The mounts of the containers of the Docker Compose project of ${env.repository} could not be read: ${errorMessage(error)}`);
+    }
+    let recorded = serviceFoldersOf(env);
+    if (existing !== undefined && live !== undefined) {
+      const named = new Set([...model, ...live]);
+      const retired = recorded.filter((folder) => !named.has(folder));
+      if (retired.length > 0) {
+        const found = await this.existingServiceFolders(existing.ctx, existing.container, retired);
+        if (found !== undefined) {
+          const dropped = retired.filter((folder) => !found.has(folder));
+          if (dropped.length > 0) this.logger.info(`No longer in the volume of ${env.repository}, so no longer left to the services: ${dropped.join(', ')}.`);
+          recorded = recorded.filter((folder) => named.has(folder) || found.has(folder));
+        }
+      }
+    }
+    const result = boundServiceFolders(repoFolder, [model, live, recorded], env.serviceFoldersOverflow === true);
+    if (result.overflow && env.serviceFoldersOverflow !== true) {
+      this.logger.warn(
+        `More than ${MAX_SERVICE_FOLDERS} paths of ${env.repository} are mounted by other services: the ownership fixes give only the files of root in the repository their owner.`,
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Review round 11 (G3): of `folders`, those that exist in the volume (EXISTING_PATHS_SCRIPT with `docker exec -u root`
+   * in the running dev container `container`); `undefined` when that fails (the caller keeps them all).
+   */
+  private async existingServiceFolders(ctx: PipelineContext, container: string, folders: readonly string[]): Promise<Set<string> | undefined> {
+    const found = new Set<string>();
+    // In calls of at most EXISTING_PATHS_CHARACTERS characters of paths (the command line on Windows).
+    const batches: string[][] = [[]];
+    let characters = 0;
+    for (const folder of folders) {
+      if (characters + folder.length > EXISTING_PATHS_CHARACTERS && batches[batches.length - 1].length > 0) {
+        batches.push([]);
+        characters = 0;
+      }
+      batches[batches.length - 1].push(folder);
+      characters += folder.length + 1;
+    }
+    try {
+      for (const batch of batches) {
+        const result = await this.deps.docker.exec(container, existingPathsCommand(batch), { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+        if (result.exitCode !== 0) {
+          this.logger.warn(`The recorded paths of the services of ${ctx.env.repository} could not be checked: ${(result.stderr || result.stdout).trim()}`);
+          return undefined;
+        }
+        for (const folder of parseExistingPaths(result.stdout)) found.add(folder);
+      }
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The recorded paths of the services of ${ctx.env.repository} could not be checked: ${errorMessage(error)}`);
+      return undefined;
+    }
+    return found;
+  }
+
+  /**
+   * Review round 9 (D9-1), round 10 (D10-1), round 11 (G3, G5): writes `facts` (serviceFolderFacts) to
+   * Environment.serviceFolders and Environment.serviceFoldersOverflow when they differ. The list of a build record of
+   * review round 9 is taken over into it.
+   */
+  private async recordServiceFolders(ctx: PipelineContext, facts: { folders: string[]; overflow: boolean }): Promise<void> {
+    const next = facts.folders;
     const own = ctx.env.serviceFolders ?? [];
     const legacy = composeRecordOf(ctx.env.buildRecord)?.serviceFolders !== undefined;
-    if (!legacy && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
-    if (replace && recorded.length > 0) {
-      this.logger.info(`No container of another service of ${ctx.env.repository} exists: the paths of the repository that they mount are those of the model now.`);
-    }
+    const sameOverflow = (ctx.env.serviceFoldersOverflow === true) === facts.overflow;
+    if (!legacy && sameOverflow && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
     await this.updateEntry(ctx, (entry) => {
       if (next.length > 0) entry.serviceFolders = [...next];
       else delete entry.serviceFolders;
+      if (facts.overflow) entry.serviceFoldersOverflow = true;
+      else delete entry.serviceFoldersOverflow;
       if (entry.buildRecord && isRecord(entry.buildRecord.compose)) delete entry.buildRecord.compose.serviceFolders;
     });
   }
 
   /**
-   * Review round 10 (D10-1): whether a container of the Docker Compose project of the environment exists other than the
-   * dev container of `compose` (a container of another service, of this or an earlier model). `true` when it cannot be
-   * read, so that the recorded paths of the services are kept.
+   * Review round 11 (G3, G4, G5): after `up` (finish), the list of the paths of the services from facts, written back to
+   * the entry, for the ownership fix after `up`. `undefined` for an environment that neither is of Docker Compose nor has
+   * recorded paths.
    */
-  private async otherServiceContainersExist(env: Environment, compose: LoadedCompose): Promise<boolean> {
+  private async refreshServiceFolders(ctx: PipelineContext, container: string, loaded: LoadedConfiguration | undefined): Promise<ServiceFolders | undefined> {
+    const env = ctx.env;
+    const compose = loaded?.compose !== undefined || ctx.composeContainer === true || ctx.modelServiceFolders !== undefined;
+    if (!compose && serviceFoldersOf(env).length === 0 && env.serviceFoldersOverflow !== true) return undefined;
+    const facts = await this.serviceFolderFacts(env, ctx.modelServiceFolders ?? [], { ctx, container });
+    await this.recordServiceFolders(ctx, facts);
+    return facts.overflow ? 'repository' : facts.folders;
+  }
+
+  /**
+   * Review round 11 (G4, G5): what Switch branch… leaves to the services: the recorded paths and those that the existing
+   * containers of the other services mount (also for an entry without a record, for example one that
+   * reconcileFromVolumes restored).
+   */
+  private async switchServiceFolders(env: Environment): Promise<ServiceFolders> {
+    const facts = await this.serviceFolderFacts(env, []);
+    return facts.overflow ? 'repository' : facts.folders;
+  }
+
+  /**
+   * Review round 9 (D9-2), round 11 (G3, G4): the paths of the repository with data of the services, relative to the
+   * repository folder (`./data/postgres`), for the confirmation of Delete: the recorded paths and those that the existing
+   * containers of the other services mount. Never throws: without Docker, the recorded paths.
+   */
+  async repositoryServiceData(environmentId: string): Promise<string[]> {
+    const env = await this.deps.registry.get(environmentId);
+    if (!env) return [];
+    let folders: string[];
     try {
-      const containers = await this.composeContainers(env);
-      return containers.some((container) => container.name !== env.containerName && container.labels['com.docker.compose.service'] !== compose.service);
+      folders = (await this.serviceFolderFacts(env, [])).folders;
     } catch (error) {
-      this.logger.warn(`The containers of the Docker Compose project of ${env.repository} could not be listed: ${errorMessage(error)}`);
-      return true;
+      this.logger.warn(`The paths of the services of ${env.repository} could not be read: ${errorMessage(error)}`);
+      folders = serviceFoldersOf(env);
     }
+    return repositoryServiceDataFolders({ repository: env.repository, serviceFolders: folders });
   }
 
   /**
@@ -3224,9 +3361,11 @@ export class EnvironmentService {
       configRemoteUser(loaded?.config, loaded?.compose ? undefined : stringList(loaded?.config.runArgs));
     const folder = repositoryFolder(env.repository);
 
+    // Review round 11 (G3, G4, G5): the paths of the services from facts, written back after each `up`.
+    const serviceFolders = await this.refreshServiceFolders(ctx, containerRef, loaded);
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
       // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner).
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser, ctx.serviceFolders ?? serviceFoldersOf(env));
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, serviceFolders);
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
       // is still root when the ownership fix before `up` did not run or failed.
       await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
@@ -3304,10 +3443,14 @@ export class EnvironmentService {
   }
 
   /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */
-  private async fixOwnership(ctx: PipelineContext, container: string, folder: string, user: string, serviceFolders?: readonly string[]): Promise<void> {
-    this.logger.info(
-      `Giving the files in ${folder} to ${user}${serviceFolders !== undefined && serviceFolders.length > 0 ? `, except ${serviceFolders.join(', ')} (mounted by other services)` : ''}.`,
-    );
+  private async fixOwnership(ctx: PipelineContext, container: string, folder: string, user: string, serviceFolders?: ServiceFolders): Promise<void> {
+    const except =
+      serviceFolders === 'repository'
+        ? ' of root only (more paths of the repository are mounted by other services than the ownership fix can name)'
+        : serviceFolders !== undefined && serviceFolders.length > 0
+          ? `, except ${serviceFolders.length > 20 ? `${serviceFolders.slice(0, 20).join(', ')} and ${serviceFolders.length - 20} more` : serviceFolders.join(', ')} (mounted by other services)`
+          : '';
+    this.logger.info(`Giving the files in ${folder} to ${user}${except}.`);
     try {
       const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user, serviceFolders), {
         user: 'root',
@@ -3618,8 +3761,9 @@ export class EnvironmentService {
             branch,
             token,
             // Review round 9 (D9-1): the restore of the owner leaves out the paths that the other services mount.
-            // Review round 10 (D10-1): all that their containers may mount (Environment.serviceFolders).
-            serviceFolders: serviceFoldersOf(env),
+            // Review round 10 (D10-1): all that their containers may mount (Environment.serviceFolders). Review round 11
+            // (G4): also the paths that the existing containers mount, for an entry without a record too.
+            serviceFolders: await this.switchServiceFolders(env),
             onOutput: this.output,
             signal: options.signal,
           })
@@ -3915,6 +4059,16 @@ export class EnvironmentService {
         .filter((volume) => labelled.includes(volume.name) && volume.labels[LABEL_SERVICE_DATA] === SERVICE_DATA)
         .map((volume) => volume.name);
       if (serviceVolumes.length > 0) candidate.serviceVolumes = serviceVolumes;
+      // Review round 11 (G4): the paths of the repository that the containers of the other services mount, so that
+      // Switch branch… and the ownership fixes leave their data alone before the next open writes the list.
+      const serviceFolders = boundServiceFolders(repositoryFolder(candidate.repository), [
+        liveServiceFolders(
+          containers.filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id),
+          candidate,
+        ),
+      ]);
+      if (serviceFolders.folders.length > 0) candidate.serviceFolders = serviceFolders.folders;
+      if (serviceFolders.overflow) candidate.serviceFoldersOverflow = true;
       // Review round 4 (D4-2): the configuration path of the label devenv.config-path of its dev container, when it is a
       // configuration path of a repository (isConfigPathLabelValue); else the default one. Review round 6 (S6-2): only the
       // dev container (a container without devenv.compose-service) counts; the label of another service can come from its
