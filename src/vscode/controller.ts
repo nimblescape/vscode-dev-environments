@@ -12,6 +12,7 @@ import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import type { WorkspaceHelper } from '../core/helper/workspaceHelper';
+import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
@@ -108,7 +109,7 @@ export interface ControllerDeps {
   /** Requests of other windows to close this window's connection first (concept 6.2 Stop, 7.14). */
   disconnectRequests: DisconnectRequests;
   docker: ContainerAdapter;
-  /** The workspace helper, which removes the token of the owner account from the volume (concept 7.5). */
+  /** The workspace helper, which removes the token of versions before unit 15 from the volume (concept 7.5). */
   helper: Pick<WorkspaceHelper, 'removeGitToken'>;
   service: EnvironmentService;
   discovery: DiscoveryService;
@@ -193,7 +194,7 @@ interface WindowEnvironment {
 interface LeftEnvironment {
   environmentId: string;
   containerName: string;
-  /** The workspace volume, which holds the token of the owner account. */
+  /** The workspace volume, which held the token of the owner account before unit 15. */
   volumeName: string;
   repository: string;
   reason: 'account' | 'outdated';
@@ -1751,16 +1752,18 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Concept 7.5: the token of the owner account leaves the environment that the signed-in account may not use, so that
-   * Git and the GitHub CLI there cannot work as the owner while a window keeps its connection. The workspace helper
-   * removes the token file and the sign-in of the GitHub CLI from the volume (REMOVE_GIT_TOKEN_SCRIPT): it needs no tool
-   * of the image of the dev container, no rights in it (a configuration may take them away, for example `--cap-drop
-   * ALL`), and works also when the container is stopped (its volume still holds the token). The credential helper of the
-   * container then gives nothing; the next open of the owner writes the token again (section 9). Best effort: the result
-   * is logged. A missing volume holds no token (and the helper would create an empty one).
+   * Git and the GitHub CLI there cannot work as the owner while a window keeps its connection. Unit 15: first from the
+   * memory of the dev container when it runs (removeContainerToken: TOKEN_REMOVE_SCRIPT with `docker exec`, as root, or
+   * as the remote user of the entry when root may not), then from the volume, where versions before unit 15 kept it (the
+   * workspace helper, REMOVE_GIT_TOKEN_SCRIPT: it needs no tool of the image and works also when the container is
+   * stopped). The credential helper of the container then gives nothing; the next open of the owner writes the token
+   * again (section 9). Best effort: the results are logged. A missing volume holds no token (and the helper would create
+   * an empty one).
    */
   private async removeGitToken(left: LeftEnvironment): Promise<void> {
     const { containerName, volumeName } = left;
     if (!this.deps.docker.isInstalled()) return;
+    await this.removeContainerGitToken(left);
     try {
       if (!(await this.deps.docker.volumeExists(volumeName))) {
         this.logger.info(`The volume ${volumeName} of the container ${containerName} does not exist: it holds no GitHub token.`);
@@ -1770,6 +1773,27 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The GitHub token was removed from the volume ${volumeName} of the container ${containerName}.`);
     } catch (error) {
       this.logger.warn(`The GitHub token could not be removed from the volume ${volumeName} of the container ${containerName}: ${errorMessage(error)}`);
+    }
+  }
+
+  /** Unit 15: removeGitToken in the memory of the dev container, when it runs. */
+  private async removeContainerGitToken(left: LeftEnvironment): Promise<void> {
+    const { containerName } = left;
+    try {
+      const container = await this.deps.docker.findContainer(left.environmentId, containerName);
+      if (container?.state !== 'running') {
+        this.logger.info(`The container ${containerName} does not run: its memory holds no GitHub token.`);
+        return;
+      }
+      const entry = await this.deps.registry.get(left.environmentId).catch(() => undefined);
+      await removeContainerToken((c, command, options) => this.deps.docker.exec(c, command, options), {
+        container: container.id,
+        user: entry?.remoteUser,
+        timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS,
+      });
+      this.logger.info(`The GitHub token was removed from the container ${containerName}.`);
+    } catch (error) {
+      this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${errorMessage(error)}`);
     }
   }
 

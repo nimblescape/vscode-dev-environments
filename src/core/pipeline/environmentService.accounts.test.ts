@@ -130,12 +130,15 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
       [first.volumeName, TOKEN],
       [second.volumeName, OTHER_TOKEN],
     ]);
-    expect(h.helper.gitPreparations.map((call) => [call.volumeName, call.token, call.identity.email])).toEqual([
-      [first.volumeName, TOKEN, '1001+octo@users.noreply.github.com'],
-      [second.volumeName, OTHER_TOKEN, '2002+someone@users.noreply.github.com'],
+    // unit 15: changed expectation, the volume gets the Git configuration only; the token goes into the memory of the
+    // container (tokenWrites).
+    expect(h.helper.gitPreparations.map((call) => [call.volumeName, call.identity.email])).toEqual([
+      [first.volumeName, '1001+octo@users.noreply.github.com'],
+      [second.volumeName, '2002+someone@users.noreply.github.com'],
     ]);
+    expect(h.docker.tokenWrites().map((write) => write.token)).toEqual([TOKEN, OTHER_TOKEN]);
     // Concept section 9: the GitHub CLI of each environment is signed in as the account that owns it, with its token.
-    expect(h.helper.gitPreparations.map((call) => call.login)).toEqual(['octo', 'someone']);
+    expect(h.docker.tokenWrites().map((write) => write.login)).toEqual(['octo', 'someone']);
     expect(h.docker.containersOf(first.id)).toHaveLength(1);
     expect(h.docker.containersOf(second.id)).toHaveLength(1);
     expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);
@@ -157,7 +160,10 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
     const again = await h.service.open(TARGET, options());
     expect(again.environment.id).toBe(first.id);
     expect(h.helper.clones).toHaveLength(2);
-    expect(h.helper.gitPreparations.at(-1)).toMatchObject({ volumeName: first.volumeName, token: TOKEN });
+    // unit 15: changed expectation, the token goes into the memory of the container of the first environment.
+    expect(h.helper.gitPreparations.at(-1)).toMatchObject({ volumeName: first.volumeName });
+    expect(h.docker.tokenWrites().at(-1)).toMatchObject({ token: TOKEN, login: 'octo' });
+    expect(h.docker.containersOf(first.id).map((container) => container.id)).toContain(h.docker.tokenWrites().at(-1)?.container);
     // Only an explicit reference to the environment of the other account is refused.
     expect((await rejection(h.service.openEnvironment(second.id, options()))).code).toBe('otherAccount');
     expect((await rejection(h.service.stop(second.id))).code).toBe('otherAccount');
@@ -215,7 +221,8 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
     };
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).toBe(ENV_ID);
-    expect(h.helper.gitPreparations.map((call) => call.token)).toEqual([TOKEN]);
+    // unit 15: changed expectation, the token of the open is written into the memory of the container.
+    expect(h.docker.tokenWrites().map((write) => write.token)).toEqual([TOKEN]);
   });
 
   it('asks for the sign-in first, because the account decides which environment is used', async () => {

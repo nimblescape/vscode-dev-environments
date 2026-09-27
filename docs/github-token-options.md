@@ -4,7 +4,7 @@ This document keeps the options for a stronger handling of the GitHub token insi
 
 ## Decided for now (2026-09-26)
 
-The user decided: **the token is kept only in the memory of the container** (planned as the next change after Docker Compose support; until then, the token is a file in the workspace volume) (a `tmpfs` inside the dev container), never in the workspace volume. It is written at each open and stays while the container runs, also without a window (for AI agents that keep working after the window disconnects). It is gone when the container stops. The token is the OAuth token of the GitHub sign-in of VS Code: it reaches every repository of the account and does not expire until it is revoked.
+The user decided: **the token is kept only in the memory of the container** (implemented in unit 15: the tmpfs `/run/devenv` inside the dev container, see concept section 9), never in the workspace volume. It is written at each open and stays while the container runs, also without a window (for AI agents that keep working after the window disconnects). It is gone when the container stops. The token is the OAuth token of the GitHub sign-in of VS Code: it reaches every repository of the account and does not expire until it is revoked.
 
 What this protects and what not:
 

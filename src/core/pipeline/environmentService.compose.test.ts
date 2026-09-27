@@ -34,6 +34,7 @@ import {
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   LABEL_VOLUME,
+  TOKEN_TMPFS,
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
@@ -54,6 +55,7 @@ import {
   FEATURE_DIGEST,
   OTHER_ID,
   REPO,
+  TOKEN,
   checked,
   createHarness,
   seedEnvironment,
@@ -263,6 +265,11 @@ describe('first open of a Docker Compose configuration', () => {
       volumes: [{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' }],
     });
     expect(m.services.app).not.toHaveProperty('build');
+    // Unit 15: the tmpfs of the token, only in the dev container; the token is written into it after `up`.
+    expect(m.services.app.tmpfs).toEqual([TOKEN_TMPFS]);
+    expect(m.services.db).not.toHaveProperty('tmpfs');
+    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ container: h.docker.containersOf(ENV_ID).find((c) => c.name === NAME)?.id, user: 'root', token: TOKEN, login: 'octo' })]);
+    expect(JSON.stringify(h.helper.ups)).not.toContain(TOKEN);
     expect(m.services.db).toMatchObject({
       pull_policy: 'missing',
       labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_COMPOSE_SERVICE]: 'db' },
@@ -335,7 +342,8 @@ describe('first open of a Docker Compose configuration', () => {
     );
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('hostAccess');
-    expect(error.message).toBe(Messages.hostAccess('service db: bind mount /workspaces → /w (the workspace volume, which holds the GitHub token)'));
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    expect(error.message).toBe(Messages.hostAccess('service db: bind mount /workspaces → /w (the workspace volume, with the repository and the Git configuration of the environment)'));
     expect(h.helper.builds).toEqual([]);
     expect(await h.registry.list()).toEqual([]);
   });

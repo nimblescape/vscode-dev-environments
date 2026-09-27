@@ -30,10 +30,17 @@ import {
 } from '../../src/core/helper/containerGit';
 import { devContainersSettings } from '../../src/core/devContainers';
 import { Messages } from '../../src/core/messages';
+import { removeContainerToken } from '../../src/core/helper/containerToken';
 import {
   CONTAINER_VERSION,
   GH_CONFIG_FOLDER,
   GH_HOSTS_FILE,
+  GH_VOLUME_CONFIG_FILE,
+  GITHUB_TOKEN_FILE,
+  LEGACY_GH_HOSTS_FILE,
+  LEGACY_GITHUB_TOKEN_FILE,
+  TOKEN_FOLDER,
+  TOKEN_TMPFS,
   LABEL_ENVIRONMENT_ID,
   LABEL_HELPER_RUN,
   LABEL_OWNER_ID,
@@ -446,21 +453,28 @@ describe('open pipeline on a seeded environment', () => {
     expect(last?.remoteEnv).toEqual(containerEnvironment());
     expect(last?.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
 
-    // The token file: mode 600, owned by the remote user, readable by it. Only it and the sign-in of the GitHub CLI
-    // (hosts.yml, the same token, the owner account) hold the token.
-    expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/github-token')).toBe(`600 ${REMOTE_USER}`);
-    expect(execIn(REMOTE_USER, 'cat /workspaces/.devenv+/github-token')).toBe(DUMMY_TOKEN);
-    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`).split('\n').sort()).toEqual(
-      ['/workspaces/.devenv+/github-token', GH_HOSTS_FILE].sort(),
-    );
+    // unit 15: changed expectation, the token file is in the tmpfs /run/devenv (in memory), not in the volume: mode 600,
+    // owned by the remote user, readable by it. Only it and the sign-in of the GitHub CLI (hosts.yml, the same token, the
+    // owner account) hold the token; the volume holds none.
+    expect(cli.container(containerName)?.HostConfig.Tmpfs).toEqual({ [TOKEN_FOLDER]: TOKEN_TMPFS.slice(TOKEN_FOLDER.length + 1) });
+    expect(execIn('root', `stat -f -c %T ${TOKEN_FOLDER}`)).toBe('tmpfs');
+    expect(execIn('root', `stat -c "%a %U" ${TOKEN_FOLDER}`)).toBe(`700 ${REMOTE_USER}`);
+    expect(execIn('root', `stat -c "%a %U" ${GITHUB_TOKEN_FILE}`)).toBe(`600 ${REMOTE_USER}`);
+    expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} || true`).split('\n').sort()).toEqual([GITHUB_TOKEN_FILE, GH_HOSTS_FILE].sort());
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('');
     expect(execIn('root', 'stat -c "%a %U" /workspaces/.devenv+/docker')).toBe(`700 ${REMOTE_USER}`);
     expect(execIn('root', `stat -c "%a %U" ${GH_CONFIG_FOLDER}`)).toBe(`700 ${REMOTE_USER}`);
     expect(execIn('root', `stat -c "%a %U" ${GH_HOSTS_FILE}`)).toBe(`600 ${REMOTE_USER}`);
     const hosts = execIn(REMOTE_USER, `cat ${GH_HOSTS_FILE}`);
     expect(hosts).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
     expect(hosts).toContain(`user: "${TEST_ACCOUNT.login}"`);
-    // No GnuPG folder of the extension: GnuPG works where the image sets it up.
-    expect(execIn('root', 'ls -A /workspaces/.devenv+').split('\n').sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig', 'github-token']);
+    // gh's settings stay in the volume: config.yml is a link there, which the remote user can write through.
+    expect(execIn('root', `readlink ${GH_CONFIG_FOLDER}/config.yml`)).toBe(GH_VOLUME_CONFIG_FILE);
+    expect(execIn(REMOTE_USER, `printf 'editor: vi\\n' > ${GH_CONFIG_FOLDER}/config.yml && cat ${GH_VOLUME_CONFIG_FILE}`)).toBe('editor: vi');
+    // No GnuPG folder of the extension: GnuPG works where the image sets it up. unit 15: no token file in the volume.
+    expect(execIn('root', 'ls -A /workspaces/.devenv+').split('\n').sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
+    expect(execIn('root', 'ls -A /workspaces/.devenv+/gh')).toBe('config.yml');
 
     // Git reads only the configuration of the container; the ~/.gitconfig of the extension includes it for Git without
     // the variables. No ~/.config/git/config of the extension.
@@ -506,7 +520,8 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('container-only Git: without the token file (removed when a window of another account leaves), Git gets no password', () => {
-    const token = '/workspaces/.devenv+/github-token';
+    // unit 15: changed expectation, the token file is in the tmpfs.
+    const token = GITHUB_TOKEN_FILE;
     execIn('root', `cp -p ${token} /tmp/devenv-token-backup && rm -f ${token}`);
     try {
       const github = credentialFill('github.com');
@@ -550,6 +565,20 @@ describe('open pipeline on a seeded environment', () => {
     expect(cli.container(containerName)?.State.Status).toBe('exited');
   });
 
+  it('unit 15: the token is gone when the container stops, and a docker start without the extension does not bring it back', () => {
+    cli.ok(['start', containerName]);
+    try {
+      expect(execIn('root', `stat -f -c %T ${TOKEN_FOLDER} && ls -A ${TOKEN_FOLDER}`)).toBe('tmpfs');
+      expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /run /workspaces /home /root /tmp 2>/dev/null || true`)).toBe('');
+      // Git gets no password, and says nothing of the token.
+      const github = credentialFill('github.com');
+      expect(github.code).not.toBe(0);
+      expect(github.out).not.toContain('password=');
+    } finally {
+      cli.ok(['stop', containerName]);
+    }
+  });
+
   it('open again with the image up to date: no pull, no build, the same container starts', async () => {
     const before = await registry.get(environmentId);
     const containerId = cli.container(containerName)?.Id;
@@ -576,9 +605,39 @@ describe('open pipeline on a seeded environment', () => {
     expect(ui.since(events)).toEqual([]);
   });
 
+  it('unit 15: after stop and start, the open writes the token into the memory of the container again', () => {
+    expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+    expect(execIn(REMOTE_USER, `cat ${GH_HOSTS_FILE}`)).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
+    expect(credentialFill('github.com').out).toContain(`password=${DUMMY_TOKEN}`);
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('');
+  });
+
+  it('unit 15: a sign-out or an account change removes the token from the memory of the running container and from the volume', async () => {
+    // As the controller does it (Controller.removeGitToken): the running dev container first, then the volume.
+    const container = cli.container(containerName);
+    expect(container?.State.Running).toBe(true);
+    await removeContainerToken((c, command, options) => docker.exec(c, command, options), { container: container!.Id, user: REMOTE_USER, timeoutMs: 30_000 });
+    await helper.removeGitToken({ volumeName, timeoutMs: 30_000 });
+    expect(execIn('root', `ls -A ${TOKEN_FOLDER}`)).toBe('');
+    expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} /workspaces || true`)).toBe('');
+    const github = credentialFill('github.com');
+    expect(github.code).not.toBe(0);
+    expect(github.out).not.toContain('password=');
+    // The next open of the owner writes it again.
+    await online.openEnvironment(environmentId, { progress: new RecordingProgress() });
+    expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+  });
+
   it('a container of an older version (without the label devenv.container-version) is created again, without a build', async () => {
     // A container as the first version of the extension created it: the ID label, the workspace volume, no version label.
     cli.ok(['rm', '-f', containerName]);
+    // unit 15: the token files that versions before unit 15 wrote into the volume.
+    const legacy = await helper.run(
+      volumeName,
+      ['sh', '-c', `mkdir -p /workspaces/.devenv+/gh && printf %s "$1" > ${LEGACY_GITHUB_TOKEN_FILE} && printf 'github.com:\\n    oauth_token: "%s"\\n' "$1" > ${LEGACY_GH_HOSTS_FILE}`, 'sh', 'gho_legacy_token'],
+      { docker: false, network: false },
+    );
+    expect(legacy.exitCode, legacy.stderr).toBe(0);
     const oldId = cli.ok([
       'create',
       '--name',
@@ -606,6 +665,10 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
     expect(container?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
     expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
+    // unit 15: the old token files left the volume; the token is in the tmpfs of the new container.
+    expect(execIn('root', `ls -A /workspaces/.devenv+ /workspaces/.devenv+/gh`)).not.toMatch(/github-token|hosts\.yml/);
+    expect(execIn('root', `grep -rl gho_legacy_token /workspaces ${TOKEN_FOLDER} || true`)).toBe('');
+    expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
     expect(containersOfEnvironment()).toHaveLength(1);
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();
     expect(untrackedFileKept()).toBe(true);
@@ -880,6 +943,10 @@ describe('open pipeline on a seeded environment', () => {
       // Without its capabilities, root may not write into the home folder of the user: the user wrote ~/.gitconfig.
       const gitconfig = cli.run(['exec', '-u', REMOTE_USER, name, 'sh', '-c', 'stat -c %U ~/.gitconfig && grep -c "^\\[include\\]" ~/.gitconfig']);
       expect(gitconfig.out, gitconfig.err).toBe(`${REMOTE_USER}\n1`);
+      // Unit 15: nor may root give the token in the tmpfs to the user: nothing is left there, and the user learns that Git
+      // in the environment could not be prepared.
+      expect(cli.run(['exec', '-u', 'root', name, 'ls', '-A', TOKEN_FOLDER]).out).toBe('');
+      expect(ui.events.some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(true);
       // Without --rm, a stop keeps the container.
       await docker.stopContainer(name);
       expect(cli.container(name)?.State.Running).toBe(false);

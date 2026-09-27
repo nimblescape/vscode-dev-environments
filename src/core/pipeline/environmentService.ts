@@ -55,7 +55,8 @@ import {
   type AnalysisResult,
   type ConfigurationAnalyzer,
 } from '../helper/configurationAnalysis';
-import { containerGitSupport, gitIdentity, homeGitConfigCommand, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
+import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
+import { writeContainerToken } from '../helper/containerToken';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import {
   foreignVolumeName,
@@ -1595,7 +1596,7 @@ export class EnvironmentService {
   /**
    * Step 5 for a Docker Compose configuration (implementation notes, section "Docker Compose"): devcontainer.json as the
    * CLI resolves it (`service`, `dockerComposeFile`, `runServices`), then the merged model of its compose files, read in
-   * the workspace helper without the Docker socket, network, and the configuration folder with the token
+   * the workspace helper without the Docker socket, network, and the configuration folder of the container
    * (WorkspaceHelper.composeModel). Concept section 9 "Host access", before any build: every service of the model
    * (composeAccessReport) and the settings of devcontainer.json that Compose does not support (composeConfigurationReport),
    * then devcontainer.json and its merged configuration with the rules of a single container (hostAccessReport, without
@@ -3454,9 +3455,10 @@ export class EnvironmentService {
   }
 
   /**
-   * Concept section 9 "Git inside the container": the token of the owner account and the Git configuration of the
-   * container, written into the volume once per run (at every open: a new sign-in gives a new token), before `up`. A
-   * failure is a warning: the environment opens, but Git may not reach GitHub.
+   * Concept section 9 "Git inside the container": the Git configuration of the container, written into the volume once
+   * per run, before `up` (unit 15: without the token, which goes into the memory of the container after its start,
+   * writeGitToken; the token files of earlier versions leave the volume here). A failure is a warning: the environment
+   * opens, but Git may not reach GitHub.
    */
   private async prepareGit(ctx: PipelineContext): Promise<void> {
     if (ctx.gitPrepared || ctx.helperUnavailable) return;
@@ -3469,16 +3471,43 @@ export class EnvironmentService {
       await this.deps.helper.prepareGit({
         volumeName: env.volumeName,
         repository: env.repository,
-        token: ctx.session.token,
         identity,
-        // The environment belongs to the account of the session (concept 7.5): the GitHub CLI there is signed in as it.
-        login: ctx.session.account.login,
         onOutput: this.output,
         signal: ctx.signal,
       });
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
       this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
+      this.deps.ui.warn(Messages.gitSetupFailed);
+    }
+  }
+
+  /**
+   * Unit 15 (concept section 9 "Git inside the container"): the token of the owner account and the sign-in of the GitHub
+   * CLI as that account go into the tmpfs TOKEN_FOLDER of the running dev container (writeContainerToken: `docker exec
+   * -i -u root`, the token on stdin only), owned by `user`. They stay there while the container runs, also without a
+   * window, and are gone when it stops. A failure is a warning: the environment opens, but Git and the GitHub CLI in it
+   * cannot reach GitHub as the owner account.
+   */
+  private async writeGitToken(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    const { token, account } = ctx.session;
+    // The environment belongs to the account of the session (concept 7.5): the GitHub CLI there is signed in as it.
+    if (!isGitHubLogin(account.login)) {
+      this.logger.warn(`The GitHub login ${JSON.stringify(account.login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
+    }
+    try {
+      const output = await writeContainerToken((c, command, options) => this.deps.docker.exec(c, command, options), {
+        container,
+        user,
+        token,
+        login: account.login,
+        signal: ctx.signal,
+        timeoutMs: GIT_EXEC_TIMEOUT_MS,
+      });
+      if (output !== '') this.logger.info(output);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.error(`The GitHub token could not be written into the container of ${ctx.env.repository}: ${errorMessage(error)}`);
       this.deps.ui.warn(Messages.gitSetupFailed);
     }
   }
@@ -3601,12 +3630,14 @@ export class EnvironmentService {
       // Review round 16 (L2): the targets of the mounts are marked one by one (DevMountPaths), not the whole list.
       const dev = await this.withDevMountFolders(ctx, containerName, serviceFolders);
       await this.fixOwnership(ctx, containerRef, folder, remoteUser, dev.folders, dev.mounts);
-      // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
+      // The Git configuration was written before `up` with the owner of the repository folder (unit 15: the token is not there), which
       // is still root when the ownership fix before `up` did not run or failed. Review round 15 (K3): in a helper container
       // that mounts only the workspace volume, not in the dev container, whose mounts may lie in the folder.
       await this.fixConfigOwnership(ctx, containerRef, remoteUser);
     }
     if (outcome.created) await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
+    // Unit 15: the container runs now, so its tmpfs can take the token (at every open: a new sign-in gives a new token).
+    await this.writeGitToken(ctx, containerRef, remoteUser ?? 'root');
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.
     this.throwIfCancelled(ctx.signal);

@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CONFIG_FOLDER, GIT_CONFIG_FILE } from '../names';
+import { CONFIG_FOLDER, GIT_CONFIG_FILE, TOKEN_FOLDER } from '../names';
 import {
   CONTAINER_CREDENTIAL_HELPER,
   GIT_CREDENTIALS_CONFIG_FILE,
@@ -59,8 +59,9 @@ describe('environment of the dev container (concept section 9 "Git inside the co
     expect(env.GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     expect(env.DOCKER_CONFIG).toBe('/workspaces/.devenv+/docker');
     expect(env.GIT_SSH_COMMAND).toBe('ssh -o IdentityAgent=none');
-    // The GitHub CLI reads its sign-in (hosts.yml of the owner account) from the volume, not from ~/.config/gh.
-    expect(env.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
+    // The GitHub CLI reads its sign-in (hosts.yml of the owner account) from its folder, not from ~/.config/gh.
+    // unit 15: that folder is in the memory of the container (the tmpfs /run/devenv), not in the volume.
+    expect(env.GH_CONFIG_DIR).toBe('/run/devenv/gh');
     expect(Object.keys(env).some((name) => /TOKEN/.test(name))).toBe(false);
     expect(remoteEnvironment()).toEqual(env);
   });
@@ -250,8 +251,11 @@ describe.skipIf(!hasGit).each(GITS)('credentials of Git in the dev container (%s
     const home = path.join(dir, 'home');
     fs.mkdirSync(volume);
     fs.mkdirSync(home);
-    const local = (value: string): string => value.split(CONFIG_FOLDER).join(volume);
-    if (options.token !== undefined) fs.writeFileSync(path.join(volume, 'github-token'), options.token, { mode: 0o600 });
+    // unit 15: the token is in the tmpfs of the container (TOKEN_FOLDER), not in the volume.
+    const memory = path.join(dir, 'run-devenv');
+    fs.mkdirSync(memory);
+    const local = (value: string): string => value.split(CONFIG_FOLDER).join(volume).split(TOKEN_FOLDER).join(memory);
+    if (options.token !== undefined) fs.writeFileSync(path.join(memory, 'github-token'), options.token, { mode: 0o600 });
     // gitconfig as GIT_FILES_SCRIPT writes it.
     fs.writeFileSync(
       path.join(volume, 'gitconfig'),

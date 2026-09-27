@@ -14,6 +14,7 @@ import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { CommandError, UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
+import { tokenRemoveCommand } from '../core/helper/containerToken';
 import type { ConfigurationKindChange, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
@@ -2510,21 +2511,51 @@ describe('Accounts (concept 7.5)', () => {
       await settle(logged, 'the removal of the token');
     }
 
-    it('removes it from the volume of the environment with a time limit, and runs nothing in the dev container', async () => {
+    // unit 15: changed expectation, the token is removed from the memory of the running dev container first (as root,
+    // TOKEN_REMOVE_SCRIPT), then the files of earlier versions from the volume.
+    it('removes it from the memory of the running container and from the volume of the environment, with a time limit', async () => {
       await takeTokenOut();
+      expect(h.docker.exec).toHaveBeenCalledTimes(1);
+      expect(h.docker.exec).toHaveBeenCalledWith('c0ffee', tokenRemoveCommand(), { user: 'root', timeoutMs: 30_000, signal: undefined });
+      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
       expect(h.docker.volumeExists).toHaveBeenCalledWith(VOLUME);
       expect(h.helper.removeGitToken).toHaveBeenCalledTimes(1);
       expect(h.helper.removeGitToken).toHaveBeenCalledWith({ volumeName: VOLUME, timeoutMs: 30_000 });
-      expect(h.docker.exec).not.toHaveBeenCalled();
       expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the volume ${VOLUME} of the container ${CONTAINER}.`);
       expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
     });
 
-    it('removes it also when the container is stopped (its volume still holds the token)', async () => {
+    it('removes it also when the container is stopped (its volume may still hold the token of an earlier version)', async () => {
       h.docker.containerState.mockResolvedValue('stopped');
+      // unit 15: a stopped container has nothing in its memory: nothing runs in it.
+      h.docker.findContainer.mockResolvedValue({ ...containerInfo(String(CONTAINER_VERSION)), state: 'stopped', rawState: 'exited' });
       await takeTokenOut();
       expect(h.helper.removeGitToken).toHaveBeenCalledWith({ volumeName: VOLUME, timeoutMs: 30_000 });
       expect(h.docker.exec).not.toHaveBeenCalled();
+    });
+
+    it('unit 15: removes it as the remote user of the entry when root may not (for example --cap-drop ALL)', async () => {
+      h.docker.exec.mockImplementation(async (_container: string, _command: string[], options: { user?: string }) =>
+        options.user === 'root'
+          ? { exitCode: 1, stdout: '', stderr: '/run/devenv/github-token could not be removed.', timedOut: false }
+          : { exitCode: 0, stdout: '', stderr: '', timedOut: false },
+      );
+      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME, remoteUser: 'vscode' });
+      await h.registry.add(env);
+      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+      await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal of the token');
+      expect(h.docker.exec.mock.calls.map((call) => (call[2] as { user?: string }).user)).toEqual(['root', 'vscode']);
+      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
+    });
+
+    it('unit 15: warns when the token cannot be removed from the container, and still removes the files of the volume', async () => {
+      h.docker.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: '/run/devenv/github-token could not be removed.', timedOut: false });
+      await takeTokenOut();
+      await settle(() => h.helper.removeGitToken.mock.calls.length > 0, 'the removal from the volume');
+      expect(h.logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(`^The GitHub token could not be removed from the container ${CONTAINER}: .*github-token could not be removed`)),
+      );
+      expect(h.helper.removeGitToken).toHaveBeenCalledWith({ volumeName: VOLUME, timeoutMs: 30_000 });
     });
 
     it('warns when the helper cannot remove it', async () => {
@@ -2535,7 +2566,8 @@ describe('Accounts (concept 7.5)', () => {
       expect(h.logger.warn).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`^The GitHub token could not be removed from the volume ${VOLUME} of the container ${CONTAINER}: .*github-token could not be removed`)),
       );
-      expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('The GitHub token was removed'));
+      // unit 15: changed expectation, the removal from the memory of the container succeeded; the volume's did not.
+      expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('The GitHub token was removed from the volume'));
     });
 
     it('runs no helper for a volume that does not exist (the helper would create an empty one)', async () => {

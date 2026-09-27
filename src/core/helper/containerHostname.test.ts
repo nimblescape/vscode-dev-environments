@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { containerHostname } from '../names';
+import { TOKEN_TMPFS, containerHostname } from '../names';
 import { buildOverrideConfig } from './devcontainerCli';
 import { runArgsDecideHostname } from './hostAccess';
 
@@ -38,7 +38,8 @@ describe('the host name of the container in the override configuration', () => {
     expect(hostnameOf(['--init', '-p', '3000'])).toBe('module-oop');
     // With the host access checks off too.
     const off = buildOverrideConfig({ ...base, hostAccessChecks: 'off' }).runArgs as string[];
-    expect(off.slice(-2)).toEqual(['--hostname', 'module-oop']);
+    // unit 15: changed expectation, the tmpfs of the token comes after the host name.
+    expect(off.slice(-4)).toEqual(['--hostname', 'module-oop', '--tmpfs', TOKEN_TMPFS]);
   });
 
   it.each([

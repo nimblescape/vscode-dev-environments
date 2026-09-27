@@ -78,7 +78,8 @@ describe('review round 22, H22-2: volumes_from', () => {
 
   it('refuses the volumes of the dev service (the workspace volume with the token) whatever the switch says', () => {
     expect(classes(set('db', { volumes_from: ['app:ro'] }))).toEqual([
-      { item: 'service db: volumes_from app:ro (the volumes of the dev container, with the workspace volume, which holds the GitHub token)', class: 'protected' },
+      // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+      { item: 'service db: volumes_from app:ro (the volumes of the dev container, with the workspace volume)', class: 'protected' },
     ]);
     const report = composeAccessReport(input(set('db', { volumes_from: ['app'] })), false);
     expect(report.hostAccess).toHaveLength(1);

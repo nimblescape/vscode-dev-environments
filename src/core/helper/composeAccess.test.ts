@@ -14,6 +14,7 @@ import {
 } from './composeAccess';
 import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
 import type { HostAccessReport } from './hostAccess';
+import { TOKEN_TMPFS } from '../names';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';
@@ -182,14 +183,16 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['network_mode of another environment', 'db', { network_mode: 'devenv-11111111_default' }, A('service db: network devenv-11111111_default of another environment')],
     ['networks', 'db', { networks: { default: { aliases: ['database'], ipv4_address: '172.20.0.5' } } }, NONE],
     // volumes (D-6, D-11: details in compose.test.ts)
-    ['the workspace volume in a side service', 'db', { volumes: [{ type: 'bind', source: '/workspaces', target: '/w' }] }, A('service db: bind mount /workspaces → /w (the workspace volume, which holds the GitHub token)')],
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    ['the workspace volume in a side service', 'db', { volumes: [{ type: 'bind', source: '/workspaces', target: '/w' }] }, A('service db: bind mount /workspaces → /w (the workspace volume, with the repository and the Git configuration of the environment)')],
     ['a bind mount of the computer', 'db', { volumes: [{ type: 'bind', source: '/var/run/docker.sock', target: '/var/run/docker.sock' }] }, A('service db: bind mount /var/run/docker.sock → /var/run/docker.sock')],
     ['a bind mount of repository files', 'db', { volumes: [{ type: 'bind', source: `${REPO}/init.sql`, target: '/i.sql' }] }, NONE],
     ['a volume at /workspaces of the dev service', 'app', { volumes: [{ type: 'volume', source: 'pgdata', target: '/workspaces' }] }, U('service app: mount at /workspaces')],
     ['a mount of the type npipe', 'db', { volumes: [{ type: 'npipe', source: 'p', target: '/p' }] }, U('service db: mount of the type npipe (p → /p)')],
     // other containers
     // review round 22, H22-2: changed expectation, the volumes of the dev service are named with the reason (protected).
-    ['volumes_from', 'db', { volumes_from: ['app'] }, A('service db: volumes_from app (the volumes of the dev container, with the workspace volume, which holds the GitHub token)')],
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    ['volumes_from', 'db', { volumes_from: ['app'] }, A('service db: volumes_from app (the volumes of the dev container, with the workspace volume)')],
     // review round 22, H22-1: changed expectation, links to services of the model are allowed.
     ['links', 'db', { links: ['app'] }, NONE],
     ['external_links', 'db', { external_links: ['redis'] }, A('service db: external_links')],
@@ -295,7 +298,8 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     const base = model();
     base.volumes = { ...base.volumes, ws: { name: OWN, external: true } };
     base.services.db.volumes = [{ type: 'volume', source: 'ws', target: '/w' }];
-    expect(composeAccessReport(input({ model: base }))).toEqual(A(`service db: volume ${OWN} (the workspace volume, which holds the GitHub token)`));
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    expect(composeAccessReport(input({ model: base }))).toEqual(A(`service db: volume ${OWN} (the workspace volume, with the repository and the Git configuration of the environment)`));
   });
 });
 
@@ -361,7 +365,8 @@ describe('composeAccessReport: devcontainer.json (rule table 4.3)', () => {
       'a dev service that is not in the model',
       { devService: 'web' },
       {
-        hostAccess: ['service app: bind mount /workspaces → /workspaces (the workspace volume, which holds the GitHub token)'],
+        // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+        hostAccess: ['service app: bind mount /workspaces → /workspaces (the workspace volume, with the repository and the Git configuration of the environment)'],
         unsupported: ['service web (not in the Docker Compose configuration)'],
       },
     ],
@@ -567,5 +572,27 @@ describe('review round 14 of unit 6 (S14-1): no mount of the dev service into th
 
   it('leaves the other services alone: their containers do not have the folder', () => {
     expect(serviceReport('db', { volumes: [{ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+/pg' }], tmpfs: ['/workspaces/.devenv+'] })).toEqual(NONE);
+  });
+});
+
+describe('unit 15: no mount of the dev service at or below /run/devenv, the tmpfs of the token', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const report = (settings: Record<string, unknown>, checksOn: boolean, service = 'app') => {
+    const base = model();
+    base.services[service] = { ...(base.services[service] ?? { image: 'alpine:3.22' }), ...settings };
+    return composeAccessReport(input({ model: base }), checksOn);
+  };
+
+  it.each([true, false])('refuses volumes, tmpfs, secrets, and configs there, also the text of our own tmpfs (checks on: %s)', (checksOn) => {
+    expect(report({ volumes: [{ type: 'volume', source: 'pgdata', target: '/run/devenv' }] }, checksOn)).toEqual(U(`service app: mount at /run/devenv (${INTERNAL})`));
+    expect(report({ volumes: [{ type: 'tmpfs', target: '/run/devenv/gh' }] }, checksOn)).toEqual(U(`service app: mount at /run/devenv/gh (${INTERNAL})`));
+    expect(report({ tmpfs: ['/run/devenv:size=1m'] }, checksOn)).toEqual(U(`service app: tmpfs /run/devenv (${INTERNAL})`));
+    expect(report({ tmpfs: [TOKEN_TMPFS] }, checksOn)).toEqual(U(`service app: tmpfs /run/devenv (${INTERNAL})`));
+    expect(report({ tmpfs: '/run/./devenv/x' }, checksOn)).toEqual(U(`service app: tmpfs /run/devenv/x (${INTERNAL})`));
+  });
+
+  it('allows /run and /run/devenvx in the dev service, and the folder in another service', () => {
+    expect(report({ tmpfs: ['/run', '/run/devenvx'] }, true)).toEqual(NONE);
+    expect(report({ volumes: [{ type: 'volume', source: 'pgdata', target: '/run/devenv' }], tmpfs: ['/run/devenv'] }, true, 'db')).toEqual(NONE);
   });
 });

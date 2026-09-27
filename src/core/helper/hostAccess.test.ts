@@ -10,6 +10,7 @@ import {
   CONTAINER_VERSION_LABEL,
   ENVIRONMENT_VOLUME_PATTERN,
   HELPER_CACHE_VOLUME,
+  TOKEN_TMPFS,
   newEnvironmentId,
   resourceName,
 } from '../names';
@@ -394,9 +395,22 @@ describe('host access policy: the runArgs that Docker gets', () => {
     const all = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
       .runArgs as string[];
     // The host name is left out where the repository decides it (runArgsDecideHostname).
-    const added = all.at(-2) === '--hostname' ? ['--hostname', 'api'] : [];
+    // unit 15: changed expectation, the tmpfs of the token comes last; container version 5.
+    const added = all.at(-4) === '--hostname' ? ['--hostname', 'api'] : [];
     // Review round 2 (D2-1): changed expectation, the override configuration also sets the labels of Docker Compose empty.
-    const tail = ['--label', 'devenv.container-version=4', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service=', '--name', OWN, ...added];
+    const tail = [
+      '--label',
+      'devenv.container-version=5',
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
+      '--name',
+      OWN,
+      ...added,
+      '--tmpfs',
+      '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+    ];
     expect(all.slice(-tail.length)).toEqual(tail);
     return all.slice(0, -tail.length);
   }
@@ -481,7 +495,8 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       '--label',
       '--rm',
       '--label',
-      'devenv.container-version=4',
+      // unit 15: changed expectation, container version 5 and the tmpfs of the token, which the check accepts.
+      'devenv.container-version=5',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -490,6 +505,8 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       OWN,
       '--hostname',
       'api',
+      '--tmpfs',
+      '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
     ]);
     expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
   });
@@ -1005,7 +1022,8 @@ describe('GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account (con
       'variable GH_CONFIG_DIR in containerEnv',
     ]);
     const merged = { containerEnv: containerEnvironment(), remoteEnv: remoteEnvironment() };
-    expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/workspaces/.devenv+/gh');
+    // unit 15: changed expectation, the folder of the GitHub CLI is in the tmpfs of the token.
+    expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/run/devenv/gh');
     expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
   });
 });
@@ -1853,5 +1871,44 @@ describe('host access policy: what the Dev Container CLI substitutes again at up
       expect(hostAccessProblems({ ownVolume: OWN, variables, config: readConfiguration({ mounts, runArgs }) }, checksOn)).toEqual([]);
     });
     expect(mountedVolumeNames({ ownVolume: OWN, variables, config: readConfiguration({ mounts }) })).toEqual(['api-node_modules', 'projectname-bashhistory']);
+  });
+});
+
+describe('unit 15: no mount of a configuration at or below /run/devenv, the tmpfs of the token', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const U = (...items: string[]) => ({ hostAccess: [], unsupported: items });
+  const NONE = { hostAccess: [], unsupported: [] };
+
+  it.each([true, false])('refuses `mounts`, -v, --mount, and --tmpfs there, also the tmpfs of the override as the repository writes it (checks on: %s)', (checksOn) => {
+    const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN }, checksOn);
+    expect(report({ mounts: ['source=cache,target=/run/devenv,type=volume'] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    expect(report({ mounts: ['type=tmpfs,dst=/run//devenv/gh/'] })).toEqual(U(`mount at /run/devenv/gh (${INTERNAL})`));
+    expect(report({ mounts: [{ source: 'cache', target: '/run/x/../devenv', type: 'volume' }] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    expect(report({ runArgs: ['-v', 'cache:/run/devenv'] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    expect(report({ runArgs: ['--volume=/run/devenv/gh'] })).toEqual(U(`mount at /run/devenv/gh (${INTERNAL})`));
+    expect(report({ runArgs: ['--mount', 'type=volume,source=cache,target=/run/devenv/github-token'] })).toEqual(U(`mount at /run/devenv/github-token (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs', '/run/devenv:size=1m'] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    // Exactly the tmpfs of the override configuration: the repository may not add it (only the override does).
+    expect(report({ runArgs: ['--tmpfs', TOKEN_TMPFS] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    expect(report({ runArgs: [`--tmpfs=${TOKEN_TMPFS}`] })).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+  });
+
+  it('allows /run itself (a tmpfs of the image or of systemd lies below ours) and a folder that only starts like it', () => {
+    const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN });
+    expect(report({ runArgs: ['--tmpfs', '/run', '--tmpfs', '/run/devenvx', '--mount', 'type=tmpfs,target=/run/devenv-other'] })).toEqual(NONE);
+    expect(report({ mounts: ['source=cache,target=/run/lock,type=volume'] })).toEqual(NONE);
+  });
+
+  it('accepts the tmpfs of the override configuration only in the override and the merged configuration, exactly as written', () => {
+    const override = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: [] });
+    expect((override.runArgs as string[]).slice(-2)).toEqual(['--tmpfs', TOKEN_TMPFS]);
+    expect(hostAccessReport({ config: { runArgs: override.runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual(NONE);
+    expect(hostAccessReport({ config: {}, merged: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual(NONE);
+    // Another text at the folder stays refused there too, also with the checks off.
+    for (const checksOn of [true, false]) {
+      const other = hostAccessReport({ config: { runArgs: ['--tmpfs', '/run/devenv:mode=0777'] }, ownVolume: OWN, overrideConfiguration: true }, checksOn);
+      expect(other).toEqual(U(`mount at /run/devenv (${INTERNAL})`));
+    }
+    expect(hostAccessReport({ config: {}, merged: { runArgs: ['-v', 'cache:/run/devenv/gh'] }, ownVolume: OWN })).toEqual(U(`mount at /run/devenv/gh (${INTERNAL})`));
   });
 });

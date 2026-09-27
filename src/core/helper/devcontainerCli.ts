@@ -15,6 +15,7 @@ import {
   containerHostname,
   HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
   HOST_ACCESS_UNRESTRICTED_LABEL,
+  TOKEN_TMPFS,
   WORKSPACES_ROOT,
 } from '../names';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
@@ -187,7 +188,8 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
  * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>`, the labels
  * `com.docker.compose.project` and `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and
  * `--name <container name>`, and `--hostname <repository name>` (containerHostname) unless the runArgs decide the host
- * name themselves, runArgsDecideHostname), appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
+ * name themselves, runArgsDecideHostname, and last, unit 15, `--tmpfs TOKEN_TMPFS`, the folder of the token in memory),
+ * appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
  * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
  * (ATTACHED_SHUTDOWN_ACTION, ../devContainers.ts).
  * `hostAccessChecks` `off` (the switch of the repository, ../hostAccessChecks.ts): the published ports of runArgs and
@@ -216,7 +218,9 @@ export function buildOverrideConfig(p: {
   const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);
   // Without it, Docker names the host after the container ID, and the shell prompt shows that ID.
   const hostname = runArgsDecideHostname(repositoryRunArgs) ? [] : ['--hostname', containerHostname(p.repositoryName)];
-  const runArgs = [...repositoryRunArgs, ...labels, '--name', p.containerName, ...hostname];
+  // Unit 15: the tmpfs of the token (TOKEN_FOLDER), after the runArgs of the repository; the checks of the override
+  // configuration accept exactly this entry (runArgsFindings), a configuration may not mount there (configFolderTarget).
+  const runArgs = [...repositoryRunArgs, ...labels, '--name', p.containerName, ...hostname, '--tmpfs', TOKEN_TMPFS];
   const override: Record<string, unknown> = {
     image: p.environmentImage,
     workspaceMount: `source=${p.volumeName},target=${WORKSPACES_ROOT},type=volume`,

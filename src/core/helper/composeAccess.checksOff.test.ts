@@ -72,7 +72,8 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['the cgroup namespace of the computer', input(service('db', { cgroup: 'host' })), 'service db: cgroup host', 'computer'],
   // review round 22, H22-2 and H22-1: changed rows, the volumes of the dev service stay refused whatever the switch
   // says; links to services of the model are allowed, a link to an unknown service is not supported.
-  ['volumes_from', input(service('db', { volumes_from: ['app'] })), 'service db: volumes_from app (the volumes of the dev container, with the workspace volume, which holds the GitHub token)', 'protected'],
+  // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+  ['volumes_from', input(service('db', { volumes_from: ['app'] })), 'service db: volumes_from app (the volumes of the dev container, with the workspace volume)', 'protected'],
   ['volumes_from of a container', input(service('db', { volumes_from: ['container:other'] })), 'service db: volumes_from container:other (the volumes of another container)', 'protected'],
   ['links', input(service('db', { links: ['other'] })), 'service db: links other (not a service of the Docker Compose configuration)', 'unsupported'],
   ['external_links', input(service('db', { external_links: ['other'] })), 'service db: external_links', 'computer'],
@@ -102,7 +103,8 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['the cache volume of the workspace helper', input((m) => (m.volumes = { pgdata: { name: 'devenv-helper-cache' } })), 'volume devenv-helper-cache of the workspace helper', 'protected'],
   ['a network of another environment', input((m) => (m.networks = { other: { name: 'devenv-11111111_default', external: true } })), 'network devenv-11111111_default of another environment', 'protected'],
   ['network_mode of another environment', input(service('db', { network_mode: 'devenv-11111111_default' })), 'service db: network devenv-11111111_default of another environment', 'protected'],
-  ['the workspace volume in a side service', input(service('db', { volumes: [{ type: 'bind', source: '/workspaces', target: '/w' }] })), 'service db: bind mount /workspaces → /w (the workspace volume, which holds the GitHub token)', 'protected'],
+  // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+  ['the workspace volume in a side service', input(service('db', { volumes: [{ type: 'bind', source: '/workspaces', target: '/w' }] })), 'service db: bind mount /workspaces → /w (the workspace volume, with the repository and the Git configuration of the environment)', 'protected'],
   ['a link out of the repository', input(service('db', { volumes: [{ type: 'bind', source: `${REPO}/d`, target: '/d' }] }), { realPaths: { [`${REPO}/d`]: '/workspaces/.devenv+' } }), `service db: bind mount ${REPO}/d → /d (a link to /workspaces/.devenv+, outside of the repository)`, 'protected'],
   ['an env_file outside the repository', input(service('db', { env_file: ['/root/.env'] })), 'service db: env_file /root/.env', 'protected'],
   ['a Git variable in the dev service', input(service('app', { environment: { GIT_CONFIG_GLOBAL: '/x' } })), 'service app: variable GIT_CONFIG_GLOBAL in environment', 'protected'],

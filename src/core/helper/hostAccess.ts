@@ -30,6 +30,8 @@ import {
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_VOLUME,
+  TOKEN_FOLDER,
+  TOKEN_TMPFS,
   VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
   composeProjectName,
@@ -717,13 +719,18 @@ export function isHelperPath(file: string, repositoryFolder: string): boolean {
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }
 
+/** The folders of configFolderTarget. */
+const INTERNAL_FOLDERS: readonly string[] = [CONFIG_FOLDER, TOKEN_FOLDER];
+
 /** Review round 14 (S14-1): the reason of configFolderMountItem. */
 export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal folder are not supported";
 
 /**
  * Review round 14 (S14-1): the target of a mount of the dev container, normalized (`.`, `..`, double and trailing
- * slashes), when it is CONFIG_FOLDER or a path below it (on segment boundaries: `/workspaces/.devenv+x` is not);
- * `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
+ * slashes), when it is CONFIG_FOLDER or a path below it (on segment boundaries: `/workspaces/.devenv+x` is not), or
+ * (unit 15) TOKEN_FOLDER or a path below it (`/run/devenv`, the tmpfs with the token, which only the override
+ * configuration adds: a mount there would shadow the token or move it out of the memory of the container, for example
+ * into a volume; `/run/devenvx` and the parent `/run` are not); `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
  * every file there the remote user (`find -xdev`, no paths left out): a mount there would shadow them, and would give
  * the files of the mounted folder (for example the data of another service, or the whole repository through an alias)
  * to the remote user. Other paths of WORKSPACES_ROOT outside the repository (for example a cache volume at
@@ -732,7 +739,7 @@ export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal 
 export function configFolderTarget(target: string): string | undefined {
   if (!target.startsWith('/')) return undefined;
   const normal = path.posix.normalize(target).replace(/(.)\/+$/, '$1');
-  return normal === CONFIG_FOLDER || normal.startsWith(`${CONFIG_FOLDER}/`) ? normal : undefined;
+  return INTERNAL_FOLDERS.some((folder) => normal === folder || normal.startsWith(`${folder}/`)) ? normal : undefined;
 }
 
 /** Review round 14 (S14-1): the item of a mount at configFolderTarget `target` (class `unsupported`). */
@@ -2201,8 +2208,8 @@ function isOwnConfigPathLabel(value: string): boolean {
 
 /**
  * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
- * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, and the label devenv.config-path
- * of the override configuration (review round 4, D4-2).
+ * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, the label devenv.config-path
+ * of the override configuration (review round 4, D4-2), and (unit 15) its `--tmpfs TOKEN_TMPFS`.
  */
 function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
   const problems: Problem[] = [];
@@ -2216,6 +2223,9 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
       continue;
     } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && isOwnConfigPathLabel(flag.value)) {
       // Review round 4 (D4-2): the label devenv.config-path that the override configuration adds.
+      continue;
+    } else if (cleared && flag.name === '--tmpfs' && flag.value === TOKEN_TMPFS) {
+      // Unit 15: the tmpfs of the token that the override configuration adds, exactly as written there.
       continue;
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));

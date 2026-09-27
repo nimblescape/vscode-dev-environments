@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
+import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { isDevContainer, type ContainerInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
@@ -24,6 +25,7 @@ import {
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   LABEL_VOLUME,
+  TOKEN_TMPFS,
   VOLUME_KIND_ADDITIONAL,
   environmentImageName,
   resourceName,
@@ -75,6 +77,8 @@ export const T0 = Date.parse('2026-09-24T15:40:00.000Z');
 export const CLEARED_COMPOSE_LABELS: readonly string[] = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
 /** Review round 4 (D4-2): the label devenv.config-path of the override configuration, for the default configuration. */
 export const CONFIG_PATH_LABEL: readonly string[] = ['--label', 'devenv.config-path=.devcontainer/devcontainer.json'];
+/** Unit 15: the tmpfs of the token at the end of the runArgs of the override configuration. */
+export const TOKEN_TMPFS_ARGS: readonly string[] = ['--tmpfs', TOKEN_TMPFS];
 
 export const DEFAULT_CONFIG_TEXT = `{
   // test configuration
@@ -108,7 +112,8 @@ export class FakeDocker implements EnvironmentDocker {
   readonly imageIds = new Map<string, string>();
   /** Changing calls, in order: `pull x`, `rm x`, `rmi x`, `stop x`, `volume create x`, `volume rm x`, `start x`. */
   readonly log: string[] = [];
-  readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal }> = [];
+  /** Each `docker exec`; unit 15: with its standard input (the token of TOKEN_WRITE_SCRIPT). */
+  readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal; input?: string }> = [];
   /** Each `docker pull`, with the credentials that it got instead of those of Docker. */
   readonly pulls: Array<{ reference: string; credentials?: PullCredentials }> = [];
   pullError: (reference: string, credentials?: PullCredentials) => Error | undefined = () => undefined;
@@ -274,9 +279,9 @@ export class FakeDocker implements EnvironmentDocker {
   async exec(
     container: string,
     command: readonly string[],
-    options: { user?: string; signal?: AbortSignal; timeoutMs?: number } = {},
+    options: { user?: string; signal?: AbortSignal; timeoutMs?: number; input?: string } = {},
   ): Promise<RunResult> {
-    this.execs.push({ container, command, user: options.user, signal: options.signal });
+    this.execs.push({ container, command, user: options.user, signal: options.signal, ...(options.input !== undefined ? { input: options.input } : {}) });
     // Review round 11 (G3): the check of the recorded paths of the services prints those that exist.
     const existing =
       command[2] === EXISTING_PATHS_SCRIPT
@@ -291,6 +296,16 @@ export class FakeDocker implements EnvironmentDocker {
     // Like the process runner: an abort during the call kills the process and rejects.
     if (options.signal?.aborted) throw abortError();
     return result;
+  }
+
+  /**
+   * Unit 15: each write of the token into the tmpfs of a dev container (TOKEN_WRITE_SCRIPT with `docker exec`): the
+   * container, the user of the exec, the remote user and the login that the script gets, and the token on its stdin.
+   */
+  tokenWrites(): Array<{ container: string; user?: string; remoteUser: string; login: string; token?: string }> {
+    return this.execs
+      .filter((exec) => exec.command[2] === TOKEN_WRITE_SCRIPT)
+      .map((exec) => ({ container: exec.container, user: exec.user, remoteUser: exec.command[4], login: exec.command[5], token: exec.input }));
   }
 
   /**
@@ -569,13 +584,11 @@ export class FakeHelper implements EnvironmentHelper {
   readonly composeModels: Array<{ files: readonly string[]; project: string }> = [];
   /** `composeProjectName` of the result of `up` of a Docker Compose configuration. Default: COMPOSE_PROJECT_NAME. */
   composeProjectNameResult: string | undefined;
-  /** Each write of the token and the Git configuration into the volume. */
+  /** Each write of the Git configuration into the volume (unit 15: without the token, FakeDocker.tokenWrites has it). */
   readonly gitPreparations: Array<{
     volumeName: string;
     repository: string;
-    token: string;
     identity: { name: string; email: string };
-    login: string;
   }> = [];
   /** Volumes that a helper run created silently (the real helper does this for a missing volume). Must stay empty. */
   readonly silentlyCreatedVolumes: string[] = [];
@@ -693,16 +706,10 @@ export class FakeHelper implements EnvironmentHelper {
     if (this.createFoldersError) throw this.createFoldersError;
   }
 
-  async prepareGit(p: {
-    volumeName: string;
-    repository: string;
-    token: string;
-    identity: { name: string; email: string };
-    login: string;
-  }): Promise<void> {
+  async prepareGit(p: { volumeName: string; repository: string; identity: { name: string; email: string } }): Promise<void> {
     this.mount(p.volumeName);
     this.calls.push('prepareGit');
-    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, token: p.token, identity: { ...p.identity }, login: p.login });
+    this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, identity: { ...p.identity } });
     if (this.prepareGitError) throw this.prepareGitError;
   }
 

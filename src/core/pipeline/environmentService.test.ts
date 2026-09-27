@@ -10,6 +10,7 @@ import { devContainersSettings } from '../devContainers';
 import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
+import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
 import { hostAccessProblems } from '../helper/hostAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
@@ -65,6 +66,7 @@ import {
   type Harness,
   type SeedOptions,
   CLEARED_COMPOSE_LABELS,
+  TOKEN_TMPFS_ARGS,
   CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
@@ -172,12 +174,26 @@ describe('open: first open', () => {
     });
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
+    // unit 15: changed expectation, container version 5 and the tmpfs of the token.
+    expect(h.helper.ups[0].override.runArgs).toEqual([
+      '--label',
+      'devenv.container-version=5',
+      ...CONFIG_PATH_LABEL,
+      ...CLEARED_COMPOSE_LABELS,
+      '--name',
+      name,
+      '--hostname',
+      'api',
+      '--tmpfs',
+      '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+    ]);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
-    // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
+    // Concept section 9: the Git configuration is in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
-    expect(h.helper.gitPreparations).toEqual([
-      { volumeName: name, repository: REPO, token: TOKEN, identity: { name: 'octo', email: '1001+octo@users.noreply.github.com' }, login: 'octo' },
+    // unit 15: changed expectation, no token in the volume; it goes into the memory of the container after `up`.
+    expect(h.helper.gitPreparations).toEqual([{ volumeName: name, repository: REPO, identity: { name: 'octo', email: '1001+octo@users.noreply.github.com' } }]);
+    expect(h.docker.tokenWrites()).toEqual([
+      { container: h.docker.containersOf(env!.id)[0].id, user: 'root', remoteUser: 'vscode', login: 'octo', token: TOKEN },
     ]);
 
     expect(env!.buildRecord).toMatchObject({
@@ -577,8 +593,10 @@ describe('open: existing environment', () => {
     // The branch comes from the container; the counts stay.
     expect(env?.gitSummary).toMatchObject({ branch: 'feature-y', uncommittedFiles: 3, unpushedCommits: 4, stashes: 1 });
     expect(env?.buildRecord?.environmentImage).toBe(IMAGE_1);
-    // No ownership fix for a container that only starts.
-    expect(h.docker.execs.some((e) => e.user === 'root')).toBe(false);
+    // No ownership fix for a container that only starts. unit 15: changed expectation, the only exec as root is the write
+    // of the token into its memory.
+    expect(h.docker.execs.some((e) => e.user === 'root' && e.command[2] !== TOKEN_WRITE_SCRIPT)).toBe(false);
+    expect(h.docker.tokenWrites()).toHaveLength(1);
     expect(await pendingIds()).toEqual([ENV_ID]);
     expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
     expect(h.helper.silentlyCreatedVolumes).toEqual([]);
@@ -1319,6 +1337,14 @@ describe('open: existing environment', () => {
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
   });
 
+  it('unit 15: writes the token into the memory of a container that docker start started without the helper', async () => {
+    await seedEnvironment(h);
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    await h.service.open(TARGET, options());
+    const container = h.docker.containersOf(ENV_ID)[0];
+    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ container: container.id, user: 'root', token: TOKEN, login: 'octo' })]);
+  });
+
   it('starts the old container again when the replacement fails before it was removed', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
     const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -1327,8 +1353,9 @@ describe('open: existing environment', () => {
     await h.service.open(TARGET, options());
     expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
     expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
-    // No ownership fix for the old container.
-    expect(h.docker.execs.some((e) => e.command.join(' ').includes('chown'))).toBe(false);
+    // No ownership fix for the old container. unit 15: changed expectation, the write of the token (which gives its files
+    // to the remote user with chown) is no ownership fix.
+    expect(h.docker.execs.some((e) => e.command[2] !== TOKEN_WRITE_SCRIPT && e.command.join(' ').includes('chown'))).toBe(false);
   });
 
   it('creates the container again from the image of the old container when a replacement without record fails', async () => {
@@ -2422,8 +2449,52 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     await h.service.openEnvironment(ENV_ID, options());
     h.token = 'gho_new_session';
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.gitPreparations.map((call) => call.token)).toEqual([TOKEN, 'gho_new_session']);
+    // unit 15: changed expectation, the token goes into the memory of the running container at each open.
+    expect(h.helper.gitPreparations).toHaveLength(2);
+    expect(h.docker.tokenWrites().map((write) => write.token)).toEqual([TOKEN, 'gho_new_session']);
     expect(h.helper.ups).toEqual([]);
+  });
+
+  it('unit 15: writes the token into the tmpfs of the container after `up`, as root, with the token on stdin only', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    let callsAtWrite: string[] = [];
+    h.docker.execHandler = (_container, command) => {
+      if (command[2] === TOKEN_WRITE_SCRIPT) callsAtWrite = [...h.helper.calls];
+      return {};
+    };
+    await h.service.openEnvironment(ENV_ID, options());
+    // After `up` started the container (the tmpfs exists only while it runs), and after the Git configuration.
+    expect(callsAtWrite).toContain(`up ${IMAGE_1}`);
+    expect(callsAtWrite).toContain('prepareGit');
+    const [write] = h.docker.tokenWrites();
+    expect(write).toEqual({ container: h.docker.containersOf(ENV_ID)[0].id, user: 'root', remoteUser: 'vscode', login: 'octo', token: TOKEN });
+    const exec = h.docker.execs.find((e) => e.command[2] === TOKEN_WRITE_SCRIPT)!;
+    expect(exec.command).toEqual(tokenWriteCommand('vscode', 'octo'));
+    expect(exec.command.some((arg) => arg.includes(TOKEN))).toBe(false);
+    // Never in the override configuration, the helper runs, or the log.
+    expect(JSON.stringify(h.helper.ups)).not.toContain(TOKEN);
+    expect([...h.logger.infos, ...h.logger.warnings, ...h.logger.errors].join('\n')).not.toContain(TOKEN);
+  });
+
+  it('unit 15: a failed write of the token is a warning; the environment opens, and the log has no token', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = (_container, command) =>
+      command[2] === TOKEN_WRITE_SCRIPT ? { exitCode: 5, stderr: `Root in the container may not give the files of /run/devenv to vscode. ${TOKEN}` } : {};
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.gitSetupFailed]);
+    const logged = [...h.logger.infos, ...h.logger.warnings, ...h.logger.errors].join('\n');
+    expect(logged).toContain('The GitHub token could not be written into the container of acme/api: Root in the container may not give');
+    expect(logged).not.toContain(TOKEN);
+  });
+
+  it('unit 15: passes no invalid GitHub login to the container (gh is signed in nowhere), and still writes the token', async () => {
+    const h2 = recreate({ auth: { getToken: async () => TOKEN, getAccount: async () => ({ id: ACCOUNT.id, login: 'octo"' }) } });
+    h = h2;
+    await seedEnvironment(h, { container: 'running', owner: { id: ACCOUNT.id, login: 'octo"' } });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ login: '', token: TOKEN })]);
+    expect(h.logger.warnings.some((line) => line.includes('is no valid GitHub login'))).toBe(true);
   });
 
   it('writes it before `up`, once per open, and passes the variables of container-only Git', async () => {
@@ -2548,6 +2619,9 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     ['a running container without the label', 'running', {}],
     ['a container of an older version', 'stopped', { 'devenv.container-version': '1' }],
     ['a container of the version before (without the settings of the Dev Containers extension)', 'running', { 'devenv.container-version': '2' }],
+    // unit 15: version 4 kept the token in the volume and has no tmpfs for it.
+    ['a container of version 4 (without the tmpfs of the token)', 'running', { 'devenv.container-version': '4' }],
+    ['a stopped container of version 4', 'stopped', { 'devenv.container-version': '4' }],
   ])('creates %s again from the environment image, without a build; the volume stays', async (_name, state, labels) => {
     await seedEnvironment(h, { container: state, containerLabels: labels });
     const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -2557,7 +2631,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     const containers = h.docker.containersOf(ENV_ID);
     expect(containers).toHaveLength(1);
     expect(containers[0].id).not.toBe(before);
-    expect(containers[0].labels['devenv.container-version']).toBe('4');
+    // unit 15: changed expectation, container version 5.
+    expect(containers[0].labels['devenv.container-version']).toBe('5');
     expect(h.docker.volumes.has(NAME)).toBe(true);
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
     expect(result.containerName).toBe(NAME);
@@ -2578,7 +2653,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     }
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    expect((override.runArgs as string[]).slice(-12)).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
+    expect((override.runArgs as string[]).slice(-14)).toEqual(['--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('starts a current container as it is', async () => {
@@ -2639,7 +2715,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
       const provisional = h.docker.containersOf(ENV_ID)[0];
       expect(provisional.id).not.toBe(original);
-      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '4', 'devenv.container-config': 'unknown' });
+      // unit 15: changed expectation, container version 5.
+      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '5', 'devenv.container-config': 'unknown' });
       expect(h.progress.details).toContain(Messages.containerRecreated);
 
       // While the configuration stays broken, the provisional container is only started.
@@ -3063,7 +3140,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     const given = h.helper.ups[0].override.runArgs as string[];
     // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
     expect(hostAccessProblems({ config: { runArgs: given }, ownVolume: NAME, overrideConfiguration: true })).toEqual([]);
-    expect(given.slice(-4)).toEqual(['--name', NAME, '--hostname', 'api']);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(given.slice(-6)).toEqual(['--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
   });
 
@@ -3089,7 +3167,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
@@ -3098,7 +3177,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
+    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {
