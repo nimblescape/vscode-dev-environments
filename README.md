@@ -31,6 +31,17 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 - **No builder isolation and no Docker isolation per account for now** (user decision 2026-09-27; also no VM). Plan kept in the session only: Docker-in-Docker per account, rootless Docker per user on Linux.
 - **Unit 6 (Docker Compose) is merged** (PR #8, 3df65f4 on main, 2026-09-27). Known leftover (low, accepted): after a failed forced rebuild where the user edited `service` in place in one devcontainer.json, the next open recreates the previous dev container, so its files outside the volumes are lost (same as a successful rebuild).
 
+## Agreed order of the open items (user: "go with this plan", 2026-09-27)
+
+1. Remove the Dockerfile refusals (single container and Compose); keep the FROM extraction for the update check — branch `feat/drop-dockerfile-refusals`.
+2. Helper socket follows the Docker context (rootless Docker) — branch `fix/helper-socket-context`.
+3. Unit 15: token only in the container's memory (tmpfs) — spec in the session scratchpad `u15/spec.md`.
+4. Unit 11: one policy module, guard rails only (pure refactor).
+5. Unit 7: Docker on a remote machine (`devEnvLauncher.dockerHost`, application scope; one shared Docker there, trusted repositories only).
+6. Offer to recreate the container. 7. Fix "Bad progress location". 8. Slow repository list.
+
+Deferred: Docker per account (Docker-in-Docker, rootless per user), builder isolation, VMs.
+
 ## Documents to read first (on `main` / the work branch)
 
 `docs/vscode-dev-environments.md` (concept — the source of requirements), `docs/implementation-notes.md` (technical decisions), `docs/container-restrictions.md` (every restriction on containers), `README.md`.
