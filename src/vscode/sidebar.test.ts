@@ -511,6 +511,81 @@ describe('Sidebar', () => {
   });
 });
 
+describe('Sidebar: the time until the list is shown (concept 7.4)', () => {
+  it('shows the complete list at once, before GitHub answered about the repositories that the list lacks', async () => {
+    await h.registry.add(environment(API, 'acme/api'));
+    await h.registry.add(environment(OLD, 'acme/old'));
+    h.discovery.loadStored.mockResolvedValue(data([info('acme/stored')]));
+    let answer: (value: RepositoryInfo | undefined) => void = () => undefined;
+    h.discovery.getRepository.mockImplementation(() => new Promise<RepositoryInfo | undefined>((resolve) => (answer = resolve)));
+    await h.sidebar.initialize();
+    const refresh = h.sidebar.refreshDiscovery();
+    await vi.waitFor(() => expect(h.discovery.getRepository).toHaveBeenCalledWith('acme/old', 'gho_token'));
+    // The view renders the new list by itself (no render call of the test), while the question is open.
+    await vi.waitFor(() => expect(rows().map((row) => row.repository).sort()).toEqual(['acme/api', 'acme/old']));
+    expect(h.sidebar.discoveryData?.repositories.map((repository) => repository.nameWithOwner)).toEqual(['acme/api']);
+    // Not known yet: no `not on GitHub` until GitHub answered.
+    expect(rowOf('acme/old').notOnGitHub).toBe(false);
+    answer(undefined);
+    await refresh;
+    await h.sidebar.render();
+    expect(rowOf('acme/old').notOnGitHub).toBe(true);
+  });
+
+  it('asks GitHub about the repositories that the list lacks, at most 4 at the same time', async () => {
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f'].map((letter) => `${letter.repeat(8)}-1111-4111-8111-111111111111`);
+    for (const [index, id] of ids.entries()) await h.registry.add(environment(id, `acme/unlisted${index}`));
+    let open = 0;
+    let peak = 0;
+    h.discovery.getRepository.mockImplementation(async (repository: string) => {
+      open++;
+      peak = Math.max(peak, open);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      open--;
+      return info(repository);
+    });
+    await signedIn();
+    expect(h.discovery.getRepository).toHaveBeenCalledTimes(6);
+    expect(peak).toBe(4);
+    await h.sidebar.render();
+    expect(rows().every((row) => !row.notOnGitHub)).toBe(true);
+  });
+
+  it('reuses a running refresh when VS Code reports a session change of the same account with the same token', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    const changed = h.sidebar.onSessionChanged();
+    finish(data([info('acme/api')]));
+    await changed;
+    expect(h.discovery.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts one more refresh after a session change with a new token, a new sign-in, or another account', async () => {
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(() => new Promise<DiscoveryData>((resolve) => (finish = resolve)));
+    await h.sidebar.initialize();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+    h.auth.getToken.mockResolvedValue('gho_new');
+    const changed = h.sidebar.onSessionChanged();
+    finish(data([info('acme/api')]));
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(2));
+    expect(h.discovery.refresh).toHaveBeenLastCalledWith('gho_new', OCTO.id);
+    finish(data([info('acme/api')]));
+    await changed;
+
+    // Signed out, then signed in again: the sign-in loads the list, whatever runs.
+    h.auth.isSignedIn.mockResolvedValue(false);
+    await h.sidebar.onSessionChanged();
+    h.auth.isSignedIn.mockResolvedValue(true);
+    const signedInAgain = h.sidebar.onSessionChanged();
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(3));
+    finish(data([info('acme/api')]));
+    await signedInAgain;
+  });
+});
+
 describe('Sidebar and the scan scope (setting owners, concept 7.4)', () => {
   const scoped = (repositories: RepositoryInfo[], scope: string[]): DiscoveryData => ({ ...data(repositories), scope });
 
