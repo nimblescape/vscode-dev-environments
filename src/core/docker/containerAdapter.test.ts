@@ -1317,6 +1317,28 @@ describe('ContainerAdapter.engineArchitecture (review round 18, P18-3)', () => {
   });
 });
 
+describe('ContainerAdapter: the platform of the helper image (review round 19, P19-1)', () => {
+  it('buildImage passes --platform when asked', async () => {
+    const { docker, runner } = adapter(() => ok());
+    await docker.buildImage({ tag: 't:1', dockerfile: 'D', context: '.', platform: 'linux/arm64', pull: true });
+    expect(runner.calls[0].args).toEqual(['build', '-t', 't:1', '-f', 'D', '--platform', 'linux/arm64', '--pull', '.']);
+  });
+
+  it('reads the architecture of an image', async () => {
+    const { docker, runner } = adapter(() => ok('amd64\n'));
+    expect(await docker.imageArchitecture('devenv-helper:0123456789ab')).toBe('amd64');
+    expect(runner.calls[0].args).toEqual(['image', 'inspect', '--format', '{{.Architecture}}', 'devenv-helper:0123456789ab']);
+  });
+
+  it.each([
+    ['a missing image', fail('Error: No such image: devenv-helper:0123456789ab', 1, '')],
+    ['an output that is no architecture', ok('<no value>\n')],
+  ])('the architecture of an image is undefined after %s', async (_name, result) => {
+    const { docker } = adapter(() => result);
+    expect(await docker.imageArchitecture('devenv-helper:0123456789ab')).toBeUndefined();
+  });
+});
+
 // Unit 6, package C: Delete and a failed first open of a Docker Compose environment remove the whole project.
 describe('ContainerAdapter: the objects of a Docker Compose project', () => {
   it('lists the containers of the project by its label, also those without the label of the environment', async () => {

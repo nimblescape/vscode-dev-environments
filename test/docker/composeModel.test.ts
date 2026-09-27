@@ -100,7 +100,9 @@ describe('model run of a Docker Compose configuration', () => {
     expect(Object.keys(output.model.services).sort()).toEqual(['app', 'db', 'tools']);
     // Interpolated from the .env of the project folder.
     expect(output.model.services.db.image).toBe(TEST_BASE_IMAGE);
-    expect(output.model.services.app.environment).toMatchObject({ LITERAL: output.dollarEscaped ? 'a$$b' : 'a$b' });
+    // review round 19, S19-1: changed expectation, the model holds the texts that Compose uses (unescaped), whatever
+    // Compose prints.
+    expect(output.model.services.app.environment).toMatchObject({ LITERAL: 'a$b' });
     expect(output.model.volumes?.pgdata).toMatchObject({ name: `${PROJECT}_pgdata` });
     expect(output.dockerfiles).toEqual({ app: `FROM ${TEST_BASE_IMAGE}\n` });
     expect(output.realPaths[`${REPO}/init.sql`]).toBe(`${REPO}/init.sql`);
@@ -146,6 +148,43 @@ describe('model run of a Docker Compose configuration', () => {
     expect(composeAccessReport(input).hostAccess).toContain(item);
     // Whatever the switch says.
     expect(composeAccessReport(input, false).hostAccess).toContain(item);
+  });
+
+  it('reads a dockerfile_inline and a bind mount source with a literal $ as Compose uses them (review round 19, S19-1)', async () => {
+    const files = {
+      [`${REPO}/.devcontainer/dollar.yml`]: `services:\n  side:\n    build:\n      context: ..\n      dockerfile_inline: |\n        ARG X=${TEST_BASE_IMAGE}\n        FROM $$X\n    volumes:\n      - ../$$data:/data\n`,
+      [`${REPO}/$data/x`]: 'x\n',
+    };
+    const written = await helper.run(volumeName, ['node', '-e', WRITE_FILES_SCRIPT], { input: JSON.stringify(files), docker: false, network: false });
+    expect(written.exitCode, written.stderr).toBe(0);
+    const output = await model(['compose.yml', 'dollar.yml']);
+    if ('error' in output) throw new Error(output.error);
+    log.info(`Compose ${output.version}, dollarEscaped ${output.dollarEscaped}, side ${JSON.stringify(output.model.services.side)}`);
+    const text = `ARG X=${TEST_BASE_IMAGE}\nFROM $X\n`;
+    expect(output.model.services.side.build).toMatchObject({ dockerfile_inline: text });
+    expect(output.dockerfiles.side).toBe(text);
+    expect(output.model.services.side.volumes).toContainEqual(expect.objectContaining({ type: 'bind', source: `${REPO}/$data`, target: '/data' }));
+    expect(output.realPaths[`${REPO}/$data`]).toBe(`${REPO}/$data`);
+    // Our rewrite, read again by Compose, names the same folder.
+    const { model: rewritten } = composeUpModel(output.model, {
+      project: PROJECT,
+      devService: 'app',
+      environmentId: ENVIRONMENT_ID,
+      containerName: 'devenv-test-compose-app',
+      volumeName,
+      repositoryFolder: REPO,
+      dollarEscaped: output.dollarEscaped,
+      engineApiVersion: '1.45',
+      realPaths: output.realPaths,
+      image: 'devenv-c0ffee00:1',
+    });
+    const script = `mkdir -p /tmp/m && cat > /tmp/m/compose.json && docker compose -p ${PROJECT} -f /tmp/m/compose.json --profile '*' config --format json`;
+    const result = await helper.run(volumeName, ['sh', '-c', script], { input: JSON.stringify(rewritten), docker: false, network: false });
+    expect(result.exitCode, result.stderr).toBe(0);
+    const again = JSON.parse(result.stdout) as Record<string, Record<string, Record<string, unknown>>>;
+    expect(again.services.side.volumes).toContainEqual(
+      expect.objectContaining({ volume: expect.objectContaining({ subpath: output.dollarEscaped ? 'app/$$data' : 'app/$data' }) }),
+    );
   });
 
   it('reads the labels and the containers of a network, and leaves out a missing one (review round 1, S2)', async () => {

@@ -41,6 +41,7 @@ import {
 import { MAX_SERVICE_REAL_PATHS } from '../git/gitSummary';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 import { parseComposeModelOutput } from './compose';
+import { composeAccessReport, type ComposeAccessInput } from './composeAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 
@@ -599,6 +600,132 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     const { repo, env } = setup();
     const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$b' } } } }) });
     expect((output as Record<string, unknown>).dollarEscaped).toBe(false);
+  });
+
+  it('unescapes the texts of a model that Compose printed with $$, not the keys, before it reads the paths (review round 19, S19-1)', () => {
+    const { dir, repo, env } = setup();
+    // Files whose names hold a literal $, as Compose and BuildKit use them.
+    fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, '$d'));
+    fs.mkdirSync(path.join(repo, '$c'));
+    write(path.join(repo, '$c', '$D.Dockerfile'), 'FROM node:24\n');
+    write(path.join(repo, '$e.env'), 'A=1\n');
+    const printed = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        inline: { build: { context: repo, dockerfile_inline: 'ARG X=a\nFROM $$X\n' }, labels: { 'k$$': 'v$$w' } },
+        file: { build: { context: `${repo}/$$c`, dockerfile: '$$D.Dockerfile' } },
+        db: {
+          image: 'postgres:16',
+          env_file: [`${repo}/$$e.env`],
+          volumes: [
+            { type: 'bind', source: `${repo}/$$d`, target: '/x' },
+            { type: 'bind', source: `${repo}/$$c/$$new`, target: '/y' },
+          ],
+        },
+      },
+    };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed) }) as {
+      model: Record<string, Record<string, Record<string, unknown>>>;
+      dockerfiles: Record<string, string>;
+      realPaths: Record<string, string | null>;
+      mountAncestors: Record<string, string | null>;
+      mountCreateTargets: Record<string, string>;
+      inputsHash: string;
+    };
+    expect(output.model.services.inline).toEqual({ build: { context: repo, dockerfile_inline: 'ARG X=a\nFROM $X\n' }, labels: { 'k$$': 'v$w' } });
+    expect(output.model.services.db.volumes).toEqual([
+      { type: 'bind', source: `${repo}/$d`, target: '/x' },
+      { type: 'bind', source: `${repo}/$c/$new`, target: '/y' },
+    ]);
+    expect(output.dockerfiles).toEqual({ inline: 'ARG X=a\nFROM $X\n', file: 'FROM node:24\n' });
+    expect(output.realPaths).toMatchObject({
+      [`${repo}/$d`]: fs.realpathSync(path.join(dir, 'outside')),
+      [`${repo}/$c`]: fs.realpathSync(path.join(repo, '$c')),
+      [`${repo}/$c/$D.Dockerfile`]: fs.realpathSync(path.join(repo, '$c', '$D.Dockerfile')),
+      [`${repo}/$e.env`]: fs.realpathSync(path.join(repo, '$e.env')),
+      [`${repo}/$c/$new`]: null,
+    });
+    expect(Object.keys(output.realPaths).some((key) => key.includes('$$'))).toBe(false);
+    expect(output.mountAncestors).toEqual({ [`${repo}/$c/$new`]: fs.realpathSync(path.join(repo, '$c')) });
+    expect(output.mountCreateTargets).toEqual({ [`${repo}/$c/$new`]: `${fs.realpathSync(path.join(repo, '$c'))}/$new` });
+    // The env_file of the inputs hash is the unescaped one: its text changes the hash.
+    write(path.join(repo, '$e.env'), 'A=2\n');
+    const again = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed) }) as { inputsHash: string };
+    expect(again.inputsHash).not.toBe(output.inputsHash);
+  });
+
+  describe('review round 19 (S19-1): the checks see the texts that Compose and BuildKit use', () => {
+    /** The model run of `printed` (as Compose prints it with $$), and the check of its output. */
+    function check(repo: string, env: NodeJS.ProcessEnv, printed: unknown): { hostAccess: string[]; unsupported: string[] } {
+      const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+      const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env: { ...env, FAKE_MODEL: JSON.stringify(printed) } });
+      const output = parseComposeModelOutput(result.stdout);
+      if ('error' in output) throw new Error(output.error);
+      const input: ComposeAccessInput = {
+        model: output.model,
+        devService: 'app',
+        project: 'devenv-3f2a9c1e',
+        repositoryFolder: repo,
+        ownVolume: 'devenv-acme-api-3f2a9c1e',
+        engineApiVersion: '1.47',
+        dockerfiles: output.dockerfiles,
+        features: false,
+        realPaths: output.realPaths,
+        ...(output.mountAncestors !== undefined ? { mountAncestors: output.mountAncestors } : {}),
+        ...(output.missing !== undefined ? { missing: output.missing } : {}),
+      };
+      return composeAccessReport(input);
+    }
+    const APP = { image: 'mcr.microsoft.com/devcontainers/base:bookworm', command: ['sleep', 'infinity'] };
+
+    it('refuses a dockerfile_inline of another service whose FROM resolves to the image of another environment', () => {
+      const { repo, env } = setup();
+      const report = check(repo, env, {
+        name: 'devenv-3f2a9c1e',
+        services: { app: APP, db: { build: { context: repo, dockerfile_inline: 'ARG img=devenv-0badc0de:3\nFROM $$img\n' } } },
+      });
+      expect([...report.hostAccess, ...report.unsupported].join('\n')).toContain('devenv-0badc0de:3');
+    });
+
+    it('checks a bind mount on the unescaped path (a link out of the repository)', () => {
+      const { dir, repo, env } = setup();
+      fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, '$x'));
+      const report = check(repo, env, {
+        name: 'devenv-3f2a9c1e',
+        services: { app: APP, db: { image: 'postgres:16', volumes: [{ type: 'bind', source: `${repo}/$$x`, target: '/data', bind: { create_host_path: true } }] } },
+      });
+      expect(report.hostAccess.join('\n')).toContain(`a link to ${fs.realpathSync(path.join(dir, 'outside'))}, outside of the repository`);
+    });
+
+    it('checks an env_file on the unescaped path (a link out of the repository)', () => {
+      const { dir, repo, env } = setup();
+      fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '$e.env'));
+      const report = check(repo, env, { name: 'devenv-3f2a9c1e', services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$e.env`] } } });
+      expect([...report.hostAccess, ...report.unsupported]).toEqual([`service db: env_file ${repo}/$e.env`]);
+      // A file of the repository whose name holds a $ is allowed.
+      write(path.join(repo, '$ok.env'), 'A=1\n');
+      expect(check(repo, env, { name: 'devenv-3f2a9c1e', services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$ok.env`] } } })).toEqual({ hostAccess: [], unsupported: [] });
+    });
+
+    it('does not refuse a dockerfile_inline of the dev service with a variable in FROM', () => {
+      const { repo, env } = setup();
+      const report = check(repo, env, {
+        name: 'devenv-3f2a9c1e',
+        services: { app: { build: { context: repo, dockerfile_inline: 'ARG BASE=mcr.microsoft.com/devcontainers/base:bookworm\nFROM $${BASE}\n' }, command: ['sleep', 'infinity'] } },
+      });
+      expect(report).toEqual({ hostAccess: [], unsupported: [] });
+    });
+  });
+
+  it('leaves the texts of a model that Compose printed without escaping $ as they are (review round 19, S19-1)', () => {
+    const { repo, env } = setup();
+    const printed = { name: 'devenv-3f2a9c1e', services: { app: { image: 'alpine', environment: { A: 'a$$b' } } } };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], {
+      ...env,
+      FAKE_MODEL: JSON.stringify(printed),
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$b' } } } }),
+    }) as Record<string, unknown>;
+    expect(output.model).toEqual(printed);
   });
 
   it('reports an unknown form of $ as an error', () => {

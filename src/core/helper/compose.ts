@@ -152,8 +152,9 @@ export interface ComposeModelOutput {
   /** `docker compose version --short` in the helper. */
   version: string;
   /**
-   * Whether `docker compose config` prints a literal `$` as `$$` (the probe of COMPOSE_MODEL_SCRIPT). When it does not,
-   * the values of our model are escaped (escapeComposeDollars), because Compose interpolates the model again.
+   * Whether `docker compose config` prints a literal `$` as `$$` (the probe of COMPOSE_MODEL_SCRIPT). Review round 19
+   * (S19-1): either way `model` holds the unescaped texts (COMPOSE_MODEL_SCRIPT unescapes them), and the values of our
+   * models are always escaped (escapeComposeDollars), because Compose interpolates the model again.
    */
   dollarEscaped: boolean;
   model: ComposeModel;
@@ -723,7 +724,7 @@ export interface ComposeRewriteParams {
   volumeName: string;
   /** The folder of the repository in the helper, for example `/workspaces/api`. */
   repositoryFolder: string;
-  /** ComposeModelOutput.dollarEscaped. */
+  /** ComposeModelOutput.dollarEscaped (review round 19, S19-1: the rewrite no longer uses it; the written texts are always escaped). */
   dollarEscaped: boolean;
   /** See ComposeMountContext.engineApiVersion. */
   engineApiVersion?: string;
@@ -789,10 +790,6 @@ export function escapeComposeDollars(value: unknown): unknown {
   return value;
 }
 
-/** The text that a value of the model stands for: `$$` → `$` when the output escapes it. */
-function literal(text: string, dollarEscaped: boolean): string {
-  return dollarEscaped ? text.replace(/\$\$/g, '$') : text;
-}
 
 /** Labels in the map form (`docker compose config` prints a map; a list `KEY=value` is read too). */
 function labelMap(labels: unknown): Record<string, string> {
@@ -1030,8 +1027,12 @@ function mountText(entry: unknown): string {
   return isRecord(entry) ? `${String(entry.source)} → ${String(entry.target)}` : String(entry);
 }
 
-function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
-  return dollarEscaped ? model : (escapeComposeDollars(model) as ComposeModel);
+/**
+ * Review round 19 (S19-1): the texts of the model are the unescaped ones (COMPOSE_MODEL_SCRIPT unescapes them when
+ * `docker compose config` escapes them), so every text of a written model is escaped, whatever the Compose version.
+ */
+function finish(model: ComposeModel): ComposeModel {
+  return escapeComposeDollars(model) as ComposeModel;
 }
 
 /**
@@ -1051,7 +1052,7 @@ function finish(model: ComposeModel, dollarEscaped: boolean): ComposeModel {
  * - the label devenv.host-access on every service: `checked`, or with the host access checks off (`hostAccessChecks`)
  *   `unrestricted` (review round 2, D2-2); with the checks off also the published ports as the model has them, and the
  *   mounts that only the class `computer` refuses unchanged;
- * - each text escaped (`$$`) when the output of `docker compose config` does not escape it.
+ * - each text escaped (`$$`), whatever the Compose version (review round 19, S19-1: the model holds the unescaped texts).
  * `network_mode: service:<name>` stays as it is: the check allows only a service of the same model, which Compose
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check
  * refuses (composeAccessReport must pass first). `rewrites` names each change for the log.
@@ -1071,7 +1072,7 @@ export function composeUpModel(
   // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.
   // Review round 9 (D9-1): the paths of the repository that the other services mount (serviceRepositoryPath).
   return {
-    model: finish(result, p.dollarEscaped),
+    model: finish(result),
     rewrites,
     ...(createFolders.length > 0 ? { createFolders } : {}),
     ...(serviceFolders.length > 0 ? { serviceFolders } : {}),
@@ -1115,17 +1116,17 @@ export function composeBuildModel(model: ComposeModel, p: ComposeRewriteParams):
   let devDockerfile: string | undefined;
   if (isRecord(dev.build)) {
     if (typeof dev.build.dockerfile_inline === 'string') {
-      devDockerfile = literal(dev.build.dockerfile_inline, p.dollarEscaped);
+      devDockerfile = dev.build.dockerfile_inline;
       delete dev.build.dockerfile_inline;
       dev.build.dockerfile = COMPOSE_DEV_DOCKERFILE;
     }
   } else if (typeof dev.image === 'string' && dev.image.trim() !== '') {
-    devDockerfile = `FROM ${literal(dev.image.trim(), p.dollarEscaped)}\n`;
+    devDockerfile = `FROM ${dev.image.trim()}\n`;
     dev.build = { context: COMPOSE_BUILD_CONTEXT, dockerfile: COMPOSE_DEV_DOCKERFILE };
   } else {
     throw notChecked(`service ${p.devService}: no image and no build`);
   }
   dev.image = image;
-  const escaped = finish(result, p.dollarEscaped);
+  const escaped = finish(result);
   return devDockerfile === undefined ? { model: escaped, rewrites } : { model: escaped, rewrites, devDockerfile };
 }

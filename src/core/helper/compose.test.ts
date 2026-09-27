@@ -553,11 +553,13 @@ describe('composeUpModel', () => {
     expect(rewrites).toContainEqual({ item: 'project name api_devcontainer', reason: `the project of the environment is ${PROJECT}` });
   });
 
-  it('escapes $ when the output of Docker Compose does not, and not when it does', () => {
+  it('escapes $ whatever the output of Docker Compose', () => {
     const model = templateModel();
     model.services.app.environment = { A: 'a$b' };
     expect(up(model, { dollarEscaped: false }).model.services.app.environment).toEqual({ A: 'a$$b' });
-    expect(up(model, { dollarEscaped: true }).model.services.app.environment).toEqual({ A: 'a$b' });
+    // review round 19, S19-1: changed expectation, the model holds the unescaped texts (COMPOSE_MODEL_SCRIPT unescapes
+    // them), so the written model is escaped also when Compose prints $ as $$.
+    expect(up(model, { dollarEscaped: true }).model.services.app.environment).toEqual({ A: 'a$$b' });
   });
 
   it.each<[string, (model: ComposeModel) => void, RegExp]>([
@@ -601,7 +603,9 @@ describe('composeBuildModel', () => {
 
   it('writes a dockerfile_inline of the dev service to a file, which the CLI reads', () => {
     const source = templateModel();
-    source.services.app.build = { context: REPO, dockerfile_inline: 'FROM alpine:3.22\nRUN echo $$HOME\n' };
+    // review round 19, S19-1: changed expectation, the model holds the unescaped text (COMPOSE_MODEL_SCRIPT unescapes
+    // it), which is written as it is, whatever Compose prints.
+    source.services.app.build = { context: REPO, dockerfile_inline: 'FROM alpine:3.22\nRUN echo $HOME\n' };
     const escaped = composeBuildModel(source, params({ dollarEscaped: true }));
     expect(escaped.devDockerfile).toBe('FROM alpine:3.22\nRUN echo $HOME\n');
     expect(escaped.model.services.app.build).toEqual({ context: REPO, dockerfile: COMPOSE_DEV_DOCKERFILE });

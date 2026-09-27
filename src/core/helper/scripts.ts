@@ -704,7 +704,9 @@ if (process.exitCode === undefined) {
  * volume is hidden (WorkspaceHelper.composeModel). Prints one JSON line (ComposeModelOutput of compose.ts):
  * - `version`: `docker compose version --short`;
  * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
- * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles);
+ * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles), each text value
+ *   unescaped (`$$` → `$`) when `dollarEscaped` (review round 19, S19-1): the texts that Compose and BuildKit use, from
+ *   which everything below is computed;
  * - `dockerfiles`: the `build.dockerfile_inline` of each service that has one;
  * - `dockerfileFiles` and `dockerfileTexts` (review round 9, S9-2): of each other service with a local build, the real
  *   path of its Dockerfile (when it is in the repository folder, also after links, or when it is outside of it and no
@@ -830,7 +832,17 @@ const main = () => {
   for (const file of files) args.push('-f', file);
   const result = compose([...args, '--profile', '*', 'config', '--format', 'json'], { cwd: root });
   if (result.status !== 0) return failure(result, 'docker compose config');
-  const model = JSON.parse(result.stdout);
+  // Review round 19 (S19-1): the texts that Compose and BuildKit use. A Compose that prints a literal $ as $$ gets each
+  // text value (not the keys) unescaped first, so that the Dockerfiles, the real paths, and the files read below are
+  // those of the unescaped texts (and the maps are keyed by them); the model leaves the run unescaped too.
+  const unescape = (value) => {
+    if (typeof value === 'string') return value.replace(/\$\$/g, '$');
+    if (Array.isArray(value)) return value.map(unescape);
+    if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, unescape(entry)]));
+    return value;
+  };
+  const printed = JSON.parse(result.stdout);
+  const model = value === 'a$$b' ? unescape(printed) : printed;
   const dockerfiles = {};
   const dockerfileFiles = {};
   const realPaths = {};

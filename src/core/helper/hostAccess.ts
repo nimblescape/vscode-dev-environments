@@ -933,7 +933,10 @@ export function cliBaseImageCheck(
     const reason = error instanceof CliDockerfileError ? error.message : 'the Dev Container CLI cannot read the Dockerfile';
     return { findings: [{ item: `${what} (${reason}, so it cannot be checked)`, class: 'unsupported' }] };
   }
-  if (image === undefined || image.toLowerCase() === 'scratch') return { findings: [] };
+  // Review round 19 (P19-2): the CLI inspects its base image only when it is not empty (a variable that it does not
+  // resolve, for example an argument that only `build.options` gives, becomes ''). Only the empty text itself: any
+  // other text (blanks too) is inspected, and so checked.
+  if (image === undefined || image === '' || image.toLowerCase() === 'scratch') return { findings: [] };
   if (image.includes('$')) {
     const cannot: HostAccessFinding = { item: `${what} ${shortReference(image)} (its variables cannot be resolved, so it cannot be checked)`, class: 'unsupported' };
     if (platform !== undefined) return { findings: [cannot] };
@@ -979,7 +982,11 @@ export function singleCliBaseImageCheck(
   checked?: readonly string[],
 ): CliBaseImageCheck {
   const build = isRecord(config.build) ? config.build : {};
-  const args = (build.args || {}) as Readonly<Record<string, unknown>>;
+  // Review round 19 (S19-3): the CLI's build arguments after its substitution are a null-prototype object with the own
+  // properties of `build.args` (so an ARG named like a property of Object.prototype, `constructor` for example, is
+  // not found among them); an absent or other value gives no arguments.
+  const args: Readonly<Record<string, unknown>> =
+    isRecord(build.args) && !Array.isArray(build.args) ? (Object.assign(Object.create(null), build.args) as Record<string, unknown>) : {};
   return cliBaseImageCheck(dockerfileText, args, build.target, platform, checked ?? dockerViewImages(dockerfileText, singleBuildArguments(build).args));
 }
 

@@ -1098,6 +1098,7 @@ describe('open: existing environment', () => {
       },
       listImagesByLabel: async () => [],
       removeImage: async () => false,
+      imageArchitecture: async () => undefined,
     };
     // The registry does not answer the helper: its lookup runs until its time limit (5 seconds) ends it.
     let lookupSignal: AbortSignal | undefined;
@@ -3810,5 +3811,45 @@ describe('review round 18 (P18-1, P18-3): the base image that the Dev Container 
   it('does not ask for the architecture of a configuration with an image', async () => {
     await h.service.open(TARGET, options());
     expect(h.docker.archQueries).toBe(0);
+  });
+});
+
+describe('review round 19 (S19-4, P19-2): the checks of a single container before the read of the merged configuration', () => {
+  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS x\n';
+
+  function useDockerfile(text: string, build: Record<string, unknown> = {}): void {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', ...build } };
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: text };
+  }
+
+  it('S19-4: a refused base image of the CLI leads to no read of the merged configuration', async () => {
+    useDockerfile(`${BASE}RUN echo \\\nFROM devenv-0badc0de:3 AS x\n`);
+    h.helper.merged = { privileged: false };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('base image of the Dev Container CLI devenv-0badc0de:3 of another environment'));
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('S19-4: a refused configuration leads to no read of the merged configuration, and the merged one is still checked', async () => {
+    h.helper.config = { image: BASE_IMAGE, privileged: true };
+    h.helper.merged = {};
+    let error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }]);
+    // Only the merged configuration asks for privileged mode (the metadata of the image).
+    h.helper.readConfigurations.length = 0;
+    h.helper.config = { image: BASE_IMAGE };
+    h.helper.merged = { privileged: true };
+    error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }, { configPath: DEFAULT_CONFIG_PATH }]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('P19-2: builds a single container whose base image comes only from `--build-arg` of build.options', async () => {
+    useDockerfile('ARG BASE\nFROM ${BASE}\n', { options: ['--build-arg', `BASE=${BASE_IMAGE}`] });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 });

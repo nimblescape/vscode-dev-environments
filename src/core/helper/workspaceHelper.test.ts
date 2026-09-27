@@ -82,6 +82,21 @@ class FakeDocker implements HelperDocker {
     this.builds.push(options);
     await this.buildHandler(options);
     this.images.add(options.tag);
+    this.architectures.set(options.tag, options.platform !== undefined ? options.platform.split('/')[1] : this.defaultArchitecture);
+  }
+
+  /** Review round 19 (P19-1): the architecture of the Docker Engine (`undefined`: not told, the default of the fake). */
+  engineArch: string | undefined;
+  /** The architecture of each image by tag; a build without `--platform` gets defaultArchitecture. */
+  readonly architectures = new Map<string, string>();
+  defaultArchitecture = 'amd64';
+
+  async engineArchitecture(): Promise<string | undefined> {
+    return this.engineArch;
+  }
+
+  async imageArchitecture(reference: string): Promise<string | undefined> {
+    return this.architectures.get(reference);
   }
 
   async listImagesByLabel(): Promise<ImageInfo[]> {
@@ -390,6 +405,42 @@ describe('WorkspaceHelper.run', () => {
     await expect(helper.run('vol', ['sleep', '60'], { signal: controller.signal })).rejects.toThrow(/cancelled/);
     const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
     expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+  });
+});
+
+describe('review round 19 (P19-1): the helper image and its runs for the architecture of the Docker Engine', () => {
+  it('builds and runs the helper with --platform linux/<engine architecture>, under a tag of that platform', async () => {
+    docker.engineArch = 'arm64';
+    // DOCKER_DEFAULT_PLATFORM=linux/amd64: the image of the tag without a platform is of another architecture.
+    docker.images.add(TAG);
+    docker.architectures.set(TAG, 'amd64');
+    const helper = createHelper();
+    const tag = await helper.ensureImage();
+    expect(tag).toBe(helperImageTag(DOCKERFILE, undefined, 'linux/arm64'));
+    expect(docker.builds.map((build) => build.platform)).toEqual(['linux/arm64']);
+    await helper.run('devenv-acme-api-3f2a9c1e', ['true']);
+    const args = docker.runs[0].args;
+    expect(args.slice(args.indexOf('--platform'), args.indexOf('--platform') + 2)).toEqual(['--platform', 'linux/arm64']);
+    expect(args.indexOf('--platform')).toBeLessThan(args.indexOf(tag));
+  });
+
+  it('refuses a helper image of another architecture (an error of the helper)', async () => {
+    docker.engineArch = 'arm64';
+    docker.buildHandler = async (options) => {
+      delete options.platform;
+    };
+    const error = await createHelper().ensureImage().catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: 'helperFailed' });
+    expect((error as UserFacingError).detail).toContain('is for the architecture amd64, not for arm64, the architecture of the Docker Engine');
+    expect(docker.runs).toEqual([]);
+  });
+
+  it('without the architecture of the engine: as before (no --platform)', async () => {
+    const helper = createHelper();
+    expect(await helper.ensureImage()).toBe(TAG);
+    await helper.run('devenv-acme-api-3f2a9c1e', ['true']);
+    expect(docker.builds[0].platform).toBeUndefined();
+    expect(docker.runs[0].args).not.toContain('--platform');
   });
 });
 

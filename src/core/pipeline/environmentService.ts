@@ -1423,6 +1423,64 @@ export class EnvironmentService {
     const problems = checkConfiguration(files.configText);
     if (problems.compose) return this.loadComposeConfiguration(ctx, { configPath, fallback, files, problems });
 
+    // Review round 19 (S19-4): devcontainer.json first without the merged configuration (for which the CLI inspects,
+    // and pulls when it is missing, the image or the base image of the Dockerfile, and merges its metadata), as for
+    // Docker Compose: the checks of the configuration, of the image references (imageIdItems), and of the base image that
+    // the CLI reads (checkCliBaseImage) come before the read of the merged configuration.
+    await this.requireVolume(env);
+    const { config } = await helper.readConfiguration({
+      volumeName: env.volumeName,
+      repository: env.repository,
+      configPath,
+      environmentId: env.id,
+      merged: false,
+      onOutput: this.output,
+      signal: ctx.signal,
+    });
+    // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
+    // CLI resolves the build context and the Dockerfile, and the Dockerfile (review round 1, S1 and S4) at the path that
+    // the resolved configuration names (review round 2, S2-01).
+    const repository = repositoryFolder(env.repository);
+    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
+    const input: Omit<HostAccessInput, 'ownVolume'> = {
+      config,
+      configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
+      repositoryFolder: repository,
+      ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
+      ...(dockerfile.unreadable !== undefined ? { dockerfileUnreadable: dockerfile.unreadable } : {}),
+    };
+    // Review round 8: in the worker (ConfigurationAnalyzer), with the image references of the configuration.
+    const singleAnalysis = async (checked: HostAccessInput) =>
+      this.analyze(ctx, {
+        kind: 'single',
+        input: checked,
+        checksOn: ctx.hostAccessChecks === 'on',
+        config,
+        ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
+      });
+    // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image. Review round 9 (S9-3): only when
+    // the configuration is not refused already. `known`: the references that were asked already.
+    const refuseUnlessAllowed = async (report: HostAccessReport, references: readonly NamedImageReference[]) => {
+      if (!isRefused(report)) {
+        for (const item of await this.imageIdItems(references, ctx.signal)) {
+          if (!report.unsupported.includes(item)) report.unsupported.push(item);
+        }
+      }
+      if (isRefused(report)) {
+        this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
+        throw new HostAccessError(report);
+      }
+    };
+    let checked = await this.hostAccessInput(env, input);
+    let analysis = await singleAnalysis(checked);
+    await refuseUnlessAllowed(analysis.report, analysis.imageReferences);
+    // Review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads, with the exact platform.
+    const imageReferences = analysis.imageReferences;
+    const cliPlatform =
+      dockerfile.text !== undefined && usesCliDockerfile(config)
+        ? await this.checkCliBaseImage(ctx, (platform) => singleCliBaseImageCheck(config, dockerfile.text as string, platform, imageReferences.map((entry) => entry.reference)))
+        : undefined;
+    // The merged configuration (review round 19, S19-4: only now).
     await this.requireVolume(env);
     const read = await helper.readConfiguration({
       volumeName: env.volumeName,
@@ -1432,7 +1490,6 @@ export class EnvironmentService {
       onOutput: this.output,
       signal: ctx.signal,
     });
-    const config = read.config;
     let merged = read.merged;
     // The CLI merges the metadata of an existing container. A container created while the host access checks were off
     // holds what they allowed then (for example `privileged` of a configuration that has changed since); with the checks
@@ -1453,50 +1510,23 @@ export class EnvironmentService {
       );
       merged = undefined;
     }
-    // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
-    // CLI resolves the build context and the Dockerfile, and the Dockerfile (review round 1, S1 and S4) at the path that
-    // the resolved configuration names (review round 2, S2-01).
-    const repository = repositoryFolder(env.repository);
-    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
-    const checked = await this.hostAccessInput(env, {
-      config,
-      merged,
-      configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
-      repositoryFolder: repository,
-      ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
-      ...(dockerfile.unreadable !== undefined ? { dockerfileUnreadable: dockerfile.unreadable } : {}),
-    });
-    // Review round 8: in the worker (ConfigurationAnalyzer), with the image references of the configuration.
-    const analysis = await this.analyze(ctx, {
-      kind: 'single',
-      input: checked,
-      checksOn: ctx.hostAccessChecks === 'on',
-      config,
-      ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
-    });
-    const report = analysis.report;
-    // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image. Review round 9 (S9-3): only when
-    // the configuration is not refused already.
-    if (!isRefused(report)) {
-      for (const item of await this.imageIdItems(analysis.imageReferences, ctx.signal)) {
-        if (!report.unsupported.includes(item)) report.unsupported.push(item);
-      }
-    }
-    if (isRefused(report)) {
-      this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
-      throw new HostAccessError(report);
+    if (merged !== undefined) {
+      // The whole check again with the merged configuration; only the image references that were not asked yet go to
+      // Docker.
+      checked = await this.hostAccessInput(env, { ...input, merged });
+      analysis = await singleAnalysis(checked);
+      const asked = new Set(imageReferences.map((entry) => `${entry.what} ${entry.reference}`));
+      await refuseUnlessAllowed(
+        analysis.report,
+        analysis.imageReferences.filter((entry) => !asked.has(`${entry.what} ${entry.reference}`)),
+      );
     }
     // Review round 3 (P3-1): a Dockerfile that does not exist in the repository is an error of the configuration, not a
-    // refusal: the existing environment still starts (runPipeline), and nothing is built from a file that is not checked.
+    // refusal (also of the merged configuration): the existing environment still starts (runPipeline), and nothing is built from a file that is not checked.
     if (dockerfile.missing !== undefined) {
       this.logger.warn(`The Dockerfile ${dockerfile.missing} of the configuration ${configPath} of ${env.repository} does not exist.`);
       throw new UserFacingError('buildFailed', Messages.buildFileMissing(`the Dockerfile ${dockerfile.missing}`));
     }
-    // Review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads, with the exact platform.
-    const cliPlatform =
-      dockerfile.text !== undefined && usesCliDockerfile(config)
-        ? await this.checkCliBaseImage(ctx, (platform) => singleCliBaseImageCheck(config, dockerfile.text as string, platform, analysis.imageReferences.map((entry) => entry.reference)))
-        : undefined;
     if (merged === undefined) {
       this.logger.info('The merged configuration is not known: the image metadata is checked before the container starts.');
     }
@@ -1589,12 +1619,16 @@ export class EnvironmentService {
     const { configPath, files } = p;
     const project = composeProjectName(env.id);
     await this.requireVolume(env);
+    // Review round 19 (D19-1): with the project name in the environment of the CLI, as for the merged read below: the
+    // CLI resolves `${localEnv:COMPOSE_PROJECT_NAME}` of devcontainer.json (for example in `mounts`) with it, and the
+    // mounts, their volumes, and the checks use this configuration.
     const { config } = await helper.readConfiguration({
       volumeName: env.volumeName,
       repository: env.repository,
       configPath,
       environmentId: env.id,
       merged: false,
+      env: { COMPOSE_PROJECT_NAME: project },
       onOutput: this.output,
       signal: ctx.signal,
     });
@@ -4251,12 +4285,14 @@ export class EnvironmentService {
   ): Promise<{ configHash: string; inputsHash: string; version: string } | undefined> {
     const { helper } = this.deps;
     await this.requireVolume(env);
+    // Review round 19 (D19-1): with the project name, as loadComposeConfiguration reads it.
     const { config } = await helper.readConfiguration({
       volumeName: env.volumeName,
       repository: env.repository,
       configPath,
       environmentId: env.id,
       merged: false,
+      env: { COMPOSE_PROJECT_NAME: composeProjectName(env.id) },
       onOutput: this.output,
       signal,
     });

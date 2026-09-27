@@ -60,6 +60,7 @@ import {
   type Harness,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, repositoryServiceDataFolders } from './pipelineRules';
+import { parseJsonc } from '../jsonc';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
@@ -221,7 +222,8 @@ describe('first open of a Docker Compose configuration', () => {
     // The model run gets the compose files of the configuration, resolved against its folder.
     expect(h.helper.composeModels).toEqual([{ files: [`${FOLDER}/.devcontainer/compose.yml`], project: PROJECT }]);
     // devcontainer.json first without the merged configuration, then with our copy, whose only compose file is ours.
-    expect(h.helper.readConfigurations[0]).toEqual({ configPath: DEFAULT_CONFIG_PATH, merged: false });
+    // review round 19, D19-1: changed expectation, the first read also has the project name in its environment.
+    expect(h.helper.readConfigurations[0]).toEqual({ configPath: DEFAULT_CONFIG_PATH, merged: false, env: { COMPOSE_PROJECT_NAME: PROJECT } });
     const merged = h.helper.readConfigurations[1];
     expect(merged.override).toMatchObject({ dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app', name: 'API' });
     expect(merged.env).toEqual({ COMPOSE_PROJECT_NAME: PROJECT });
@@ -3076,5 +3078,86 @@ describe('review round 18 of unit 6 (D18-1): `${localEnv:COMPOSE_PROJECT_NAME}` 
       [LABEL_VOLUME]: VOLUME_KIND_COMPOSE,
     });
     expect((await h.registry.get(ENV_ID))?.additionalVolumes).toContain(`${PROJECT}_${key}`);
+  });
+});
+
+describe('review round 19 of unit 6 (D19-1): `${localEnv:COMPOSE_PROJECT_NAME}` in the mounts of devcontainer.json', () => {
+  const MOUNTS_TEXT = CONFIG_TEXT.replace('"source=cache,', '"source=cache${localEnv:COMPOSE_PROJECT_NAME},');
+
+  /** As the CLI: read-configuration substitutes `${localEnv:…}` with the environment of the helper process. */
+  function substitutingReads(withMerged: boolean): void {
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: MOUNTS_TEXT } };
+    const helper = h.helper as unknown as {
+      readConfiguration: (p: { volumeName: string; configPath: string; merged?: boolean; env?: Record<string, string> }) => Promise<unknown>;
+      readConfigurations: Array<Record<string, unknown>>;
+      mount(volume: string): void;
+    };
+    helper.readConfiguration = async (p) => {
+      helper.mount(p.volumeName);
+      helper.readConfigurations.push({ configPath: p.configPath, ...(p.merged !== undefined ? { merged: p.merged } : {}), ...(p.env !== undefined ? { env: p.env } : {}) });
+      const config = parseJsonc<Record<string, unknown>>(MOUNTS_TEXT.replace('${localEnv:COMPOSE_PROJECT_NAME}', p.env?.COMPOSE_PROJECT_NAME ?? ''));
+      return p.merged === false || !withMerged ? { config } : { config, merged: { ...config } };
+    };
+  }
+
+  for (const withMerged of [true, false]) {
+    it(`declares, creates, and records only the volume that the CLI uses (${withMerged ? 'with' : 'without'} the merged configuration)`, async () => {
+      substitutingReads(withMerged);
+      await h.service.open(TARGET, options());
+      const real = `${PROJECT}_cache${PROJECT}`;
+      expect(h.docker.volumes.has(real)).toBe(true);
+      expect(h.docker.volumes.has(`${PROJECT}_cache`)).toBe(false);
+      const additional = (await h.registry.get(ENV_ID))?.additionalVolumes ?? [];
+      expect(additional).toContain(real);
+      expect(additional).not.toContain(`${PROJECT}_cache`);
+      expect(Object.keys(upModel().volumes ?? {})).not.toContain('cache');
+      expect(h.helper.readConfigurations.every((read) => (read.env as Record<string, string> | undefined)?.COMPOSE_PROJECT_NAME === PROJECT)).toBe(true);
+    });
+  }
+
+  it('reads the configuration for the question about a rebuild with the project name too', async () => {
+    await seedCompose();
+    h.helper.readConfigurations.length = 0;
+    await h.service.configurationChanged(ENV_ID, options());
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false, env: { COMPOSE_PROJECT_NAME: PROJECT } }]);
+  });
+});
+
+describe('review round 19 of unit 6 (S19-1): the configuration hash of an environment whose model has a $ changes once', () => {
+  /** The model as it holds the texts now (unescaped), and the hash that an earlier version recorded (escaped texts). */
+  const withDollar = () => output((m) => (m.services.db.environment = { POSTGRES_PASSWORD: 'a$b' }));
+  const legacyHash = () => {
+    const m = model();
+    m.services.db.environment = { POSTGRES_PASSWORD: 'a$$b' };
+    return composeConfigHash(CONFIG_TEXT, m, {});
+  };
+  const legacyRecord = () => ({
+    configHash: legacyHash(),
+    compose: { service: 'app', images: [`${PROJECT}-app`], version: '2.40.3', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) },
+  });
+
+  it('asks as for any change; "Rebuild later" starts the existing containers as they are', async () => {
+    await seedCompose({ dev: 'stopped', record: legacyRecord() });
+    useCompose(h, withDollar());
+    h.ui.configurationChangedAnswer = 'later';
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(devContainer()?.state).toBe('running');
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(legacyHash());
+  });
+
+  it('"Rebuild now" rebuilds once, keeps the volumes, and records the new hash; then no change is left', async () => {
+    await seedCompose({ record: legacyRecord() });
+    useCompose(h, withDollar());
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+    expect(upModel().services.db.environment).toEqual({ POSTGRES_PASSWORD: 'a$$b' });
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(composeConfigHash(CONFIG_TEXT, withDollar().model, {}));
+    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
   });
 });
