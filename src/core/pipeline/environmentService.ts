@@ -21,6 +21,7 @@ import {
   isNumericId,
   parseGitSummaryOutput,
   serviceFolderPaths,
+  type DevMountPaths,
   type ServiceFolders,
 } from '../git/gitSummary';
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
@@ -43,7 +44,13 @@ import {
   type ComposeModelOutput,
   type ComposeRewriteParams,
 } from '../helper/compose';
-import { composeConfigurationReport, composeIgnoredProperties, composeMissingBuildPaths } from '../helper/composeAccess';
+import {
+  composeBuildImageItems,
+  composeConfigurationReport,
+  composeDevBuildImages,
+  composeIgnoredProperties,
+  composeMissingBuildPaths,
+} from '../helper/composeAccess';
 import { helperCliVariables } from '../helper/cliVariables';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import {
@@ -711,6 +718,11 @@ function composeBuildFiles(build: ComposeBuildModelRewrite): HelperFiles {
     [COMPOSE_MODEL_PATH]: JSON.stringify(build.model, null, 2),
     ...(build.devDockerfile !== undefined ? { [COMPOSE_DEV_DOCKERFILE]: build.devDockerfile } : {}),
   };
+}
+
+/** Review round 16 (Dp): whether the configuration names Features (the CLI then builds them into the image). */
+function hasFeatures(config: DevcontainerConfig | undefined): boolean {
+  return isRecord(config?.features) && Object.keys(config.features).length > 0;
 }
 
 function isHostAccess(error: unknown): boolean {
@@ -2090,6 +2102,19 @@ export class EnvironmentService {
       }
     }
 
+    // Review round 16 (Dp): the user of the images of the dev service, which the Dev Container CLI writes as text into its
+    // compose file for the build (with Features), after the downloads, before the build.
+    if (loaded.compose !== undefined && hasFeatures(loaded.config)) {
+      try {
+        await this.checkComposeBuildImages(ctx, loaded.compose);
+      } catch (error) {
+        if (!isHostAccess(error)) return this.updateFailed(ctx, error, canFallBack, plan.check);
+        if (!canFallBack) throw error;
+        await this.rememberRefusedUpdate(ctx, loaded, record, plan.check, error);
+        return undefined;
+      }
+    }
+
     ctx.steps.step('preparing');
     const buildNumber = await this.nextBuildNumber(env);
     const imageName = environmentImageName(env.id, buildNumber);
@@ -2226,6 +2251,36 @@ export class EnvironmentService {
     this.logger.info(`New environment image of ${env.repository}: ${imageName}.`);
     await this.removeEnvironmentImages(ctx.env, imageName, record, newRecord.compose?.images ?? []);
     return { result, created: true };
+  }
+
+  /**
+   * Review round 16 (Dp): with Features, the Dev Container CLI 0.89.0 writes the user of the target stage of the dev
+   * service into its compose file for the build as text (`- _DEV_CONTAINERS_IMAGE_USER=<user>`, function `Dp`): the USER
+   * instruction of the Dockerfile (devBuildTextProblems checks it with the build arguments), or the user of the image of
+   * the stage. So the images of the dev service (composeDevBuildImages) are inspected (downloaded first when they are not
+   * here, as the build would), and a user, or with a USER instruction that uses a variable a variable of the environment,
+   * with a line break is refused (composeBuildImageItems), as is a FROM image whose variables could not be resolved.
+   * Throws a HostAccessError for them.
+   */
+  private async checkComposeBuildImages(ctx: PipelineContext, compose: LoadedCompose): Promise<void> {
+    const { images, unresolved, userVariables } = composeDevBuildImages(compose.output.model, compose.output.dockerfiles, compose.service);
+    const items = unresolved.map((image) => `the image ${image} of the dev service (its variables could not be resolved, so the user that the Dev Container CLI writes into its compose file for the build cannot be checked)`);
+    for (const image of images) {
+      this.throwIfCancelled(ctx.signal);
+      let config: unknown;
+      try {
+        config = await this.imageConfig(image, ctx.signal);
+      } catch (error) {
+        if (this.isCancellation(error, ctx.signal)) throw error;
+        await this.pull(ctx, image, false, new Set());
+        config = await this.imageConfig(image, ctx.signal);
+      }
+      items.push(...composeBuildImageItems(image, config, userVariables));
+    }
+    if (items.length === 0) return;
+    const report: HostAccessReport = { hostAccess: [], unsupported: items.map((item) => `service ${compose.service}: ${item}`) };
+    this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
+    throw new HostAccessError(report);
   }
 
   /**
@@ -3429,7 +3484,9 @@ export class EnvironmentService {
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
       // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner). Review
       // round 12 (D12-2): nor the paths where the dev container mounts other volumes.
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser, await this.withDevMountFolders(ctx, containerName, serviceFolders), true);
+      // Review round 16 (L2): the targets of the mounts are marked one by one (DevMountPaths), not the whole list.
+      const dev = await this.withDevMountFolders(ctx, containerName, serviceFolders);
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, dev.folders, dev.mounts);
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
       // is still root when the ownership fix before `up` did not run or failed. Review round 15 (K3): in a helper container
       // that mounts only the workspace volume, not in the dev container, whose mounts may lie in the folder.
@@ -3525,9 +3582,16 @@ export class EnvironmentService {
    * they matter only in the dev container, where they are mounted. When the dev container cannot be read, the whole
    * repository (only the files of root change). Review round 13 (D13-1, D13-3): also the mounts of the workspace volume
    * below the repository, but not the anonymous volumes of the dev container while the host access checks are on.
+   * Review round 16 (L2 = D16-2): with the targets of the mounts (`mounts`), which the fix marks one by one: a real path
+   * in `.git` of a target is kept, that of a path of the services is not.
    */
-  private async withDevMountFolders(ctx: PipelineContext, containerName: string, serviceFolders: ServiceFolders | undefined): Promise<ServiceFolders | undefined> {
-    if (serviceFolders === 'repository') return serviceFolders;
+  private async withDevMountFolders(
+    ctx: PipelineContext,
+    containerName: string,
+    serviceFolders: ServiceFolders | undefined,
+  ): Promise<{ folders: ServiceFolders | undefined; mounts: ReadonlySet<string> }> {
+    const none: ReadonlySet<string> = new Set();
+    if (serviceFolders === 'repository') return { folders: serviceFolders, mounts: none };
     const repository = repositoryFolder(ctx.env.repository);
     // Review round 15 (K4): the paths of the services without `.git` (their filter), before the targets of the mounts,
     // which may lie in `.git` (the list is passed to the fix with `gitPaths`).
@@ -3539,11 +3603,11 @@ export class EnvironmentService {
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);
-      return 'repository';
+      return { folders: 'repository', mounts: none };
     }
-    if (mounts.length === 0) return records;
+    if (mounts.length === 0) return { folders: records, mounts: none };
     const bounded = boundServiceFolders(repository, [records, mounts], false, true);
-    return bounded.overflow ? 'repository' : bounded.folders;
+    return bounded.overflow ? { folders: 'repository', mounts: none } : { folders: bounded.folders, mounts: new Set(mounts) };
   }
 
   /**
@@ -3618,7 +3682,7 @@ export class EnvironmentService {
     folder: string,
     user: string,
     serviceFolders?: ServiceFolders,
-    gitPaths = false,
+    gitPaths: DevMountPaths = false,
   ): Promise<void> {
     const except =
       serviceFolders === 'repository'

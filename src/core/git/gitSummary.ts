@@ -71,15 +71,24 @@ seen=$nl
  * `readlink -f` otherwise), and a real path that differs, lies in the folder (not the folder itself, not in `.git`), and
  * was not added before (`seen`) is appended as `-o -path <real> -o -path <real>/*`. A path with a character that `-path`
  * reads as a pattern (then written with `\`), a real path with one or with a newline, or more than
- * MAX_SERVICE_REAL_PATHS real paths in all: `whole`. It runs in service_owner_fix (at the time of the fix) and, in
+ * MAX_SERVICE_REAL_PATHS real paths in all: `whole`. Review round 16 (L2 = D16-2): a real path in `.git` is added for
+ * a path of a mount of the dev container, which servicePathArguments marks one by one with `(` before it and `)` after
+ * its patterns (`mount`): the target of the mount may be a link into `.git` (`data -> .git/pg`), where Docker mounts it.
+ * The marker is read only where no path can be (never right after `-path`); the text of the test starts with `1` then,
+ * so that the case of `.git` does not match. It runs in service_owner_fix (at the time of the fix) and, in
  * SWITCH_BRANCH_SCRIPT, also at the top level before `git fetch` and `git switch` (the real paths of the branch before
  * the switch, which service_owner_fix gets as arguments and unites with its own). The paths stay arguments: no shell
  * text is built from them.
  */
 export const SERVICE_REAL_PATHS = `  here=$PWD
   previous=''
+  mount=''
   for arg do
-    if [ "$previous" = '-path' ]; then
+    if [ "$previous" != '-path' ] && [ "$arg" = '(' ]; then
+      mount=1
+    elif [ "$previous" != '-path' ] && [ "$arg" = ')' ]; then
+      mount=''
+    elif [ "$previous" = '-path' ]; then
       case $arg in
         */\\*) ;;
         *\\\\*) whole=1 ;;
@@ -93,8 +102,8 @@ export const SERVICE_REAL_PATHS = `  here=$PWD
           if [ -n "$real" ] && [ "$real" != "$arg" ]; then
             case $real in
               "$folder"/*)
-                case "/\${real#"$folder"/}/" in
-                  */.git/*) ;;
+                case "$mount/\${real#"$folder"/}/" in
+                  /.git/* | /*/.git/*) ;;
                   *[[\\\\*?]* | *"$nl"*) whole=1 ;;
                   *)
                     case $seen in
@@ -198,6 +207,18 @@ export function isOverlongServicePath(repoFolder: string, folder: string): boole
   return false;
 }
 
+/**
+ * Review round 16 (L2 = D16-2): which paths of a list are targets of the mounts of the dev container (devMountFolders):
+ * all (`true`), none (`false`), or those of the set. They keep a place in `.git` (serviceFolderPaths), and
+ * servicePathArguments marks each of them for the resolution of links in SERVICE_REAL_PATHS, which then keeps a real
+ * path in `.git` for them (and only for them).
+ */
+export type DevMountPaths = boolean | ReadonlySet<string>;
+
+function isDevMountPath(paths: DevMountPaths, folder: string): boolean {
+  return typeof paths === 'boolean' ? paths : paths.has(folder);
+}
+
 interface PathNode {
   children?: Map<string, PathNode>;
   terminal?: boolean;
@@ -216,17 +237,19 @@ interface PathNode {
  * Review round 15 (K4 = D15-2): `gitPaths` keeps paths in `.git` for the targets of the mounts of the dev container
  * (devMountFolders, for example a volume that db shares at `.git/pg`, or a bind of the computer at `.git/hooks`): they
  * are mounts, not records of the services, and the fix would otherwise give their files to the remote user. Only the
- * callers of those targets set it; the records of the services keep the filter.
+ * callers of those targets set it; the records of the services keep the filter. Review round 16 (L2 = D16-2): `gitPaths`
+ * may name the targets one by one (DevMountPaths), so that the records of the services in the same list keep the filter.
  */
-export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined, gitPaths = false): string[] {
+export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined, gitPaths: DevMountPaths = false): string[] {
   // Segments without a place in the list: empty, `.`, `..`, `.git` (review round 15, K4: except for `gitPaths`).
-  const invalidSegment = gitPaths ? /(?:^|\/)(?:|\.|\.\.)(?:\/|$)/ : /(?:^|\/)(?:|\.|\.\.|\.git)(?:\/|$)/;
+  const withGit = /(?:^|\/)(?:|\.|\.\.)(?:\/|$)/;
+  const withoutGit = /(?:^|\/)(?:|\.|\.\.|\.git)(?:\/|$)/;
   const valid: Array<{ folder: string; segments: string[] | undefined }> = [];
   const seen = new Set<string>();
   for (const folder of folders ?? []) {
     if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`) || seen.has(folder)) continue;
     const relative = folder.slice(repoFolder.length + 1);
-    if (invalidSegment.test(relative)) continue;
+    if ((isDevMountPath(gitPaths, folder) ? withGit : withoutGit).test(relative)) continue;
     seen.add(folder);
     // A path over the bounds is not split: it never covers another one (it is never an ancestor of one within the
     // bounds, and the callers treat the list as overflow anyway), so only the paths within the bounds go into the tree.
@@ -289,7 +312,7 @@ export function boundServiceFolders(
   repoFolder: string,
   groups: ReadonlyArray<readonly string[] | undefined>,
   overflow = false,
-  gitPaths = false,
+  gitPaths: DevMountPaths = false,
 ): { folders: string[]; overflow: boolean } {
   const paths = serviceFolderPaths(repoFolder, groups.flatMap((group) => group ?? []), gitPaths);
   // Review round 12 (S12-1): a path over the bounds is overflow; it is not recorded (the recorded overflow covers it).
@@ -311,9 +334,11 @@ function findPathPattern(path: string): string {
  * one argument (never shell text), built in linear time. With `'repository'`, more than MAX_SERVICE_FOLDERS paths, a
  * path over the bounds of isOverlongServicePath (review round 12, S12-1), or more than MAX_SERVICE_ARGUMENT_CHARACTERS
  * characters: the test of the whole repository folder, so that only the files
- * of root get their owner.
+ * of root get their owner. Review round 16 (L2 = D16-2): the patterns of each path of `gitPaths` (a target of a mount of
+ * the dev container) stand between the arguments `(` and `)`, which change nothing for `find` and tell SERVICE_REAL_PATHS
+ * that a real path of it in `.git` is kept.
  */
-export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined, gitPaths = false): string[] {
+export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined, gitPaths: DevMountPaths = false): string[] {
   const whole = () => ['-path', findPathPattern(repoFolder), '-o', '-path', `${findPathPattern(repoFolder)}/*`];
   if (folders === 'repository') return whole();
   const paths = serviceFolderPaths(repoFolder, folders, gitPaths);
@@ -323,8 +348,9 @@ export function servicePathArguments(repoFolder: string, folders: ServiceFolders
   for (const path of paths) {
     const pattern = findPathPattern(path);
     if (args.length > 0) args.push('-o');
-    args.push('-path', pattern, '-o', '-path', `${pattern}/*`);
-    characters += 2 * pattern.length + 20;
+    if (isDevMountPath(gitPaths, path)) args.push('(', '-path', pattern, '-o', '-path', `${pattern}/*`, ')');
+    else args.push('-path', pattern, '-o', '-path', `${pattern}/*`);
+    characters += 2 * pattern.length + 24;
     if (characters > MAX_SERVICE_ARGUMENT_CHARACTERS) return whole();
   }
   return args;
@@ -434,8 +460,9 @@ export function gitSummaryCommand(repoFolder: string): string[] {
 /**
  * Command for `docker exec -u root` in the dev container after its first creation (implementation notes 7 "Ownership"):
  * the helper clones as root, so the files get the user and the primary group of `remoteUser`. `gitPaths`: as in
- * serviceFolderPaths (review round 15, K4), for a list that holds the targets of the mounts of the dev container.
+ * serviceFolderPaths (review round 15, K4), for a list that holds the targets of the mounts of the dev container; review
+ * round 16 (L2): the set of those targets, when the list holds the paths of the services too.
  */
-export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths = false): string[] {
+export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
   return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders, gitPaths)];
 }

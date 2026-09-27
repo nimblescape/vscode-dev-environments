@@ -151,6 +151,13 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['a Git variable in the dev service', 'app', { environment: { GIT_CONFIG_GLOBAL: '/x', PORT: '1' } }, A('service app: variable GIT_CONFIG_GLOBAL in environment')],
     ['a gh variable in the dev service', 'app', { environment: { GH_TOKEN: 'x' } }, A(`service app: variable GH_TOKEN in environment (${GITHUB_CLI_ACCOUNT_REASON})`)],
     ['a Git variable in the dev service (list)', 'app', { environment: ['GIT_CONFIG_GLOBAL=/x'] }, A('service app: variable GIT_CONFIG_GLOBAL in environment')],
+    // Review round 16: the rule of containerEnv from the merge of #27 (refusedVariable): the part of a name before a `=`,
+    // without surrounding spaces, and names with a space or a control character.
+    ['a gh variable before a `=` in the name (map)', 'app', { environment: { 'GH_TOKEN=x': '1' } }, A(`service app: variable GH_TOKEN in environment (${GITHUB_CLI_ACCOUNT_REASON})`)],
+    ['a gh variable with spaces in the name (map)', 'app', { environment: { ' GH_HOST ': 'x' } }, A(`service app: variable GH_HOST in environment (${GITHUB_CLI_ACCOUNT_REASON})`)],
+    ['a Git variable before a second `=` (list)', 'app', { environment: ['GIT_CONFIG_COUNT=1=2'] }, A('service app: variable GIT_CONFIG_COUNT in environment')],
+    ['a name with a space in the dev service', 'app', { environment: { 'A B': '1' } }, U('service app: variable "A B" in environment (a name with a space or a control character)')],
+    ['a name with a line break in the dev service', 'app', { environment: { 'A\nB': '1' } }, U('service app: variable "A\\nB" in environment (a name with a space or a control character)')],
     // env_file
     ['an env_file in the repository', 'db', { env_file: [`${REPO}/.env.db`, { path: `${REPO}/.devcontainer/db.env`, required: false }] }, NONE],
     ['an env_file outside the repository', 'db', { env_file: ['/root/.env'] }, A('service db: env_file /root/.env')],

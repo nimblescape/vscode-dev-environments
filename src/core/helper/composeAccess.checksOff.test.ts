@@ -99,6 +99,9 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['an env_file outside the repository', input(service('db', { env_file: ['/root/.env'] })), 'service db: env_file /root/.env', 'protected'],
   ['a Git variable in the dev service', input(service('app', { environment: { GIT_CONFIG_GLOBAL: '/x' } })), 'service app: variable GIT_CONFIG_GLOBAL in environment', 'protected'],
   ['a gh variable in the dev service', input(service('app', { environment: { GH_TOKEN: 'x' } })), `service app: variable GH_TOKEN in environment (${GITHUB_CLI_ACCOUNT_REASON})`, 'protected'],
+  // Review round 16: the rule of the merge of #27 (refusedVariable) on the part of a name before a `=`.
+  ['a gh variable before a `=` in the dev service', input(service('app', { environment: { 'GH_TOKEN=x': '1' } })), `service app: variable GH_TOKEN in environment (${GITHUB_CLI_ACCOUNT_REASON})`, 'protected'],
+  ['a name with a space in the dev service', input(service('app', { environment: { 'A B': '1' } })), 'service app: variable "A B" in environment (a name with a space or a control character)', 'unsupported'],
   ['a log driver', input(service('db', { logging: { driver: 'syslog' } })), 'service db: log driver syslog', 'protected'],
   ['oom_kill_disable', input(service('db', { oom_kill_disable: true })), 'service db: oom_kill_disable', 'protected'],
   ['a negative oom_score_adj', input(service('db', { oom_score_adj: -500 })), 'service db: oom_score_adj -500', 'protected'],

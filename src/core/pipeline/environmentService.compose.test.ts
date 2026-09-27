@@ -581,7 +581,9 @@ describe('existing Docker Compose environment', () => {
     await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST } } });
     h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([`pull ${DB_IMAGE}`]);
+    // review round 16, Dp: the image of the dev service is not here, so it is downloaded before the build, whose user
+    // (with Features) the Dev Container CLI writes into its compose file for the build (checkComposeBuildImages).
+    expect(h.docker.log.filter((line) => line.startsWith('pull'))).toEqual([`pull ${DB_IMAGE}`, `pull ${BASE_IMAGE}`]);
     expect(h.helper.calls.filter((call) => call.startsWith('build') || call.startsWith('up'))).toEqual([
       `build ${IMAGE_2}`,
       `up ${IMAGE_2} --remove-existing-container`,
@@ -2477,7 +2479,8 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     );
     await h.service.open(TARGET, options());
     // Before: [FOLDER, 'vscode'] alone, and the files of Postgres (uid 999) in the volume were given to vscode.
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [PGDATA])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [PGDATA], new Set([PGDATA]))]]);
     // Not a path of the workspace volume: neither recorded nor named for Delete.
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual([]);
@@ -2490,7 +2493,8 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
       { type: 'bind', target: '/home/vscode/.ssh' },
     ];
     await h.service.open(TARGET, options());
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`, `${FOLDER}/tmp`])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`, `${FOLDER}/tmp`], new Set([`${FOLDER}/node_modules`, `${FOLDER}/tmp`]))]]);
 
     h.cleanup();
     h = createHarness({ newEnvironmentId: () => ENV_ID });
@@ -2519,7 +2523,8 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     // The pipeline rewrote the bind to the workspace volume (a subpath of it).
     expect(upApp.find((entry) => entry.target === PGVIEW)).toMatchObject({ type: 'volume', source: WORKSPACE_VOLUME_KEY });
     // Before: [DATA] alone, and `find -xdev` gave the files of db (uid 999) to vscode through pgview.
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [DATA, PGVIEW])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [DATA, PGVIEW], new Set([PGVIEW]))]]);
     // Not recorded: it matters only in the dev container.
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
   });
@@ -2555,7 +2560,8 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     h.docker.execHandler = (_container, command) => (command[0] === 'cat' ? { exitCode: 1, stderr: 'cat: not found' } : {});
     await h.service.open(TARGET, options());
     expect(h.docker.execs.filter((e) => e.command[0] === 'cat').map((e) => [e.command, e.user])).toEqual([[['cat', '/proc/self/mountinfo'], 'root']]);
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC], new Set([SRC]))]]);
   });
 
   it('keeps a mount of the workspace volume protected when a link in the volume makes it another folder (review round 14, P14-1)', async () => {
@@ -2568,7 +2574,8 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     useCompose(h, out);
     h.docker.volumeLinks.set('api/src', 'api/data');
     await h.service.open(TARGET, options());
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SRC], new Set([SRC]))]]);
   });
 
   it('gives an anonymous volume of the dev container the full fix, and keeps a named volume protected (review round 13, D13-3)', async () => {
@@ -2580,14 +2587,16 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     ];
     await h.service.open(TARGET, options());
     // Before (review round 12): node_modules protected too (only the files of root changed).
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.cache`])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.cache`], new Set([`${FOLDER}/.cache`]))]]);
   });
 
   it('keeps an anonymous volume protected when the host access checks are off (review round 13, D13-3)', async () => {
     h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
     h.helper.containerMounts = [{ type: 'volume', volume: 'c'.repeat(64), target: `${FOLDER}/node_modules` }];
     await h.service.open(TARGET, options());
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`])]]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`], new Set([`${FOLDER}/node_modules`]))]]);
   });
 });
 
@@ -2700,7 +2709,88 @@ describe('review round 15 of unit 6 (K3, K4): the ownership fixes after up', () 
     h.helper.containerMounts = [{ type: 'volume', volume: `${PROJECT}_pgdata`, target: `${FOLDER}/.git/pg` }];
     await h.service.open(TARGET, options());
     // Before: [FOLDER, 'vscode'] alone (the filter of .git dropped the target), and the fix gave the data of db to vscode.
-    expect(devFixes()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], true)]]);
-    expect(servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], true)).toEqual(['-path', `${FOLDER}/.git/pg`, '-o', '-path', `${FOLDER}/.git/pg/*`]);
+    // review round 16, L2: the targets of the mounts of the dev container are marked one by one (DevMountPaths).
+    expect(devFixes()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], new Set([`${FOLDER}/.git/pg`]))]]);
+    expect(servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], true)).toEqual(['(', '-path', `${FOLDER}/.git/pg`, '-o', '-path', `${FOLDER}/.git/pg/*`, ')']);
+  });
+});
+
+describe('review round 16 of unit 6 (Dp): the user that the Dev Container CLI writes into its compose file for the build', () => {
+  const USER = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
+
+  it('refuses an image of the dev service whose user has a line break, before the build, also with the checks off', async () => {
+    for (const off of [false, true]) {
+      h.cleanup();
+      h = createHarness({ newEnvironmentId: () => ENV_ID });
+      useCompose(h);
+      if (off) h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+      h.docker.imageConfigs.set(BASE_IMAGE, { User: USER });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toContain(`service app: the user ${JSON.stringify(USER)} of the image ${BASE_IMAGE}`);
+      expect(h.helper.builds).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+    }
+  });
+
+  it('checks the image after its download, and builds with a plain user', async () => {
+    h.docker.imageConfigs.set(BASE_IMAGE, { User: 'vscode' });
+    await h.service.open(TARGET, options());
+    expect(h.docker.log.indexOf(`pull ${BASE_IMAGE}`)).toBeGreaterThanOrEqual(0);
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('does not inspect the images without Features (the CLI writes no user then)', async () => {
+    h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
+    h.docker.imageConfigs.set(BASE_IMAGE, { User: USER });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses a build target of the dev service with a line break before any build', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.app = { build: { context: `${FOLDER}/.devcontainer`, dockerfile: 'Dockerfile', target: 'base\n      ssh:\n        - default' }, command: ['sleep', 'infinity'] };
+      }),
+    );
+    const out = h.helper.composeOutput as ComposeModelOutput;
+    h.helper.composeOutput = {
+      ...out,
+      dockerfiles: { app: 'FROM alpine AS base\n' },
+      realPaths: { ...out.realPaths, [`${FOLDER}/.devcontainer`]: `${FOLDER}/.devcontainer`, [`${FOLDER}/.devcontainer/Dockerfile`]: `${FOLDER}/.devcontainer/Dockerfile` },
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service app: build target');
+    expect(h.helper.builds).toEqual([]);
+  });
+});
+
+describe('review round 16 of unit 6 (L1): values that the Dev Container CLI writes as text into its compose file for up', () => {
+  it('refuses a containerUser of the image metadata with a line break before up, also with the checks off', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    const user = 'root\n    privileged: true';
+    h.helper.buildMetadata = [{ id: 'ghcr.io/acme/features/user:1', containerUser: user, entrypoint: '/x.sh"]\n    privileged: true\n    x-a: ["' }];
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(`containerUser ${JSON.stringify(user)}`);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('refuses a containerEnv name of devcontainer.json that is no plain name before any build', async () => {
+    h.helper.files = {
+      [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace('"remoteUser": "vscode",', `"remoteUser": "vscode", "containerEnv": { "A'": "1" },`) },
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(`containerEnv variable "A'"`);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('still opens with the usual values', async () => {
+    h.helper.buildMetadata = [{ id: 'ghcr.io/devcontainers/features/docker-in-docker:2', entrypoint: '/usr/local/share/docker-init.sh', containerEnv: { DOCKER_BUILDKIT: '1' } }, { containerUser: 'vscode' }];
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
   });
 });

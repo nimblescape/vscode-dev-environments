@@ -543,6 +543,8 @@ function readHostAccessFindings(original: HostAccessInput, checksOn: boolean): P
     if (source.privileged) add([access('privileged mode')]);
     add(accessAll(capabilityProblems(cliList(source.capAdd))));
     add(accessAll(securityOptionProblems(cliList(source.securityOpt))));
+    // Review round 16 (L1): what the Dev Container CLI writes as text into its compose file, whatever the switch says.
+    if (input.composeMounts === true) add(composeTextProblems(source));
     const gpu = isRecord(source.hostRequirements) ? source.hostRequirements.gpu : undefined;
     if (gpu !== undefined && gpu !== false && gpu !== null) add([access('GPU access (hostRequirements.gpu)')]);
     // It would run in the workspace helper, which has the Docker socket (not on the computer): the integrity of the
@@ -1414,6 +1416,63 @@ function environmentProblems(config: Record<string, unknown>): Problem[] {
       const problem = refusedVariable(name, property);
       if (problem !== undefined) problems.push(problem);
     }
+  }
+  return problems;
+}
+
+/** Review round 16 (L1): a user name or ID, optionally with a group name or ID (`containerUser` for Docker Compose). */
+const COMPOSE_USER = /^[A-Za-z0-9_][A-Za-z0-9._-]*(:[A-Za-z0-9_][A-Za-z0-9._-]*)?$/;
+/** Review round 16 (L1): the name of a variable of `containerEnv` for Docker Compose. */
+const COMPOSE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+/**
+ * Review round 16 (L1): what an `entrypoint` may not hold for Docker Compose: quotes, a backslash, `$`, and line breaks
+ * and other control characters (`\p{Cc}` holds `\n`, `\r`, `\t`, and NEL; the parser of Compose also breaks lines at
+ * U+2028 and U+2029).
+ */
+const COMPOSE_ENTRYPOINT_REFUSED = /["'\\$\p{Cc}\u2028\u2029]/u;
+/** Review round 16 (L1): a capability of `capAdd` for Docker Compose. */
+const COMPOSE_CAPABILITY = /^[A-Za-z0-9_]+$/;
+/**
+ * Review round 16 (L1): an option of `securityOpt` for Docker Compose (for example `seccomp=/etc/p.json`, `label=disable`,
+ * `no-new-privileges:true`). Not with `:` at its end: YAML would read `- <option>:` as a mapping.
+ */
+const COMPOSE_SECURITY_OPTION = /^[A-Za-z0-9_](?:[A-Za-z0-9_.:=/,+@-]*[A-Za-z0-9_.=/,+@-])?$/;
+const COMPOSE_TEXT = 'the Dev Container CLI writes it into its compose file as it is';
+
+/**
+ * Review round 16 (L1 = D16-1 = S16-1): the values of `source` (the configuration, the merged configuration, or an entry
+ * of the image metadata, substituted as the CLI substitutes it) that the Dev Container CLI 0.89.0 writes as text into
+ * the compose file that it generates for the dev service of a Docker Compose configuration (function `iW`), without
+ * escaping them: `user: <containerUser>`, the names of `containerEnv` inside `- '<name>=<value>'` (the values are
+ * escaped), each `entrypoint` (the `entrypoints` of the merged configuration) inside a double-quoted string, and each
+ * `capAdd` and `securityOpt` as `- <value>`. A value that is not a plain token could add keys to the dev service (for
+ * example `privileged: true`), or Compose would interpolate its `$`: not supported, whatever the switch says. A value
+ * that is not a text is refused too: the CLI writes it with String(), and a list of one text is that text. A single
+ * container does not need this: the CLI passes these values to `docker run` as separate arguments.
+ */
+function composeTextProblems(source: Record<string, unknown>): Problem[] {
+  const problems: Problem[] = [];
+  const user = source.containerUser;
+  if (user !== undefined && user !== null && user !== '' && !(typeof user === 'string' && COMPOSE_USER.test(user))) {
+    problems.push(unsupported(`containerUser ${JSON.stringify(user)} (${COMPOSE_TEXT}: only a user name or ID, optionally with a group, is supported)`));
+  }
+  if (isRecord(source.containerEnv)) {
+    for (const name of Object.keys(source.containerEnv)) {
+      if (COMPOSE_ENV_NAME.test(name)) continue;
+      problems.push(unsupported(`containerEnv variable ${JSON.stringify(name)} (the Dev Container CLI writes its name into its compose file as it is: only letters, digits, _, ., and - are supported)`));
+    }
+  }
+  for (const entrypoint of [...cliList(source.entrypoint), ...cliList(source.entrypoints)]) {
+    if (typeof entrypoint === 'string' && !COMPOSE_ENTRYPOINT_REFUSED.test(entrypoint)) continue;
+    problems.push(unsupported(`entrypoint ${JSON.stringify(entrypoint)} (${COMPOSE_TEXT}: quotes, backslashes, $, line breaks, and control characters are not supported)`));
+  }
+  for (const capability of cliList(source.capAdd)) {
+    if (typeof capability === 'string' && COMPOSE_CAPABILITY.test(capability)) continue;
+    problems.push(unsupported(`capability ${JSON.stringify(capability)} (${COMPOSE_TEXT}: only a plain name is supported)`));
+  }
+  for (const option of cliList(source.securityOpt)) {
+    if (typeof option === 'string' && COMPOSE_SECURITY_OPTION.test(option)) continue;
+    problems.push(unsupported(`security option ${JSON.stringify(option)} (${COMPOSE_TEXT}: only a plain option is supported)`));
   }
   return problems;
 }

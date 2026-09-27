@@ -229,6 +229,9 @@ describe('review round 16 (L3): the Compose reading of the image metadata sees t
       { source: '${localWorkspaceFolderBasename}-cache', target: '/cache', type: 'volume' },
       'source=${localEnv:DEVUSER:cache}-x,target=/x,type=volume',
       'source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume',
+      // The raw entries of the probe of L3 (r16-P/probe2.test.ts), which the label holds unresolved.
+      { source: '${localWorkspaceFolderBasename}-venv', target: '${containerWorkspaceFolder}/.venv', type: 'volume' },
+      'source=pgdata,target=${containerWorkspaceFolder}/.pgdata,type=volume',
     ]) {
       expect(metadata(mount), JSON.stringify(mount)).toEqual({ hostAccess: [], unsupported: [] });
     }

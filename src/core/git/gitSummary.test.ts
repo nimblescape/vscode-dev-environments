@@ -787,6 +787,65 @@ describe.skipIf(process.getuid?.() !== 0)('review round 15 (K4 = D15-2): a mount
   });
 });
 
+describe.skipIf(process.getuid?.() !== 0)('review round 16 (L2 = D16-2): a mount of the dev container at a link into .git, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const PG = ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION'];
+
+  /** A repository with the data of db (uid 999) in .git/pg, a link `data -> .git/pg`, and a file of root in .git. */
+  function repository(): string {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['.git/pg/base', '.git/objects', 'src']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['.git/HEAD', '.git/objects/x', '.git/pg/PG_VERSION', '.git/pg/base/1', 'src/a.ts']) fs.writeFileSync(path.join(repo, file), 'x');
+    fs.symlinkSync('.git/pg', path.join(repo, 'data'));
+    for (const file of PG) fs.chownSync(path.join(repo, file), 999, 999);
+    return repo;
+  }
+
+  function run(command: string[]): void {
+    const [file, ...args] = command;
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  }
+
+  it('keeps the owner of the data behind the link, when the target of the mount names the link (probe of D16-2)', () => {
+    const repo = repository();
+    // The target of the mount as withDevMountFolders passes it: marked as a mount (before: 999 -> nobody).
+    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`], new Set([`${repo}/data`])));
+    for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    for (const name of ['.git/HEAD', '.git/objects/x', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+  });
+
+  it('marks each mount on its own: a path of the services behind a link into .git still gets no real path there', () => {
+    const repo = repository();
+    fs.mkdirSync(path.join(repo, 'cache'));
+    fs.writeFileSync(path.join(repo, 'cache/c'), 'x');
+    fs.chownSync(path.join(repo, 'cache/c'), 999, 999);
+    // `data` is a path of the services (a record), `cache` the target of a mount of the dev container, in one list.
+    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`, `${repo}/cache`], new Set([`${repo}/cache`])));
+    expect(uidOf(path.join(repo, 'cache/c'))).toBe(999);
+    // The real path of the record lies in .git: not protected (review round 10, D10-3), as before.
+    for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+  });
+
+  it('writes the marker only around the patterns of the mounts', () => {
+    const repo = '/workspaces/api';
+    expect(servicePathArguments(repo, [`${repo}/db`, `${repo}/data`], new Set([`${repo}/data`]))).toEqual([
+      '-path', `${repo}/db`, '-o', '-path', `${repo}/db/*`,
+      '-o', '(', '-path', `${repo}/data`, '-o', '-path', `${repo}/data/*`, ')',
+    ]);
+    // A path of the services named `(` or `)` below the repository is a path, never a marker.
+    expect(servicePathArguments(repo, [`${repo}/(`], new Set())).toEqual(['-path', `${repo}/(`, '-o', '-path', `${repo}/(/*`]);
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      expect(spawnSync(shell, ['-n', '-c', OWNERSHIP_FIX_SCRIPT], { encoding: 'utf8' }).status, shell).toBe(0);
+    }
+  });
+});
+
 describe('review round 15 (K3): the ownership fix of the internal folder with numeric IDs, for a helper container', () => {
   it('takes only decimal user and group IDs', () => {
     for (const id of ['0', '1000', '999', '4294967294']) expect(isNumericId(id), id).toBe(true);

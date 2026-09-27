@@ -3760,8 +3760,9 @@ describe('review round 12 (D12-2): the ownership fix of a single container leave
     await h.service.open(TARGET, options());
     const fix = h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT && e.command[4] === '/workspaces/api');
     // Before: ['/workspaces/api', 'vscode'] alone: the files of the volume were given to vscode.
+    // review round 16, L2: the target of the mount is marked with `(` and `)` (DevMountPaths).
     expect(fix.map((e) => e.command.slice(4))).toEqual([
-      ['/workspaces/api', 'vscode', '-path', '/workspaces/api/.pgdata', '-o', '-path', '/workspaces/api/.pgdata/*'],
+      ['/workspaces/api', 'vscode', '(', '-path', '/workspaces/api/.pgdata', '-o', '-path', '/workspaces/api/.pgdata/*', ')'],
     ]);
     expect((await entry())?.serviceFolders).toBeUndefined();
   });
