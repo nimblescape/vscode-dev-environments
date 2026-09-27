@@ -16,8 +16,11 @@ export const OPERATION_FAILED = 'The operation failed.';
 
 /** Command of the welcome view and of the action "Sign in" (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
-/** Command of the action "Install Docker…" (package.json): the walkthrough "Set up Docker for Dev Environments". */
-const INSTALL_DOCKER_COMMAND = 'devEnvironments.installDocker';
+/**
+ * Command of the action "Install Docker…": shows the sidebar view, whose welcome view has the steps of the Docker setup
+ * (VS Code contributes `<view id>.focus` for each view of package.json).
+ */
+const INSTALL_DOCKER_COMMAND = 'devEnvironments.repositories.focus';
 
 export interface ShowErrorOptions {
   logger: Logger;

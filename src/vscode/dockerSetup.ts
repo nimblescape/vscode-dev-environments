@@ -2,9 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view (the setup in the sidebar), the
-// walkthrough "Set up Docker for Dev Environments", and the commands of the walkthrough. Nothing runs hidden: after a
-// modal confirmation that lists the exact commands, they run in a visible terminal, or the installer of Docker Desktop is
+// Docker setup (concept 6.1 step 2, 7.3, section 9): the context keys of the welcome view (the setup in the sidebar) and
+// the commands of its buttons. Nothing runs hidden: after a modal confirmation that lists the exact commands, they run in a visible terminal, or the installer of Docker Desktop is
 // downloaded from desktop.docker.com with a progress notification and opened. The rules are pure functions in
 // src/core/docker/dockerSetup.ts.
 import * as fs from 'fs';
@@ -51,12 +50,7 @@ import { errorMessage, isUserFacingError } from '../core/errors';
 import { Steps } from '../core/messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner } from '../core/ports';
 
-/** The walkthrough of package.json (`contributes.walkthroughs`), with the ID of this extension (publisher.name). */
-export const DOCKER_WALKTHROUGH_ID = 'nimblescape.vscode-dev-environments#dockerSetup';
-// Internal VS Code command (not extension API): opens a walkthrough of the Welcome page. Arguments: the walkthrough ID
-// (`publisher.extension#walkthrough`) and `toSide`.
-export const OPEN_WALKTHROUGH_COMMAND = 'workbench.action.openWalkthrough';
-/** Command of the walkthrough step "Start Docker" (package.json). */
+/** Command Start Docker (package.json), offered once an installation has put the CLI in place. */
 export const DOCKER_SETUP_START_COMMAND = 'devEnvironments.dockerSetup.start';
 /** Name of the terminal of the installation commands. */
 export const INSTALL_TERMINAL_NAME = 'Install Docker';
@@ -253,20 +247,14 @@ export class DockerSetup implements vscode.Disposable {
     this.apply({ kind: 'engine', running });
   }
 
-  /** Command devEnvironments.installDocker: opens the walkthrough (only in a local window). */
-  async openWizard(): Promise<void> {
-    if (this.refuseInRemoteWindow()) return;
-    this.checkWslInBackground();
-    await vscode.commands.executeCommand(OPEN_WALKTHROUGH_COMMAND, DOCKER_WALKTHROUGH_ID, false);
-  }
-
   /**
-   * Command devEnvironments.dockerSetup.install (walkthrough step "Install Docker"): the installation plan of this
+   * Command devEnvironments.dockerSetup.install (sidebar button "Install Docker"): the installation plan of this
    * computer, after a modal confirmation. Afterwards, the CLI is looked up every 5 seconds for at most 30 minutes.
    */
   async install(): Promise<void> {
     if (this.refuseInRemoteWindow()) return;
-    // The walkthrough stays reachable after the installation (Welcome page): an installed Docker is never installed again.
+    // The command may run after the installation (for example from an older notification): an installed Docker is never
+    // installed again.
     if (this.dockerAlreadyInstalled()) return;
     const plan = installPlan(await (this.deps.planInput ?? (() => readInstallPlanInput(this.deps.runner, this.deps.platform, this.deps.env)))());
     this.deps.logger.info(`Docker installation: ${describePlan(plan)}`);
@@ -289,7 +277,7 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /**
-   * Command devEnvironments.dockerSetup.start (walkthrough step "Start Docker"): starts Docker Desktop with the
+   * Command devEnvironments.dockerSetup.start (action Start Docker after an installation): starts Docker Desktop with the
    * documented commands and waits until it is ready. Docker Engine on Linux: `sudo systemctl enable --now docker` in the
    * terminal, after a confirmation.
    */
@@ -310,7 +298,7 @@ export class DockerSetup implements vscode.Disposable {
                 signal,
                 onStarting,
               }));
-          return run(abort.signal, () => this.deps.logger.info('Starting Docker from the setup walkthrough.')).finally(() =>
+          return run(abort.signal, () => this.deps.logger.info('Starting Docker from the Docker setup.')).finally(() =>
             subscription.dispose(),
           );
         },
@@ -325,7 +313,7 @@ export class DockerSetup implements vscode.Disposable {
     void vscode.window.showInformationMessage(DockerSetupUiTexts.dockerRunning).then(undefined, () => undefined);
   }
 
-  /** Command devEnvironments.dockerSetup.installWsl (walkthrough step "WSL 2", Windows): `wsl --install` in the terminal. */
+  /** Command devEnvironments.dockerSetup.installWsl (sidebar button "Install WSL 2", Windows): `wsl --install` in the terminal. */
   async installWsl(): Promise<void> {
     if (this.refuseInRemoteWindow()) return;
     if (this.state.wslReady) {
@@ -566,7 +554,7 @@ export class DockerSetup implements vscode.Disposable {
     this.updateMissingTimer();
   }
 
-  /** Walkthrough step "Start Docker", offered once the installation has put the CLI in place. */
+  /** Start Docker, offered once the installation has put the CLI in place. */
   private offerStart(): void {
     vscode.window.showInformationMessage(DockerSetupUiTexts.installedStartNow, DockerSetupUiTexts.startDocker).then(
       (choice) => {

@@ -228,7 +228,7 @@ interface Harness {
     updateContextKey: ReturnType<typeof vi.fn>;
   };
   claims: { claim: ReturnType<typeof vi.fn> };
-  dockerSetup: Record<'openWizard' | 'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
+  dockerSetup: Record<'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
   repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
@@ -310,7 +310,6 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
   };
   const claims = { claim: vi.fn(async (): Promise<string[]> => []) };
   const dockerSetup = {
-    openWizard: vi.fn(async () => {}),
     install: vi.fn(async () => {}),
     start: vi.fn(async () => {}),
     installWsl: vi.fn(async () => {}),
@@ -546,7 +545,8 @@ describe('Controller commands', () => {
     // 25 since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups….
     // 27 since unit 26 (user decision 2026-09-26, "go with the proposal for closing"): Keep Running When Closed and
     // Stop When Closed.
-    expect(declared).toHaveLength(27);
+    // 26 since the Docker setup walkthrough was removed (user decision 2026-09-27): no Install Docker… command.
+    expect(declared).toHaveLength(26);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -596,22 +596,21 @@ describe('Controller commands', () => {
 
   // User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the repositories
   // shall not be shown, instead, the side view shall show the install docker wizard". The sidebar then has no rows
-  // (sidebar.test.ts), so the view shows these entries: the steps of the walkthrough, each with its button, then the
+  // (sidebar.test.ts), so the view shows these entries: the steps of the Docker setup, each with its button, then the
   // sign-in while not signed in.
   describe('Docker setup in the sidebar (package.json viewsWelcome)', () => {
     const setup = { [DockerContextKeys.missing]: true, [DockerContextKeys.setupRequired]: true };
     const intro = 'Dev Environments runs your environments in Docker, which is not installed on this computer. Set it up in these steps:';
-    const after =
-      'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.\n[Open the Setup Guide](command:devEnvironments.installDocker)';
+    const after = 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.';
     const signIn =
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)';
     const installWsl =
       '1. Install WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs. Windows asks for administrator permission; restart the computer afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)';
     const wslInstalled = '1. WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs:\n✓ WSL 2 is installed.';
     const installMac =
-      '1. Install Docker Desktop, with Homebrew or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+      '1. Install Docker Desktop, with Homebrew or with its installer from Docker. You see the exact commands before anything runs. Docker Desktop is subject to the [Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/): free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
     const installWindows =
-      '2. Install Docker Desktop, with winget or with its installer from Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+      '2. Install Docker Desktop, with winget or with its installer from Docker. You see the exact commands before anything runs. Docker Desktop is subject to the [Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/): free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
     const installLinux =
       '1. Install Docker Engine from the package repository of Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
 
@@ -665,18 +664,12 @@ describe('Controller commands', () => {
       const used = manifest.contributes.viewsWelcome.flatMap((view) => [...view.contents.matchAll(/\(command:([\w.]+)\)/g)].map((match) => match[1]));
       expect(used).toEqual(
         expect.arrayContaining([
-          Commands.installDocker,
           'devEnvironments.dockerSetup.install',
           'devEnvironments.dockerSetup.installWsl',
           'devEnvironments.signIn',
         ]),
       );
       for (const command of used) expect(declared.has(command), command).toBe(true);
-      expect(manifest.contributes.commands.find((command) => command.command === Commands.installDocker)).toEqual({
-        command: 'devEnvironments.installDocker',
-        title: 'Install Docker…',
-        category: 'Dev Environments',
-      });
     });
   });
 
@@ -1880,33 +1873,6 @@ describe('Connection of this window', () => {
     h.controller.onBusyChanged({ busy: true, title: 'Stopping acme/web…' });
     h.controller.onBusyChanged({ busy: false });
     expect(h.statusBar.clearBusy).toHaveBeenCalledTimes(2);
-  });
-
-  it('checks once that Docker is installed when the view shows', () => {
-    h.docker.isInstalled.mockReturnValue(false);
-    h.controller.onViewVisible();
-    h.controller.onViewVisible();
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerNotInstalled, Actions.installDocker);
-  });
-
-  it('opens the Docker setup with the action Install Docker…', async () => {
-    h.docker.isInstalled.mockReturnValue(false);
-    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.installDocker);
-    h.controller.onViewVisible();
-    await settle(() => fakeVscode.commands.executeCommand.mock.calls.length > 0, 'the command');
-    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(Commands.installDocker);
-    expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
-  });
-
-  it('says nothing when the view shows and Docker is installed', () => {
-    h.controller.onViewVisible();
-    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
-  });
-
-  it('opens the walkthrough with Install Docker…', async () => {
-    await run('installDocker');
-    expect(h.dockerSetup.openWizard).toHaveBeenCalledTimes(1);
   });
 
   it('opens the editor of the repository groups with Edit Repository Groups…', async () => {

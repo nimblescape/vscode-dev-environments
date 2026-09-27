@@ -26,11 +26,9 @@ import { abortError, type RunResult } from '../core/ports';
 import { Commands } from './commands';
 import {
   DOCKER_SETUP_START_COMMAND,
-  DOCKER_WALKTHROUGH_ID,
   DockerSetup,
   DockerSetupUiTexts,
   INSTALL_TERMINAL_NAME,
-  OPEN_WALKTHROUGH_COMMAND,
   dockerAppLocations,
   readBrewCaskState,
   type DockerSetupDeps,
@@ -204,33 +202,6 @@ describe('DockerSetup: context keys and CLI checks', () => {
     expect(dockerSetup.dockerMissing).toBe(true);
     expect(logger.warn).toHaveBeenCalled();
     dockerSetup.dispose();
-  });
-});
-
-describe('DockerSetup: Install Docker…', () => {
-  it('opens the walkthrough in a local window', async () => {
-    const { dockerSetup } = setup(false);
-    await dockerSetup.openWizard();
-    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(OPEN_WALKTHROUGH_COMMAND, DOCKER_WALKTHROUGH_ID, false);
-    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalled();
-  });
-
-  it('asks for a local window in a remote window', async () => {
-    fakeVscode.env.remoteName = 'ssh-remote';
-    const { dockerSetup } = setup(false);
-    await dockerSetup.openWizard();
-    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith('Open a local window to install Docker.');
-    expect(DockerSetupUiTexts.localWindowNeeded).toBe('Open a local window to install Docker.');
-    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalled();
-  });
-
-  it('names the walkthrough of package.json', () => {
-    expect(OPEN_WALKTHROUGH_COMMAND).toBe('workbench.action.openWalkthrough');
-    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
-      publisher: string;
-      name: string;
-    };
-    expect(DOCKER_WALKTHROUGH_ID).toBe(`${manifest.publisher}.${manifest.name}#dockerSetup`);
   });
 });
 
@@ -685,83 +656,13 @@ describe('DockerSetup: WSL 2 (walkthrough step 1, Windows)', () => {
   });
 });
 
-describe('walkthrough (package.json)', () => {
-  interface Step {
-    id: string;
-    title: string;
-    description: string;
-    media: { markdown: string };
-    completionEvents: string[];
-    when?: string;
-  }
+describe('Docker setup commands (package.json)', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
     contributes: {
-      walkthroughs: Array<{ id: string; title: string; steps: Step[] }>;
       commands: Array<{ command: string; title: string; category: string }>;
       menus: { commandPalette: Array<{ command: string; when: string }> };
     };
-    files?: string[];
   };
-  const [walkthrough] = manifest.contributes.walkthroughs;
-  const step = (id: string) => walkthrough.steps.find((candidate) => candidate.id === id)!;
-
-  it('is the walkthrough dockerSetup with its title', () => {
-    expect(manifest.contributes.walkthroughs).toHaveLength(1);
-    expect(walkthrough.id).toBe('dockerSetup');
-    expect(walkthrough.title).toBe('Set up Docker for Dev Environments');
-  });
-
-  it('has the steps per platform, which check themselves off through the context keys', () => {
-    expect(walkthrough.steps.map((entry) => [entry.id, entry.when, entry.completionEvents])).toEqual([
-      ['wsl', 'isWindows', ['onContext:devEnvironments.wslReady']],
-      ['installMac', 'isMac', ['onContext:devEnvironments.dockerInstalled']],
-      ['installWindows', 'isWindows', ['onContext:devEnvironments.dockerInstalled']],
-      ['installLinux', 'isLinux', ['onContext:devEnvironments.dockerInstalled']],
-      ['startDesktop', 'isMac || isWindows', ['onContext:devEnvironments.dockerReady']],
-      ['startLinux', 'isLinux', ['onContext:devEnvironments.dockerReady']],
-      ['signIn', undefined, ['onContext:devEnvironments.signedIn']],
-    ]);
-  });
-
-  it('has the buttons of the steps', () => {
-    expect(step('wsl').description).toContain('(command:devEnvironments.dockerSetup.installWsl)');
-    for (const id of ['installMac', 'installWindows', 'installLinux']) {
-      expect(step(id).description).toContain('[Install Docker](command:devEnvironments.dockerSetup.install)');
-    }
-    for (const id of ['startDesktop', 'startLinux']) {
-      expect(step(id).description).toContain('[Start Docker](command:devEnvironments.dockerSetup.start)');
-    }
-    expect(step('signIn').description).toContain('[Sign in with GitHub](command:devEnvironments.signIn)');
-  });
-
-  it('uses the context keys that the extension sets', () => {
-    const keys = new Set(walkthrough.steps.flatMap((entry) => entry.completionEvents.map((event) => event.replace('onContext:', ''))));
-    expect([...keys].sort()).toEqual(
-      [DockerContextKeys.wslReady, DockerContextKeys.installed, DockerContextKeys.ready, 'devEnvironments.signedIn'].sort(),
-    );
-  });
-
-  it('has a media file for each step in resources/walkthrough, which the package includes', () => {
-    const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8');
-    expect(ignore).toContain('!resources/**');
-    for (const entry of walkthrough.steps) {
-      expect(entry.media.markdown).toMatch(/^resources\/walkthrough\/[a-z-]+\.md$/);
-      expect(fs.existsSync(path.join(ROOT, entry.media.markdown)), entry.media.markdown).toBe(true);
-    }
-  });
-
-  it('names the license of Docker Desktop and the signature of the installers in the install steps', () => {
-    const read = (id: string) => fs.readFileSync(path.join(ROOT, step(id).media.markdown), 'utf8');
-    for (const id of ['installMac', 'installWindows']) {
-      expect(read(id)).toContain('Docker Subscription Service Agreement');
-      expect(read(id)).toContain('desktop.docker.com');
-      expect(read(id)).toMatch(/signed/);
-    }
-    expect(read('installMac')).toContain('drag **Docker** to the **Applications** folder');
-    expect(read('installLinux')).toContain('sudo usermod -aG docker $USER');
-    expect(read('installLinux')).toContain('newgrp docker');
-    expect(read('startLinux')).toContain('sudo systemctl enable --now docker');
-  });
 
   it('declares the buttons as commands, hidden in the Command Palette', () => {
     const commands = [Commands.dockerSetupInstall, Commands.dockerSetupStart, Commands.dockerSetupInstallWsl];

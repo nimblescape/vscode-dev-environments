@@ -41,7 +41,7 @@ describe('showError (concept 6.5)', () => {
     return { severity: error ? 'error' : 'warning', message, actions };
   }
 
-  it('offers Install Docker… (the setup walkthrough) when Docker is not installed', async () => {
+  it('offers Install Docker… (the Docker setup in the sidebar) when Docker is not installed', async () => {
     const { logger } = recordingLogger();
     window.showErrorMessage.mockResolvedValue(Actions.installDocker);
     showError(new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled), { logger, showLog: vi.fn() });
@@ -52,7 +52,7 @@ describe('showError (concept 6.5)', () => {
     });
     await flush();
     expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.installDocker');
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.repositories.focus');
     expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
   });
 

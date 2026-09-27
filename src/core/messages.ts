@@ -147,7 +147,7 @@ export const Messages = {
 } as const;
 
 export const Actions = {
-  /** Opens the walkthrough "Set up Docker for Dev Environments" (command devEnvironments.installDocker). */
+  /** Shows the sidebar view with the steps of the Docker setup (action of the error dockerNotInstalled). */
   installDocker: 'Install Docker…',
   showDetails: 'Show details',
   tryAgain: 'Try again',
