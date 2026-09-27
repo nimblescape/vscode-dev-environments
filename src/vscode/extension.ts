@@ -296,6 +296,7 @@ async function activateExtension(
     settings: getSettings,
     dockerSetupRequired: () => setup.setupRequired,
     dockerHost: () => targets.host(),
+    view,
   });
   setup.initialize();
   const repositoryGroupsEditor = new RepositoryGroupsEditor({
