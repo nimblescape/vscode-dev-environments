@@ -34,8 +34,8 @@ export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
 
 /**
  * True for a container of the current setup: its label devenv.container-version is CONTAINER_VERSION or newer. The
- * pipeline creates an older container (without the variables of container-only Git, concept section 9) again from its
- * environment image; the volume stays.
+ * pipeline creates a container without the label, or with an older value, again from its environment image; the volume
+ * stays.
  * `configKnown`: the configuration of the repository can be read now. Then a container that was created without it
  * (label devenv.container-config=unknown) is not current either: it lacks the runArgs and appPort of the configuration.
  * While the configuration cannot be read, such a container is current, so it is only started and not created again at

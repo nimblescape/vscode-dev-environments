@@ -6,13 +6,27 @@ import type { SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, WindowStatus } from '../core/types';
 import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
+
+// Versions reset to 1 (user decision 2026-09-27): no monitor older than version 1 exists. To test the retirement of an
+// older monitor, a test sets the protocol version of the window to a future version 2 (`windowVersion.value`); the
+// protocol version of the monitor module stays the real one otherwise.
+const windowVersion = vi.hoisted(() => ({ value: undefined as number | undefined }));
+vi.mock('../monitor/lock', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../monitor/lock')>();
+  return {
+    ...actual,
+    get MONITOR_PROTOCOL_VERSION(): number {
+      return windowVersion.value ?? actual.MONITOR_PROTOCOL_VERSION;
+    },
+  };
+});
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -232,11 +246,19 @@ describe('SessionCoordinator', () => {
     expect(h.spawns).toHaveLength(1);
   });
 
-  // Review finding F2 of PR #26: a Session Monitor of an older version (without keepRunning) keeps running as long as a
-  // window is alive, and stops kept environments. A window asks it to exit and starts the current monitor, which waits
-  // for it (monitor protocol version, monitor.version next to monitor.lock). It never sends a signal (round-2 review of
-  // PR #26): a monitor without a version is left alone, and after an update from such a version VS Code is restarted.
+  // A Session Monitor of an older protocol version may decide wrongly with the files of a newer window. A window asks it
+  // to exit and starts the current monitor, which waits for it (monitor protocol version, monitor.version next to
+  // monitor.lock). It never sends a signal (round-2 review of PR #26): a monitor without a version is left alone.
+  // Versions reset to 1 (user decision 2026-09-27): the window runs as a future version 2, the older monitor is version 1.
   describe('a monitor of an older version', () => {
+    const FUTURE_VERSION = 2;
+    const OLDER_VERSION = 1;
+    beforeEach(() => {
+      windowVersion.value = FUTURE_VERSION;
+    });
+    afterEach(() => {
+      windowVersion.value = undefined;
+    });
     const versionFile = (): string => path.join(h.root, 'monitor.version');
     const exitFile = (): string => path.join(h.root, 'monitor.exit');
     const writeLock = (ageMs: number): void => {
@@ -254,12 +276,15 @@ describe('SessionCoordinator', () => {
     };
 
     it('asks a monitor of an older version through the control file, and starts the current one', async () => {
+      expect(MONITOR_PROTOCOL_VERSION).toBe(FUTURE_VERSION);
       writeLock(3_000);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION - 1 }));
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
       await h.coordinator.start(null);
       expect(exitRequestPid()).toBe(OTHER_PID);
       expect(h.spawns).toHaveLength(1);
-      expect(h.logger.lines.join('\n')).toContain(`Asked the Session Monitor (process ${OTHER_PID}) to exit`);
+      expect(h.logger.lines.join('\n')).toContain(
+        `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version 1, older than 2.`,
+      );
     });
 
     it('leaves a monitor of the current version alone', async () => {
@@ -270,12 +295,22 @@ describe('SessionCoordinator', () => {
       expect(h.spawns).toEqual([]);
     });
 
+    it('leaves a monitor of version 1 alone while the window is of version 1 too', async () => {
+      windowVersion.value = undefined;
+      expect(MONITOR_PROTOCOL_VERSION).toBe(OLDER_VERSION);
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
+      await h.coordinator.start(null);
+      expect(exitRequestPid()).toBeUndefined();
+      expect(h.spawns).toEqual([]);
+    });
+
     it('leaves a monitor without a version alone, also when the version file names another process ID', async () => {
       writeLock(3_000);
       await h.coordinator.start(null);
       expect(exitRequestPid()).toBeUndefined();
       expect(h.spawns).toEqual([]);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID + 1, version: MONITOR_PROTOCOL_VERSION - 1 }));
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID + 1, version: OLDER_VERSION }));
       await h.coordinator.ensureMonitorRunning();
       expect(exitRequestPid()).toBeUndefined();
       expect(h.spawns).toEqual([]);
@@ -291,7 +326,7 @@ describe('SessionCoordinator', () => {
       expect(h.spawns).toEqual([]);
       // Once it can be read again, an older monitor is asked to exit.
       fs.rmdirSync(versionFile());
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION - 1 }));
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
       await h.coordinator.ensureMonitorRunning();
       expect(exitRequestPid()).toBe(OTHER_PID);
       expect(h.spawns).toHaveLength(1);

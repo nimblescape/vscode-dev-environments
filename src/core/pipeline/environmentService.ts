@@ -2290,8 +2290,8 @@ export class EnvironmentService {
     imagePresent: boolean,
     loaded: LoadedConfiguration | undefined,
   ): Promise<ContainerOutcome> {
-    // Concept section 9: a container of an older setup, without the variables of container-only Git, is created again
-    // from its environment image, like a missing one. The volume stays. So is a container that was created without the
+    // Concept section 9: a container of an older setup (label devenv.container-version) is created again from its
+    // environment image, like a missing one. The volume stays. So is a container that was created without the
     // configuration (it could not be read then), once the configuration can be read: it lacks its runArgs and appPort.
     // So is a container that was created while the host access checks were off, once they are on again: it is created
     // again when the checks pass (the image metadata before `up`), and never started as it is.

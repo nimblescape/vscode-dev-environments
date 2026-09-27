@@ -392,8 +392,8 @@ export class Controller implements vscode.Disposable {
         // "Delete environment" for missing files (concept 7.12) removed the environment of this window.
         if (await this.leaveDeletedEnvironment(environment.id)) return;
         // Concept section 9: the pipeline did not make the container of an older version again (for example the host
-        // access policy refused the configuration, or the user cancelled). That container uses the Git of the computer,
-        // so the window must not attach to it. A current container stays: it passed the policy when it was made. So does a
+        // access policy refused the configuration, or the user cancelled). That container lacks the current setup, so
+        // the window must not attach to it. A current container stays: it passed the policy when it was made. So does a
         // container that was made while the host access checks were off, when they are on now and the pipeline refused
         // the configuration: it must not be used as it is.
         const outdated = this.current?.environment.id === environment.id ? await this.containerOutdated(environment) : undefined;
@@ -975,7 +975,7 @@ export class Controller implements vscode.Disposable {
         // "Already connected → nothing" only while the container runs; otherwise this is Reconnect (concept 6.3, 7.12).
         const containerName = this.current?.containerName ?? environment.containerName;
         if (await this.containerRuns(containerName)) {
-          // Concept section 9: a container of an older version uses the Git of the computer. The pipeline must not
+          // Concept section 9: a container of an older version lacks the current setup. The pipeline must not
           // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
           // The same for a container made while the host access checks were off, when they are on now.
           const outdated = await this.containerOutdated(environment);
@@ -1813,9 +1813,9 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Why the container of the environment exists but must not be used as it is (concept section 9): `version`, it was
-   * made by an older version of the extension (it uses the Git of the computer); `hostAccess`, it was made while the
-   * host access checks of the repository were off, and they are on now (containerIsCurrent). `undefined` otherwise, and
-   * when Docker cannot be asked. Never throws.
+   * made by an older version of the extension (label devenv.container-version); `hostAccess`, it was made while the host
+   * access checks of the repository were off, and they are on now (containerIsCurrent). `undefined` otherwise, and when
+   * Docker cannot be asked. Never throws.
    */
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;

@@ -67,13 +67,12 @@ describe('configHash', () => {
 });
 
 describe('containerIsCurrent (concept section 9: containers of an older setup are created again)', () => {
+  // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
   it.each<[string, Record<string, string>, boolean]>([
-    ['the current version', { 'devenv.container-version': '4' }, true],
-    ['a newer version', { 'devenv.container-version': '5' }, true],
-    ['the version before (without GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account)', { 'devenv.container-version': '3' }, false],
-    ['container-only Git without the settings of the Dev Containers extension', { 'devenv.container-version': '2' }, false],
-    ['an older version', { 'devenv.container-version': '1' }, false],
-    ['no label (created by version 1 of the extension)', { 'devenv.environment-id': 'x' }, false],
+    ['the current version', { 'devenv.container-version': '1' }, true],
+    ['a newer version', { 'devenv.container-version': '2' }, true],
+    ['an older value (a label other than 1, below it)', { 'devenv.container-version': '0' }, false],
+    ['no label', { 'devenv.environment-id': 'x' }, false],
     ['an invalid label', { 'devenv.container-version': 'two' }, false],
     ['an empty label', { 'devenv.container-version': '' }, false],
   ])('%s', (_name, labels, expected) => {
@@ -81,26 +80,26 @@ describe('containerIsCurrent (concept section 9: containers of an older setup ar
   });
 
   it('counts a container created without the configuration as current only while the configuration cannot be read', () => {
-    const provisional = { 'devenv.container-version': '4', 'devenv.container-config': 'unknown' };
+    const provisional = { 'devenv.container-version': '1', 'devenv.container-config': 'unknown' };
     expect(containerIsCurrent(provisional)).toBe(false);
     expect(containerIsCurrent(provisional, true)).toBe(false);
     expect(containerIsCurrent(provisional, false)).toBe(true);
-    expect(containerIsCurrent({ 'devenv.container-version': '4' }, false)).toBe(true);
+    expect(containerIsCurrent({ 'devenv.container-version': '1' }, false)).toBe(true);
     expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
   });
 });
 
 describe('containerIsCurrent and the switch of the host access checks (concept section 9 "Host access")', () => {
-  const unrestricted = { 'devenv.container-version': '4', 'devenv.host-access': 'unrestricted' };
+  const unrestricted = { 'devenv.container-version': '1', 'devenv.host-access': 'unrestricted' };
 
   it.each<[string, Record<string, string>, 'on' | 'off', boolean, boolean]>([
     // [name, labels, switch, current with the configuration known, current without it]
     ['a container of the checks-off time, checks on', unrestricted, 'on', false, false],
     ['a container of the checks-off time, checks off', unrestricted, 'off', true, true],
-    ['a container with the checks, checks on', { 'devenv.container-version': '4' }, 'on', true, true],
-    ['a container with the checks, checks off (it has less access)', { 'devenv.container-version': '4' }, 'off', true, true],
-    ['another value of the label, checks on', { 'devenv.container-version': '4', 'devenv.host-access': 'other' }, 'on', true, true],
-    ['an older version of the checks-off time, checks off', { 'devenv.container-version': '3', 'devenv.host-access': 'unrestricted' }, 'off', false, false],
+    ['a container with the checks, checks on', { 'devenv.container-version': '1' }, 'on', true, true],
+    ['a container with the checks, checks off (it has less access)', { 'devenv.container-version': '1' }, 'off', true, true],
+    ['another value of the label, checks on', { 'devenv.container-version': '1', 'devenv.host-access': 'other' }, 'on', true, true],
+    ['an older version of the checks-off time, checks off', { 'devenv.container-version': '0', 'devenv.host-access': 'unrestricted' }, 'off', false, false],
     ['a container of the checks-off time without the configuration, checks off', { ...unrestricted, 'devenv.container-config': 'unknown' }, 'off', false, true],
   ])('%s', (_name, labels, checks, current, currentWithoutConfiguration) => {
     expect(containerIsCurrent(labels, true, checks)).toBe(current);
@@ -110,7 +109,7 @@ describe('containerIsCurrent and the switch of the host access checks (concept s
   it('treats the checks as on by default', () => {
     expect(containerIsCurrent(unrestricted)).toBe(false);
     expect(isUnrestrictedContainer(unrestricted)).toBe(true);
-    expect(isUnrestrictedContainer({ 'devenv.container-version': '4' })).toBe(false);
+    expect(isUnrestrictedContainer({ 'devenv.container-version': '1' })).toBe(false);
     expect(isUnrestrictedContainer({ 'devenv.host-access': 'Unrestricted' })).toBe(false);
   });
 });

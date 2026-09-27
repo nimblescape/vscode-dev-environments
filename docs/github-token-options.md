@@ -4,13 +4,13 @@ This document keeps the options for a stronger handling of the GitHub token insi
 
 ## Decided for now (2026-09-26)
 
-The user decided: **the token is kept only in the memory of the container** (implemented in unit 15: the tmpfs `/run/devenv` inside the dev container, see concept section 9), never in the workspace volume. It is written at each open and stays while the container runs, also without a window (for AI agents that keep working after the window disconnects). It is gone when the container stops. The token is the OAuth token of the GitHub sign-in of VS Code: it reaches every repository of the account and does not expire until it is revoked.
+The user decided: **the token is kept only in the memory of the container** (implemented in unit 15: the tmpfs `/run/devenv` inside the dev container, see concept section 9), never in the workspace volume; the kernel may swap it to the swap space of the computer or the Docker VM. It is written at each open and stays while the container runs, also without a window (for AI agents that keep working after the window disconnects). It is gone when the container stops. The token is the OAuth token of the GitHub sign-in of VS Code: it reaches every repository of the account and does not expire until it is revoked.
 
 What this protects and what not:
 
 | Risk | Token in the volume (before) | Token only in memory (decided) |
 |---|---|---|
-| At rest: stopped environment, copy or export of the volume, volume kept by a Delete | exposed | gone when the container stops |
+| At rest: stopped environment, copy or export of the volume, volume kept by a Delete | exposed | gone when the container stops (the kernel may swap it while it runs) |
 | Anyone who can use Docker on the computer, while the container runs | readable | readable |
 | A process or AI agent in the container | readable (it must be) | readable (it must be) |
 | What a leaked token can do | every repository of the account, no expiry | the same |

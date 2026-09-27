@@ -223,7 +223,7 @@ describe('monitor lock', () => {
   });
 });
 
-// Review finding F2 of PR #26: a monitor of an older version is asked to exit, and the current one takes over.
+// A monitor of an older protocol version is asked to exit, and the current one takes over.
 describe('monitor protocol version and exit request', () => {
   let dir: string;
   let lockFile: string;
@@ -241,8 +241,9 @@ describe('monitor protocol version and exit request', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('is version 2 since Keep Running When Closed (version 1 wrote no version file)', () => {
-    expect(MONITOR_PROTOCOL_VERSION).toBe(2);
+  // Versions reset to 1 (user decision 2026-09-27).
+  it('is version 1', () => {
+    expect(MONITOR_PROTOCOL_VERSION).toBe(1);
   });
 
   it('writes and reads the version of a process ID, atomically and next to the lock', () => {
@@ -349,9 +350,10 @@ describe('monitor protocol version and exit request', () => {
     fs.writeFileSync(exitFile, 'x');
     removeLeftoverExitRequest(lockFile, exitFile, alive);
     expect(fs.existsSync(exitFile)).toBe(false);
-    // The request names the live lock holder: whatever its version (older, current, unknown), the request may be valid.
+    // The request names the live lock holder: whatever its version (current, another, unknown), the request may be valid.
+    // Versions reset to 1 (user decision 2026-09-27): no version below the current one exists.
     fs.writeFileSync(lockFile, '1111\n');
-    for (const version of [MONITOR_PROTOCOL_VERSION - 1, MONITOR_PROTOCOL_VERSION, undefined]) {
+    for (const version of [MONITOR_PROTOCOL_VERSION, MONITOR_PROTOCOL_VERSION + 1, undefined]) {
       if (version === undefined) fs.rmSync(versionFile, { force: true });
       else writeMonitorVersion(versionFile, 1111, version);
       request();
@@ -426,7 +428,8 @@ describe('monitor protocol version and exit request', () => {
 
   // Round-2 review finding 3 of PR #26: transient file errors of Windows (a virus scanner holds the file).
   it('retries transient errors when it reads the version, and an unreadable version is unknown, never older', () => {
-    writeMonitorVersion(versionFile, 1111, MONITOR_PROTOCOL_VERSION - 1);
+    // Versions reset to 1 (user decision 2026-09-27): version 1 is the one that a window of version 2 will retire.
+    writeMonitorVersion(versionFile, 1111, 1);
     let failures = 0;
     fsHooks.readFileSync = (file) => {
       if (file === versionFile && failures < 2) {
@@ -435,7 +438,7 @@ describe('monitor protocol version and exit request', () => {
       }
     };
     try {
-      expect(readMonitorVersion(versionFile, 1111)).toBe(MONITOR_PROTOCOL_VERSION - 1);
+      expect(readMonitorVersion(versionFile, 1111)).toBe(1);
       expect(failures).toBe(2);
       fsHooks.readFileSync = (file) => {
         if (file === versionFile) throw fsError('EBUSY');
