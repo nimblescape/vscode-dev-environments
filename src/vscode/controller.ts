@@ -121,8 +121,8 @@ export interface ControllerDeps {
   sidebar: Sidebar;
   statusBar: EnvironmentStatusBar;
   settings: () => ExtensionSettings;
-  /** The Docker setup (concept 6.1 step 2): the walkthrough and its commands. */
-  dockerSetup: Pick<DockerSetup, 'openWizard' | 'install' | 'start' | 'installWsl'>;
+  /** The Docker setup (concept 6.1 step 2): the commands of the setup in the sidebar. */
+  dockerSetup: Pick<DockerSetup, 'install' | 'start' | 'installWsl' | 'show'>;
   /** The editor of the setting repositoryGroups (concept 6.2). */
   repositoryGroupsEditor: Pick<RepositoryGroupsEditor, 'open'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
@@ -222,7 +222,6 @@ export class Controller implements vscode.Disposable {
   private checkingLeft = false;
   private ready: Promise<void> = Promise.resolve();
   private checkingConnection = false;
-  private dockerChecked = false;
   /** Numbers the flows that connect this window (see `connect`). */
   private connectRequests = 0;
   /** The connecting flows that still run. */
@@ -276,7 +275,6 @@ export class Controller implements vscode.Disposable {
       signIn: () => this.signIn(),
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
-      installDocker: () => this.deps.dockerSetup.openWizard(),
       editRepositoryGroups: () => this.deps.repositoryGroupsEditor.open(),
       turnOffHostAccessChecks: (argument) => this.turnOffHostAccessChecks(parseCommandArgument(argument)),
       turnOnHostAccessChecks: (argument) => this.turnOnHostAccessChecks(parseCommandArgument(argument)),
@@ -285,6 +283,7 @@ export class Controller implements vscode.Disposable {
       dockerSetupInstall: () => this.deps.dockerSetup.install(),
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
+      dockerSetupShow: () => this.deps.dockerSetup.show(),
     };
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
@@ -349,21 +348,6 @@ export class Controller implements vscode.Disposable {
       current.branch = branch;
       this.updateStatusBar();
     }
-  }
-
-  /**
-   * Concept 6.1 step 2: when the view shows for the first time in this window, check that Docker is installed. The action
-   * Install Docker… opens the walkthrough.
-   */
-  onViewVisible(): void {
-    if (this.dockerChecked) return;
-    this.dockerChecked = true;
-    if (this.deps.docker.isInstalled()) return;
-    this.logger.warn('The Docker CLI was not found.');
-    vscode.window
-      .showWarningMessage(Messages.dockerNotInstalled, Actions.installDocker)
-      .then((choice) => (choice === Actions.installDocker ? vscode.commands.executeCommand(Commands.installDocker) : undefined))
-      .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
   }
 
   dispose(): void {

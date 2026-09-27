@@ -26,7 +26,6 @@ export const Commands = {
   selectOwners: 'devEnvironments.selectOwners',
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devEnvironments.selectOwnersFiltered',
-  installDocker: 'devEnvironments.installDocker',
   // The editor of the setting repositoryGroups (Command Palette, view title "…" menu, link in the setting).
   editRepositoryGroups: 'devEnvironments.editRepositoryGroups',
   // The switch of the host access checks of a repository (row context menu only, hidden in the Command Palette).
@@ -36,10 +35,13 @@ export const Commands = {
   // The row context menu shows one of the two; the Command Palette offers both with a picker of the environments, as Stop.
   keepRunning: 'devEnvironments.keepRunning',
   stopWhenClosed: 'devEnvironments.stopWhenClosed',
-  // The buttons of the walkthrough "Set up Docker for Dev Environments" (hidden in the Command Palette).
+  // The buttons of the Docker setup in the sidebar (welcome view), Start Docker after an installation and of the error
+  // "Docker is not running." (Docker Engine on Linux), and Show Docker Setup, the action Install Docker… of the error
+  // "Docker Desktop is not installed." (all hidden in the Command Palette).
   dockerSetupInstall: 'devEnvironments.dockerSetup.install',
   dockerSetupStart: 'devEnvironments.dockerSetup.start',
   dockerSetupInstallWsl: 'devEnvironments.dockerSetup.installWsl',
+  dockerSetupShow: 'devEnvironments.dockerSetup.show',
 } as const;
 
 export type CommandName = keyof typeof Commands;
