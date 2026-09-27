@@ -17,7 +17,7 @@ import { isRepositoryInScope, sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
-import { WorkspaceHelper, readDockerContextEndpoint } from '../core/helper/workspaceHelper';
+import { WorkspaceHelper, readDockerContextEndpoint, readDockerEngineName } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
@@ -130,8 +130,11 @@ async function activateExtension(
     dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
     env,
     // Implementation notes 6: with an empty DOCKER_HOST, the socket of the Docker context that the CLI uses (for example
-    // `docker context use rootless`) is mounted into the helper; read once, when the first helper run needs it.
+    // `docker context use rootless`) is mounted into the helper, but only when the engine runs on this computer (its
+    // `docker info` name is the hostname; not Colima, Rancher Desktop or Docker Desktop). Read for each helper run that
+    // mounts the socket, like every other Docker CLI call reads the current context; overlapping runs share one lookup.
     contextEndpoint: () => readDockerContextEndpoint(docker, env, logger),
+    engineName: () => readDockerEngineName(docker, logger),
     // Implementation notes 7: the weekly check of the base image uses the registry client (and the credentials) of the
     // image check, with its own time limit of 5 seconds, in the background of the open.
     statePath: paths.helperState,

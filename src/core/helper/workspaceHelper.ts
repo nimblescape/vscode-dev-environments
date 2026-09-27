@@ -7,6 +7,7 @@
 // CLI builds and starts dev containers with the Docker engine of the computer. Git and the scripts that read files run
 // without the socket: Git runs programs that the repository configuration names (for example filter drivers).
 import * as crypto from 'crypto';
+import * as os from 'os';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
@@ -81,11 +82,20 @@ export interface HelperDeps {
    */
   env: NodeJS.ProcessEnv;
   /**
-   * Endpoint of the Docker context that the CLI uses (readDockerContextEndpoint), asked once, before the first run that
-   * mounts the socket, and only on Linux with an empty DOCKER_HOST. Without it, or when it gives `undefined`, only
-   * DOCKER_HOST counts (helperDockerSocket).
+   * Endpoint of the Docker context that the CLI uses (readDockerContextEndpoint), asked for each helper run that mounts
+   * the socket (runs that overlap in time share one lookup; nothing is cached), and only on Linux with an empty
+   * DOCKER_HOST. Without it, or when it gives `undefined`, only DOCKER_HOST counts (helperDockerSocket).
    */
   contextEndpoint?: () => Promise<string | undefined>;
+  /**
+   * Name of the Docker engine (readDockerEngineName, `docker info` .Name: the hostname of the machine of the engine),
+   * asked in the same lookup as `contextEndpoint` when the endpoint is a `unix://` path that could be mounted. Without
+   * it, or when it gives `undefined`, the engine does not count as one on this computer, and the helper mounts
+   * /var/run/docker.sock.
+   */
+  engineName?: () => Promise<string | undefined>;
+  /** Hostname of this computer, compared with `engineName`. Default: os.hostname(). */
+  hostname?: () => string;
   /** Default: the platform of this process. */
   platform?: NodeJS.Platform;
   clock?: Clock;
@@ -129,19 +139,55 @@ export const DOCKER_SOCKET = HELPER_DOCKER_SOCKET;
 export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
 
 /**
- * Source of the socket mount (implementation notes 6). The source is a path on the machine of the Docker engine.
- * Assumption (V-7): Docker Desktop (macOS, Windows, and Linux) runs the engine in a VM, where the socket is
- * /var/run/docker.sock, whatever DOCKER_HOST points to on the computer. So a `unix://` endpoint is used only on Linux
- * without Docker Desktop (for example rootless Docker Engine). The endpoint is DOCKER_HOST, or, when it is empty,
- * `contextEndpoint`: the endpoint of the Docker context that the CLI uses (readDockerContextEndpoint), for example
- * after `docker context use rootless`. Any other endpoint (ssh://, tcp://, npipe://, Docker Desktop) gives
- * /var/run/docker.sock.
+ * The `unix://` path that the helper may mount instead of /var/run/docker.sock (implementation notes 6), before the check
+ * that the engine runs on this computer (helperDockerSocket): the endpoint is DOCKER_HOST, or, when it is empty,
+ * `contextEndpoint` (the endpoint of the Docker context that the CLI uses, readDockerContextEndpoint). Only a `unix://`
+ * absolute path on Linux that is not the socket of Docker Desktop (a path with `/.docker/desktop/`) counts; anything
+ * else (ssh://, tcp://, npipe://, macOS, Windows) gives `undefined`.
  */
-export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, contextEndpoint?: string): string {
+export function helperSocketCandidate(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, contextEndpoint?: string): string | undefined {
   const host = env.DOCKER_HOST?.trim() || contextEndpoint?.trim();
-  if (platform !== 'linux' || !host || !host.startsWith('unix://')) return DOCKER_SOCKET;
+  if (platform !== 'linux' || !host || !host.startsWith('unix://')) return undefined;
   const socketPath = host.slice('unix://'.length);
-  if (!socketPath.startsWith('/') || socketPath.includes('/.docker/desktop/')) return DOCKER_SOCKET;
+  if (!socketPath.startsWith('/') || socketPath.includes('/.docker/desktop/')) return undefined;
+  return socketPath;
+}
+
+/**
+ * Whether the Docker engine runs on this computer: its name (`docker info` .Name, which the Engine API documents as the
+ * hostname of the host) equals the hostname of this computer, ignoring case; the part before the first dot of either
+ * side also counts (a short name against a fully qualified one). An empty or unknown name never matches.
+ */
+export function isEngineOnThisHost(engineName: string | undefined, hostname: string): boolean {
+  const name = engineName?.trim().toLowerCase();
+  const host = hostname.trim().toLowerCase();
+  if (!name || !host) return false;
+  const short = (value: string): string => value.split('.')[0];
+  return name === host || short(name) === host || name === short(host);
+}
+
+/** The engine of `helperDockerSocket`: its name (`docker info` .Name; `undefined` when unknown) and the local hostname. */
+export interface HelperDockerEngine {
+  name: string | undefined;
+  hostname: string;
+}
+
+/**
+ * Source of the socket mount (implementation notes 6). The source is a path on the machine of the Docker engine, so a
+ * `unix://` path of the computer (helperSocketCandidate, for example rootless Docker Engine after `docker context use
+ * rootless`) is used only when the engine runs on this computer (isEngineOnThisHost). Engines in a VM report the name
+ * of the VM (Colima: `colima`, Rancher Desktop: `lima-rancher-desktop`; Docker Desktop is also excluded by its path),
+ * and there the socket is /var/run/docker.sock, as Colima and Rancher Desktop document for socket mounts. Everything
+ * else, and an unknown engine, gives /var/run/docker.sock.
+ */
+export function helperDockerSocket(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  contextEndpoint?: string,
+  engine?: HelperDockerEngine,
+): string {
+  const socketPath = helperSocketCandidate(env, platform, contextEndpoint);
+  if (!socketPath || !engine || !isEngineOnThisHost(engine.name, engine.hostname)) return DOCKER_SOCKET;
   return socketPath;
 }
 
@@ -198,10 +244,50 @@ export async function readDockerContextEndpoint(
       logger.warn(`The endpoint of ${context} could not be read (${detail}). ${fallback}.`);
       return undefined;
     }
-    logger.info(`Endpoint of ${context}: ${host || '(empty)'}`);
+    // Not logged: this runs for each helper run; the helper logs the chosen socket when it changes.
     return host;
   } catch (error) {
     logger.warn(`The endpoint of ${context} could not be read (${errorMessage(error)}). ${fallback}.`);
+    return undefined;
+  }
+}
+
+/** Time limit of `docker info` (readDockerEngineName). */
+export const DOCKER_ENGINE_TIMEOUT_MS = 5_000;
+
+/**
+ * Name of the Docker engine of the current endpoint (`docker info --format '{{json .Name}}'`; the Engine API documents
+ * Name as the hostname of the host), for helperDockerSocket. `undefined` when it cannot be read (an error, a time
+ * limit); that is logged, and the helper then uses /var/run/docker.sock. Never throws.
+ */
+export async function readDockerEngineName(
+  docker: Pick<HelperDocker, 'run'>,
+  logger: Logger,
+  timeoutMs: number = DOCKER_ENGINE_TIMEOUT_MS,
+): Promise<string | undefined> {
+  const fallback = `The workspace helper uses ${DOCKER_SOCKET}`;
+  try {
+    const result = await docker.run(['info', '--format', '{{json .Name}}'], { timeoutMs });
+    if (result.timedOut) {
+      logger.warn(`The name of the Docker engine was not read within ${Math.round(timeoutMs / 1000)} seconds. ${fallback}.`);
+      return undefined;
+    }
+    let name: unknown;
+    if (result.exitCode === 0) {
+      try {
+        name = JSON.parse(result.stdout.trim());
+      } catch {
+        name = undefined;
+      }
+    }
+    if (typeof name !== 'string') {
+      const detail = result.stderr.trim() || `exit code ${result.exitCode}`;
+      logger.warn(`The name of the Docker engine could not be read (${detail}). ${fallback}.`);
+      return undefined;
+    }
+    return name;
+  } catch (error) {
+    logger.warn(`The name of the Docker engine could not be read (${errorMessage(error)}). ${fallback}.`);
     return undefined;
   }
 }
@@ -435,27 +521,57 @@ export class WorkspaceHelper {
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
-  /** Source of the socket mount (helperDockerSocket), resolved once per instance. */
-  private socketPathPromise: Promise<string> | undefined;
+  /** Lookup of the socket (dockerSocketPath) that runs now; runs that overlap in time share it. Never a cached result. */
+  private socketLookup: Promise<string> | undefined;
+  /** Socket (and reason) last logged, so that the choice is logged only when it changes. */
+  private loggedSocket: string | undefined;
 
   constructor(private readonly deps: HelperDeps) {
     this.clock = deps.clock ?? systemClock;
   }
 
-  /** helperDockerSocket, with the endpoint of the Docker context when it is needed; cached for the life of the helper. */
+  /**
+   * helperDockerSocket for one helper run, with the endpoint of the Docker context and the name of the engine when they
+   * are needed. Resolved for each run, because the current Docker context can change while the extension host runs;
+   * runs that overlap in time share one lookup, and nothing (also no failure) is kept afterwards.
+   */
   private dockerSocketPath(): Promise<string> {
-    if (!this.socketPathPromise) {
-      const { env, contextEndpoint } = this.deps;
-      const platform = this.deps.platform ?? process.platform;
-      this.socketPathPromise = (async () => {
-        const endpoint =
-          contextEndpoint && needsDockerContextEndpoint(env, platform) ? await contextEndpoint().catch(() => undefined) : undefined;
-        const socketPath = helperDockerSocket(env, platform, endpoint);
-        this.deps.logger.info(`Docker socket of the workspace helper: ${socketPath}`);
-        return socketPath;
-      })();
+    if (!this.socketLookup) {
+      const lookup = this.lookUpDockerSocket();
+      this.socketLookup = lookup;
+      const clear = (): void => {
+        if (this.socketLookup === lookup) this.socketLookup = undefined;
+      };
+      lookup.then(clear, clear);
     }
-    return this.socketPathPromise;
+    return this.socketLookup;
+  }
+
+  private async lookUpDockerSocket(): Promise<string> {
+    const { env, contextEndpoint, engineName } = this.deps;
+    const platform = this.deps.platform ?? process.platform;
+    const endpoint =
+      contextEndpoint && needsDockerContextEndpoint(env, platform) ? await contextEndpoint().catch(() => undefined) : undefined;
+    const candidate = helperSocketCandidate(env, platform, endpoint);
+    let socketPath = DOCKER_SOCKET;
+    let reason = '';
+    if (candidate && candidate !== DOCKER_SOCKET) {
+      const hostname = (this.deps.hostname ?? os.hostname)();
+      const name = engineName ? await engineName().catch(() => undefined) : undefined;
+      socketPath = helperDockerSocket(env, platform, endpoint, { name, hostname });
+      if (socketPath !== candidate) {
+        reason =
+          name === undefined
+            ? ` (the name of the Docker engine of ${candidate} is unknown, so it does not count as an engine on this computer)`
+            : ` (the Docker engine of ${candidate} is "${name}", not this computer "${hostname}", for example an engine in a VM)`;
+      }
+    }
+    const choice = `${socketPath}${reason}`;
+    if (choice !== this.loggedSocket) {
+      this.loggedSocket = choice;
+      this.deps.logger.info(`Docker socket of the workspace helper: ${choice}`);
+    }
+    return socketPath;
   }
 
   /**

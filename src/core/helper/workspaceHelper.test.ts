@@ -32,14 +32,17 @@ import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
   COMPOSE_MODEL_TIMEOUT_MS,
   DOCKER_CONTEXT_TIMEOUT_MS,
+  DOCKER_ENGINE_TIMEOUT_MS,
   DOCKER_SOCKET,
   HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
   helperDockerSocket,
   helperRunArgs,
+  isEngineOnThisHost,
   isPassableEnvName,
   readDockerContextEndpoint,
+  readDockerEngineName,
   type HelperDeps,
   type HelperDocker,
 } from './workspaceHelper';
@@ -148,7 +151,7 @@ let dir: string;
 let docker: FakeDocker;
 let logger: RecordingLogger;
 
-function createHelper(env: NodeJS.ProcessEnv = {}, platform: NodeJS.Platform = 'darwin'): WorkspaceHelper {
+function createHelper(env: NodeJS.ProcessEnv = {}, platform: NodeJS.Platform = 'darwin', extra: Partial<HelperDeps> = {}): WorkspaceHelper {
   return new WorkspaceHelper({
     docker,
     logger,
@@ -156,8 +159,12 @@ function createHelper(env: NodeJS.ProcessEnv = {}, platform: NodeJS.Platform = '
     env,
     platform,
     clock: { now: () => Date.parse('2026-09-24T17:10:00Z') },
+    ...extra,
   });
 }
+
+/** An engine on this computer (`docker info` .Name equals the hostname), for helperDockerSocket. */
+const LOCAL_ENGINE = { name: 'myhost', hostname: 'myhost' };
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
@@ -180,21 +187,31 @@ describe('helperDockerSocket', () => {
   });
 
   it('uses the path of a unix:// DOCKER_HOST on Linux (for example rootless Docker)', () => {
-    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux')).toBe('/run/user/1000/docker.sock');
+    // review, F2: the path counts only for an engine on this computer; without a known engine it is /var/run/docker.sock.
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux', undefined, LOCAL_ENGINE)).toBe(
+      '/run/user/1000/docker.sock',
+    );
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux')).toBe(DOCKER_SOCKET);
   });
 });
 
 describe('helperDockerSocket with the endpoint of the Docker context', () => {
   it('uses a unix:// DOCKER_HOST on Linux, before the endpoint of the context', () => {
-    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux', 'unix:///run/user/2000/docker.sock')).toBe(
-      '/run/user/1000/docker.sock',
+    // review, F2: with an engine on this computer (LOCAL_ENGINE).
+    expect(
+      helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux', 'unix:///run/user/2000/docker.sock', LOCAL_ENGINE),
+    ).toBe('/run/user/1000/docker.sock');
+    expect(helperDockerSocket({ DOCKER_HOST: 'tcp://10.0.0.1:2376' }, 'linux', 'unix:///run/user/1000/docker.sock', LOCAL_ENGINE)).toBe(
+      DOCKER_SOCKET,
     );
-    expect(helperDockerSocket({ DOCKER_HOST: 'tcp://10.0.0.1:2376' }, 'linux', 'unix:///run/user/1000/docker.sock')).toBe(DOCKER_SOCKET);
   });
 
   it('uses the socket of a rootless context on Linux when DOCKER_HOST is empty', () => {
-    expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock')).toBe('/run/user/1000/docker.sock');
-    expect(helperDockerSocket({ DOCKER_HOST: '  ' }, 'linux', ' unix:///run/user/1000/docker.sock\n')).toBe('/run/user/1000/docker.sock');
+    // review, F2: with an engine on this computer (LOCAL_ENGINE).
+    expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock', LOCAL_ENGINE)).toBe('/run/user/1000/docker.sock');
+    expect(helperDockerSocket({ DOCKER_HOST: '  ' }, 'linux', ' unix:///run/user/1000/docker.sock\n', LOCAL_ENGINE)).toBe(
+      '/run/user/1000/docker.sock',
+    );
   });
 
   it.each([
@@ -209,6 +226,69 @@ describe('helperDockerSocket with the endpoint of the Docker context', () => {
     ['Windows', 'win32', 'npipe:////./pipe/docker_engine'],
   ] as const)('uses /var/run/docker.sock for %s', (_name, platform, endpoint) => {
     expect(helperDockerSocket({}, platform, endpoint)).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({}, platform, endpoint, LOCAL_ENGINE)).toBe(DOCKER_SOCKET);
+  });
+});
+
+describe('helperDockerSocket and the engine on this computer (F2)', () => {
+  it.each([
+    ['Colima', 'unix:///home/u/.colima/default/docker.sock', 'colima'],
+    ['Rancher Desktop', 'unix:///home/u/.rd/docker.sock', 'lima-rancher-desktop'],
+  ])('uses /var/run/docker.sock for the context of %s (engine in a VM)', (_name, endpoint, engineName) => {
+    expect(helperDockerSocket({}, 'linux', endpoint, { name: engineName, hostname: 'myhost' })).toBe(DOCKER_SOCKET);
+  });
+
+  it('uses the socket of rootless Docker, whose engine reports the hostname', () => {
+    expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock', { name: 'myhost', hostname: 'myhost' })).toBe(
+      '/run/user/1000/docker.sock',
+    );
+  });
+
+  it('checks a unix:// DOCKER_HOST as well', () => {
+    const env = { DOCKER_HOST: 'unix:///home/u/.colima/default/docker.sock' };
+    expect(helperDockerSocket(env, 'linux', undefined, { name: 'colima', hostname: 'myhost' })).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket(env, 'linux', undefined, { name: undefined, hostname: 'myhost' })).toBe(DOCKER_SOCKET);
+  });
+
+  it.each([
+    ['myhost', 'myhost', true],
+    ['MyHost', 'myhost', true],
+    ['myhost.example.com', 'myhost', true],
+    ['myhost', 'MYHOST.example.com', true],
+    ['myhost.example.com', 'myhost.example.com', true],
+    ['colima', 'myhost', false],
+    ['lima-rancher-desktop', 'myhost', false],
+    ['docker-desktop', 'myhost', false],
+    ['myhost2', 'myhost', false],
+    ['', 'myhost', false],
+    [undefined, 'myhost', false],
+    ['myhost', '', false],
+  ])('isEngineOnThisHost(%j, %j) is %s', (name, hostname, expected) => {
+    expect(isEngineOnThisHost(name, hostname)).toBe(expected);
+  });
+});
+
+describe('readDockerEngineName', () => {
+  it('reads the name with docker info', async () => {
+    docker.handler = () => ({ stdout: '"myhost"\n' });
+    await expect(readDockerEngineName(docker, logger)).resolves.toBe('myhost');
+    expect(docker.calls.map((call) => call.args)).toEqual([['info', '--format', '{{json .Name}}']]);
+    expect(docker.calls[0].options.timeoutMs).toBe(DOCKER_ENGINE_TIMEOUT_MS);
+    expect(DOCKER_ENGINE_TIMEOUT_MS).toBe(5_000);
+  });
+
+  it.each<[string, Partial<RunResult> | Error]>([
+    ['a failed docker info', { exitCode: 1, stderr: 'Cannot connect to the Docker daemon' }],
+    ['a time limit', { exitCode: -1, timedOut: true }],
+    ['output that is no JSON string', { stdout: 'null' }],
+    ['a missing CLI', new Error('spawn docker ENOENT')],
+  ])('gives undefined and logs after %s', async (_name, outcome) => {
+    docker.handler = () => {
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    };
+    await expect(readDockerEngineName(docker, logger)).resolves.toBeUndefined();
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('Docker engine') && line.includes(DOCKER_SOCKET))).toBe(true);
   });
 });
 
@@ -250,20 +330,36 @@ describe('readDockerContextEndpoint', () => {
 });
 
 describe('WorkspaceHelper socket mount with the Docker context', () => {
-  function helperWith(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, contextEndpoint: () => Promise<string | undefined>): WorkspaceHelper {
-    return new WorkspaceHelper({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env, platform, contextEndpoint });
+  function helperWith(
+    env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform,
+    contextEndpoint: () => Promise<string | undefined>,
+    // review, F2: an engine on this computer by default, so that the socket of the context counts.
+    engineName: () => Promise<string | undefined> = async () => 'myhost',
+  ): WorkspaceHelper {
+    return new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env,
+      platform,
+      contextEndpoint,
+      engineName,
+      hostname: () => 'myhost',
+    });
   }
 
   function socketMount(args: string[]): string | undefined {
     return args.find((arg) => arg.startsWith('type=bind,'));
   }
 
-  it('mounts the socket of the rootless context on Linux with an empty DOCKER_HOST, and asks for it once', async () => {
+  it('mounts the socket of the rootless context on Linux with an empty DOCKER_HOST, and asks for it for each run', async () => {
     const lookup = vi.fn(async () => 'unix:///run/user/1000/docker.sock');
     const helper = helperWith({}, 'linux', lookup);
     await helper.run('vol', ['true']);
     await helper.run('vol', ['true']);
-    expect(lookup).toHaveBeenCalledTimes(1);
+    // review, F1: the context is read for each run (it can change while VS Code runs), no longer once per helper.
+    expect(lookup).toHaveBeenCalledTimes(2);
     for (const run of docker.runs) {
       expect(socketMount(run.args)).toBe('type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock');
       expect(run.args.join(' ')).not.toMatch(/DOCKER_HOST|DOCKER_CONTEXT/);
@@ -298,6 +394,168 @@ describe('WorkspaceHelper socket mount with the Docker context', () => {
     await helper.run('vol', ['true']);
     expect(lookup).not.toHaveBeenCalled();
     expect(socketMount(docker.runs[0].args)).toBe(`type=bind,source=${expected},target=/var/run/docker.sock`);
+  });
+
+  /** A helper with the real lookups (readDockerContextEndpoint, readDockerEngineName) on the fake Docker CLI. */
+  function helperWithRealLookups(env: NodeJS.ProcessEnv = {}): WorkspaceHelper {
+    return new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env,
+      platform: 'linux',
+      contextEndpoint: () => readDockerContextEndpoint(docker, env, logger),
+      engineName: () => readDockerEngineName(docker, logger),
+      hostname: () => 'myhost',
+    });
+  }
+
+  /** The fake Docker CLI with a current context (its endpoint) and an engine (its `docker info` name). */
+  function engine(state: { endpoint: string; name: string }, info: () => Partial<RunResult> = () => ({ stdout: JSON.stringify(state.name) })): void {
+    docker.handler = (args) => {
+      if (args[0] === 'context') return { stdout: JSON.stringify(state.endpoint) };
+      if (args[0] === 'info') return info();
+      return {};
+    };
+  }
+
+  const mountOf = (source: string): string => `type=bind,source=${source},target=/var/run/docker.sock`;
+
+  it('mounts the socket of the new context after `docker context use` between two runs (F1)', async () => {
+    const state = { endpoint: 'unix:///run/user/1000/docker.sock', name: 'myhost' };
+    engine(state);
+    const helper = helperWithRealLookups();
+    await helper.run('vol', ['true']);
+    state.endpoint = 'unix:///var/run/docker.sock';
+    await helper.run('vol', ['true']);
+    state.endpoint = 'unix:///run/user/1000/docker.sock';
+    await helper.run('vol', ['true']);
+    expect(docker.runs.map((run) => socketMount(run.args))).toEqual([
+      mountOf('/run/user/1000/docker.sock'),
+      mountOf(DOCKER_SOCKET),
+      mountOf('/run/user/1000/docker.sock'),
+    ]);
+    // The choice is logged when it changes.
+    expect(logger.lines.filter((line) => line.includes('Docker socket of the workspace helper'))).toHaveLength(3);
+  });
+
+  it('logs the socket only when it changes', async () => {
+    engine({ endpoint: 'unix:///run/user/1000/docker.sock', name: 'myhost' });
+    const helper = helperWithRealLookups();
+    await helper.run('vol', ['true']);
+    await helper.run('vol', ['true']);
+    expect(logger.lines.filter((line) => line.includes('Docker socket of the workspace helper'))).toEqual([
+      'info Docker socket of the workspace helper: /run/user/1000/docker.sock',
+    ]);
+  });
+
+  it('does not keep a failed lookup: the next run reads the context again (F1)', async () => {
+    let fail = true;
+    docker.handler = (args) => {
+      if (args[0] === 'context') return fail ? { exitCode: -1, timedOut: true } : { stdout: '"unix:///run/user/1000/docker.sock"' };
+      if (args[0] === 'info') return { stdout: '"myhost"' };
+      return {};
+    };
+    const helper = helperWithRealLookups();
+    await helper.run('vol', ['true']);
+    fail = false;
+    await helper.run('vol', ['true']);
+    expect(docker.runs.map((run) => socketMount(run.args))).toEqual([mountOf(DOCKER_SOCKET), mountOf('/run/user/1000/docker.sock')]);
+  });
+
+  it('does not keep a failed docker info: the next run asks again (F1, F2)', async () => {
+    let fail = true;
+    engine({ endpoint: 'unix:///run/user/1000/docker.sock', name: 'myhost' }, () => (fail ? { exitCode: 1, stderr: 'boom' } : { stdout: '"myhost"' }));
+    const helper = helperWithRealLookups();
+    await helper.run('vol', ['true']);
+    fail = false;
+    await helper.run('vol', ['true']);
+    expect(docker.runs.map((run) => socketMount(run.args))).toEqual([mountOf(DOCKER_SOCKET), mountOf('/run/user/1000/docker.sock')]);
+  });
+
+  it('shares one lookup between runs that overlap in time', async () => {
+    let release: (endpoint: string) => void = () => undefined;
+    const lookup = vi.fn(async (): Promise<string | undefined> => 'unix:///run/user/1000/docker.sock');
+    lookup.mockImplementationOnce(() => new Promise<string | undefined>((resolve) => (release = resolve)));
+    const engineName = vi.fn(async () => 'myhost');
+    const helper = helperWith({}, 'linux', lookup, engineName);
+    const runs = [helper.run('vol', ['true']), helper.run('vol', ['true'])];
+    await vi.waitFor(() => expect(lookup).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    release('unix:///run/user/1000/docker.sock');
+    await Promise.all(runs);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(engineName).toHaveBeenCalledTimes(1);
+    expect(docker.runs.map((run) => socketMount(run.args))).toEqual([mountOf('/run/user/1000/docker.sock'), mountOf('/run/user/1000/docker.sock')]);
+    // A later run looks up again.
+    await helper.run('vol', ['true']);
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['colima', 'unix:///home/u/.colima/default/docker.sock', 'colima'],
+    ['rancher-desktop', 'unix:///home/u/.rd/docker.sock', 'lima-rancher-desktop'],
+  ])('mounts /var/run/docker.sock for the context %s, whose engine runs in a VM (F2)', async (_name, endpoint, name) => {
+    engine({ endpoint, name });
+    await helperWithRealLookups().run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe(mountOf(DOCKER_SOCKET));
+    expect(logger.lines.some((line) => line.startsWith('info') && line.includes(`"${name}"`) && line.includes('myhost'))).toBe(true);
+  });
+
+  it.each([
+    ['the hostname', 'myhost'],
+    ['a fully qualified name of the hostname', 'myhost.example.com'],
+  ])('mounts the socket of rootless Docker, whose engine name is %s', async (_name, name) => {
+    engine({ endpoint: 'unix:///run/user/1000/docker.sock', name });
+    await helperWithRealLookups().run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe(mountOf('/run/user/1000/docker.sock'));
+  });
+
+  it('matches a short engine name with a fully qualified hostname', async () => {
+    engine({ endpoint: 'unix:///run/user/1000/docker.sock', name: 'myhost' });
+    const env = {};
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env,
+      platform: 'linux',
+      contextEndpoint: () => readDockerContextEndpoint(docker, env, logger),
+      engineName: () => readDockerEngineName(docker, logger),
+      hostname: () => 'MyHost.example.com',
+    });
+    await helper.run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe(mountOf('/run/user/1000/docker.sock'));
+  });
+
+  it.each<[string, () => Partial<RunResult>]>([
+    ['fails', () => ({ exitCode: 1, stderr: 'Cannot connect to the Docker daemon' })],
+    ['reaches its time limit', () => ({ exitCode: -1, timedOut: true })],
+  ])('mounts /var/run/docker.sock and logs when docker info %s (F2)', async (_name, info) => {
+    engine({ endpoint: 'unix:///run/user/1000/docker.sock', name: 'myhost' }, info);
+    await helperWithRealLookups().run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe(mountOf(DOCKER_SOCKET));
+    expect(docker.calls.find((call) => call.args[0] === 'info')?.options.timeoutMs).toBe(DOCKER_ENGINE_TIMEOUT_MS);
+    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('Docker engine') && line.includes(DOCKER_SOCKET))).toBe(true);
+    expect(logger.lines.some((line) => line.startsWith('info') && line.includes('unknown'))).toBe(true);
+  });
+
+  it('mounts /var/run/docker.sock for a unix:// DOCKER_HOST whose engine is not on this computer (F2)', async () => {
+    const env = { DOCKER_HOST: 'unix:///home/u/.colima/default/docker.sock' };
+    engine({ endpoint: 'unix:///ignored.sock', name: 'colima' });
+    await helperWithRealLookups(env).run('vol', ['true']);
+    expect(socketMount(docker.runs[0].args)).toBe(mountOf(DOCKER_SOCKET));
+    expect(docker.calls.some((call) => call.args[0] === 'context')).toBe(false);
+    expect(docker.runs[0].args.join(' ')).not.toMatch(/DOCKER_HOST|DOCKER_CONTEXT/);
+  });
+
+  it('does not ask docker info for the default socket or for a run without the socket', async () => {
+    engine({ endpoint: 'unix:///var/run/docker.sock', name: 'myhost' });
+    const helper = helperWithRealLookups();
+    await helper.run('vol', ['true']);
+    await helper.run('vol', ['true'], { docker: false });
+    expect(docker.calls.filter((call) => call.args[0] === 'info')).toEqual([]);
+    expect(docker.calls.filter((call) => call.args[0] === 'context')).toHaveLength(1);
   });
 });
 
@@ -435,7 +693,11 @@ describe('helperRunArgs', () => {
 
 describe('WorkspaceHelper.run', () => {
   it('builds the helper image once, then runs the command with the helper arguments', async () => {
-    const helper = createHelper({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux');
+    // review, F2: the rootless socket counts only for an engine on this computer.
+    const helper = createHelper({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux', {
+      engineName: async () => 'myhost',
+      hostname: () => 'myhost',
+    });
     docker.handler = () => ({ stdout: 'ok\n' });
     const output: string[] = [];
     const result = await helper.run('vol', ['echo', 'ok'], { env: { HOME: '/home/me' }, onOutput: (text) => output.push(text) });
