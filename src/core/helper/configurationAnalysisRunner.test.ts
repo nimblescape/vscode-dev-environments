@@ -12,7 +12,6 @@ import * as path from 'path';
 import { Worker } from 'worker_threads';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import type { ComposeAccessInput } from './composeAccess';
 import { helperCliVariables, mayBeSetInHelper } from './cliVariables';
 import {
   ANALYSIS_FAILED_ITEM,
@@ -24,6 +23,7 @@ import {
   type AnalysisJob,
 } from './configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from './configurationAnalysisRunner';
+import type { ComposeAccessInput } from '../policy';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';

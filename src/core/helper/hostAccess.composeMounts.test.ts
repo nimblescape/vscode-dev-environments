@@ -10,7 +10,7 @@ import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
 import { CONFIG_FOLDER } from '../names';
 import { helperCliVariables } from './cliVariables';
-import { hostAccessReport, type HostAccessInput } from './hostAccess';
+import { hostAccessReport, type HostAccessInput } from '../policy';
 
 const OWN = 'devenv-api-12345678';
 

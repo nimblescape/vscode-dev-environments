@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Review round 8 (structural fix of the parser DoS class): the host access analysis of the configuration of a repository
-// (hostAccessReport, composeAccessReport, and the FROM images of its Dockerfiles for the update check) as jobs that run in a worker thread with
+// (checkContainer of the container policy, ../policy, and the FROM images of its Dockerfiles for the update check) as jobs that run in a worker thread with
 // limits of time and memory (configurationAnalysisRunner.ts, configurationAnalysisWorker.ts). A Dockerfile or a Compose
 // model of a repository is hostile input: however its text is analysed, the extension host must not freeze or crash on
 // it. A job that fails (too slow, too much memory, a crash) refuses the configuration: never allowed on a failure.
@@ -12,14 +12,16 @@ import { collectReferences, type ConfigReferences } from '../imageCheck/imageChe
 import type { DevcontainerConfig } from '../types';
 import { composeReferences } from './compose';
 import { mayBeSetInHelper } from './cliVariables';
-import { composeAccessReport, composeImageReferences, type ComposeAccessInput } from './composeAccess';
 import {
-  hostAccessReport,
+  checkContainer,
+  composeImageReferences,
   singleImageReferences,
+  type CheckStage,
+  type ComposeAccessInput,
   type HostAccessInput,
   type HostAccessReport,
   type NamedImageReference,
-} from './hostAccess';
+} from '../policy';
 
 /**
  * The item of a configuration whose analysis failed (ConfigurationAnalyzer): refused as not supported, whatever the
@@ -65,18 +67,26 @@ export function analysisFailureItem(failure: AnalysisFailure): string {
   return failure.docker === true ? dockerCheckItem(failure.reason) : analysisInternalItem(failure.reason);
 }
 
-/** One analysis of the host access policy. */
+/**
+ * One analysis of the host access policy: checkContainer (../policy) at a stage, with the switch of the repository
+ * (`checksOn`), and the references that the stage needs besides its report.
+ */
 export type AnalysisJob =
-  /** hostAccessReport alone (devcontainer.json, the merged configuration, the runArgs of Docker, the image metadata). */
-  | { kind: 'hostAccess'; input: HostAccessInput; checksOn: boolean }
   /**
-   * A single container: hostAccessReport, the image references for the question of image IDs (singleImageReferences),
-   * and the references of the image check (collectReferences, with the FROM images of its Dockerfile).
+   * checkContainer alone at `stage` (default `configuration`): devcontainer.json and the merged configuration of a Docker
+   * Compose configuration (`configuration`), the runArgs of Docker (`finalRunArgs`), the image metadata (`imageMetadata`).
+   */
+  | { kind: 'hostAccess'; stage?: Exclude<CheckStage, 'composeModel'>; input: HostAccessInput; checksOn: boolean }
+  /**
+   * A single container: checkContainer `configuration`, the image references for the question of image IDs
+   * (singleImageReferences), and the references of the image check (collectReferences, with the FROM images of its
+   * Dockerfile).
    */
   | { kind: 'single'; input: HostAccessInput; checksOn: boolean; config: DevcontainerConfig; dockerfileText?: string }
   /**
-   * A Docker Compose model: composeAccessReport, its image references (composeImageReferences), and the references of
-   * the image check (composeReferences, with the `features` of devcontainer.json).
+   * A Docker Compose model: checkContainer `composeModel` (with the local Features of `features`, composeConfigurationReport),
+   * its image references (composeImageReferences), and the references of the image check (composeReferences, with the
+   * `features` of devcontainer.json).
    */
   | { kind: 'compose'; input: ComposeAccessInput; checksOn: boolean; features?: unknown };
 
@@ -101,7 +111,7 @@ export interface ConfigurationAnalyzer {
 /**
  * `job` as the worker gets it (merge of #27 into the Compose branch): the structured clone of postMessage copies no
  * function, and HostAccessInput.variables (helperCliVariables) holds `mayBeSet`. The only one that the pipeline passes is
- * mayBeSetInHelper, which the checks use when none is given (cliVariablesOf in ./hostAccess.ts, imageRemoteUser): it is
+ * mayBeSetInHelper, which the checks use when none is given (cliVariablesOf in ../policy/single.ts, imageRemoteUser): it is
  * left out, the key too (a key with `undefined` would replace the default). Any other function cannot be passed: an
  * error, which the runner reports as a job that could not be passed (the configuration is refused).
  */
@@ -114,21 +124,26 @@ export function transferableJob<J extends AnalysisJob>(job: J): J {
   return { ...job, input: { ...job.input, variables: rest } };
 }
 
+/** The switch of the host access checks (HostAccessChecks) of a job's `checksOn`. */
+function checks(checksOn: boolean): 'on' | 'off' {
+  return checksOn ? 'on' : 'off';
+}
+
 /** Runs a job in this thread (the worker runs it with runAnalysisJob too). Throws what the analysis throws. */
 export function runAnalysisJob<J extends AnalysisJob>(job: J): AnalysisResult<J> {
   switch (job.kind) {
     case 'hostAccess':
-      return { report: hostAccessReport(job.input, job.checksOn) } as AnalysisResult<J>;
+      return { report: checkContainer(job.stage ?? 'configuration', { ...job.input, checks: checks(job.checksOn) }) } as AnalysisResult<J>;
     case 'single':
       return {
-        report: hostAccessReport(job.input, job.checksOn),
+        report: checkContainer('configuration', { ...job.input, checks: checks(job.checksOn) }),
         imageReferences: singleImageReferences(job.config),
         references: collectReferences(job.config, job.dockerfileText),
       } as AnalysisResult<J>;
     case 'compose': {
       const dockerfiles = job.input.dockerfiles ?? {};
       return {
-        report: composeAccessReport(job.input, job.checksOn),
+        report: checkContainer('composeModel', { ...job.input, features: job.features, checks: checks(job.checksOn) }),
         imageReferences: composeImageReferences(job.input.model),
         references: composeReferences(job.input.model, dockerfiles, job.features),
       } as AnalysisResult<J>;

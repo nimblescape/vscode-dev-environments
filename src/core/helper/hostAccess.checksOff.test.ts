@@ -10,9 +10,9 @@ import { describe, expect, it } from 'vitest';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { CONTAINER_CONFIG_UNKNOWN_LABEL, CONTAINER_VERSION_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL } from '../names';
 import { runAnalysisJob } from './configurationAnalysis';
-import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
+  GITHUB_CLI_ACCOUNT_REASON,
   hostAccessClassification,
   hostAccessProblems,
   hostAccessReport,
@@ -21,7 +21,7 @@ import {
   singleImageReferences,
   type HostAccessClass,
   type HostAccessInput,
-} from './hostAccess';
+} from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };

@@ -7,9 +7,7 @@
 // the switch on again for a container that was created while it was off.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
-import { GITHUB_CLI_ACCOUNT_REASON } from '../helper/containerGit';
 import { helperCliVariables, substituteCliVariables } from '../helper/cliVariables';
-import { hostAccessProblems, runArgsProblems } from '../helper/hostAccess';
 import { Messages } from '../messages';
 import {
   CONTAINER_CONFIG_UNKNOWN,
@@ -42,6 +40,7 @@ import {
   CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { GITHUB_CLI_ACCOUNT_REASON, hostAccessProblems, runArgsProblems } from '../policy';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);

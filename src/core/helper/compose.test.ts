@@ -25,20 +25,22 @@ import {
   composeUserArgs,
   type ComposeModelOutput,
   composeVolumeNames,
-  decideServiceMount,
-  decideServicePort,
   escapeComposeDollars,
-  isOtherEnvironmentProjectName,
   isSupportedComposeVersion,
   parseComposeModelOutput,
   resolveComposeFiles,
   supportsVolumeSubpath,
-  type ComposeEntryDecision,
   type ComposeModel,
-  type ComposeMountContext,
   type ComposeRewriteParams,
 } from './compose';
 import { OVERRIDE_FOLDER } from './scripts';
+import {
+  decideServiceMount,
+  decideServicePort,
+  isOtherEnvironmentProjectName,
+  type ComposeEntryDecision,
+  type ComposeMountContext,
+} from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';

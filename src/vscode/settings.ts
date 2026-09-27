@@ -5,7 +5,7 @@
 // Settings of concept section 8 (prefix `devEnvLauncher`, working name of decision D-1).
 import * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
-import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../core/hostAccessChecks';
+import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../core/policy/hostAccessChecks';
 import { Messages } from '../core/messages';
 import type { Logger } from '../core/ports';
 import type { ExtensionSettings } from '../core/types';

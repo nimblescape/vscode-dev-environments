@@ -107,47 +107,6 @@ export function remoteEnvironment(): Record<string, string> {
   return { ...containerEnvironment() };
 }
 
-/**
- * True for the name of an environment variable that a configuration may not set (host access policy, concept section 9
- * "Host access"): each variable of containerEnvironment (among them GH_CONFIG_DIR, so that no configuration moves the
- * GitHub CLI away from the sign-in of the owner account), and every other variable of the configuration of Git
- * (`GIT_CONFIG` and `GIT_CONFIG_*`, for example GIT_CONFIG_PARAMETERS, which Git applies after GIT_CONFIG_COUNT). In
- * `docker run`, a `-e` of runArgs comes after the containerEnv of the override configuration and replaces its value (a
- * `-e NAME` without a value removes it) for the main process of the container and `docker exec`. Compared without case
- * and surrounding spaces.
- */
-export function isContainerGitVariable(name: string): boolean {
-  const upper = name.trim().toUpperCase();
-  return /^GIT_CONFIG(_|$)/.test(upper) || Object.keys(containerEnvironment()).includes(upper);
-}
-
-/**
- * The variables of the GitHub CLI that choose its account or host (gh help environment): gh uses a token in GH_TOKEN,
- * GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, or GITHUB_ENTERPRISE_TOKEN instead of the sign-in in GH_CONFIG_DIR, and GH_HOST
- * makes it use another host than github.com.
- */
-export const GITHUB_CLI_ACCOUNT_VARIABLES: readonly string[] = [
-  'GH_TOKEN',
-  'GITHUB_TOKEN',
-  'GH_ENTERPRISE_TOKEN',
-  'GITHUB_ENTERPRISE_TOKEN',
-  'GH_HOST',
-];
-
-/** Plain-language reason of the refusal of a variable of GITHUB_CLI_ACCOUNT_VARIABLES. */
-export const GITHUB_CLI_ACCOUNT_REASON = 'the GitHub CLI would use it instead of the sign-in of the account that owns the environment';
-
-/**
- * True for the name of a variable of GITHUB_CLI_ACCOUNT_VARIABLES, which a configuration may not set either (host access
- * policy, concept section 9 "Host access"; like isContainerGitVariable in containerEnv, remoteEnv, and `-e`/`--env` of
- * runArgs): the GitHub CLI in the container is signed in only as the account that owns the environment (GH_CONFIG_DIR),
- * and nothing else decides who is signed in (user decision 2026-09-26). Compared without case and surrounding spaces. A
- * variable that the Dockerfile of the image sets with ENV is not part of any configuration and is not refused.
- */
-export function isGitHubCliAccountVariable(name: string): boolean {
-  return GITHUB_CLI_ACCOUNT_VARIABLES.includes(name.trim().toUpperCase());
-}
-
 /** user.name and user.email of the Git configuration of the container. */
 export interface GitIdentity {
   name: string;

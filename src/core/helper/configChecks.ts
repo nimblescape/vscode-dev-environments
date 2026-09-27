@@ -4,7 +4,7 @@
 
 // Checks of a devcontainer.json that the extension makes before it uses the configuration: whether it is a Docker Compose
 // configuration (implementation notes, section "Docker Compose") and `${localWorkspaceFolder}` (concept RK-10, implementation notes 7). Mounts of the computer
-// are refused by the host access policy, and its parser also gives the named volumes of an environment (hostAccess.ts,
+// are refused by the host access policy, and its parser also gives the named volumes of an environment (../policy/single.ts,
 // mountedVolumeNames).
 import { parseJsonc, stripJsonc } from '../jsonc';
 

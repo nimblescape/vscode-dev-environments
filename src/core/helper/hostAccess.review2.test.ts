@@ -7,7 +7,13 @@
 import { describe, expect, it } from 'vitest';
 import { HELPER_CACHE_VOLUME } from '../names';
 import { DEVCONTAINER_ID_PLACEHOLDER, helperCliVariables, substituteCliVariables } from './cliVariables';
-import { hostAccessClassification, hostAccessProblems, hostAccessReport, mountedVolumeNames, type HostAccessInput } from './hostAccess';
+import {
+  hostAccessClassification,
+  hostAccessProblems,
+  hostAccessReport,
+  mountedVolumeNames,
+  type HostAccessInput,
+} from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 const FOREIGN_NAME = 'devenv-other-abcdef12';

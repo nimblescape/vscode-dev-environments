@@ -44,7 +44,6 @@ import {
   type ComposeModelOutput,
   type ComposeRewriteParams,
 } from '../helper/compose';
-import { composeConfigurationReport, composeIgnoredProperties, composeMissingBuildPaths } from '../helper/composeAccess';
 import { environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import { checkConfiguration, type ConfigurationProblems } from '../helper/configChecks';
 import {
@@ -58,32 +57,7 @@ import {
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
-import {
-  foreignVolumeName,
-  imageIdItem,
-  imageUncheckedItem,
-  imageInvalidReferenceItem,
-  isValidImageReference,
-  imageReferenceFinding,
-  imageIdResolvedReferences,
-  type NamedImageReference,
-  imageLabelItems,
-  isOwnVolume,
-  isSameOwnerAdditionalVolume,
-  mountedVolumeNames,
-  removedRunArgs,
-  resolveNetworkReference,
-  runArgsNetworks,
-  truncated,
-  volumeLabelOwner,
-  MAX_ITEM_LENGTH,
-  capped,
-  type HostAccessInput,
-  type HostAccessReport,
-  type NetworkState,
-} from '../helper/hostAccess';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
-import { hostAccessChecks, type HostAccessChecks } from '../hostAccessChecks';
 import type { HelperFiles, WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   compareWithBuildRecord,
@@ -123,6 +97,36 @@ import {
   splitRepository,
 } from '../names';
 import { isAvailableTo, ownerOf } from '../ownership';
+import {
+  MAX_ITEM_LENGTH,
+  addRefusedItems,
+  capped,
+  cappedReport,
+  composeIgnoredProperties,
+  composeMissingBuildPaths,
+  describeRefusal,
+  foreignVolumeName,
+  hostAccessChecks,
+  imageLabelItems,
+  imageReferencesToInspect,
+  inspectedImageItems,
+  isOwnVolume,
+  isRefused,
+  isSameOwnerAdditionalVolume,
+  mountedVolumeNames,
+  removedRunArgs,
+  resolveNetworkReference,
+  runArgsNetworks,
+  truncated,
+  volumeLabelOwner,
+  withoutComposeIgnored,
+  type CheckStage,
+  type HostAccessChecks,
+  type HostAccessInput,
+  type HostAccessReport,
+  type NamedImageReference,
+  type NetworkState,
+} from '../policy';
 import {
   abortError,
   isAbortError,
@@ -329,8 +333,8 @@ export interface EnvironmentServiceDeps {
   /** For tests. Default: newEnvironmentId of names.ts. */
   newEnvironmentId?: () => string;
   /**
-   * Review round 8: runs the host access analysis of a configuration (hostAccessReport, composeAccessReport, and the
-   * FROM images of the Dockerfiles for the update check). The extension runs it in a worker thread with limits of time and memory
+   * Review round 8: runs the host access analysis of a configuration (checkContainer of the container policy, ../policy,
+   * and the FROM images of the Dockerfiles for the update check). The extension runs it in a worker thread with limits of time and memory
    * (WorkerConfigurationAnalyzer); a failed analysis refuses the configuration.
    */
   analyzer: ConfigurationAnalyzer;
@@ -683,23 +687,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A configuration without the properties that the Dev Container CLI ignores for Docker Compose (composeIgnoredProperties:
- * runArgs, appPort, workspaceMount, build.options): the host access policy does not refuse what has no effect.
- */
-function withoutComposeIgnored(config: Readonly<Record<string, unknown>>): Record<string, unknown> {
-  const result: Record<string, unknown> = { ...config };
-  delete result.runArgs;
-  delete result.appPort;
-  delete result.workspaceMount;
-  if (isRecord(result.build) && 'options' in result.build) {
-    const build = { ...result.build };
-    delete build.options;
-    result.build = build;
-  }
-  return result;
-}
-
-/**
  * The files of a helper run for the build model of a Docker Compose configuration: the model, and the Dockerfile of the
  * dev service.
  */
@@ -721,21 +708,6 @@ function isHostAccess(error: unknown): boolean {
 
 function otherAccount(repository: string): UserFacingError {
   return new UserFacingError('otherAccount', Messages.otherAccount(repository));
-}
-
-/** True if the host access policy refuses something of `report`. */
-function isRefused(report: HostAccessReport): boolean {
-  return report.hostAccess.length > 0 || report.unsupported.length > 0;
-}
-
-/** Both lists of a report, for the log. */
-function describeRefusal(report: HostAccessReport): string {
-  return [
-    report.hostAccess.length > 0 ? `access to the computer: ${report.hostAccess.join('; ')}` : undefined,
-    report.unsupported.length > 0 ? `not supported: ${report.unsupported.join('; ')}` : undefined,
-  ]
-    .filter((part) => part !== undefined)
-    .join(' / ');
 }
 
 /**
@@ -1358,11 +1330,7 @@ export class EnvironmentService {
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image. Review round 9 (S9-3): only when
     // the configuration is not refused already. `known`: the references that were asked already.
     const refuseUnlessAllowed = async (report: HostAccessReport, references: readonly NamedImageReference[]) => {
-      if (!isRefused(report)) {
-        for (const item of await this.imageIdItems(references, ctx.signal)) {
-          if (!report.unsupported.includes(item)) report.unsupported.push(item);
-        }
-      }
+      if (!isRefused(report)) addRefusedItems(report, 'unsupported', await this.imageIdItems(references, ctx.signal));
       if (isRefused(report)) {
         this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
         throw new HostAccessError(report);
@@ -1496,10 +1464,10 @@ export class EnvironmentService {
    * Step 5 for a Docker Compose configuration (implementation notes, section "Docker Compose"): devcontainer.json as the
    * CLI resolves it (`service`, `dockerComposeFile`, `runServices`), then the merged model of its compose files, read in
    * the workspace helper without the Docker socket, network, and the configuration folder of the container
-   * (WorkspaceHelper.composeModel). Concept section 9 "Host access", before any build: every service of the model
-   * (composeAccessReport) and the settings of devcontainer.json that Compose does not support (composeConfigurationReport),
-   * then devcontainer.json and its merged configuration with the rules of a single container (hostAccessReport, without
-   * the properties that the CLI ignores for Compose, composeIgnoredProperties). The merged configuration is read with our
+   * (WorkspaceHelper.composeModel). Concept section 9 "Host access", before any build: every service of the model and
+   * the settings of devcontainer.json that Compose does not support (checkContainer `composeModel`), then devcontainer.json
+   * and its merged configuration with the rules of a single container (checkContainer `configuration`, without the
+   * properties that the CLI ignores for Compose, withoutComposeIgnored). The merged configuration is read with our
    * copy of devcontainer.json, whose only compose file is our build model. The switch of the host access checks applies
    * as for a single container: with the checks off, only the items of the class `computer` are lifted.
    */
@@ -1536,7 +1504,6 @@ export class EnvironmentService {
       throw new HostAccessError({ hostAccess: [], unsupported });
     }
     ctx.compose = true;
-    const checksOn = ctx.hostAccessChecks === 'on';
     await this.requireVolume(env);
     const output = await helper.composeModel({
       volumeName: env.volumeName,
@@ -1581,7 +1548,7 @@ export class EnvironmentService {
     // the policy refuses (for example privileged mode) never counts as a plain error of the configuration, after which the
     // existing environment would start. The merged configuration follows below (it needs the read with our build model).
     // Review round 15 (K1, K2): `mounts` also as the Dev Container CLI writes them into its compose file (composeMounts).
-    const ownReport = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: withoutComposeIgnored(config), composeMounts: true }), checksOn);
+    const ownReport = await this.check(ctx, 'configuration', await this.hostAccessInput(env, { config: withoutComposeIgnored(config), composeMounts: true }), ctx.hostAccessChecks);
     if (isRefused(ownReport)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(ownReport)}`);
       throw new HostAccessError(ownReport);
@@ -1615,7 +1582,7 @@ export class EnvironmentService {
       ...(merged !== undefined ? { merged: withoutComposeIgnored(merged) } : {}),
       composeMounts: true,
     });
-    const report = await this.hostAccessReport(ctx, checked, checksOn);
+    const report = await this.check(ctx, 'configuration', checked, ctx.hostAccessChecks);
     if (isRefused(report)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
       throw new HostAccessError(report);
@@ -1638,10 +1605,10 @@ export class EnvironmentService {
   }
 
   /**
-   * The host access policy for the merged model of a Docker Compose configuration (composeAccessReport), with the
-   * labels of its named volumes now and the volumes of the environments of other accounts (hostAccessInput), and the
-   * settings of devcontainer.json that Compose does not support (composeConfigurationReport). With the switch of the
-   * check (LoadedCompose.hostAccessChecks).
+   * The container policy for the merged model of a Docker Compose configuration and the settings of devcontainer.json
+   * that Compose does not support (checkContainer `composeModel`), with the labels of its named volumes now and the
+   * volumes of the environments of other accounts (hostAccessInput), and the image references that Docker resolves by
+   * the ID of an image (imageIdItems, cappedReport). With the switch of the check (LoadedCompose.hostAccessChecks).
    */
   private async composeReport(
     ctx: PipelineContext,
@@ -1674,20 +1641,10 @@ export class EnvironmentService {
       ...(compose.output.missing !== undefined ? { missing: compose.output.missing } : {}),
       },
     });
-    const model = analysis.report;
-    const configuration = composeConfigurationReport(config);
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
     // Review round 9 (S9-3): only when the configuration is not refused already.
-    const ids = isRefused(model) || isRefused(configuration) ? [] : await this.imageIdItems(analysis.imageReferences, ctx.signal);
-    // Review round 17 (P17-3): each list at most MAX_LISTED_ITEMS, each item at most MAX_ITEM_LENGTH characters, after
-    // the merge and without duplicates (a model with hundreds of services would otherwise make a message of megabytes).
-    return {
-      report: {
-        hostAccess: capped([...new Set([...configuration.hostAccess, ...model.hostAccess])]),
-        unsupported: capped([...new Set([...configuration.unsupported, ...model.unsupported, ...ids])]),
-      },
-      references: analysis.references,
-    };
+    const ids = isRefused(analysis.report) ? [] : await this.imageIdItems(analysis.imageReferences, ctx.signal);
+    return { report: cappedReport(analysis.report, ids), references: analysis.references };
   }
 
   /**
@@ -1707,9 +1664,9 @@ export class EnvironmentService {
     return result;
   }
 
-  /** hostAccessReport of `input` in the analyzer (analyze). */
-  private async hostAccessReport(ctx: PipelineContext, input: HostAccessInput, checksOn: boolean): Promise<HostAccessReport> {
-    return (await this.analyze(ctx, { kind: 'hostAccess', input, checksOn })).report;
+  /** checkContainer of the container policy at `stage`, with the switch `checks`, in the analyzer (analyze). */
+  private async check(ctx: PipelineContext, stage: Exclude<CheckStage, 'composeModel'>, input: HostAccessInput, checks: HostAccessChecks): Promise<HostAccessReport> {
+    return (await this.analyze(ctx, { kind: 'hostAccess', stage, input, checksOn: checks === 'on' })).report;
   }
 
   /**
@@ -1728,15 +1685,7 @@ export class EnvironmentService {
    * transient (which are logged, never turned into items); AnalysisFailedError only when there is no definitive item.
    */
   private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
-    const named: NamedImageReference[] = [];
-    const invalid: string[] = [];
-    const seen = new Set<string>();
-    for (const entry of references) {
-      if (seen.has(`${entry.what} ${entry.reference}`) || imageReferenceFinding(entry.reference, entry.what) !== undefined) continue;
-      seen.add(`${entry.what} ${entry.reference}`);
-      if (isValidImageReference(entry.reference)) named.push(entry);
-      else invalid.push(imageInvalidReferenceItem(entry.reference, entry.what));
-    }
+    const { named, invalid } = imageReferencesToInspect(references);
     // Review round 13 (P13-1): the configuration is refused for them anyway (like the isRefused short-circuit of the
     // callers): no inspect, so that no failure of Docker for another reference hides the refusal.
     // Review round 17 (P17-3): at most MAX_LISTED_ITEMS items, each at most MAX_ITEM_LENGTH characters (capped).
@@ -1762,19 +1711,8 @@ export class EnvironmentService {
       return { images: [], unchecked: distinct.map((reference) => ({ reference, reason: 'transient' as const })) };
     });
     this.throwIfCancelled(signal);
-    const transient = unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference);
-    // Review round 14 (P14-2): the ID test only over the references with a definitive answer: a transient one was never
-    // inspected, so the images of the others (a batch before the failure) say nothing about it (for example `cafe`, with
-    // a local cafe:latest, and another image whose ID starts with cafe). It takes the transient path below.
-    const transientSet = new Set(transient);
-    const byId = new Set(imageIdResolvedReferences(distinct.filter((reference) => !transientSet.has(reference)), images));
-    // Review round 13 (P13-1): only a definitive answer (`invalid`) becomes an item; a transient one never does.
-    const notChecked = new Set(unchecked.filter((entry) => entry.reason === 'invalid').map((entry) => entry.reference));
-    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${capped([...notChecked]).join(', ')}.`);
-    const items = named.flatMap((entry) => [
-      ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
-      ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
-    ]);
+    const { items, transient, notChecked } = inspectedImageItems(named, images, unchecked);
+    if (notChecked.length > 0) this.logger.warn(`Docker could not inspect the image references ${capped(notChecked).join(', ')}.`);
     if (transient.length > 0) {
       const shown = transient.slice(0, 5).map((reference) => truncated(reference, MAX_ITEM_LENGTH)).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
       // Review round 13 (P13-1): a definitive refusal is not hidden by a failure of Docker for another reference: the
@@ -2579,7 +2517,6 @@ export class EnvironmentService {
       const list = removed.map((entry) => `${entry.arg} (${entry.reason})`).join(', ');
       this.logger.info(`Removed from the runArgs of ${env.repository}: ${list}.`);
     }
-    const checksOn = ctx.hostAccessChecks === 'on';
     const override = buildOverrideConfig({
       environmentImage: image,
       volumeName: env.volumeName,
@@ -2596,7 +2533,7 @@ export class EnvironmentService {
     // returned them; the CLI substitutes both again at `up`, hotfix review 1).
     let finalRunArgs: HostAccessReport;
     try {
-      finalRunArgs = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: { runArgs: override.runArgs, appPort: override.appPort }, overrideConfiguration: true }), checksOn);
+      finalRunArgs = await this.check(ctx, 'finalRunArgs', await this.hostAccessInput(env, { config: { runArgs: override.runArgs, appPort: override.appPort } }), ctx.hostAccessChecks);
     } catch (error) {
       // Review round 9 (P9-2): `up` only starts the existing container, which passed the check when it was created, and
       // applies no runArgs: an analysis that could not run does not keep it from starting.
@@ -2740,7 +2677,7 @@ export class EnvironmentService {
         throw new HostAccessError(report);
       }
       const serviceLabels = await this.serviceImageLabelItems(ctx, compose);
-      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks === 'on', labels, serviceLabels, true);
+      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks, labels, serviceLabels, true);
     }
     // Review round 1 (P-2): also when `up` only adds containers (a service that the model gained, after a "Rebuild
     // later"): Compose would refuse an external volume that does not exist. Only the missing ones are created.
@@ -3281,7 +3218,7 @@ export class EnvironmentService {
   private async checkImageHostAccess(ctx: PipelineContext, image: string): Promise<string[]> {
     const { metadata, labels } = await this.imageMetadataAndLabels(image, ctx.signal);
     // The same switch as the check of the configuration (read at the start of this open).
-    return this.checkMetadataHostAccess(ctx, image, metadata, ctx.hostAccessChecks === 'on', labels);
+    return this.checkMetadataHostAccess(ctx, image, metadata, ctx.hostAccessChecks, labels);
   }
 
   /** The entries of the label devcontainer.metadata of `image` (none when it has no valid label). */
@@ -3318,15 +3255,14 @@ export class EnvironmentService {
     ctx: PipelineContext,
     image: string,
     metadata: readonly unknown[],
-    checksOn: boolean,
+    checks: HostAccessChecks,
     labels: Readonly<Record<string, string>> = {},
     moreItems: readonly string[] = [],
     composeMounts = false,
   ): Promise<string[]> {
     // Review round 15 (K1, K2): for Docker Compose, the `mounts` of the metadata also as the CLI writes them (composeMounts).
     const checked = await this.hostAccessInput(ctx.env, { metadata, ...(composeMounts ? { composeMounts: true } : {}) });
-    const report = await this.hostAccessReport(ctx, checked, checksOn);
-    for (const item of [...imageLabelItems(image, labels), ...moreItems]) if (!report.hostAccess.includes(item)) report.hostAccess.push(item);
+    const report = addRefusedItems(await this.check(ctx, 'imageMetadata', checked, checks), 'hostAccess', [...imageLabelItems(image, labels), ...moreItems]);
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);

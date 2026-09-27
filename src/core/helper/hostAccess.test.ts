@@ -15,10 +15,11 @@ import {
   resourceName,
 } from '../names';
 import { helperCliVariables, mayBeSetInHelper, substituteCliVariables, unresolvedCliVariables } from './cliVariables';
-import { GITHUB_CLI_ACCOUNT_REASON, containerEnvironment, remoteEnvironment } from './containerGit';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
 import { runAnalysisJob } from './configurationAnalysis';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
+  GITHUB_CLI_ACCOUNT_REASON,
   MAX_LISTED_ITEMS,
   MAX_STOP_TIMEOUT_SECONDS,
   buildOptionProblems,
@@ -52,7 +53,7 @@ import {
   withoutNameArgs,
   type HostAccessInput,
   type HostAccessReport,
-} from './hostAccess';
+} from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 

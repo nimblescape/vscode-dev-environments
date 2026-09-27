@@ -9,9 +9,14 @@ import { collectReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
 import { composeReferences, type ComposeModel } from './compose';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
-import { composeAccessReport, composeImageReferences, type ComposeAccessInput } from './composeAccess';
 import { runAnalysisJob } from './configurationAnalysis';
-import { singleImageReferences, type HostAccessReport } from './hostAccess';
+import {
+  composeAccessReport,
+  composeImageReferences,
+  singleImageReferences,
+  type ComposeAccessInput,
+  type HostAccessReport,
+} from '../policy';
 
 const PROJECT = 'devenv-3f2a9c1e';
 const REPO = '/workspaces/api';

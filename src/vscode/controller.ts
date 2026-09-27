@@ -12,7 +12,7 @@ import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import { removeContainerToken } from '../core/helper/containerToken';
-import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
+import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';

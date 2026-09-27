@@ -10,8 +10,7 @@ import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import { composeAccessReport, type ComposeAccessInput } from './composeAccess';
-import type { HostAccessReport } from './hostAccess';
+import { composeAccessReport, type ComposeAccessInput, type HostAccessReport } from '../policy';
 
 const PROJECT = 'devenv-3f2a9c1e';
 const REPO = '/workspaces/api';

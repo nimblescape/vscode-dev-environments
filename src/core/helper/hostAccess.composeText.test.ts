@@ -12,7 +12,7 @@ import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import { containerEnvironment } from './containerGit';
-import { hostAccessReport, type HostAccessInput } from './hostAccess';
+import { hostAccessReport, type HostAccessInput } from '../policy';
 
 const OWN = 'devenv-api-12345678';
 type Where = 'config' | 'merged' | 'metadata';

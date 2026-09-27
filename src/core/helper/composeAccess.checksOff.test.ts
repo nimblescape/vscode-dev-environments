@@ -9,9 +9,14 @@
 // clear) and `unsupported` stay refused whatever the switch says.
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from './compose';
-import { composeAccessClassification, composeAccessReport, composeMissingBuildPaths, type ComposeAccessInput } from './composeAccess';
-import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
-import type { HostAccessClass } from './hostAccess';
+import {
+  composeAccessClassification,
+  composeAccessReport,
+  composeMissingBuildPaths,
+  GITHUB_CLI_ACCOUNT_REASON,
+  type ComposeAccessInput,
+  type HostAccessClass,
+} from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';

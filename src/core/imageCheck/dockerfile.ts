@@ -33,7 +33,7 @@ export const SHELL_NAME = /^(?:\p{Nd}+|[@*#?\-$!]|[\p{L}_][\p{L}\p{Nd}_]*)/u;
 const isArgName = (name: string): boolean => name !== '';
 /**
  * Review round 6 (S6-1): the longest image reference that the update check reads; a longer one is skipped. Docker's own
- * limit for a name is 255. The check of an image reference of the configuration (imageReferenceFinding of hostAccess.ts)
+ * limit for a name is 255. The check of an image reference of the configuration (imageReferenceFinding of ../policy/images.ts)
  * refuses a longer one.
  */
 export const MAX_REFERENCE_LENGTH = 1024;

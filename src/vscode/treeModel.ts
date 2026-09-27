@@ -6,7 +6,7 @@
 // `vscode`, so the rules for rows, states, actions, and sorting are unit-tested; treeView.ts only maps the model to
 // tree items.
 import { filterRepositories } from '../core/discovery/discoveryService';
-import { hostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
+import { hostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { formatChanges, Messages, StateTexts } from '../core/messages';
 import { configurationName } from '../core/names';
 import type {

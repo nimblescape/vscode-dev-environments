@@ -6,12 +6,12 @@
 // `docker compose config --format json` prints in the workspace helper (COMPOSE_MODEL_SCRIPT), and the model that the
 // Dev Container CLI runs, which is our rewrite of exactly the checked model (composeUpModel, composeBuildModel): the
 // repository's compose files are read once, by the check, so nothing can change between the check and `up`. The rules
-// of the check are in composeAccess.ts; the mounts and ports are decided by the same functions here for both.
-// Pure functions, no I/O.
+// of the check are in the container policy (../policy/compose.ts); the mounts and ports of each service are decided by
+// the same functions of the policy for both (decideServiceMount, decideServicePort in ../policy/rewrites.ts). The model
+// types and names are in ./composeModel.ts (re-exported here). Pure functions, no I/O.
 import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ConfigReferences } from '../imageCheck/imageCheck';
-import type { HostAccessChecks } from '../hostAccessChecks';
 import { buildArgumentTexts, extractBaseImages } from '../imageCheck/dockerfile';
 import { hasDigest, isOciFeatureReference } from '../imageCheck/reference';
 import {
@@ -29,34 +29,46 @@ import {
   isConfigPathLabelValue,
 } from '../names';
 import {
-  isDockerNetworkMode,
-  configFolderMountItem,
-  configFolderTarget,
-  isHelperPath,
-  isLoopbackAddress,
-  isOtherEnvironmentProjectName,
-  isPathSource,
-  isSharedPropagation,
   MAX_STOP_TIMEOUT_SECONDS,
+  decideServiceMount,
+  decideServicePort,
+  isDockerNetworkMode,
+  isPathSource,
   parseMountString,
-  sharedPropagationItem,
-  splitPortAddress,
-  tokenPropagationTarget,
-  withLoopbackAddress,
-} from './hostAccess';
+  type ComposeEntryDecision,
+  type ComposeMountContext,
+  type HostAccessChecks,
+} from '../policy';
 import { MAX_ANALYSIS_JOB_CHARACTERS, MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES, MAX_COMPOSE_TOP_LEVEL_ENTRIES } from './analysisLimits';
+import {
+  WORKSPACE_VOLUME_KEY,
+  composeNetworkNames,
+  composeVolumeNames,
+  durationSeconds,
+  type ComposeModel,
+  type ComposeService,
+} from './composeModel';
 import { OVERRIDE_FOLDER } from './scripts';
 
-/** A service of the merged model (`services.<name>`), as `docker compose config --format json` prints it. */
-export type ComposeService = Record<string, unknown>;
+// The model types and names (./composeModel.ts), for the callers of this module.
+export {
+  MIN_COMPOSE_VERSION,
+  MIN_SUBPATH_API_VERSION,
+  MIN_SUBPATH_ENGINE,
+  WORKSPACE_VOLUME_KEY,
+  composeNetworkNames,
+  composeVolumeNames,
+  durationSeconds,
+  isSupportedComposeVersion,
+  supportsVolumeSubpath,
+  type ComposeModel,
+  type ComposeNetworkName,
+  type ComposeService,
+  type ComposeVolumeName,
+} from './composeModel';
 
-/** The merged model of a Compose configuration (`docker compose config --format json`). */
-export interface ComposeModel {
-  name?: string;
-  services: Record<string, ComposeService>;
-  volumes?: Record<string, Record<string, unknown> | null>;
-  networks?: Record<string, Record<string, unknown> | null>;
-  [key: string]: unknown;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** The model that we write for the Dev Container CLI: the only compose file of `read-configuration`, `build`, and `up`. */
@@ -68,57 +80,6 @@ export const COMPOSE_BUILD_CONTEXT = `${OVERRIDE_FOLDER}/context`;
  * file of the repository), its `dockerfile_inline`, or the synthesized `FROM <image>`.
  */
 export const COMPOSE_DEV_DOCKERFILE = `${OVERRIDE_FOLDER}/dev.Dockerfile`;
-/** Key of the workspace volume in the top-level `volumes` of our model. The check refuses it in a repository. */
-export const WORKSPACE_VOLUME_KEY = 'devenv-workspace';
-
-/**
- * The oldest Compose plugin with the YAML tags `!reset` (2.24.0) and `!override` (2.24.4): the fallback of the
- * implementation notes (the repository's files plus one file of ours) needs them. The helper installs the current plugin.
- */
-export const MIN_COMPOSE_VERSION = '2.24.4';
-
-/**
- * The oldest Docker Engine API with `volume.subpath` (API 1.45, Docker Engine 26): a bind mount of repository files is
- * rewritten to a subpath of the workspace volume only with this engine or a newer one.
- */
-export const MIN_SUBPATH_API_VERSION = '1.45';
-/** The Docker Engine version of MIN_SUBPATH_API_VERSION, for the messages. */
-export const MIN_SUBPATH_ENGINE = 'Docker Engine 26';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** The numeric parts of a version text (`v2.29.1-desktop.1` → [2, 29, 1]); `undefined` when it starts otherwise. */
-function versionParts(version: string): number[] | undefined {
-  const match = /^v?(\d+(?:\.\d+)*)/.exec(version.trim());
-  return match ? match[1].split('.').map(Number) : undefined;
-}
-
-/** Whether version `a` is `b` or newer (missing parts count as 0). */
-function atLeast(a: readonly number[], b: readonly number[]): boolean {
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const x = a[i] ?? 0;
-    const y = b[i] ?? 0;
-    if (x !== y) return x > y;
-  }
-  return true;
-}
-
-/** Whether the version of the Compose plugin (`docker compose version --short`) is MIN_COMPOSE_VERSION or newer. */
-export function isSupportedComposeVersion(version: string): boolean {
-  const parts = versionParts(version);
-  return parts !== undefined && atLeast(parts, versionParts(MIN_COMPOSE_VERSION)!);
-}
-
-/**
- * Whether the Docker Engine API version (`docker version --format '{{.Server.APIVersion}}'`) has `volume.subpath`
- * (MIN_SUBPATH_API_VERSION). `false` when it is not known.
- */
-export function supportsVolumeSubpath(apiVersion: string | undefined): boolean {
-  const parts = apiVersion === undefined ? undefined : versionParts(apiVersion);
-  return parts !== undefined && atLeast(parts, versionParts(MIN_SUBPATH_API_VERSION)!);
-}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The compose files of a configuration
@@ -309,51 +270,6 @@ export function composeServiceImage(project: string, service: string): string {
   return `${project}-${name || 'service'}`;
 }
 
-export { isOtherEnvironmentProjectName };
-
-/** A named volume of the top-level `volumes` of a model. */
-export interface ComposeVolumeName {
-  /** The key in the model. */
-  key: string;
-  /** The name of the volume in Docker. */
-  name: string;
-  /** A volume of the project (`<project>_<key>`): its kind is VOLUME_KIND_COMPOSE; other named volumes are `additional`. */
-  project: boolean;
-}
-
-/** The Docker name of the top-level volume `key`: its `name`, the key of an external volume, or `<project>_<key>`. */
-function volumeNameOf(key: string, volume: Record<string, unknown> | null | undefined, project: string): string {
-  if (isRecord(volume) && typeof volume.name === 'string' && volume.name !== '') return volume.name;
-  if (isRecord(volume) && volume.external) return key;
-  return `${project}_${key}`;
-}
-
-/**
- * The named volumes of the top-level `volumes` of the model, with their Docker names: the volumes that the pipeline
- * creates before `up` with the labels of the environment (all of them are external in our model) and whose labels the
- * check reads.
- */
-export function composeVolumeNames(model: ComposeModel, project: string): ComposeVolumeName[] {
-  const volumes = isRecord(model.volumes) ? model.volumes : {};
-  return Object.entries(volumes).map(([key, volume]) => {
-    const name = volumeNameOf(key, volume, project);
-    const external = isRecord(volume) && Boolean(volume.external);
-    return { key, name, project: !external && name === `${project}_${key}` };
-  });
-}
-
-/** A network of the top-level `networks` of a model, with its Docker name. */
-export interface ComposeNetworkName {
-  key: string;
-  name: string;
-}
-
-/** The Docker names of the top-level networks of the model: `name`, the key of an external network, or `<project>_<key>`. */
-export function composeNetworkNames(model: ComposeModel, project: string): ComposeNetworkName[] {
-  const networks = isRecord(model.networks) ? model.networks : {};
-  return Object.entries(networks).map(([key, network]) => ({ key, name: volumeNameOf(key, network, project) }));
-}
-
 /**
  * The networks of the model that may exist before `up` and whose labels and containers the check reads (S2): the
  * top-level networks (composeNetworkNames) and each network that a `network_mode` names (not a mode of Docker such as
@@ -529,200 +445,6 @@ export function composeUserArgs(service: ComposeService | undefined): string[] {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Mounts and ports of a service (shared by the check and the rewrite)
-
-/**
- * What happens to a mount or a published port of a service. A refusal of the kind `hostAccess` is access to the computer
- * (HostAccessClass `computer`, lifted while the host access checks are off), unless `guarded` says that it stays refused
- * whatever the switch says (HostAccessClass `protected`: the workspace volume with the GitHub token, and a path whose
- * target is not clear).
- */
-export type ComposeEntryDecision =
-  | { action: 'keep' }
-  | { action: 'drop'; reason: string }
-  /**
-   * `createFolder` (review round 8, P8-2): the source is a folder of the repository that does not exist yet; the pipeline
-   * creates it in the workspace volume before `up` (composeUpModel's `createFolders`).
-   */
-  | { action: 'replace'; value: unknown; reason: string; createFolder?: string }
-  | { action: 'refuse'; kind: 'hostAccess' | 'unsupported'; item: string; guarded?: true };
-
-/** What decides the mounts of a service. */
-export interface ComposeMountContext {
-  /** The dev service gets the workspace volume at WORKSPACES_ROOT; the other services may not mount it. */
-  isDev: boolean;
-  /** The folder of the repository in the helper, for example `/workspaces/api`. */
-  repositoryFolder: string;
-  /** The top-level volumes of the model: key → Docker name. */
-  volumeNames: ReadonlyMap<string, string>;
-  /** The workspace volume of the environment. */
-  ownVolume: string;
-  /** The Docker Engine API version (supportsVolumeSubpath); `undefined` when it is not known. */
-  engineApiVersion?: string;
-  /** ComposeModelOutput.realPaths; without it, links are not checked. */
-  realPaths?: Readonly<Record<string, string | null>>;
-  /** ComposeModelOutput.mountAncestors (review round 8, P8-2). */
-  mountAncestors?: Readonly<Record<string, string | null>>;
-}
-
-function isInside(file: string, folder: string): boolean {
-  return file === folder || file.startsWith(`${folder}/`);
-}
-
-function normalizedTarget(target: unknown): string | undefined {
-  if (typeof target !== 'string' || target === '') return undefined;
-  const normal = path.posix.normalize(target);
-  return normal.length > 1 ? normal.replace(/\/+$/, '') : normal;
-}
-
-/**
- * A mount of the `volumes` of a service (long syntax of `docker compose config`):
- * - `tmpfs` and anonymous volumes: kept; a named volume: kept (its name is checked with the top-level volumes), except
- *   the workspace volume in a service other than the dev service (it holds the GitHub token);
- * - a bind mount of the dev service at WORKSPACES_ROOT whose source is the repository folder or its parent (the
- *   templates' `../..:/workspaces`): dropped, the workspace volume takes its place;
- * - a bind mount of the dev service whose source is the parent of the repository folder, at another target: the
- *   workspace volume at that target;
- * - a bind mount whose source is in the repository folder (lexically, and, with `realPaths`, also after links): the
- *   workspace volume with `volume.subpath` (Docker Engine 26, API 1.45; refused with an older or unknown engine) and
- *   `nocopy` (so the content of the image never lands in the repository), read-only as before;
- * - every other bind mount, and the types npipe, cluster, and image: refused;
- * - in the dev service, any other mount at WORKSPACES_ROOT: refused (the workspace volume is mounted there);
- * - review round 14 (S14-1): in the dev service, any mount at or below CONFIG_FOLDER (configFolderTarget): refused as not
- *   supported (the token and the Git configuration of the extension are there, and its ownership fix walks the folder in
- *   full). The other services do not have the folder (they cannot mount the workspace volume), so their targets there
- *   stay allowed;
- * - review of unit 15: in the dev service, `bind.propagation` shared or rshared at `/` or a parent of the tmpfs of the
- *   token (tokenPropagationTarget): refused whatever the switch says (it would bring the token to the computer).
- */
-export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): ComposeEntryDecision {
-  if (!isRecord(entry)) return { action: 'refuse', kind: 'unsupported', item: `volume ${JSON.stringify(entry)}` };
-  const type = typeof entry.type === 'string' ? entry.type : 'volume';
-  const target = normalizedTarget(entry.target);
-  const source = typeof entry.source === 'string' ? entry.source : '';
-  const describe = `${source || '(anonymous)'} → ${String(entry.target)}`;
-  const atWorkspaces = ctx.isDev && target === WORKSPACES_ROOT;
-  if (target === undefined) return { action: 'refuse', kind: 'unsupported', item: `volume ${describe} without a target` };
-  // Review round 14 (S14-1): only the dev container has the folder (the other services cannot mount the workspace volume).
-  const internal = ctx.isDev ? configFolderTarget(target) : undefined;
-  if (internal !== undefined) return { action: 'refuse', kind: 'unsupported', item: configFolderMountItem(internal) };
-  // Review of unit 15: a shared propagation where the tmpfs of the token would reach the computer, whatever the switch
-  // says (tokenPropagationTarget).
-  const propagation = isRecord(entry.bind) && typeof entry.bind.propagation === 'string' ? entry.bind.propagation : undefined;
-  const shared = ctx.isDev && propagation !== undefined && isSharedPropagation(propagation) ? tokenPropagationTarget(target) : undefined;
-  if (shared !== undefined) return { action: 'refuse', kind: 'hostAccess', item: sharedPropagationItem(shared), guarded: true };
-  if (type === 'tmpfs') {
-    return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'keep' };
-  }
-  if (type === 'volume') {
-    if (atWorkspaces) return { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` };
-    if (source === '') return { action: 'keep' };
-    const name = ctx.volumeNames.get(source);
-    if (name === undefined) return { action: 'refuse', kind: 'unsupported', item: `volume ${source} (not in the top-level volumes)` };
-    if (name === ctx.ownVolume && !ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `volume ${name} (the workspace volume, with the repository and the Git configuration of the environment)`, guarded: true };
-    }
-    return { action: 'keep' };
-  }
-  if (type !== 'bind') return { action: 'refuse', kind: 'unsupported', item: `mount of the type ${type} (${describe})` };
-  if (!source.startsWith('/')) {
-    return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
-  }
-  const lexical = path.posix.normalize(source).replace(/(.)\/+$/, '$1');
-  const parent = WORKSPACES_ROOT;
-  const repository = ctx.repositoryFolder;
-  const readOnly = entry.read_only === true;
-  if (atWorkspaces && (lexical === repository || lexical === parent)) {
-    return { action: 'drop', reason: 'the workspace volume is mounted there' };
-  }
-  // Any other folder at WORKSPACES_ROOT of the dev service, also one that the host access checks off would allow: the
-  // workspace volume is mounted there.
-  if (atWorkspaces) return { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` };
-  if (lexical === parent) {
-    if (!ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (the workspace volume, with the repository and the Git configuration of the environment)`, guarded: true };
-    }
-    const value: Record<string, unknown> = { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: entry.target };
-    if (readOnly) value.read_only = true;
-    return { action: 'replace', value, reason: 'the workspace volume in place of the folder' };
-  }
-  if (!isInside(lexical, repository)) return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe}` };
-  let createFolder: string | undefined;
-  if (ctx.realPaths && Object.prototype.hasOwnProperty.call(ctx.realPaths, source)) {
-    const real = ctx.realPaths[source];
-    if (real === null) {
-      // Review round 8 (P8-2): a folder of the repository that does not exist yet (for example a data folder in
-      // .gitignore), which Docker would create (`create_host_path`): created in the workspace volume before `up`, when the
-      // nearest folder above it that exists is in the repository after links (ComposeModelOutput.mountAncestors).
-      const ancestor = ctx.mountAncestors !== undefined && Object.prototype.hasOwnProperty.call(ctx.mountAncestors, source) ? ctx.mountAncestors[source] : undefined;
-      const bind = isRecord(entry.bind) ? entry.bind : {};
-      if (typeof ancestor !== 'string' || bind.create_host_path === false) {
-        return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (the path does not exist in the repository)` };
-      }
-      if (!isInside(ancestor, repository) || isHelperPath(ancestor, repository)) {
-        return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${ancestor}, outside of the repository)`, guarded: true };
-      }
-      createFolder = lexical;
-    } else if (!isInside(real, repository)) {
-      // A subpath of the workspace volume that a link leads out of the repository, for example to the GitHub token: not clear.
-      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (a link to ${real}, outside of the repository)`, guarded: true };
-    }
-  }
-  if (ctx.engineApiVersion === undefined) {
-    // Review round 1 (P-5): an engine that did not tell its version is not an old engine.
-    return {
-      action: 'refuse',
-      kind: 'unsupported',
-      item: `bind mount ${describe} (needs ${MIN_SUBPATH_ENGINE} or newer; the version of the Docker Engine could not be read)`,
-    };
-  }
-  if (!supportsVolumeSubpath(ctx.engineApiVersion)) {
-    return { action: 'refuse', kind: 'unsupported', item: `bind mount ${describe} (needs ${MIN_SUBPATH_ENGINE} or newer)` };
-  }
-  const subpath = path.posix.relative(parent, lexical);
-  const value: Record<string, unknown> = {
-    type: 'volume',
-    source: WORKSPACE_VOLUME_KEY,
-    target: entry.target,
-    volume: { nocopy: true, subpath },
-  };
-  if (readOnly) value.read_only = true;
-  if (createFolder !== undefined) {
-    return {
-      action: 'replace',
-      value,
-      reason: `the folder ${subpath} of the workspace volume, created in the repository before the start (the service can read and change these files of the repository)`,
-      createFolder,
-    };
-  }
-  return { action: 'replace', value, reason: `the folder ${subpath} of the workspace volume (the service can read and change these files of the repository)` };
-}
-
-/**
- * A published port of a service: without an address (`host_ip` missing or empty) it is published on 127.0.0.1 only;
- * a loopback address is kept; any other address is refused (concept section 9: ports reach the computer only on
- * localhost). The long syntax of `docker compose config` is an object; a text (short syntax) is read as `-p`.
- */
-export function decideServicePort(entry: unknown): ComposeEntryDecision {
-  const reason = 'published on 127.0.0.1 only';
-  if (typeof entry === 'string' || typeof entry === 'number') {
-    const text = String(entry).trim();
-    if (text.includes('=')) return { action: 'refuse', kind: 'unsupported', item: `published port ${text}` };
-    const { address } = splitPortAddress(text);
-    if (address === undefined || address === '') return { action: 'replace', value: withLoopbackAddress(text), reason };
-    return isLoopbackAddress(address) ? { action: 'keep' } : { action: 'refuse', kind: 'hostAccess', item: `published port ${text}` };
-  }
-  if (!isRecord(entry)) return { action: 'refuse', kind: 'unsupported', item: `published port ${JSON.stringify(entry)}` };
-  const hostIp = entry.host_ip;
-  if (hostIp === undefined || hostIp === null || hostIp === '') {
-    return { action: 'replace', value: { ...entry, host_ip: '127.0.0.1' }, reason };
-  }
-  if (typeof hostIp === 'string' && isLoopbackAddress(hostIp)) return { action: 'keep' };
-  const published = entry.published === undefined || entry.published === null ? '' : String(entry.published);
-  return { action: 'refuse', kind: 'hostAccess', item: `published port ${String(hostIp)}:${published}:${String(entry.target)}` };
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
 // The model that runs
 
 /** What the rewrite needs to know about the environment. */
@@ -758,7 +480,7 @@ export interface ComposeRewriteParams {
    */
   mountVolumeSources?: readonly string[];
   /**
-   * The switch of the host access checks of the repository (../hostAccessChecks.ts), as the check used it. `off`: the
+   * The switch of the host access checks of the repository (../policy/hostAccessChecks.ts), as the check used it. `off`: the
    * published ports keep the address that the model gives them, the mounts that only the class `computer` refuses stay
    * as they are, and every container gets the label devenv.host-access=unrestricted (containerIsCurrent); with the checks
    * on, `checked`. Default `on`.
@@ -784,16 +506,6 @@ export interface ComposeModelRewrite {
   rewrites: ComposeRewrite[];
 }
 
-/** A Go duration (`20s`, `1m30s`, `500ms`) in seconds; `undefined` when it is none. */
-export function durationSeconds(value: unknown): number | undefined {
-  if (typeof value === 'number') return value;
-  if (typeof value !== 'string' || !/^(\d+(\.\d+)?(h|m|s|ms|us|µs|ns))+$/.test(value.trim())) return undefined;
-  const factors: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, µs: 1e-6, ns: 1e-9 };
-  let seconds = 0;
-  for (const match of value.trim().matchAll(/(\d+(?:\.\d+)?)(h|ms|m|s|us|µs|ns)/g)) seconds += Number(match[1]) * factors[match[2]];
-  return seconds;
-}
-
 /** The model is our rewrite of a model that the check refused: the pipeline checks before it rewrites. */
 function notChecked(item: string): Error {
   return new Error(`The Compose model has a setting that the host access policy refuses: ${item}`);
@@ -809,7 +521,6 @@ export function escapeComposeDollars(value: unknown): unknown {
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, escapeComposeDollars(entry)]));
   return value;
 }
-
 
 /** Labels in the map form (`docker compose config` prints a map; a list `KEY=value` is read too). */
 function labelMap(labels: unknown): Record<string, string> {

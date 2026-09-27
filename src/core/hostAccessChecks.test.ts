@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { hostAccessChecks, isRepositoryEntry, parseHostAccessChecksOff, withHostAccessChecks } from './hostAccessChecks';
+import { hostAccessChecks, isRepositoryEntry, parseHostAccessChecksOff, withHostAccessChecks } from './policy';
 
 describe('the setting devEnvLauncher.hostAccessChecksOff (concept section 8)', () => {
   it.each<[string, unknown, string[], string[]]>([

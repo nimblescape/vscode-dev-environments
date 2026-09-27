@@ -5,7 +5,7 @@
 // Hotfix review 3, C3-2: the items of a refusal are bounded in length, not only in number.
 import { describe, expect, it } from 'vitest';
 import { helperCliVariables } from './cliVariables';
-import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS, hostAccessProblems, hostAccessReport, truncated } from './hostAccess';
+import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS, hostAccessProblems, hostAccessReport, truncated } from '../policy';
 
 const OWN = 'devenv-acme-api-3f2a9c1e';
 const variables = helperCliVariables('acme/api');
