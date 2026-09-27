@@ -19,7 +19,7 @@ export type ProgressStep = keyof typeof Steps;
 export const Messages = {
   dockerNotInstalled: 'Docker Desktop is not installed.',
   dockerStartFailed: 'Docker could not be started.',
-  dockerEngineNotRunning: 'Docker is not running. Start the Docker service with this command: sudo systemctl start docker',
+  dockerEngineNotRunning: 'Docker is not running. Start the Docker service with this command: sudo systemctl enable --now docker',
   buildFailed: 'The environment could not be prepared.',
   registryUnreachable:
     'No connection to the image registry. The update check was skipped. The environment uses the local image.',
@@ -147,8 +147,11 @@ export const Messages = {
 } as const;
 
 export const Actions = {
-  /** Opens the walkthrough "Set up Docker for Dev Environments" (command devEnvironments.installDocker). */
+  /** Shows the sidebar view with the steps of the Docker setup (action of the error dockerNotInstalled). */
   installDocker: 'Install Docker…',
+  /** Starts Docker Engine on Linux with `sudo systemctl enable --now docker` in a terminal, after a confirmation (action
+   *  of the error dockerEngineNotRunning). */
+  startDocker: 'Start Docker',
   showDetails: 'Show details',
   tryAgain: 'Try again',
   signIn: 'Sign in',

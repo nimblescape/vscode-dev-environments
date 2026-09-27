@@ -3,20 +3,20 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Docker setup (concept 6.1 step 2, implementation notes 6 "Installation plan"): how Docker is installed on this
-// computer, the confirmation before anything runs, and the context keys of the setup walkthrough. Pure functions; the
-// VS Code side (terminal, download, walkthrough) is in src/vscode/dockerSetup.ts.
+// computer, the confirmation before anything runs, and the context keys of the Docker setup in the sidebar. Pure
+// functions; the VS Code side (terminal, download) is in src/vscode/dockerSetup.ts.
 
-/** Context keys of the welcome view and the walkthrough steps (package.json). */
+/** Context keys of the welcome view (package.json) and of the Docker setup. */
 export const DockerContextKeys = {
   /** No Docker CLI was found. */
   missing: 'devEnvironments.dockerMissing',
   /** `dockerSetupRequired`: the sidebar shows the Docker setup instead of the repositories (welcome view). */
   setupRequired: 'devEnvironments.dockerSetupRequired',
-  /** A Docker CLI was found (the opposite of `missing`; walkthrough step "Install Docker"). */
+  /** A Docker CLI was found (the opposite of `missing`). */
   installed: 'devEnvironments.dockerInstalled',
-  /** The last `docker info` succeeded (walkthrough step "Start Docker"). */
+  /** The last `docker info` succeeded. */
   ready: 'devEnvironments.dockerReady',
-  /** Windows: `wsl --status` succeeded (walkthrough step "WSL 2"). */
+  /** Windows: `wsl --status` succeeded (the sidebar shows "✓ WSL 2 is installed." instead of its button). */
   wslReady: 'devEnvironments.wslReady',
 } as const;
 
@@ -43,8 +43,6 @@ export const DOCKER_DOWNLOAD_HOST = 'desktop.docker.com';
 export const DOCKER_ENGINE_INSTALL_URL = 'https://docs.docker.com/engine/install/';
 /** Docker Desktop, for a platform or architecture without a download link. */
 export const DOCKER_DESKTOP_DOCS_URL = 'https://docs.docker.com/desktop/';
-/** Docker Desktop for Linux, which the extension does not install itself. */
-export const DOCKER_DESKTOP_LINUX_URL = 'https://docs.docker.com/desktop/setup/install/linux/';
 /** Docker Desktop on Windows needs WSL 2. */
 export const WSL_INSTALL_COMMAND = 'wsl --install';
 /** Docker Engine on Linux: starts the service now and with the computer. */
