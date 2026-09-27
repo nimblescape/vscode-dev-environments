@@ -244,7 +244,7 @@ export class FakeDocker implements EnvironmentDocker {
     if (container) this.containers.delete(container.id);
   }
 
-  /** Review round 22 (D22-1): `docker rename`; fails with renameError, or when the name is taken. */
+  /** Review round 22 (D22-1): `docker rename`; fails with renameError, when the name is taken, or when it is the current name (FF-1). */
   renameError: Error | undefined = undefined;
 
   async renameContainer(nameOrId: string, newName: string): Promise<void> {
@@ -252,6 +252,10 @@ export class FakeDocker implements EnvironmentDocker {
     if (this.renameError) throw this.renameError;
     const container = this.containerByRef(nameOrId);
     if (!container) throw new CommandError(`docker rename ${nameOrId}`, 1, '', `Error: No such container: ${nameOrId}`);
+    // Final review (FF-1): as Docker (verified on 29.3.1), a rename to the current name is refused.
+    if (container.name === newName) {
+      throw new CommandError(`docker rename ${nameOrId}`, 1, '', 'Error response from daemon: Renaming a container with the same name as its current name');
+    }
     if ([...this.containers.values()].some((c) => c.name === newName && c.id !== container.id)) {
       throw new CommandError(`docker rename ${nameOrId}`, 1, '', `Error response from daemon: Conflict. The container name "/${newName}" is already in use`);
     }

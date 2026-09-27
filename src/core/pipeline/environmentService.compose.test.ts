@@ -42,7 +42,7 @@ import {
 } from '../names';
 import type { ContainerInfo } from '../docker/containerAdapter';
 import type { BuildRecord, ContainerState } from '../types';
-import type { RepositoryTarget } from './environmentService';
+import { PipelineTexts, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -3095,6 +3095,34 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
   });
 
+  describe('final review, FF-1: a failed switch keeps the previous dev container', () => {
+    it('restores nothing with the new configuration: the previous dev container stays stopped and intact, and a reopen with the previous configuration starts it', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      const log = h.docker.log.length;
+      const ups = h.helper.ups.length;
+      // Compose fails before it creates the new dev container; the previous environment image would start.
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_1 ? undefined : new Error('compose up failed'));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('startFailed');
+      expect(error.message).toBe(PipelineTexts.startFailed);
+      const after = h.docker.log.slice(log);
+      expect(after).not.toContain(`rm ${app.id}`);
+      // No `up` with the new configuration and the previous image (it would create the previous dev service again).
+      expect(h.helper.ups.slice(ups).map((up) => up.image)).toEqual([IMAGE_2]);
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+
+      h.helper.upFailsBeforeRemoval = false;
+      h.helper.upError = () => undefined;
+      await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+      expect(h.docker.containers.get(app.id)?.state).toBe('running');
+      expect(h.docker.log.slice(log)).not.toContain(`rm ${app.id}`);
+    });
+  });
+
   describe('final review, FC-1: the new configuration does not start the previous dev service (runServices)', () => {
     const RUN_TEXT = WEB_TEXT.replace('"service": "web"', '"service": "web",\n  "runServices": ["web", "db"]');
 
@@ -3154,6 +3182,27 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       await h.service.openEnvironment(ENV_ID, { progress: h.progress });
       expect(h.docker.containers.get(app.id)?.state).toBe('running');
       expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    });
+
+    it('final review, FF-1: a retry of a failed switch keeps the previous dev container (renamed already: no rename, never removed)', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      h.helper.upError = () => new Error('compose up failed');
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('startFailed');
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      h.helper.upError = () => undefined;
+      const log = h.docker.log.length;
+      const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+      const after = h.docker.log.slice(log);
+      expect(after).not.toContain(`rename ${app.id} ${PROJECT}-app-1`);
+      expect(after).not.toContain(`rm ${app.id}`);
+      expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect(result.containerName).toBe(NAME);
+      expect(byService('web')).toMatchObject({ name: NAME, state: 'running' });
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(WEB_PATH);
+      expect(h.progress.details).not.toContain(Messages.containerComposeDevServiceChanged);
     });
   });
 });

@@ -2254,6 +2254,17 @@ export class EnvironmentService {
           kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept),
         );
       }
+      // Final review (FF-1): the build switched the dev service of the Docker Compose project (Select configuration…
+      // between two configurations of one compose file, D22-1). The previous dev container was renamed out of the way
+      // and stopped (movePreviousDevContainer); an `up` with the new configuration would take it for another service
+      // (and Compose would create it again, losing its files outside the volumes). It stays as it is, stopped: the
+      // previous configuration stays selected (open), so the next open starts it again. The next build tries again.
+      const previousService = composeRecordOf(record)?.service;
+      if (loaded.compose !== undefined && previousService !== undefined && previousService !== loaded.compose.service) {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
+        throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
+      }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
       const previousImage =
@@ -2937,7 +2948,9 @@ export class EnvironmentService {
     this.logger.info(`The dev container ${previous.name} of ${env.repository} is of the service ${previousService}; the configuration uses the service ${compose.service}.`);
     let renamed = false;
     try {
-      await docker.renameContainer(previous.id, name);
+      // Final review (FF-1): an earlier attempt (for example a failed switch) renamed it already; Docker refuses a rename
+      // to the current name, and the container must never be removed for that.
+      if (previous.name !== name) await docker.renameContainer(previous.id, name);
       renamed = true;
       this.logger.info(`The container ${previous.name} is now ${name}; Docker Compose creates it again as the service ${previousService} when the configuration starts it.`);
     } catch (error) {
