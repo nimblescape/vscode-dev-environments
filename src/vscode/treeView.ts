@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { Actions } from '../core/messages';
 import type { Logger } from '../core/ports';
+import { Commands } from './commands';
 import {
   rootNodes,
   stateIcon,
@@ -125,6 +126,9 @@ function repositoryItem(row: RepositoryRow): vscode.TreeItem {
     item.iconPath = new vscode.ThemeIcon('blank');
   }
   item.accessibilityInformation = { label: [row.repository, row.description].filter((text) => text !== '').join(', ') };
+  // VS Code runs this command on each click (or only on a double-click, per workbench.list.openMode); the controller
+  // runs Start on a double-click (rowActivation.ts).
+  item.command = { command: Commands.rowActivated, title: 'Start', arguments: [row] };
   return item;
 }
 
