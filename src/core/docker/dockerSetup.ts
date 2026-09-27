@@ -43,8 +43,6 @@ export const DOCKER_DOWNLOAD_HOST = 'desktop.docker.com';
 export const DOCKER_ENGINE_INSTALL_URL = 'https://docs.docker.com/engine/install/';
 /** Docker Desktop, for a platform or architecture without a download link. */
 export const DOCKER_DESKTOP_DOCS_URL = 'https://docs.docker.com/desktop/';
-/** Docker Desktop for Linux, which the extension does not install itself. */
-export const DOCKER_DESKTOP_LINUX_URL = 'https://docs.docker.com/desktop/setup/install/linux/';
 /** Docker Desktop on Windows needs WSL 2. */
 export const WSL_INSTALL_COMMAND = 'wsl --install';
 /** Docker Engine on Linux: starts the service now and with the computer. */

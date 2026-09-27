@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
+import { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DownloadOptions } from '../core/docker/dockerDownload';
 import {
   DOCKER_DESKTOP_DOWNLOADS,
@@ -193,6 +194,58 @@ describe('DockerSetup: context keys and CLI checks', () => {
     expect(docker.isInstalled).toHaveBeenCalledTimes(1);
   });
 
+  it('Show Docker Setup (action Install Docker… of an error) looks for the CLI again, then shows the sidebar', async () => {
+    const { dockerSetup, docker, changed } = setup(true);
+    dockerSetup.initialize();
+    expect(dockerSetup.setupRequired).toBe(false);
+    fakeVscode.commands.executeCommand.mockClear();
+    // The CLI is gone, and nothing has reported it yet.
+    docker.isInstalled.mockReturnValue(false);
+    await dockerSetup.show();
+    expect(dockerSetup.setupRequired).toBe(true);
+    expect(changed).toHaveBeenCalledTimes(1);
+    const calls = fakeVscode.commands.executeCommand.mock.calls.map((call) => call[0] as string);
+    expect(calls).toContain('devEnvironments.repositories.focus');
+    // The context key is set before the view is shown.
+    expect(calls.indexOf('setContext')).toBeLessThan(calls.indexOf('devEnvironments.repositories.focus'));
+    expect(contextCalls()).toContainEqual([DockerContextKeys.setupRequired, true]);
+    dockerSetup.dispose();
+  });
+
+  it('shows the setup when the adapter reports a lost CLI (ENOENT of a CLI that was found before)', async () => {
+    let found: string | undefined = '/usr/local/bin/docker';
+    const runner = {
+      run: vi.fn(async () => {
+        throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+      }),
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    let dockerSetup: DockerSetup | undefined;
+    const docker = new ContainerAdapter(runner, found, {}, logger, 'darwin', {
+      findDocker: () => found,
+      onCliLost: () => dockerSetup?.checkCli(),
+    });
+    const changed = vi.fn();
+    dockerSetup = new DockerSetup({
+      docker,
+      runner,
+      logger,
+      showLog: vi.fn(),
+      platform: 'darwin',
+      env: {},
+      onDidChangeInstalled: changed,
+      remoteDockerHostConfigured: () => false,
+    });
+    dockerSetup.initialize();
+    expect(dockerSetup.setupRequired).toBe(false);
+    found = undefined;
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    expect(dockerSetup.setupRequired).toBe(true);
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(contextCalls()).toContainEqual([DockerContextKeys.setupRequired, true]);
+    dockerSetup.dispose();
+  });
+
   it('counts a failed lookup as missing', () => {
     const { dockerSetup, docker, logger } = setup(true);
     docker.isInstalled.mockImplementation(() => {
@@ -205,7 +258,7 @@ describe('DockerSetup: context keys and CLI checks', () => {
   });
 });
 
-describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
+describe('DockerSetup: Install Docker (sidebar button Install Docker)', () => {
   it('runs the Homebrew command in a visible terminal after the modal confirmation, and nothing before it', async () => {
     const { dockerSetup } = setup(false, { tools: ['brew'] });
     confirmWith(DockerSetupTexts.install);
@@ -271,7 +324,7 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     dockerSetup.dispose();
   });
 
-  it('installs nothing when Docker is installed already (the walkthrough stays reachable)', async () => {
+  it('installs nothing when Docker is installed already (the command may still run, for example from an older notification)', async () => {
     const { dockerSetup, download } = setup(true, { tools: ['brew'] });
     confirmWith(DockerSetupTexts.install);
     await dockerSetup.install();
@@ -447,6 +500,7 @@ describe('DockerSetup: Install Docker (walkthrough step 2)', () => {
     await dockerSetup.installWsl();
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(3);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.localWindowNeeded);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith('Open a local window to install Docker.');
     expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
     expect(fakeVscode.terminals).toEqual([]);
     expect(download).not.toHaveBeenCalled();
@@ -535,7 +589,7 @@ describe('readBrewCaskState (input of the installation plan on macOS)', () => {
   });
 });
 
-describe('DockerSetup: Start Docker (walkthrough step 3)', () => {
+describe('DockerSetup: Start Docker (after an installation, and the action Start Docker of an error)', () => {
   it('starts Docker with a progress notification', async () => {
     const startDocker = vi.fn(async () => {});
     const { dockerSetup } = setup(true, { startDocker });
@@ -590,7 +644,7 @@ describe('DockerSetup: Start Docker (walkthrough step 3)', () => {
   });
 });
 
-describe('DockerSetup: WSL 2 (walkthrough step 1, Windows)', () => {
+describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
   const status = (exitCode: number): RunResult => ({ exitCode, stdout: '', stderr: '', timedOut: false });
 
   it('checks wsl --status at activation while Docker is missing', async () => {
@@ -665,10 +719,18 @@ describe('Docker setup commands (package.json)', () => {
   };
 
   it('declares the buttons as commands, hidden in the Command Palette', () => {
-    const commands = [Commands.dockerSetupInstall, Commands.dockerSetupStart, Commands.dockerSetupInstallWsl];
+    const commands = [Commands.dockerSetupInstall, Commands.dockerSetupStart, Commands.dockerSetupInstallWsl, Commands.dockerSetupShow];
     for (const command of commands) {
       expect(manifest.contributes.commands.find((entry) => entry.command === command)?.category).toBe('Dev Environments');
       expect(manifest.contributes.menus.commandPalette).toContainEqual({ command, when: 'false' });
+    }
+  });
+
+  it('packages the resources (icon, workspace helper, editor of the repository groups)', () => {
+    const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split('\n').map((line) => line.trim());
+    expect(ignore).toContain('!resources/**');
+    for (const file of ['resources/icon.svg', 'resources/helper/Dockerfile', 'resources/groupsEditor/editor.js', 'resources/groupsEditor/editor.css']) {
+      expect(fs.existsSync(path.join(ROOT, file)), file).toBe(true);
     }
   });
 });

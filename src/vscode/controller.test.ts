@@ -228,7 +228,7 @@ interface Harness {
     updateContextKey: ReturnType<typeof vi.fn>;
   };
   claims: { claim: ReturnType<typeof vi.fn> };
-  dockerSetup: Record<'install' | 'start' | 'installWsl', ReturnType<typeof vi.fn>>;
+  dockerSetup: Record<'install' | 'start' | 'installWsl' | 'show', ReturnType<typeof vi.fn>>;
   repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
   ui: { configurationChanged: ReturnType<typeof vi.fn> };
   discovery: { listBranches: ReturnType<typeof vi.fn> };
@@ -313,6 +313,7 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     install: vi.fn(async () => {}),
     start: vi.fn(async () => {}),
     installWsl: vi.fn(async () => {}),
+    show: vi.fn(async () => {}),
   };
   const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
   const ui = { configurationChanged: vi.fn(async () => 'later') };
@@ -546,7 +547,8 @@ describe('Controller commands', () => {
     // 27 since unit 26 (user decision 2026-09-26, "go with the proposal for closing"): Keep Running When Closed and
     // Stop When Closed.
     // 26 since the Docker setup walkthrough was removed (user decision 2026-09-27): no Install Docker… command.
-    expect(declared).toHaveLength(26);
+    // 27 with Show Docker Setup (hidden), the action Install Docker… of an error: it looks for the CLI, then shows the view.
+    expect(declared).toHaveLength(27);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -602,6 +604,9 @@ describe('Controller commands', () => {
     const setup = { [DockerContextKeys.missing]: true, [DockerContextKeys.setupRequired]: true };
     const intro = 'Dev Environments runs your environments in Docker, which is not installed on this computer. Set it up in these steps:';
     const after = 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.';
+    // Docker Engine on Linux is not started by the extension: it needs administrator rights.
+    const afterLinux =
+      'After the installation, your repositories appear here. When Docker Engine is not running, Dev Environments asks to start it.';
     const signIn =
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)';
     const installWsl =
@@ -630,7 +635,7 @@ describe('Controller commands', () => {
     });
 
     it('shows the steps of Linux', () => {
-      expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, after, signIn]);
+      expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, afterLinux, signIn]);
     });
 
     it('numbers the steps 1, 2, … on each platform', () => {
@@ -1880,16 +1885,18 @@ describe('Connection of this window', () => {
     expect(h.repositoryGroupsEditor.open).toHaveBeenCalledTimes(1);
   });
 
-  it('runs the buttons of the walkthrough', async () => {
+  it('runs the buttons of the Docker setup in the sidebar, and Show Docker Setup of the action Install Docker…', async () => {
     await run('dockerSetupInstall');
     await run('dockerSetupStart');
     await run('dockerSetupInstallWsl');
+    await run('dockerSetupShow');
     expect(h.dockerSetup.install).toHaveBeenCalledTimes(1);
     expect(h.dockerSetup.start).toHaveBeenCalledTimes(1);
     expect(h.dockerSetup.installWsl).toHaveBeenCalledTimes(1);
+    expect(h.dockerSetup.show).toHaveBeenCalledTimes(1);
   });
 
-  it('shows an error of a walkthrough button (concept 6.5)', async () => {
+  it('shows an error of a Docker setup command (concept 6.5)', async () => {
     h.dockerSetup.start.mockRejectedValue(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
     await run('dockerSetupStart');
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerStartFailed, Actions.showDetails);

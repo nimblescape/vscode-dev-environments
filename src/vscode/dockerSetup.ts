@@ -52,6 +52,8 @@ import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner 
 
 /** Command Start Docker (package.json), offered once an installation has put the CLI in place. */
 export const DOCKER_SETUP_START_COMMAND = 'devEnvironments.dockerSetup.start';
+/** Shows the sidebar view (VS Code contributes `<view id>.focus` for each view of package.json). */
+const SHOW_SIDEBAR_COMMAND = 'devEnvironments.repositories.focus';
 /** Name of the terminal of the installation commands. */
 export const INSTALL_TERMINAL_NAME = 'Install Docker';
 const MAC_OPEN = '/usr/bin/open';
@@ -242,6 +244,15 @@ export class DockerSetup implements vscode.Disposable {
     return this.lookUp(() => this.deps.docker.isInstalled());
   }
 
+  /**
+   * Command devEnvironments.dockerSetup.show (action Install Docker… of the error "Docker Desktop is not installed."):
+   * looks for the CLI again, so that a CLI lost since the last check shows the setup, then shows the sidebar view.
+   */
+  async show(): Promise<void> {
+    this.checkCli();
+    await vscode.commands.executeCommand(SHOW_SIDEBAR_COMMAND);
+  }
+
   /** The result of a `docker info` that ran anyway (ContainerAdapter option `onDaemonStatus`). */
   reportDaemonStatus(running: boolean): void {
     this.apply({ kind: 'engine', running });
@@ -277,7 +288,8 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /**
-   * Command devEnvironments.dockerSetup.start (action Start Docker after an installation): starts Docker Desktop with the
+   * Command devEnvironments.dockerSetup.start (action Start Docker after an installation, and of the error "Docker is not
+   * running." of Docker Engine on Linux): starts Docker Desktop with the
    * documented commands and waits until it is ready. Docker Engine on Linux: `sudo systemctl enable --now docker` in the
    * terminal, after a confirmation.
    */

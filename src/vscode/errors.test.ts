@@ -52,8 +52,25 @@ describe('showError (concept 6.5)', () => {
     });
     await flush();
     expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
-    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.repositories.focus');
+    // The command looks for the Docker CLI again before it shows the sidebar, so that the view shows the setup.
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.dockerSetup.show');
     expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('offers Start Docker when Docker Engine does not run (Linux), which runs Start Docker of the Docker setup', async () => {
+    const { logger } = recordingLogger();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.startDocker);
+    showError(new UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning), { logger, showLog });
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: Messages.dockerEngineNotRunning,
+      actions: ['Show details', 'Start Docker'],
+    });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devEnvironments.dockerSetup.start');
+    expect(showLog).not.toHaveBeenCalled();
   });
 
   it.each([

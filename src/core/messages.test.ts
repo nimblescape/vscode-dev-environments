@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { LINUX_ENGINE_START_COMMAND } from './docker/dockerSetup';
 import { Messages } from './messages';
 
 describe('Messages.localEnvNotPassed', () => {
@@ -27,5 +28,13 @@ describe('Messages.olderEnvironmentNotAssigned', () => {
     const text = Messages.olderEnvironmentNotAssigned('acme/api');
     expect(text).toContain('acme/api');
     expect(text).not.toMatch(/another/i);
+  });
+});
+
+describe('Messages.dockerEngineNotRunning', () => {
+  // The same command as the action Start Docker of the Docker setup: the service also starts with the computer then.
+  it('names the command that enables and starts the Docker service', () => {
+    expect(Messages.dockerEngineNotRunning).toContain(LINUX_ENGINE_START_COMMAND);
+    expect(LINUX_ENGINE_START_COMMAND).toBe('sudo systemctl enable --now docker');
   });
 });

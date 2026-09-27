@@ -5,16 +5,35 @@
 // The Docker setup lives only in the sidebar (welcome view): no walkthrough, no command that opens it, and no message
 // "Docker Desktop is not installed." at activation (user decision 2026-09-27).
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+vi.mock('vscode', async () => {
+  const { fakeVscode } = await import('./testing/fakeVscode');
+  return { ...fakeVscode, ExtensionMode: { Production: 1, Development: 2, Test: 3 } };
+});
+// No Docker CLI on this computer (activation test).
+const foundDockerCli = vi.hoisted(() => vi.fn((): string | undefined => undefined));
+vi.mock('../core/docker/dockerCli', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../core/docker/dockerCli')>();
+  return { ...actual, findDockerCli: foundDockerCli };
+});
+// The activation test starts no Session Monitor process.
+vi.mock('./sessionCoordinator', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./sessionCoordinator')>();
+  class SessionCoordinatorWithoutMonitor extends actual.SessionCoordinator {
+    constructor(deps: ConstructorParameters<typeof actual.SessionCoordinator>[0]) {
+      super({ ...deps, spawnProcess: () => ({ unref() {}, on: () => undefined }) });
+    }
+  }
+  return { ...actual, SessionCoordinator: SessionCoordinatorWithoutMonitor };
+});
 
 import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { Messages } from '../core/messages';
 import { Commands } from './commands';
 import { Controller } from './controller';
-import { DockerSetup, type DockerSetupDeps } from './dockerSetup';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 const ROOT = path.join(__dirname, '..', '..');
@@ -29,7 +48,6 @@ interface Manifest {
     menus: Record<string, Array<{ command?: string; submenu?: string }>>;
     keybindings?: Array<{ command: string }>;
   };
-  activationEvents?: string[];
 }
 
 function manifest(): Manifest {
@@ -59,24 +77,58 @@ afterEach(() => {
 });
 
 describe('no message at activation when Docker is missing', () => {
-  it('sets up the sidebar setup without any notification, also while the CLI is looked up again', () => {
-    const docker = { isInstalled: vi.fn(() => false), lookUpCliNow: vi.fn(() => false) };
-    const dockerSetup = new DockerSetup({
-      docker,
-      runner: { run: vi.fn(async () => ({ exitCode: 1, stdout: '', stderr: '', timedOut: false })) },
-      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() },
-      showLog: vi.fn(),
-      platform: 'darwin',
-      env: {},
-      onDidChangeInstalled: vi.fn(),
-      remoteDockerHostConfigured: () => false,
-    } as unknown as DockerSetupDeps);
-    dockerSetup.initialize();
-    vi.advanceTimersByTime(60_000);
-    expect(dockerSetup.setupRequired).toBe(true);
-    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', DockerContextKeys.setupRequired, true);
-    expect(messageCalls()).toBe(0);
-    dockerSetup.dispose();
+  it('activates with the sidebar visible and no Docker CLI without any notification, also when the view is shown again', async () => {
+    vi.useRealTimers();
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-activation-test-'));
+    const visibility = new fakeVscode.EventEmitter<{ visible: boolean }>();
+    const view = { visible: true, onDidChangeVisibility: visibility.event, dispose() {} };
+    const window = fakeVscode.window as unknown as Record<string, unknown>;
+    window.createTreeView = vi.fn(() => view);
+    window.onDidChangeWindowState = vi.fn(() => ({ dispose() {} }));
+    const workspace = fakeVscode.workspace as unknown as Record<string, unknown>;
+    workspace.onDidChangeConfiguration = vi.fn(() => ({ dispose() {} }));
+    workspace.workspaceFolders = undefined;
+    workspace.workspaceFile = undefined;
+    fakeVscode.workspace.getConfiguration.mockImplementation(() => ({
+      get: () => undefined,
+      inspect: () => undefined,
+      update: async () => {},
+    }));
+    const context = {
+      subscriptions: [] as Array<{ dispose(): unknown }>,
+      globalStorageUri: { fsPath: storage },
+      extensionUri: { fsPath: ROOT },
+      extensionMode: 1,
+      asAbsolutePath: (relative: string) => path.join(storage, 'extension', relative),
+    };
+    try {
+      const { activate } = await import('./extension');
+      await activate(context as never);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The view becomes visible again (for example after another view was shown).
+      view.visible = false;
+      visibility.fire({ visible: false });
+      view.visible = true;
+      visibility.fire({ visible: true });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(foundDockerCli).toHaveBeenCalled();
+      // The sidebar shows the Docker setup (welcome view) instead of the repositories.
+      expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', DockerContextKeys.setupRequired, true);
+      expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalled();
+      expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+      expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
+      expect(messageCalls()).toBe(0);
+    } finally {
+      for (const subscription of context.subscriptions) {
+        try {
+          subscription.dispose();
+        } catch {
+          // Only the cleanup of the test.
+        }
+      }
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
   });
 
   it('has no check of the view that shows "Docker Desktop is not installed." once', () => {
@@ -121,10 +173,6 @@ describe('package.json without the walkthrough', () => {
     expect(referenced.length).toBeGreaterThan(0);
     for (const command of referenced) expect(declared, command).toContain(command);
   });
-
-  it('has no activation event of the removed command', () => {
-    expect(manifest().activationEvents ?? []).not.toContain(`onCommand:${REMOVED_COMMAND}`);
-  });
 });
 
 describe('the Docker setup in the sidebar welcome view', () => {
@@ -134,12 +182,20 @@ describe('the Docker setup in the sidebar welcome view', () => {
       expect(view.contents).not.toContain(REMOVED_COMMAND);
       expect(view.contents).not.toContain('Setup Guide');
     }
-    const after = welcome.find((view) => view.contents.startsWith('After the installation'));
-    expect(after).toEqual({
-      view: 'devEnvironments.repositories',
-      contents: 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.',
-      when: DockerContextKeys.setupRequired,
-    });
+    const after = welcome.filter((view) => view.contents.startsWith('After the installation'));
+    expect(after).toEqual([
+      {
+        view: 'devEnvironments.repositories',
+        contents: 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.',
+        when: `${DockerContextKeys.setupRequired} && !isLinux`,
+      },
+      {
+        // Docker Engine on Linux needs administrator rights to start: the error offers Start Docker instead.
+        view: 'devEnvironments.repositories',
+        contents: 'After the installation, your repositories appear here. When Docker Engine is not running, Dev Environments asks to start it.',
+        when: `${DockerContextKeys.setupRequired} && isLinux`,
+      },
+    ]);
   });
 
   it('keeps the buttons of the setup and the sign-in', () => {
@@ -163,12 +219,5 @@ describe('the Docker setup in the sidebar welcome view', () => {
         '[Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/)',
       );
     }
-  });
-
-  it('is the view that the action Install Docker… of the error shows', () => {
-    const errors = fs.readFileSync(path.join(ROOT, 'src', 'vscode', 'errors.ts'), 'utf8');
-    const views = manifest().contributes.views.devEnvironments.map((view) => view.id);
-    expect(views).toContain('devEnvironments.repositories');
-    expect(errors).toContain("const INSTALL_DOCKER_COMMAND = 'devEnvironments.repositories.focus';");
   });
 });

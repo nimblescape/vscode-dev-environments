@@ -86,7 +86,12 @@
       {
         "view": "devEnvironments.repositories",
         "contents": "After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.",
-        "when": "devEnvironments.dockerSetupRequired"
+        "when": "devEnvironments.dockerSetupRequired && !isLinux"
+      },
+      {
+        "view": "devEnvironments.repositories",
+        "contents": "After the installation, your repositories appear here. When Docker Engine is not running, Dev Environments asks to start it.",
+        "when": "devEnvironments.dockerSetupRequired && isLinux"
       },
       {
         "view": "devEnvironments.repositories",
@@ -248,6 +253,11 @@
         "command": "devEnvironments.dockerSetup.installWsl",
         "title": "Install WSL 2",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.dockerSetup.show",
+        "title": "Show Docker Setup",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [
@@ -289,6 +299,10 @@
         },
         {
           "command": "devEnvironments.dockerSetup.installWsl",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.dockerSetup.show",
           "when": "false"
         },
         {

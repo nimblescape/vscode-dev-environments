@@ -122,7 +122,7 @@ export interface ControllerDeps {
   statusBar: EnvironmentStatusBar;
   settings: () => ExtensionSettings;
   /** The Docker setup (concept 6.1 step 2): the commands of the setup in the sidebar. */
-  dockerSetup: Pick<DockerSetup, 'install' | 'start' | 'installWsl'>;
+  dockerSetup: Pick<DockerSetup, 'install' | 'start' | 'installWsl' | 'show'>;
   /** The editor of the setting repositoryGroups (concept 6.2). */
   repositoryGroupsEditor: Pick<RepositoryGroupsEditor, 'open'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
@@ -283,6 +283,7 @@ export class Controller implements vscode.Disposable {
       dockerSetupInstall: () => this.deps.dockerSetup.install(),
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
+      dockerSetupShow: () => this.deps.dockerSetup.show(),
     };
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {

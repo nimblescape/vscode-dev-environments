@@ -4,7 +4,7 @@ Open your GitHub repositories in local dev containers with one action.
 
 Dev Environments lists the GitHub repositories that you can access and that contain a Dev Container configuration. **Start** opens a repository in a container on your computer, in the current window. **Start in New Window** opens it in a new window instead, so you can work in several environments at the same time. The extension does the rest for you:
 
-- It starts Docker when Docker is not running.
+- It starts Docker Desktop when it is not running. Docker Engine on Linux needs administrator rights: the extension asks to start it.
 - It downloads the repository into a Docker volume. Your work stays in this volume when the container is created again.
 - Before each connection, it checks for a newer container image and updates the environment if one exists. Without internet access, it skips this check and uses the local image.
 - When you close the window, it stops the container after a short waiting time.
