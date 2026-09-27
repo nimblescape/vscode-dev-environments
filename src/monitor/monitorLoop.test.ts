@@ -8,6 +8,8 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BUSY_OWNER_STATUS_MAX_AGE_MS } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
+import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import { operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { gitSummaryCommand } from '../core/git/gitSummary';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import type { Logger, RunResult } from '../core/ports';
@@ -934,5 +936,78 @@ describe('MonitorLoop.run', () => {
     });
     expect(await h.loop.run()).toBe('lockLost');
     expect(pauses).toBe(3);
+  });
+});
+
+describe('the Docker host of a tick (review, D2)', () => {
+  let h: Harness;
+  /** The Docker target that the fake reads at the start of each tick; the calls record the context they were pinned to. */
+  let target: DockerTarget;
+  let reads: number;
+  let pinned: Array<string | undefined>;
+
+  beforeEach(() => {
+    h = createHarness();
+    target = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    reads = 0;
+    pinned = [];
+    const docker = h.docker as FakeDocker & MonitorDocker;
+    const record = <T>(call: () => Promise<T>) => () => {
+      pinned.push(operationDockerTarget()?.context);
+      return call();
+    };
+    const list = docker.listEnvironmentContainers.bind(docker);
+    const exec = docker.exec.bind(docker);
+    const stop = docker.stopContainer.bind(docker);
+    docker.listEnvironmentContainers = () => record(list)();
+    docker.exec = (container, command, options) => record(() => exec(container, command, options))();
+    docker.stopContainer = (id) => record(() => stop(id))();
+    docker.withCurrentTarget = async (fn) => {
+      reads++;
+      const current = target;
+      return runWithDockerTarget(current, () => fn(current));
+    };
+    h.loop = h.newLoop();
+  });
+
+  it('stops an environment of the current host, with every Docker call pinned to its context', async () => {
+    await closedWindowScenario(h, { dockerHost: 'build-box' });
+    const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+    expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    expect(pinned.length).toBeGreaterThan(0);
+    expect(new Set(pinned)).toEqual(new Set(['devenv-remote-11111111']));
+    // One read of the target per tick.
+    expect(reads).toBe(results.length);
+  });
+
+  it('never acts on an environment of another host, whose id the containers of the current host may carry', async () => {
+    // The environment is on other-box; Docker is set to build-box, where a container carries its id.
+    await closedWindowScenario(h, { dockerHost: 'other-box' });
+    const results = await runUntil(h, T0 + WAITING_MS + 4 * TICK_MS);
+    expect(results.flatMap((result) => result.stopped)).toEqual([]);
+    expect(h.docker.count('stop')).toBe(0);
+    expect(h.docker.count('exec')).toBe(0);
+  });
+
+  it('never acts on an environment of the local Docker while Docker is set to a remote host', async () => {
+    await closedWindowScenario(h);
+    await runUntil(h, T0 + WAITING_MS + 4 * TICK_MS);
+    expect(h.docker.count('stop')).toBe(0);
+  });
+
+  it('acts on the local environments on the local Docker, as before', async () => {
+    target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    await closedWindowScenario(h);
+    const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+    expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+  });
+
+  it('makes no Docker call at all on an endpoint that is neither local nor SSH, and says so once', async () => {
+    target = dockerTargetOf('tcp://10.0.0.5:2375', 'tcpbox');
+    // As an earlier build recorded it after a restore there.
+    await closedWindowScenario(h, { dockerHost: 'tcp://10.0.0.5:2375' });
+    await runUntil(h, T0 + WAITING_MS + 4 * TICK_MS);
+    expect(h.docker.calls).toEqual([]);
+    expect(h.logger.lines.filter((line) => line.includes('neither local nor SSH'))).toHaveLength(1);
   });
 });

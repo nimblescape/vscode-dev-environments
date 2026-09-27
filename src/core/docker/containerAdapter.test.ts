@@ -10,10 +10,13 @@ import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner
 import {
   ContainerAdapter,
   DOCKER_CLI_LOOKUP_RETRY_MS,
+  SSH_DROP_RETRY_DELAY_MS,
   isProtectedDockerEndpoint,
+  isReadOnlyDockerCall,
   mapContainerState,
   parseJsonLines,
   registryLoginConfig,
+  sshDroppedReadCall,
   toLabels,
   type ImageInspection,
 } from './containerAdapter';
@@ -1472,5 +1475,154 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
     });
     expect(await docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-tool:latest']);
     expect(runner.calls[1].args).toEqual(['image', 'inspect', 'devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-db:latest', 'devenv-3f2a9c1e-tool:latest']);
+  });
+});
+
+describe('ContainerAdapter: an SSH server that closes the connection before the login (unit 7)', () => {
+  /** The error of the Docker CLI when sshd dropped the connection (as in CI: OpenSSH 9.6 prints one line). */
+  function dropped(path = 'images/devenv-helper:1/json', sshStderr = 'Connection closed by 127.0.0.1 port 32771\r\n'): RunResult {
+    return fail(
+      `error during connect: Get "http://docker.example.com/v1.48/${path}": command [ssh -o ConnectTimeout=30 -T -- build-box docker system dial-stdio] has exited with exit status 255, make sure the URL is valid, and Docker 18.09 or later is installed on the remote host: stderr=${sshStderr}\n`,
+    );
+  }
+
+  function droppingAdapter(handler: Handler, warnings: string[] = []): { docker: ContainerAdapter; runner: FakeRunner } {
+    const runner = new FakeRunner(handler);
+    const logger: Logger = { ...silentLogger, warn: (message: string) => warnings.push(message) };
+    return { docker: new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin' }, logger, 'linux', { sshDropRetryDelayMs: 0 }), runner };
+  }
+
+  it('waits one second before the repetition by default', () => {
+    expect(SSH_DROP_RETRY_DELAY_MS).toBe(1_000);
+  });
+
+  it('repeats a call that only reads once, and returns the second answer', async () => {
+    const warnings: string[] = [];
+    let calls = 0;
+    const { docker, runner } = droppingAdapter(() => (++calls === 1 ? dropped() : ok('"sha256:abc"\n')), warnings);
+    await expect(docker.run(['image', 'inspect', '--format', '{{json .Id}}', 'devenv-helper:1'])).resolves.toMatchObject({ exitCode: 0 });
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[1].args).toEqual(runner.calls[0].args);
+    expect(warnings).toEqual([expect.stringContaining('docker image inspect: the SSH server of the Docker host closed the connection before the login')]);
+  });
+
+  it('repeats it only once: a second drop is the answer', async () => {
+    const { docker, runner } = droppingAdapter(() => dropped());
+    const result = await docker.run(['ps', '-a', '--format', '{{json .ID}}']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('Connection closed by 127.0.0.1 port 32771');
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it('also after the older message of the client (kex_exchange_identification), and for docker -H ssh://… info', async () => {
+    let calls = 0;
+    const { docker, runner } = droppingAdapter(() =>
+      ++calls === 1 ? dropped('info', 'kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 192.0.2.10 port 22\r\n') : ok('"28.0.1"'),
+    );
+    await expect(docker.run(['-H', 'ssh://build-box', 'info', '--format', '{{json .ServerVersion}}'])).resolves.toMatchObject({ exitCode: 0 });
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it.each([
+    [['run', '-d', '--name', 'x', 'img']],
+    [['create', '--name', 'x', 'img']],
+    [['exec', '-i', 'x', 'sh', '-c', 'cat > /run/devenv/github-token']],
+    [['start', 'x']],
+    [['stop', 'x']],
+    [['rm', '-f', 'x']],
+    [['volume', 'create', 'v']],
+    [['volume', 'rm', 'v']],
+    [['image', 'rm', 'img']],
+    [['build', '-t', 'img', '.']],
+    [['pull', 'img']],
+  ])('never repeats a call that changes something: %j', async (args) => {
+    const { docker, runner } = droppingAdapter(() => dropped());
+    expect((await docker.run(args)).exitCode).toBe(1);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['a failed login', 'root@127.0.0.1: Permission denied (publickey).\r\n'],
+    ['an unknown host key', 'No ED25519 host key is known for [127.0.0.1]:32771 and you have requested strict checking.\r\nHost key verification failed.\r\n'],
+    ['a closed port', 'ssh: connect to host 127.0.0.1 port 45171: Connection refused\r\n'],
+    ['a drop with another message of ssh', 'Warning: Permanently added build-box.\r\nConnection closed by 127.0.0.1 port 32771\r\n'],
+  ])('does not repeat a read after %s', async (_name, sshStderr) => {
+    const { docker, runner } = droppingAdapter(() => dropped('info', sshStderr));
+    expect((await docker.run(['info'])).exitCode).toBe(1);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it('does not repeat a read that failed on the engine, or ran out of time', async () => {
+    const engine = droppingAdapter(() => fail('Error: No such image: devenv-helper:1'));
+    expect((await engine.docker.run(['image', 'inspect', 'devenv-helper:1'])).exitCode).toBe(1);
+    expect(engine.runner.calls).toHaveLength(1);
+    const late = droppingAdapter(() => ({ ...dropped(), exitCode: null, timedOut: true }));
+    expect((await late.docker.run(['info'])).timedOut).toBe(true);
+    expect(late.runner.calls).toHaveLength(1);
+  });
+
+  it('does not repeat after an abort, and an abort during the wait rejects with an AbortError', async () => {
+    const aborted = new AbortController();
+    const first = droppingAdapter(() => {
+      aborted.abort();
+      return dropped();
+    });
+    expect((await first.docker.run(['ps'], { signal: aborted.signal })).exitCode).toBe(1);
+    expect(first.runner.calls).toHaveLength(1);
+
+    const during = new AbortController();
+    const runner = new FakeRunner(() => dropped());
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin' }, silentLogger, 'linux', { sshDropRetryDelayMs: 60_000 });
+    const pending = docker.run(['ps'], { signal: during.signal });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    during.abort();
+    const error = await pending.catch((e: unknown) => e);
+    expect(isAbortError(error)).toBe(true);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it('isReadOnlyDockerCall: only commands that read, also after global options', () => {
+    for (const args of [
+      ['info'],
+      ['version', '--format', '{{json .Server.APIVersion}}'],
+      ['ps', '-aq'],
+      ['images'],
+      ['inspect', 'x'],
+      ['image', 'inspect', 'img'],
+      ['image', 'ls'],
+      ['container', 'inspect', 'x'],
+      ['volume', 'ls', '--filter', 'label=a'],
+      ['volume', 'inspect', 'v'],
+      ['network', 'inspect', 'n'],
+      ['context', 'inspect'],
+      ['system', 'df'],
+      ['-H', 'ssh://build-box', 'info'],
+      ['--context', 'devenv-remote', 'image', 'inspect', 'img'],
+    ]) {
+      expect(isReadOnlyDockerCall(args), args.join(' ')).toBe(true);
+    }
+    for (const args of [
+      [],
+      ['-H', 'ssh://info'],
+      ['run', 'img', 'inspect'],
+      ['exec', 'x', 'docker', 'ps'],
+      ['image', 'rm', 'img'],
+      ['image', 'prune', '-f'],
+      ['volume', 'create', 'ls'],
+      ['network', 'rm', 'inspect'],
+      ['context', 'use', 'devenv-remote'],
+      ['compose', 'ps'],
+      ['buildx', 'build', '.'],
+      ['logs', 'x'],
+    ]) {
+      expect(isReadOnlyDockerCall(args), args.join(' ')).toBe(false);
+    }
+  });
+
+  it('sshDroppedReadCall needs the exit of the SSH command of the Docker CLI', () => {
+    expect(sshDroppedReadCall(['info'], dropped())).toBe(true);
+    expect(sshDroppedReadCall(['info'], ok())).toBe(false);
+    // The same words from somewhere else (for example the output of a container) are not a drop.
+    expect(sshDroppedReadCall(['info'], fail('Connection closed by 127.0.0.1 port 32771'))).toBe(false);
   });
 });

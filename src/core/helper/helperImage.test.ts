@@ -502,10 +502,25 @@ describe('ensureHelperImage with a state file: new helper image', () => {
   it('rejects with an AbortError when the signal aborts during the lookup before the build of a missing tag', async () => {
     const h = new Harness();
     const controller = new AbortController();
-    h.answer = () => new Promise<LookupAnswer>(() => {});
-    setTimeout(() => controller.abort(), 5);
+    // review, CI race: the abort comes from inside the lookup (it has started for sure), not from a 5 ms timer that could
+    // fire before the lookup starts (the per-engine step before it takes a variable time).
+    h.answer = () => {
+      setTimeout(() => controller.abort(), 0);
+      return new Promise<LookupAnswer>(() => {});
+    };
     await expect(h.ensure({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
     expect(h.lookups[0].signal?.aborted).toBe(true);
+    expect(h.docker.builds).toHaveLength(0);
+    expect(fs.existsSync(h.statePath)).toBe(false);
+  });
+
+  it('rejects with an AbortError without a lookup and without a build when the signal aborted before the lookup', async () => {
+    // review, CI race: the case that the old timer could hit.
+    const h = new Harness();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(h.ensure({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(h.lookups).toHaveLength(0);
     expect(h.docker.builds).toHaveLength(0);
     expect(fs.existsSync(h.statePath)).toBe(false);
   });

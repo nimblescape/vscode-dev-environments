@@ -7,6 +7,8 @@
 // Session Coordinator, and the Connection Adapter.
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
+import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
+import type { DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
@@ -50,6 +52,7 @@ import type { OutputChannelLogger } from './logger';
 import { selectOwners } from './ownerSelector';
 import type { VsCodePipelineUi } from './pipelineUi';
 import { runWithProgress, type BusyChange } from './progress';
+import type { RemoteDockerCommands } from './remoteDockerCommands';
 import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { SETTINGS_SECTION, hostAccessChecksOffValue } from './settings';
@@ -120,6 +123,13 @@ export interface ControllerDeps {
   repositoryGroupsEditor: Pick<RepositoryGroupsEditor, 'open'>;
   /** True while the sidebar view is visible: only then Docker is asked outside of operations. */
   viewVisible: () => boolean;
+  /**
+   * Unit 7: the current Docker host, read at the start of each operation (the current Docker context). Default: the
+   * local Docker.
+   */
+  dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation'>;
+  /** Unit 7: "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
+  remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'offerSwitchBack'>;
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
   development?: boolean;
   clock?: Clock;
@@ -243,7 +253,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 27 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 29 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -273,10 +283,16 @@ export class Controller implements vscode.Disposable {
       dockerSetupStart: () => this.deps.dockerSetup.start(),
       dockerSetupInstallWsl: () => this.deps.dockerSetup.installWsl(),
       dockerSetupShow: () => this.deps.dockerSetup.show(),
+      useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
+      useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
     };
+    // Unit 7: each command is one operation on the Docker host that is current when it starts; the two commands that
+    // change the host read it themselves.
+    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
-        await handlers[name](argument);
+        if (ownTarget.has(name)) await handlers[name](argument);
+        else await this.withDockerTarget(() => handlers[name](argument));
       } catch (error) {
         this.showError(error);
       }
@@ -361,6 +377,17 @@ export class Controller implements vscode.Disposable {
     // Concept 7.5: the environment of another account runs no pipeline and starts no container; the window closes.
     const environment = await this.ownWindowEnvironment(attached, containerName);
     if (!environment) return;
+    // Unit 7: an environment of another Docker host (for example a window of Open Recent after a switch, or Docker
+    // Desktop reset the context) is used only after the user switched back; otherwise the window closes its connection.
+    if (!(await this.onWindowHost(environment))) return;
+    await this.withDockerTarget(() => this.openAttachedEnvironment(environment, containerName, pending));
+  }
+
+  private async openAttachedEnvironment(
+    environment: Environment,
+    containerName: string,
+    pending: PendingConnection | undefined,
+  ): Promise<void> {
     this.current = { environment, containerName, lost: false };
     this.updateStatusBar();
     // Concept 7.5: an account change while the window checked its environment found no
@@ -431,6 +458,10 @@ export class Controller implements vscode.Disposable {
    * REOPEN_MIN_AGE_MS (review finding F1 of PR #26).
    */
   async runEmptyWindowTasks(activatedAt: number = this.clock.now()): Promise<void> {
+    await this.withDockerTarget(() => this.runEmptyWindowTasksNow(activatedAt));
+  }
+
+  private async runEmptyWindowTasksNow(activatedAt: number): Promise<void> {
     await this.ready;
     const { sessionFiles, coordinator, registry, connection } = this.deps;
     await sessionFiles
@@ -442,6 +473,7 @@ export class Controller implements vscode.Disposable {
       await this.removeOperationQuietly(operation.environmentId);
     }
     const account = await this.readAccount();
+    const dockerHost = await this.currentDockerHost();
     for (const operation of runnable) {
       if (this.disposed) return;
       // Concept 7.5: an operation of an environment of another account is not run by this window; it expires.
@@ -450,6 +482,11 @@ export class Controller implements vscode.Disposable {
         this.logger.info(
           `The pending ${operation.operation} of ${operation.environmentId} is for another GitHub account. It is not run.`,
         );
+        continue;
+      }
+      // Unit 7: nor one of an environment of another Docker host; it expires.
+      if (target && !isOnDockerHost(target, dockerHost)) {
+        this.logger.info(`The pending ${operation.operation} of ${operation.environmentId} is for another Docker host. It is not run.`);
         continue;
       }
       let claimed: PendingOperation | undefined;
@@ -478,8 +515,10 @@ export class Controller implements vscode.Disposable {
       otherConnectedWindows: others.filter((status) => status.environmentId !== null).length,
       pendingOperations: operations.length,
       record,
-      // Concept 7.5: only an environment of the signed-in account is opened again.
-      environmentIds: new Set(availableEnvironments(environments, account).map((environment) => environment.id)),
+      // Concept 7.5: only an environment of the signed-in account is opened again; unit 7: of the current Docker host.
+      environmentIds: new Set(
+        availableEnvironments(environmentsOfHost(environments, dockerHost), account).map((environment) => environment.id),
+      ),
       // The age of the record at activation (see `activatedAt`), not after the awaits and the pause.
       now: activatedAt,
       development: this.deps.development,
@@ -500,10 +539,16 @@ export class Controller implements vscode.Disposable {
    * missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
    */
   async reconcileIfRegistryLost(): Promise<void> {
+    await this.withDockerTarget(() => this.reconcileIfRegistryLostNow());
+  }
+
+  private async reconcileIfRegistryLostNow(): Promise<void> {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
     if (!(await this.deps.registryNeedsRestore())) return;
-    if (!docker.isInstalled() || !(await docker.isRunning())) return;
+    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs; no `docker info` here before that check.
+    if (!docker.isInstalled()) return;
     const added = await service.reconcileFromVolumes();
     if (added === 0) return;
     await this.adoptWindowEnvironment();
@@ -1739,6 +1784,12 @@ export class Controller implements vscode.Disposable {
     const { containerName } = left;
     if (!this.deps.docker.isInstalled()) return;
     try {
+      // Unit 7: never on another Docker host (its container is not on the current engine).
+      const known = await this.deps.registry.get(left.environmentId).catch(() => undefined);
+      if (known && !isOnDockerHost(known, await this.currentDockerHost())) {
+        this.logger.info(`The container ${containerName} is on another Docker host. Its token is not removed from here.`);
+        return;
+      }
       const container = await this.deps.docker.findContainer(left.environmentId, containerName);
       if (container?.state !== 'running') {
         this.logger.info(`The container ${containerName} does not run: its memory holds no GitHub token.`);
@@ -2036,7 +2087,9 @@ export class Controller implements vscode.Disposable {
     const info = this.deps.sidebar.repositoryInfo(repository);
     const account = signIn === 'token' ? await this.readWorkingAccount() : await this.readAccount(signIn);
     if (signIn && !account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    const environment = account ? await this.deps.registry.findForAccount(repository, account.id) : undefined;
+    const environment = account
+      ? await this.deps.registry.findForAccount(repository, account.id, await this.currentDockerHost())
+      : undefined;
     return { repository, info, environment };
   }
 
@@ -2167,7 +2220,7 @@ export class Controller implements vscode.Disposable {
   ): Promise<boolean> {
     await this.ready;
     try {
-      const outcome = await this.gate.run(repositoryKey(repository), label, fn);
+      const outcome = await this.gate.run(repositoryKey(repository), label, () => this.withDockerTarget(fn));
       if (!outcome.started) {
         this.logger.info(`${label} of ${repository} was not started: ${outcome.running} of ${repository} is still running.`);
         return false;
@@ -2179,6 +2232,42 @@ export class Controller implements vscode.Disposable {
     } finally {
       if (!this.disposed) this.background(this.deps.sidebar.refreshStates(), 'update the sidebar');
     }
+  }
+
+  /** Unit 7: runs `fn` as one operation on the Docker host that is current now (DockerTargets.withOperation). */
+  private withDockerTarget<T>(fn: () => Promise<T>): Promise<T> {
+    return this.deps.dockerTargets ? this.deps.dockerTargets.withOperation(fn) : fn();
+  }
+
+  /** Unit 7: the Docker host of the operation ('' = the local Docker). */
+  private async currentDockerHost(): Promise<string> {
+    return this.deps.dockerTargets ? (await this.deps.dockerTargets.current()).host : '';
+  }
+
+  /**
+   * Unit 7: a restored window whose environment is on another Docker host than the current Docker context asks "Use
+   * <host> again?" (RemoteDockerCommands.offerSwitchBack: the same test and modal as the commands). True when Docker uses
+   * the environment's host (then the open continues); otherwise the window closes its remote connection with the
+   * message, and nothing runs on the other host. Assumption (V-2): VS Code waits for activate() before it resolves the
+   * authority, so the Dev Containers extension connects through the context that is current afterwards.
+   */
+  private async onWindowHost(environment: Environment): Promise<boolean> {
+    if (!this.deps.dockerTargets) return true;
+    const current = await this.deps.dockerTargets.resolve();
+    if (isOnDockerHost(environment, current.host)) return true;
+    const environmentHost = dockerHostOf(environment);
+    this.logger.info(
+      `This window's environment is on ${describeDockerHost(environmentHost)}, and Docker is set to ${describeDockerHost(current.host)}.`,
+    );
+    const switched = (await this.deps.remoteDocker?.offerSwitchBack(environmentHost, current)) ?? false;
+    if (switched) {
+      const now = await this.deps.dockerTargets.resolve();
+      if (isOnDockerHost(environment, now.host)) return true;
+    }
+    const repository = this.displayName({ repository: environment.repository });
+    this.logger.info('The window closes its remote connection: its environment is on another Docker host.');
+    await this.leaveEnvironment(Messages.otherDockerHost(repository, environmentHost, current.host));
+    return false;
   }
 
   private showError(error: unknown, retry?: () => Promise<void>): void {

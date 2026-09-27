@@ -91,6 +91,31 @@ export interface HelperDeps {
   baseDigest?: BaseDigestLookup;
   /** Called with each check of the base image that ensureImage starts in the background (for tests). */
   onBaseImageCheck?: (check: Promise<void>) => void;
+  /**
+   * Unit 7: the Docker engine that the operation uses (the current Docker context). `key` names it ('' for the local
+   * Docker, else the remote host): the image found or built for one engine is not reused for another, and a remote
+   * engine has its own state file. `socket`: the source of the socket mount on the machine of that engine (for a remote
+   * host `/var/run/docker.sock`, or the recorded socket of a rootless engine); `endpoint`: the local endpoint of the
+   * context, for helperDockerSocket. Without it, the local Docker of DOCKER_HOST.
+   */
+  engine?: () => Promise<HelperEngine>;
+}
+
+/** See HelperDeps.engine. */
+export interface HelperEngine {
+  key: string;
+  socket?: string;
+  endpoint?: string;
+}
+
+/**
+ * The state file of the helper images of a remote engine: `helper.json` → `helper-remote-<hash>.json` (unit 7). The
+ * state of the local Docker stays in `helper.json`.
+ */
+export function helperStatePathFor(statePath: string, engineKey: string): string {
+  if (engineKey === '') return statePath;
+  const hash = crypto.createHash('sha256').update(engineKey).digest('hex').slice(0, 16);
+  return statePath.replace(/(\.json)?$/, `-remote-${hash}.json`);
 }
 
 /** Options of WorkspaceHelper.ensureImage. */
@@ -125,8 +150,10 @@ export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
  * /var/run/docker.sock, whatever DOCKER_HOST points to on the computer. So a `unix://` DOCKER_HOST is used only on
  * Linux without Docker Desktop (for example rootless Docker Engine).
  */
-export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
-  const host = env.DOCKER_HOST?.trim();
+export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, endpoint?: string): string {
+  // Unit 7: the endpoint of the current Docker context (DOCKER_HOST when it is set), so a context of a local rootless
+  // engine is followed like DOCKER_HOST.
+  const host = (endpoint?.trim() || env.DOCKER_HOST?.trim()) ?? '';
   if (platform !== 'linux' || !host || !host.startsWith('unix://')) return DOCKER_SOCKET;
   const socketPath = host.slice('unix://'.length);
   if (!socketPath.startsWith('/') || socketPath.includes('/.docker/desktop/')) return DOCKER_SOCKET;
@@ -413,11 +440,27 @@ export class WorkspaceHelper {
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
-  private readonly socketPath: string;
+  /** The engine of the cached image (HelperDeps.engine). */
+  private imageEngine = '';
 
   constructor(private readonly deps: HelperDeps) {
     this.clock = deps.clock ?? systemClock;
-    this.socketPath = helperDockerSocket(deps.env, deps.platform ?? process.platform);
+  }
+
+  /** The engine of the operation (HelperDeps.engine); the local Docker without it. */
+  private async currentEngine(): Promise<HelperEngine> {
+    return (await this.deps.engine?.()) ?? { key: '' };
+  }
+
+  /** The source of the socket mount for the engine (see HelperDeps.engine and helperDockerSocket). */
+  private socketPathFor(engine: HelperEngine): string {
+    if (engine.socket !== undefined) return engine.socket;
+    return helperDockerSocket(this.deps.env, this.deps.platform ?? process.platform, engine.endpoint);
+  }
+
+  private statePathFor(engine: HelperEngine): string | undefined {
+    const statePath = this.deps.statePath;
+    return statePath === undefined ? undefined : helperStatePathFor(statePath, engine.key);
   }
 
   /**
@@ -951,6 +994,11 @@ export class WorkspaceHelper {
    * a stop, a delete, or a branch switch.
    */
   private async image(options: EnsureImageOptions, recheck: boolean): Promise<string> {
+    const engine = await this.currentEngine();
+    // Unit 7: an image of another engine (the Docker context changed) is not reused.
+    if (this.imagePromise && engine.key !== this.imageEngine) this.resetImage();
+    this.imageEngine = engine.key;
+    const statePath = this.statePathFor(engine);
     if (recheck && this.imagePromise && !this.imageMaintained) {
       // The result of a helper run: wait until it is ready (a missing tag is built only once), then maintain.
       const pending = this.imagePromise;
@@ -960,13 +1008,13 @@ export class WorkspaceHelper {
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
       if (recheck && Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS) this.resetImage();
-      else await this.recordUse(now);
+      else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
       const promise: Promise<string> = ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
-        statePath: this.deps.statePath,
+        statePath,
         baseDigest: this.deps.baseDigest,
         maintain: recheck,
         checkBaseImage: options.checkBaseImage,
@@ -1009,8 +1057,7 @@ export class WorkspaceHelper {
   }
 
   /** `lastUsedAt` of the tag in the state file, at most once per hour per instance. Never throws. */
-  private async recordUse(now: number): Promise<void> {
-    const statePath = this.deps.statePath;
+  private async recordUse(now: number, statePath: string | undefined): Promise<void> {
     const tag = this.imageTag;
     if (statePath === undefined || tag === undefined) return;
     if (this.imageUsedAt !== undefined && Math.abs(now - this.imageUsedAt) < HELPER_LAST_USED_INTERVAL_MS) return;
@@ -1116,7 +1163,7 @@ export class WorkspaceHelper {
     const args = helperRunArgs({
       tag,
       volumeName,
-      socketPath: this.socketPath,
+      socketPath: this.socketPathFor(await this.currentEngine()),
       containerName,
       env,
       secrets: options.secrets === true,

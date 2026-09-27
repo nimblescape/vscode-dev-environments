@@ -104,6 +104,8 @@ interface Harness {
   settings: ExtensionSettings;
   logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
   clock: { now: () => number };
+  /** Unit 7: the Docker host of the current Docker context ('' = the local Docker). */
+  dockerHost: { value: string };
 }
 
 function createHarness(): Harness {
@@ -115,6 +117,7 @@ function createHarness(): Harness {
   const sessionFiles = new SessionFiles(paths, clock);
   const models: OwnerGroup[][] = [];
   const setupRequired = { value: false };
+  const dockerHost = { value: '' };
   const signedInFlags: boolean[] = [];
   const tree = {
     setModel: (groups: OwnerGroup[], options: { signedIn?: boolean }) => {
@@ -158,6 +161,7 @@ function createHarness(): Harness {
     tree,
     settings: () => settings,
     dockerSetupRequired: () => setupRequired.value,
+    dockerHost: async () => dockerHost.value,
     clock,
     isAlive: (pid: number) => pid === process.pid,
   } as unknown as SidebarDeps);
@@ -177,6 +181,7 @@ function createHarness(): Harness {
     settings,
     logger,
     clock,
+    dockerHost,
   };
 }
 
@@ -379,6 +384,24 @@ describe('Sidebar', () => {
     h.discovery.refresh.mockResolvedValue(data([]));
     expect(await h.sidebar.trustedOwner('acme')).toBe(true);
     expect(await h.sidebar.trustedOwner('stranger')).toBe(false);
+  });
+
+  // Unit 7: the environments of another Docker host are hidden and never acted on.
+  it('shows only the environments of the current Docker host', async () => {
+    await h.registry.add(environment(API, 'acme/api'));
+    await h.registry.add(environment(OLD, 'acme/web', { dockerHost: 'build-box' }));
+    h.discovery.refresh.mockResolvedValue(data([info('acme/api'), info('acme/web')]));
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    await h.sidebar.render();
+    const withEnvironment = (): string[] => rows().filter((row) => row.environment).map((row) => row.environment!.id);
+    expect(withEnvironment()).toEqual([API]);
+    expect((await h.sidebar.availableEnvironments()).map((entry) => entry.id)).toEqual([API]);
+    // After a switch to build-box, the next render shows its environment only.
+    h.dockerHost.value = 'build-box';
+    await h.sidebar.render();
+    expect(withEnvironment()).toEqual([OLD]);
+    expect((await h.sidebar.availableEnvironments()).map((entry) => entry.id)).toEqual([OLD]);
   });
 
   it('shows only the environments of the signed-in account, and names no other (concept 7.5)', async () => {

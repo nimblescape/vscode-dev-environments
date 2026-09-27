@@ -8,6 +8,7 @@
 // or the new content (implementation notes 4).
 import * as fs from 'fs';
 import * as path from 'path';
+import { dockerHostOf, isOnDockerHost } from '../docker/dockerHost';
 import { isoTime, silentLogger, sleep, systemClock, type Clock, type Logger } from '../ports';
 import type {
   BuildRecord,
@@ -60,14 +61,20 @@ const EPOCH = new Date(0).toISOString();
 
 /**
  * True if `environment` is the environment of the repository `owner/name` (ignoring case) of the GitHub account
- * `accountId`. A repository has at most one environment per account (concept D-3).
+ * `accountId` on the Docker host `dockerHost` ('' = the local Docker). A repository has at most one environment per
+ * account (concept D-3) and Docker host (unit 7).
  */
 export function isEnvironmentOf(
-  environment: Pick<Environment, 'repository' | 'owner'>,
+  environment: Pick<Environment, 'repository' | 'owner' | 'dockerHost'>,
   repository: string,
   accountId: string,
+  dockerHost = '',
 ): boolean {
-  return environment.repository.toLowerCase() === repository.toLowerCase() && environment.owner.id === accountId;
+  return (
+    environment.repository.toLowerCase() === repository.toLowerCase() &&
+    environment.owner.id === accountId &&
+    isOnDockerHost(environment, dockerHost)
+  );
 }
 
 /** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
@@ -124,9 +131,12 @@ export class EnvironmentRegistry {
     return (await this.list()).find((environment) => environment.id === id);
   }
 
-  /** Finds the environment of `owner/name` (ignoring case) of the GitHub account `accountId` (concept D-3). */
-  async findForAccount(repository: string, accountId: string): Promise<Environment | undefined> {
-    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, accountId));
+  /**
+   * Finds the environment of `owner/name` (ignoring case) of the GitHub account `accountId` on the Docker host
+   * `dockerHost` (concept D-3, unit 7; '' = the local Docker).
+   */
+  async findForAccount(repository: string, accountId: string, dockerHost = ''): Promise<Environment | undefined> {
+    return (await this.list()).find((environment) => isEnvironmentOf(environment, repository, accountId, dockerHost));
   }
 
   /** Finds the environment of a container name, with or without the leading `/` of `docker inspect`. */
@@ -159,7 +169,7 @@ export class EnvironmentRegistry {
       if (file.environments.some((existing) => existing.id === environment.id)) {
         throw new Error(`The environment ${environment.id} exists already.`);
       }
-      if (file.environments.some((existing) => isEnvironmentOf(existing, environment.repository, accountId))) {
+      if (file.environments.some((existing) => isEnvironmentOf(existing, environment.repository, accountId, dockerHostOf(environment)))) {
         throw new Error(`An environment of ${environment.repository} of the GitHub account ${accountId} exists already.`);
       }
       file.environments.push(environment);
@@ -451,6 +461,8 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['lastBuildNumber', isCount],
   ['refusedUpdate', isRefusedUpdate],
   ['keepRunning', (value) => typeof value === 'boolean'],
+  // Unit 7: the Docker host; '' is the local Docker, as a missing field.
+  ['dockerHost', isNonEmptyString],
 ];
 
 /**

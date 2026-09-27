@@ -64,6 +64,8 @@ export class StoragePaths {
   readonly monitorLog: string;
   /** State of the workspace helper images: base image digests, last check, last use, last cleanup. */
   readonly helperState: string;
+  /** Remote Docker hosts (unit 7): the context before the switch, and the rootless sockets (RemoteDockerState). */
+  readonly remoteDocker: string;
 
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
@@ -78,6 +80,7 @@ export class StoragePaths {
     this.monitorExit = path.join(root, 'monitor.exit');
     this.monitorLog = path.join(root, 'monitor.log');
     this.helperState = path.join(root, 'helper.json');
+    this.remoteDocker = path.join(root, 'remote-docker.json');
   }
 
   /**

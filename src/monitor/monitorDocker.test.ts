@@ -38,10 +38,13 @@ function result(stdout: string, exitCode = 0, stderr = ''): RunResult {
 class FakeDockerCli implements ProcessRunner {
   calls: Call[] = [];
   running = true;
+  /** The current Docker context (`docker context inspect`). */
+  context = { Name: 'desktop-linux', Endpoints: { docker: { Host: 'unix:///home/me/.docker/desktop/docker.sock' } } };
 
   async run(file: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     this.calls.push({ file, args, options });
     const [command] = args;
+    if (command === 'context' && args[1] === 'inspect') return result(JSON.stringify(this.context));
     if (command === 'ps') return result('"c0ffee"\n');
     if (command === 'container' && args[1] === 'inspect') {
       return result(
@@ -151,6 +154,13 @@ describe('MonitorDockerClient', () => {
     expect(commands.some((command) => command.startsWith('exec'))).toBe(true);
     for (const call of cli.calls) {
       expect(call.file).toBe(DOCKER);
+      // review, D2: also `docker context inspect` (it reads only local files) once per tick; before: no context read.
+      if (call.args[0] === 'context') {
+        expect(call.args).toEqual(['context', 'inspect', '--format', '{{json .}}']);
+        continue;
+      }
+      // The Docker calls of a tick are pinned to the context it read.
+      expect(call.options.env?.DOCKER_CONTEXT).toBe('desktop-linux');
       expect(['ps', 'container', 'exec', 'stop']).toContain(call.args[0]);
       expect(call.args).not.toContain('desktop');
       expect(call.args).not.toContain('start');
@@ -194,5 +204,65 @@ describe('MonitorDockerClient', () => {
     expect(lookups).toBe(2);
     await docker.listEnvironmentContainers();
     expect(lookups).toBe(2);
+  });
+});
+
+describe('MonitorDockerClient.withCurrentTarget (review, D2)', () => {
+  it('reads the current context once and pins the Docker calls of the tick to it', async () => {
+    const cli = new FakeDockerCli();
+    cli.context = { Name: 'devenv-remote-11111111', Endpoints: { docker: { Host: 'ssh://build-box' } } };
+    const docker = new MonitorDockerClient({ runner: cli, env: { PATH: '/usr/bin' }, platform: 'linux', logger: silentLogger, findDocker: () => DOCKER });
+    const target = await docker.withCurrentTarget(async (current) => {
+      await docker.listEnvironmentContainers();
+      await docker.stopContainer('c0ffee');
+      return current;
+    });
+    expect(target).toEqual({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devenv-remote-11111111' });
+    expect(cli.calls.filter((call) => call.args[0] === 'context')).toHaveLength(1);
+    for (const call of cli.calls.filter((entry) => entry.args[0] !== 'context')) {
+      expect(call.options.env?.DOCKER_CONTEXT).toBe('devenv-remote-11111111');
+    }
+    // After the tick, the calls are not pinned any more.
+    await docker.listEnvironmentContainers();
+    expect(cli.calls[cli.calls.length - 1].options.env?.DOCKER_CONTEXT).toBeUndefined();
+  });
+
+  it('stops nothing on the remote host for an environment of the local Docker', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
+    roots.push(root);
+    const paths = new StoragePaths(root);
+    let now = T0;
+    const clock = { now: () => now };
+    const registry = new EnvironmentRegistry(paths, clock);
+    const sessionFiles = new SessionFiles(paths, clock);
+    await registry.add({
+      id: ID_A,
+      repository: 'acme/api',
+      configPath: '.devcontainer/devcontainer.json',
+      volumeName: 'devenv-acme-api-3f2a9c1e',
+      containerName: 'devenv-acme-api-3f2a9c1e',
+      createdAt: new Date(T0).toISOString(),
+      lastUsedAt: new Date(T0).toISOString(),
+      owner: { id: '1001', login: 'me' },
+    });
+    await sessionFiles.writeWindowStatus({ windowId: 'w1', pid: 999_991, environmentId: ID_A, state: 'closing', updatedAt: new Date(T0).toISOString() });
+    const cli = new FakeDockerCli();
+    cli.context = { Name: 'devenv-remote-11111111', Endpoints: { docker: { Host: 'ssh://build-box' } } };
+    const docker = new MonitorDockerClient({ runner: cli, env: { PATH: '/usr/bin' }, platform: 'linux', logger: silentLogger, clock, findDocker: () => DOCKER });
+    const loop = new MonitorLoop({
+      registry,
+      sessionFiles,
+      docker,
+      logger: silentLogger,
+      clock,
+      isAlive: () => false,
+      refreshLock: () => true,
+      delay: async (ms) => {
+        now += ms;
+      },
+    });
+    expect(await loop.run()).toBe('idle');
+    expect(cli.calls.map((call) => call.args[0])).not.toContain('stop');
+    expect(cli.calls.map((call) => call.args[0])).not.toContain('exec');
   });
 });

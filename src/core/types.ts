@@ -140,6 +140,12 @@ export interface Environment {
    * Monitor never stops this environment when no window uses it; only the user's Stop or Delete does. Missing or false: the container stops after the waiting time, as the setting stopOnClose says.
    */
   keepRunning?: boolean;
+  /**
+   * Unit 7: the Docker host of the environment, the part after `ssh://` of the Docker context in which it was created
+   * (an SSH alias or `user@host[:port]`). Missing: the local Docker. The view, the switcher, the status bar, and every
+   * command show and act on the environments of the current Docker host only.
+   */
+  dockerHost?: string;
 }
 
 /**

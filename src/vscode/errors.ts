@@ -111,6 +111,10 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   unencryptedDockerConnection: ['showDetails'],
   otherAccount: [],
   cancelled: [],
+  // Unit 7: never Start Docker or Install Docker… for a remote host.
+  dockerHostUnreachable: 'retry',
+  dockerEndpointUnsupported: ['showDetails'],
+  otherDockerHost: ['showDetails'],
 };
 
 /** Situations that the user can resolve, rather than failures. */
@@ -121,6 +125,8 @@ const WARNINGS = new Set<UserErrorCode>([
   'hostAccess',
   'unencryptedDockerConnection',
   'otherAccount',
+  'dockerEndpointUnsupported',
+  'otherDockerHost',
 ]);
 
 function runAction(action: ErrorAction, options: ShowErrorOptions): void {

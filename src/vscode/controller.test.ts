@@ -21,6 +21,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import { availableEnvironments } from '../core/ownership';
+import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
@@ -258,7 +259,16 @@ interface Harness {
   clock: { now: () => number };
 }
 
-function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number; disconnectAnswerMs?: number } = {}): Harness {
+function createHarness(
+  options: {
+    handOffCheckMs?: number;
+    leaveCheckMs?: number;
+    disconnectAnswerMs?: number;
+    /** Unit 7: the current Docker host and the remote Docker commands. Default: none (the local Docker). */
+    dockerTargets?: ControllerDeps['dockerTargets'];
+    remoteDocker?: ControllerDeps['remoteDocker'];
+  } = {},
+): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const clock = { now: () => NOW };
   const paths = new StoragePaths(root);
@@ -370,6 +380,8 @@ function createHarness(options: { handOffCheckMs?: number; leaveCheckMs?: number
     dockerSetup,
     repositoryGroupsEditor,
     viewVisible: () => false,
+    dockerTargets: options.dockerTargets,
+    remoteDocker: options.remoteDocker,
     clock,
     isAlive: (pid: number) => alive.has(pid),
     timing: {
@@ -555,7 +567,8 @@ describe('Controller commands', () => {
     // Stop When Closed.
     // 26 since the Docker setup walkthrough was removed (user decision 2026-09-27): no Install Docker… command.
     // 27 with Show Docker Setup (hidden), the action Install Docker… of an error: it looks for the CLI, then shows the view.
-    expect(declared).toHaveLength(27);
+    // 29 since unit 7: Use a Remote Docker Host… and Use the Local Docker.
+    expect(declared).toHaveLength(29);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -1575,6 +1588,20 @@ describe('Sign in and Refresh', () => {
     fs.writeFileSync(h.paths.registry, '{ "version": 1, "environments": [ { "id": ');
     await run('refresh');
     expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the check of the Docker target and of a running Docker to the restore itself (review, D2)', async () => {
+    // Before, the controller asked `docker info` first, on any endpoint (also one that is neither local nor SSH).
+    fs.writeFileSync(h.paths.registry, '{ "version": 1, "environments": [ { "id": ');
+    h.docker.isRunning.mockClear();
+    let runningAsked = 0;
+    h.service.reconcileFromVolumes.mockImplementation(async () => {
+      runningAsked = h.docker.isRunning.mock.calls.length;
+      return 0;
+    });
+    await run('refresh');
+    expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
+    expect(runningAsked).toBe(0);
   });
 
   it('does not restore from the volumes while registry.json is valid', async () => {
@@ -3060,5 +3087,147 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
       scope: 'application',
       default: false,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Unit 7: Docker on another computer through the Docker context.
+
+describe('the Docker host of the current Docker context (unit 7)', () => {
+  const REMOTE_ENV_ID = 'a1b2c3d4-0000-4000-8000-00000000000b';
+  let current: DockerTarget;
+  let operations: DockerTarget[];
+  let resolves: number;
+  let depth = 0;
+  let remote: { useRemoteHost: ReturnType<typeof vi.fn>; useLocalDocker: ReturnType<typeof vi.fn>; offerSwitchBack: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    h.controller.dispose();
+    fs.rmSync(h.root, { recursive: true, force: true });
+    current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    operations = [];
+    resolves = 0;
+    depth = 0;
+    remote = { useRemoteHost: vi.fn(async () => {}), useLocalDocker: vi.fn(async () => {}), offerSwitchBack: vi.fn(async () => false) };
+    const dockerTargets = {
+      resolve: vi.fn(async () => {
+        resolves++;
+        return current;
+      }),
+      // As DockerTargets.current: the target of the running operation, else a fresh read.
+      current: vi.fn(async () => (depth > 0 ? operations[operations.length - 1] : current)),
+      // As DockerTargets.withOperation: a nested operation keeps the target of the outer one.
+      withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => {
+        if (depth > 0) return fn();
+        operations.push(current);
+        depth++;
+        try {
+          return await fn();
+        } finally {
+          depth--;
+        }
+      }),
+    };
+    h = createHarness({ dockerTargets: dockerTargets as unknown as ControllerDeps['dockerTargets'], remoteDocker: remote });
+  });
+
+  function remoteEnvironment(overrides: Partial<Environment> = {}): Environment {
+    return environment({
+      id: REMOTE_ENV_ID,
+      containerName: 'devenv-acme-api-a1b2c3d4',
+      volumeName: 'devenv-acme-api-a1b2c3d4',
+      dockerHost: 'build-box',
+      ...overrides,
+    });
+  }
+
+  it('registers both commands and runs them without an operation of their own', async () => {
+    await run('useRemoteDockerHost');
+    await run('useLocalDocker');
+    expect(remote.useRemoteHost).toHaveBeenCalledTimes(1);
+    expect(remote.useLocalDocker).toHaveBeenCalledTimes(1);
+    expect(operations).toEqual([]);
+  });
+
+  it('runs every other command as one operation on the host that is current when it starts', async () => {
+    await h.registry.add(environment());
+    await run('stop', row('acme/api', environment()));
+    expect(operations).toHaveLength(1);
+    expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
+  });
+
+  it('Start of a repository uses the environment of the current host only (D-3 with the Docker host)', async () => {
+    await h.registry.add(remoteEnvironment());
+    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+    await run('start', row('acme/api', undefined, repositoryInfo('acme/api')));
+    // The local Docker is current: the service opens the repository (a new environment), not the one on build-box.
+    expect(h.service.open).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('a restored window of the current host opens as before, without a question', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(remote.offerSwitchBack).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
+    expect(operations.map((target) => target.host)).toEqual(['build-box']);
+  });
+
+  it('a restored window of another host asks "Use <host> again?"; declined, it runs nothing and closes its connection', async () => {
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    fakeVscode.window.showWarningMessage.mockResolvedValue(undefined);
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(remote.offerSwitchBack).toHaveBeenCalledWith('build-box', current);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.docker.exec).not.toHaveBeenCalled();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.otherDockerHost('acme/api', 'build-box', ''));
+    expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
+  });
+
+  it('a restored window of another host continues after the switch back', async () => {
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    remote.offerSwitchBack.mockImplementation(async () => {
+      current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+      return true;
+    });
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    // The pipeline runs on the host that the switch selected.
+    expect(operations.map((target) => target.host)).toEqual(['build-box']);
+  });
+
+  it('role B: a pending operation of another host is not run; the reopen rule skips its environment', async () => {
+    await h.registry.add(remoteEnvironment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    await h.sessionFiles.writeOperation({
+      environmentId: REMOTE_ENV_ID,
+      operation: 'stop',
+      requestedAt: iso(NOW - 5000),
+      requestedBy: 'old-window',
+      reason: 'manual',
+    });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(h.logger.info).toHaveBeenCalledWith(`The pending stop of ${REMOTE_ENV_ID} is for another Docker host. It is not run.`);
+
+    await h.sessionFiles.removeOperation(REMOTE_ENV_ID).catch(() => {});
+    h.sessionFiles.writeReopenSync({ environmentId: REMOTE_ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.controller.runEmptyWindowTasks();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('reads the Docker context again for the next operation (a switch while VS Code runs takes effect)', async () => {
+    await h.registry.add(environment());
+    await run('stop', row('acme/api', environment()));
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    await run('stop', row('acme/api', environment()));
+    expect(operations.map((target) => target.host)).toEqual(['', 'build-box']);
   });
 });

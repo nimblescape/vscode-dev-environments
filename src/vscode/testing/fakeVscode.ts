@@ -115,6 +115,7 @@ export const fakeVscode = {
     showWarningMessage: vi.fn(),
     showErrorMessage: vi.fn(),
     showQuickPick: vi.fn(),
+    showInputBox: vi.fn(),
     createQuickPick: vi.fn(),
     withProgress: vi.fn(),
     createTerminal: vi.fn(),
@@ -156,6 +157,7 @@ export function resetFakeVscode(): void {
   window.showWarningMessage.mockResolvedValue(undefined);
   window.showErrorMessage.mockResolvedValue(undefined);
   window.showQuickPick.mockResolvedValue(undefined);
+  window.showInputBox.mockResolvedValue(undefined);
   fakeVscode.env.openExternal.mockResolvedValue(true);
   fakeVscode.commands.executeCommand.mockResolvedValue(undefined);
   fakeVscode.commands.registerCommand.mockImplementation(() => ({ dispose() {} }));

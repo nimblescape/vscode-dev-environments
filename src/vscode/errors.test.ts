@@ -106,6 +106,32 @@ describe('showError (concept 6.5)', () => {
     expect(showLog).not.toHaveBeenCalled();
   });
 
+  // Unit 7: a remote Docker host that cannot be reached gets its own message, never Start Docker or Install Docker….
+  it('offers Show details and Try again, not Start Docker or Install Docker…, for an unreachable remote host', async () => {
+    const { logger } = recordingLogger();
+    const retry = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.tryAgain);
+    const message = Messages.dockerHostUnreachable('build-box', 'The computer does not answer.');
+    showError(new UserFacingError('dockerHostUnreachable', message, 'ssh: connect to host build-box port 22: Connection timed out'), {
+      logger,
+      showLog: vi.fn(),
+      retry,
+    });
+    expect(shown()).toEqual({ severity: 'error', message: 'The Docker host build-box cannot be reached. The computer does not answer.', actions: ['Show details', 'Try again'] });
+    await flush();
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['dockerEndpointUnsupported', Messages.dockerEndpointUnsupported('tcp://box:2376')],
+    ['otherDockerHost', Messages.otherDockerHost('acme/api', 'build-box', '')],
+  ] as const)('shows %s as a warning with Show details', (code, message) => {
+    const { logger } = recordingLogger();
+    showError(new UserFacingError(code, message), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message, actions: ['Show details'] });
+  });
+
   it('offers only Show details when the caller cannot retry', async () => {
     const { logger } = recordingLogger();
     const showLog = vi.fn();

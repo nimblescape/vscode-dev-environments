@@ -9,6 +9,8 @@
 import * as path from 'path';
 import { isBusyMarkLive } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
+import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import {
@@ -315,8 +317,22 @@ export interface EnvironmentServiceDeps {
    * ghcr.io (githubPackagesPullCredentials). Default: none, Docker pulls with its own credentials.
    */
   pullCredentials?: PullCredentialsProvider;
-  /** Default: `ensureDockerRunning` with `docker` (then it must be a ContainerAdapter) and `runner`. */
+  /**
+   * Default: `ensureDockerRunning` with `docker` (then it must be a ContainerAdapter) and `runner`. Unit 7: the extension
+   * gives a starter that follows the current Docker context (startDockerOn): no Docker Desktop start for a remote host.
+   */
   startDocker?: DockerStarter;
+  /**
+   * Unit 7: the Docker host of the operation ('' = the local Docker; DockerTargets.host). New environments record it;
+   * only environments of this host are opened, restored, or changed. Default: the local Docker.
+   */
+  dockerHost?: () => Promise<string>;
+  /**
+   * Unit 7, review D2: the Docker target of the operation (DockerTargets.current), with its kind. When given, it decides
+   * instead of `dockerHost`: an endpoint that is neither local nor SSH ('unsupported') is refused by every operation
+   * (dockerEndpointUnsupported) and never read or recorded.
+   */
+  dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
   /**
@@ -844,6 +860,8 @@ function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefin
  */
 export class EnvironmentService {
   private readonly queues = new Map<string, Promise<void>>();
+  /** Review D2: the endpoints (neither local nor SSH) whose refusal the reads showed already: once each. */
+  private readonly refusedEndpoints = new Set<string>();
   /**
    * Git identity per account ID (identityOf): the question to GitHub, shared by the opens of this window. After a failed
    * question, `retryAfter` is the time from which GitHub is asked again.
@@ -881,7 +899,7 @@ export class EnvironmentService {
       try {
         // The account decides which environment is used, and the token of the same session goes into it.
         const session = await this.requireSession();
-        const existing = await this.deps.registry.findForAccount(target.repository, session.account.id);
+        const existing = await this.deps.registry.findForAccount(target.repository, session.account.id, await this.currentDockerHost());
         if (existing) {
           if (options.branch !== undefined) {
             this.logger.info(`The branch ${options.branch} applies only to a first open; use Switch branch for an environment.`);
@@ -899,6 +917,7 @@ export class EnvironmentService {
   async openEnvironment(environmentId: string, options: OpenOptions): Promise<OpenResult> {
     const environment = await this.deps.registry.get(environmentId);
     if (!environment) throw environmentMissing();
+    await this.requireCurrentHost(environment);
     return this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
       try {
         const current = await this.deps.registry.get(environmentId);
@@ -928,8 +947,9 @@ export class EnvironmentService {
     // Concept 7.5 "registry lost", D-3: a labeled volume of this repository and account that the registry lacks holds the
     // work of the user. It becomes the environment again; a second environment would hide it. Docker runs now, so the
     // volumes are read also when the registry was lost while Docker was stopped, or when registry.json is invalid.
+    const dockerHost = await this.currentDockerHost();
     if ((await this.reconcileFromVolumes()) > 0) {
-      const restored = await this.deps.registry.findForAccount(target.repository, session.account.id);
+      const restored = await this.deps.registry.findForAccount(target.repository, session.account.id, dockerHost);
       if (restored) {
         this.logger.info(`An environment of ${target.repository} was restored from its volume ${restored.volumeName}. It is used.`);
         if (options.branch !== undefined) {
@@ -953,13 +973,15 @@ export class EnvironmentService {
       busy: this.busyMark('create'),
       // The environment belongs to the account that creates it (concept 7.5, section 9 "Accounts").
       owner: ownerOf(session.account),
+      // Unit 7: and to the Docker host of the operation.
+      ...dockerHostField(dockerHost),
     };
     try {
       await this.deps.registry.add(environment);
     } catch (error) {
       // One environment per repository and account (concept D-3): another window of the account may have created it
       // right now.
-      const other = await this.deps.registry.findForAccount(target.repository, session.account.id);
+      const other = await this.deps.registry.findForAccount(target.repository, session.account.id, dockerHost);
       if (!other) throw error;
       this.logger.info(`An environment of ${target.repository} was created in the meantime. It is used.`);
       return this.openExisting(other, options, target.defaultBranch ?? undefined, session);
@@ -2964,7 +2986,7 @@ export class EnvironmentService {
    */
   async repositoryServiceData(environmentId: string): Promise<string[]> {
     const env = await this.deps.registry.get(environmentId);
-    if (!env) return [];
+    if (!env || !(await this.isOnCurrentHost(env))) return [];
     let folders: string[];
     try {
       folders = (await this.serviceFolderFacts(env, [])).folders;
@@ -3785,6 +3807,7 @@ export class EnvironmentService {
       this.logger.info(`Stop: the environment ${environmentId} does not exist.`);
       return;
     }
+    await this.requireCurrentHost(environment);
     await this.requireOwnAccount(environment, false);
     await this.exclusive(repositoryKey(environment.repository), undefined, async () => {
       if (!(await this.deps.docker.isRunning())) {
@@ -3955,6 +3978,7 @@ export class EnvironmentService {
   async safetyCheck(environmentId: string, options: OperationOptions): Promise<GitSummary | undefined> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return undefined;
+    await this.requireCurrentHost(env);
     const steps = new StepReporter(options.progress, this.logger);
     try {
       await this.requireOwnAccount(env, true);
@@ -3986,6 +4010,7 @@ export class EnvironmentService {
       await this.removeEnvironmentFiles(environmentId);
       return;
     }
+    await this.requireCurrentHost(environment);
     await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
       try {
         const current = await this.deps.registry.get(environmentId);
@@ -4049,6 +4074,7 @@ export class EnvironmentService {
   async switchBranch(environmentId: string, branch: string, options: OperationOptions): Promise<void> {
     const environment = await this.deps.registry.get(environmentId);
     if (!environment) throw environmentMissing();
+    await this.requireCurrentHost(environment);
     await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
       const steps = new StepReporter(options.progress, this.logger);
       let busy = false;
@@ -4104,6 +4130,7 @@ export class EnvironmentService {
   async configurationChanged(environmentId: string, options: OperationOptions): Promise<boolean | ConfigurationKindChange> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return false;
+    await this.requireCurrentHost(env);
     const record = env.buildRecord;
     if (!record) return this.configurationKindChange(env, options);
     const steps = new StepReporter(options.progress, this.logger);
@@ -4237,6 +4264,7 @@ export class EnvironmentService {
   async listConfigurations(environmentId: string, options: OperationOptions): Promise<string[]> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return [];
+    await this.requireCurrentHost(env);
     const steps = new StepReporter(options.progress, this.logger);
     try {
       await this.requireOwnAccount(env, true);
@@ -4248,13 +4276,20 @@ export class EnvironmentService {
     }
   }
 
-  /** Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. */
+  /**
+   * Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. Review
+   * D2: no Docker call at all on an endpoint that is neither local nor SSH; its (empty) map of states.
+   */
   async inspectStates(): Promise<Map<string, EnvironmentRuntimeState> | undefined> {
     const { docker } = this.deps;
     try {
+      const readable = await this.readableDockerHost();
+      if (readable === undefined) return new Map();
       if (!(await docker.isRunning())) return undefined;
+      // Unit 7: only the environments of the current Docker host; the others are hidden.
+      const dockerHost = readable;
       const [environments, containers, volumes] = await Promise.all([
-        this.deps.registry.list(),
+        this.deps.registry.list().then((list) => environmentsOfHost(list, dockerHost)),
         docker.listEnvironmentContainers(),
         docker.listEnvironmentVolumes(),
       ]);
@@ -4292,7 +4327,7 @@ export class EnvironmentService {
   /** Current branch from the running container (`git branch --show-current` through `docker exec`). */
   async currentBranch(environmentId: string): Promise<string | undefined> {
     const env = await this.deps.registry.get(environmentId);
-    if (!env) return undefined;
+    if (!env || !(await this.isOnCurrentHost(env))) return undefined;
     const branch = await this.branchInContainer(env.containerName, env.remoteUser, repositoryFolder(env.repository));
     return branch ?? undefined;
   }
@@ -4309,7 +4344,12 @@ export class EnvironmentService {
    */
   async reconcileFromVolumes(): Promise<number> {
     const { docker } = this.deps;
+    // Review D2: never on an endpoint that is neither local nor SSH (it would be recorded as the host of the entries).
+    const readable = await this.readableDockerHost();
+    if (readable === undefined) return 0;
     if (!(await docker.isRunning())) return 0;
+    // Unit 7: the volumes of the current Docker host only; the restored entries record it.
+    const dockerHost = readable;
     const volumes = await docker.listEnvironmentVolumes();
     const now = isoTime(this.deps.clock);
     const candidates: Environment[] = [];
@@ -4344,6 +4384,7 @@ export class EnvironmentService {
         createdAt: now,
         lastUsedAt: now,
         owner: { id: ownerId, login: '' },
+        ...dockerHostField(dockerHost),
       });
     }
     if (candidates.length === 0) return 0;
@@ -4399,7 +4440,7 @@ export class EnvironmentService {
       let count = 0;
       for (const candidate of candidates) {
         if (file.environments.some((e) => e.id === candidate.id || e.volumeName === candidate.volumeName)) continue;
-        if (file.environments.some((e) => isEnvironmentOf(e, candidate.repository, candidate.owner.id))) {
+        if (file.environments.some((e) => isEnvironmentOf(e, candidate.repository, candidate.owner.id, dockerHost))) {
           skipped.push(candidate.volumeName);
           continue;
         }
@@ -4437,6 +4478,62 @@ export class EnvironmentService {
 
   // -------------------------------------------------------------------------------------------------------------------
   // Steps and helpers
+
+  /**
+   * Unit 7, review D2: the one check of the Docker target of the service. The target of the operation (dockerTarget),
+   * else the host of `dockerHost` (local or SSH).
+   */
+  private async dockerTarget(): Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>> {
+    if (this.deps.dockerTarget) return this.deps.dockerTarget();
+    const host = (await this.deps.dockerHost?.()) ?? '';
+    return { kind: host === '' ? 'local' : 'remote', host, endpoint: '' };
+  }
+
+  /**
+   * Unit 7: the Docker host of the operation ('' = the local Docker). Review D2: an endpoint that is neither local nor
+   * SSH is refused (UserFacingError dockerEndpointUnsupported), so no operation reaches it or records it.
+   */
+  private async currentDockerHost(): Promise<string> {
+    const target = await this.dockerTarget();
+    if (target.kind === 'unsupported') {
+      this.logger.warn(`The Docker endpoint ${target.endpoint || target.host} is neither local nor SSH. Nothing is done.`);
+      throw dockerEndpointUnsupported(target.endpoint || target.host);
+    }
+    return target.host;
+  }
+
+  /**
+   * Review D2: the Docker host for the reads of the view and the restore (states, branch, volumes): undefined on an
+   * endpoint that is neither local nor SSH, and the reads do nothing then. The message is shown once per endpoint.
+   */
+  private async readableDockerHost(): Promise<string | undefined> {
+    const target = await this.dockerTarget();
+    if (target.kind !== 'unsupported') return target.host;
+    const endpoint = target.endpoint || target.host;
+    if (!this.refusedEndpoints.has(endpoint)) {
+      this.refusedEndpoints.add(endpoint);
+      this.logger.warn(`The Docker endpoint ${endpoint} is neither local nor SSH. Its containers and volumes are not read.`);
+      this.deps.ui.warn(Messages.dockerEndpointUnsupported(endpoint));
+    }
+    return undefined;
+  }
+
+  private async isOnCurrentHost(environment: Environment): Promise<boolean> {
+    const host = await this.readableDockerHost();
+    return host !== undefined && isOnDockerHost(environment, host);
+  }
+
+  /**
+   * Unit 7: an environment of another Docker host is never acted on (no clone, restore, recreation, deletion, stop, or
+   * token write there): UserFacingError('otherDockerHost').
+   */
+  private async requireCurrentHost(environment: Environment): Promise<void> {
+    const host = await this.currentDockerHost();
+    if (isOnDockerHost(environment, host)) return;
+    const environmentHost = dockerHostOf(environment);
+    this.logger.warn(`${environment.repository}: the environment is on the Docker host ${environmentHost || '(local)'}, and Docker is set to ${host || '(local)'}. Nothing is done.`);
+    throw new UserFacingError('otherDockerHost', Messages.otherDockerHost(environment.repository, environmentHost, host));
+  }
 
   private async startDocker(steps: StepReporter, signal: AbortSignal | undefined): Promise<void> {
     this.throwIfCancelled(signal);
@@ -4679,7 +4776,7 @@ export class EnvironmentService {
    */
   private async removableVolumesByKind(environmentId: string): Promise<Array<{ name: string; kind: string | undefined; possibly?: boolean }>> {
     const env = await this.deps.registry.get(environmentId);
-    if (!env || (env.additionalVolumes ?? []).length === 0) return [];
+    if (!env || (env.additionalVolumes ?? []).length === 0 || !(await this.isOnCurrentHost(env))) return [];
     try {
       const { removable, labels } = await this.removableVolumes(env, env.additionalVolumes ?? []);
       const services = new Set(env.serviceVolumes ?? []);

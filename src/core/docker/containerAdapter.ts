@@ -16,6 +16,7 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
   abortError,
   isAbortError,
+  sleep,
   systemClock,
   type Clock,
   type Credentials,
@@ -26,6 +27,8 @@ import {
 } from '../ports';
 import type { ContainerState } from '../types';
 import { dockerProcessEnv, envValue } from './dockerCli';
+import { isSshClosedBeforeLogin } from './dockerHost';
+import { operationDockerTarget } from './dockerTargets';
 
 export interface ContainerInfo {
   id: string;
@@ -119,6 +122,57 @@ const INSPECT_BATCH_SIZE = 50;
  */
 export const DOCKER_CLI_LOOKUP_RETRY_MS = 10_000;
 
+/**
+ * Unit 7: the wait before the one repetition of a Docker call that only reads, after the SSH server of a remote Docker
+ * host closed the connection before the login (see sshDroppedReadCall).
+ */
+export const SSH_DROP_RETRY_DELAY_MS = 1_000;
+
+/** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */
+const GLOBAL_OPTIONS_WITH_VALUE = new Set(['-H', '--host', '-c', '--context', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']);
+
+/** Docker commands that only read: `docker <command>`, or `docker <object> <command>`. */
+const READ_ONLY_COMMANDS = new Set(['info', 'version', 'ps', 'images', 'inspect']);
+const READ_ONLY_OBJECT_COMMANDS: Record<string, readonly string[]> = {
+  container: ['inspect', 'ls', 'list', 'ps'],
+  image: ['inspect', 'ls', 'list', 'history'],
+  volume: ['inspect', 'ls', 'list'],
+  network: ['inspect', 'ls', 'list'],
+  context: ['inspect', 'ls', 'list', 'show'],
+  system: ['info', 'df'],
+};
+
+/**
+ * True for a Docker call that only reads (inspect, ls, ps, info, version…), which may run again without any effect.
+ * Everything else (create, run, exec, start, stop, rm, build, pull, …) is never repeated.
+ */
+export function isReadOnlyDockerCall(args: readonly string[]): boolean {
+  const [command, subcommand] = dockerCommandWords(args);
+  if (command === undefined) return false;
+  if (READ_ONLY_COMMANDS.has(command)) return true;
+  return READ_ONLY_OBJECT_COMMANDS[command]?.includes(subcommand ?? '') ?? false;
+}
+
+/** The first two words after the global options of the Docker CLI (`docker -H ssh://box image inspect x` → image inspect). */
+function dockerCommandWords(args: readonly string[]): string[] {
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-')) i += GLOBAL_OPTIONS_WITH_VALUE.has(args[i]) ? 2 : 1;
+  return args.slice(i, i + 2);
+}
+
+/**
+ * Unit 7: true when a Docker call that only reads failed because the SSH server of the remote Docker host closed the
+ * connection before the login (the Docker CLI's `ssh … docker system dial-stdio` exited with 255, and ssh said nothing
+ * else, see isSshClosedBeforeLogin). The command never reached the engine then. The Docker CLI opens a new SSH connection
+ * for each call (up to five for one failing call), and sshd drops new connections at random while more than 10 are not
+ * logged in yet (MaxStartups 10:30:100), so a call is repeated once, after SSH_DROP_RETRY_DELAY_MS. A refusal of
+ * PerSourcePenalties lasts longer; the repetition fails too, and the error says why (DockerHostProblem closedBeforeLogin).
+ */
+export function sshDroppedReadCall(args: readonly string[], result: RunResult): boolean {
+  if (result.exitCode === 0 || result.timedOut || !isReadOnlyDockerCall(args)) return false;
+  return /\bdial-stdio\b[^\n]*exit status 255/.test(result.stderr) && isSshClosedBeforeLogin(result.stderr);
+}
+
 /** Credentials of one registry for one `docker pull` (for example the GitHub session for ghcr.io). */
 export interface RegistryLogin extends Credentials {
   /** Registry host, for example `ghcr.io`. */
@@ -145,6 +199,8 @@ export interface ContainerAdapterOptions {
    * seconds later (for example after Docker Desktop updated itself) would be found only 10 seconds later.
    */
   onCliLost?: () => void;
+  /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
+  sshDropRetryDelayMs?: number;
 }
 
 type ObjectKind = 'container' | 'volume' | 'image' | 'network';
@@ -466,6 +522,7 @@ export class ContainerAdapter {
   private readonly clock: Clock;
   private readonly onDaemonStatus: ContainerAdapterOptions['onDaemonStatus'];
   private readonly onCliLost: ContainerAdapterOptions['onCliLost'];
+  private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
 
   /**
@@ -490,6 +547,7 @@ export class ContainerAdapter {
     this.clock = options.clock ?? systemClock;
     this.onDaemonStatus = options.onDaemonStatus;
     this.onCliLost = options.onCliLost;
+    this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     // The caller has just looked the CLI up.
     this.lookedUpAt = this.clock.now();
   }
@@ -507,14 +565,26 @@ export class ContainerAdapter {
 
   /**
    * Raw call. Resolves also for a non-zero exit code. Throws UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled)
-   * without a CLI, or when the CLI cannot be started anymore (removed after it was found).
+   * without a CLI, or when the CLI cannot be started anymore (removed after it was found). A call that only reads is
+   * repeated once when the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall).
    */
   async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    const result = await this.runOnce(args, options);
+    if (!sshDroppedReadCall(args, result) || options.signal?.aborted) return result;
+    const command = dockerCommandWords(args).join(' ');
+    this.logger.warn(
+      `docker ${command}: the SSH server of the Docker host closed the connection before the login. Trying once more in ${this.sshDropRetryDelayMs / 1000} s.`,
+    );
+    await sleep(this.sshDropRetryDelayMs, options.signal);
+    return this.runOnce(args, options);
+  }
+
+  private async runOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
     this.lookUpCliIfMissing();
     const dockerPath = this.path;
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
-      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.env });
+      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv() });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
@@ -528,6 +598,26 @@ export class ContainerAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * The environment of a Docker call. Within an operation (unit 7, dockerTargets.ts) that read its Docker context, the
+   * call gets DOCKER_CONTEXT with that context's name, so the whole operation stays on the Docker host it started with,
+   * even when the user switches the context meanwhile. DOCKER_HOST is never set here; when it is set for VS Code, it
+   * decides the endpoint and the operation has no context name.
+   */
+  private operationEnv(): NodeJS.ProcessEnv {
+    const context = operationDockerTarget()?.context;
+    if (context === undefined) return this.env;
+    const env: NodeJS.ProcessEnv = { ...this.env };
+    deleteEnv(env, 'DOCKER_CONTEXT');
+    env.DOCKER_CONTEXT = context;
+    return env;
+  }
+
+  /** A copy of the environment of the Docker calls outside of an operation. */
+  processEnv(): NodeJS.ProcessEnv {
+    return { ...this.env };
   }
 
   /**
@@ -1066,7 +1156,7 @@ export class ContainerAdapter {
    * folder). A DOCKER_HOST that is set already stays. When the endpoint cannot be read, the default endpoint is used.
    */
   private async envForOwnConfig(signal: AbortSignal | undefined): Promise<NodeJS.ProcessEnv> {
-    const env: NodeJS.ProcessEnv = { ...this.env };
+    const env: NodeJS.ProcessEnv = { ...this.operationEnv() };
     if (!envValue(env, 'DOCKER_HOST', this.platform)) {
       const args = ['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'];
       const result = await this.run(args, { signal, timeoutMs: DOCKER_QUERY_TIMEOUT_MS });

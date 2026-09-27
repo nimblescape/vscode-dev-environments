@@ -11,13 +11,16 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
+import { ensureDockerRunning } from '../core/docker/dockerStart';
+import { DockerTargets } from '../core/docker/dockerTargets';
+import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
-import { WorkspaceHelper } from '../core/helper/workspaceHelper';
+import { DOCKER_SOCKET, WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
@@ -26,8 +29,10 @@ import { systemClock, type Logger } from '../core/ports';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
+import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
+import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
 import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
@@ -41,6 +46,7 @@ import { updateOwnersContextKey } from './ownerSelector';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
+import { RemoteDockerCommands } from './remoteDockerCommands';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
@@ -102,6 +108,13 @@ async function activateExtension(
   let dockerSetup: DockerSetup | undefined;
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload.
   const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, dockerAdapterOptions(() => dockerSetup));
+  // Unit 7: the Docker host is the current Docker context, read at the start of each operation.
+  const targets = new DockerTargets(docker, env, logger, platform);
+  const remoteState = new RemoteDockerState(paths.remoteDocker);
+  const sshPath = (): string | undefined => findExecutable('ssh', env, platform);
+  // Review, C3: the SSH check before the Docker calls to a remote host; a success counts for a minute per host.
+  const sshLogins = new SshLoginCache();
+  const remoteDeps = (): RemoteReachabilityDeps => ({ docker, runner, state: remoteState, logger, sshPath: sshPath(), env, sshLogins });
   const registry = new EnvironmentRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
@@ -132,6 +145,13 @@ async function activateExtension(
     // image check, with its own time limit of 5 seconds, in the background of the open.
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
+    // Unit 7: the engine of the operation. On a remote host the socket mount's source is a path of that computer: the
+    // recorded socket of a rootless engine, else /var/run/docker.sock.
+    engine: async () => {
+      const target = await targets.current();
+      if (target.kind !== 'remote') return { key: target.host, endpoint: target.endpoint };
+      return { key: target.host, socket: (await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
+    },
   });
   // One stored list per GitHub account (concept 6.2).
   const discovery = new DiscoveryService(
@@ -183,6 +203,17 @@ async function activateExtension(
     pullCredentials: githubPackagesPullCredentials(credentials.provider(), auth),
     // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
     analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
+    // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
+    // neither local nor SSH is refused by every operation and never read.
+    dockerTarget: () => targets.current(),
+    // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
+    startDocker: async ({ onStarting, signal }) =>
+      startDockerFor(
+        await targets.current(),
+        () => ensureDockerRunning(docker, runner, logger, { platform, env, onStarting, signal }),
+        remoteDeps(),
+        signal,
+      ),
   });
 
   const tree = new RepositoriesTreeProvider(logger);
@@ -206,8 +237,17 @@ async function activateExtension(
     onDidChangeInstalled: () => {
       sidebar.render().catch((error: unknown) => logger.error('Could not update the sidebar.', error));
     },
-    // Remote Docker hosts do not exist yet: unit 7 supplies this value (the only place that decides it).
-    remoteDockerHostConfigured: () => false,
+    // Unit 7: the current Docker context points to another computer (as last read). Without a Docker CLI no context can
+    // be read, so the setup shows as before.
+    remoteDockerHostConfigured: () => targets.last?.kind === 'remote',
+    // Unit 7: Start Docker never starts Docker Desktop for a remote host; it only checks that host.
+    startDocker: async (signal, onStarting) =>
+      startDockerFor(
+        await targets.current(),
+        () => ensureDockerRunning(docker, runner, logger, { platform, env, signal, onStarting }),
+        remoteDeps(),
+        signal,
+      ),
   });
   dockerSetup = setup;
   context.subscriptions.push(setup);
@@ -223,6 +263,7 @@ async function activateExtension(
     tree,
     settings: getSettings,
     dockerSetupRequired: () => setup.setupRequired,
+    dockerHost: () => targets.host(),
   });
   setup.initialize();
   const repositoryGroupsEditor = new RepositoryGroupsEditor({
@@ -253,6 +294,24 @@ async function activateExtension(
     repositoryGroupsEditor,
     viewVisible: () => view.visible,
     development: context.extensionMode === vscode.ExtensionMode.Development,
+    dockerTargets: targets,
+    remoteDocker: new RemoteDockerCommands({
+      docker,
+      runner,
+      targets,
+      state: remoteState,
+      logger,
+      showLog: () => logger.show(),
+      sshHosts: () => parseSshConfig(nodeSshConfigFiles, { home: os.homedir() }),
+      sshPath,
+      env,
+      platform,
+      sshLogins,
+      onDidSwitch: async () => {
+        await sidebar.render();
+        if (view.visible) await sidebar.refreshStates();
+      },
+    }),
   });
   context.subscriptions.push(
     sidebar,
@@ -357,7 +416,9 @@ async function findWindowEnvironment(
   try {
     const environment = await registry.findByContainerName(containerName);
     if (environment || !(await needsRestore())) return environment;
-    if (!docker.isInstalled() || !(await docker.isRunning())) return undefined;
+    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs.
+    if (!docker.isInstalled()) return undefined;
     if ((await service.reconcileFromVolumes()) === 0) return undefined;
     return await registry.findByContainerName(containerName);
   } catch (error) {

@@ -2,7 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
+import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
 import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
 
@@ -26,10 +27,34 @@ export class OutputTooLargeError extends Error {
  * which has no time limit) cannot fill the memory of the extension host.
  */
 export class NodeProcessRunner implements ProcessRunner {
+  private readonly platform: NodeJS.Platform;
+  private readonly killTree: (pid: number, fallback: () => void) => void;
+
   constructor(
     private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
     private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
-  ) {}
+    options: { platform?: NodeJS.Platform; killTree?: (pid: number, fallback: () => void) => void } = {},
+  ) {
+    this.platform = options.platform ?? process.platform;
+    this.killTree = options.killTree ?? ((pid, fallback) => runTaskkill(pid, process.env, fallback));
+  }
+
+  /**
+   * Stops `child` (time limit, abort, too much output). Review, C3: on Windows, the whole process tree
+   * (`taskkill /T /F /PID <pid>`): docker.exe starts ssh.exe, which a kill of docker.exe alone leaves running. Elsewhere
+   * the signal of `child.kill()` as before.
+   */
+  private stop(child: ChildProcess): void {
+    if (this.platform === 'win32' && child.pid !== undefined) {
+      try {
+        this.killTree(child.pid, () => child.kill());
+        return;
+      } catch {
+        // Below: at least the program itself.
+      }
+    }
+    child.kill();
+  }
 
   run(file: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     return new Promise((resolve, reject) => {
@@ -75,7 +100,7 @@ export class NodeProcessRunner implements ProcessRunner {
         if (stdoutBytes > this.maxStdoutBytes) {
           tooLarge = true;
           stdout = '';
-          child.kill();
+          this.stop(child);
           return;
         }
         onStdout(stdoutDecoder.decode(chunk, { stream: true }));
@@ -86,12 +111,12 @@ export class NodeProcessRunner implements ProcessRunner {
         options.timeoutMs !== undefined
           ? setTimeout(() => {
               timedOut = true;
-              child.kill();
+              this.stop(child);
             }, options.timeoutMs)
           : undefined;
       const onAbort = () => {
         aborted = true;
-        child.kill();
+        this.stop(child);
       };
       options.signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -131,4 +156,23 @@ export class NodeProcessRunner implements ProcessRunner {
       else child.stdin.end();
     });
   }
+}
+
+/**
+ * The command that ends the process `pid` and all processes that it started, on Windows: `taskkill /T /F /PID <pid>`
+ * (taskkill of Windows: /T the tree, /F by force), from the System32 folder of Windows (SystemRoot), never through a
+ * shell or a PATH lookup.
+ */
+export function windowsTreeKillCommand(pid: number, env: NodeJS.ProcessEnv): { file: string; args: string[] } {
+  const root = Object.keys(env).find((key) => key.toUpperCase() === 'SYSTEMROOT');
+  const systemRoot = (root !== undefined ? env[root] : undefined) || 'C:\\Windows';
+  return { file: path.win32.join(systemRoot, 'System32', 'taskkill.exe'), args: ['/T', '/F', '/PID', String(Math.trunc(pid))] };
+}
+
+function runTaskkill(pid: number, env: NodeJS.ProcessEnv, fallback: () => void): void {
+  const { file, args } = windowsTreeKillCommand(pid, env);
+  const killer = spawn(file, args, { shell: false, windowsHide: true, stdio: 'ignore' });
+  // taskkill could not be started: at least the program itself. A taskkill that fails (for example because the process
+  // ended already) changes nothing.
+  killer.on('error', fallback);
 }
