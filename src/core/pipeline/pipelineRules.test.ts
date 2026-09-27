@@ -22,6 +22,7 @@ import {
   isRepositoryName,
   isUnrestrictedContainer,
   isRootUser,
+  MAX_REFUSED_ITEMS_LENGTH,
   lifecycleHookFailure,
   lifecycleHookName,
   needsBuild,
@@ -142,6 +143,16 @@ describe('refused updates (concept 7.7: a new image that the host access policy 
     expect(refusedUpdateOf({ refusedUpdate: { ...refused, images: { a: 1 } } })).toBeUndefined();
     expect(refusedUpdateOf({ refusedUpdate: { ...refused, items: undefined } })).toBeUndefined();
     expect(refusedUpdateOf({ refusedUpdate: 'x' })).toBeUndefined();
+  });
+
+  it('bounds the items of a stored refusal when they are read (hotfix review 4, Q3)', () => {
+    // 100 KB, as an older version stored them.
+    const items = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
+    const read = refusedUpdateOf({ refusedUpdate: { ...refused, items } });
+    expect(read?.items).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
+    expect(read?.items.startsWith('bind mount /aaa')).toBe(true);
+    expect(read?.items.endsWith('aaa, and 20 more')).toBe(true);
+    expect(read).toEqual({ ...refused, items: read?.items });
   });
 
   it('recognizes the same update: same configuration and digests, ignoring the case of the digests', () => {

@@ -13,6 +13,7 @@
 // identity of the owner account, the integrity of the extension, and the options that the policy does not support stay
 // refused (`protected` and `unsupported`); an item whose class is not clear stays refused too.
 // Pure functions, no I/O.
+import * as path from 'path';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -788,6 +789,19 @@ export function isPathSource(source: string): boolean {
   return /[\\/]/.test(source) || source.startsWith('.') || source.startsWith('~') || /^[A-Za-z]:/.test(source);
 }
 
+/**
+ * The source of a bind mount as an item shows it (hotfix review 4, Q2): normalized (`.` and `..` resolved, repeated
+ * separators joined), a drive path (`C:\…`) as on Windows, any other as on posix; a relative path keeps a leading `./`.
+ * The item is truncated later (MAX_ITEM_LENGTH), which keeps only the start and the end: without the normalization, a
+ * source such as `/Users/me/proj/./././…/../../../Users/me/.ssh/./././…` would hide in the middle what Docker mounts.
+ */
+export function shownBindSource(source: string): string {
+  if (/^[A-Za-z]:/.test(source)) return path.win32.normalize(source);
+  const normalized = path.posix.normalize(source);
+  if (source.startsWith('/') || /^[./~]/.test(normalized)) return normalized;
+  return `./${normalized}`;
+}
+
 /** What the mounts of an environment may use besides the rules of volumeNameProblems. */
 interface VolumeContext {
   /** The workspace volume of the environment. */
@@ -818,7 +832,7 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
   const source = mount.source ?? '';
   const type = mountType(mount);
   if (type === 'tmpfs') return [];
-  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${source}` : 'bind mount')];
+  if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${shownBindSource(source)}` : 'bind mount')];
   if (type === 'npipe') return [access(`mount of the type ${type}`)];
   if (type !== 'volume') return [guarded(`mount of the type ${type}`)];
   const options: Problem[] = [];
@@ -1026,7 +1040,7 @@ function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
   if (left.length > 0) return [unsupported(`volume ${JSON.stringify(value)} uses ${listedVariables(left)}, which cannot be checked`)];
   const source = volumeFlagSource(value);
   if (source === undefined) return [];
-  if (isPathSource(source)) return [access(`bind mount ${source}`)];
+  if (isPathSource(source)) return [access(`bind mount ${shownBindSource(source)}`)];
   return volumeNameProblems(source, volumes);
 }
 

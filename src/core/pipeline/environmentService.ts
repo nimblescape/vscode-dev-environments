@@ -112,6 +112,7 @@ import {
   nonEmptyString,
   recordDigests,
   refusedUpdateOf,
+  MAX_REFUSED_ITEMS_LENGTH,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
@@ -292,11 +293,8 @@ export interface EnvironmentRuntimeState {
   volume: boolean;
 }
 
-/**
- * The most characters of the text `items` of a refused update (hotfix review 3, C3-2): it is kept in the registry, and
- * an error message that is no HostAccessError has no bound of its own. The middle is `…` (truncated).
- */
-export const MAX_REFUSED_ITEMS_LENGTH = 4096;
+/** MAX_REFUSED_ITEMS_LENGTH of ./pipelineRules (hotfix review 3, C3-2; review 4, Q3). */
+export { MAX_REFUSED_ITEMS_LENGTH };
 
 const BUSY_POLL_MS = 500;
 const DEFAULT_BUSY_WAIT_MS = 10_000;
@@ -1153,6 +1151,9 @@ export class EnvironmentService {
       const refused = refusedUpdateOf(entry);
       if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
         delete entry.refusedUpdate;
+      } else if (refused !== undefined && entry.refusedUpdate !== undefined) {
+        // The items bounded as they are read (hotfix review 4, Q3): an older version stored them without a bound.
+        entry.refusedUpdate.items = refused.items;
       }
     });
   }

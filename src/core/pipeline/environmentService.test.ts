@@ -3020,6 +3020,29 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(items).toContain('…');
       expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
     });
+
+    it('bounds a stored refusal with long items when it is read, logged, shown, and kept (hotfix review 4, Q3)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      await h.service.openEnvironment(ENV_ID, options());
+      // 100 KB of items, as an older version stored them without a bound.
+      const long = `bind mount /${'a'.repeat(100 * 1024)}, and 20 more`;
+      await h.registry.updateEnvironment(ENV_ID, (e) => {
+        if (e.refusedUpdate) e.refusedUpdate.items = long;
+      });
+      h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+      h.ui.warnings.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.builds).toHaveLength(1);
+      expect(h.ui.warnings).toHaveLength(1);
+      expect(h.ui.warnings[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
+      expect(h.ui.warnings[0]).toContain('…');
+      const logged = h.logger.infos.filter((line) => line.includes('was refused by the host access policy'));
+      expect(logged).toHaveLength(1);
+      expect(logged[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
+      const stored = ((await refusedUpdate()) as { items: string }).items;
+      expect(stored).toHaveLength(MAX_REFUSED_ITEMS_LENGTH + 1);
+      expect(stored.endsWith(', and 20 more')).toBe(true);
+    });
   });
 
   it('binds published ports to 127.0.0.1 in the override configuration', async () => {

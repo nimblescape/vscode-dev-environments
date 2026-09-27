@@ -6,7 +6,7 @@
 import * as crypto from 'crypto';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
-import { runArgsUser } from '../helper/hostAccess';
+import { runArgsUser, truncated } from '../helper/hostAccess';
 import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessChecks } from '../hostAccessChecks';
@@ -55,7 +55,16 @@ export function isUnrestrictedContainer(labels: Readonly<Record<string, string>>
   return labels[LABEL_HOST_ACCESS] === HOST_ACCESS_UNRESTRICTED;
 }
 
-/** The field `refusedUpdate` of a registry entry, when it is valid. */
+/**
+ * The most characters of the text `items` of a refused update (hotfix review 3, C3-2): it is kept in the registry, and
+ * an error message that is no HostAccessError has no bound of its own. The middle is `…` (truncated).
+ */
+export const MAX_REFUSED_ITEMS_LENGTH = 4096;
+
+/**
+ * The field `refusedUpdate` of a registry entry, when it is valid. Its items at most MAX_REFUSED_ITEMS_LENGTH
+ * characters (hotfix review 4, Q3): an older version stored them without a bound, and they are logged and shown.
+ */
 export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
   const value: unknown = (entry as { refusedUpdate?: unknown }).refusedUpdate;
   if (
@@ -74,7 +83,7 @@ export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
     configHash: value.configHash,
     images: value.images,
     features: value.features,
-    items: value.items,
+    items: truncated(value.items, MAX_REFUSED_ITEMS_LENGTH),
   };
   if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
   return refused;
