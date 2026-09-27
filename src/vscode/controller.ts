@@ -639,8 +639,10 @@ export class Controller implements vscode.Disposable {
    * When Closed until a window connects again, or Stop or Delete. For an environment on a remote Docker host, one
    * heartbeat with the keep-running flag goes to the Session Monitor there first, so that it keeps the container also
    * when this computer goes offline; when it fails, the flag is cleared again, an error says so, and the window stays
-   * open. When the window is still open after LEAVE_CHECK_MS (Cancel in the dialog about unsaved files), the flag is
-   * cleared again.
+   * open. The flag stays until the next open or attach of the environment, or Stop or Delete, also when the user
+   * cancels the close (the dialog about unsaved files): `workbench.action.closeWindow` resolves when the close starts,
+   * not after that dialog, so the window cannot tell (review round 1 of PR #39, F1). A cancelled close leaves the
+   * environment kept until then: the safe side.
    */
   async closeAndKeepRunning(): Promise<void> {
     const current = this.current;
@@ -682,17 +684,9 @@ export class Controller implements vscode.Disposable {
     }
     this.logger.info(`${repository} keeps running this time. The window closes.`);
     await this.deps.connection.closeWindow();
-    // The window closes and this extension host ends: the check never runs then.
-    const timer = setTimeout(() => {
-      this.timers.delete(timer);
-      if (this.disposed || this.current?.environment.id !== environment.id) return;
-      this.logger.info(`The window of ${repository} stayed open. It stops when closed, as before.`);
-      this.background(this.clearKeepRunningOnce(environment.id), 'clear Close and Keep Running');
-    }, this.deps.timing?.leaveCheckMs ?? LEAVE_CHECK_MS);
-    this.timers.add(timer);
   }
 
-  /** Unit 7, PR 2: removes `keepRunningOnce` (a window connected again, or the close did not happen). Never throws. */
+  /** Unit 7, PR 2: removes `keepRunningOnce` (a window connected again, or the heartbeat failed). Never throws. */
   private async clearKeepRunningOnce(environmentId: string): Promise<void> {
     try {
       if ((await this.deps.registry.get(environmentId))?.keepRunningOnce === undefined) return;

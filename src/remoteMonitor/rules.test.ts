@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  FUTURE_RECORD_TOLERANCE_MS,
   RECORD_MAX_AGE_MS,
   REMOTE_GAP_MS,
   REMOTE_GRACE_MS,
@@ -155,6 +156,26 @@ describe('decide of the remote Session Monitor', () => {
       const later = decide({ now: T0 + 4000, containers: [container(A)], records, state: { ...first.state, lastTickAt: T0 + 3500 }, timing });
       expect(later.stop).toHaveLength(1);
     });
+  });
+
+  // Review round 1 of PR #39 (R1): a time in the future counts as now, and the record still counts.
+  it('takes a record with a time more than 5 minutes in the future as written when first seen, and lets it age', () => {
+    const future = [record(A, T0 + 365 * 24 * 60 * MINUTE, { limitSeconds: 60 })];
+    const first = decide({ now: T0, containers: [container(A)], records: future, state: running() });
+    expect(first.stop).toEqual([]);
+    // Not dropped (the environment is still acted on), and not fresh for ever: stopped once the limit passed since then.
+    const later = decide({ now: T0 + 2 * MINUTE, containers: [container(A)], records: future, state: { ...first.state, lastTickAt: T0 + 2 * MINUTE - REMOTE_TICK_MS } });
+    expect(later.stop.map((stop) => stop.environmentId)).toEqual([A]);
+    expect(later.stop[0].reason).toContain('2 minutes');
+  });
+
+  it('takes a record up to 5 minutes in the future as it is', () => {
+    const near = [record(A, T0 + FUTURE_RECORD_TOLERANCE_MS, { limitSeconds: 60 })];
+    const decision = decide({ now: T0, containers: [container(A)], records: near, state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.state.futureSeen).toBeUndefined();
+    const later = decide({ now: T0 + 5 * MINUTE, containers: [container(A)], records: near, state: running({}, T0 + 5 * MINUTE) });
+    expect(later.stop).toEqual([]);
   });
 
   describe('old records', () => {

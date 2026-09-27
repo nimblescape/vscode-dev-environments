@@ -106,6 +106,8 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['a volume of another environment by its labels', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'devenv.environment-id': 'other' } } }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['a volume of an environment of another account', input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`] }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['the cache volume of the workspace helper', input((m) => (m.volumes = { pgdata: { name: 'devenv-helper-cache' } })), 'volume devenv-helper-cache of the workspace helper', 'protected'],
+  // Review round 1 of PR #39 (R1).
+  ['the volume of the remote Session Monitor', input((m) => (m.volumes = { pgdata: { name: 'devenv-session-monitor' } })), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
   ['a network of another environment', input((m) => (m.networks = { other: { name: 'devenv-11111111_default', external: true } })), 'network devenv-11111111_default of another environment', 'protected'],
   ['network_mode of another environment', input(service('db', { network_mode: 'devenv-11111111_default' })), 'service db: network devenv-11111111_default of another environment', 'protected'],
   // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).

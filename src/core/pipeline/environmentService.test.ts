@@ -2211,7 +2211,7 @@ describe('reconcileFromVolumes', () => {
     const name = resourceName(REPO, OTHER_ID);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, ACCOUNT));
-    const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-acme-web-12345678'];
+    const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-session-monitor', 'devenv-acme-web-12345678'];
     const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);

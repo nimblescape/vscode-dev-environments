@@ -171,11 +171,14 @@ export function parseRecordsOutput(stdout: string): RecordsOutput | undefined {
 }
 
 /**
- * Shared engine (reviewer note of PR 2): true when a computer other than `ownSource` sent a heartbeat for the
- * environment less than OTHER_COMPUTER_FRESH_MS ago (by the clock of the remote host).
+ * Shared engine (reviewer note of PR 2): true when a computer other than `ownSource` keeps the environment running (a
+ * record with keepRunning, whatever its age; review round 1 of PR #39, F2), or sent a heartbeat for it less than
+ * OTHER_COMPUTER_FRESH_MS ago (by the clock of the remote host). Then this computer does not stop it.
  */
 export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): boolean {
-  return output.records.some((record) => record.source !== ownSource && Math.abs(output.now - record.at) < OTHER_COMPUTER_FRESH_MS);
+  return output.records.some(
+    (record) => record.source !== ownSource && (record.keepRunning || Math.abs(output.now - record.at) < OTHER_COMPUTER_FRESH_MS),
+  );
 }
 
 /** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script and the helper tag. */

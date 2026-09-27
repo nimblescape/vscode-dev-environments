@@ -3327,16 +3327,16 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
   });
 
-  it('clears the flag again when the window stayed open (Cancel in the dialog about unsaved files)', async () => {
+  // Review round 1 of PR #39 (F1): closeWindow resolves when the close starts, not after the dialog about unsaved files.
+  it('keeps the flag when the window stays open (Cancel in the dialog about unsaved files), until the next connect', async () => {
     recreateHarness({ leaveCheckMs: 10 });
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);
     await run('closeAndKeepRunning');
+    await pause(50);
     expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
-    await settle(() => h.logger.info.mock.calls.some((call) => String(call[0]).includes('stayed open')), 'the check of the window');
-    await vi.waitFor(async () => expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce'));
-    expect(h.logger.info).toHaveBeenCalledWith('The window of acme/api stayed open. It stops when closed, as before.');
+    expect(h.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('stayed open'));
   });
 
   it('a window that connects to the environment again clears the flag', async () => {

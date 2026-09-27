@@ -181,6 +181,8 @@ interface HeartbeatSeries {
   sentAt?: number;
   /** The last heartbeat failed (logged once per series). */
   failing: boolean;
+  /** The full sync of the series was sent (review round 1 of PR #39, R3; see sendHeartbeat). */
+  synced: boolean;
 }
 
 export class MonitorLoop {
@@ -510,9 +512,10 @@ export class MonitorLoop {
    * Unit 7, PR 2: the heartbeat to the Session Monitor on the SSH host of this tick. It reports the environments of that
    * host that are in use (rule 1) or kept (keptWhenClosed), with their keep-running flag, and once more without the flag
    * an environment that the last heartbeat reported as kept and that is kept no longer (so the remote monitor does not
-   * keep it for ever). It sends when an environment is new to the series, when a flag changed, or when the last
-   * successful heartbeat is REMOTE_HEARTBEAT_INTERVAL_MS old and an environment is in use or kept. A failure is logged
-   * once per series and tried again at the next tick. Never throws.
+   * keep it for ever). The first successful heartbeat of a series (a new process, or another host) is a full sync: it
+   * also reports every other environment of the host without the flag. It sends when an environment is new to the
+   * series, when a flag changed, or when the last successful heartbeat is REMOTE_HEARTBEAT_INTERVAL_MS old and an
+   * environment is in use or kept. A failure is logged once per series and tried again at the next tick. Never throws.
    */
   private async sendHeartbeat(
     target: DockerTarget,
@@ -523,7 +526,7 @@ export class MonitorLoop {
   ): Promise<void> {
     const source = this.deps.sourceId;
     if (source === undefined) return;
-    if (this.heartbeats?.host !== target.host) this.heartbeats = { host: target.host, sent: new Map(), failing: false };
+    if (this.heartbeats?.host !== target.host) this.heartbeats = { host: target.host, sent: new Map(), failing: false, synced: false };
     const series = this.heartbeats;
     const entries = new Map<string, boolean>();
     for (const environment of snapshot.monitorEnvironments) {
@@ -536,6 +539,16 @@ export class MonitorLoop {
     const known = new Set(snapshot.monitorEnvironments.map((environment) => environment.id));
     for (const [id, kept] of series.sent) {
       if (kept && !entries.has(id) && known.has(id) && entries.size < MAX_HEARTBEAT_ENVIRONMENTS) entries.set(id, false);
+    }
+    // Review round 1 of PR #39 (R3): the first heartbeat of a series (a new monitor process, or Docker set to this host
+    // again) also reports every other environment of the host without the flag. A record that an earlier process sent
+    // with the flag would otherwise keep an environment that is kept no longer for ever. A fresh record without the
+    // flag only restarts the time limit on the remote host; the local rules are unchanged.
+    if (!series.synced) {
+      for (const environment of snapshot.monitorEnvironments) {
+        if (entries.size >= MAX_HEARTBEAT_ENVIRONMENTS) break;
+        if (isRemoteEnvironmentId(environment.id) && !entries.has(environment.id)) entries.set(environment.id, false);
+      }
     }
     if (entries.size === 0) return;
     const changed = [...entries].some(([id, kept]) => series.sent.get(id) !== kept);
@@ -571,14 +584,15 @@ export class MonitorLoop {
     }
     if (series.failing) this.deps.logger.info(`The Session Monitor on ${target.host} answers again.`);
     series.failing = false;
+    series.synced = true;
     series.sent = entries;
     series.sentAt = now;
   }
 
   /**
-   * Unit 7, PR 2 (shared engine): true when the Session Monitor on the SSH host of this tick has a heartbeat of another
-   * computer for the environment that is younger than OTHER_COMPUTER_FRESH_MS: then it is in use there, and not
-   * stopped (logged once). When the question fails, the stop goes on as before.
+   * Unit 7, PR 2 (shared engine): true when the Session Monitor on the SSH host of this tick has a record of another
+   * computer for the environment that keeps it running (whatever its age), or that is younger than
+   * OTHER_COMPUTER_FRESH_MS (review round 1 of PR #39, F2): then it is in use or kept there, and not stopped (logged once). When the question fails, the stop goes on as before.
    */
   private async usedByOtherComputer(id: string, label: string): Promise<boolean> {
     const source = this.deps.sourceId;
@@ -595,7 +609,9 @@ export class MonitorLoop {
       this.otherComputerUntil.delete(id);
       return false;
     }
-    if (!this.otherComputerUntil.has(id)) this.deps.logger.info(`${label} is in use from another computer. Its container is not stopped.`);
+    if (!this.otherComputerUntil.has(id)) {
+      this.deps.logger.info(`${label} is in use or kept running by another computer. Its container is not stopped.`);
+    }
     this.otherComputerUntil.set(id, this.clock.now() + OTHER_COMPUTER_RECHECK_MS);
     return true;
   }

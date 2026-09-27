@@ -149,6 +149,9 @@ describe('the subcommands of the remote monitor', () => {
     // The own record never counts.
     expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: now, keepRunning: false }] }, SOURCE)).toBe(false);
     expect(inUseByOtherComputer({ now, records: [] }, SOURCE)).toBe(false);
+    // Review round 1 of PR #39 (F2): another computer keeps it running, however old its record.
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 30 * 24 * 3_600_000, keepRunning: true }] }, SOURCE)).toBe(true);
+    expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: 1, keepRunning: true }] }, SOURCE)).toBe(false);
   });
 });
 

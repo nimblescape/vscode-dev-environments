@@ -177,6 +177,7 @@ describe('host access checks off for the repository', () => {
     ['a variable of container-only Git', { runArgs: ['-e', 'GIT_CONFIG_GLOBAL=/x'] }, Messages.hostAccess('variable GIT_CONFIG_GLOBAL in runArgs')],
     ['initializeCommand', { initializeCommand: 'docker ps' }, Messages.hostAccess('initializeCommand')],
     ['the cache volume of the workspace helper', { mounts: ['source=devenv-helper-cache,target=/c,type=volume'] }, Messages.hostAccess('volume devenv-helper-cache of the workspace helper')],
+    ['the volume of the remote Session Monitor', { mounts: ['source=devenv-session-monitor,target=/s,type=volume'] }, Messages.hostAccess('volume devenv-session-monitor of the Session Monitor')],
     ['the workspace volume of another environment', { mounts: ['source=devenv-acme-web-11111111,target=/w,type=volume'] }, Messages.hostAccess('volume devenv-acme-web-11111111 of another environment')],
     ['a label of Dev Environments', { runArgs: ['--label', 'devenv.environment-id=x'] }, Messages.unsupportedOptions('label devenv.environment-id')],
     ['an unknown flag', { runArgs: ['--pull=always', '--privileged'] }, Messages.unsupportedOptions('--pull')],

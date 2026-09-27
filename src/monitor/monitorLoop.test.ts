@@ -1147,6 +1147,50 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     expect(h.logger.lines.filter((line) => line.includes('A heartbeat to the Session Monitor on build-box failed'))).toHaveLength(1);
   });
 
+  // Review round 1 of PR #39 (R3): the first heartbeat of a series is a full sync.
+  it('a new monitor process reports every environment of the host without the flag once, then only the used and kept ones', async () => {
+    const each = await inUseScenario();
+    // B was kept by an earlier process (its record on the host may still say keepRunning), and is neither used nor kept now.
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await runUntil(h, T0 + 60_000, each);
+    const sent = heartbeats().map((item) => item.environments);
+    expect(sent[0]).toEqual([
+      { id: ID_A, keepRunning: false },
+      { id: ID_B, keepRunning: false },
+    ]);
+    expect(sent.slice(1)).toEqual([[{ id: ID_A, keepRunning: false }]]);
+    // Another process: the full sync again.
+    h.loop = h.newLoop({ sourceId: SOURCE });
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments.map((item) => item.id)).toEqual([ID_A, ID_B]);
+  });
+
+  it('sends the full sync also when no environment is in use, and then nothing; the monitor still ends', async () => {
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await writeSettings(h);
+    const results = await runUntil(h, T0 + 60_000);
+    expect(heartbeats().map((item) => item.environments)).toEqual([[{ id: ID_B, keepRunning: false }]]);
+    expect(results.at(-1)?.end).toBe('idle');
+  });
+
+  it('a switch to another host starts a new series with a full sync there', async () => {
+    const each = await inUseScenario();
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'other-box' }));
+    await runUntil(h, T0 + 10_000, each);
+    expect(heartbeats().map((item) => item.environments.map((entry) => entry.id))).toEqual([[ID_A]]);
+    target = dockerTargetOf('ssh://other-box', 'devenv-remote-22222222');
+    await each();
+    await step(h);
+    expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_B, keepRunning: false }]);
+    // And back: a full sync on build-box again, at once (not only after 30 s).
+    target = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    await each();
+    await step(h);
+    expect(heartbeats()).toHaveLength(3);
+    expect(heartbeats().at(-1)?.environments).toEqual([{ id: ID_A, keepRunning: false }]);
+  });
+
   it('never sends a heartbeat through the local Docker', async () => {
     target = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await h.registry.add(environment(ID_A, 'acme/api', { keepRunning: true }));
@@ -1177,7 +1221,7 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
       recordsResult = () => ok(JSON.stringify({ now: 1_000_000, records: [{ source: OTHER_SOURCE, at: 1_000_000 - 10_000, keepRunning: false }] }));
       await runUntil(h, T0 + WAITING_MS + 10 * TICK_MS);
       expect(h.docker.count('stop')).toBe(0);
-      expect(h.logger.lines.filter((line) => line.includes('acme/api is in use from another computer. Its container is not stopped.'))).toHaveLength(1);
+      expect(h.logger.lines.filter((line) => line.includes('acme/api is in use or kept running by another computer. Its container is not stopped.'))).toHaveLength(1);
       // Asked at the first stop, and again after OTHER_COMPUTER_RECHECK_MS (not at every tick).
       expect(recordsCalls().length).toBeGreaterThanOrEqual(2);
       expect(recordsCalls().length).toBeLessThanOrEqual(3);
@@ -1186,6 +1230,15 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
       recordsResult = () => ok(JSON.stringify({ now: 1_000_000, records: [{ source: OTHER_SOURCE, at: 1_000_000 - 91_000, keepRunning: false }] }));
       const results = await runUntil(h, h.clock.time + 40_000);
       expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
+    });
+
+    // Review round 1 of PR #39 (F2).
+    it('does not stop an environment that another computer keeps running, however old its record', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () => ok(JSON.stringify({ now: 1_000_000_000, records: [{ source: OTHER_SOURCE, at: 1_000, keepRunning: true }] }));
+      await runUntil(h, T0 + WAITING_MS + 10 * TICK_MS);
+      expect(h.docker.count('stop')).toBe(0);
+      expect(h.logger.lines.filter((line) => line.includes('kept running by another computer'))).toHaveLength(1);
     });
 
     it('stops as before when only its own record is fresh', async () => {

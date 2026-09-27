@@ -19,6 +19,13 @@ export const REMOTE_GAP_MS = 60_000;
 export const REMOTE_GRACE_MS = 120_000;
 /** A record of an environment that has no container at all any more is removed after this time. */
 export const RECORD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * A record whose `at` is later than now plus this counts as written when the monitor first saw it (review round 1 of
+ * PR #39, R1): a forged or skewed time in the future must not keep an environment for ever. It is not dropped: without a
+ * record the monitor would not act on the environment at all. A restart of the monitor sees it anew (the gap rule holds
+ * the stops after the start anyway).
+ */
+export const FUTURE_RECORD_TOLERANCE_MS = 5 * 60_000;
 
 /** A container with the label devenv.environment-id, as `docker ps -a` lists it. */
 export interface RemoteContainer {
@@ -46,6 +53,11 @@ export interface RemoteMonitorState {
   lastTickAt?: number;
   /** Until this time nothing is stopped (the gap rule). */
   graceUntil?: number;
+  /**
+   * `<source>.<environment id>.<at>` of a record whose time is in the future (FUTURE_RECORD_TOLERANCE_MS) → the time the
+   * monitor first saw it: the record counts as written then, and ages from then on.
+   */
+  futureSeen?: Record<string, number>;
 }
 
 export function initialRemoteState(): RemoteMonitorState {
@@ -125,7 +137,15 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     running.set(container.environmentId, [...(running.get(container.environmentId) ?? []), container]);
   }
   const recordsOf = new Map<string, RemoteRecord[]>();
-  for (const record of input.records) {
+  const futureSeen: Record<string, number> = {};
+  const clamped = input.records.map((record) => {
+    if (record.at <= now + FUTURE_RECORD_TOLERANCE_MS) return record;
+    const key = `${record.source}.${record.environmentId}.${record.at}`;
+    const seen = Math.min(previous.futureSeen?.[key] ?? now, now);
+    futureSeen[key] = seen;
+    return { ...record, at: seen };
+  });
+  for (const record of clamped) {
     recordsOf.set(record.environmentId, [...(recordsOf.get(record.environmentId) ?? []), record]);
   }
 
@@ -147,7 +167,9 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
   }
 
   const forget = input.records.filter((record) => !present.has(record.environmentId) && now - record.at > RECORD_MAX_AGE_MS);
+  // (A record with a time in the future is kept by this rule until its time has passed by 7 days.)
   const state: RemoteMonitorState = { lastTickAt: now };
+  if (Object.keys(futureSeen).length > 0) state.futureSeen = futureSeen;
   if (graceUntil !== undefined && now < graceUntil) state.graceUntil = graceUntil;
   return { state, stop, kept, forget, grace };
 }
