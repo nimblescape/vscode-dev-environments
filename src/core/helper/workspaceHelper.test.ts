@@ -23,7 +23,6 @@ import {
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   READ_FILES_SCRIPT,
-  REMOVE_GIT_TOKEN_SCRIPT,
   SWITCH_BRANCH_SCRIPT,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
@@ -725,29 +724,9 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
   });
 });
 
-describe('WorkspaceHelper.removeGitToken (concept 7.5)', () => {
-  it('removes the token from the volume without a token, the Docker socket, network, or a variable', async () => {
-    await createHelper().removeGitToken({ volumeName: 'vol', timeoutMs: 30_000 });
-    expect(docker.runs).toHaveLength(1);
-    const run = docker.runs[0];
-    expect(commandOf(run.args)).toEqual(['sh', '-c', REMOVE_GIT_TOKEN_SCRIPT, 'sh']);
-    expect(run.args.join(' ')).toContain('source=vol,target=/workspaces');
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
-    expect(run.args).not.toContain('--tmpfs');
-    expect(run.args).not.toContain('-e');
-    expect(run.options.input).toBeUndefined();
-  });
-
-  it('throws a CommandError when a file is still there', async () => {
-    docker.handler = () => ({ exitCode: 1, stderr: '/workspaces/.devenv+/github-token could not be removed.\n' });
-    const error = await createHelper()
-      .removeGitToken({ volumeName: 'vol' })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(CommandError);
-    expect((error as CommandError).message).toContain('github-token could not be removed');
-  });
-
+// Greenfield (user decision 2026-09-27): removeGitToken, which ran this test, is gone; the time limit of a helper run
+// stays (fixConfigOwnership).
+describe('WorkspaceHelper helper run with a time limit', () => {
   it('ends the helper run after the time limit and removes its container', async () => {
     let started!: () => void;
     const running = new Promise<void>((resolve) => (started = resolve));
@@ -758,7 +737,7 @@ describe('WorkspaceHelper.removeGitToken (concept 7.5)', () => {
     };
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
-      const result = createHelper().removeGitToken({ volumeName: 'vol', timeoutMs: 30_000 });
+      const result = createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 30_000 });
       const caught = result.catch((e: unknown) => e);
       await running;
       await vi.advanceTimersByTimeAsync(30_000);

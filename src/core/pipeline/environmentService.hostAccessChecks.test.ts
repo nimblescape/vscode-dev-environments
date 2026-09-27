@@ -102,8 +102,8 @@ describe('host access checks off for the repository', () => {
     const name = environment.containerName;
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect(runArgs).toEqual(['--label', 'devenv.container-version=5', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(runArgs).toEqual(['--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     // The labels of the override configuration pass the policy also with the checks on.
     // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
     expect(hostAccessProblems({ config: { runArgs }, ownVolume: environment.volumeName, overrideConfiguration: true })).toEqual([]);
@@ -126,8 +126,8 @@ describe('host access checks off for the repository', () => {
       '--device',
       '/dev/fuse',
       '--label',
-      // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-      'devenv.container-version=5',
+      // unit 15: changed expectation, the tmpfs of the token at the end.
+      'devenv.container-version=4',
       '--label',
       'devenv.host-access=unrestricted',
       // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
@@ -158,8 +158,8 @@ describe('host access checks off for the repository', () => {
     const override = h.helper.ups[0].override;
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=5', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(override.runArgs).toEqual(['-p', '8080:80', '-p0.0.0.0:9000:9000', '-P', '--label', 'devenv.container-version=4', '--label', 'devenv.host-access=unrestricted', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     expect(override.appPort).toEqual([3000, '5000:5000', '0.0.0.0:6000:6000']);
   });
 
@@ -238,8 +238,8 @@ describe('host access checks on again (containerIsCurrent)', () => {
     expect(container.labels[LABEL_HOST_ACCESS]).toBeUndefined();
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     expect(h.progress.details).toEqual([Messages.containerHostAccessChecksOn]);
     expect(h.logger.infos.some((line) => line.includes('was created while the host access checks were off. They are on now'))).toBe(true);
     // The next open starts it as it is.

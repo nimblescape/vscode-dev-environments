@@ -86,8 +86,9 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     const container = start(['--mount', `type=volume,src=${hiding},dst=/var/run`]);
     await expect(write(container)).rejects.toThrow(/is not (a tmpfs mount|the tmpfs) of the container/);
     expect(tokenFiles(container)).toEqual([]);
-    // The removal finds no token of the extension there.
-    await remove(container);
+    // The removal finds no tmpfs of the extension there and removes nothing (greenfield, user decision 2026-09-27:
+    // changed expectation, exit code 3 like any other mount, before exit code 0 for a container of an earlier version).
+    await expect(remove(container)).rejects.toThrow('is not the tmpfs of the container');
     cli.ok(['rm', '-f', container]);
     const inVolume = cli.run(['run', '--rm', '--network', 'none', '-v', `${hiding}:/v`, TEST_BASE_IMAGE, 'sh', '-c', `grep -rl '${DUMMY_TOKEN}' /v || true`]);
     expect(inVolume.out).toBe('');

@@ -174,10 +174,10 @@ describe('open: first open', () => {
     });
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token.
+    // unit 15: changed expectation, the tmpfs of the token.
     expect(h.helper.ups[0].override.runArgs).toEqual([
       '--label',
-      'devenv.container-version=5',
+      'devenv.container-version=4',
       ...CONFIG_PATH_LABEL,
       ...CLEARED_COMPOSE_LABELS,
       '--name',
@@ -2619,9 +2619,6 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     ['a running container without the label', 'running', {}],
     ['a container of an older version', 'stopped', { 'devenv.container-version': '1' }],
     ['a container of the version before (without the settings of the Dev Containers extension)', 'running', { 'devenv.container-version': '2' }],
-    // unit 15: version 4 kept the token in the volume and has no tmpfs for it.
-    ['a container of version 4 (without the tmpfs of the token)', 'running', { 'devenv.container-version': '4' }],
-    ['a stopped container of version 4', 'stopped', { 'devenv.container-version': '4' }],
   ])('creates %s again from the environment image, without a build; the volume stays', async (_name, state, labels) => {
     await seedEnvironment(h, { container: state, containerLabels: labels });
     const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -2631,8 +2628,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     const containers = h.docker.containersOf(ENV_ID);
     expect(containers).toHaveLength(1);
     expect(containers[0].id).not.toBe(before);
-    // unit 15: changed expectation, container version 5.
-    expect(containers[0].labels['devenv.container-version']).toBe('5');
+    expect(containers[0].labels['devenv.container-version']).toBe('4');
     expect(h.docker.volumes.has(NAME)).toBe(true);
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
     expect(result.containerName).toBe(NAME);
@@ -2653,8 +2649,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     }
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect((override.runArgs as string[]).slice(-14)).toEqual(['--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect((override.runArgs as string[]).slice(-14)).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('starts a current container as it is', async () => {
@@ -2715,8 +2711,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
       const provisional = h.docker.containersOf(ENV_ID)[0];
       expect(provisional.id).not.toBe(original);
-      // unit 15: changed expectation, container version 5.
-      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '5', 'devenv.container-config': 'unknown' });
+      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '4', 'devenv.container-config': 'unknown' });
       expect(h.progress.details).toContain(Messages.containerRecreated);
 
       // While the configuration stays broken, the provisional container is only started.
@@ -3167,8 +3162,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
@@ -3177,8 +3172,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     await h.service.openEnvironment(ENV_ID, options());
     // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
     // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=5', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // unit 15: changed expectation, the tmpfs of the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {

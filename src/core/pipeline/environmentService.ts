@@ -3457,7 +3457,7 @@ export class EnvironmentService {
   /**
    * Concept section 9 "Git inside the container": the Git configuration of the container, written into the volume once
    * per run, before `up` (unit 15: without the token, which goes into the memory of the container after its start,
-   * writeGitToken; the token files of earlier versions leave the volume here). A failure is a warning: the environment
+   * writeGitToken). A failure is a warning: the environment
    * opens, but Git may not reach GitHub.
    */
   private async prepareGit(ctx: PipelineContext): Promise<void> {

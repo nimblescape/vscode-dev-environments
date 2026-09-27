@@ -349,13 +349,15 @@ describe('TOKEN_REMOVE_SCRIPT (in the dev container)', () => {
     expect(fs.readFileSync(elsewhere, 'utf8')).toBe('x');
   });
 
-  it('removes nothing where the folder is no tmpfs (a container of an earlier version)', () => {
+  // Greenfield (user decision 2026-09-27): changed expectation, a folder that is no tmpfs is not ours, like any other
+  // mount there (exit code 3), no longer a container of an earlier version (exit code 0).
+  it('removes nothing where the folder is no tmpfs (exit code 3)', () => {
     // review, T1/T2/P1: as /proc/self/mountinfo, and `stat -f` of the folder.
     const env = setup({ mountinfo: (dir) => mountinfo(dir, { tmpfs: '' }), fsType: 'overlay' });
     write(path.join(env.dir, 'kept'), 'x');
     const result = env.remove();
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain('holds no GitHub token there');
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('is not the tmpfs of the container');
     expect(fs.readdirSync(env.dir)).toEqual(['kept']);
   });
 

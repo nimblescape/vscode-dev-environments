@@ -52,7 +52,6 @@ import {
   gitFilesCommand,
   listConfigsCommand,
   readFilesCommand,
-  removeGitTokenCommand,
   switchBranchCommand,
   upCommand,
   writeAndRunCommand,
@@ -730,9 +729,9 @@ export class WorkspaceHelper {
 
   /**
    * Writes the Git and Docker configuration of the dev container into the volume (GIT_FILES_SCRIPT, concept section 9
-   * "Git inside the container"), without the Docker socket, the cache volume, and network, and removes the token files
-   * that versions before unit 15 wrote there. Unit 15: no token; the token and the sign-in of the GitHub CLI go into the
-   * memory of the dev container after its start (writeContainerToken, ./containerToken.ts). Throws CommandError.
+   * "Git inside the container"), without the Docker socket, the cache volume, and network. Unit 15: no token; the token
+   * and the sign-in of the GitHub CLI go into the memory of the dev container after its start (writeContainerToken,
+   * ./containerToken.ts). Throws CommandError.
    */
   async prepareGit(p: {
     volumeName: string;
@@ -752,23 +751,6 @@ export class WorkspaceHelper {
       onStderr: output,
     });
     if (result.exitCode !== 0) throw new CommandError('prepare Git', result.exitCode, result.stdout, result.stderr);
-  }
-
-  /**
-   * Removes the token of the owner account that versions before unit 15 wrote into the volume (REMOVE_GIT_TOKEN_SCRIPT:
-   * the token file and the sign-in of the GitHub CLI), concept 7.5, without the Docker socket, the cache volume, and network. Works whether the dev
-   * container runs or not; it needs no tool of its image. `timeoutMs` limits the helper container (not a build of the
-   * helper image before it). Throws CommandError when a file is still there.
-   */
-  async removeGitToken(p: { volumeName: string; timeoutMs?: number; signal?: AbortSignal }): Promise<void> {
-    const result = await this.runStreams(p.volumeName, removeGitTokenCommand(), {
-      docker: false,
-      network: false,
-      timeoutMs: p.timeoutMs,
-      signal: p.signal,
-      onStderr: this.logOutput,
-    });
-    if (result.exitCode !== 0) throw new CommandError('remove the GitHub token', result.exitCode, result.stdout, result.stderr);
   }
 
   /**

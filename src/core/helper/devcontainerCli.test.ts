@@ -197,10 +197,10 @@ describe('buildOverrideConfig', () => {
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
-      // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
+      // unit 15: changed expectation, the tmpfs of the token at the end.
       runArgs: [
         '--label',
-        'devenv.container-version=5',
+        'devenv.container-version=4',
         '--label',
         'com.docker.compose.project=',
         '--label',
@@ -280,8 +280,8 @@ describe('buildOverrideConfig', () => {
       '-p',
       '127.0.0.1:8080:80',
       '--label',
-      // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-      'devenv.container-version=5',
+      // unit 15: changed expectation, the tmpfs of the token at the end.
+      'devenv.container-version=4',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',
@@ -317,8 +317,8 @@ describe('buildOverrideConfig', () => {
     expect(buildOverrideConfig({ ...base, runArgs: shifting }).runArgs).toEqual([
       ...shifting,
       '--label',
-      // unit 15: changed expectation, container version 5 and the tmpfs of the token at the end.
-      'devenv.container-version=5',
+      // unit 15: changed expectation, the tmpfs of the token at the end.
+      'devenv.container-version=4',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',

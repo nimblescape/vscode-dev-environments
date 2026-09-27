@@ -12,10 +12,9 @@
 // (SECRETS_FOLDER). For the clone and the branch switch, a Git credential helper that exists only for one command
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // Unit 15: no copy is in the volume. The token file of the dev container and the sign-in of the GitHub CLI are only in the
-// memory of the dev container (TOKEN_FOLDER, ./containerToken.ts); GIT_FILES_SCRIPT and REMOVE_GIT_TOKEN_SCRIPT remove
-// the copies that versions before unit 15 wrote into the volume.
+// memory of the dev container (TOKEN_FOLDER, ./containerToken.ts).
 import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, SERVICE_REAL_PATHS, servicePathArguments, type ServiceFolders } from '../git/gitSummary';
-import { CONFIG_FOLDER, GH_VOLUME_FOLDER, LEGACY_GH_HOSTS_FILE, LEGACY_GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
+import { CONFIG_FOLDER, GH_VOLUME_FOLDER, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
@@ -197,13 +196,10 @@ if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
  * written into the memory of the dev container after its start, TOKEN_WRITE_SCRIPT). Prepares the configuration folder of
  * the dev container in the volume (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and
  * folders get with the owner (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
- * - unit 15: the token file and gh/hosts.yml that versions before unit 15 wrote here (LEGACY_GITHUB_TOKEN_FILE,
- *   LEGACY_GH_HOSTS_FILE) are removed (also a link or a folder in their place, never its target);
  * - gh/ (GH_VOLUME_FOLDER), mode 0700: the folder of gh's config.yml (the settings of the GitHub CLI, no secret), to which
  *   the link config.yml in GH_CONFIG_DIR leads; config.yml itself belongs to gh and stays as it is;
  * - gitconfig: created when missing, with user.name and user.email; of an existing file, only the section
- *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours; unit
- *   15: the helper of an earlier version, which read the token file of the volume, is replaced);
+ *   `[credential "https://github.com"]` is ensured (an empty helper, which removes the helpers before it, then ours);
  * - credentials.gitconfig (GIT_CREDENTIALS_CONFIG_FILE, the credential helpers of the user for other Git servers):
  *   created when missing, with an example in comments; an existing file stays as it is;
  * - docker/ (DOCKER_CONFIG), mode 0700.
@@ -249,12 +245,6 @@ for path in "$dir" "$dir/docker" "$gh"; do
 done
 chmod 0755 "$dir"
 chmod 0700 "$dir/docker" "$gh"
-for path in '${LEGACY_GITHUB_TOKEN_FILE}' '${LEGACY_GH_HOSTS_FILE}'; do
-  rm -rf -- "$path"
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    fail 1 "$path could not be removed."
-  fi
-done
 work=$(mktemp -d "$dir/.work.XXXXXX")
 cfg="$dir/gitconfig"
 if [ -L "$cfg" ]; then
@@ -286,27 +276,6 @@ if [ ! -e "$credentials" ]; then
 fi
 chown -h "$owner" "$dir" "$dir/docker" "$cfg" "$credentials" "$gh"
 echo "The Git configuration of the environment is in $dir."
-`;
-
-/**
- * No arguments. Removes the token of the owner account that versions before unit 15 wrote into the configuration folder
- * of the dev container in the volume: the token file (LEGACY_GITHUB_TOKEN_FILE) and the sign-in of the GitHub CLI
- * (LEGACY_GH_HOSTS_FILE), concept 7.5. It runs in the workspace helper (our image, as root with the rights of a normal
- * container), which mounts the workspace volume, so it needs no tool of the image of the dev container, and works
- * whether the dev container runs or not. The other files stay. Exit code 1 when a file is still there. The token in the
- * memory of a running dev container is removed by TOKEN_REMOVE_SCRIPT (./containerToken.ts).
- */
-export const REMOVE_GIT_TOKEN_SCRIPT = `set -u
-status=0
-for path in '${LEGACY_GITHUB_TOKEN_FILE}' '${LEGACY_GH_HOSTS_FILE}'; do
-  rm -rf -- "$path" || true
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    printf '%s could not be removed.\n' "$path" >&2
-    status=1
-  fi
-done
-if [ "$status" -eq 0 ]; then echo 'The GitHub token was removed from the volume.'; fi
-exit "$status"
 `;
 
 /**
@@ -936,17 +905,12 @@ export function cloneCommand(repository: string, folderName: string, branch?: st
 }
 
 /**
- * `sh -c` command that writes the Git configuration of the dev container into the volume and removes the token files of
- * versions before unit 15 (GIT_FILES_SCRIPT). No token.
+ * `sh -c` command that writes the Git configuration of the dev container into the volume (GIT_FILES_SCRIPT). No token.
  */
 export function gitFilesCommand(folderName: string, identity: { name: string; email: string }, credentialHelper: string): string[] {
   return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper];
 }
 
-/** `sh -c` command that removes the token of the owner account from the volume (REMOVE_GIT_TOKEN_SCRIPT). */
-export function removeGitTokenCommand(): string[] {
-  return ['sh', '-c', REMOVE_GIT_TOKEN_SCRIPT, 'sh'];
-}
 
 /** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */
 export function switchBranchCommand(repoFolder: string, branch: string, repository: string, serviceFolders?: ServiceFolders): string[] {

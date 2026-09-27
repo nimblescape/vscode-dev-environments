@@ -37,8 +37,6 @@ import {
   GH_HOSTS_FILE,
   GH_VOLUME_CONFIG_FILE,
   GITHUB_TOKEN_FILE,
-  LEGACY_GH_HOSTS_FILE,
-  LEGACY_GITHUB_TOKEN_FILE,
   TOKEN_FOLDER,
   TOKEN_TMPFS,
   LABEL_ENVIRONMENT_ID,
@@ -612,12 +610,11 @@ describe('open pipeline on a seeded environment', () => {
     expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('');
   });
 
-  it('unit 15: a sign-out or an account change removes the token from the memory of the running container and from the volume', async () => {
-    // As the controller does it (Controller.removeGitToken): the running dev container first, then the volume.
+  it('unit 15: a sign-out or an account change removes the token from the memory of the running container', async () => {
+    // As the controller does it (Controller.removeGitToken).
     const container = cli.container(containerName);
     expect(container?.State.Running).toBe(true);
     await removeContainerToken((c, command, options) => docker.exec(c, command, options), { container: container!.Id, user: REMOTE_USER, timeoutMs: 30_000 });
-    await helper.removeGitToken({ volumeName, timeoutMs: 30_000 });
     expect(execIn('root', `ls -A ${TOKEN_FOLDER}`)).toBe('');
     expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} /workspaces || true`)).toBe('');
     const github = credentialFill('github.com');
@@ -631,13 +628,6 @@ describe('open pipeline on a seeded environment', () => {
   it('a container of an older version (without the label devenv.container-version) is created again, without a build', async () => {
     // A container as the first version of the extension created it: the ID label, the workspace volume, no version label.
     cli.ok(['rm', '-f', containerName]);
-    // unit 15: the token files that versions before unit 15 wrote into the volume.
-    const legacy = await helper.run(
-      volumeName,
-      ['sh', '-c', `mkdir -p /workspaces/.devenv+/gh && printf %s "$1" > ${LEGACY_GITHUB_TOKEN_FILE} && printf 'github.com:\\n    oauth_token: "%s"\\n' "$1" > ${LEGACY_GH_HOSTS_FILE}`, 'sh', 'gho_legacy_token'],
-      { docker: false, network: false },
-    );
-    expect(legacy.exitCode, legacy.stderr).toBe(0);
     const oldId = cli.ok([
       'create',
       '--name',
@@ -665,9 +655,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
     expect(container?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
     expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
-    // unit 15: the old token files left the volume; the token is in the tmpfs of the new container.
-    expect(execIn('root', `ls -A /workspaces/.devenv+ /workspaces/.devenv+/gh`)).not.toMatch(/github-token|hosts\.yml/);
-    expect(execIn('root', `grep -rl gho_legacy_token /workspaces ${TOKEN_FOLDER} || true`)).toBe('');
+    // unit 15: the token is in the tmpfs of the new container.
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
     expect(containersOfEnvironment()).toHaveLength(1);
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();

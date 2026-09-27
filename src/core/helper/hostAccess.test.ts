@@ -395,12 +395,12 @@ describe('host access policy: the runArgs that Docker gets', () => {
     const all = buildOverrideConfig({ environmentImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
       .runArgs as string[];
     // The host name is left out where the repository decides it (runArgsDecideHostname).
-    // unit 15: changed expectation, the tmpfs of the token comes last; container version 5.
+    // unit 15: changed expectation, the tmpfs of the token comes last.
     const added = all.at(-4) === '--hostname' ? ['--hostname', 'api'] : [];
     // Review round 2 (D2-1): changed expectation, the override configuration also sets the labels of Docker Compose empty.
     const tail = [
       '--label',
-      'devenv.container-version=5',
+      'devenv.container-version=4',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -495,8 +495,8 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       '--label',
       '--rm',
       '--label',
-      // unit 15: changed expectation, container version 5 and the tmpfs of the token, which the check accepts.
-      'devenv.container-version=5',
+      // unit 15: changed expectation, the tmpfs of the token, which the check accepts.
+      'devenv.container-version=4',
       '--label',
       'com.docker.compose.project=',
       '--label',

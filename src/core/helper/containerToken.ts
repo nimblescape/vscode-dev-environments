@@ -212,22 +212,18 @@ echo "The GitHub token of the environment is in $dir, in the memory of the conta
 /**
  * No arguments. Runs in the dev container (as root, or as the remote user when root may not empty the folder): empties
  * TOKEN_FOLDER when it is the tmpfs of the container (OWN_TMPFS), as root after giving everything in it back to root
- * (TAKE_BACK), as the user after giving its own folders mode 0700. Where the folder is no tmpfs (for example a container
- * of a version before unit 15), there is nothing to remove: exit code 0. Exit code 3 for another tmpfs, or ours with a
- * mount over it or in it (nothing is removed there: the scripts never wrote there). Exit code 1 when the folder cannot
- * be entered or read, or is not empty afterwards (so that the removal as the remote user runs).
+ * (TAKE_BACK), as the user after giving its own folders mode 0700. Exit code 3 where the folder is no tmpfs, another
+ * tmpfs, or ours with a mount over it or in it (nothing is removed there: the scripts never wrote there). Exit code 1
+ * when the folder cannot be entered or read, or is not empty afterwards (so that the removal as the remote user runs).
  */
 export const TOKEN_REMOVE_SCRIPT = `set -u
 ${OWN_TMPFS}folder=0
 enter_folder || folder=$?
-if [ "$folder" = 1 ]; then
-  echo "The container has no tmpfs at $dir: it holds no GitHub token there."
-  exit 0
-elif [ "$folder" = 4 ]; then
+if [ "$folder" = 4 ]; then
   printf '%s cannot be read.\\n' "$dir" >&2
   exit 1
 elif [ "$folder" != 0 ]; then
-  printf '%s is not the tmpfs of the container: another mount lies over it or in it, or shares it with the computer. Nothing is removed there.\\n' "$dir" >&2
+  printf '%s is not the tmpfs of the container: no tmpfs, or another mount lies over it or in it, or shares it with the computer. Nothing is removed there.\\n' "$dir" >&2
   exit 3
 fi
 if [ "$(id -u)" = 0 ]; then

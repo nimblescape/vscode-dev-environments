@@ -52,11 +52,10 @@ export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
  * helpers, no sign-in of the GitHub CLI; devContainersSettings in devContainers.ts), which it reads from the label
  * devcontainer.metadata only at the first attach of a new container, and only the documented variables of Git and
  * Docker (no more GIT_CONFIG_PARAMETERS, GNUPGHOME, and SSH_AUTH_SOCK). 4: the GitHub CLI reads its configuration from the volume (GH_CONFIG_DIR, GH_CONFIG_FOLDER), where
- * it is signed in with the account that owns the environment. 5 (unit 15): the token of the owner account and the sign-in
- * of the GitHub CLI are only in the memory of the container (the tmpfs TOKEN_FOLDER, TOKEN_TMPFS), not in the volume. A
- * container with an older version (or without the label) is created again from its environment image.
+ * it is signed in with the account that owns the environment. A container with an older version (or without the label) is
+ * created again from its environment image.
  */
-export const CONTAINER_VERSION = 5;
+export const CONTAINER_VERSION = 4;
 /**
  * Container label: `unknown` when the container was created without the configuration of the repository (it could not
  * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
@@ -160,12 +159,6 @@ export const GH_HOSTS_FILE = `${GH_CONFIG_FOLDER}/hosts.yml`;
 export const GH_VOLUME_FOLDER = `${CONFIG_FOLDER}/gh`;
 /** gh's config.yml in the volume; GH_CONFIG_FOLDER/config.yml is a link to it. */
 export const GH_VOLUME_CONFIG_FILE = `${GH_VOLUME_FOLDER}/config.yml`;
-/**
- * Unit 15: where versions before unit 15 wrote the token and the sign-in of the GitHub CLI in the volume. The next open
- * (GIT_FILES_SCRIPT) and the removal at a sign-out or account change (REMOVE_GIT_TOKEN_SCRIPT) remove them.
- */
-export const LEGACY_GITHUB_TOKEN_FILE = `${CONFIG_FOLDER}/github-token`;
-export const LEGACY_GH_HOSTS_FILE = `${GH_VOLUME_FOLDER}/hosts.yml`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();
