@@ -22,6 +22,12 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 8. **Thoroughness "max"**: for each unit, implement in small steps; then review rounds — several independent reviewers, one per dimension; every finding verified by three independent verifiers (code path, requirement, reproduction), confirmed only if at least two agree; fix the confirmed findings with tests; integrate; repeat until a round finds nothing new (at most three rounds); then a final check. The scripts in `workflows/` show the exact dimensions and prompts that were planned (their paths point to the original machine; see "Path mapping").
 9. Commit messages: plain imperative subject, short bullet body, and the last line `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
 
+## Standing user decisions (2026-09-27)
+
+- **Trust model.** Repositories are trusted code. The checks are a guard rail on the final configuration (host bind mounts, Docker socket, privileged, capabilities, devices, host namespaces, ports on all addresses), not a sandbox. Untrusted repositories belong in a VM or a separate user account with its own Docker (`docs/concept-vm-isolation.md`, not planned).
+- **No model of the Dev Container CLI's reader**, and no Docker gate.
+- **The Dockerfile check is frozen.** Review rounds do not report, verify, or fix gaps in the image-reference refusals of the Dockerfile (`src/core/imageCheck/dockerfile.ts`, `dockerfileImageFindings`, expansion budgets). Tell every reviewer this in its prompt. Queued: remove those refusals, keep only the `FROM` extraction for the image update check (needs the user's explicit permission in the session; auto mode blocked it once).
+
 ## Documents to read first (on `main` / the work branch)
 
 `docs/vscode-dev-environments.md` (concept — the source of requirements), `docs/implementation-notes.md` (technical decisions), `docs/container-restrictions.md` (every restriction on containers), `README.md`.
