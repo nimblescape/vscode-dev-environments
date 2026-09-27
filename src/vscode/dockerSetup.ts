@@ -580,6 +580,9 @@ export class DockerSetup implements vscode.Disposable {
         this.stopInstallWatch();
         this.offerStart();
       }
+      // Windows: a CLI found at activation skipped `wsl --status`; the setup now shows the step Install WSL 2, so it
+      // needs the state of WSL (review round 3, W3-1). Returns at once on other platforms or while a check runs.
+      if (!this.state.cliFound) this.checkWslInBackground();
     }
     this.updateMissingTimer();
   }

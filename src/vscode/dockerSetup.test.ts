@@ -743,6 +743,49 @@ describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
     dockerSetup.dispose();
   });
 
+  it('checks wsl --status when a CLI found at activation is lost (review round 3, W3-1)', async () => {
+    let found: string | undefined = 'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe';
+    const runner = {
+      run: vi.fn(async (file: string, _args: readonly string[]): Promise<RunResult> => {
+        if (file === 'wsl.exe') return status(0);
+        throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+      }),
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    let dockerSetup: DockerSetup | undefined;
+    const docker = new ContainerAdapter(runner, found, {}, logger, 'win32', {
+      findDocker: () => found,
+      onCliLost: () => dockerSetup?.reportCliLost(),
+    });
+    dockerSetup = new DockerSetup({
+      docker,
+      runner,
+      logger,
+      showLog: vi.fn(),
+      platform: 'win32',
+      env: {},
+      onDidChangeInstalled: vi.fn(),
+      remoteDockerHostConfigured: () => false,
+    });
+    dockerSetup.initialize();
+    await flush();
+    // The CLI was found at activation: no wsl --status yet.
+    expect(runner.run).not.toHaveBeenCalledWith('wsl.exe', expect.anything(), expect.anything());
+    found = undefined;
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    await flush();
+    expect(dockerSetup.setupRequired).toBe(true);
+    expect(runner.run).toHaveBeenCalledWith('wsl.exe', ['--status'], { timeoutMs: 15_000 });
+    expect(contextCalls()).toContainEqual([DockerContextKeys.wslReady, true]);
+    // WSL is installed: Install WSL 2 asks nothing and runs no wsl --install.
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.installWsl();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(fakeVscode.terminals).toEqual([]);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.wslAlreadyInstalled);
+    dockerSetup.dispose();
+  });
+
   it('runs wsl --install in the terminal after the confirmation, then checks again', async () => {
     let exitCode = 1;
     const { dockerSetup, runner } = setup(false, { platform: 'win32', wsl: () => status(exitCode) });

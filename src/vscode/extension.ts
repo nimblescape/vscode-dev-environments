@@ -34,6 +34,7 @@ import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
+import { dockerAdapterOptions } from './dockerAdapterOptions';
 import { DockerSetup } from './dockerSetup';
 import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
@@ -99,13 +100,8 @@ async function activateExtension(
   logger.info(dockerPath ? `Docker CLI: ${dockerPath}` : 'The Docker CLI was not found.');
   // Set below; the adapter reports each `docker info` to it (context key devEnvironments.dockerReady).
   let dockerSetup: DockerSetup | undefined;
-  // Docker Desktop installed or updated while VS Code runs is found without a reload.
-  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, {
-    findDocker: findDockerCli,
-    onDaemonStatus: (running) => dockerSetup?.reportDaemonStatus(running),
-    // Docker was uninstalled or moved while VS Code runs: the sidebar shows the Docker setup again.
-    onCliLost: () => dockerSetup?.reportCliLost(),
-  });
+  // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload.
+  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, dockerAdapterOptions(() => dockerSetup));
   const registry = new EnvironmentRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
