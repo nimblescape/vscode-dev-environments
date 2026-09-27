@@ -6,10 +6,26 @@
 // Docker, Docker Compose, the Dev Container CLI, the Dev Containers extension, and this extension all follow it by
 // themselves. This module holds the pure rules: which endpoint counts as local, remote (ssh://), or not supported; the
 // Docker host of an environment; the check of an SSH address; the plain reasons of a failed connection. No `vscode`.
+import { createHash } from 'crypto';
 import type { Environment } from '../types';
 
-/** The Docker context that "Use a Remote Docker Host…" creates (or updates) and selects. */
-export const REMOTE_CONTEXT_NAME = 'devenv-remote';
+/**
+ * The start of the names of the Docker contexts that "Use a Remote Docker Host…" creates: one context per host,
+ * `devenv-remote-<the first 8 hex digits of sha256(host)>` (remoteContextName). Review, C1: one context for all hosts,
+ * updated at each switch, moved the running operations of other windows (which name their context in DOCKER_CONTEXT) to
+ * the new host; a context of a host is never changed after its creation.
+ */
+export const REMOTE_CONTEXT_PREFIX = 'devenv-remote';
+
+/** The Docker context of the remote host `host` (an alias or an address, as recorded): `devenv-remote-1a2b3c4d`. */
+export function remoteContextName(host: string): string {
+  return `${REMOTE_CONTEXT_PREFIX}-${createHash('sha256').update(host, 'utf8').digest('hex').slice(0, 8)}`;
+}
+
+/** True for a context that Dev Environments created (remoteContextName; `devenv-remote` of earlier builds). */
+export function isOwnRemoteContext(name: string | undefined): boolean {
+  return name !== undefined && (name === REMOTE_CONTEXT_PREFIX || /^devenv-remote-[0-9a-f]{8}$/.test(name));
+}
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */
 export const DEFAULT_CONTEXT_NAME = 'default';
 
@@ -210,6 +226,19 @@ export function sshTargetOf(host: string): SshAddress | undefined {
   if (isUsableSshAlias(host)) return { host };
   const parsed = parseSshAddress(host);
   return parsed.ok && parsed.address === host ? parsed.parts : undefined;
+}
+
+/**
+ * The command line that opens an SSH connection to the remote host `host` in a terminal (for the advice about an unknown
+ * host key): `ssh <alias>` for an alias of the SSH config, `ssh [-p <port>] [<user>@]<host>` for an address (an IPv6
+ * address without brackets, which ssh does not take there). Review, C4: `ssh me@box:2222` is no valid command line.
+ */
+export function sshCommandLine(host: string): string {
+  const target = sshTargetOf(host);
+  if (!target) return `ssh ${host}`;
+  const port = target.port !== undefined ? `-p ${target.port} ` : '';
+  const user = target.user !== undefined ? `${target.user}@` : '';
+  return `ssh ${port}${user}${target.host}`;
 }
 
 /** The Docker endpoint of a remote host: `ssh://<alias-or-address>`. */

@@ -4,27 +4,27 @@
 
 // "Dev Environments: Use a Remote Docker Host…" and "Dev Environments: Use the Local Docker" (unit 7, user decisions
 // 2026-09-27). The remote host is the current Docker context: the command tests the host over SSH without questions,
-// asks once (modal), remembers the context that was current, then creates or updates the context `devenv-remote`
-// (`ssh://<alias-or-address>`) and uses it. Nothing else is written: no setting, no DOCKER_HOST, no setting of the Dev
-// Containers extension. One Docker host at a time.
+// asks once (modal), remembers the context that was current, then uses the context of that host (`devenv-remote-<hash>`,
+// created with `ssh://<alias-or-address>` when missing, never changed afterwards). Nothing else is written: no setting,
+// no DOCKER_HOST, no setting of the Dev Containers extension. One Docker host at a time.
 import * as vscode from 'vscode';
 import {
-  REMOTE_CONTEXT_NAME,
   describeDockerHost,
+  isOwnRemoteContext,
   parseSshAddress,
   type DockerTarget,
   type SshAddressProblem,
 } from '../core/docker/dockerHost';
 import type { DockerTargets } from '../core/docker/dockerTargets';
 import {
+  chooseLocalContext,
   dockerVariableOverride,
-  listContexts,
-  localContextChoice,
   recordRootlessSocket,
   testRemoteDockerHost,
   useContext,
   useRemoteContext,
   type RemoteDockerCli,
+  type SshLoginCache,
 } from '../core/docker/remoteDocker';
 import { errorMessage, isUserFacingError } from '../core/errors';
 import { Actions, Messages, dockerHostReason } from '../core/messages';
@@ -62,13 +62,16 @@ export const RemoteDockerTexts = {
   testing: (host: string) => `Testing the connection to ${host}…`,
   confirm: (host: string) => `All Docker tools on this computer will use ${host} until you switch back.`,
   confirmDetail:
-    'Dev Environments sets the Docker context "devenv-remote". Docker, Docker Compose, and the Dev Containers extension follow it. Use "Dev Environments: Use the Local Docker" to switch back.',
+    'Dev Environments sets a Docker context of this host ("devenv-remote-…"). Docker, Docker Compose, and the Dev Containers extension follow it. Use "Dev Environments: Use the Local Docker" to switch back.',
   confirmLocal: 'All Docker tools on this computer will use the local Docker again.',
   useHost: (host: string) => `Use ${host}`,
   useLocal: 'Use the Local Docker',
   nowRemote: (host: string, rootless: boolean) =>
     `Docker now uses ${host}.${rootless ? ' Its Docker engine runs rootless: ports below 1024 cannot be published there.' : ''}`,
   nowLocal: (context: string) => `Docker now uses the local Docker (context ${context}).`,
+  /** Review, C2: the context of the switch back does not point to the local Docker (never claimed as local). */
+  notLocal: (context: string, where: string) =>
+    `Docker now uses the context ${context}, which points to ${where}, not to the local Docker. Check the context with "docker context ls".`,
   alreadyLocal: 'Docker already uses the local Docker.',
   variableSet: (name: string) =>
     `${name} is set in the environment of VS Code, so Docker ignores the Docker context. Remove ${name} and start VS Code again, then try again.`,
@@ -91,6 +94,8 @@ export interface RemoteDockerDeps {
   sshPath: () => string | undefined;
   env: NodeJS.ProcessEnv;
   platform: NodeJS.Platform;
+  /** Review, C3: the successes of the SSH check, shared with the operations. */
+  sshLogins?: SshLoginCache;
   /** After a switch: the sidebar shows the environments of the new host. */
   onDidSwitch: () => Promise<void>;
 }
@@ -160,7 +165,12 @@ export class RemoteDockerCommands {
         const controller = new AbortController();
         const subscription = token.onCancellationRequested(() => controller.abort());
         try {
-          const result = await testRemoteDockerHost(this.deps.docker, host, { signal: controller.signal });
+          const result = await testRemoteDockerHost(
+            this.deps.docker,
+            host,
+            { runner: this.deps.runner, sshPath: this.deps.sshPath(), env: this.deps.env, sshLogins: this.deps.sshLogins },
+            { signal: controller.signal },
+          );
           // A rootless engine: its socket is read once (ssh, without questions) and recorded with the host.
           if (result.ok) {
             await recordRootlessSocket(host, result.rootless, {
@@ -191,12 +201,12 @@ export class RemoteDockerCommands {
     );
     if (choice !== button) return false;
     const current = await this.deps.targets.resolve();
-    // The context to go back to; not our own (a switch from one remote host to another keeps the first one).
-    if (current.context !== undefined && current.context !== REMOTE_CONTEXT_NAME) {
+    // The context to go back to; not one of ours (a switch from one remote host to another keeps the first one).
+    if (current.context !== undefined && !isOwnRemoteContext(current.context)) {
       await this.deps.state.setPreviousContext(current.context);
     }
-    await useRemoteContext(this.deps.docker, host);
-    this.deps.logger.info(`The Docker context ${REMOTE_CONTEXT_NAME} (ssh://${host}) is the current context. The previous one was ${current.context ?? 'not known'}.`);
+    const name = await useRemoteContext(this.deps.docker, host);
+    this.deps.logger.info(`The Docker context ${name} (ssh://${host}) is the current context. The previous one was ${current.context ?? 'not known'}.`);
     await this.deps.targets.resolve();
     this.inform(RemoteDockerTexts.nowRemote(host, check.rootless));
     await this.afterSwitch();
@@ -209,16 +219,20 @@ export class RemoteDockerCommands {
       const choice = await vscode.window.showWarningMessage(RemoteDockerTexts.confirmLocal, { modal: true }, RemoteDockerTexts.useLocal);
       if (choice !== RemoteDockerTexts.useLocal) return false;
     }
-    const name = localContextChoice(await this.deps.state.previousContext(), await listContexts(this.deps.docker));
+    // Review, C2: the remembered context only when it points to the local Docker, else `default`.
+    const name = await chooseLocalContext(this.deps.docker, await this.deps.state.previousContext(), this.deps.logger);
     await useContext(this.deps.docker, name);
     await this.deps.state.setPreviousContext(undefined);
     this.deps.logger.info(`The Docker context ${name} is the current context again.`);
+    // The message follows where Docker points now; it never says "local" otherwise.
     const now = await this.deps.targets.resolve();
-    if (now.kind !== 'local') {
-      // For example a remembered context that points to another computer.
+    if (now.kind === 'local') {
+      this.inform(RemoteDockerTexts.nowLocal(name));
+    } else {
+      const where = now.kind === 'remote' ? now.host : now.endpoint || 'an endpoint that cannot be read';
       this.deps.logger.warn(`The context ${name} does not point to the local Docker: ${now.endpoint}`);
+      this.showWarning(RemoteDockerTexts.notLocal(now.context ?? name, where));
     }
-    this.inform(RemoteDockerTexts.nowLocal(name));
     await this.afterSwitch();
     return now.kind === 'local';
   }
@@ -288,6 +302,15 @@ export class RemoteDockerCommands {
 
   private showError(message: string): void {
     vscode.window.showErrorMessage(message, Actions.showDetails).then(
+      (choice) => {
+        if (choice === Actions.showDetails) this.deps.showLog();
+      },
+      (error: unknown) => this.deps.logger.error('Could not show the message.', error),
+    );
+  }
+
+  private showWarning(message: string): void {
+    vscode.window.showWarningMessage(message, Actions.showDetails).then(
       (choice) => {
         if (choice === Actions.showDetails) this.deps.showLog();
       },

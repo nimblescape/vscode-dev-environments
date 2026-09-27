@@ -9,8 +9,13 @@
 // It never starts Docker: the only Docker calls are the container list, `docker exec` for the Git summary, and
 // `docker stop` (concept 7.6: "The Session Monitor never starts Docker. When Docker does not run, no container runs.").
 // It only acts on containers whose label devenv.environment-id names an environment of the registry.
+//
+// Unit 7, review D2: each tick reads the current Docker target once (MonitorDocker.withCurrentTarget) and pins its Docker
+// calls to it (DOCKER_CONTEXT). It acts only on the environments of that host (their dockerHost; the local Docker: none);
+// on an endpoint that is neither local nor SSH it acts on none and makes no Docker call.
 import { isBusyMarkLive } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
+import { LOCAL_DOCKER_TARGET, environmentsOfHost, type DockerTarget } from '../core/docker/dockerHost';
 import { errorMessage } from '../core/errors';
 import { gitSummaryCommand, parseGitSummaryOutput } from '../core/git/gitSummary';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, repositoryFolder, shortId } from '../core/names';
@@ -84,6 +89,11 @@ export interface MonitorDocker {
   exec(container: string, command: readonly string[], options: { user?: string; timeoutMs?: number }): Promise<RunResult>;
   /** `docker stop`. A missing container is not an error. */
   stopContainer(nameOrId: string): Promise<void>;
+  /**
+   * Unit 7, review D2: reads the current Docker target once and runs `fn` with the Docker calls pinned to it
+   * (DOCKER_CONTEXT of its context). Without it: the local Docker, calls as they are.
+   */
+  withCurrentTarget?<T>(fn: (target: DockerTarget) => Promise<T>): Promise<T>;
 }
 
 export interface MonitorLoopDeps {
@@ -142,6 +152,10 @@ export class MonitorLoop {
   private readonly stopRetries = new Map<string, StopRetry>();
   private dockerFailing = false;
   private stopRequested = false;
+  /** The Docker target of the running tick (review D2). */
+  private tickTarget: DockerTarget = LOCAL_DOCKER_TARGET;
+  /** The endpoint (neither local nor SSH) that the log named last, so it is named once. */
+  private unsupportedLogged: string | undefined;
 
   constructor(private readonly deps: MonitorLoopDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -199,6 +213,28 @@ export class MonitorLoop {
     }
     const now = this.clock.now();
     const settings = (await this.deps.sessionFiles.readMonitorSettings()) ?? defaultMonitorSettings();
+    const run = async (target: DockerTarget): Promise<TickResult> => {
+      this.tickTarget = target;
+      try {
+        return await this.tickOn(target, now, settings);
+      } finally {
+        this.tickTarget = LOCAL_DOCKER_TARGET;
+      }
+    };
+    const { docker } = this.deps;
+    return docker.withCurrentTarget ? docker.withCurrentTarget(run) : run(LOCAL_DOCKER_TARGET);
+  }
+
+  /** The tick on the Docker target `target` (review D2): the rules, the container list, and the stops. */
+  private async tickOn(target: DockerTarget, now: number, settings: MonitorSettings): Promise<TickResult> {
+    if (target.kind === 'unsupported') {
+      if (this.unsupportedLogged !== target.endpoint) {
+        this.unsupportedLogged = target.endpoint;
+        this.deps.logger.info(`Docker is set to ${target.endpoint}, which is neither local nor SSH. No container is asked or stopped there.`);
+      }
+    } else {
+      this.unsupportedLogged = undefined;
+    }
     const snapshot = await this.readSnapshot(now);
     const input = {
       now,
@@ -252,8 +288,10 @@ export class MonitorLoop {
   }
 
   private async readSnapshot(now: number): Promise<Snapshot> {
+    const target = this.tickTarget;
     const [environments, statuses, pendings] = await Promise.all([
-      this.deps.registry.list(),
+      // Review D2: only the environments of the Docker host of the tick; none on an endpoint that is neither local nor SSH.
+      this.deps.registry.list().then((list) => (target.kind === 'unsupported' ? [] : environmentsOfHost(list, target.host))),
       this.deps.sessionFiles.readWindowStatuses(),
       this.deps.sessionFiles.readPendings(),
     ]);

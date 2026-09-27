@@ -53,8 +53,21 @@ describe('the messages of a remote Docker host (unit 7)', () => {
 
   it('asks the user to accept an unknown host key in a terminal, never accepts it', () => {
     const reason = dockerHostReason('hostKey', 'me@box:2222');
-    expect(reason).toContain('Run "ssh me@box:2222" once in a terminal');
+    // review, C4: `ssh me@box:2222` is no valid command line (ssh takes the port with -p).
+    expect(reason).toContain('Run "ssh -p 2222 me@box" once in a terminal');
     expect(reason).toContain('accept it');
+  });
+
+  it.each([
+    ['build-box', 'ssh build-box'],
+    ['me@box', 'ssh me@box'],
+    ['me@box:2222', 'ssh -p 2222 me@box'],
+    ['box:2222', 'ssh -p 2222 box'],
+    ['me@[2001:db8::1]:22', 'ssh -p 22 me@2001:db8::1'],
+    ['[2001:db8::1]', 'ssh 2001:db8::1'],
+    ['me@192.0.2.10', 'ssh me@192.0.2.10'],
+  ])('the host key advice for %s is a valid ssh command line: %s (review, C4)', (host, line) => {
+    expect(dockerHostReason('hostKey', host)).toContain(`Run "${line}" once in a terminal`);
   });
 
   it.each([

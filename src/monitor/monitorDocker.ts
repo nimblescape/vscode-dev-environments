@@ -6,6 +6,8 @@
 // looked up again when it was not found (for example while Docker Desktop updates itself).
 import { ContainerAdapter, type ContainerInfo } from '../core/docker/containerAdapter';
 import { findDockerCli } from '../core/docker/dockerCli';
+import type { DockerTarget } from '../core/docker/dockerHost';
+import { DockerTargets, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { systemClock, type Clock, type Logger, type ProcessRunner, type RunResult } from '../core/ports';
 import type { MonitorDocker } from './monitorLoop';
 
@@ -76,6 +78,16 @@ export class MonitorDockerClient implements MonitorDocker {
 
   stopContainer(nameOrId: string): Promise<void> {
     return this.current().stopContainer(nameOrId);
+  }
+
+  /**
+   * Unit 7, review D2: the current Docker target (`docker context inspect`, which reads only local files; DOCKER_HOST
+   * decides when set), once per call; the Docker calls of `fn` get DOCKER_CONTEXT of that context (ContainerAdapter).
+   */
+  async withCurrentTarget<T>(fn: (target: DockerTarget) => Promise<T>): Promise<T> {
+    const adapter = this.current();
+    const target = await new DockerTargets(adapter, this.env, this.options.logger, this.options.platform).resolve();
+    return runWithDockerTarget(target, () => fn(target));
   }
 
   private current(): ContainerAdapter {

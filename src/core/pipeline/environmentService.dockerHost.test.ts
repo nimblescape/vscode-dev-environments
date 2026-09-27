@@ -5,7 +5,7 @@
 // Unit 7: each environment records its Docker host (the current Docker context when it was created). The service acts
 // only on the environments of the current host; the others are never cloned, restored, recreated, deleted, stopped, or
 // given a token.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, resourceName } from '../names';
@@ -136,5 +136,75 @@ describe('restore after a lost registry reads only the current host', () => {
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(OTHER_ID))?.dockerHost).toBeUndefined();
     expect((await h.registry.get(ENV_ID))?.dockerHost).toBe('other-box');
+  });
+});
+
+describe('an endpoint that is neither local nor SSH is never reached (review, D2)', () => {
+  const ENDPOINT = 'tcp://10.0.0.5:2375';
+  let u: Harness;
+  let dockerReads: Array<ReturnType<typeof vi.spyOn>>;
+
+  beforeEach(async () => {
+    u = createHarness({ dockerTarget: async () => ({ kind: 'unsupported', host: ENDPOINT, endpoint: ENDPOINT }) });
+    // Seeded as an earlier build recorded it after a restore on that endpoint, and one of the local Docker.
+    await seedEnvironment(u, { container: 'running', extra: { dockerHost: ENDPOINT } });
+    await seedEnvironment(u, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    const docker = u.docker as unknown as Record<string, (...args: unknown[]) => unknown>;
+    dockerReads = [
+      'isRunning',
+      'listEnvironmentContainers',
+      'listEnvironmentVolumes',
+      'volumeExists',
+      'findContainer',
+      'inspectVolumes',
+      'stopContainer',
+      'exec',
+    ]
+      .filter((name) => typeof docker[name] === 'function')
+      .map((name) => vi.spyOn(docker, name as never));
+  });
+
+  afterEach(() => {
+    u.cleanup();
+  });
+
+  const noDockerCall = (): void => {
+    for (const spy of dockerReads) expect(spy).not.toHaveBeenCalled();
+    expect(u.dockerStarts).toBe(0);
+    expect(u.helper.calls).toEqual([]);
+  };
+
+  it.each([
+    ['open', () => u.service.open(TARGET, { progress: u.progress })],
+    ['openEnvironment', () => u.service.openEnvironment(ENV_ID, { progress: u.progress })],
+    ['stop', () => u.service.stop(ENV_ID)],
+    ['stop (local environment)', () => u.service.stop(OTHER_ID)],
+    ['delete', () => u.service.delete(ENV_ID, { progress: u.progress, additionalVolumesToRemove: [] })],
+    ['safetyCheck', () => u.service.safetyCheck(ENV_ID, { progress: u.progress })],
+    ['switchBranch', () => u.service.switchBranch(ENV_ID, 'main', { progress: u.progress })],
+    ['configurationChanged', () => u.service.configurationChanged(ENV_ID, { progress: u.progress })],
+    ['listConfigurations', () => u.service.listConfigurations(ENV_ID, { progress: u.progress })],
+  ])('%s is refused with dockerEndpointUnsupported, before any Docker call', async (_name, operation) => {
+    const error = await rejection(operation());
+    expect(error.code).toBe('dockerEndpointUnsupported');
+    expect(error.message).toBe(Messages.dockerEndpointUnsupported(ENDPOINT));
+    noDockerCall();
+    expect(u.docker.log).toEqual([]);
+  });
+
+  it('the reads of the view and the restore do nothing, and the message is shown once', async () => {
+    const name = resourceName('acme/lost', OTHER_ID.replace(/^./, 'f'));
+    u.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID.replace(/^./, 'f'), [LABEL_REPOSITORY]: 'acme/lost', [LABEL_OWNER_ID]: ACCOUNT.id });
+    expect(await u.service.reconcileFromVolumes()).toBe(0);
+    expect(await u.service.inspectStates()).toEqual(new Map());
+    expect(await u.service.currentBranch(ENV_ID)).toBeUndefined();
+    expect(await u.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
+    expect(await u.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
+    expect(await u.service.repositoryServiceData(ENV_ID)).toEqual([]);
+    expect(await u.service.inspectStates()).toEqual(new Map());
+    noDockerCall();
+    // Never recorded as the host of a restored entry.
+    expect((await u.registry.list()).filter((env) => env.repository === 'acme/lost')).toEqual([]);
+    expect(u.ui.warnings.filter((warning) => warning === Messages.dockerEndpointUnsupported(ENDPOINT))).toHaveLength(1);
   });
 });

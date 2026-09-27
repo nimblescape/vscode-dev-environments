@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // All user-visible texts. Where the concept gives a text (section 6.5), the text here is exactly that text.
+import { sshCommandLine } from './docker/dockerHost';
 
 export const Steps = {
   startingDocker: 'Starting Docker',
@@ -253,7 +254,7 @@ export function dockerHostReason(
     case 'login':
       return 'SSH could not log in. Add your SSH key to the SSH agent (ssh-add) or name it in your SSH config, then try again.';
     case 'hostKey':
-      return `SSH does not know the host key of this computer yet. Run "ssh ${host}" once in a terminal, check the key and accept it, then try again.`;
+      return `SSH does not know the host key of this computer yet. Run "${sshCommandLine(host)}" once in a terminal, check the key and accept it, then try again.`;
     case 'dockerMissing':
       return 'Docker is not installed on that computer.';
     case 'dockerNotRunning':

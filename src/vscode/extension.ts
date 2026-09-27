@@ -13,7 +13,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets } from '../core/docker/dockerTargets';
-import { startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -112,7 +112,9 @@ async function activateExtension(
   const targets = new DockerTargets(docker, env, logger, platform);
   const remoteState = new RemoteDockerState(paths.remoteDocker);
   const sshPath = (): string | undefined => findExecutable('ssh', env, platform);
-  const remoteDeps = (): RemoteReachabilityDeps => ({ docker, runner, state: remoteState, logger, sshPath: sshPath(), env });
+  // Review, C3: the SSH check before the Docker calls to a remote host; a success counts for a minute per host.
+  const sshLogins = new SshLoginCache();
+  const remoteDeps = (): RemoteReachabilityDeps => ({ docker, runner, state: remoteState, logger, sshPath: sshPath(), env, sshLogins });
   const registry = new EnvironmentRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
@@ -201,8 +203,9 @@ async function activateExtension(
     pullCredentials: githubPackagesPullCredentials(credentials.provider(), auth),
     // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
     analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
-    // Unit 7: new environments record the Docker host; only its environments are used.
-    dockerHost: () => targets.host(),
+    // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
+    // neither local nor SSH is refused by every operation and never read.
+    dockerTarget: () => targets.current(),
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
       startDockerFor(
@@ -303,6 +306,7 @@ async function activateExtension(
       sshPath,
       env,
       platform,
+      sshLogins,
       onDidSwitch: async () => {
         await sidebar.render();
         if (view.visible) await sidebar.refreshStates();
@@ -412,7 +416,9 @@ async function findWindowEnvironment(
   try {
     const environment = await registry.findByContainerName(containerName);
     if (environment || !(await needsRestore())) return environment;
-    if (!docker.isInstalled() || !(await docker.isRunning())) return undefined;
+    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs.
+    if (!docker.isInstalled()) return undefined;
     if ((await service.reconcileFromVolumes()) === 0) return undefined;
     return await registry.findByContainerName(containerName);
   } catch (error) {

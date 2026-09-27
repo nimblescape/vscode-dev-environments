@@ -5,8 +5,9 @@
 // Unit 7: Docker on another computer through the Docker context, against the real Docker engine. The "remote computer"
 // is an SSH server in a container (test/docker/sshd: Alpine with openssh-server and the Docker CLI, key authentication
 // only) whose Docker socket is the socket of the engine of the runner. A test SSH config names it; a wrapper `ssh` first on
-// PATH adds `-F <config>`, so the Docker CLI's ssh uses it and the SSH config of the user is not touched. The context
-// `devenv-remote` (`ssh://devenv-test-remote`) is created in a Docker configuration folder of this file only.
+// PATH adds `-F <config>`, so the Docker CLI's ssh uses it and the SSH config of the user is not touched. The context of
+// the host (`devenv-remote-<hash>`, `ssh://devenv-test-remote`) is created in a Docker configuration folder of this file
+// only.
 // Checked: the test of a host and the plain reasons of its failures (unknown host key, login failed, unreachable), the
 // context switch and the detection of the remote mode, the open pipeline of a seeded environment through the context
 // (every Docker call goes through SSH: the SSH server logs each connection), the containers and volumes on the engine
@@ -18,10 +19,10 @@ import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { findExecutable } from '../../src/core/docker/dockerCli';
-import { REMOTE_CONTEXT_NAME } from '../../src/core/docker/dockerHost';
+import { remoteContextName } from '../../src/core/docker/dockerHost';
 import { ensureDockerRunning } from '../../src/core/docker/dockerStart';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { startDockerFor, testRemoteDockerHost, useContext, useRemoteContext } from '../../src/core/docker/remoteDocker';
+import { startDockerFor, testRemoteDockerHost, useContext, useRemoteContext, type SshCheckDeps } from '../../src/core/docker/remoteDocker';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
@@ -96,11 +97,12 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
   const volumeName = resourceName(REPOSITORY, environmentId);
   const containerName = volumeName;
 
-  // The environment of this file: its own Docker configuration (the context devenv-remote lives there), the wrapper
+  // The environment of this file: its own Docker configuration (the context of the host lives there), the wrapper
   // `ssh` first on PATH, and neither DOCKER_HOST nor DOCKER_CONTEXT, so the current context decides.
   const env: NodeJS.ProcessEnv = { ...localEnv };
   let docker: ContainerAdapter;
   let targets: DockerTargets;
+  let sshDeps: () => SshCheckDeps;
   let sshLog = '';
 
   /** "Accepted publickey" lines of the SSH server: one per SSH connection of the Docker CLI. */
@@ -170,11 +172,13 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     delete env.DOCKER_CONTEXT;
     docker = new ContainerAdapter(runner, run.dockerPath, env, log);
     targets = new DockerTargets(docker, env, log);
+    // Review, C3: the SSH check before the Docker calls uses the wrapper `ssh` (the test SSH config).
+    sshDeps = () => ({ runner, sshPath: findExecutable('ssh', env, process.platform), env });
 
     // The SSH server answers once sshd runs.
     const deadline = Date.now() + 30_000;
     for (;;) {
-      const test = await testRemoteDockerHost(docker, ALIAS, { timeoutMs: 20_000 });
+      const test = await testRemoteDockerHost(docker, ALIAS, sshDeps(), { timeoutMs: 20_000 });
       if (test.ok) break;
       if (Date.now() > deadline) throw new Error(`The SSH server does not answer: ${test.detail}`);
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -190,14 +194,14 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
   });
 
   it('tests a host without questions, and names the reason of a failure', async () => {
-    await expect(testRemoteDockerHost(docker, ALIAS)).resolves.toMatchObject({ ok: true, rootless: false });
+    await expect(testRemoteDockerHost(docker, ALIAS, sshDeps())).resolves.toMatchObject({ ok: true, rootless: false });
     for (const [alias, problem] of [
       ['devenv-test-unknown-key', 'hostKey'],
       ['devenv-test-wrong-key', 'login'],
       ['devenv-test-closed', 'unreachable'],
     ] as const) {
       const started = Date.now();
-      const result = await testRemoteDockerHost(docker, alias, { timeoutMs: 40_000 });
+      const result = await testRemoteDockerHost(docker, alias, sshDeps(), { timeoutMs: 40_000 });
       log.info(`${alias}: ${JSON.stringify(result)}`);
       expect(result).toMatchObject({ ok: false, problem });
       // No prompt waits for an answer: each failure comes at once.
@@ -208,7 +212,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
   it('switches the context to ssh://<alias>: the remote mode follows it, and back', async () => {
     await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local', host: '' });
     await useRemoteContext(docker, ALIAS);
-    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}`, context: REMOTE_CONTEXT_NAME });
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}`, context: remoteContextName(ALIAS) });
     await useContext(docker, 'default');
     await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local' });
     await useRemoteContext(docker, ALIAS);
@@ -251,7 +255,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       owner: { windowId: 'docker-test-remote-window', pid: process.pid },
       settings: () => settings,
       windowStatuses: () => sessionFiles.readWindowStatuses(),
-      dockerHost: () => targets.host(),
+      dockerTarget: () => targets.current(),
       startDocker: async ({ onStarting, signal }) =>
         startDockerFor(
           await targets.current(),

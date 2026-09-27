@@ -9,7 +9,8 @@
 import * as path from 'path';
 import { isBusyMarkLive } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
-import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../docker/dockerHost';
+import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
+import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import {
@@ -326,6 +327,12 @@ export interface EnvironmentServiceDeps {
    * only environments of this host are opened, restored, or changed. Default: the local Docker.
    */
   dockerHost?: () => Promise<string>;
+  /**
+   * Unit 7, review D2: the Docker target of the operation (DockerTargets.current), with its kind. When given, it decides
+   * instead of `dockerHost`: an endpoint that is neither local nor SSH ('unsupported') is refused by every operation
+   * (dockerEndpointUnsupported) and never read or recorded.
+   */
+  dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
   /**
@@ -853,6 +860,8 @@ function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefin
  */
 export class EnvironmentService {
   private readonly queues = new Map<string, Promise<void>>();
+  /** Review D2: the endpoints (neither local nor SSH) whose refusal the reads showed already: once each. */
+  private readonly refusedEndpoints = new Set<string>();
   /**
    * Git identity per account ID (identityOf): the question to GitHub, shared by the opens of this window. After a failed
    * question, `retryAfter` is the time from which GitHub is asked again.
@@ -4267,13 +4276,18 @@ export class EnvironmentService {
     }
   }
 
-  /** Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. */
+  /**
+   * Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. Review
+   * D2: no Docker call at all on an endpoint that is neither local nor SSH; its (empty) map of states.
+   */
   async inspectStates(): Promise<Map<string, EnvironmentRuntimeState> | undefined> {
     const { docker } = this.deps;
     try {
+      const readable = await this.readableDockerHost();
+      if (readable === undefined) return new Map();
       if (!(await docker.isRunning())) return undefined;
       // Unit 7: only the environments of the current Docker host; the others are hidden.
-      const dockerHost = await this.currentDockerHost();
+      const dockerHost = readable;
       const [environments, containers, volumes] = await Promise.all([
         this.deps.registry.list().then((list) => environmentsOfHost(list, dockerHost)),
         docker.listEnvironmentContainers(),
@@ -4330,9 +4344,12 @@ export class EnvironmentService {
    */
   async reconcileFromVolumes(): Promise<number> {
     const { docker } = this.deps;
+    // Review D2: never on an endpoint that is neither local nor SSH (it would be recorded as the host of the entries).
+    const readable = await this.readableDockerHost();
+    if (readable === undefined) return 0;
     if (!(await docker.isRunning())) return 0;
     // Unit 7: the volumes of the current Docker host only; the restored entries record it.
-    const dockerHost = await this.currentDockerHost();
+    const dockerHost = readable;
     const volumes = await docker.listEnvironmentVolumes();
     const now = isoTime(this.deps.clock);
     const candidates: Environment[] = [];
@@ -4462,13 +4479,48 @@ export class EnvironmentService {
   // -------------------------------------------------------------------------------------------------------------------
   // Steps and helpers
 
-  /** Unit 7: the Docker host of the operation ('' = the local Docker). */
+  /**
+   * Unit 7, review D2: the one check of the Docker target of the service. The target of the operation (dockerTarget),
+   * else the host of `dockerHost` (local or SSH).
+   */
+  private async dockerTarget(): Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>> {
+    if (this.deps.dockerTarget) return this.deps.dockerTarget();
+    const host = (await this.deps.dockerHost?.()) ?? '';
+    return { kind: host === '' ? 'local' : 'remote', host, endpoint: '' };
+  }
+
+  /**
+   * Unit 7: the Docker host of the operation ('' = the local Docker). Review D2: an endpoint that is neither local nor
+   * SSH is refused (UserFacingError dockerEndpointUnsupported), so no operation reaches it or records it.
+   */
   private async currentDockerHost(): Promise<string> {
-    return (await this.deps.dockerHost?.()) ?? '';
+    const target = await this.dockerTarget();
+    if (target.kind === 'unsupported') {
+      this.logger.warn(`The Docker endpoint ${target.endpoint || target.host} is neither local nor SSH. Nothing is done.`);
+      throw dockerEndpointUnsupported(target.endpoint || target.host);
+    }
+    return target.host;
+  }
+
+  /**
+   * Review D2: the Docker host for the reads of the view and the restore (states, branch, volumes): undefined on an
+   * endpoint that is neither local nor SSH, and the reads do nothing then. The message is shown once per endpoint.
+   */
+  private async readableDockerHost(): Promise<string | undefined> {
+    const target = await this.dockerTarget();
+    if (target.kind !== 'unsupported') return target.host;
+    const endpoint = target.endpoint || target.host;
+    if (!this.refusedEndpoints.has(endpoint)) {
+      this.refusedEndpoints.add(endpoint);
+      this.logger.warn(`The Docker endpoint ${endpoint} is neither local nor SSH. Its containers and volumes are not read.`);
+      this.deps.ui.warn(Messages.dockerEndpointUnsupported(endpoint));
+    }
+    return undefined;
   }
 
   private async isOnCurrentHost(environment: Environment): Promise<boolean> {
-    return isOnDockerHost(environment, await this.currentDockerHost());
+    const host = await this.readableDockerHost();
+    return host !== undefined && isOnDockerHost(environment, host);
   }
 
   /**

@@ -11,18 +11,29 @@
 // askpass program for the test. The Docker CLI gives ssh a connection time limit of 30 s ("-o ConnectTimeout=30",
 // connhelper.go addSSHTimeout); each call here has its own time limit on top. Our own `ssh` call (the runtime folder of
 // a rootless engine) uses the documented options BatchMode=yes and ConnectTimeout. Host keys are never accepted here:
-// an unknown key fails, and the message asks the user to run `ssh <host>` once in a terminal.
+// an unknown key fails, and the message asks the user to run `ssh <host>` once in a terminal (sshCommandLine).
+//
+// Review, C3: on Windows the Docker CLI starts ssh.exe without Setsid, and the OpenSSH client of Windows asks on the
+// hidden console (a host key, a password) until the time limit; the answer was "does not answer". So before the test of
+// a host and before each operation on it, our own `ssh -o BatchMode=yes -o ConnectTimeout=15 -T -- <host> true` runs
+// first (checkSshLogin), on every platform: BatchMode makes ssh fail at once instead of asking, and its error names the
+// reason (host key, login, unreachable, closed before the login). It is one connection instead of the several of the
+// Docker CLI, which also lowers the risk of a lock-out by PerSourcePenalties. A success is kept for SSH_CHECK_CACHE_MS
+// per host (SshLoginCache), a failure never.
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
-import { isAbortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
+import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import type { RemoteDockerState } from '../storage/remoteDockerState';
 import { envValue } from './dockerCli';
 import {
   DEFAULT_CONTEXT_NAME,
-  REMOTE_CONTEXT_NAME,
   RUNTIME_DIR_COMMAND,
+  classifyDockerEndpoint,
   dockerHostProblem,
+  isOwnRemoteContext,
   isRootlessEngine,
+  parseContextInspect,
+  remoteContextName,
   rootlessSocketPath,
   sshCommandArgs,
   sshEndpoint,
@@ -101,14 +112,18 @@ async function runEngineInfo(
 }
 
 /**
- * The test before the switch: `docker -H ssh://<host> info`, without questions (see the module comment). The current
- * context is not used and not changed.
+ * The test before the switch: the SSH check (checkSshLogin), then `docker -H ssh://<host> info`, without questions (see
+ * the module comment). The current context is not used and not changed.
  */
 export async function testRemoteDockerHost(
   docker: RemoteDockerCli,
   host: string,
+  ssh: SshCheckDeps,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<EngineCheck> {
+  // Review, C3: our own ssh without questions first; it always connects (no cached success).
+  const login = await checkSshLogin(host, ssh, { signal: options.signal, useCache: false });
+  if (!login.ok) return login;
   const timeoutMs = options.timeoutMs ?? REMOTE_INFO_TIMEOUT_MS;
   const env = noPromptEnv(docker.processEnv());
   // -H decides the endpoint; DOCKER_CONTEXT would conflict with it.
@@ -164,6 +179,88 @@ export async function readRootlessSocket(
   return { ok: true, socket };
 }
 
+/** A successful SSH login to a host is not checked again for this time (review, C3). */
+export const SSH_CHECK_CACHE_MS = 60_000;
+
+/** The hosts whose SSH login succeeded within the last SSH_CHECK_CACHE_MS. Failures are never kept. */
+export class SshLoginCache {
+  private readonly succeededAt = new Map<string, number>();
+
+  constructor(
+    private readonly clock: Clock = systemClock,
+    private readonly maxAgeMs: number = SSH_CHECK_CACHE_MS,
+  ) {}
+
+  /** True when the login to `host` succeeded less than maxAgeMs ago. */
+  isFresh(host: string): boolean {
+    const at = this.succeededAt.get(host);
+    if (at === undefined) return false;
+    const age = this.clock.now() - at;
+    if (age >= 0 && age < this.maxAgeMs) return true;
+    this.succeededAt.delete(host);
+    return false;
+  }
+
+  remember(host: string): void {
+    this.succeededAt.set(host, this.clock.now());
+  }
+
+  forget(host: string): void {
+    this.succeededAt.delete(host);
+  }
+}
+
+/** What the SSH check before a Docker call over SSH needs. */
+export interface SshCheckDeps {
+  runner: ProcessRunner;
+  /** The path of `ssh` (findExecutable). */
+  sshPath: string | undefined;
+  env: NodeJS.ProcessEnv;
+  /** Keeps successes for a while; without it, every check opens a connection. */
+  sshLogins?: SshLoginCache;
+}
+
+export type SshLoginCheck =
+  | { ok: true; skipped?: 'cached' | 'notAnSshTarget' }
+  | { ok: false; problem: DockerHostProblem; detail: string };
+
+/**
+ * The SSH check before a Docker call to `host` (see the module comment): `ssh -o BatchMode=yes -o ConnectTimeout=15 -T
+ * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts
+ * (the test before a switch always connects). A host that is no usable alias or address (for example of a context of
+ * the user with a path) is left to the Docker CLI.
+ */
+export async function checkSshLogin(
+  host: string,
+  deps: SshCheckDeps,
+  options: { signal?: AbortSignal; useCache?: boolean } = {},
+): Promise<SshLoginCheck> {
+  if (options.useCache !== false && deps.sshLogins?.isFresh(host)) return { ok: true, skipped: 'cached' };
+  const target = sshTargetOf(host);
+  if (!target) return { ok: true, skipped: 'notAnSshTarget' };
+  if (deps.sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
+  let result: RunResult;
+  try {
+    result = await deps.runner.run(deps.sshPath, sshCommandArgs(target, 'true'), {
+      env: noPromptEnv(deps.env),
+      timeoutMs: SSH_TIMEOUT_MS,
+      signal: options.signal,
+    });
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    const detail = errorMessage(error);
+    return { ok: false, problem: dockerHostProblem(detail), detail };
+  }
+  if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `ssh did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
+  if (result.exitCode !== 0) {
+    deps.sshLogins?.forget(host);
+    const detail = result.stderr.trim() || `ssh failed with exit code ${result.exitCode}.`;
+    return { ok: false, problem: dockerHostProblem(detail), detail };
+  }
+  deps.sshLogins?.remember(host);
+  return { ok: true };
+}
+
 /** UserFacingError('dockerHostUnreachable') for `host`. */
 export function dockerHostUnreachable(host: string, problem: DockerHostProblem, detail: string): UserFacingError {
   return new UserFacingError('dockerHostUnreachable', Messages.dockerHostUnreachable(host, dockerHostReason(problem, host)), detail);
@@ -182,10 +279,12 @@ export interface RemoteReachabilityDeps {
   /** The path of `ssh` (findExecutable), for the runtime folder of a rootless engine. */
   sshPath: string | undefined;
   env: NodeJS.ProcessEnv;
+  /** Review, C3: the successes of the SSH check, per host (one cache for the extension). */
+  sshLogins?: SshLoginCache;
 }
 
 /**
- * The step "Docker start" for a remote host: one `docker info` through the current context (no Docker Desktop start, no
+ * The step "Docker start" for a remote host: the SSH check (checkSshLogin), then one `docker info` through the current context (no Docker Desktop start, no
  * setup, no "Starting Docker" step). Throws UserFacingError('dockerHostUnreachable') with the plain reason. A rootless
  * engine gets its socket recorded (read once with ssh), a rootful one has it forgotten, so the helper mounts the right
  * socket of that computer.
@@ -195,6 +294,12 @@ export async function ensureDockerHostReachable(
   deps: RemoteReachabilityDeps,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<void> {
+  // Review, C3: our own ssh without questions first (a success of the last minute counts).
+  const login = await checkSshLogin(target.host, deps, { signal: options.signal });
+  if (!login.ok) {
+    deps.logger.warn(`The Docker host ${target.host} cannot be reached over SSH: ${login.detail}`);
+    throw dockerHostUnreachable(target.host, login.problem, login.detail);
+  }
   const check = await checkCurrentEngine(deps.docker, options);
   if (!check.ok) {
     deps.logger.warn(`The Docker host ${target.host} cannot be reached: ${check.detail}`);
@@ -262,18 +367,37 @@ export async function listContexts(docker: RemoteDockerCli): Promise<string[]> {
 }
 
 /**
- * Points the context `devenv-remote` to `ssh://<host>` (`docker context create`, or `docker context update` when it
- * exists) and makes it the current context (`docker context use`).
+ * The endpoint of the context `name` (`docker context inspect <name> --format '{{json .}}'`); undefined when it cannot
+ * be read.
  */
-export async function useRemoteContext(docker: RemoteDockerCli, host: string): Promise<void> {
-  const exists = (await listContexts(docker)).includes(REMOTE_CONTEXT_NAME);
-  const endpoint = `host=${sshEndpoint(host)}`;
-  const args = exists
-    ? ['update', REMOTE_CONTEXT_NAME, '--description', 'Dev Environments: remote Docker host', '--docker', endpoint]
-    : ['create', REMOTE_CONTEXT_NAME, '--description', 'Dev Environments: remote Docker host', '--docker', endpoint];
-  const written = await contextCommand(docker, args);
-  if (written.exitCode !== 0) throw contextCommandError(args, written);
-  await useContext(docker, REMOTE_CONTEXT_NAME);
+export async function contextEndpoint(docker: RemoteDockerCli, name: string): Promise<string | undefined> {
+  const args = ['inspect', name, '--format', '{{json .}}'];
+  const result = await contextCommand(docker, args);
+  if (result.exitCode !== 0) return undefined;
+  return parseContextInspect(result.stdout)?.endpoint;
+}
+
+/**
+ * Makes the context of `host` (remoteContextName: one per host) the current context (`docker context use`); creates it
+ * with `ssh://<host>` first when it does not exist (`docker context create`). An existing context is never changed
+ * (review, C1): an operation of another window that runs on it keeps its host. One of our names that points elsewhere
+ * is refused. Returns the name of the context.
+ */
+export async function useRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
+  const name = remoteContextName(host);
+  const endpoint = sshEndpoint(host);
+  if ((await listContexts(docker)).includes(name)) {
+    const existing = await contextEndpoint(docker, name);
+    if (existing !== endpoint) {
+      throw new Error(`The Docker context ${name} points to ${existing ?? 'an endpoint that cannot be read'}, not to ${endpoint}. Remove it (docker context rm ${name}) and try again.`);
+    }
+  } else {
+    const args = ['create', name, '--description', `Dev Environments: remote Docker host ${host}`, '--docker', `host=${endpoint}`];
+    const written = await contextCommand(docker, args);
+    if (written.exitCode !== 0) throw contextCommandError(args, written);
+  }
+  await useContext(docker, name);
+  return name;
 }
 
 /** `docker context use <name>`. */
@@ -284,11 +408,25 @@ export async function useContext(docker: RemoteDockerCli, name: string): Promise
 }
 
 /**
- * The context for "Use the Local Docker": the remembered one (for example Docker Desktop's `desktop-linux`) when it
- * still exists and is not ours, else `default`.
+ * The context for "Use the Local Docker" by name: the remembered one (for example Docker Desktop's `desktop-linux`) when
+ * it still exists and is not ours, else `default`. chooseLocalContext also checks where it points.
  */
 export function localContextChoice(remembered: string | undefined, existing: readonly string[]): string {
-  if (remembered !== undefined && remembered !== REMOTE_CONTEXT_NAME && existing.includes(remembered)) return remembered;
+  if (remembered !== undefined && !isOwnRemoteContext(remembered) && existing.includes(remembered)) return remembered;
+  return DEFAULT_CONTEXT_NAME;
+}
+
+/**
+ * The context for "Use the Local Docker": localContextChoice, and the remembered context only when its endpoint is the
+ * local Docker (classifyDockerEndpoint); one that points to another computer (for example a context `mybox` with
+ * `ssh://…` of the user) gives `default` (review, C2).
+ */
+export async function chooseLocalContext(docker: RemoteDockerCli, remembered: string | undefined, logger?: Logger): Promise<string> {
+  const name = localContextChoice(remembered, await listContexts(docker));
+  if (name === DEFAULT_CONTEXT_NAME) return name;
+  const endpoint = await contextEndpoint(docker, name);
+  if (endpoint !== undefined && classifyDockerEndpoint(endpoint).kind === 'local') return name;
+  logger?.info(`The remembered Docker context ${name} does not point to the local Docker (${endpoint ?? 'not readable'}); the context ${DEFAULT_CONTEXT_NAME} is used.`);
   return DEFAULT_CONTEXT_NAME;
 }
 

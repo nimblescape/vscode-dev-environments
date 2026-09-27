@@ -5,7 +5,7 @@
 import { Readable } from 'stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
-import { NodeProcessRunner, OutputTooLargeError } from './process';
+import { NodeProcessRunner, OutputTooLargeError, windowsTreeKillCommand } from './process';
 
 const node = process.execPath;
 
@@ -61,5 +61,49 @@ describe('NodeProcessRunner', () => {
     const result = await new NodeProcessRunner().run(node, ['-e', 'console.log("hello")']);
     expect(result.stdout).toBe('hello\n');
     expect(setEncoding).not.toHaveBeenCalled();
+  });
+});
+
+describe('the end of a program on Windows: its whole process tree (review, C3)', () => {
+  const sleeper = ['-e', 'setTimeout(() => {}, 60000)'];
+
+  it('builds taskkill /T /F /PID <pid> from the System32 folder, as arguments without a shell', () => {
+    expect(windowsTreeKillCommand(4242, { SystemRoot: 'D:\\Win' })).toEqual({
+      file: 'D:\\Win\\System32\\taskkill.exe',
+      args: ['/T', '/F', '/PID', '4242'],
+    });
+    expect(windowsTreeKillCommand(7, { SYSTEMROOT: 'C:\\Windows' }).file).toBe('C:\\Windows\\System32\\taskkill.exe');
+    expect(windowsTreeKillCommand(7, {}).file).toBe('C:\\Windows\\System32\\taskkill.exe');
+  });
+
+  it('on win32, ends the tree at the time limit and at an abort', async () => {
+    const killed: number[] = [];
+    const killTree = vi.fn((pid: number) => {
+      killed.push(pid);
+      process.kill(pid);
+    });
+    const runner = new NodeProcessRunner(undefined, undefined, { platform: 'win32', killTree });
+    const result = await runner.run(node, sleeper, { timeoutMs: 200 });
+    expect(result.timedOut).toBe(true);
+    expect(killTree).toHaveBeenCalledTimes(1);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    await expect(runner.run(node, sleeper, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(killTree).toHaveBeenCalledTimes(2);
+    expect(killed.every((pid) => Number.isInteger(pid) && pid > 0)).toBe(true);
+  });
+
+  it('elsewhere, only the program itself, as before', async () => {
+    const killTree = vi.fn();
+    const runner = new NodeProcessRunner(undefined, undefined, { platform: 'linux', killTree });
+    const result = await runner.run(node, sleeper, { timeoutMs: 200 });
+    expect(result.timedOut).toBe(true);
+    expect(killTree).not.toHaveBeenCalled();
+  });
+
+  it('on win32, ends the program itself when taskkill cannot be started', async () => {
+    const runner = new NodeProcessRunner(undefined, undefined, { platform: 'win32', killTree: (_pid, fallback) => fallback() });
+    const result = await runner.run(node, sleeper, { timeoutMs: 200 });
+    expect(result.timedOut).toBe(true);
   });
 });

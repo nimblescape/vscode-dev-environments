@@ -1590,6 +1590,20 @@ describe('Sign in and Refresh', () => {
     expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
   });
 
+  it('leaves the check of the Docker target and of a running Docker to the restore itself (review, D2)', async () => {
+    // Before, the controller asked `docker info` first, on any endpoint (also one that is neither local nor SSH).
+    fs.writeFileSync(h.paths.registry, '{ "version": 1, "environments": [ { "id": ');
+    h.docker.isRunning.mockClear();
+    let runningAsked = 0;
+    h.service.reconcileFromVolumes.mockImplementation(async () => {
+      runningAsked = h.docker.isRunning.mock.calls.length;
+      return 0;
+    });
+    await run('refresh');
+    expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
+    expect(runningAsked).toBe(0);
+  });
+
   it('does not restore from the volumes while registry.json is valid', async () => {
     await h.registry.add(environment());
     await run('refresh');

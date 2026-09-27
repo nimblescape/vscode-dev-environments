@@ -546,7 +546,9 @@ export class Controller implements vscode.Disposable {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
     if (!(await this.deps.registryNeedsRestore())) return;
-    if (!docker.isInstalled() || !(await docker.isRunning())) return;
+    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs; no `docker info` here before that check.
+    if (!docker.isInstalled()) return;
     const added = await service.reconcileFromVolumes();
     if (added === 0) return;
     await this.adoptWindowEnvironment();
