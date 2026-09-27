@@ -25,7 +25,7 @@ import {
 } from '../names';
 import { abortError } from '../ports';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
-import { PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
+import { MAX_REFUSED_ITEMS_LENGTH, PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -3002,6 +3002,23 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
       expect(h.ui.warnings).toEqual([REFUSED]);
       expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
+    });
+
+    it('keeps a bounded text of what it needed, also for many long items (hotfix review 3, C3-2)', async () => {
+      // 40 long bind mounts (access to the computer) and 40 long mounts with a leftover variable (unsupported): 21 items
+      // of each list, each at most 200 characters, are still more than MAX_REFUSED_ITEMS_LENGTH together.
+      const binds = Array.from({ length: 40 }, (_, i) => ({ source: `/${i}${'a'.repeat(5000)}`, target: `/t${i}`, type: 'bind' }));
+      const leftovers = Array.from({ length: 40 }, (_, i) => `type=volume,src=\${localEnv:TERM:v${i}${'b'.repeat(5000)}},dst=/v${i}`);
+      h.helper.buildMetadata = [{ id: 'many-mounts', mounts: [...binds, ...leftovers] }];
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      await h.service.openEnvironment(ENV_ID, options());
+      const items = ((await refusedUpdate()) as { items: string }).items;
+      expect(items.length).toBe(MAX_REFUSED_ITEMS_LENGTH + 1);
+      expect(items.startsWith(`bind mount /0${'a'.repeat(80)}`)).toBe(true);
+      // The start and the end stay: the first item that needs the computer, and the count of the unknown items.
+      expect(items.endsWith(', and 20 more')).toBe(true);
+      expect(items).toContain('…');
+      expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
     });
   });
 

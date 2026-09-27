@@ -376,13 +376,37 @@ export function hostAccessReport(input: HostAccessInput, checksOn = true): HostA
  */
 export const MAX_LISTED_ITEMS = 20;
 
-/** `items`, of which at most MAX_LISTED_ITEMS, and then `and <n> more`. */
-function capped(items: readonly string[]): string[] {
-  if (items.length <= MAX_LISTED_ITEMS) return [...items];
-  return [...items.slice(0, MAX_LISTED_ITEMS), `and ${items.length - MAX_LISTED_ITEMS} more`];
+/**
+ * The most characters of one listed item or expression (hotfix review 3, C3-2): an item quotes its entry, which may be
+ * up to MAX_CLI_TEXT_LENGTH long, and the substitution of the CLI makes it longer. The middle is `…` (truncated).
+ */
+export const MAX_ITEM_LENGTH = 200;
+
+/**
+ * `text` with at most `max` characters: its start and its end, with `…` for the middle (never half of a surrogate
+ * pair). The end stays because it says why an item is refused (for example `, which cannot be checked`).
+ */
+export function truncated(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const tail = Math.floor(max / 2);
+  let headEnd = max - tail;
+  let tailStart = text.length - tail;
+  if (/[\uD800-\uDBFF]/.test(text.charAt(headEnd - 1))) headEnd--;
+  if (/[\uDC00-\uDFFF]/.test(text.charAt(tailStart))) tailStart++;
+  return `${text.slice(0, headEnd)}…${text.slice(tailStart)}`;
 }
 
-/** The expressions of a leftover list for an item: at most MAX_LISTED_ITEMS, then `and <n> more`. */
+/**
+ * `items`, of which at most MAX_LISTED_ITEMS, and then `and <n> more`; each at most MAX_ITEM_LENGTH characters. Called
+ * after the items are without duplicates and the placeholder of an ID is named as the configuration writes it (add in
+ * hostAccessFindings), so that both see the whole text.
+ */
+function capped(items: readonly string[]): string[] {
+  const listed = items.slice(0, MAX_LISTED_ITEMS).map((item) => truncated(item, MAX_ITEM_LENGTH));
+  return items.length <= MAX_LISTED_ITEMS ? listed : [...listed, `and ${items.length - MAX_LISTED_ITEMS} more`];
+}
+
+/** The expressions of a leftover list for an item: at most MAX_LISTED_ITEMS, each at most MAX_ITEM_LENGTH characters, then `and <n> more`. */
 function listedVariables(expressions: readonly string[]): string {
   return capped(expressions).join(', ');
 }

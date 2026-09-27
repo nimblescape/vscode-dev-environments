@@ -22,6 +22,7 @@ import {
   isSameOwnerAdditionalVolume,
   mountedVolumeNames,
   removedRunArgs,
+  truncated,
   volumeLabelOwner,
   type HostAccessInput,
   type HostAccessReport,
@@ -290,6 +291,12 @@ export interface EnvironmentRuntimeState {
   container: ContainerState;
   volume: boolean;
 }
+
+/**
+ * The most characters of the text `items` of a refused update (hotfix review 3, C3-2): it is kept in the registry, and
+ * an error message that is no HostAccessError has no bound of its own. The middle is `…` (truncated).
+ */
+export const MAX_REFUSED_ITEMS_LENGTH = 4096;
 
 const BUSY_POLL_MS = 500;
 const DEFAULT_BUSY_WAIT_MS = 10_000;
@@ -1408,7 +1415,8 @@ export class EnvironmentService {
     check: ImageCheckState,
     error: unknown,
   ): Promise<void> {
-    const items = error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error);
+    // At most MAX_REFUSED_ITEMS_LENGTH characters (hotfix review 3, C3-2): the text is kept in the registry.
+    const items = truncated(error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error), MAX_REFUSED_ITEMS_LENGTH);
     this.logger.info(`The existing environment of ${ctx.env.repository} is started without the update. A changed digest or configuration tries it again.`);
     this.deps.ui.warn(Messages.updateRefused(items));
     if (check.kind !== 'checked') return;
