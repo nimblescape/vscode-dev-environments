@@ -37,6 +37,23 @@ describe('extraSearchFolders', () => {
     ]);
   });
 
+  it('adds the per-user folders of Docker Desktop on macOS when HOME is known', () => {
+    expect(extraSearchFolders('darwin', { HOME: '/Users/me' })).toEqual([
+      '/usr/local/bin',
+      '/opt/homebrew/bin',
+      '/Applications/Docker.app/Contents/Resources/bin',
+      '/Users/me/.docker/bin',
+      '/Users/me/Applications/Docker.app/Contents/Resources/bin',
+    ]);
+    // A relative HOME is ignored (it would name a folder of the opened workspace).
+    expect(extraSearchFolders('darwin', { HOME: 'me' })).toHaveLength(3);
+  });
+
+  it('finds the Docker CLI of a per-user Docker Desktop installation on macOS', () => {
+    const fake = existing('/Users/me/.docker/bin/docker');
+    expect(findDockerCli({ PATH: '/usr/bin:/bin', HOME: '/Users/me' }, 'darwin', fake.exists)).toBe('/Users/me/.docker/bin/docker');
+  });
+
   it('lists the Docker Desktop folder on Windows', () => {
     expect(extraSearchFolders('win32')).toEqual(['C:\\Program Files\\Docker\\Docker\\resources\\bin']);
   });
@@ -136,7 +153,8 @@ describe('dockerProcessEnv', () => {
     const env = { PATH: '/usr/bin:/bin', HOME: '/Users/me' };
     const result = dockerProcessEnv(env, 'darwin', '/Applications/Docker.app/Contents/Resources/bin/docker');
     expect(result.PATH).toBe(
-      '/usr/bin:/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/local/bin:/opt/homebrew/bin',
+      '/usr/bin:/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/local/bin:/opt/homebrew/bin' +
+        ':/Users/me/.docker/bin:/Users/me/Applications/Docker.app/Contents/Resources/bin',
     );
     expect(result.HOME).toBe('/Users/me');
     expect(env.PATH).toBe('/usr/bin:/bin');

@@ -628,22 +628,22 @@ describe('Controller commands', () => {
   // sign-in while not signed in.
   describe('Docker setup in the sidebar (package.json viewsWelcome)', () => {
     const setup = { [DockerContextKeys.missing]: true, [DockerContextKeys.setupRequired]: true };
-    const intro = 'Dev Environments runs your environments in Docker, which is not installed on this computer. Set it up in these steps:';
-    const after = 'After the installation, your repositories appear here. Dev Environments starts Docker when it is needed.';
+    const intro = 'Dev Environments needs Docker, which is not installed on this computer.';
+    const after = 'Your repositories appear here once Docker is installed. Dev Environments starts Docker when needed.';
     // Docker Engine on Linux is not started by the extension: it needs administrator rights.
     const afterLinux =
-      'After the installation, your repositories appear here. When Docker Engine is not running, Dev Environments asks to start it.';
+      'Your repositories appear here once Docker is installed. Dev Environments asks to start Docker Engine when needed.';
     const signIn =
       'Sign in with GitHub to see your repositories that have a Dev Container configuration.\n[Sign in with GitHub](command:devEnvironments.signIn)';
     const installWsl =
-      '1. Install WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs. Windows asks for administrator permission; restart the computer afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)';
-    const wslInstalled = '1. WSL 2, the Windows Subsystem for Linux, which Docker Desktop needs:\n✓ WSL 2 is installed.';
+      '1. Install WSL 2, which Docker Desktop needs. Windows asks for administrator permission; restart afterwards.\n[Install WSL 2](command:devEnvironments.dockerSetup.installWsl)';
+    const wslInstalled = '1. ✓ WSL 2 is installed.';
     const installMac =
-      '1. Install Docker Desktop, with Homebrew or with its installer from Docker. You see the exact commands before anything runs. Docker Desktop is subject to the [Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/): free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+      'Install Docker Desktop with Homebrew or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devEnvironments.dockerSetup.install)';
     const installWindows =
-      '2. Install Docker Desktop, with winget or with its installer from Docker. You see the exact commands before anything runs. Docker Desktop is subject to the [Docker Subscription Service Agreement](https://www.docker.com/legal/docker-subscription-service-agreement/): free for personal use, education, non-commercial open source projects, and small businesses; larger companies need a paid subscription.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+      '2. Install Docker Desktop with winget or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devEnvironments.dockerSetup.install)';
     const installLinux =
-      '1. Install Docker Engine from the package repository of Docker. You see the exact commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
+      'Install Docker Engine from Docker\'s package repository. You see the commands before anything runs.\n[Install Docker](command:devEnvironments.dockerSetup.install)';
 
     it('shows the steps of macOS, then the sign-in', () => {
       expect(shownWelcome({ ...setup, isMac: true })).toEqual([intro, installMac, after, signIn]);
@@ -664,14 +664,21 @@ describe('Controller commands', () => {
       expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, afterLinux, signIn]);
     });
 
-    it('numbers the steps 1, 2, … on each platform', () => {
-      for (const platform of <Array<Record<string, boolean>>>[{ isMac: true },{ isLinux: true }, { isWindows: true }, { isWindows: true, [DockerContextKeys.wslReady]: true }]) {
+    // User decision 2026-09-27: numbers only where there is more than one step (Windows: WSL 2, then Docker Desktop).
+    it('numbers the steps 1, 2, … only on the platform with two steps', () => {
+      const cases = <Array<[Record<string, boolean>, number]>>[
+        [{ isMac: true }, 0],
+        [{ isLinux: true }, 0],
+        [{ isWindows: true }, 2],
+        [{ isWindows: true, [DockerContextKeys.wslReady]: true }, 2],
+      ];
+      for (const [platform, count] of cases) {
         const numbers = shownWelcome({ ...setup, ...platform })
           .map((contents) => /^(\d+)\. /.exec(contents)?.[1])
           .filter((number) => number !== undefined)
           .map(Number);
         expect(numbers).toEqual(numbers.map((_number, index) => index + 1));
-        expect(numbers.length).toBeGreaterThan(0);
+        expect(numbers).toHaveLength(count);
       }
     });
 
