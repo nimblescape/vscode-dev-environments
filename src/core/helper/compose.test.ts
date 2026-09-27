@@ -8,6 +8,7 @@ import { CONTAINER_VERSION, composeProjectName, environmentImageRepository } fro
 import {
   COMPOSE_BUILD_CONTEXT,
   COMPOSE_DEV_DOCKERFILE,
+  COMPOSE_DEV_DOCKERIGNORE,
   COMPOSE_MODEL_PATH,
   WORKSPACE_VOLUME_KEY,
   builtServiceImages,
@@ -45,6 +46,7 @@ const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 const PROJECT = 'devenv-3f2a9c1e';
 const OWN = 'devenv-acme-api-3f2a9c1e';
 const REPO = '/workspaces/api';
+const DEV_DOCKERFILE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm\n';
 
 /** A merged model in the form of `docker compose config --format json` (the templates' app + db). */
 function templateModel(): ComposeModel {
@@ -82,6 +84,8 @@ function params(overrides: Partial<ComposeRewriteParams> = {}): ComposeRewritePa
     repositoryFolder: REPO,
     dollarEscaped: true,
     engineApiVersion: '1.47',
+    // Review round 20 (P20-1): the Dockerfile of the dev service that the model run read (templateModel builds one).
+    dockerfiles: { app: DEV_DOCKERFILE },
     ...overrides,
   };
 }
@@ -577,10 +581,11 @@ describe('composeUpModel', () => {
 describe('composeBuildModel', () => {
   it('builds the dev service of the repository as <project>-<service>', () => {
     const { model, devDockerfile } = composeBuildModel(templateModel(), params());
-    expect(devDockerfile).toBeUndefined();
+    // review round 20, P20-1: changed expectation, the checked Dockerfile text is written to COMPOSE_DEV_DOCKERFILE.
+    expect(devDockerfile).toBe(DEV_DOCKERFILE);
     expect(model.services.app).toMatchObject({
       image: `${PROJECT}-app`,
-      build: { context: `${REPO}/.devcontainer`, dockerfile: 'Dockerfile' },
+      build: { context: `${REPO}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE },
       container_name: OWN,
       pull_policy: 'never',
     });
@@ -1017,5 +1022,87 @@ describe('decideServiceMount: the extension\'s internal folder (review round 14,
     expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+x' }, context(true))).toEqual({ action: 'keep' });
     expect(decideServiceMount({ type: 'tmpfs', target: '/workspaces/.devenv+x/y' }, context(true))).toEqual({ action: 'keep' });
     expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+/pg' }, context(false))).toEqual({ action: 'keep' });
+  });
+});
+
+describe('review round 20 (P20-1): the Dockerfile of a local build of the dev service is always the checked text', () => {
+  const TEXT = 'FROM mcr.microsoft.com/devcontainers/base:bookworm\nRUN echo $HOME\n';
+  /** A model as COMPOSE_MODEL_SCRIPT returns it (unescaped texts), whose dev service builds a file of the repository. */
+  function fileBuild(build: Record<string, unknown>): ComposeModel {
+    const source = templateModel();
+    source.services.app.build = build;
+    return source;
+  }
+
+  it('writes the checked text to COMPOSE_DEV_DOCKERFILE for a Dockerfile or context with a $, whatever Compose prints', () => {
+    for (const dollarEscaped of [true, false]) {
+      const source = fileBuild({ context: `${REPO}/c$d`, dockerfile: `${REPO}/c$d/D$x`, args: { A: '1' } });
+      const built = composeBuildModel(source, params({ dollarEscaped, dockerfiles: { app: TEXT } }));
+      expect(built.devDockerfile, String(dollarEscaped)).toBe(TEXT);
+      // The context stays (escaped once, as every text); the Dockerfile is ours.
+      expect(built.model.services.app.build, String(dollarEscaped)).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' } });
+      expect(built).not.toHaveProperty('devDockerignore');
+    }
+  });
+
+  it('writes it for a plain Dockerfile too (no gap between the check and the read of the CLI and of BuildKit)', () => {
+    const built = composeBuildModel(templateModel(), params({ dockerfiles: { app: TEXT, db: 'FROM x\n' } }));
+    expect(built.devDockerfile).toBe(TEXT);
+    expect(built.model.services.app.build).toEqual({ context: `${REPO}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
+  });
+
+  it('copies the .dockerignore of the Dockerfile next to the written Dockerfile', () => {
+    const built = composeBuildModel(templateModel(), params({ dockerfiles: { app: TEXT }, dockerignores: { app: 'node_modules\n', db: 'x\n' } }));
+    expect(built.devDockerignore).toBe('node_modules\n');
+    expect(COMPOSE_DEV_DOCKERIGNORE).toBe(`${COMPOSE_DEV_DOCKERFILE}.dockerignore`);
+    // A dockerfile_inline has none (Compose reads the .dockerignore of the context).
+    const inline = fileBuild({ context: REPO, dockerfile_inline: TEXT });
+    expect(composeBuildModel(inline, params({ dockerfiles: { app: TEXT }, dockerignores: { app: 'x\n' } }))).not.toHaveProperty('devDockerignore');
+  });
+
+  it('throws for a local build of the dev service whose Dockerfile the model run did not read (fail closed)', () => {
+    expect(() => composeBuildModel(templateModel(), params({ dockerfiles: { db: TEXT } }))).toThrow(/service app: build/);
+    expect(() => composeBuildModel(templateModel(), params({ dockerfiles: undefined }))).toThrow(/service app: build/);
+  });
+});
+
+describe('review round 20 (P20-1): the .dockerignore files of the model run', () => {
+  const base = { version: '2.40.3', dollarEscaped: true, model: { services: {} }, dockerfiles: {}, realPaths: {} };
+
+  it('gives each service its text, and refuses an output whose names and texts do not match', () => {
+    const line = JSON.stringify({ ...base, dockerignoreFiles: { app: '/r/i', web: '/r/i' }, dockerignoreTexts: { '/r/i': 'dist\n' } });
+    expect(parseComposeModelOutput(line)).toMatchObject({ dockerignores: { app: 'dist\n', web: 'dist\n' } });
+    expect(parseComposeModelOutput(JSON.stringify(base))).not.toHaveProperty('dockerignores');
+    for (const bad of [
+      { dockerignoreFiles: { app: '/r/j' }, dockerignoreTexts: { '/r/i': 'x' } },
+      { dockerignoreFiles: { app: '/r/i' }, dockerignoreTexts: { '/r/i': 3 } },
+      { dockerignoreFiles: { app: '/r/i' } },
+      { dockerignoreFiles: [], dockerignoreTexts: {} },
+    ]) {
+      expect(() => parseComposeModelOutput(JSON.stringify({ ...base, ...bad })), JSON.stringify(bad)).toThrow('invalid Compose model');
+    }
+  });
+
+  it('counts them with the Dockerfiles for the limit of the extension host', () => {
+    const text = 'x'.repeat(20 * 1024 * 1024);
+    expect(composeModelLimit({ services: {} }, { a: text }, { a: text })).toBe(`more than ${32 * 1024 * 1024} characters of Dockerfiles and .dockerignore files of the services`);
+    expect(composeModelLimit({ services: {} }, { a: text }, { a: 'dist\n' })).toBeUndefined();
+  });
+
+  it('composeBuildModel refuses a .dockerignore of the dev service that is too large', () => {
+    expect(() => composeBuildModel(templateModel(), params({ dockerignores: { app: 'x'.repeat(1024 * 1024 + 1) } }))).toThrow(/too large/);
+  });
+});
+
+describe('review round 20 (D20-1): keys with a $', () => {
+  it('are written as they are, the values escaped', () => {
+    const source = templateModel();
+    source.services.db.environment = { a$b: 'c$d' };
+    source.services.db.labels = { 'k$': 'v$w' };
+    const up = composeUpModel(source, { ...params(), image: 'devenv-3f2a9c1e:7' }).model;
+    for (const written of [up, composeBuildModel(source, params()).model]) {
+      expect(written.services.db.environment).toEqual({ a$b: 'c$$d' });
+      expect(written.services.db.labels).toMatchObject({ 'k$': 'v$$w' });
+    }
   });
 });

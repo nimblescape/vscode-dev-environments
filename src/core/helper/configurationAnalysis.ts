@@ -132,7 +132,7 @@ export function runAnalysisJob<J extends AnalysisJob>(job: J): AnalysisResult<J>
         const dockerfiles = job.input.dockerfiles ?? {};
         return {
           report: composeAccessReport(job.input, job.checksOn),
-          imageReferences: composeImageReferences(job.input.model, dockerfiles, job.input.devService),
+          imageReferences: composeImageReferences(job.input.model, dockerfiles, job.input.devService, job.input.dollarEscaped === true),
           references: composeReferences(job.input.model, dockerfiles, job.features),
         } as AnalysisResult<J>;
       }

@@ -705,7 +705,7 @@ if (process.exitCode === undefined) {
  * - `version`: `docker compose version --short`;
  * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
  * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles), each text value
- *   unescaped (`$$` → `$`) when `dollarEscaped` (review round 19, S19-1): the texts that Compose and BuildKit use, from
+ *   unescaped (`$$` → `$`) when `dollarEscaped` (review round 19, S19-1; review round 20, D20-1: the keys too): the texts that Compose and BuildKit use, from
  *   which everything below is computed;
  * - `dockerfiles`: the `build.dockerfile_inline` of each service that has one;
  * - `dockerfileFiles` and `dockerfileTexts` (review round 9, S9-2): of each other service with a local build, the real
@@ -713,6 +713,10 @@ if (process.exitCode === undefined) {
  *   path of the workspace helper (isHelperPath of hostAccess.ts, the same paths here), also after links), and the text
  *   of each such file once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH (readLimited);
  *   parseComposeModelOutput gives each service its text in `dockerfiles`;
+ * - `dockerignoreFiles` and `dockerignoreTexts` (review round 20, P20-1): of each such service whose Dockerfile was
+ *   read, the real path of `<Dockerfile>.dockerignore` when it is a file in the repository folder, also after links,
+ *   and its text once, by its real path, at most one character longer than MAX_DOCKERFILE_LENGTH;
+ *   parseComposeModelOutput gives each service its text in `dockerignores`;
  * - `realPaths`: the real path of each bind mount source, `env_file`, local build context, and Dockerfile of a local
  *   build of the model, and (review round 2, S2-03) of each local additional context (also of `oci-layout://`), SSH key
  *   of `build.ssh`, and file of a top-level secret that `build.secrets` names (`null` when it does not exist);
@@ -816,6 +820,25 @@ const readDockerfile = (file) => {
     return undefined;
   }
 };
+// Review round 20 (P20-1): the .dockerignore of a Dockerfile (<Dockerfile>.dockerignore next to it, which BuildKit
+// prefers to the one of the context), when it and its real path are in the repository folder and it is a file; each
+// once, by its real path (dockerignoreTexts), at most one character more than MAX_DOCKERFILE_LENGTH. Returns the real
+// path of the text, or undefined.
+const dockerignoreTexts = {};
+const readDockerignore = (dockerfile) => {
+  const file = dockerfile + '.dockerignore';
+  if (!inside(file)) return undefined;
+  const real = realPath(file);
+  if (real === null || !inside(real)) return undefined;
+  if (Object.prototype.hasOwnProperty.call(dockerignoreTexts, real)) return real;
+  try {
+    if (!fs.statSync(real).isFile()) return undefined;
+    dockerignoreTexts[real] = readLimited(real, ${MAX_DOCKERFILE_LENGTH});
+    return real;
+  } catch {
+    return undefined;
+  }
+};
 const main = () => {
   const version = compose(['version', '--short']);
   if (version.status !== 0) return failure(version, 'docker compose version');
@@ -833,18 +856,22 @@ const main = () => {
   const result = compose([...args, '--profile', '*', 'config', '--format', 'json'], { cwd: root });
   if (result.status !== 0) return failure(result, 'docker compose config');
   // Review round 19 (S19-1): the texts that Compose and BuildKit use. A Compose that prints a literal $ as $$ gets each
-  // text value (not the keys) unescaped first, so that the Dockerfiles, the real paths, and the files read below are
-  // those of the unescaped texts (and the maps are keyed by them); the model leaves the run unescaped too.
+  // text value unescaped first, so that the Dockerfiles, the real paths, and the files read below are those of the
+  // unescaped texts (and the maps are keyed by them); the model leaves the run unescaped too. Review round 20 (D20-1):
+  // the keys too (Compose escapes the whole output and never interpolates a key; the names of services, volumes,
+  // networks, secrets, and configs cannot hold a $).
+  const unescapeText = (text) => text.replace(/\$\$/g, '$');
   const unescape = (value) => {
-    if (typeof value === 'string') return value.replace(/\$\$/g, '$');
+    if (typeof value === 'string') return unescapeText(value);
     if (Array.isArray(value)) return value.map(unescape);
-    if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, unescape(entry)]));
+    if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, entry]) => [unescapeText(key), unescape(entry)]));
     return value;
   };
   const printed = JSON.parse(result.stdout);
   const model = value === 'a$$b' ? unescape(printed) : printed;
   const dockerfiles = {};
   const dockerfileFiles = {};
+  const dockerignoreFiles = {};
   const realPaths = {};
   const missing = [];
   // Review round 9 (S9-1): a Set, so that many services cost linear time.
@@ -882,6 +909,10 @@ const main = () => {
         if (!missingSeen.has(file) && missingInRepository(file)) addMissing(file);
         const real = readDockerfile(file);
         if (real !== undefined) dockerfileFiles[name] = real;
+        // Review round 20 (P20-1): the pipeline writes the checked Dockerfile of the dev service to a file of its own,
+        // and this file next to it.
+        const ignore = real === undefined ? undefined : readDockerignore(file);
+        if (ignore !== undefined) dockerignoreFiles[name] = ignore;
       }
     }
     for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
@@ -919,7 +950,21 @@ const main = () => {
     }
   }
   const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, dockerfileFiles, dockerfileTexts, realPaths, missing, mountAncestors, mountCreateTargets, inputsHash };
+  return {
+    version: version.stdout.trim(),
+    dollarEscaped: value === 'a$$b',
+    model,
+    dockerfiles,
+    dockerfileFiles,
+    dockerfileTexts,
+    dockerignoreFiles,
+    dockerignoreTexts,
+    realPaths,
+    missing,
+    mountAncestors,
+    mountCreateTargets,
+    inputsHash,
+  };
 };
 let output;
 try {

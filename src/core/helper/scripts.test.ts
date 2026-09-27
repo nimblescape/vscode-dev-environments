@@ -413,7 +413,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
   function runModel(repo: string, files: string[], env: NodeJS.ProcessEnv): unknown {
     const command = composeModelCommand(repo, files);
     expect(command.slice(0, 3)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT]);
-    const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env });
+    const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024 });
     expect(result.status, result.stderr).toBe(0);
     const lines = result.stdout.trim().split('\n');
     expect(lines).toHaveLength(1);
@@ -422,6 +422,8 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     // each service its text in `dockerfiles`, as the extension reads it.
     const parsed = parseComposeModelOutput(lines[0]);
     if (!('error' in parsed)) value.dockerfiles = parsed.dockerfiles;
+    // Review round 20 (P20-1): the same for the .dockerignore files (dockerignoreTexts).
+    if (!('error' in parsed) && parsed.dockerignores !== undefined) value.dockerignores = parsed.dockerignores;
     return value;
   }
 
@@ -602,7 +604,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect((output as Record<string, unknown>).dollarEscaped).toBe(false);
   });
 
-  it('unescapes the texts of a model that Compose printed with $$, not the keys, before it reads the paths (review round 19, S19-1)', () => {
+  it('unescapes the texts of a model that Compose printed with $$ (review round 20, D20-1: and the keys) before it reads the paths (review round 19, S19-1)', () => {
     const { dir, repo, env } = setup();
     // Files whose names hold a literal $, as Compose and BuildKit use them.
     fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, '$d'));
@@ -632,7 +634,8 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
       mountCreateTargets: Record<string, string>;
       inputsHash: string;
     };
-    expect(output.model.services.inline).toEqual({ build: { context: repo, dockerfile_inline: 'ARG X=a\nFROM $X\n' }, labels: { 'k$$': 'v$w' } });
+    // review round 20, D20-1: changed expectation, the keys are unescaped too.
+    expect(output.model.services.inline).toEqual({ build: { context: repo, dockerfile_inline: 'ARG X=a\nFROM $X\n' }, labels: { k$: 'v$w' } });
     expect(output.model.services.db.volumes).toEqual([
       { type: 'bind', source: `${repo}/$d`, target: '/x' },
       { type: 'bind', source: `${repo}/$c/$new`, target: '/y' },
@@ -714,6 +717,86 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
         services: { app: { build: { context: repo, dockerfile_inline: 'ARG BASE=mcr.microsoft.com/devcontainers/base:bookworm\nFROM $${BASE}\n' }, command: ['sleep', 'infinity'] } },
       });
       expect(report).toEqual({ hostAccess: [], unsupported: [] });
+    });
+  });
+
+  it('unescapes the keys of every map of a model that Compose printed with $$ (review round 20, D20-1)', () => {
+    const { repo, env } = setup();
+    const printed = {
+      name: 'devenv-3f2a9c1e',
+      services: {
+        app: {
+          image: 'alpine',
+          environment: { a$$b: 'c$$d', PLAIN: 'x' },
+          labels: { 'k$$': 'v' },
+          sysctls: { 'net.x$$y': '1' },
+          annotations: { 'a$$$$': 'b' },
+          build: { context: repo, dockerfile_inline: 'FROM alpine\n', args: { 'A$$': '1' } },
+        },
+      },
+      volumes: { data: { driver_opts: { 'o$$': 'v$$' } } },
+    };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed) }) as { model: Record<string, Record<string, Record<string, unknown>>> };
+    expect(output.model.services.app).toEqual({
+      image: 'alpine',
+      environment: { a$b: 'c$d', PLAIN: 'x' },
+      labels: { k$: 'v' },
+      sysctls: { 'net.x$y': '1' },
+      annotations: { a$$: 'b' },
+      build: { context: repo, dockerfile_inline: 'FROM alpine\n', args: { A$: '1' } },
+    });
+    expect(output.model.volumes).toEqual({ data: { driver_opts: { o$: 'v$' } } });
+    // A Compose that does not escape: the keys stay as they are.
+    const plain = runModel(repo, [path.join(repo, 'compose.yml')], {
+      ...env,
+      FAKE_MODEL: JSON.stringify(printed),
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$b' } } } }),
+    }) as { model: unknown };
+    expect(plain.model).toEqual(printed);
+  });
+
+  describe('review round 20 (P20-1): the .dockerignore of the Dockerfile of a local build', () => {
+    const printed = (repo: string, dockerfile: string) => ({
+      name: 'devenv-3f2a9c1e',
+      services: { app: { build: { context: `${repo}/.devcontainer`, dockerfile } }, inline: { build: { context: repo, dockerfile_inline: 'FROM x\n' } } },
+    });
+    type Output = { dockerfiles: Record<string, string>; dockerignores?: Record<string, string> };
+
+    it('reads <Dockerfile>.dockerignore next to the Dockerfile (by the unescaped path), by service', () => {
+      const { repo, env } = setup();
+      write(path.join(repo, '.devcontainer', 'D$x'), 'FROM node:24\n');
+      write(path.join(repo, '.devcontainer', 'D$x.dockerignore'), 'node_modules\n');
+      write(path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'), 'other\n');
+      const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'D$$x')) }) as Output;
+      expect(output.dockerfiles.app).toBe('FROM node:24\n');
+      expect(output.dockerignores).toEqual({ app: 'node_modules\n' });
+    });
+
+    it('has none without the file, and never reads one through a link out of the repository or a folder', () => {
+      const { dir, repo, env } = setup();
+      let output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'Dockerfile')) }) as Output;
+      expect(output.dockerignores ?? {}).toEqual({});
+      fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'));
+      output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'Dockerfile')) }) as Output;
+      expect(output.dockerignores ?? {}).toEqual({});
+      expect(JSON.stringify(output)).not.toContain('secret');
+      fs.unlinkSync(path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'));
+      fs.mkdirSync(path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'));
+      output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'Dockerfile')) }) as Output;
+      expect(output.dockerignores ?? {}).toEqual({});
+      // A link within the repository is read.
+      fs.rmdirSync(path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'));
+      write(path.join(repo, 'ignore'), 'dist\n');
+      fs.symlinkSync(path.join(repo, 'ignore'), path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'));
+      output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'Dockerfile')) }) as Output;
+      expect(output.dockerignores).toEqual({ app: 'dist\n' });
+    });
+
+    it('reads at most one character more than MAX_DOCKERFILE_LENGTH of it', () => {
+      const { repo, env } = setup();
+      write(path.join(repo, '.devcontainer', 'Dockerfile.dockerignore'), 'x'.repeat(MAX_DOCKERFILE_LENGTH + 100));
+      const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(printed(repo, 'Dockerfile')) }) as Output;
+      expect(output.dockerignores?.app).toHaveLength(MAX_DOCKERFILE_LENGTH + 1);
     });
   });
 

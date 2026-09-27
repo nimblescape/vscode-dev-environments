@@ -12,7 +12,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ConfigReferences } from '../imageCheck/imageCheck';
 import type { HostAccessChecks } from '../hostAccessChecks';
-import { buildArgumentTexts, extractBaseImages } from '../imageCheck/dockerfile';
+import { MAX_DOCKERFILE_LENGTH, buildArgumentTexts, extractBaseImages } from '../imageCheck/dockerfile';
 import { hasDigest, isOciFeatureReference } from '../imageCheck/reference';
 import {
   CONTAINER_VERSION,
@@ -59,8 +59,16 @@ export interface ComposeModel {
 export const COMPOSE_MODEL_PATH = `${OVERRIDE_FOLDER}/compose.json`;
 /** Build context of the synthesized build of an image-only dev service (an empty folder, WRITE_AND_RUN_SCRIPT). */
 export const COMPOSE_BUILD_CONTEXT = `${OVERRIDE_FOLDER}/context`;
-/** Dockerfile of the synthesized build of the dev service (`FROM <image>`, or its `dockerfile_inline`). */
+/**
+ * Dockerfile of the build of the dev service: the checked text of its Dockerfile (review round 20, P20-1: also of a
+ * file of the repository), its `dockerfile_inline`, or the synthesized `FROM <image>`.
+ */
 export const COMPOSE_DEV_DOCKERFILE = `${OVERRIDE_FOLDER}/dev.Dockerfile`;
+/**
+ * Review round 20 (P20-1): the copy of the `.dockerignore` of the Dockerfile of the dev service
+ * (`<Dockerfile>.dockerignore`), next to COMPOSE_DEV_DOCKERFILE under the matching name, where BuildKit finds it.
+ */
+export const COMPOSE_DEV_DOCKERIGNORE = `${COMPOSE_DEV_DOCKERFILE}.dockerignore`;
 /** Key of the workspace volume in the top-level `volumes` of our model. The check refuses it in a repository. */
 export const WORKSPACE_VOLUME_KEY = 'devenv-workspace';
 
@@ -161,6 +169,12 @@ export interface ComposeModelOutput {
   /** The Dockerfile text of each service with a local build, by service name (only files in the repository). */
   dockerfiles: Record<string, string>;
   /**
+   * Review round 20 (P20-1): the text of the `<Dockerfile>.dockerignore` of each service whose Dockerfile file the model
+   * run read, by service name, when it is a file in the repository (also after links); at most one character longer than
+   * MAX_DOCKERFILE_LENGTH. Missing in older outputs.
+   */
+  dockerignores?: Record<string, string>;
+  /**
    * The real path (links resolved) of each bind mount source and `env_file` of the model, as the model names it; `null`
    * for a path that does not exist.
    */
@@ -216,6 +230,20 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     }
     value.dockerfiles = dockerfiles;
   }
+  // Review round 20 (P20-1): the .dockerignore files the same way (dockerignoreFiles, dockerignoreTexts).
+  let dockerignores: Record<string, string> | undefined;
+  if (isRecord(value) && (value.dockerignoreFiles !== undefined || value.dockerignoreTexts !== undefined)) {
+    const files = value.dockerignoreFiles;
+    const texts = value.dockerignoreTexts;
+    if (!isRecord(files) || !isRecord(texts)) throw new Error('The workspace helper printed an invalid Compose model.');
+    dockerignores = {};
+    for (const [service, file] of Object.entries(files)) {
+      if (typeof file !== 'string' || !Object.prototype.hasOwnProperty.call(texts, file) || typeof texts[file] !== 'string') {
+        throw new Error('The workspace helper printed an invalid Compose model.');
+      }
+      dockerignores[service] = texts[file] as string;
+    }
+  }
   if (
     !isRecord(value) ||
     typeof value.version !== 'string' ||
@@ -234,6 +262,7 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     dollarEscaped: value.dollarEscaped,
     model: value.model as unknown as ComposeModel,
     dockerfiles: value.dockerfiles as Record<string, string>,
+    ...(dockerignores !== undefined ? { dockerignores } : {}),
     realPaths: value.realPaths as Record<string, string | null>,
     // Review round 8 (P8-2): only the entries that are a path or null.
     ...(isRecord(value.mountAncestors)
@@ -257,9 +286,14 @@ const COMPOSE_TOP_LEVEL_MAPS = ['volumes', 'networks', 'configs', 'secrets'] as 
  * a model as too large or too complex before any other work on it. Review round 10: also more than
  * MAX_COMPOSE_TOP_LEVEL_ENTRIES entries of a top-level `volumes`, `networks`, `configs`, or `secrets` (S10-1), and, with
  * the Dockerfiles of the services (ComposeModelOutput.dockerfiles), more than MAX_ANALYSIS_JOB_CHARACTERS characters of
- * them over all services, a shared text once per service as the hashes and the analysis job read it (S10-2).
+ * them over all services, a shared text once per service as the hashes and the analysis job read it (S10-2). Review
+ * round 20 (P20-1): the `.dockerignore` files of the services (ComposeModelOutput.dockerignores) count with them.
  */
-export function composeModelLimit(model: ComposeModel, dockerfiles?: Readonly<Record<string, string>>): string | undefined {
+export function composeModelLimit(
+  model: ComposeModel,
+  dockerfiles?: Readonly<Record<string, string>>,
+  dockerignores?: Readonly<Record<string, string>>,
+): string | undefined {
   const services = isRecord(model.services) ? Object.values(model.services) : [];
   if (services.length > MAX_COMPOSE_SERVICES) return `${services.length} services (at most ${MAX_COMPOSE_SERVICES})`;
   let mounts = 0;
@@ -285,6 +319,11 @@ export function composeModelLimit(model: ComposeModel, dockerfiles?: Readonly<Re
     const text = dockerfiles?.[name];
     if (typeof text === 'string') characters += text.length;
     if (characters > MAX_ANALYSIS_JOB_CHARACTERS) return `more than ${MAX_ANALYSIS_JOB_CHARACTERS} characters of Dockerfiles of the services`;
+  }
+  for (const name in dockerignores ?? {}) {
+    const text = dockerignores?.[name];
+    if (typeof text === 'string') characters += text.length;
+    if (characters > MAX_ANALYSIS_JOB_CHARACTERS) return `more than ${MAX_ANALYSIS_JOB_CHARACTERS} characters of Dockerfiles and .dockerignore files of the services`;
   }
   return undefined;
 }
@@ -726,6 +765,13 @@ export interface ComposeRewriteParams {
   repositoryFolder: string;
   /** ComposeModelOutput.dollarEscaped (review round 19, S19-1: the rewrite no longer uses it; the written texts are always escaped). */
   dollarEscaped: boolean;
+  /**
+   * Review round 20 (P20-1): ComposeModelOutput.dockerfiles, the checked Dockerfile texts. composeBuildModel writes the
+   * one of the dev service to COMPOSE_DEV_DOCKERFILE, and refuses a local build of it without one.
+   */
+  dockerfiles?: Readonly<Record<string, string>>;
+  /** Review round 20 (P20-1): ComposeModelOutput.dockerignores (composeBuildModel copies the one of the dev service). */
+  dockerignores?: Readonly<Record<string, string>>;
   /** See ComposeMountContext.engineApiVersion. */
   engineApiVersion?: string;
   /** ComposeModelOutput.realPaths. */
@@ -782,7 +828,10 @@ function notChecked(item: string): Error {
   return new Error(`The Compose model has a setting that the host access policy refuses: ${item}`);
 }
 
-/** `$` → `$$` in every text of a value (not in the keys): Compose then reads the texts as they are. */
+/**
+ * `$` → `$$` in every text of a value (not in the keys): Compose then reads the texts as they are. Review round 20
+ * (D20-1): Compose never interpolates a key, so the keys stay unescaped (COMPOSE_MODEL_SCRIPT unescapes them).
+ */
 export function escapeComposeDollars(value: unknown): unknown {
   if (typeof value === 'string') return value.replace(/\$/g, '$$$$');
   if (Array.isArray(value)) return value.map(escapeComposeDollars);
@@ -1092,9 +1141,13 @@ export function serviceDecidesHostname(service: ComposeService): boolean {
   return typeof service.uts === 'string' && service.uts.trim().toLowerCase() === 'host';
 }
 
-/** The result of composeBuildModel: the model, and the Dockerfile of the dev service to write at COMPOSE_DEV_DOCKERFILE. */
+/**
+ * The result of composeBuildModel: the model, the Dockerfile of the dev service to write at COMPOSE_DEV_DOCKERFILE, and
+ * (review round 20, P20-1) the copy of its `.dockerignore` to write at COMPOSE_DEV_DOCKERIGNORE.
+ */
 export interface ComposeBuildModelRewrite extends ComposeModelRewrite {
   devDockerfile?: string;
+  devDockerignore?: string;
 }
 
 /**
@@ -1102,7 +1155,13 @@ export interface ComposeBuildModelRewrite extends ComposeModelRewrite {
  * composeUpModel for every service, and for the dev service a build of its own image `<project>-<service>`, which the
  * CLI then tags as the environment image (CLI 0.89.0, `build`: `OA=mA||RA.image||mp(…)` … `Oe(q,"tag",OA,bA)`):
  * - with a `build` in the repository: that build (with `dockerfile_inline` written to COMPOSE_DEV_DOCKERFILE, because the
- *   CLI reads the Dockerfile itself and knows only `build.dockerfile`: function `lp`, `dockerfilePath:r.dockerfile??"Dockerfile"`);
+ *   CLI reads the Dockerfile itself and knows only `build.dockerfile`: function `lp`, `dockerfilePath:r.dockerfile??"Dockerfile"`).
+ *   Review round 20 (P20-1): a Dockerfile file too: its checked text (`p.dockerfiles`) is written to
+ *   COMPOSE_DEV_DOCKERFILE, and its `<Dockerfile>.dockerignore` (`p.dockerignores`) next to it (COMPOSE_DEV_DOCKERIGNORE).
+ *   The CLI reads the path from the output of `docker compose config` of this model, which an escaping Compose prints
+ *   with `$$`, while BuildKit reads the unescaped one: with a `$` in the path or the context, they would read two
+ *   different files; and the file could change between the check and the build. Throws when the model run read no text
+ *   for it (fail closed);
  * - image-only: a synthesized build `FROM <image>` (D-8). Otherwise the CLI names the image of the Features
  *   `vsc-<repository folder name>-<hash of the folder>` (function `Go`), the same name for every environment of a
  *   repository with that name, and a concurrent build of another environment could move the tag.
@@ -1114,12 +1173,25 @@ export function composeBuildModel(model: ComposeModel, p: ComposeRewriteParams):
   const dev = result.services[p.devService];
   const image = composeServiceImage(p.project, p.devService);
   let devDockerfile: string | undefined;
+  let devDockerignore: string | undefined;
   if (isRecord(dev.build)) {
     if (typeof dev.build.dockerfile_inline === 'string') {
       devDockerfile = dev.build.dockerfile_inline;
       delete dev.build.dockerfile_inline;
-      dev.build.dockerfile = COMPOSE_DEV_DOCKERFILE;
+    } else {
+      // Review round 20 (P20-1): the checked text, never the path.
+      const own = <T>(map: Readonly<Record<string, T>> | undefined): T | undefined =>
+        map !== undefined && Object.prototype.hasOwnProperty.call(map, p.devService) ? map[p.devService] : undefined;
+      const text = own(p.dockerfiles);
+      if (typeof text !== 'string') throw notChecked(`service ${p.devService}: build (its Dockerfile was not read)`);
+      devDockerfile = text;
+      const ignore = own(p.dockerignores);
+      if (typeof ignore === 'string') {
+        if (ignore.length > MAX_DOCKERFILE_LENGTH) throw notChecked(`service ${p.devService}: build (its .dockerignore is too large)`);
+        devDockerignore = ignore;
+      }
     }
+    dev.build.dockerfile = COMPOSE_DEV_DOCKERFILE;
   } else if (typeof dev.image === 'string' && dev.image.trim() !== '') {
     devDockerfile = `FROM ${dev.image.trim()}\n`;
     dev.build = { context: COMPOSE_BUILD_CONTEXT, dockerfile: COMPOSE_DEV_DOCKERFILE };
@@ -1128,5 +1200,10 @@ export function composeBuildModel(model: ComposeModel, p: ComposeRewriteParams):
   }
   dev.image = image;
   const escaped = finish(result);
-  return devDockerfile === undefined ? { model: escaped, rewrites } : { model: escaped, rewrites, devDockerfile };
+  return {
+    model: escaped,
+    rewrites,
+    ...(devDockerfile !== undefined ? { devDockerfile } : {}),
+    ...(devDockerignore !== undefined ? { devDockerignore } : {}),
+  };
 }

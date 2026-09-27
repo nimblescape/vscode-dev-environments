@@ -27,6 +27,7 @@ import {
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
 import {
   COMPOSE_DEV_DOCKERFILE,
+  COMPOSE_DEV_DOCKERIGNORE,
   COMPOSE_MODEL_PATH,
   builtServiceImages,
   composeBuildModel,
@@ -105,6 +106,7 @@ import {
   type ConfigReferences,
   type ImageChecker,
 } from '../imageCheck/imageCheck';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { registryDisplayName } from '../imageCheck/reference';
 import { parseJsonc } from '../jsonc';
 import { Messages, Steps, listSome, type ProgressStep } from '../messages';
@@ -728,11 +730,15 @@ function withoutComposeIgnored(config: Readonly<Record<string, unknown>>): Recor
   return result;
 }
 
-/** The files of a helper run for the build model of a Docker Compose configuration: the model, and a synthesized Dockerfile. */
+/**
+ * The files of a helper run for the build model of a Docker Compose configuration: the model, the Dockerfile of the dev
+ * service, and (review round 20, P20-1) the copy of its `.dockerignore`.
+ */
 function composeBuildFiles(build: ComposeBuildModelRewrite): HelperFiles {
   return {
     [COMPOSE_MODEL_PATH]: JSON.stringify(build.model, null, 2),
     ...(build.devDockerfile !== undefined ? { [COMPOSE_DEV_DOCKERFILE]: build.devDockerfile } : {}),
+    ...(build.devDockerignore !== undefined ? { [COMPOSE_DEV_DOCKERIGNORE]: build.devDockerignore } : {}),
   };
 }
 
@@ -1658,7 +1664,11 @@ export class EnvironmentService {
     }
     // Review round 9 (S9-1): before anything in this thread works on the model. Review round 10 (S10-2): also the
     // Dockerfiles, before the hashes read them.
-    const tooLarge = composeModelLimit(output.model, output.dockerfiles);
+    // Review round 20 (P20-1): the .dockerignore of the Dockerfile of the dev service, which the build model copies.
+    const devIgnore = Object.prototype.hasOwnProperty.call(output.dockerignores ?? {}, service) ? output.dockerignores?.[service] : undefined;
+    const tooLarge =
+      composeModelLimit(output.model, output.dockerfiles, output.dockerignores) ??
+      (devIgnore !== undefined && devIgnore.length > MAX_DOCKERFILE_LENGTH ? `a .dockerignore of the Dockerfile of the dev service of more than ${MAX_DOCKERFILE_LENGTH} characters` : undefined);
     if (tooLarge !== undefined) {
       this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} is too large to check: ${tooLarge}.`);
       throw tooLargeError(tooLarge);
@@ -1707,7 +1717,7 @@ export class EnvironmentService {
     // Review round 18 (P18-1, P18-3): the base image that the Dev Container CLI reads for the build of the dev service,
     // with the exact platform, before read-configuration, which inspects it for the merged configuration.
     const cliPlatform = hasComposeDevBuild(output, service)
-      ? await this.checkCliBaseImage(ctx, (platform) => composeCliBaseImageCheck(output.model, output.dockerfiles, service, platform, imageReferences.map((entry) => entry.reference)))
+      ? await this.checkCliBaseImage(ctx, (platform) => composeCliBaseImageCheck(output.model, output.dockerfiles, service, platform, imageReferences.map((entry) => entry.reference), output.dollarEscaped))
       : undefined;
     await this.requireVolume(env);
     const read = await helper.readConfiguration({
@@ -1777,6 +1787,8 @@ export class EnvironmentService {
       ...(volumes.networks !== undefined ? { networks: volumes.networks } : {}),
       dockerfiles: compose.output.dockerfiles,
       model: compose.output.model,
+      // Review round 20 (S20-1): the CLI reads the build arguments from the output of `docker compose config`.
+      dollarEscaped: compose.output.dollarEscaped,
       // Review round 17 (P17-2): only with Features does the CLI write the user of the build.
       features: cliHasFeatures(config.features),
       devService: compose.service,
@@ -1978,6 +1990,9 @@ export class EnvironmentService {
       volumeName: env.volumeName,
       repositoryFolder: repositoryFolder(env.repository),
       dollarEscaped: compose.output.dollarEscaped,
+      // Review round 20 (P20-1): the checked Dockerfile of the dev service (and its .dockerignore), which the build writes.
+      dockerfiles: compose.output.dockerfiles,
+      ...(compose.output.dockerignores !== undefined ? { dockerignores: compose.output.dockerignores } : {}),
       ...(compose.engineApiVersion !== undefined ? { engineApiVersion: compose.engineApiVersion } : {}),
       realPaths: compose.output.realPaths,
       ...(compose.output.mountAncestors !== undefined ? { mountAncestors: compose.output.mountAncestors } : {}),
@@ -2407,7 +2422,9 @@ export class EnvironmentService {
    */
   private async checkComposeBuildImages(ctx: PipelineContext, compose: LoadedCompose, platform: Readonly<Record<string, string>> = CLI_PLATFORM_VARIABLES): Promise<void> {
     const { model, dockerfiles } = compose.output;
-    const { images, unresolved } = composeDevBuildImages(model, dockerfiles, compose.service, platform);
+    // Review round 20 (S20-1): with the build arguments as the CLI reads them (LoadedCompose.output.dollarEscaped).
+    const { dollarEscaped } = compose.output;
+    const { images, unresolved } = composeDevBuildImages(model, dockerfiles, compose.service, platform, dollarEscaped);
     const items = unresolved.map((image) => `the image ${image} of the dev service (its variables could not be resolved, so the user that the Dev Container CLI writes into its compose file for the build cannot be checked)`);
     let imageConfig: unknown;
     for (const image of images) {
@@ -2423,7 +2440,7 @@ export class EnvironmentService {
       items.push(...composeBuildImageItems(image, config));
       imageConfig = config;
     }
-    if (unresolved.length === 0) items.push(...composeBuildUserItems(model, dockerfiles, compose.service, imageConfig, platform));
+    if (unresolved.length === 0) items.push(...composeBuildUserItems(model, dockerfiles, compose.service, imageConfig, platform, dollarEscaped));
     if (items.length === 0) return;
     // Review round 17 (P17-3): at most MAX_LISTED_ITEMS, each at most MAX_ITEM_LENGTH characters.
     const report: HostAccessReport = { hostAccess: [], unsupported: capped(items.map((item) => `service ${compose.service}: ${item}`)) };
@@ -4308,7 +4325,7 @@ export class EnvironmentService {
     });
     // Review round 9 (S9-1): a model beyond the limits counts as a change; the open refuses it.
     // Review round 10 (S10-2): with the Dockerfiles, before the hashes read them.
-    if ('error' in output || composeModelLimit(output.model, output.dockerfiles) !== undefined) return undefined;
+    if ('error' in output || composeModelLimit(output.model, output.dockerfiles, output.dockerignores) !== undefined) return undefined;
     return {
       configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
       inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),

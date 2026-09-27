@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import {
   COMPOSE_DEV_DOCKERFILE,
+  COMPOSE_DEV_DOCKERIGNORE,
   COMPOSE_MODEL_PATH,
   WORKSPACE_VOLUME_KEY,
   composeConfigHash,
@@ -3159,5 +3160,89 @@ describe('review round 19 of unit 6 (S19-1): the configuration hash of an enviro
     expect(upModel().services.db.environment).toEqual({ POSTGRES_PASSWORD: 'a$$b' });
     expect((await h.registry.get(ENV_ID))?.buildRecord?.configHash).toBe(composeConfigHash(CONFIG_TEXT, withDollar().model, {}));
     expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
+  });
+});
+
+describe('review round 20 of unit 6 (P20-1, S20-1): the Dockerfile and the build arguments of the dev service as the Dev Container CLI reads them', () => {
+  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS base\n';
+
+  /** The dev service builds `dockerfile` (a file of the repository whose name has a $) with `build`. */
+  function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}, extra: Partial<ComposeModelOutput> = {}): void {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.app = { build: { context: `${FOLDER}/.devcontainer`, dockerfile: `${FOLDER}/.devcontainer/D$x`, ...build }, command: ['sleep', 'infinity'] };
+      }),
+    );
+    const out = h.helper.composeOutput as ComposeModelOutput;
+    h.helper.composeOutput = {
+      ...out,
+      dockerfiles: { app: dockerfile },
+      realPaths: { ...out.realPaths, [`${FOLDER}/.devcontainer`]: `${FOLDER}/.devcontainer`, [`${FOLDER}/.devcontainer/D$x`]: `${FOLDER}/.devcontainer/D$x` },
+      ...extra,
+    };
+  }
+
+  function fresh(): void {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID });
+  }
+
+  it('P20-1: read-configuration and build get the checked Dockerfile text at COMPOSE_DEV_DOCKERFILE, and its .dockerignore next to it', async () => {
+    const dockerfile = `${BASE}RUN echo $HOME\n`;
+    useDevBuild(dockerfile, {}, { dockerignores: { app: 'node_modules\n' } });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+    const reads = h.helper.readConfigurations.filter((read) => read.files !== undefined);
+    expect(reads.length).toBeGreaterThan(0);
+    for (const files of [h.helper.builds[0].files, ...reads.map((read) => read.files)]) {
+      expect(files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
+      expect(files?.[COMPOSE_DEV_DOCKERIGNORE]).toBe('node_modules\n');
+      const written = JSON.parse(files?.[COMPOSE_MODEL_PATH] ?? 'null') as ComposeModel;
+      expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
+    }
+    // Without a .dockerignore of the Dockerfile, none is written (the one of the context applies).
+    fresh();
+    useDevBuild(dockerfile);
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds[0].files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
+    expect(h.helper.builds[0].files).not.toHaveProperty(COMPOSE_DEV_DOCKERIGNORE);
+  });
+
+  it('P20-1: refuses a .dockerignore of the dev service that is too large, before any build', async () => {
+    useDevBuild(`${BASE}`, {}, { dockerignores: { app: 'x'.repeat(1024 * 1024 + 1) } });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.logger.warnings.some((line) => line.includes('is too large to check: a .dockerignore of the Dockerfile of the dev service'))).toBe(true);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('S20-1: refuses the image of another environment that only the CLI reads, through an argument that an escaping Compose prints with $$', async () => {
+    const dockerfile = `ARG B\n${BASE}RUN <<EOF\nFROM \${B:+devenv-0badc0de:3} AS y\nEOF\n`;
+    for (const features of [true, false]) {
+      fresh();
+      useDevBuild(dockerfile, { args: { B: '$X' } });
+      if (!features) h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace(`"features": { "${FEATURE}": {} },`, '') } };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message, String(features)).toContain('service app: base image of the Dev Container CLI devenv-0badc0de:3 of another environment');
+      expect(h.helper.builds).toEqual([]);
+    }
+  });
+
+  it('S20-1: the runtime check inspects the image that the CLI reads through such an argument, and only with an escaping Compose', async () => {
+    const OTHER = 'ghcr.io/acme/other:1';
+    const dockerfile = `ARG B\n${BASE}RUN <<EOF\nFROM \${B:+${OTHER}} AS y\nEOF\n`;
+    useDevBuild(dockerfile, { args: { B: '$X' } });
+    h.checker.outcome = checked({ [OTHER]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST, 'mcr.microsoft.com/devcontainers/base:bookworm': DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    await h.service.open(TARGET, options());
+    expect(h.docker.log).toContain(`pull ${OTHER}`);
+    fresh();
+    useDevBuild(dockerfile, { args: { B: '$X' } }, { dollarEscaped: false });
+    h.checker.outcome = checked({ [OTHER]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST, 'mcr.microsoft.com/devcontainers/base:bookworm': DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    // The CLI reads `$X` unescaped: a variable that is not resolved, refused as before (review round 17).
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain('its variables could not be resolved');
+    expect(h.docker.log).not.toContain(`pull ${OTHER}`);
+    expect(h.helper.builds).toEqual([]);
   });
 });
