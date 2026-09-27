@@ -541,13 +541,19 @@ export class MonitorLoop {
       if (kept && !entries.has(id) && known.has(id) && entries.size < MAX_HEARTBEAT_ENVIRONMENTS) entries.set(id, false);
     }
     // Review round 1 of PR #39 (R3): the first heartbeat of a series (a new monitor process, or Docker set to this host
-    // again) also reports every other environment of the host without the flag. A record that an earlier process sent
-    // with the flag would otherwise keep an environment that is kept no longer for ever. A fresh record without the
-    // flag only restarts the time limit on the remote host; the local rules are unchanged.
+    // again) also reports every other environment of the host without the flag, so that a keep that an earlier process
+    // of this computer sent ends. Review round 3 (N1): these entries are clear-only: the remote monitor writes one only
+    // when the record of this computer says keepRunning; otherwise nothing (this computer made no choice about the
+    // environment, so it must not overrule the keep of another computer on a shared engine). They are not remembered in
+    // `sent`, so a later real heartbeat of the environment is never taken for sent already.
+    const clearOnly = new Set<string>();
     if (!series.synced) {
       for (const environment of snapshot.monitorEnvironments) {
         if (entries.size >= MAX_HEARTBEAT_ENVIRONMENTS) break;
-        if (isRemoteEnvironmentId(environment.id) && !entries.has(environment.id)) entries.set(environment.id, false);
+        if (isRemoteEnvironmentId(environment.id) && !entries.has(environment.id)) {
+          entries.set(environment.id, false);
+          clearOnly.add(environment.id);
+        }
       }
     }
     if (entries.size === 0) return;
@@ -559,7 +565,9 @@ export class MonitorLoop {
       source,
       limitSeconds: clampLimitSeconds(settings.remoteStopAfterSeconds ?? remoteStopAfterSeconds(undefined)),
       // Review round 2 of PR #39 (L1): `seq` is the time of this tick, taken before the registry was read.
-      environments: [...entries].map(([id, keepRunning]) => ({ id, keepRunning, seq: now })),
+      environments: [...entries].map(([id, keepRunning]) =>
+        clearOnly.has(id) ? { id, keepRunning, seq: now, clearOnly: true as const } : { id, keepRunning, seq: now },
+      ),
     };
     let failure: string | undefined;
     let missing = false;
@@ -586,7 +594,7 @@ export class MonitorLoop {
     if (series.failing) this.deps.logger.info(`The Session Monitor on ${target.host} answers again.`);
     series.failing = false;
     series.synced = true;
-    series.sent = entries;
+    series.sent = new Map([...entries].filter(([id]) => !clearOnly.has(id)));
     series.sentAt = now;
   }
 

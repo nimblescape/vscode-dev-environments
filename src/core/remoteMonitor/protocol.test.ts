@@ -93,6 +93,16 @@ describe('parseHeartbeatInput (strict)', () => {
     expect(parseHeartbeatInput(typeof value === 'string' ? value : input(value))).toBeUndefined();
   });
 
+  // Review round 3 of PR #39 (N1).
+  it('accepts clearOnly as a boolean, and true only without keepRunning', () => {
+    const entry = (extra: Record<string, unknown>) => input({ ...valid, environments: [{ id: ID, keepRunning: false, seq: 1, ...extra }] });
+    expect(parseHeartbeatInput(entry({ clearOnly: true }))?.environments).toEqual([{ id: ID, keepRunning: false, seq: 1, clearOnly: true }]);
+    expect(parseHeartbeatInput(entry({ clearOnly: false }))?.environments).toEqual([{ id: ID, keepRunning: false, seq: 1 }]);
+    expect(parseHeartbeatInput(entry({ clearOnly: true, keepRunning: true }))).toBeUndefined();
+    expect(parseHeartbeatInput(entry({ clearOnly: 'yes' }))).toBeUndefined();
+    expect(parseHeartbeatInput(entry({ clearOnly: 1 }))).toBeUndefined();
+  });
+
   it('accepts the largest number of environments', () => {
     const environments = Array.from({ length: MAX_HEARTBEAT_ENVIRONMENTS }, () => ({ id: ID, keepRunning: true, seq: 0 }));
     expect(parseHeartbeatInput(input({ ...valid, environments }))?.environments).toHaveLength(MAX_HEARTBEAT_ENVIRONMENTS);

@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { heartbeatFileName } from '../core/remoteMonitor/protocol';
+import { heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
   PS_FORMAT,
@@ -18,7 +18,7 @@ import {
   timingFromEnv,
   type DockerResult,
 } from './main';
-import { REMOTE_GRACE_MS, REMOTE_TICK_MS } from './rules';
+import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide } from './rules';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -103,6 +103,56 @@ describe('monitor.js heartbeat', () => {
     const next = { source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: true, seq: T0 + 2000 }] };
     await run(['heartbeat', JSON.stringify(next)], T0 + 5000);
     expect(readRecord(SOURCE, A)).toEqual({ at: T0 + 5000, keepRunning: true, limitSeconds: 600, seq: T0 + 2000 });
+  });
+
+  // Review round 3 of PR #39 (N2): the seq order holds only while the stored record is at most 60 s old.
+  it('the race order within 60 s keeps the newer flag; an older record is replaced whatever its seq', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 59_000, keepRunning: true, limitSeconds: 600, seq: 5_000 });
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 4_000 }] })]);
+    expect(readRecord(SOURCE, A)).toMatchObject({ at: T0 - 59_000, keepRunning: true, seq: 5_000 });
+  });
+
+  it('a clock of the computer set back by an hour: the next heartbeat replaces the record and refreshes at', async () => {
+    const hour = 3_600_000;
+    // Written before the clock went back: its seq is an hour ahead of the heartbeats that follow.
+    writeRecord(SOURCE, A, { at: T0 - 61_000, keepRunning: false, limitSeconds: 600, seq: T0 + hour });
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: T0 - 1000 }] })]);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: T0 - 1000 });
+  });
+
+  it('a stale keep with a seq far ahead is replaced by a later keep=false after 60 s', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 120_000, keepRunning: true, limitSeconds: 600, seq: T0 + 3_600_000 });
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: T0 }] })]);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: T0 });
+  });
+
+  // Review round 3 of PR #39 (N1): the entries of the full sync are clear-only.
+  it('a clear-only entry clears the own earlier keep of this source', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: true, limitSeconds: 600, seq: 1 });
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 2, clearOnly: true }] })]);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: 2 });
+  });
+
+  it('a clear-only entry creates no record, and refreshes no record without keep', async () => {
+    writeRecord(SOURCE, B, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600, seq: 1 });
+    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 2, clearOnly: true }, { id: B, keepRunning: false, seq: 2, clearOnly: true }] };
+    expect((await run(['heartbeat', JSON.stringify(heartbeat)])).code).toBe(0);
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, B)]);
+    expect(readRecord(SOURCE, B)).toMatchObject({ at: T0 - 30 * MINUTE, seq: 1 });
+  });
+
+  it("a shared engine: the keep of computer A survives the full sync of computer B", async () => {
+    // A kept the environment and went offline long ago.
+    writeRecord(OTHER, A, { at: T0 - 5 * 24 * 60 * MINUTE, keepRunning: true, limitSeconds: 600, seq: 1 });
+    // B starts its Session Monitor: the full sync names the environment clear-only.
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: T0, clearOnly: true }] })]);
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A)]);
+    // The remote monitor keeps it.
+    const records = await readRecords(heartbeatDir(stateDir));
+    expect(decide({ now: T0, containers: [{ id: DEV_ID, state: 'running', name: 'x', environmentId: A, composeService: '' }], records, state: { lastTickAt: T0 - REMOTE_TICK_MS } }).kept).toEqual([A]);
+    // And B's own shared-engine check still blocks its stop.
+    const output = JSON.parse((await run(['records', A])).out) as RecordsOutput;
+    expect(inUseByOtherComputer(output, SOURCE)).toBe(true);
   });
 
   it('a record of another source does not hold back an entry with a lower seq', async () => {

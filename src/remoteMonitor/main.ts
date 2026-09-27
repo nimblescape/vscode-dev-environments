@@ -21,6 +21,7 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import {
   HEARTBEAT_FOLDER,
   REMOTE_MONITOR_STATE_DIR,
+  SEQ_ORDER_WINDOW_MS,
   heartbeatFileName,
   isRemoteEnvironmentId,
   isSourceId,
@@ -129,9 +130,14 @@ async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>
 }
 
 /**
- * Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. An entry whose
- * `seq` is lower than the `seq` of the existing record of the same source is ignored (review round 2 of PR #39, L1): the
- * newer choice of that computer stays. Returns the ids of the ignored entries.
+ * Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. An entry is
+ * ignored (no write, the record stays as it is):
+ * - when its `seq` is lower than the `seq` of the existing record of the same source and that record is at most
+ *   SEQ_ORDER_WINDOW_MS old (review round 2 of PR #39, L1, and round 3, N2): the newer choice of that computer stays,
+ *   while an older record is replaced whatever its `seq` (a clock of the computer that was set back);
+ * - when it is `clearOnly` and the existing record of the same source does not say keepRunning (review round 3, N1):
+ *   it only withdraws a keep of this source, and must not create or refresh a record.
+ * Returns the ids of the ignored entries.
  */
 export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<string[]> {
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -141,7 +147,9 @@ export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: nu
     const file = path.join(dir, name);
     await withRecordLock(dir, name, async () => {
       const existing = await readRecordFile(file);
-      if (existing !== undefined && existing.seq > environment.seq) {
+      const olderEntry = existing !== undefined && existing.seq > environment.seq && Math.abs(now - existing.at) <= SEQ_ORDER_WINDOW_MS;
+      const nothingToClear = environment.clearOnly === true && existing?.keepRunning !== true;
+      if (olderEntry || nothingToClear) {
         ignored.push(environment.id);
         return;
       }

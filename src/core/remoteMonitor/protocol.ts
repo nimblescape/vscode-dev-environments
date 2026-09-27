@@ -57,14 +57,27 @@ export function isRemoteEnvironmentId(value: unknown): value is string {
 /**
  * One environment of a heartbeat. `seq` (review round 2 of PR #39, L1): the wall clock of the sending computer, in ms,
  * at which it read the keep flag (the Session Monitor: its tick; a window: right after it changed the flag). The remote
- * monitor never replaces a record of the same source with a higher `seq`, so a heartbeat that was under way while the
- * flag changed cannot undo the newer choice.
+ * monitor does not replace a recent record of the same source with a higher `seq` (SEQ_ORDER_WINDOW_MS), so a
+ * heartbeat that was under way while the flag changed cannot undo the newer choice.
+ *
+ * `clearOnly` (review round 3 of PR #39, N1; only with keepRunning false): the entry only withdraws a keep of this same
+ * source. The remote monitor writes it only when the existing record of this source says keepRunning; otherwise it
+ * writes nothing for it (no new record, no new `at`), so it is no choice about the environment and cannot overrule the
+ * keep of another computer.
  */
 export interface HeartbeatEntry {
   id: string;
   keepRunning: boolean;
   seq: number;
+  clearOnly?: true;
 }
+
+/**
+ * The seq order holds only while the stored record is at most this old by the clock of the remote host (review round 3
+ * of PR #39, N2): the time in which a heartbeat can be under way (a `docker exec` ends after 20 s). An older record is
+ * replaced whatever its `seq`, so a clock of the sending computer that was set back does not block its heartbeats.
+ */
+export const SEQ_ORDER_WINDOW_MS = 60_000;
 
 /** One heartbeat: the computer, its time limit, and the environments it uses or keeps. */
 export interface HeartbeatInput {
@@ -98,7 +111,7 @@ export function clampLimitSeconds(value: number): number {
  * The argument of `monitor.js heartbeat`, checked strictly: a JSON object with exactly `source` (isSourceId),
  * `limitSeconds` (an integer, clamped to MIN_LIMIT_SECONDS..MAX_LIMIT_SECONDS), and `environments` (at most
  * MAX_HEARTBEAT_ENVIRONMENTS objects with exactly `id` (isRemoteEnvironmentId), `keepRunning` (a boolean), and `seq` (a
- * safe non-negative integer)).
+ * safe non-negative integer), and optionally `clearOnly` (a boolean; true only with keepRunning false)).
  * `undefined` for anything else; then nothing is written.
  */
 export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
@@ -115,9 +128,14 @@ export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
   if (!Array.isArray(environments) || environments.length > MAX_HEARTBEAT_ENVIRONMENTS) return undefined;
   const checked: HeartbeatInput['environments'] = [];
   for (const entry of environments) {
-    if (!isRecord(entry) || !hasExactKeys(entry, ['id', 'keepRunning', 'seq'])) return undefined;
+    if (!isRecord(entry)) return undefined;
+    const keys = 'clearOnly' in entry ? ['id', 'keepRunning', 'seq', 'clearOnly'] : ['id', 'keepRunning', 'seq'];
+    if (!hasExactKeys(entry, keys)) return undefined;
     if (!isRemoteEnvironmentId(entry.id) || typeof entry.keepRunning !== 'boolean' || !isSeq(entry.seq)) return undefined;
-    checked.push({ id: entry.id, keepRunning: entry.keepRunning, seq: entry.seq });
+    if ('clearOnly' in entry && (typeof entry.clearOnly !== 'boolean' || (entry.clearOnly && entry.keepRunning))) return undefined;
+    const checkedEntry: HeartbeatEntry = { id: entry.id, keepRunning: entry.keepRunning, seq: entry.seq };
+    if (entry.clearOnly === true) checkedEntry.clearOnly = true;
+    checked.push(checkedEntry);
   }
   return { source, limitSeconds: clampLimitSeconds(limitSeconds), environments: checked };
 }

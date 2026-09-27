@@ -1165,11 +1165,28 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
       { id: ID_B, keepRunning: false },
     ]);
     expect(sent.slice(1)).toEqual([[{ id: ID_A, keepRunning: false }]]);
+    // Review round 3 of PR #39 (N1): the entry of the full sync is clear-only; the one in use is a real heartbeat.
+    expect(sentHeartbeats()[0].environments.map((entry) => (entry as { clearOnly?: boolean }).clearOnly)).toEqual([undefined, true]);
     // Another process: the full sync again.
     h.loop = h.newLoop({ sourceId: SOURCE });
     await each();
     await step(h);
     expect(heartbeats().at(-1)?.environments.map((item) => item.id)).toEqual([ID_A, ID_B]);
+  });
+
+  it('a clear-only entry of the full sync does not hold back the real heartbeat when the environment comes into use', async () => {
+    await h.registry.add(environment(ID_B, 'acme/web', { dockerHost: 'build-box' }));
+    await writeSettings(h);
+    await writeWindow(h, 'w0', null);
+    const each = ownerWritesEvery15s(h, 'w0', LIVE_PID);
+    await runUntil(h, T0 + 10_000, each);
+    expect(sentHeartbeats()).toHaveLength(1);
+    expect(sentHeartbeats()[0].environments).toEqual([{ id: ID_B, keepRunning: false, seq: T0, clearOnly: true }]);
+    // B comes into use: a real heartbeat at once (not only after 30 s).
+    await writeWindow(h, 'w2', ID_B, { pid: LIVE_PID_2 });
+    await step(h);
+    expect(sentHeartbeats()).toHaveLength(2);
+    expect(sentHeartbeats()[1].environments).toEqual([{ id: ID_B, keepRunning: false, seq: T0 + 10_000 }]);
   });
 
   it('sends the full sync also when no environment is in use, and then nothing; the monitor still ends', async () => {
