@@ -12,28 +12,112 @@ import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER } from '../names';
 import { isGitHubLogin } from './containerGit';
 
+/** The path of `file` (in TOKEN_FOLDER) relative to TOKEN_FOLDER, where the scripts work (`cd`). */
+function inFolder(file: string): string {
+  if (!file.startsWith(`${TOKEN_FOLDER}/`)) throw new Error(`${file} is not in ${TOKEN_FOLDER}`);
+  return file.slice(TOKEN_FOLDER.length + 1);
+}
+
 /**
- * Shell code (POSIX sh, no awk) that ends with exit code 3 unless the top-most mount at TOKEN_FOLDER is a tmpfs (the last
- * line of /proc/mounts with that mount point): a link or a mount of the image or of the repository that moved the
- * folder (for example into the workspace volume) or lies over it is never written to. Sets nothing else.
+ * The super options that the kernel shows in /proc/self/mountinfo for TOKEN_TMPFS (`size=1m`, `mode=0700`). On a host
+ * with SELinux, the kernel adds its own options in between (`seclabel`, or `context=…` that Docker sets), which change
+ * nothing of what the check below looks for; any other difference (for example another size, `uid=`, `nr_inodes=`) is
+ * not our tmpfs.
  */
-const REQUIRE_TMPFS = `dir='${TOKEN_FOLDER}'
-fstype=''
-while read -r _source mountpoint type _rest; do
-  if [ "$mountpoint" = "$dir" ]; then fstype="$type"; fi
-done < /proc/mounts
-if [ "$fstype" != tmpfs ]; then
-  printf '%s is not a tmpfs mount of the container.\\n' "$dir" >&2
-  exit 3
-fi
+export const TOKEN_TMPFS_SUPER_OPTIONS = 'rw,size=1024k,mode=700';
+
+/**
+ * Review of unit 15 (T1, T2, and the mount propagation): shell code (POSIX sh, no awk; dash and BusyBox) with the
+ * functions `own_tmpfs <folder>` and `enter_folder`, and `dir` = TOKEN_FOLDER. The scripts do everything in the folder
+ * that they entered (`cd`, then paths relative to `.`), and only when it is the tmpfs that the override configuration
+ * gives the dev container (TOKEN_TMPFS), not a mount that looks like it by its name in /proc/mounts: a volume on a
+ * parent through a link of the image (`/var/run` → `/run`) hides the tmpfs, a folder or a tmpfs of the computer at
+ * `/var/run/devenv` lies over it, and a file of the computer at `/var/run/devenv/github-token` inside it. `own_tmpfs`
+ * ends with 0 when the folder is that tmpfs, 1 when it is no tmpfs at all (or cannot be looked at), and 2 when it is
+ * another tmpfs, or ours with something over it, in it, or shared with the computer. It is ours when all of this holds:
+ * - `stat -f` says tmpfs;
+ * - the device of the folder (`stat -c %d`, as major:minor) is on exactly one line of /proc/self/mountinfo, and that
+ *   line has the mount point TOKEN_FOLDER, the root `/`, no optional fields (no `shared:`, `master:`: no peer on the
+ *   computer), the type tmpfs, the options nosuid, nodev, and noexec, and the super options TOKEN_TMPFS_SUPER_OPTIONS;
+ * - no mount on its parents, up to the root of the container, has the mount point TOKEN_FOLDER (a mount stacked on
+ *   another one there) or is `shared:` (a mount propagation that would bring our tmpfs to the computer);
+ * - no mount point lies below TOKEN_FOLDER (for example a file of the computer at the place of the token file).
+ * `enter_folder` goes into the folder and ends with the status of `own_tmpfs .`; when the folder cannot be entered (the
+ * remote user, its owner after a write, took the rights away), it gives it back to root (as root) and mode 0700 first,
+ * only when it is our tmpfs, and ends with 4 when it still cannot be entered.
+ */
+const OWN_TMPFS = `dir='${TOKEN_FOLDER}'
+own_tmpfs() {
+  [ "$(stat -f -c %T "$1" 2>/dev/null)" = tmpfs ] || return 1
+  m_device=$(stat -c %d "$1" 2>/dev/null) || return 2
+  case "$m_device" in '' | *[!0-9]*) return 2 ;; esac
+  m_want="$(( ((m_device >> 8) & 0xfff) | ((m_device >> 32) & ~0xfff) )):$(( (m_device & 0xff) | ((m_device >> 12) & ~0xff) ))"
+  m_count=0
+  m_parent_id=''
+  while read -r m_id m_parent m_dev m_root m_point m_options m_rest; do
+    case "$m_point" in "$dir"/*) return 2 ;; esac
+    [ "$m_dev" = "$m_want" ] || continue
+    m_count=$((m_count + 1))
+    [ "$m_point" = "$dir" ] && [ "$m_root" = / ] || return 2
+    case "$m_rest" in '- tmpfs '*) ;; *) return 2 ;; esac
+    case "\${m_rest#- tmpfs * }" in
+      '${TOKEN_TMPFS_SUPER_OPTIONS}' | 'rw,seclabel,${TOKEN_TMPFS_SUPER_OPTIONS.slice(3)}' | 'rw,context='*',${TOKEN_TMPFS_SUPER_OPTIONS.slice(3)}') ;;
+      *) return 2 ;;
+    esac
+    case ",$m_options," in *,nosuid,*) ;; *) return 2 ;; esac
+    case ",$m_options," in *,nodev,*) ;; *) return 2 ;; esac
+    case ",$m_options," in *,noexec,*) ;; *) return 2 ;; esac
+    m_parent_id="$m_parent"
+  done < /proc/self/mountinfo
+  [ "$m_count" = 1 ] || return 2
+  m_hops=0
+  while [ -n "$m_parent_id" ]; do
+    m_hops=$((m_hops + 1))
+    [ "$m_hops" -le 100 ] || return 2
+    m_next=''
+    while read -r m_id m_parent m_dev m_root m_point m_options m_rest; do
+      [ "$m_id" = "$m_parent_id" ] || continue
+      [ "$m_point" != "$dir" ] || return 2
+      case " \${m_rest%%- *}" in *' shared:'*) return 2 ;; esac
+      m_next="$m_parent"
+    done < /proc/self/mountinfo
+    [ "$m_next" != "$m_parent_id" ] || break
+    m_parent_id="$m_next"
+  done
+  return 0
+}
+enter_folder() {
+  if cd "$dir" 2>/dev/null; then
+    own_tmpfs .
+    return
+  fi
+  own_tmpfs "$dir" || return
+  if [ "$(id -u)" = 0 ]; then chown 0:0 "$dir" 2>/dev/null || true; fi
+  chmod 0700 "$dir" 2>/dev/null || true
+  cd "$dir" 2>/dev/null || return 4
+  own_tmpfs .
+}
+`;
+
+/**
+ * Review of unit 15 (P1): shell code that gives everything in the folder (the current folder) back to root, top down,
+ * without following links: each entry gets root (`chown -h 0:0`), and each folder mode 0700 before `find` reads it. So
+ * root clears the folder also without CAP_DAC_OVERRIDE (for example `--cap-drop DAC_OVERRIDE`): after a write the
+ * folder belongs to the remote user, who may put folders of mode 0700 or 000, and links, into it. It needs CAP_CHOWN,
+ * which needs no rights on the entry, and no search right in a folder of the user that `find` did not open yet. Errors
+ * are ignored: what is left is found afterwards.
+ */
+const TAKE_BACK = `find . -mindepth 1 -exec chown -h 0:0 {} \\; -type d -exec chmod 0700 {} \\; 2>/dev/null || true
 `;
 
 /**
  * `$1` = the remote user (a name, or a numeric user ID), `$2` = the GitHub login of the account that owns the environment
  * (isGitHubLogin; empty when it is not known or the token cannot go into hosts.yml). Token on stdin. Runs as root in the
- * dev container (`docker exec -i -u root`). Only when TOKEN_FOLDER is a tmpfs (REQUIRE_TMPFS):
- * - the folder gets root and mode 0700 and is emptied, so no process of the user can change it while it is written (an
- *   old token, a link that the user put there, everything goes);
+ * dev container (`docker exec -i -u root`). Only in the tmpfs of the container at TOKEN_FOLDER (OWN_TMPFS; otherwise exit
+ * code 3 and nothing written), with paths relative to it:
+ * - the folder gets root and mode 0700, everything in it is given back to root (TAKE_BACK) and removed, so no process of
+ *   the user can change it while it is written (an old token, a link or a folder that the user put there, everything
+ *   goes); exit code 5 when something is left;
  * - github-token (GITHUB_TOKEN_FILE): the token from stdin, mode 0600;
  * - gh/ (GH_CONFIG_FOLDER, GH_CONFIG_DIR of the container), mode 0700, with hosts.yml (GH_HOSTS_FILE, mode 0600): the
  *   sign-in of the GitHub CLI as `$2`, in both forms that gh reads (the keys `oauth_token`, `user`, and `git_protocol` of
@@ -41,10 +125,11 @@ fi
  *   goes into it with `cat` of the token file, never as an argument of a program. Without a login, or with a token that
  *   has characters that YAML would need to escape, gh is signed in nowhere (no hosts.yml); Git still works;
  * - gh/config.yml: a link to GH_VOLUME_CONFIG_FILE, the settings of gh in the volume (no secret);
- * - all of it, and last the folder itself, get the user and group of `$1` (`id -u`, `id -g`; a numeric user as it is).
- * On a failure after the check of the tmpfs, the folder is emptied again. Exit codes: 2 invalid user, 3 no tmpfs or no
- * token, 4 unknown user, 5 root may not give the files to the user (the configuration took CAP_CHOWN away, for example
- * `--cap-drop ALL`).
+ * - all of it gets the user and group of `$1` (`id -u`, `id -g`; a numeric user as it is): the files first, then gh/,
+ *   and last the folder itself, so root never needs a right in a folder of the user (CAP_DAC_OVERRIDE).
+ * On a failure after the check of the tmpfs, the folder is emptied again. Exit codes: 2 invalid user, 3 not the tmpfs of
+ * the container or no token, 4 unknown user, 5 root may not empty the folder or give the files to the user (the
+ * configuration took CAP_CHOWN away, for example `--cap-drop ALL`).
  */
 export const TOKEN_WRITE_SCRIPT = `set -eu
 umask 077
@@ -57,8 +142,17 @@ case "$login" in
   '' | [!A-Za-z0-9]* | *[!A-Za-z0-9_-]*) login='' ;;
 esac
 if [ "\${#login}" -gt 39 ]; then login=''; fi
-${REQUIRE_TMPFS}clear_folder() {
-  rm -rf "$dir"/* "$dir"/.[!.]* "$dir"/..?* 2>/dev/null || true
+${OWN_TMPFS}folder=0
+enter_folder || folder=$?
+if [ "$folder" = 1 ] || [ "$folder" = 4 ]; then
+  printf '%s is not a tmpfs mount of the container.\\n' "$dir" >&2
+  exit 3
+elif [ "$folder" != 0 ]; then
+  printf '%s is not the tmpfs of the container: another mount lies over it or in it, or shares it with the computer. The token is not written.\\n' "$dir" >&2
+  exit 3
+fi
+clear_folder() {
+  rm -rf ./* ./.[!.]* ./..?* 2>/dev/null || true
 }
 if uid=$(id -u "$user" 2>/dev/null) && gid=$(id -g "$user" 2>/dev/null); then
   :
@@ -70,20 +164,24 @@ else
   gid="$user"
 fi
 trap 'status=$?; if [ "$status" -ne 0 ]; then clear_folder; fi' EXIT
-chown 0:0 "$dir"
-chmod 0700 "$dir"
-clear_folder
-token='${GITHUB_TOKEN_FILE}'
+chown 0:0 .
+chmod 0700 .
+${TAKE_BACK}clear_folder
+if ! left=$(ls -A .) || [ -n "$left" ]; then
+  printf 'Root in the container cannot empty %s (the configuration takes rights of root away, for example with --cap-drop).\\n' "$dir" >&2
+  exit 5
+fi
+token='${inFolder(GITHUB_TOKEN_FILE)}'
 cat > "$token"
 if [ ! -s "$token" ]; then
   echo 'No token on standard input.' >&2
   exit 3
 fi
 chmod 0600 "$token"
-gh='${GH_CONFIG_FOLDER}'
+gh='${inFolder(GH_CONFIG_FOLDER)}'
 mkdir -m 0700 "$gh"
 ln -s '${GH_VOLUME_CONFIG_FILE}' "$gh/config.yml"
-hosts='${GH_HOSTS_FILE}'
+hosts='${inFolder(GH_HOSTS_FILE)}'
 others=$(tr -d 'A-Za-z0-9_.-' < "$token" | wc -c | tr -d ' ')
 if [ -z "$login" ]; then
   echo 'The GitHub CLI in the container is not signed in: the GitHub login of the account is not known. Git works.'
@@ -100,9 +198,10 @@ else
   chmod 0600 "$hosts"
 fi
 if [ "$uid:$gid" != 0:0 ]; then
-  if ! chown -h "$uid:$gid" "$token" "$gh" "$gh/config.yml" 2>/dev/null ||
+  if ! chown -h "$uid:$gid" "$token" "$gh/config.yml" 2>/dev/null ||
     { [ -e "$hosts" ] && ! chown "$uid:$gid" "$hosts" 2>/dev/null; } ||
-    ! chown "$uid:$gid" "$dir" 2>/dev/null; then
+    ! chown "$uid:$gid" "$gh" 2>/dev/null ||
+    ! chown "$uid:$gid" . 2>/dev/null; then
     printf 'Root in the container may not give the files of %s to %s (the configuration takes this right away, for example with --cap-drop).\\n' "$dir" "$user" >&2
     exit 5
   fi
@@ -111,29 +210,47 @@ echo "The GitHub token of the environment is in $dir, in the memory of the conta
 `;
 
 /**
- * No arguments. Runs in the dev container (as root, or as the remote user when root may not enter the folder): empties
- * TOKEN_FOLDER when it is a tmpfs (REQUIRE_TMPFS; otherwise, for example in a container of a version before unit 15,
- * there is nothing to remove there, exit code 0). Exit code 1 when the token file or the sign-in of the GitHub CLI is
- * still there.
+ * No arguments. Runs in the dev container (as root, or as the remote user when root may not empty the folder): empties
+ * TOKEN_FOLDER when it is the tmpfs of the container (OWN_TMPFS), as root after giving everything in it back to root
+ * (TAKE_BACK), as the user after giving its own folders mode 0700. Where the folder is no tmpfs (for example a container
+ * of a version before unit 15), there is nothing to remove: exit code 0. Exit code 3 for another tmpfs, or ours with a
+ * mount over it or in it (nothing is removed there: the scripts never wrote there). Exit code 1 when the folder cannot
+ * be entered or read, or is not empty afterwards (so that the removal as the remote user runs).
  */
 export const TOKEN_REMOVE_SCRIPT = `set -u
-dir='${TOKEN_FOLDER}'
-fstype=''
-while read -r _source mountpoint type _rest; do
-  if [ "$mountpoint" = "$dir" ]; then fstype="$type"; fi
-done < /proc/mounts
-if [ "$fstype" != tmpfs ]; then
+${OWN_TMPFS}folder=0
+enter_folder || folder=$?
+if [ "$folder" = 1 ]; then
   echo "The container has no tmpfs at $dir: it holds no GitHub token there."
   exit 0
+elif [ "$folder" = 4 ]; then
+  printf '%s cannot be read.\\n' "$dir" >&2
+  exit 1
+elif [ "$folder" != 0 ]; then
+  printf '%s is not the tmpfs of the container: another mount lies over it or in it, or shares it with the computer. Nothing is removed there.\\n' "$dir" >&2
+  exit 3
 fi
-rm -rf "$dir"/* "$dir"/.[!.]* "$dir"/..?* 2>/dev/null || true
+if [ "$(id -u)" = 0 ]; then
+  chown 0:0 . 2>/dev/null
+  chmod 0700 . 2>/dev/null
+  ${TAKE_BACK}else
+  find . -mindepth 1 -type d -exec chmod 0700 {} \\; 2>/dev/null
+fi
+rm -rf ./* ./.[!.]* ./..?* 2>/dev/null
 status=0
-for path in '${GITHUB_TOKEN_FILE}' '${GH_HOSTS_FILE}'; do
+for path in '${inFolder(GITHUB_TOKEN_FILE)}' '${inFolder(GH_HOSTS_FILE)}'; do
   if [ -e "$path" ] || [ -L "$path" ]; then
-    printf '%s could not be removed.\\n' "$path" >&2
+    printf '%s/%s could not be removed.\\n' "$dir" "$path" >&2
     status=1
   fi
 done
+if ! left=$(ls -A . 2>/dev/null); then
+  printf '%s cannot be read.\\n' "$dir" >&2
+  status=1
+elif [ -n "$left" ]; then
+  printf '%s could not be emptied.\\n' "$dir" >&2
+  status=1
+fi
 if [ "$status" -eq 0 ]; then echo 'The GitHub token was removed from the container.'; fi
 exit "$status"
 `;

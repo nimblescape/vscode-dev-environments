@@ -958,6 +958,68 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  /**
+   * Review of unit 15: an environment of the base image of the tests with `runArgs`, opened once; `check` runs while the
+   * container runs. Everything is removed at the end (also the anonymous volumes of the container).
+   */
+  async function withEnvironment(repository: string, runArgs: string[], check: (name: string) => Promise<void>, dockerfileLines: string[] = []): Promise<void> {
+    const id = newEnvironmentId();
+    const name = resourceName(repository, id);
+    const config = JSON.stringify({ name: repository, build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, ...runArgs] });
+    const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', ...dockerfileLines, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
+    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', `/workspaces/${repository.split('/')[1]}`, config, dockerfile], { docker: false, network: false });
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
+    try {
+      await timings.measure(`first open of ${repository}`, () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      expect(cli.container(name)?.State.Running).toBe(true);
+      await check(name);
+    } finally {
+      await registry.remove(id);
+      cli.run(['rm', '-f', '-v', name]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      cli.run(['volume', 'rm', name]);
+    }
+  }
+
+  it('review of unit 15 (T1): a volume on /var/run (the link of the image to /run) hides the tmpfs: nothing is written, the open warns', async () => {
+    const events = ui.events.length;
+    // The image has /run/devenv, so the volume (an anonymous one, filled from the image) has the folder too.
+    await withEnvironment(
+      'devenv-test/var-run-volume',
+      ['-v', '/var/run'],
+      async (name) => {
+        expect(ui.since(events).some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(true);
+        const found = cli.run(['exec', '-u', 'root', name, 'sh', '-c', `grep -rl '${DUMMY_TOKEN}' /run /var/run /workspaces 2>/dev/null || true`]);
+        expect(found.out).toBe('');
+        expect(fs.readFileSync(log.file, 'utf8')).toMatch(/is not (a tmpfs mount|the tmpfs) of the container/);
+      },
+      ['RUN mkdir -p /run/devenv'],
+    );
+  });
+
+  it('review of unit 15 (P1): with --cap-drop DAC_OVERRIDE and a user other than root, the token is written, a second open works, a sign-out removes it', async () => {
+    await withEnvironment('devenv-test/no-dac-override', ['--cap-drop', 'DAC_OVERRIDE'], async (name) => {
+      const asUser = (script: string) => cli.run(['exec', '-u', REMOTE_USER, name, 'sh', '-c', script]);
+      expect(asUser(`cat ${GITHUB_TOKEN_FILE}`).out).toBe(DUMMY_TOKEN);
+      // What the user may do in its folder, then a second open (the container runs).
+      expect(asUser(`cd ${TOKEN_FOLDER} && mkdir -p x/y && ln -s / l && chmod 000 x/y x gh && chmod 000 ${TOKEN_FOLDER}`).code).toBe(0);
+      const id = (await registry.list()).find((entry) => entry.containerName === name)?.id;
+      expect(id).toBeDefined();
+      const events = ui.events.length;
+      await online.openEnvironment(id!, { progress: new RecordingProgress() });
+      expect(ui.since(events).some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(false);
+      expect(asUser(`cat ${GITHUB_TOKEN_FILE}`).out).toBe(DUMMY_TOKEN);
+      expect(asUser(`cat ${GH_HOSTS_FILE}`).out).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
+      // A sign-out, as the controller does it.
+      await removeContainerToken((c, command, options) => docker.exec(c, command, options), { container: name, user: REMOTE_USER, timeoutMs: 30_000 });
+      expect(cli.run(['exec', '-u', 'root', name, 'ls', '-A', TOKEN_FOLDER]).out).toBe('');
+      expect(cli.run(['exec', '-u', 'root', name, 'sh', '-c', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} || true`]).out).toBe('');
+    });
+  });
+
   it('host access checks off for the repository (unit 10): a configuration with privileged: true starts; with the checks on again it is refused and not started', async () => {
     const id = newEnvironmentId();
     const repository = 'devenv-test/privileged';

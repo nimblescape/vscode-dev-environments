@@ -719,8 +719,14 @@ export function isHelperPath(file: string, repositoryFolder: string): boolean {
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }
 
+/**
+ * Review of unit 15 (T2): TOKEN_FOLDER by the link `/var/run` → `/run` that most images have. A mount there lands on the
+ * tmpfs of the token (over it, or in it), so it is the same internal folder.
+ */
+export const TOKEN_FOLDER_ALIAS = `/var${TOKEN_FOLDER}`;
+
 /** The folders of configFolderTarget. */
-const INTERNAL_FOLDERS: readonly string[] = [CONFIG_FOLDER, TOKEN_FOLDER];
+const INTERNAL_FOLDERS: readonly string[] = [CONFIG_FOLDER, TOKEN_FOLDER, TOKEN_FOLDER_ALIAS];
 
 /** Review round 14 (S14-1): the reason of configFolderMountItem. */
 export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal folder are not supported";
@@ -730,7 +736,9 @@ export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal 
  * slashes), when it is CONFIG_FOLDER or a path below it (on segment boundaries: `/workspaces/.devenv+x` is not), or
  * (unit 15) TOKEN_FOLDER or a path below it (`/run/devenv`, the tmpfs with the token, which only the override
  * configuration adds: a mount there would shadow the token or move it out of the memory of the container, for example
- * into a volume; `/run/devenvx` and the parent `/run` are not); `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
+ * into a volume; `/run/devenvx` and the parent `/run` are not), also by its other name TOKEN_FOLDER_ALIAS
+ * (`/var/run/devenv`, review of unit 15, T2; a clearer message only: the write of the token checks the mount that it
+ * finds in the container, whatever path led there); `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
  * every file there the remote user (`find -xdev`, no paths left out): a mount there would shadow them, and would give
  * the files of the mounted folder (for example the data of another service, or the whole repository through an alias)
  * to the remote user. Other paths of WORKSPACES_ROOT outside the repository (for example a cache volume at
@@ -740,6 +748,30 @@ export function configFolderTarget(target: string): string | undefined {
   if (!target.startsWith('/')) return undefined;
   const normal = path.posix.normalize(target).replace(/(.)\/+$/, '$1');
   return INTERNAL_FOLDERS.some((folder) => normal === folder || normal.startsWith(`${folder}/`)) ? normal : undefined;
+}
+
+/** Review of unit 15: a mount propagation (`-v …:rshared`, `bind-propagation=shared`) that shares a mount with the computer. */
+export function isSharedPropagation(value: string): boolean {
+  return /^r?shared$/i.test(value.trim());
+}
+
+/**
+ * Review of unit 15: the target of a mount of the dev container, normalized, where a shared propagation (a peer of a
+ * mount of the computer, isSharedPropagation) would bring the tmpfs of the token, which Docker mounts later below it,
+ * to the computer: the root `/`, or a folder that contains TOKEN_FOLDER or TOKEN_FOLDER_ALIAS (`/run`, `/var`,
+ * `/var/run`); `undefined` otherwise (TOKEN_FOLDER itself and the paths below it are configFolderTarget). Refused whatever
+ * the switch says (class `protected`). The write of the token refuses such a mount in the container too.
+ */
+export function tokenPropagationTarget(target: string): string | undefined {
+  if (!target.startsWith('/')) return undefined;
+  const normal = path.posix.normalize(target).replace(/(.)\/+$/, '$1');
+  if (normal === '/') return normal;
+  return [TOKEN_FOLDER, TOKEN_FOLDER_ALIAS].some((folder) => folder.startsWith(`${normal}/`)) ? normal : undefined;
+}
+
+/** Review of unit 15: the item of a shared mount propagation at tokenPropagationTarget `target` (class `protected`). */
+export function sharedPropagationItem(target: string): string {
+  return `shared mount propagation at ${target} (it would bring the GitHub token in the memory of the container to the computer)`;
 }
 
 /** Review round 14 (S14-1): the item of a mount at configFolderTarget `target` (class `unsupported`). */
@@ -1244,6 +1276,8 @@ export interface MountSpec {
   otherVolumeOptions?: boolean;
   /** The text, when it cannot be read as Docker reads it (csvFields). */
   unreadable?: string;
+  /** Review of unit 15: `bind-propagation`, as written. */
+  propagation?: string;
 }
 
 /**
@@ -1293,6 +1327,7 @@ export function parseMountString(spec: string): MountSpec {
     if (key === 'type') mount.type = value.toLowerCase();
     else if (key === 'source' || key === 'src') mount.source = value;
     else if (key === 'target' || key === 'dst' || key === 'destination') mount.target = value;
+    else if (key === 'bind-propagation') mount.propagation = value;
     else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') {
       mount.volumeOptions = true;
       if (key !== 'volume-driver' && key !== 'volume-opt') mount.otherVolumeOptions = true;
@@ -1374,8 +1409,9 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
   if (mount.unreadable !== undefined) return [guarded(`mount ${JSON.stringify(mount.unreadable)}`)];
   const source = mount.source ?? '';
   const type = mountType(mount);
-  // Review round 14 (S14-1): whatever the type, and whatever the switch says.
-  const internal = targetProblems(mount.target);
+  // Review round 14 (S14-1): whatever the type, and whatever the switch says. Review of unit 15: so is a shared
+  // propagation where the tmpfs of the token would reach the computer.
+  const internal = [...targetProblems(mount.target), ...propagationProblems(mount.target, mount.propagation === undefined ? [] : [mount.propagation])];
   if (type === 'tmpfs') return internal;
   return [...internal, ...mountTypeProblems(mount, type, source, volumes)];
 }
@@ -1384,6 +1420,13 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
 function targetProblems(target: string | undefined): Problem[] {
   const internal = target === undefined ? undefined : configFolderTarget(target);
   return internal === undefined ? [] : [unsupported(configFolderMountItem(internal))];
+}
+
+/** Review of unit 15: a shared propagation (isSharedPropagation) at tokenPropagationTarget `target`. */
+function propagationProblems(target: string | undefined, options: readonly string[]): Problem[] {
+  if (target === undefined || !options.some(isSharedPropagation)) return [];
+  const shared = tokenPropagationTarget(target);
+  return shared === undefined ? [] : [guarded(sharedPropagationItem(shared))];
 }
 
 function mountTypeProblems(mount: MountSpec, type: string, source: string, volumes: VolumeContext): Problem[] {
@@ -1741,11 +1784,25 @@ export function volumeFlagTarget(spec: string): string {
   return target.startsWith('/') ? target : source;
 }
 
+/**
+ * Review of unit 15: the options of a `-v`/`--volume` value (after the target, volumeFlagTarget), comma-separated, for
+ * example `ro,rshared`.
+ */
+export function volumeFlagOptions(spec: string): string[] {
+  const source = volumeFlagSource(spec);
+  if (source === undefined) return [];
+  const rest = spec.slice(source.length + 1);
+  // `/data:ro`: Docker reads the text before the colon as the target (volumeFlagTarget), and the rest as the options.
+  const index = rest.startsWith('/') ? rest.indexOf(':') : -1;
+  const options = rest.startsWith('/') ? (index < 0 ? '' : rest.slice(index + 1)) : rest;
+  return options.split(',').filter((option) => option !== '');
+}
+
 function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
   // As in mountEntryProblems: a variable that is left makes the volume or the target unknown, also of a bind mount.
   const left = unresolvedCliVariables(value);
   if (left.length > 0) return [unsupported(`volume ${JSON.stringify(value)} uses ${listedVariables(left)}, which cannot be checked`)];
-  const internal = targetProblems(volumeFlagTarget(value));
+  const internal = [...targetProblems(volumeFlagTarget(value)), ...propagationProblems(volumeFlagTarget(value), volumeFlagOptions(value))];
   const source = volumeFlagSource(value);
   if (source === undefined) return internal;
   if (isPathSource(source)) return [...internal, access(`bind mount ${shownBindSource(source)}`)];

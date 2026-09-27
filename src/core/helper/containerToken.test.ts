@@ -13,6 +13,7 @@ import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER, TOKEN_TMPFS } from '../names';
 import {
   TOKEN_REMOVE_SCRIPT,
+  TOKEN_TMPFS_SUPER_OPTIONS,
   TOKEN_WRITE_SCRIPT,
   removeContainerToken,
   tokenRemoveCommand,
@@ -56,35 +57,80 @@ describe('the names of unit 15', () => {
   });
 });
 
+/** The device of the tmpfs in the default mount table of setup: 8:300 (a minor above 255 tests the arithmetic). */
+const DEVICE = '8:300';
+const DEVICE_NUMBER = String((300 & 0xff) | (8 << 8) | ((300 & ~0xff) << 12));
+
 /**
- * The scripts with the folder and /proc/mounts of a test folder, and tools on PATH that log their arguments (so a test
+ * The mount table of a dev container with the tmpfs of the token at `dir` (/proc/self/mountinfo). `tmpfs` replaces the
+ * line of the tmpfs; `extra` comes after it.
+ */
+function mountinfo(dir: string, options: { tmpfs?: string; extra?: string[]; root?: string } = {}): string {
+  return [
+    options.root ?? '88 58 0:41 / / rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w',
+    '90 88 0:49 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw',
+    '91 88 0:50 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755',
+    options.tmpfs ?? `106 88 ${DEVICE} / ${dir} rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,mode=700`,
+    ...(options.extra ?? []),
+    '',
+  ].join('\n');
+}
+
+/**
+ * /proc/mounts of a mount table (source, mount point, type, options): what the scripts before the review of unit 15
+ * read, so that a test of a refusal fails on them for the right reason.
+ */
+function procMounts(table: string): string {
+  return table
+    .split('\n')
+    .filter((line) => line !== '')
+    .map((line) => {
+      const [left, right] = line.split(' - ');
+      const fields = left.split(' ');
+      const [type, source] = right.split(' ');
+      return `${source} ${fields[4]} ${type} ${fields[5]} 0 0\n`;
+    })
+    .join('');
+}
+
+/**
+ * The scripts with the folder and /proc/self/mountinfo (and /proc/mounts, procMounts) of a test folder, a `stat` that
+ * answers `fsType` (`stat -f -c %T`) and `device` (`stat -c %d`), and tools on PATH that log their arguments (so a test
  * sees whether the token is ever an argument of a program). `id` knows root (0), dev (1000:1001); chown only logs.
  */
-function setup(options: { mounts?: (dir: string) => string; chownFails?: boolean } = {}) {
+function setup(options: { mountinfo?: (dir: string) => string; fsType?: string; device?: string; chownFails?: boolean } = {}) {
   const base = tempDir();
   const dir = path.join(base, 'run-devenv');
-  const mounts = path.join(base, 'mounts');
+  const mountsFile = path.join(base, 'mountinfo');
+  const procMountsFile = path.join(base, 'mounts');
   const bin = path.join(base, 'bin');
   const log = path.join(base, 'log');
   fs.mkdirSync(dir);
-  write(mounts, options.mounts ? options.mounts(dir) : `proc /proc proc rw 0 0\ntmpfs ${dir} tmpfs rw,nosuid,nodev,noexec,size=1024k,mode=700 0 0\n`);
+  const table = options.mountinfo ? options.mountinfo(dir) : mountinfo(dir);
+  write(mountsFile, table);
+  write(procMountsFile, procMounts(table));
   const tool = (name: string, body: string) => {
     write(path.join(bin, name), `#!/bin/sh\necho "${name} $*" >> '${log}'\n${body}\n`);
     fs.chmodSync(path.join(bin, name), 0o755);
   };
-  for (const name of ['cat', 'tr', 'wc', 'chmod', 'mkdir', 'ln', 'rm']) tool(name, `PATH=/usr/bin:/bin exec ${name} "$@"`);
+  for (const name of ['cat', 'tr', 'wc', 'chmod', 'mkdir', 'ln', 'rm', 'ls']) tool(name, `PATH=/usr/bin:/bin exec ${name} "$@"`);
+  // find with the PATH of the test, so that the programs of its -exec log too.
+  tool('find', 'exec "$(PATH=/usr/bin:/bin command -v find)" "$@"');
   tool(
     'id',
     [
       'case "$1:$2" in',
       '  -u:root) echo 0 ;; -g:root) echo 0 ;;',
       '  -u:dev) echo 1000 ;; -g:dev) echo 1001 ;;',
+      '  -u:) echo 0 ;;',
       '  *) echo "id: $2: no such user" >&2; exit 1 ;;',
       'esac',
     ].join('\n'),
   );
+  tool('stat', `case "$1" in -f) echo '${options.fsType ?? 'tmpfs'}' ;; *) echo '${options.device ?? DEVICE_NUMBER}' ;; esac`);
   tool('chown', options.chownFails ? 'case "$*" in *0:0*) exit 0 ;; esac\necho "chown: Operation not permitted" >&2\nexit 1' : 'exit 0');
-  const adapt = (script: string) => script.split(TOKEN_FOLDER).join(dir).split('/proc/mounts').join(mounts);
+  const adapt = (script: string) =>
+    script.split(TOKEN_FOLDER).join(dir).split('/proc/self/mountinfo').join(mountsFile).split('/proc/mounts').join(procMountsFile);
   const runScript = (script: string, args: string[], input?: string) => {
     const result = spawnSync(shell, ['-c', adapt(script), 'sh', ...args], {
       encoding: 'utf8',
@@ -96,6 +142,8 @@ function setup(options: { mounts?: (dir: string) => string; chownFails?: boolean
   return {
     dir,
     log,
+    bin,
+    tool,
     logText: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''),
     write: (user = 'dev', login = 'scalarion', token = TOKEN) => runScript(TOKEN_WRITE_SCRIPT, [user, login], token),
     remove: () => runScript(TOKEN_REMOVE_SCRIPT, []),
@@ -135,12 +183,16 @@ describe('TOKEN_WRITE_SCRIPT (in the dev container, as root)', () => {
     expect(fs.readlinkSync(path.join(gh, 'config.yml'))).toBe(GH_VOLUME_CONFIG_FILE);
     expect(fs.readdirSync(env.dir).sort()).toEqual(['gh', 'github-token']);
     expect(fs.readdirSync(gh).sort()).toEqual(['config.yml', 'hosts.yml']);
-    // The folder is root's while it is written, and the remote user's at the end: its files first, the folder last.
+    // The folder is root's while it is written, and the remote user's at the end: its files first, then gh/, the folder
+    // last (review, T1/T2/P1: paths relative to the folder, and gh/ after its files, so root needs no DAC_OVERRIDE).
     const chowns = env.logText().split('\n').filter((line) => line.startsWith('chown '));
-    expect(chowns[0]).toBe(`chown 0:0 ${env.dir}`);
-    expect(chowns).toContain(`chown -h 1000:1001 ${token} ${gh} ${gh}/config.yml`);
-    expect(chowns).toContain(`chown 1000:1001 ${hosts}`);
-    expect(chowns.at(-1)).toBe(`chown 1000:1001 ${env.dir}`);
+    expect(chowns).toEqual([
+      'chown 0:0 .',
+      'chown -h 1000:1001 github-token gh/config.yml',
+      'chown 1000:1001 gh/hosts.yml',
+      'chown 1000:1001 gh',
+      'chown 1000:1001 .',
+    ]);
     // The token is never an argument of a program.
     expect(env.logText()).not.toContain(TOKEN);
   });
@@ -202,13 +254,14 @@ describe('TOKEN_WRITE_SCRIPT (in the dev container, as root)', () => {
     expect(fs.readFileSync(path.join(env.dir, 'github-token'), 'utf8')).toBe('gho_"x":\\y');
   });
 
+  // review, T1/T2/P1: the mount table is /proc/self/mountinfo, and `stat -f` tells what the folder is on.
   it.each([
-    ['no mount at the folder', () => 'proc /proc proc rw 0 0\n'],
-    ['a mount of another folder', () => 'tmpfs /elsewhere tmpfs rw 0 0\n'],
-    ['a volume at the folder', (dir: string) => `proc /proc proc rw 0 0\n/dev/sda1 ${dir} ext4 rw 0 0\n`],
-    ['a volume over the tmpfs', (dir: string) => `tmpfs ${dir} tmpfs rw 0 0\n/dev/sda1 ${dir} ext4 rw 0 0\n`],
-  ])('writes nothing and removes nothing without the tmpfs at the folder (%s)', (_name, mounts) => {
-    const env = setup({ mounts });
+    ['no mount at the folder', (dir: string) => mountinfo(dir, { tmpfs: '' }), 'overlay'],
+    ['a mount of another folder', (dir: string) => mountinfo(dir, { tmpfs: '106 88 0:55 / /elsewhere rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k,mode=700' }), 'overlay'],
+    ['a volume at the folder', (dir: string) => mountinfo(dir, { tmpfs: `106 88 254:1 /volumes/x/_data ${dir} rw,relatime - ext4 /dev/sda1 rw` }), 'ext4'],
+    ['a volume over the tmpfs', (dir: string) => mountinfo(dir, { extra: [`107 106 254:1 /volumes/x/_data ${dir} rw,relatime - ext4 /dev/sda1 rw`] }), 'ext4'],
+  ])('writes nothing and removes nothing without the tmpfs at the folder (%s)', (_name, table, fsType) => {
+    const env = setup({ mountinfo: table, fsType });
     write(path.join(env.dir, 'kept'), 'x');
     const result = env.write();
     expect(result.status).toBe(3);
@@ -219,7 +272,16 @@ describe('TOKEN_WRITE_SCRIPT (in the dev container, as root)', () => {
   });
 
   it('accepts the tmpfs when a mount of a parent folder lies below it (for example --tmpfs /run)', () => {
-    const env = setup({ mounts: (dir) => `tmpfs ${path.dirname(dir)} tmpfs rw 0 0\ntmpfs ${dir} tmpfs rw,mode=700 0 0\n` });
+    // review, T1/T2/P1: as /proc/self/mountinfo.
+    const env = setup({
+      mountinfo: (dir) =>
+        mountinfo(dir, {
+          tmpfs: [
+            `100 88 0:60 / ${path.dirname(dir)} rw,nosuid,nodev,relatime - tmpfs tmpfs rw,mode=755`,
+            `106 100 ${DEVICE} / ${dir} rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,mode=700`,
+          ].join('\n'),
+        }),
+    });
     expect(env.write().status).toBe(0);
     expect(fs.readFileSync(path.join(env.dir, 'github-token'), 'utf8')).toBe(TOKEN);
   });
@@ -247,13 +309,15 @@ describe('TOKEN_WRITE_SCRIPT (in the dev container, as root)', () => {
     const result = env.write('root');
     expect(result.status).toBe(0);
     expect(fs.readFileSync(path.join(env.dir, 'github-token'), 'utf8')).toBe(TOKEN);
-    expect(env.logText().split('\n').filter((line) => line.startsWith('chown '))).toEqual([`chown 0:0 ${env.dir}`]);
+    // review, T1/T2/P1: the folder by its relative path.
+    expect(env.logText().split('\n').filter((line) => line.startsWith('chown '))).toEqual(['chown 0:0 .']);
   });
 
   it('takes a numeric user as it is, and refuses an unknown name or an invalid user without writing', () => {
     const numeric = setup();
     expect(numeric.write('1234').status).toBe(0);
-    expect(numeric.logText()).toContain(`chown 1234:1234 ${numeric.dir}`);
+    // review, T1/T2/P1: the folder by its relative path.
+    expect(numeric.logText()).toContain('chown 1234:1234 .');
 
     const unknown = setup();
     const result = unknown.write('nobody-here');
@@ -286,7 +350,8 @@ describe('TOKEN_REMOVE_SCRIPT (in the dev container)', () => {
   });
 
   it('removes nothing where the folder is no tmpfs (a container of an earlier version)', () => {
-    const env = setup({ mounts: () => 'proc /proc proc rw 0 0\n' });
+    // review, T1/T2/P1: as /proc/self/mountinfo, and `stat -f` of the folder.
+    const env = setup({ mountinfo: (dir) => mountinfo(dir, { tmpfs: '' }), fsType: 'overlay' });
     write(path.join(env.dir, 'kept'), 'x');
     const result = env.remove();
     expect(result.status).toBe(0);
@@ -303,6 +368,225 @@ describe('TOKEN_REMOVE_SCRIPT (in the dev container)', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('github-token could not be removed');
     expect(result.stdout).not.toContain('The GitHub token was removed');
+  });
+});
+
+describe('review of unit 15 (T1, T2): only into the tmpfs that the override configuration gives the container', () => {
+  it('knows the super options that the kernel shows for TOKEN_TMPFS', () => {
+    // size=1m is shown as 1024k, mode=0700 as 700.
+    expect(TOKEN_TMPFS).toContain(',size=1m,mode=0700');
+    expect(TOKEN_TMPFS_SUPER_OPTIONS).toBe('rw,size=1024k,mode=700');
+  });
+
+  const tmpfsLine = (dir: string, fields: { id?: string; parent?: string; device?: string; root?: string; point?: string; options?: string; optional?: string; superOptions?: string } = {}) =>
+    [
+      fields.id ?? '106',
+      fields.parent ?? '88',
+      fields.device ?? DEVICE,
+      fields.root ?? '/',
+      fields.point ?? dir,
+      fields.options ?? 'rw,nosuid,nodev,noexec,relatime',
+      ...(fields.optional ? [fields.optional] : []),
+      '-',
+      'tmpfs',
+      'tmpfs',
+      fields.superOptions ?? 'rw,size=1024k,mode=700',
+    ].join(' ');
+
+  it.each([
+    ['SELinux: seclabel', 'rw,seclabel,size=1024k,mode=700'],
+    ['SELinux: the context of Docker', 'rw,context="system_u:object_r:container_file_t:s0:c1,c2",size=1024k,mode=700'],
+  ])('accepts our tmpfs with the options of the kernel (%s)', (_name, superOptions) => {
+    const env = setup({ mountinfo: (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions }) }) });
+    expect(env.write().status).toBe(0);
+    expect(fs.readFileSync(path.join(env.dir, 'github-token'), 'utf8')).toBe(TOKEN);
+  });
+
+  const refusals: Array<[string, (dir: string) => string, { fsType?: string; device?: string; message: string }]> = [
+    [
+      'T1: a volume on /run through a link of the image (/var/run → /run) hides the tmpfs',
+      (dir) => mountinfo(dir, { extra: [`107 88 254:1 /volumes/v/_data ${path.dirname(dir)} rw,relatime - ext4 /dev/sda1 rw`] }),
+      { fsType: 'ext4', device: String((254 << 8) | 1), message: 'is not a tmpfs mount of the container' },
+    ],
+    [
+      'T1: a tmpfs volume on /run hides the tmpfs',
+      (dir) => mountinfo(dir, { extra: [`107 88 0:70 / ${path.dirname(dir)} rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,mode=700`] }),
+      { device: '70', message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs of the computer stacked on ours (/var/run/devenv)',
+      (dir) => mountinfo(dir, { extra: [tmpfsLine(dir, { id: '107', parent: '106', device: '0:70' })] }),
+      { device: '70', message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a folder of a tmpfs of the computer (its root is not /)',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { root: '/devenv-host' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs of another size',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=2048k,mode=700' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs with other options of the kernel (nr_inodes)',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { superOptions: 'rw,size=1024k,nr_inodes=5,mode=700' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a tmpfs without noexec',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { options: 'rw,nosuid,nodev,relatime' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: a file of the computer at the place of the token file',
+      (dir) => mountinfo(dir, { extra: [`107 106 254:1 /home/u/file ${dir}/github-token rw,relatime - ext4 /dev/sda1 rw`] }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'T2: our tmpfs with an optional field (a slave of a mount of the computer)',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { optional: 'master:3' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'the mount propagation: our tmpfs is shared',
+      (dir) => mountinfo(dir, { tmpfs: tmpfsLine(dir, { optional: 'shared:5' }) }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'the mount propagation: /run is shared with the computer (-v <folder>:/run:rshared)',
+      (dir) =>
+        mountinfo(dir, {
+          tmpfs: [`100 88 254:1 /host/run ${path.dirname(dir)} rw,relatime shared:2 - ext4 /dev/sda1 rw`, tmpfsLine(dir, { parent: '100' })].join('\n'),
+        }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'the mount propagation: the root of the container is shared',
+      (dir) => mountinfo(dir, { root: '88 58 0:41 / / rw,relatime shared:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w' }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+    [
+      'our tmpfs twice in the mount table',
+      (dir) => mountinfo(dir, { extra: [tmpfsLine(dir, { id: '120', point: '/mnt/copy' })] }),
+      { message: 'is not the tmpfs of the container' },
+    ],
+  ];
+
+  it.each(refusals)('writes nothing (%s)', (_name, table, expected) => {
+    const env = setup({ mountinfo: table, fsType: expected.fsType, device: expected.device });
+    write(path.join(env.dir, 'kept'), 'x');
+    const result = env.write();
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(expected.message);
+    expect(result.stdout + result.stderr).not.toContain(TOKEN);
+    expect(fs.readdirSync(env.dir)).toEqual(['kept']);
+    expect(env.logText()).not.toContain('chown');
+    expect(env.logText()).not.toContain('cat');
+  });
+
+  it.each(refusals.filter(([, , expected]) => expected.fsType === undefined))('removes nothing from another tmpfs, exit code 3 (%s)', (_name, table, expected) => {
+    const env = setup({ mountinfo: table, device: expected.device });
+    write(path.join(env.dir, 'kept'), 'x');
+    const result = env.remove();
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('is not the tmpfs of the container');
+    expect(fs.readdirSync(env.dir)).toEqual(['kept']);
+  });
+});
+
+describe('review of unit 15 (P1): without CAP_DAC_OVERRIDE of root', () => {
+  /** A folder of the remote user as it can leave it after a write: nested folders of mode 000, a link out of the folder. */
+  function userLeftovers(dir: string): string {
+    const elsewhere = path.join(tempDir(), 'elsewhere');
+    write(path.join(elsewhere, 'file'), 'x');
+    fs.chmodSync(elsewhere, 0o750);
+    write(path.join(dir, 'gh', 'hosts.yml'), TOKEN);
+    write(path.join(dir, 'x', 'y', 'file'), 'x');
+    fs.symlinkSync(elsewhere, path.join(dir, 'l'));
+    fs.chmodSync(path.join(dir, 'x', 'y'), 0o000);
+    fs.chmodSync(path.join(dir, 'x'), 0o000);
+    fs.chmodSync(path.join(dir, 'gh'), 0o000);
+    return elsewhere;
+  }
+
+  function takeBack(logText: string): string[] {
+    return logText.split('\n').filter((line) => /^(chown -h 0:0|chmod 0700) \.\//.test(line));
+  }
+
+  it('the write gives everything in the folder back to root, top down, each folder 0700 before it is read, never through a link', () => {
+    const env = setup();
+    const elsewhere = userLeftovers(env.dir);
+    const result = env.write();
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(env.logText()).toContain('find . -mindepth 1 -exec chown -h 0:0 {} ; -type d -exec chmod 0700 {} ;');
+    const steps = takeBack(env.logText());
+    for (const entry of ['./gh', './x', './x/y']) {
+      expect(steps).toContain(`chown -h 0:0 ${entry}`);
+      expect(steps).toContain(`chmod 0700 ${entry}`);
+    }
+    expect(steps.indexOf('chmod 0700 ./x')).toBeLessThan(steps.indexOf('chown -h 0:0 ./x/y'));
+    expect(steps).toContain('chown -h 0:0 ./l');
+    expect(steps).not.toContain('chmod 0700 ./l');
+    expect(fs.statSync(elsewhere).mode & 0o777).toBe(0o750);
+    expect(fs.readFileSync(path.join(elsewhere, 'file'), 'utf8')).toBe('x');
+    expect(fs.readdirSync(env.dir).sort()).toEqual(['gh', 'github-token']);
+  });
+
+  it('the write stops with exit code 5 and writes no token when root cannot empty the folder', () => {
+    const env = setup();
+    userLeftovers(env.dir);
+    // An rm that removes nothing (root without the rights in the folders of the user).
+    env.tool('rm', 'exit 1');
+    const result = env.write();
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('Root in the container cannot empty');
+    expect(fs.existsSync(path.join(env.dir, 'github-token'))).toBe(false);
+    expect(fs.readFileSync(path.join(env.dir, 'gh', 'hosts.yml'), 'utf8')).toBe(TOKEN);
+  });
+
+  it('the removal as root gives everything back to root first, and empties the folder', () => {
+    const env = setup();
+    const elsewhere = userLeftovers(env.dir);
+    const result = env.remove();
+    expect(result).toMatchObject({ status: 0, stderr: '' });
+    const steps = takeBack(env.logText());
+    expect(steps).toContain('chmod 0700 ./x/y');
+    expect(steps).not.toContain('chmod 0700 ./l');
+    expect(fs.readdirSync(env.dir)).toEqual([]);
+    expect(fs.readFileSync(path.join(elsewhere, 'file'), 'utf8')).toBe('x');
+  });
+
+  it('the removal as the remote user gives only its folders mode 0700 (no chown)', () => {
+    const env = setup();
+    userLeftovers(env.dir);
+    env.tool('id', 'echo 1000');
+    const result = env.remove();
+    expect(result).toMatchObject({ status: 0, stderr: '' });
+    expect(env.logText()).not.toContain('chown');
+    expect(env.logText()).toContain('chmod 0700 ./x/y');
+    expect(fs.readdirSync(env.dir)).toEqual([]);
+  });
+
+  it('the removal fails when the folder cannot be listed afterwards (so the removal as the remote user runs)', () => {
+    const env = setup();
+    expect(env.write().status).toBe(0);
+    env.tool('ls', 'echo "ls: cannot open directory .: Permission denied" >&2\nexit 2');
+    const result = env.remove();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('cannot be read');
+    expect(result.stdout).not.toContain('The GitHub token was removed');
+  });
+
+  it('the removal fails when something is left in the folder', () => {
+    const env = setup();
+    userLeftovers(env.dir);
+    env.tool('rm', 'exit 1');
+    const result = env.remove();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('gh/hosts.yml could not be removed');
+    expect(result.stderr).toContain('could not be emptied');
   });
 });
 

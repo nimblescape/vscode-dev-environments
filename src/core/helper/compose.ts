@@ -36,9 +36,12 @@ import {
   isLoopbackAddress,
   isOtherEnvironmentProjectName,
   isPathSource,
+  isSharedPropagation,
   MAX_STOP_TIMEOUT_SECONDS,
   parseMountString,
+  sharedPropagationItem,
   splitPortAddress,
+  tokenPropagationTarget,
   withLoopbackAddress,
 } from './hostAccess';
 import { MAX_ANALYSIS_JOB_CHARACTERS, MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES, MAX_COMPOSE_TOP_LEVEL_ENTRIES } from './analysisLimits';
@@ -588,7 +591,9 @@ function normalizedTarget(target: unknown): string | undefined {
  * - review round 14 (S14-1): in the dev service, any mount at or below CONFIG_FOLDER (configFolderTarget): refused as not
  *   supported (the token and the Git configuration of the extension are there, and its ownership fix walks the folder in
  *   full). The other services do not have the folder (they cannot mount the workspace volume), so their targets there
- *   stay allowed.
+ *   stay allowed;
+ * - review of unit 15: in the dev service, `bind.propagation` shared or rshared at `/` or a parent of the tmpfs of the
+ *   token (tokenPropagationTarget): refused whatever the switch says (it would bring the token to the computer).
  */
 export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): ComposeEntryDecision {
   if (!isRecord(entry)) return { action: 'refuse', kind: 'unsupported', item: `volume ${JSON.stringify(entry)}` };
@@ -601,6 +606,11 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
   // Review round 14 (S14-1): only the dev container has the folder (the other services cannot mount the workspace volume).
   const internal = ctx.isDev ? configFolderTarget(target) : undefined;
   if (internal !== undefined) return { action: 'refuse', kind: 'unsupported', item: configFolderMountItem(internal) };
+  // Review of unit 15: a shared propagation where the tmpfs of the token would reach the computer, whatever the switch
+  // says (tokenPropagationTarget).
+  const propagation = isRecord(entry.bind) && typeof entry.bind.propagation === 'string' ? entry.bind.propagation : undefined;
+  const shared = ctx.isDev && propagation !== undefined && isSharedPropagation(propagation) ? tokenPropagationTarget(target) : undefined;
+  if (shared !== undefined) return { action: 'refuse', kind: 'hostAccess', item: sharedPropagationItem(shared), guarded: true };
   if (type === 'tmpfs') {
     return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'keep' };
   }
