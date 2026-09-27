@@ -254,9 +254,35 @@ export function isRootlessEngine(securityOptions: unknown): boolean {
 // ---------------------------------------------------------------------------------------------------------------------
 // Failures of the connection
 
+/**
+ * A line of ssh's error when the SSH server closed or reset the connection before the login, without any other reason:
+ * the client of OpenSSH 9.6 (Ubuntu 24.04) prints only "Connection closed by <address> port <port>"; 9.2 prints
+ * "kex_exchange_identification: Connection closed by remote host" (or "…: read: Connection reset by peer") before it.
+ */
+const SSH_CLOSED_LINE =
+  /^(?:(?:kex|ssh)_exchange_identification: .*|Connection (?:closed|reset) by \S+ port \d+|Connection (?:closed|reset) by remote host)$/;
+
+/**
+ * True when ssh's error (alone, or as `stderr=…` at the end of the Docker CLI's error) says only that the SSH server
+ * closed the connection before the login: no banner, no key exchange, so no command ran on that computer. sshd does so
+ * when it limits new connections: MaxStartups (by default it drops new connections at random while more than 10 are not
+ * logged in yet) and PerSourcePenalties (OpenSSH 9.8 and later: after failed or unfinished logins from an address, its
+ * new connections are refused for a while).
+ */
+export function isSshClosedBeforeLogin(detail: string): boolean {
+  const marker = detail.lastIndexOf('stderr=');
+  const stderr = marker >= 0 ? detail.slice(marker + 'stderr='.length) : detail;
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+  return lines.length > 0 && lines.every((line) => SSH_CLOSED_LINE.test(line)) && lines.some((line) => line.startsWith('Connection '));
+}
+
 /** Why a remote Docker host could not be used, from the error of `docker info` (the Docker CLI passes on ssh's error). */
 export type DockerHostProblem =
   | 'unreachable'
+  | 'closedBeforeLogin'
   | 'login'
   | 'hostKey'
   | 'dockerMissing'
@@ -284,6 +310,7 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
   if (/Cannot connect to the Docker daemon|Is the docker daemon running|dial unix [^\s]*docker\.sock: connect: (?:no such file|connection refused)/i.test(text)) {
     return 'dockerNotRunning';
   }
+  if (isSshClosedBeforeLogin(text)) return 'closedBeforeLogin';
   if (
     /Could not resolve hostname|Name or service not known|nodename nor servname|Temporary failure in name resolution|Connection refused|Connection timed out|Operation timed out|timed out|No route to host|Network is unreachable|Connection closed by|Connection reset|kex_exchange_identification|did not answer/i.test(
       text,

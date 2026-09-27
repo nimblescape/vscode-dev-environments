@@ -5,12 +5,20 @@
 # The "remote computer" of the Docker tests of unit 7 (test/docker/remoteHost.test.ts): an SSH server with the Docker CLI,
 # whose Docker socket is the socket of the engine of the runner (mounted by the test). Key authentication only; the
 # public key comes from the variable AUTHORIZED_KEY at the start.
+# Connection limits: the Docker CLI opens a new SSH connection for each call (up to five for one failing call), and all
+# of them come from one address (the Docker gateway). The test of the failure reasons logs in with a wrong key on
+# purpose; with the default PerSourcePenalties of OpenSSH 9.8 and later (authfail:5s, noauth:1s, min:15s), that blocked
+# the address and the next test's first call got "Connection closed by …". So penalties are off (only where sshd knows
+# the option: `sshd -t` checks it; an exemption of every address where `no` is not known), and MaxStartups/MaxSessions are raised above the parallel calls of the open pipeline.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 RUN apk add --no-cache openssh-server docker-cli \
  && ssh-keygen -A \
  && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow \
- && printf '%s\n' 'PermitRootLogin prohibit-password' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PubkeyAuthentication yes' 'AllowTcpForwarding no' 'X11Forwarding no' 'LogLevel VERBOSE' >> /etc/ssh/sshd_config
+ && printf '%s\n' 'PermitRootLogin prohibit-password' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PubkeyAuthentication yes' 'AllowTcpForwarding no' 'X11Forwarding no' 'LogLevel VERBOSE' 'MaxStartups 100:30:200' 'MaxSessions 100' >> /etc/ssh/sshd_config \
+ && if /usr/sbin/sshd -t -o PerSourcePenalties=no; then echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config; \
+    elif /usr/sbin/sshd -t -o PerSourcePenaltyExemptList=0.0.0.0/0,::/0; then echo 'PerSourcePenaltyExemptList 0.0.0.0/0,::/0' >> /etc/ssh/sshd_config; fi \
+ && /usr/sbin/sshd -t
 LABEL devenv-test.purpose=remote-docker-host
 EXPOSE 22
 CMD ["sh", "-c", "mkdir -p /root/.ssh && printf '%s\\n' \"$AUTHORIZED_KEY\" > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e"]

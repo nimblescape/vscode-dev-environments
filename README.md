@@ -143,7 +143,16 @@ Your environments can run in Docker on another computer, for example a build ser
 - The GitHub token goes into the memory (tmpfs) of the container on the other computer, through `docker exec` over SSH, never onto its disk. Root and every member of the group `docker` on that computer can read it, as on your own computer.
 - Rootless Docker on the other computer is supported: Dev Environments detects it and reads the socket folder of your SSH user once (`$XDG_RUNTIME_DIR/docker.sock`). Its limits: no published ports below 1024, Docker-in-Docker needs set-up on that computer, and resource limits need cgroup v2 there.
 - The Session Monitor stops the environments of the remote host after their windows closed, through the same context, while your computer is online and Docker is set to that host.
-- Each Docker call opens an SSH connection. `ControlMaster auto` with `ControlPersist` in your SSH config makes them faster.
+- Each Docker call opens a new SSH connection, and opening an environment makes many calls, some at the same time. SSH servers limit new connections: by default, OpenSSH drops new connections at random while more than 10 are not logged in yet (`MaxStartups`), and OpenSSH 9.8 and later refuse new connections from an address for a while after failed or unfinished logins from it (`PerSourcePenalties`). The message then says that the SSH server closed the connection before the login. Dev Environments repeats a call that only reads once after such a drop, but never a call that changes something. **We recommend connection sharing** in your SSH config for the host: every Docker call then uses one connection, which is also much faster.
+
+  ```
+  Host build-box
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+  ```
+
+  `%C` is a short hash of the connection, so the path stays short enough for a socket. Connection sharing needs Unix sockets and does not work with the OpenSSH client of Windows; there, raise `MaxStartups` in `/etc/ssh/sshd_config` of the other computer (for example `MaxStartups 30:30:100`) if drops happen.
 
 ## Known limits
 

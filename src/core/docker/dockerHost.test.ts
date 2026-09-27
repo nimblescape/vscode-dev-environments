@@ -9,6 +9,7 @@ import {
   dockerHostField,
   dockerHostOf,
   dockerHostProblem,
+  isSshClosedBeforeLogin,
   dockerTargetOf,
   environmentsOfHost,
   isOnDockerHost,
@@ -228,8 +229,27 @@ describe('dockerHostProblem (plain reasons of a failed connection)', () => {
       'dockerPermission',
     ],
     ['error during connect: exec: "ssh": executable file not found in $PATH', 'sshMissing'],
+    // sshd dropped the connection before the login (MaxStartups, PerSourcePenalties): OpenSSH 9.6 and older clients.
+    [
+      'error during connect: Get "http://docker.example.com/v1.48/info": command [ssh -o ConnectTimeout=30 -T -- box docker system dial-stdio] has exited with exit status 255, make sure the URL is valid, and Docker 18.09 or later is installed on the remote host: stderr=Connection closed by 127.0.0.1 port 32771\r\n',
+      'closedBeforeLogin',
+    ],
+    ['kex_exchange_identification: Connection closed by remote host\r\nConnection closed by 192.0.2.10 port 22', 'closedBeforeLogin'],
+    ['kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 192.0.2.10 port 22', 'closedBeforeLogin'],
     ['something else', 'unknown'],
   ])('%s → %s', (detail, problem) => {
     expect(dockerHostProblem(detail)).toBe(problem);
+  });
+});
+
+describe('isSshClosedBeforeLogin', () => {
+  it('is true only when ssh said nothing but the closed connection', () => {
+    expect(isSshClosedBeforeLogin('Connection closed by 127.0.0.1 port 32771')).toBe(true);
+    expect(isSshClosedBeforeLogin('… installed on the remote host: stderr=Connection closed by 127.0.0.1 port 32771\r\n\n')).toBe(true);
+    expect(isSshClosedBeforeLogin('')).toBe(false);
+    expect(isSshClosedBeforeLogin('kex_exchange_identification: Connection closed by remote host')).toBe(false);
+    expect(isSshClosedBeforeLogin('root@box: Permission denied (publickey).\r\nConnection closed by 127.0.0.1 port 22')).toBe(false);
+    expect(isSshClosedBeforeLogin('Connection to box closed by remote host.')).toBe(false);
+    expect(isSshClosedBeforeLogin('ssh: connect to host box port 22: Connection refused')).toBe(false);
   });
 });
