@@ -4,7 +4,7 @@
 
 import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
-import { CONTAINER_VERSION, composeProjectName, environmentImageRepository } from '../names';
+import { CONTAINER_VERSION, TOKEN_TMPFS, composeProjectName, environmentImageRepository } from '../names';
 import {
   COMPOSE_BUILD_CONTEXT,
   COMPOSE_DEV_DOCKERFILE,
@@ -352,7 +352,8 @@ describe('decideServiceMount (D-6, D-11)', () => {
     ['a named volume', { type: 'volume', source: 'pgdata', target: '/data' }, {}, { action: 'keep' }],
     ['a named volume without type', { source: 'pgdata', target: '/data' }, {}, { action: 'keep' }],
     ['a volume that is not declared', { type: 'volume', source: 'nope', target: '/data' }, {}, { action: 'refuse', kind: 'unsupported', item: 'volume nope (not in the top-level volumes)' }],
-    ['the workspace volume in another service', { type: 'volume', source: 'ws', target: '/w' }, {}, { action: 'refuse', kind: 'hostAccess', item: `volume ${OWN} (the workspace volume, which holds the GitHub token)`, guarded: true }],
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    ['the workspace volume in another service', { type: 'volume', source: 'ws', target: '/w' }, {}, { action: 'refuse', kind: 'hostAccess', item: `volume ${OWN} (the workspace volume, with the repository and the Git configuration of the environment)`, guarded: true }],
     ['the workspace volume in the dev service', { type: 'volume', source: 'ws', target: '/w' }, dev, { action: 'keep' }],
     ['a volume at /workspaces in the dev service', { type: 'volume', source: 'pgdata', target: '/workspaces' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
     ['a tmpfs at /workspaces/ in the dev service', { type: 'tmpfs', target: '/workspaces/' }, dev, { action: 'refuse', kind: 'unsupported', item: 'mount at /workspaces' }],
@@ -360,7 +361,8 @@ describe('decideServiceMount (D-6, D-11)', () => {
     ['the templates\' ../..:/workspaces in the dev service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, dev, { action: 'drop', reason: 'the workspace volume is mounted there' }],
     ['the repository at /workspaces in the dev service', { type: 'bind', source: `${REPO}/`, target: '/workspaces' }, dev, { action: 'drop', reason: 'the workspace volume is mounted there' }],
     ['the parent at another target in the dev service', { type: 'bind', source: '/workspaces', target: '/src', read_only: true }, dev, { action: 'replace', value: { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/src', read_only: true }, reason: 'the workspace volume in place of the folder' }],
-    ['the parent in another service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, {}, { action: 'refuse', kind: 'hostAccess', item: 'bind mount /workspaces → /workspaces (the workspace volume, which holds the GitHub token)', guarded: true }],
+    // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
+    ['the parent in another service', { type: 'bind', source: '/workspaces', target: '/workspaces' }, {}, { action: 'refuse', kind: 'hostAccess', item: 'bind mount /workspaces → /workspaces (the workspace volume, with the repository and the Git configuration of the environment)', guarded: true }],
     ['the repository in another service', { type: 'bind', source: REPO, target: '/app' }, {}, subpath('api', '/app')],
     ['the repository at /workspace (older templates) in the dev service', { type: 'bind', source: REPO, target: '/workspace' }, dev, subpath('api', '/workspace')],
     ['a file of the repository, read-only', { type: 'bind', source: `${REPO}/init.sql`, target: '/docker-entrypoint-initdb.d/init.sql', read_only: true }, {}, subpath('api/init.sql', '/docker-entrypoint-initdb.d/init.sql', true)],
@@ -407,6 +409,8 @@ describe('composeUpModel', () => {
           volumes: [{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' }],
           // Package C of unit 6: the dev container is named after the repository, as a single container (containerHostname).
           hostname: 'api',
+          // unit 15: changed expectation, the tmpfs of the token, only in the dev container.
+          tmpfs: ['/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700'],
         },
         db: {
           image: 'postgres:16',
@@ -1026,6 +1030,48 @@ describe('decideServiceMount: the extension\'s internal folder (review round 14,
     expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+x' }, context(true))).toEqual({ action: 'keep' });
     expect(decideServiceMount({ type: 'tmpfs', target: '/workspaces/.devenv+x/y' }, context(true))).toEqual({ action: 'keep' });
     expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/workspaces/.devenv+/pg' }, context(false))).toEqual({ action: 'keep' });
+  });
+});
+
+describe('unit 15: the tmpfs of the token (/run/devenv) in the Docker Compose up model', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const context = (isDev: boolean): ComposeMountContext => ({
+    isDev,
+    repositoryFolder: REPO,
+    volumeNames: new Map([['pgdata', `${PROJECT}_pgdata`]]),
+    ownVolume: OWN,
+    engineApiVersion: '1.47',
+  });
+  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: 'devenv-3f2a9c1e:7' }).model;
+
+  it('adds the tmpfs to the dev service only, after its own tmpfs entries (a text or a list)', () => {
+    const model = templateModel();
+    expect(up(model).services.app.tmpfs).toEqual([TOKEN_TMPFS]);
+    expect(up(model).services.db.tmpfs).toBeUndefined();
+    const withList = templateModel();
+    withList.services.app.tmpfs = ['/tmp:size=64m'];
+    expect(up(withList).services.app.tmpfs).toEqual(['/tmp:size=64m', TOKEN_TMPFS]);
+    const withText = templateModel();
+    withText.services.app.tmpfs = '/run';
+    expect(up(withText).services.app.tmpfs).toEqual(['/run', TOKEN_TMPFS]);
+  });
+
+  it('does not add it to the build model', () => {
+    expect(composeBuildModel(templateModel(), params()).model.services.app.tmpfs).toBeUndefined();
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a named volume', { type: 'volume', source: 'pgdata', target: '/run/devenv' }, '/run/devenv'],
+    ['a tmpfs below it', { type: 'tmpfs', target: '/run/devenv/gh' }, '/run/devenv/gh'],
+    ['a bind mount of repository data', { type: 'bind', source: `${REPO}/x`, target: '/run//devenv/' }, '/run/devenv'],
+  ])('decideServiceMount refuses %s at or below it in the dev service', (_name, entry, target) => {
+    expect(decideServiceMount(entry, context(true))).toEqual({ action: 'refuse', kind: 'unsupported', item: `mount at ${target} (${INTERNAL})` });
+  });
+
+  it('decideServiceMount keeps /run and /run/devenvx in the dev service, and the folder in another service', () => {
+    expect(decideServiceMount({ type: 'tmpfs', target: '/run' }, context(true))).toEqual({ action: 'keep' });
+    expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/run/devenvx' }, context(true))).toEqual({ action: 'keep' });
+    expect(decideServiceMount({ type: 'volume', source: 'pgdata', target: '/run/devenv' }, context(false))).toEqual({ action: 'keep' });
   });
 });
 

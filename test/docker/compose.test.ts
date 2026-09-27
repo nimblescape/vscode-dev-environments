@@ -22,6 +22,9 @@ import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,
+  GITHUB_TOKEN_FILE,
+  TOKEN_FOLDER,
+  TOKEN_TMPFS,
   HOST_ACCESS_CHECKED,
   HOST_ACCESS_UNRESTRICTED,
   LABEL_COMPOSE_SERVICE,
@@ -43,7 +46,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
@@ -312,6 +315,11 @@ ${extra}volumes:
     // about none that it did not create.
     expect(fs.readFileSync(log.file, 'utf8')).not.toContain('was not created by Docker Compose');
     expect(exec(app.name, `cat ${app.folder}/init.sql`)).toBe(INIT_SQL);
+    // Unit 15: the token is in the tmpfs of the dev container (in memory), not in the volume; db has no such tmpfs.
+    expect(dev?.HostConfig.Tmpfs).toEqual({ [TOKEN_FOLDER]: TOKEN_TMPFS.slice(TOKEN_FOLDER.length + 1) });
+    expect(exec(app.name, `stat -f -c %T ${TOKEN_FOLDER}`)).toBe('tmpfs');
+    expect(exec(app.name, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+    expect(exec(app.name, `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('');
 
     // The db container: the labels of the environment, the port on 127.0.0.1 only, the data volume of the project.
     const db = dbContainer();
@@ -352,6 +360,7 @@ ${extra}volumes:
     // Only these paths of the volume: not the configuration folder with the token.
     expect(exec(db, 'ls /init')).toBe('init.sql\nseed');
     expect(exec(db, 'test -e /workspaces && echo yes || echo no')).toBe('no');
+    expect(exec(db, `test -e ${TOKEN_FOLDER} && echo yes || echo no`)).toBe('no');
 
     const entry = await registry.get(app.id);
     expect(entry?.buildRecord).toMatchObject({

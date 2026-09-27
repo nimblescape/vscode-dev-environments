@@ -23,6 +23,7 @@ import {
   LABEL_ENVIRONMENT_ID,
   LABEL_CONFIG_PATH,
   LABEL_HOST_ACCESS,
+  TOKEN_TMPFS,
   WORKSPACES_ROOT,
   containerHostname,
   isConfigPathLabelValue,
@@ -35,9 +36,12 @@ import {
   isLoopbackAddress,
   isOtherEnvironmentProjectName,
   isPathSource,
+  isSharedPropagation,
   MAX_STOP_TIMEOUT_SECONDS,
   parseMountString,
+  sharedPropagationItem,
   splitPortAddress,
+  tokenPropagationTarget,
   withLoopbackAddress,
 } from './hostAccess';
 import { MAX_ANALYSIS_JOB_CHARACTERS, MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES, MAX_COMPOSE_TOP_LEVEL_ENTRIES } from './analysisLimits';
@@ -587,7 +591,9 @@ function normalizedTarget(target: unknown): string | undefined {
  * - review round 14 (S14-1): in the dev service, any mount at or below CONFIG_FOLDER (configFolderTarget): refused as not
  *   supported (the token and the Git configuration of the extension are there, and its ownership fix walks the folder in
  *   full). The other services do not have the folder (they cannot mount the workspace volume), so their targets there
- *   stay allowed.
+ *   stay allowed;
+ * - review of unit 15: in the dev service, `bind.propagation` shared or rshared at `/` or a parent of the tmpfs of the
+ *   token (tokenPropagationTarget): refused whatever the switch says (it would bring the token to the computer).
  */
 export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): ComposeEntryDecision {
   if (!isRecord(entry)) return { action: 'refuse', kind: 'unsupported', item: `volume ${JSON.stringify(entry)}` };
@@ -600,6 +606,11 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
   // Review round 14 (S14-1): only the dev container has the folder (the other services cannot mount the workspace volume).
   const internal = ctx.isDev ? configFolderTarget(target) : undefined;
   if (internal !== undefined) return { action: 'refuse', kind: 'unsupported', item: configFolderMountItem(internal) };
+  // Review of unit 15: a shared propagation where the tmpfs of the token would reach the computer, whatever the switch
+  // says (tokenPropagationTarget).
+  const propagation = isRecord(entry.bind) && typeof entry.bind.propagation === 'string' ? entry.bind.propagation : undefined;
+  const shared = ctx.isDev && propagation !== undefined && isSharedPropagation(propagation) ? tokenPropagationTarget(target) : undefined;
+  if (shared !== undefined) return { action: 'refuse', kind: 'hostAccess', item: sharedPropagationItem(shared), guarded: true };
   if (type === 'tmpfs') {
     return atWorkspaces ? { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` } : { action: 'keep' };
   }
@@ -609,7 +620,7 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
     const name = ctx.volumeNames.get(source);
     if (name === undefined) return { action: 'refuse', kind: 'unsupported', item: `volume ${source} (not in the top-level volumes)` };
     if (name === ctx.ownVolume && !ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `volume ${name} (the workspace volume, which holds the GitHub token)`, guarded: true };
+      return { action: 'refuse', kind: 'hostAccess', item: `volume ${name} (the workspace volume, with the repository and the Git configuration of the environment)`, guarded: true };
     }
     return { action: 'keep' };
   }
@@ -629,7 +640,7 @@ export function decideServiceMount(entry: unknown, ctx: ComposeMountContext): Co
   if (atWorkspaces) return { action: 'refuse', kind: 'unsupported', item: `mount at ${WORKSPACES_ROOT}` };
   if (lexical === parent) {
     if (!ctx.isDev) {
-      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (the workspace volume, which holds the GitHub token)`, guarded: true };
+      return { action: 'refuse', kind: 'hostAccess', item: `bind mount ${describe} (the workspace volume, with the repository and the Git configuration of the environment)`, guarded: true };
     }
     const value: Record<string, unknown> = { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: entry.target };
     if (readOnly) value.read_only = true;
@@ -1054,8 +1065,8 @@ function finish(model: ComposeModel): ComposeModel {
  *   Compose builds them;
  * - the dev service: the environment image (`image`, no `build`, `pull_policy: never`), the name of the environment
  *   (`container_name`), the label devenv.container-version, the workspace volume at WORKSPACES_ROOT (the templates'
- *   bind mount there is dropped), and the host name of the repository (containerHostname) unless the service decides
- *   it (serviceDecidesHostname);
+ *   bind mount there is dropped), the host name of the repository (containerHostname) unless the service decides
+ *   it (serviceDecidesHostname), and (unit 15) the tmpfs of the token, TOKEN_TMPFS, added to its `tmpfs`;
  * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY) and the
  *   volumes of `mountVolumeSources`;
  * - the label devenv.host-access on every service: `checked`, or with the host access checks off (`hostAccessChecks`)
@@ -1078,6 +1089,9 @@ export function composeUpModel(
   // Without it, Docker names the host after the container ID, and the shell prompt shows that ID (as for a single
   // container, buildOverrideConfig). The other services keep theirs.
   if (!serviceDecidesHostname(dev)) dev.hostname = containerHostname(path.posix.basename(p.repositoryFolder));
+  // Unit 15: the tmpfs of the token (TOKEN_FOLDER), only in the dev container. The check refused every entry of the
+  // repository there (configFolderTarget), so this one is the only one.
+  dev.tmpfs = [...tmpfsEntries(dev.tmpfs), TOKEN_TMPFS];
   // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.
   // Review round 9 (D9-1): the paths of the repository that the other services mount (serviceRepositoryPath).
   return {
@@ -1086,6 +1100,12 @@ export function composeUpModel(
     ...(createFolders.length > 0 ? { createFolders } : {}),
     ...(serviceFolders.length > 0 ? { serviceFolders } : {}),
   };
+}
+
+/** The entries of `tmpfs` of a service of the model (a text, a list, or none). */
+function tmpfsEntries(value: unknown): unknown[] {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? [...value] : [value];
 }
 
 /**

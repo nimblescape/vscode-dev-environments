@@ -426,7 +426,7 @@ function volumesFromEntry(entry: unknown): { container: boolean; name: string } 
 
 /**
  * Review round 22 (H22-2): `volumes_from`. The volumes of another service of the model are allowed, except those of the
- * dev service (the workspace volume, which holds the GitHub token); a container (`container:…`, perhaps of another
+ * dev service (the workspace volume, with the repository and the Git configuration of the environment); a container (`container:…`, perhaps of another
  * environment) stays refused whatever the switch says. When the dev service takes the volumes of other services (also
  * through their own `volumes_from`), their mounts land in the dev container: the rules of its mounts apply to their
  * targets (not at WORKSPACES_ROOT, not in the internal folder with the token).
@@ -444,7 +444,7 @@ function volumesFromProblems(value: unknown, ctx: ServiceContext): Problem[] {
     } else if (!ctx.services.has(parsed.name) || parsed.name === ctx.name) {
       problems.push(unsupported(`volumes_from ${text} (not a service of the Docker Compose configuration)`));
     } else if (parsed.name === ctx.input.devService) {
-      problems.push(guarded(`volumes_from ${text} (the volumes of the dev container, with the workspace volume, which holds the GitHub token)`));
+      problems.push(guarded(`volumes_from ${text} (the volumes of the dev container, with the workspace volume)`));
     } else if (ctx.isDev) {
       for (const target of volumesFromTargets(parsed.name, services)) {
         const internal = configFolderTarget(target);

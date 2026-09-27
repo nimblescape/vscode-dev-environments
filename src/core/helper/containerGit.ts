@@ -3,7 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Container-only Git (concept section 9 "Git inside the container"): Git and Docker in a dev container use only the
-// configuration in the workspace volume (CONFIG_FOLDER) and the token of the owner account, never the configuration or
+// configuration in the workspace volume (CONFIG_FOLDER) and the token of the owner account (unit 15: in the memory of the
+// container, TOKEN_FOLDER, ./containerToken.ts), never the configuration or
 // the credentials that the Dev Containers extension forwards from the computer. The global Dev Containers settings stay
 // unchanged, so other dev containers of the user keep working. The forwarding is switched off per environment, only
 // through settings of the Dev Containers extension (devContainersSettings in ../devContainers.ts: the settings are
@@ -16,7 +17,8 @@ import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GH_CONFIG_FOLDER, GIT_CONFIG_FILE,
 
 /**
  * Git credential helper of the dev container (a shell snippet that Git runs with `sh`, see gitcredentials(7)). It
- * answers only `get` requests for https://github.com, with the token file of the owner account. It contains no `${`,
+ * answers only `get` requests for https://github.com, with the token file of the owner account (unit 15: in the tmpfs
+ * TOKEN_FOLDER; while the file is missing or cannot be read, it answers nothing). It contains no `${`,
  * because the Dev Container CLI and the Dev Containers extension substitute `${…}` in the override configuration.
  */
 export const CONTAINER_CREDENTIAL_HELPER =
@@ -73,8 +75,9 @@ function commandLineGitConfig(): Array<[key: string, value: string]> {
  * - DOCKER_CONFIG: the Docker CLI reads its configuration from the volume, not a credential store that the Dev
  *   Containers extension may write into ~/.docker/config.json.
  * - GIT_SSH_COMMAND: Git over SSH does not use the SSH agent (`IdentityAgent=none`, ssh_config(5)).
- * - GH_CONFIG_DIR: the GitHub CLI (gh) reads its configuration from the volume (GH_CONFIG_FOLDER), where GIT_FILES_SCRIPT
- *   signs it in with the account that owns the environment (its hosts.yml), not from ~/.config/gh of the image.
+ * - GH_CONFIG_DIR: the GitHub CLI (gh) reads its configuration from GH_CONFIG_FOLDER in the memory of the container
+ *   (unit 15: TOKEN_FOLDER), where TOKEN_WRITE_SCRIPT signs it in with the account that owns the environment (its
+ *   hosts.yml; config.yml is a link into the volume), not from ~/.config/gh of the image. The path is no secret.
  * The token is never an environment variable (no GH_TOKEN, no GITHUB_TOKEN).
  * Assumption (V-8): Git of the Source Control view and of the integrated terminal runs with these variables (the VS Code
  * server gets containerEnv and remoteEnv), so `git push` uses the credential helper of the container.

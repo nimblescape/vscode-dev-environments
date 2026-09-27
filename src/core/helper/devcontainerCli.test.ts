@@ -197,7 +197,21 @@ describe('buildOverrideConfig', () => {
       workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
       workspaceFolder: '/workspaces/api',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
-      runArgs: ['--label', 'devenv.container-version=4', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service=', '--name', 'devenv-acme-api-3f2a9c1e', '--hostname', 'api'],
+      // unit 15: changed expectation, the tmpfs of the token at the end.
+      runArgs: [
+        '--label',
+        'devenv.container-version=4',
+        '--label',
+        'com.docker.compose.project=',
+        '--label',
+        'com.docker.compose.service=',
+        '--name',
+        'devenv-acme-api-3f2a9c1e',
+        '--hostname',
+        'api',
+        '--tmpfs',
+        '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+      ],
       containerEnv: containerEnvironment(),
       remoteEnv: remoteEnvironment(),
       customizations: { vscode: { settings: devContainersSettings() } },
@@ -266,6 +280,7 @@ describe('buildOverrideConfig', () => {
       '-p',
       '127.0.0.1:8080:80',
       '--label',
+      // unit 15: changed expectation, the tmpfs of the token at the end.
       'devenv.container-version=4',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
@@ -274,6 +289,8 @@ describe('buildOverrideConfig', () => {
       'com.docker.compose.service=',
       '--name',
       'devenv-acme-api-3f2a9c1e',
+      '--tmpfs',
+      '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
     ]);
   });
 
@@ -300,6 +317,7 @@ describe('buildOverrideConfig', () => {
     expect(buildOverrideConfig({ ...base, runArgs: shifting }).runArgs).toEqual([
       ...shifting,
       '--label',
+      // unit 15: changed expectation, the tmpfs of the token at the end.
       'devenv.container-version=4',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
@@ -310,6 +328,8 @@ describe('buildOverrideConfig', () => {
       'devenv-acme-api-3f2a9c1e',
       '--hostname',
       'api',
+      '--tmpfs',
+      '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
     ]);
   });
 });

@@ -127,17 +127,38 @@ export const WORKSPACES_ROOT = '/workspaces';
 export const CONFIG_FOLDER = `${WORKSPACES_ROOT}/.devenv+`;
 /** The global Git configuration of the container (GIT_CONFIG_GLOBAL). */
 export const GIT_CONFIG_FILE = `${CONFIG_FOLDER}/gitconfig`;
-/** The token of the owner account, mode 0600, owned by the owner of the repository folder. */
-export const GITHUB_TOKEN_FILE = `${CONFIG_FOLDER}/github-token`;
+/**
+ * Unit 15: the folder of the token of the owner account in the dev container, a tmpfs (TOKEN_TMPFS) that the override
+ * configuration adds (single container: runArgs; Docker Compose: `tmpfs` of the dev service in the up model). It is in
+ * memory only: its files are gone when the container stops, and they are never in the workspace volume. The extension
+ * writes it after each start of an open (TOKEN_WRITE_SCRIPT), owned by the remote user, mode 0700. No configuration of a
+ * repository may mount anything at or below it (configFolderTarget).
+ */
+export const TOKEN_FOLDER = '/run/devenv';
+/**
+ * The `--tmpfs` value (and the entry of `tmpfs` of the dev service of Docker Compose) of TOKEN_FOLDER: 1 MiB, no programs,
+ * no devices, no set-user-ID, only root may enter until the extension gives the folder to the remote user.
+ */
+export const TOKEN_TMPFS = `${TOKEN_FOLDER}:rw,nosuid,nodev,noexec,size=1m,mode=0700`;
+/** The token of the owner account, mode 0600, owned by the remote user (unit 15: in TOKEN_FOLDER, not in the volume). */
+export const GITHUB_TOKEN_FILE = `${TOKEN_FOLDER}/github-token`;
 /** DOCKER_CONFIG of the container. */
 export const DOCKER_CONFIG_FOLDER = `${CONFIG_FOLDER}/docker`;
-/** GH_CONFIG_DIR of the container: the configuration folder of the GitHub CLI (gh). */
-export const GH_CONFIG_FOLDER = `${CONFIG_FOLDER}/gh`;
+/**
+ * GH_CONFIG_DIR of the container: the configuration folder of the GitHub CLI (gh), in TOKEN_FOLDER (unit 15), because gh
+ * reads its sign-in (hosts.yml) from this folder. Its other file, config.yml (no secret: gh writes the accounts and their
+ * tokens only to hosts.yml), is a link to GH_VOLUME_CONFIG_FILE, so the settings of the user survive a stop.
+ */
+export const GH_CONFIG_FOLDER = `${TOKEN_FOLDER}/gh`;
 /**
  * The sign-in of the GitHub CLI: the account that owns the environment, with the token of GITHUB_TOKEN_FILE, mode 0600.
- * Written again at each open (GIT_FILES_SCRIPT); the other files of GH_CONFIG_FOLDER belong to the user.
+ * Written again at each open (TOKEN_WRITE_SCRIPT).
  */
 export const GH_HOSTS_FILE = `${GH_CONFIG_FOLDER}/hosts.yml`;
+/** The folder of the GitHub CLI in the volume (unit 15: only for config.yml, the settings of gh without a secret). */
+export const GH_VOLUME_FOLDER = `${CONFIG_FOLDER}/gh`;
+/** gh's config.yml in the volume; GH_CONFIG_FOLDER/config.yml is a link to it. */
+export const GH_VOLUME_CONFIG_FILE = `${GH_VOLUME_FOLDER}/config.yml`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();

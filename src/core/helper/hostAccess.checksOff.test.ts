@@ -296,9 +296,11 @@ describe('the override configuration with the checks off', () => {
     const on = buildOverrideConfig({ ...common, appPort: [3000, '0.0.0.0:5000:5000'] as Array<number | string> });
     // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
     const cleared = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
-    expect(on.runArgs).toEqual(['-p', '127.0.0.1::80', '--label', CONTAINER_VERSION_LABEL, ...cleared, '--name', OWN, '--hostname', 'api']);
+    // unit 15: changed expectation, the tmpfs of the token at the end, with the checks off too.
+    const tmpfs = ['--tmpfs', '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700'];
+    expect(on.runArgs).toEqual(['-p', '127.0.0.1::80', '--label', CONTAINER_VERSION_LABEL, ...cleared, '--name', OWN, '--hostname', 'api', ...tmpfs]);
     const off = buildOverrideConfig({ ...common, appPort: [3000, '5000:5000'], hostAccessChecks: 'off' });
-    expect(off.runArgs).toEqual(['-p', '80', '--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL, ...cleared, '--name', OWN, '--hostname', 'api']);
+    expect(off.runArgs).toEqual(['-p', '80', '--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL, ...cleared, '--name', OWN, '--hostname', 'api', ...tmpfs]);
     expect(off.appPort).toEqual([3000, '5000:5000']);
     expect(buildOverrideConfig({ ...common, appPort: 3000, hostAccessChecks: 'off' }).appPort).toBe(3000);
     expect(buildOverrideConfig({ ...common, hostAccessChecks: 'off' })).not.toHaveProperty('appPort');

@@ -257,7 +257,6 @@ async function activateExtension(
     sessionFiles,
     disconnectRequests,
     docker,
-    helper,
     service,
     discovery,
     auth,

@@ -11,7 +11,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
-import type { WorkspaceHelper } from '../core/helper/workspaceHelper';
+import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
@@ -79,10 +79,7 @@ const HANDOFF_CHECK_MS = 30_000;
  * Connection" that its connection closed; a running extension host means that the user kept the connection.
  */
 const LEAVE_CHECK_MS = 10_000;
-/**
- * The helper run that removes the token of the owner account from the volume of an environment (not a build of the
- * helper image before it).
- */
+/** The `docker exec` that removes the token of the owner account from the memory of a running dev container. */
 const TOKEN_REMOVAL_TIMEOUT_MS = 30_000;
 /**
  * The reopen rule (concept 7.10) looks at the other windows. Windows that VS Code restores at the same start write their
@@ -108,8 +105,6 @@ export interface ControllerDeps {
   /** Requests of other windows to close this window's connection first (concept 6.2 Stop, 7.14). */
   disconnectRequests: DisconnectRequests;
   docker: ContainerAdapter;
-  /** The workspace helper, which removes the token of the owner account from the volume (concept 7.5). */
-  helper: Pick<WorkspaceHelper, 'removeGitToken'>;
   service: EnvironmentService;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
@@ -193,8 +188,6 @@ interface WindowEnvironment {
 interface LeftEnvironment {
   environmentId: string;
   containerName: string;
-  /** The workspace volume, which holds the token of the owner account. */
-  volumeName: string;
   repository: string;
   reason: 'account' | 'outdated';
 }
@@ -416,7 +409,6 @@ export class Controller implements vscode.Disposable {
           await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
             environmentId: environment.id,
             containerName,
-            volumeName: environment.volumeName,
             repository,
             reason: 'outdated',
           });
@@ -1002,7 +994,6 @@ export class Controller implements vscode.Disposable {
             await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
               environmentId: environment.id,
               containerName,
-              volumeName: environment.volumeName,
               repository,
               reason: 'outdated',
             });
@@ -1614,7 +1605,6 @@ export class Controller implements vscode.Disposable {
       await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
         environmentId: environment.id,
         containerName,
-        volumeName: environment.volumeName,
         repository,
         reason: 'outdated',
       });
@@ -1751,25 +1741,30 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Concept 7.5: the token of the owner account leaves the environment that the signed-in account may not use, so that
-   * Git and the GitHub CLI there cannot work as the owner while a window keeps its connection. The workspace helper
-   * removes the token file and the sign-in of the GitHub CLI from the volume (REMOVE_GIT_TOKEN_SCRIPT): it needs no tool
-   * of the image of the dev container, no rights in it (a configuration may take them away, for example `--cap-drop
-   * ALL`), and works also when the container is stopped (its volume still holds the token). The credential helper of the
-   * container then gives nothing; the next open of the owner writes the token again (section 9). Best effort: the result
-   * is logged. A missing volume holds no token (and the helper would create an empty one).
+   * Git and the GitHub CLI there cannot work as the owner while a window keeps its connection. Unit 15: the token is only
+   * in the memory of the dev container, so it is removed from there when the container runs (removeContainerToken:
+   * TOKEN_REMOVE_SCRIPT with `docker exec`, as root, or as the remote user of the entry when root may not); a stopped
+   * container holds no token. The credential helper of the container then gives nothing; the next open of the owner
+   * writes the token again (section 9). Best effort: the result is logged.
    */
   private async removeGitToken(left: LeftEnvironment): Promise<void> {
-    const { containerName, volumeName } = left;
+    const { containerName } = left;
     if (!this.deps.docker.isInstalled()) return;
     try {
-      if (!(await this.deps.docker.volumeExists(volumeName))) {
-        this.logger.info(`The volume ${volumeName} of the container ${containerName} does not exist: it holds no GitHub token.`);
+      const container = await this.deps.docker.findContainer(left.environmentId, containerName);
+      if (container?.state !== 'running') {
+        this.logger.info(`The container ${containerName} does not run: its memory holds no GitHub token.`);
         return;
       }
-      await this.deps.helper.removeGitToken({ volumeName, timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS });
-      this.logger.info(`The GitHub token was removed from the volume ${volumeName} of the container ${containerName}.`);
+      const entry = await this.deps.registry.get(left.environmentId).catch(() => undefined);
+      await removeContainerToken((c, command, options) => this.deps.docker.exec(c, command, options), {
+        container: container.id,
+        user: entry?.remoteUser,
+        timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS,
+      });
+      this.logger.info(`The GitHub token was removed from the container ${containerName}.`);
     } catch (error) {
-      this.logger.warn(`The GitHub token could not be removed from the volume ${volumeName} of the container ${containerName}: ${errorMessage(error)}`);
+      this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${errorMessage(error)}`);
     }
   }
 
@@ -1799,7 +1794,7 @@ export class Controller implements vscode.Disposable {
       this.logger.info('This window is attached to an environment of another GitHub account. It closes its remote connection.');
       message = Messages.otherAccountConnection(repository);
     }
-    await this.leaveEnvironment(message, { environmentId: environment.id, containerName, volumeName: environment.volumeName, repository, reason: 'account' });
+    await this.leaveEnvironment(message, { environmentId: environment.id, containerName, repository, reason: 'account' });
     return undefined;
   }
 
@@ -1829,7 +1824,6 @@ export class Controller implements vscode.Disposable {
       {
         environmentId: environment.id,
         containerName: current.containerName,
-        volumeName: environment.volumeName,
         repository,
         reason: 'account',
       },

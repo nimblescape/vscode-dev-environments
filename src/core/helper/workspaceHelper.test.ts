@@ -23,7 +23,6 @@ import {
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   READ_FILES_SCRIPT,
-  REMOVE_GIT_TOKEN_SCRIPT,
   SWITCH_BRANCH_SCRIPT,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
@@ -693,79 +692,41 @@ describe('WorkspaceHelper.switchBranch', () => {
 describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the container")', () => {
   const identity = { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' };
 
-  it('passes the token only on stdin, without the Docker socket and without network', async () => {
-    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login: 'scalarion' });
+  // unit 15: prepareGit gets no token any more (the token goes into the memory of the dev container after its start,
+  // writeContainerToken, tested in containerToken.test.ts): no stdin, no tmpfs, and no login argument.
+  it('runs without the token, without the Docker socket, and without network', async () => {
+    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', identity });
     const run = docker.runs[0];
-    expect(run.options.input).toBe(TOKEN);
-    expect(run.args.some((arg) => arg.includes(TOKEN))).toBe(false);
-    expect(run.args).toContain('--tmpfs');
+    expect(run.options.input).toBeUndefined();
+    expect(run.args).not.toContain('--tmpfs');
     expect(run.args).not.toContain('-e');
     expect(run.args).not.toContain(`type=bind,source=${DOCKER_SOCKET},target=${DOCKER_SOCKET}`);
     expect(run.args.join(' ')).not.toContain('devenv-helper-cache');
     expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
-    expect(commandOf(run.args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER, 'scalarion']);
-    expect(logger.lines.join('\n')).not.toContain(TOKEN);
+    expect(commandOf(run.args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
   });
 
-  it('throws a CommandError without the token when the script fails', async () => {
-    docker.handler = () => ({ exitCode: 4, stdout: `echo ${TOKEN}\n`, stderr: `The folder /workspaces/api does not exist. ${TOKEN}\n` });
+  it('throws a CommandError when the script fails', async () => {
+    docker.handler = () => ({ exitCode: 4, stdout: '', stderr: 'The folder /workspaces/api does not exist.\n' });
     const output: string[] = [];
     const error = await createHelper()
-      .prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login: 'scalarion', onOutput: (text) => output.push(text) })
+      .prepareGit({ volumeName: 'vol', repository: 'acme/api', identity, onOutput: (text) => output.push(text) })
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(CommandError);
-    expect((error as CommandError).message).not.toContain(TOKEN);
-    expect((error as CommandError).stdout + (error as CommandError).stderr).not.toContain(TOKEN);
-    expect(output.join('')).not.toContain(TOKEN);
+    expect((error as CommandError).stderr).toContain('The folder /workspaces/api does not exist.');
   });
 
-  it('refuses an empty token before any Docker call', async () => {
-    await expect(
-      createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: '', identity, login: 'scalarion' }),
-    ).rejects.toMatchObject({ code: 'signInRequired' });
+  // unit 15: was "refuses an empty token before any Docker call"; without a token, an invalid repository name is what
+  // stops it before any Docker call.
+  it('refuses an invalid repository name before any Docker call', async () => {
+    await expect(createHelper().prepareGit({ volumeName: 'vol', repository: 'acme', identity })).rejects.toThrow();
     expect(docker.calls).toHaveLength(0);
-  });
-
-  it('runs the helper with the login of an Enterprise Managed User (with an underscore)', async () => {
-    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login: 'dev_acme' });
-    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER, 'dev_acme']);
-  });
-
-  // Deliberate change of review round 1 of unit 5: an invalid login was refused before any Docker call, which left the
-  // container without the token and the Git configuration. Now the helper runs without the login: Git works, and the
-  // invalid value never reaches hosts.yml (GIT_FILES_SCRIPT signs the GitHub CLI in nowhere without a login).
-  it.each(['', '-octo', '_x', 'octo cat', 'octo"', 'a: b'])('runs the helper without the invalid GitHub login %j', async (login) => {
-    await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, identity, login });
-    expect(docker.runs).toHaveLength(1);
-    expect(docker.runs[0].options.input).toBe(TOKEN);
-    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER, '']);
-    expect(logger.lines.join('\n')).toContain('the GitHub CLI in the container is not signed in');
   });
 });
 
-describe('WorkspaceHelper.removeGitToken (concept 7.5)', () => {
-  it('removes the token from the volume without a token, the Docker socket, network, or a variable', async () => {
-    await createHelper().removeGitToken({ volumeName: 'vol', timeoutMs: 30_000 });
-    expect(docker.runs).toHaveLength(1);
-    const run = docker.runs[0];
-    expect(commandOf(run.args)).toEqual(['sh', '-c', REMOVE_GIT_TOKEN_SCRIPT, 'sh']);
-    expect(run.args.join(' ')).toContain('source=vol,target=/workspaces');
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
-    expect(run.args).not.toContain('--tmpfs');
-    expect(run.args).not.toContain('-e');
-    expect(run.options.input).toBeUndefined();
-  });
-
-  it('throws a CommandError when a file is still there', async () => {
-    docker.handler = () => ({ exitCode: 1, stderr: '/workspaces/.devenv+/github-token could not be removed.\n' });
-    const error = await createHelper()
-      .removeGitToken({ volumeName: 'vol' })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(CommandError);
-    expect((error as CommandError).message).toContain('github-token could not be removed');
-  });
-
+// Greenfield (user decision 2026-09-27): removeGitToken, which ran this test, is gone; the time limit of a helper run
+// stays (fixConfigOwnership).
+describe('WorkspaceHelper helper run with a time limit', () => {
   it('ends the helper run after the time limit and removes its container', async () => {
     let started!: () => void;
     const running = new Promise<void>((resolve) => (started = resolve));
@@ -776,7 +737,7 @@ describe('WorkspaceHelper.removeGitToken (concept 7.5)', () => {
     };
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
-      const result = createHelper().removeGitToken({ volumeName: 'vol', timeoutMs: 30_000 });
+      const result = createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 30_000 });
       const caught = result.catch((e: unknown) => e);
       await running;
       await vi.advanceTimersByTimeAsync(30_000);
