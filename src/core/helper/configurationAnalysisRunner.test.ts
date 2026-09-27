@@ -272,11 +272,13 @@ describe('WorkerConfigurationAnalyzer', () => {
     const worker = new WorkerConfigurationAnalyzer(bundle, logger, ANALYSIS_LIMITS, 1000);
     const job: AnalysisJob = singleJob(`FROM alpine\n# ${'a'.repeat(2000)}\n`);
     const result = await worker.analyze(job);
-    expect(result.failure).toEqual({ kind: 'limit', reason: 'the configuration is larger than 0 million characters' });
+    // Review round 10, P10-3: a size limit (deterministic), no longer `limit` (time or memory of the worker).
+    expect(result.failure).toEqual({ kind: 'size', reason: 'the configuration is larger than 0 million characters' });
     expect(result.report).toEqual(REFUSED);
     // Many small values count too.
     const many: AnalysisJob = { kind: 'hostAccess', checksOn: true, input: { config: { runArgs: Array.from({ length: 200 }, () => '') }, ownVolume: OWN } };
-    expect((await worker.analyze(many)).failure?.kind).toBe('limit');
+    // Review round 10, P10-3.
+    expect((await worker.analyze(many)).failure?.kind).toBe('size');
     // Within the budget: the worker runs it.
     expect((await new WorkerConfigurationAnalyzer(bundle, logger).analyze(job)).failure).toBeUndefined();
   });

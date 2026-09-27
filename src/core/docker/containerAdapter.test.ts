@@ -695,14 +695,63 @@ describe('images', () => {
       return found.length === refs.length ? ok(stdout) : { exitCode: 1, stdout, stderr: 'Error response from daemon: No such image: gone', timedOut: false };
     });
     const references = Array.from({ length: 150 }, (_, i) => (i === 3 ? 'gone:1' : `r${i}:1`));
-    const found = await docker.inspectImageNames(references);
+    // Review round 10, P10-1: the result names the found images and the references that could not be checked.
+    const { images: found, unchecked } = await docker.inspectImageNames(references);
     expect(runner.calls).toHaveLength(2);
     expect(runner.calls[0].args.slice(0, 5)).toEqual(['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--']);
     expect(runner.calls[0].args).toHaveLength(105);
     expect(found).toHaveLength(149);
+    expect(unchecked).toEqual([]);
     expect(found[0]).toEqual({ id: 'sha256:4', repoTags: ['r0:1'], repoDigests: [] });
-    await expect(docker.inspectImageNames(['broken'])).rejects.toBeInstanceOf(CommandError);
-    expect(await docker.inspectImageNames([])).toEqual([]);
+    // Review round 10, P10-1: before, it threw for the whole batch; now the reference that Docker cannot inspect is named.
+    expect(await docker.inspectImageNames(['broken'])).toEqual({ images: [], unchecked: ['broken'] });
+    expect(await docker.inspectImageNames([])).toEqual({ images: [], unchecked: [] });
+  });
+
+  describe('review round 10 (P10-1): one reference that Docker cannot inspect does not leave the others of its batch unchecked', () => {
+    const ID = `sha256:3f2a1b9c${'0'.repeat(56)}`;
+    // As Docker 27: every reference is inspected; a missing one gives "No such image", an invalid one "invalid reference
+    // format"; exit code 1 when any failed; the found ones on stdout.
+    function daemon(call: { args: string[] }): RunResult {
+      const refs = call.args.slice(call.args.indexOf('--') + 1);
+      const lines: string[] = [];
+      const errors: string[] = [];
+      for (const ref of refs) {
+        if (ref === '3f2a1b9c') lines.push(JSON.stringify({ id: ID, repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] }));
+        else if (ref === 'postgres:16') lines.push(JSON.stringify({ id: `sha256:${'1'.repeat(64)}`, repoTags: ['postgres:16'], repoDigests: [] }));
+        else if (ref === 'foo/Bar') errors.push(`Error response from daemon: invalid reference format: repository name (library/foo/Bar) must be lowercase`);
+        else errors.push(`Error response from daemon: No such image: ${ref}`);
+      }
+      const stdout = lines.map((line) => `${line}\n`).join('');
+      return errors.length === 0 ? ok(stdout) : { exitCode: 1, stdout, stderr: `${errors.join('\n')}\n`, timedOut: false };
+    }
+
+    it('inspects the references of a batch one by one when Docker fails for another reason than a missing image', async () => {
+      const { docker, runner } = adapter(daemon);
+      const result = await docker.inspectImageNames(['foo/Bar', '3f2a1b9c', 'postgres:16']);
+      // Before: a CommandError for the batch, and the pipeline checked none of them.
+      expect(result.unchecked).toEqual(['foo/Bar']);
+      expect(result.images.map((image) => image.id)).toEqual([ID, `sha256:${'1'.repeat(64)}`]);
+      expect(runner.calls).toHaveLength(4);
+    });
+
+    it('does not take a batch with a missing and an invalid reference for missing images only', async () => {
+      const { docker, runner } = adapter(daemon);
+      const result = await docker.inspectImageNames(['gone:1', 'foo/Bar', '3f2a1b9c']);
+      // Before: "No such image" anywhere in stderr counted as missing, and foo/Bar was left unchecked without a word.
+      expect(result.unchecked).toEqual(['foo/Bar']);
+      expect(result.images.map((image) => image.id)).toEqual([ID]);
+      expect(runner.calls).toHaveLength(4);
+    });
+
+    it('still asks with one call when Docker only misses images, and names all references of a batch that timed out', async () => {
+      const { docker, runner } = adapter(daemon);
+      expect((await docker.inspectImageNames(['gone:1', 'postgres:16'])).unchecked).toEqual([]);
+      expect(runner.calls).toHaveLength(1);
+      const slow = adapter(() => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }));
+      expect(await slow.docker.inspectImageNames(['a:1', 'b:1'])).toEqual({ images: [], unchecked: ['a:1', 'b:1'] });
+      expect(slow.runner.calls).toHaveLength(1);
+    });
   });
 
   it('imageId returns the ID, undefined for a missing image, and throws for other errors', async () => {

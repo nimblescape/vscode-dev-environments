@@ -16,8 +16,21 @@ export const MAX_COMPOSE_SERVICES = 500;
 /** The most mounts (`volumes` entries) of all services of a Docker Compose model together. */
 export const MAX_COMPOSE_MOUNTS = 5000;
 
+/**
+ * Review round 10 (S10-1): the most entries of each keyed top-level map of a Docker Compose model (`volumes`,
+ * `networks`, `configs`, `secrets`).
+ */
+export const MAX_COMPOSE_TOP_LEVEL_ENTRIES = 5000;
+
 /** The most output (bytes) of a program that the extension keeps (NodeProcessRunner). */
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Review round 10 (S10-5): the most characters of the standard error output of a program that the extension keeps
+ * (NodeProcessRunner): the end of it, for error texts and the checks for a missing object. All of it still streams to
+ * `onStderr`.
+ */
+export const MAX_CAPTURED_STDERR_CHARACTERS = 1024 * 1024;
 
 /**
  * The most characters of the texts of one analysis job (AnalysisJob) that are passed to its worker: the structured clone

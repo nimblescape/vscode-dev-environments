@@ -1065,6 +1065,27 @@ describe('Delete', () => {
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
+  it('names every folder that the containers of the services may mount in the confirmation of Delete (review round 10, D10-1)', async () => {
+    const record = {
+      builtAt: iso(NOW),
+      environmentImage: 'devenv-3f2a9c1e:1',
+      buildNumber: 1,
+      configPath: '.devcontainer/devcontainer.json',
+      configHash: 'sha256:x',
+      images: {},
+      features: {},
+      compose: { service: 'app', images: [], serviceFolders: ['/workspaces/api/data/postgres'] },
+    };
+    const env = environment({ buildRecord: record, serviceFolders: ['/workspaces/api/pgdata', '/workspaces/api/data/postgres'] });
+    await h.registry.add(env);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', env));
+    // Before: only the list of the build record.
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
+      `${Messages.deleteConfirm('acme/api')} ${Messages.deleteRepositoryServiceData('./pgdata, ./data/postgres')}`,
+    );
+  });
+
   it('names the service data in folders of the repository in the confirmation (review round 9, D9-2)', async () => {
     const record = {
       builtAt: iso(NOW),

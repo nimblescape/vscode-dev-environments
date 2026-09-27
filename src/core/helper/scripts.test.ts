@@ -784,13 +784,59 @@ describe('SWITCH_BRANCH_SCRIPT with fake tools', () => {
     });
     expect(result.status).toBe(0);
     // Before: `find <repo> -xdev \( … \) -exec chown …`, over the data of the services.
-    expect(result.log).toContain(`find ${repoFolder} -xdev -path ${repoFolder}/data/postgres -prune -o -path ${repoFolder}/-data/my db -prune -o ( ! -uid 1000`);
+    // Review round 10, D10-3: in these paths the files of root get the owner too (before: `-path P -prune -o` for each).
+    const inPaths = `-path ${repoFolder}/data/postgres -o -path ${repoFolder}/data/postgres/* -o -path ${repoFolder}/-data/my db -o -path ${repoFolder}/-data/my db/*`;
+    expect(result.log).toContain(`find ${repoFolder} -xdev ( ( ${inPaths} ) -user 0 -o ! ( ${inPaths} ) ( ! -user 1000 -o ! -group 1000 ) ) -exec chown -h 1000:1000`);
     expect(switchBranchCommand('/workspaces/api', 'dev', 'acme/api', ['/workspaces/api/data/postgres']).slice(4)).toEqual([
       '/workspaces/api',
       'dev',
       'acme/api',
       '/workspaces/api/data/postgres',
     ]);
+  });
+
+  it.skipIf(process.getuid?.() !== 0)('gives the files that git switch rewrote as root in the paths of a service their owner, and leaves its data alone (review round 10, D10-3)', () => {
+    // With the real find and chown (as root): the fake git switch writes as root, as in the workspace helper.
+    const dir = tempDir();
+    const bin = path.join(dir, 'bin');
+    const secrets = path.join(dir, 'secrets');
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(secrets);
+    for (const folder of ['frontend/src', 'data', 'nginx']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'data/PG_VERSION'), '16');
+    fs.chownSync(repo, 1000, 1000);
+    fs.chownSync(path.join(repo, 'data'), 999, 999);
+    fs.chownSync(path.join(repo, 'data/PG_VERSION'), 999, 999);
+    const tool = (name: string, body: string) => {
+      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(bin, name), 0o755);
+    };
+    tool('awk', 'exit 0');
+    tool('stat', 'echo 1000:1000');
+    tool(
+      'git',
+      [
+        'while [ "$1" = -c ]; do shift 2; done',
+        'case "$1" in',
+        `  switch) mkdir -p '${repo}/frontend/src/new'; echo b > '${repo}/frontend/src/new/b.ts'; echo a > '${repo}/frontend/src/app.ts'; echo c > '${repo}/nginx/default.conf'; echo t > '${repo}/data/tracked.conf' ;;`,
+        'esac',
+      ].join('\n'),
+    );
+    const script = SWITCH_BRANCH_SCRIPT.split(SECRETS_FOLDER).join(secrets);
+    const folders = [`${repo}/frontend`, `${repo}/data`, `${repo}/nginx`];
+    const result = spawnSync('sh', ['-c', script, ...switchBranchCommand(repo, 'dev', 'acme/api', folders).slice(3)], {
+      encoding: 'utf8',
+      input: 'gho_secret',
+      env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Before: root kept them (the paths of the services were pruned with their content).
+    for (const file of ['frontend', 'frontend/src', 'frontend/src/app.ts', 'frontend/src/new', 'frontend/src/new/b.ts', 'nginx/default.conf', 'data/tracked.conf']) {
+      expect(fs.lstatSync(path.join(repo, file)).uid, file).toBe(1000);
+    }
+    expect(fs.lstatSync(path.join(repo, 'data')).uid).toBe(999);
+    expect(fs.lstatSync(path.join(repo, 'data/PG_VERSION')).uid).toBe(999);
   });
 
   it('restores the owner and does not switch when the fetch fails', () => {
@@ -1361,6 +1407,34 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
       // A link out of the repository: its real path (the check refuses it).
       [`${repo}/out/x`]: fs.realpathSync(path.join(dir, 'out')),
     });
+  });
+
+  it('COMPOSE_MODEL_SCRIPT prints where each folder to create lands after the links of its nearest folder (review round 10, D10-2)', () => {
+    const dir = tempDir();
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(path.join(repo, '.local'), { recursive: true });
+    fs.symlinkSync('.local', path.join(repo, 'data'));
+    fs.mkdirSync(path.join(repo, 'plain'));
+    const bind = (source: string) => ({ type: 'bind', source, target: `/t${source.length}` });
+    const model = { name: 'devenv-3f2a9c1e', services: { db: { image: 'postgres:16', volumes: [bind(`${repo}/data/pg/16`), bind(`${repo}/plain/x/`), bind(`${repo}/data`)] } } };
+    const bin = path.join(dir, 'bin');
+    write(path.join(bin, 'docker'), '#!/bin/sh\nshift\nif [ "$1 $2" = "version --short" ]; then echo 2.29.1; exit 0; fi\ncase "$*" in *"-p devenv-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;; esac\nprintf \'%s\\n\' "$FAKE_MODEL"\n');
+    fs.chmodSync(path.join(bin, 'docker'), 0o755);
+    const env = {
+      ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$$b' } } } }),
+      FAKE_MODEL: JSON.stringify(model),
+    };
+    const result = spawnSync(process.execPath, composeModelCommand(repo, [path.join(repo, 'compose.yml')]).slice(1), { encoding: 'utf8', env });
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim()) as { mountCreateTargets: Record<string, string>; realPaths: Record<string, string | null> };
+    const real = fs.realpathSync(repo);
+    expect(output.mountCreateTargets).toEqual({ [`${repo}/data/pg/16`]: `${real}/.local/pg/16`, [`${repo}/plain/x/`]: `${real}/plain/x` });
+    expect(output.realPaths[`${repo}/data`]).toBe(`${real}/.local`);
+    // CREATE_FOLDERS_SCRIPT creates it there.
+    expect(runNode(createFoldersCommand(repo, [`${repo}/data/pg/16`])).status).toBe(0);
+    expect(fs.realpathSync(path.join(repo, 'data/pg/16'))).toBe(`${real}/.local/pg/16`);
   });
 
   it('CREATE_FOLDERS_SCRIPT creates the missing folders in the repository, and nothing through a link out of it', () => {

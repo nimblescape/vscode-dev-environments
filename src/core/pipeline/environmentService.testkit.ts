@@ -294,14 +294,18 @@ export class FakeDocker implements EnvironmentDocker {
    * imageRepoNames does not name has the reference as its tag (or digest); its ID is imageIds, a hexadecimal reference
    * padded to an ID, or `sha256:image-of-<reference>`.
    */
-  async inspectImageNames(references: readonly string[]): Promise<Array<{ id: string; repoTags: string[]; repoDigests: string[] }>> {
+  /** Review round 10 (P10-1): references that Docker cannot inspect (for example "invalid reference format"). */
+  readonly uninspectableImages = new Set<string>();
+
+  async inspectImageNames(references: readonly string[]): Promise<{ images: Array<{ id: string; repoTags: string[]; repoDigests: string[] }>; unchecked: string[] }> {
     this.imageInspections.push([...references]);
-    return references
-      .filter((reference) => this.images.has(reference))
+    const images = references
+      .filter((reference) => this.images.has(reference) && !this.uninspectableImages.has(reference))
       .map((reference) => ({
         id: this.imageIds.get(reference) ?? (/^[0-9a-f]+$/.test(reference) ? `sha256:${reference.padEnd(64, '0')}` : `sha256:image-of-${reference}`),
         ...(this.imageRepoNames.get(reference) ?? (reference.includes('@') ? { repoTags: [], repoDigests: [reference] } : { repoTags: [reference], repoDigests: [] })),
       }));
+    return { images, unchecked: references.filter((reference) => this.uninspectableImages.has(reference)) };
   }
 
   async imageExists(reference: string): Promise<boolean> {

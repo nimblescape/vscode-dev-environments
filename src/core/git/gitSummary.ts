@@ -48,14 +48,39 @@ printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "
 
 /**
  * Review round 9 (D9-1): shell text that turns the positional parameters (the patterns of servicePrunePatterns) into
- * the arguments `-path <pattern> -prune -o` of `find`, each pattern one argument (never shell text). After it, `"$@"`
- * holds these arguments only. The `for` list is expanded once, before `set --` changes the parameters.
+ * arguments of `find`, each pattern one argument (never shell text). Review round 10 (D10-3): the test "in a path of a
+ * service", `-path <pattern> -o -path <pattern>/* -o …` (without parentheses; empty without patterns), in place of
+ * `-path <pattern> -prune -o`: the ownership fixes still go into these paths, for the files of root (SERVICE_OWNER_FIX).
+ * After it, `"$@"` holds these arguments only. The `for` list is expanded once, before `set --` changes the parameters.
  */
-export const PRUNE_ARGUMENTS = `count=$#
+export const SERVICE_PATH_ARGUMENTS = `count=$#
 for pattern do
-  set -- "$@" -path "$pattern" -prune -o
+  if [ "$#" -gt "$count" ]; then set -- "$@" -o; fi
+  set -- "$@" -path "$pattern" -o -path "$pattern/*"
 done
 shift "$count"
+`;
+
+/**
+ * Review round 10 (D10-3): the shell function `service_owner_fix <folder> <uid> <gid> <owner>` of the ownership fixes,
+ * after SERVICE_PATH_ARGUMENTS: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each
+ * file that does not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount
+ * (`"$@"`); in those, only to the files and folders of root (uid 0): the workspace helper writes as root (a clone, the
+ * `git switch` of Switch branch…), while the data of a service (for example of Postgres, uid 999) keeps its owner. A
+ * service that runs as root keeps its access to files of another owner (unless its capabilities are dropped).
+ */
+export const SERVICE_OWNER_FIX = `service_owner_fix() {
+  folder="$1"
+  fix_uid="$2"
+  fix_gid="$3"
+  fix_owner="$4"
+  shift 4
+  if [ "$#" -gt 0 ]; then
+    find "$folder" -xdev \\( \\( "$@" \\) -user 0 -o ! \\( "$@" \\) \\( ! -user "$fix_uid" -o ! -group "$fix_gid" \\) \\) -exec chown -h "$fix_owner" {} +
+  else
+    find "$folder" -xdev \\( ! -user "$fix_uid" -o ! -group "$fix_gid" \\) -exec chown -h "$fix_owner" {} +
+  fi
+}
 `;
 
 /**
@@ -63,14 +88,15 @@ shift "$count"
  * Compose mount (ComposeBuildRecord.serviceFolders), which the ownership fixes leave out with their content: a service
  * such as a database gives its data files its own owner, and would not start with others. Only absolute paths below
  * `repoFolder` (never the folder itself, which would leave out everything); the characters that `-path` reads as a
- * pattern (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path.
+ * pattern (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path. Review round 10 (D10-3): never
+ * `.git` or a path in it (also of a record written before), where Git writes as root.
  */
 export function servicePrunePatterns(repoFolder: string, folders: readonly string[] | undefined): string[] {
   const patterns = new Set<string>();
   for (const folder of folders ?? []) {
     if (typeof folder !== 'string' || folder.includes('\0') || !folder.startsWith(`${repoFolder}/`)) continue;
     const segments = folder.slice(repoFolder.length + 1).split('/');
-    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) continue;
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' || segment === '.git')) continue;
     patterns.add(folder.replace(/[\\*?[]/g, '\\$&'));
   }
   return [...patterns];
@@ -80,14 +106,15 @@ export function servicePrunePatterns(repoFolder: string, folders: readonly strin
  * Changes the owner of every file in `$1` that does not belong to the user `$2` (and its primary group) to that user.
  * `chown -h` changes a symbolic link itself, never its target, and `-xdev` stays out of other mounts, so that no file
  * outside of the workspace volume changes. Review round 9 (D9-1): the paths of the patterns `$3`… (servicePrunePatterns)
- * and their content are left out. Works with GNU and BusyBox tools.
+ * and their content are left out; review round 10 (D10-3): except their files and folders of root (SERVICE_OWNER_FIX).
+ * Works with GNU and BusyBox tools.
  */
 export const OWNERSHIP_FIX_SCRIPT = `set -eu
 dir="$1"
 uid=$(id -u "$2")
 gid=$(id -g "$2")
 shift 2
-${PRUNE_ARGUMENTS}find "$dir" -xdev "$@" \\( ! -user "$uid" -o ! -group "$gid" \\) -exec chown -h "$uid:$gid" {} +
+${SERVICE_OWNER_FIX}${SERVICE_PATH_ARGUMENTS}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
 
 /**

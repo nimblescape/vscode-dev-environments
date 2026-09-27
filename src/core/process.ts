@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { spawn } from 'child_process';
-import { MAX_CAPTURED_OUTPUT_BYTES } from './helper/analysisLimits';
+import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
 import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
 
 /**
@@ -20,10 +20,16 @@ export class OutputTooLargeError extends Error {
 
 /**
  * ProcessRunner with `child_process.spawn`, without a shell. Review round 9 (S9-2): at most `maxStdoutBytes` of
- * standard output are kept; beyond, the program is stopped and `run` rejects with OutputTooLargeError.
+ * standard output are kept; beyond, the program is stopped and `run` rejects with OutputTooLargeError. Review round 10
+ * (S10-5): of the standard error output, only the last `maxStderrCharacters` characters are kept (the program goes on;
+ * `onStderr` still gets all of it), so that an endless log (for example of a lifecycle command of `devcontainer up`,
+ * which has no time limit) cannot fill the memory of the extension host.
  */
 export class NodeProcessRunner implements ProcessRunner {
-  constructor(private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES) {}
+  constructor(
+    private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
+    private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
+  ) {}
 
   run(file: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     return new Promise((resolve, reject) => {
@@ -59,6 +65,8 @@ export class NodeProcessRunner implements ProcessRunner {
       const onStderr = (text: string) => {
         if (text === '') return;
         stderr += text;
+        // Cut to the limit only once it is twice as long: linear time, however small the chunks are.
+        if (stderr.length > 2 * this.maxStderrCharacters) stderr = stderr.slice(-this.maxStderrCharacters);
         options.onStderr?.(text);
       };
       child.stdout.on('data', (chunk: Buffer) => {
@@ -113,6 +121,7 @@ export class NodeProcessRunner implements ProcessRunner {
         // The rest of an incomplete character at the end of the output.
         onStdout(stdoutDecoder.decode());
         onStderr(stderrDecoder.decode());
+        if (stderr.length > this.maxStderrCharacters) stderr = stderr.slice(-this.maxStderrCharacters);
         resolve({ exitCode: code, stdout, stderr, timedOut });
       });
 

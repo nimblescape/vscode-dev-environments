@@ -13,7 +13,7 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // The only copies in the volume are the token file of the dev container and the sign-in of the GitHub CLI there
 // (GIT_FILES_SCRIPT, both mode 0600); REMOVE_GIT_TOKEN_SCRIPT removes both.
-import { GIT_SUMMARY_SCRIPT, PRUNE_ARGUMENTS, servicePrunePatterns } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, SERVICE_PATH_ARGUMENTS, servicePrunePatterns } from '../git/gitSummary';
 import { CONFIG_FOLDER, GH_CONFIG_FOLDER, GH_HOSTS_FILE, GITHUB_TOKEN_FILE, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
@@ -147,7 +147,8 @@ echo "The repository is in $target."
 /**
  * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find
  * -path` patterns of the paths that the other services of Docker Compose mount (servicePrunePatterns), which the
- * restore of the owner leaves out with their content. Token on stdin.
+ * restore of the owner leaves out with their content, except (review round 10, D10-3) their files and folders of root,
+ * which `git switch` wrote (SERVICE_OWNER_FIX). Token on stdin.
  * Fetches the branches of https://github.com/<owner>/<repository>.git into refs/remotes/origin (the same result as
  * `git fetch origin`, but independent of the remote in .git/config), removes the token, runs `git switch <branch>`
  * (a remote branch gets a local tracking branch), and gives files that the helper created as root the owner of the
@@ -160,7 +161,7 @@ dir="$1"
 branch="$2"
 repo="$3"
 shift 3
-${PRUNE_ARGUMENTS}check_repository "$repo"
+${SERVICE_OWNER_FIX}${SERVICE_PATH_ARGUMENTS}check_repository "$repo"
 check_branch "$branch"
 if [ -z "$branch" ]; then
   fail 2 'No branch name.'
@@ -175,7 +176,7 @@ if [ "$status" -eq 0 ]; then
   if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
   out=$(git_local switch "$branch" 2>&1) || status=$?
 fi
-if ! find "$dir" -xdev "$@" \\( ! -uid "\${owner%%:*}" -o ! -gid "\${owner#*:}" \\) -exec chown -h "$owner" {} +; then
+if ! service_owner_fix "$dir" "\${owner%%:*}" "\${owner#*:}" "$owner" "$@"; then
   echo 'The owner of some files could not be restored.'
 fi
 if [ "$status" -ne 0 ]; then
@@ -713,6 +714,8 @@ if (process.exitCode === undefined) {
  * - `mountAncestors` (review round 8, P8-2): of each bind mount source in the repository folder that does not exist, the
  *   real path of the nearest path above it (or itself, for a link that leads nowhere) that exists, when that is a folder,
  *   else `null`;
+ * - `mountCreateTargets` (review round 10, D10-2): of each of them whose nearest path is a folder, that real path plus
+ *   the rest of the (normalized) source: where CREATE_FOLDERS_SCRIPT creates it, through the links;
  * - `inputsHash`: sha256 (hex) of the texts of the files that Compose read for the model, by path (`null` for a missing
  *   one): the compose files, the `.env` of the project folder (the folder of the first compose file), and each
  *   `env_file` (review round 1, P-4: a change of the Compose version alone changes the printed model, not these files).
@@ -773,21 +776,23 @@ const sshFiles = (ssh) => {
   return values.flatMap((value) => String(value === undefined || value === null ? '' : value).split(',')).map((file) => file.trim()).filter((file) => file !== '');
 };
 ${MISSING_IN_REPOSITORY}// Review round 8 (P8-2): the real path of the nearest path at or above a file that does not exist, when it is a folder.
-const nearestFolder = (file) => {
+// Review round 10 (D10-2): with that nearest path (at).
+const nearestFolderAt = (file) => {
   for (let current = file; ; current = path.posix.dirname(current)) {
     try {
       fs.lstatSync(current);
     } catch (error) {
       if (error && ['ENOENT', 'ENOTDIR'].includes(error.code) && current !== '/') continue;
-      return null;
+      return { at: current, real: null };
     }
     try {
-      return fs.statSync(current).isDirectory() ? realPath(current) : null;
+      return { at: current, real: fs.statSync(current).isDirectory() ? realPath(current) : null };
     } catch {
-      return null;
+      return { at: current, real: null };
     }
   }
 };
+const nearestFolder = (file) => nearestFolderAt(file).real;
 ${READ_LIMITED}// Review round 9 (S9-2): each file once (dockerfileTexts, by its real path), at most one character more than
 // MAX_DOCKERFILE_LENGTH. Returns the real path of the text, or undefined.
 const dockerfileTexts = {};
@@ -833,6 +838,7 @@ const main = () => {
     missing.push(file);
   };
   const mountAncestors = {};
+  const mountCreateTargets = {};
   for (const [name, service] of Object.entries(isObject(model.services) ? model.services : {})) {
     if (!isObject(service)) continue;
     const build = service.build;
@@ -864,7 +870,13 @@ const main = () => {
     for (const volume of Array.isArray(service.volumes) ? service.volumes : []) {
       if (isObject(volume) && volume.type === 'bind' && typeof volume.source === 'string') {
         realPaths[volume.source] = realPath(volume.source);
-        if (realPaths[volume.source] === null && volume.source.startsWith('/') && inside(path.posix.normalize(volume.source))) mountAncestors[volume.source] = nearestFolder(volume.source);
+        if (realPaths[volume.source] === null && volume.source.startsWith('/') && inside(path.posix.normalize(volume.source))) {
+          mountAncestors[volume.source] = nearestFolder(volume.source);
+          // Review round 10 (D10-2): where the created folder lands after the links of the nearest folder.
+          const normal = path.posix.normalize(volume.source).replace(/(.)\/+$/, '$1');
+          const nearest = nearestFolderAt(normal);
+          if (nearest.real !== null && inside(normal)) mountCreateTargets[volume.source] = nearest.real + normal.slice(nearest.at === '/' ? 0 : nearest.at.length);
+        }
       }
     }
     for (const entry of Array.isArray(service.env_file) ? service.env_file : []) {
@@ -890,7 +902,7 @@ const main = () => {
     }
   }
   const inputsHash = crypto.createHash('sha256').update(JSON.stringify([...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))).digest('hex');
-  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, dockerfileFiles, dockerfileTexts, realPaths, missing, mountAncestors, inputsHash };
+  return { version: version.stdout.trim(), dollarEscaped: value === 'a$$b', model, dockerfiles, dockerfileFiles, dockerfileTexts, realPaths, missing, mountAncestors, mountCreateTargets, inputsHash };
 };
 let output;
 try {

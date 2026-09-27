@@ -47,6 +47,7 @@ import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConf
 import {
   foreignVolumeName,
   imageIdItem,
+  imageUncheckedItem,
   imageReferenceFinding,
   imageIdResolvedReferences,
   type NamedImageReference,
@@ -756,7 +757,7 @@ class HostAccessError extends UserFacingError {
 class AnalysisFailedError extends HostAccessError {
   constructor(readonly failure: AnalysisFailure) {
     const item = analysisFailureItem(failure);
-    super({ hostAccess: [], unsupported: [item] }, failure.kind === 'limit' ? Messages.configurationTooComplex(item) : Messages.configurationCheckInternal(item));
+    super({ hostAccess: [], unsupported: [item] }, failure.kind === 'internal' ? Messages.configurationCheckInternal(item) : Messages.configurationTooComplex(item));
   }
 
   /** The text for the user: ANALYSIS_FAILED_ITEM, or analysisInternalItem. */
@@ -772,7 +773,8 @@ function isInternalAnalysisFailure(error: unknown): error is AnalysisFailedError
 
 /** Review round 9 (S9-1): a configuration beyond the limits of analysisLimits.ts, refused as too large or too complex. */
 function tooLargeError(reason: string): AnalysisFailedError {
-  return new AnalysisFailedError({ kind: 'limit', reason });
+  // Review round 10 (P10-3): a size limit, which the same configuration always exceeds.
+  return new AnalysisFailedError({ kind: 'size', reason });
 }
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
@@ -1537,8 +1539,9 @@ export class EnvironmentService {
       this.logger.warn(`Docker Compose could not read the configuration ${configPath} of ${env.repository}: ${output.error}`);
       throw new UserFacingError('buildFailed', Messages.composeConfigurationFailed, output.error);
     }
-    // Review round 9 (S9-1): before anything in this thread works on the model.
-    const tooLarge = composeModelLimit(output.model);
+    // Review round 9 (S9-1): before anything in this thread works on the model. Review round 10 (S10-2): also the
+    // Dockerfiles, before the hashes read them.
+    const tooLarge = composeModelLimit(output.model, output.dockerfiles);
     if (tooLarge !== undefined) {
       this.logger.warn(`The Docker Compose configuration ${configPath} of ${env.repository} is too large to check: ${tooLarge}.`);
       throw tooLargeError(tooLarge);
@@ -1698,8 +1701,9 @@ export class EnvironmentService {
   /**
    * Review round 2 (S2-05): the items (imageIdItem, not supported) of the references that name a local image by its ID
    * or a prefix of it, not by its name: Docker resolves such a reference (for example `a1b2c3d4`) to any local image,
-   * also one of another environment. A reference whose image does not exist locally, or that Docker cannot inspect, is
-   * left (the pull or the build fails, or it is pulled by its name).
+   * also one of another environment. A reference whose image does not exist locally is left (the pull or the build
+   * fails, or it is pulled by its name). Review round 10 (P10-1): a reference that Docker cannot inspect for another
+   * reason is refused too (imageUncheckedItem).
    */
   private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
     const named: NamedImageReference[] = [];
@@ -1714,11 +1718,23 @@ export class EnvironmentService {
     // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
     if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
     this.throwIfCancelled(signal);
-    // Docker cannot inspect them: the pull or the build fails, or it is pulled by its name (as before, for each one).
-    const found = await this.deps.docker.inspectImageNames(distinct).catch(() => []);
+    // Review round 10 (P10-1): a reference that Docker cannot inspect (for another reason than a missing image) is
+    // refused as not checked, never left: one invalid reference no longer leaves the others of its batch unchecked
+    // (inspectImageNames inspects them one by one), and an answer that cannot be read leaves none of them.
+    const { images, unchecked } = await this.deps.docker
+      .inspectImageNames(distinct)
+      .catch((error: unknown) => {
+        this.logger.warn(`The local images of the image references could not be read: ${errorMessage(error)}`);
+        return { images: [], unchecked: distinct };
+      });
     this.throwIfCancelled(signal);
-    const byId = new Set(imageIdResolvedReferences(distinct, found));
-    return named.filter((entry) => byId.has(entry.reference)).map((entry) => imageIdItem(entry.reference, entry.what));
+    const byId = new Set(imageIdResolvedReferences(distinct, images));
+    const notChecked = new Set(unchecked);
+    if (notChecked.size > 0) this.logger.warn(`Docker could not inspect the image references ${[...notChecked].join(', ')}.`);
+    return named.flatMap((entry) => [
+      ...(byId.has(entry.reference) ? [imageIdItem(entry.reference, entry.what)] : []),
+      ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
+    ]);
   }
 
   /** What composeBuildModel and composeUpModel need to know about the environment. */
@@ -1734,6 +1750,8 @@ export class EnvironmentService {
       ...(compose.engineApiVersion !== undefined ? { engineApiVersion: compose.engineApiVersion } : {}),
       realPaths: compose.output.realPaths,
       ...(compose.output.mountAncestors !== undefined ? { mountAncestors: compose.output.mountAncestors } : {}),
+      // Review round 10 (D10-2).
+      ...(compose.output.mountCreateTargets !== undefined ? { mountCreateTargets: compose.output.mountCreateTargets } : {}),
       mountVolumeSources,
       hostAccessChecks: compose.hostAccessChecks,
     };
@@ -1865,8 +1883,12 @@ export class EnvironmentService {
       !check.upToDate &&
       isRefusedUpdate(refused, this.updateKey(ctx, loaded, record, check.outcome));
     if (refusedAgain && refused && check.kind === 'checked') {
-      this.logger.info(`The update of ${ctx.env.repository} was refused by the host access policy (${refused.items}). The existing environment is used.`);
-      this.deps.ui.warn(Messages.updateRefused(refused.items));
+      this.logger.info(
+        refused.reason === 'size'
+          ? `The update of ${ctx.env.repository} is too large or too complex to check (${refused.items}). The existing environment is used.`
+          : `The update of ${ctx.env.repository} was refused by the host access policy (${refused.items}). The existing environment is used.`,
+      );
+      this.deps.ui.warn(refused.reason === 'size' ? Messages.updateTooLarge(refused.items) : Messages.updateRefused(refused.items));
       check = { ...check, upToDate: true, changedImages: [], changedFeatures: [] };
     }
     const build = needsBuild({ ...input, check, containerExists });
@@ -1882,7 +1904,9 @@ export class EnvironmentService {
           : updateAvailable
             ? 'a newer image is available'
             : refusedAgain
-              ? 'the newer image needs access to the computer'
+              ? refused?.reason === 'size'
+                ? 'the newer image is too large or too complex to check'
+                : 'the newer image needs access to the computer'
               : 'up to date';
     this.logger.info(`Decision for ${ctx.env.repository}: ${build ? 'build a new environment image' : 'no build'} (${reason}).`);
     return { check, build, forced, updateAvailable };
@@ -2020,6 +2044,13 @@ export class EnvironmentService {
         // computer): no refusal of the policy, so the update is not remembered as refused; the next open tries again.
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         if (!canFallBack) throw error;
+        // Review round 10 (P10-3): a size limit fails the same update the same way at every open: remembered, with its
+        // own text, like a refused update (a changed digest or configuration, or a rebuild, tries again). A time or
+        // memory limit and an internal failure stay not remembered (P9-1).
+        if (error.failure.kind === 'size') {
+          await this.rememberRefusedUpdate(ctx, loaded, record, plan.check, error, 'size');
+          return undefined;
+        }
         this.logger.warn(`The new environment image of ${env.repository} could not be checked. The existing environment is started; the next open tries the update again.`);
         this.deps.ui.warn(Messages.updateCheckFailed(error.item));
         return undefined;
@@ -2100,8 +2131,7 @@ export class EnvironmentService {
               serviceImages: composeServiceImageReferences(loaded.compose.output.model, loaded.compose.service),
               version: loaded.compose.output.version,
               inputsHash: loaded.compose.inputsHash,
-              // Review round 9 (D9-1): of the `up` of this build.
-              ...(ctx.serviceFolders !== undefined && ctx.serviceFolders.length > 0 ? { serviceFolders: ctx.serviceFolders } : {}),
+              // Review round 10 (D10-1): the paths that other services mount are in Environment.serviceFolders.
             },
           }
         : {}),
@@ -2142,12 +2172,13 @@ export class EnvironmentService {
     record: BuildRecord | undefined,
     check: ImageCheckState,
     error: unknown,
+    reason?: 'size',
   ): Promise<void> {
     const items = error instanceof HostAccessError ? error.items.join(', ') : errorMessage(error);
     this.logger.info(`The existing environment of ${ctx.env.repository} is started without the update. A changed digest or configuration tries it again.`);
-    this.deps.ui.warn(Messages.updateRefused(items));
+    this.deps.ui.warn(reason === 'size' ? Messages.updateTooLarge(items) : Messages.updateRefused(items));
     if (check.kind !== 'checked') return;
-    const refusedUpdate: RefusedUpdate = { ...this.updateKey(ctx, loaded, record, check.outcome), items };
+    const refusedUpdate: RefusedUpdate = { ...this.updateKey(ctx, loaded, record, check.outcome), items, ...(reason !== undefined ? { reason } : {}) };
     await this.updateEntry(ctx, (entry) => {
       entry.refusedUpdate = refusedUpdate;
     });
@@ -2540,6 +2571,13 @@ export class EnvironmentService {
       ctx.steps.detail(Messages.containerComposeReplaced);
       await this.removeComposeServices(ctx);
     }
+    // Review round 10 (D10-1): no container of another service is left, so none mounts a path of the repository.
+    if (serviceFoldersOf(ctx.env).length > 0) {
+      await this.updateEntry(ctx, (entry) => {
+        delete entry.serviceFolders;
+        if (entry.buildRecord && isRecord(entry.buildRecord.compose)) delete entry.buildRecord.compose.serviceFolders;
+      });
+    }
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
       result = await this.deps.helper.up({
@@ -2627,7 +2665,9 @@ export class EnvironmentService {
       image,
       configPath: env.configPath,
     });
-    await this.recordServiceFolders(ctx, serviceFolders ?? []);
+    // Review round 10 (D10-1): before `up` (also before the first build record, so that a failed `up` leaves them
+    // recorded); the recorded list only shrinks when no container of another service exists before this `up`.
+    await this.recordServiceFolders(ctx, serviceFolders ?? [], !(await this.otherServiceContainersExist(env, compose)));
     if (rewrites.length > 0) {
       this.logger.info(`Changed in the Docker Compose model of ${env.repository}: ${rewrites.map((rewrite) => `${rewrite.item} (${rewrite.reason})`).join(', ')}.`);
     }
@@ -2693,18 +2733,44 @@ export class EnvironmentService {
 
   /**
    * Review round 9 (D9-1): the paths of the repository that the other services of the model of this `up` mount
-   * (composeUpModel's `serviceFolders`): kept for the ownership fix after `up`, and in the Docker Compose build record
-   * (ComposeBuildRecord.serviceFolders) for Switch branch… and Delete. A new build record takes them from the context.
+   * (composeUpModel's `serviceFolders`): kept for the ownership fix after `up`, and recorded for Switch branch… and Delete.
+   * Review round 10 (D10-1): in Environment.serviceFolders, written before `up` whether or not a build record exists; with
+   * `replace` false (a container of another service exists, which `up` may keep with the mounts of an earlier model, for
+   * example `up --no-recreate` after "Rebuild later", or a failed `up`) the union of the recorded list and `folders`, so
+   * the list never shrinks while such a container may mount a path of it; with `replace` (no such container exists: every
+   * one that `up` creates has the mounts of this model) `folders`. The list of a build record of review round 9 is taken
+   * over into it.
    */
-  private async recordServiceFolders(ctx: PipelineContext, folders: string[]): Promise<void> {
-    ctx.serviceFolders = folders;
-    const current = serviceFoldersOf(ctx.env.buildRecord);
-    if (composeRecordOf(ctx.env.buildRecord) === undefined || (current.length === folders.length && current.every((folder, i) => folder === folders[i]))) return;
+  private async recordServiceFolders(ctx: PipelineContext, folders: string[], replace: boolean): Promise<void> {
+    const recorded = serviceFoldersOf(ctx.env);
+    const next = [...new Set(replace ? folders : [...recorded, ...folders])];
+    ctx.serviceFolders = next;
+    const own = ctx.env.serviceFolders ?? [];
+    const legacy = composeRecordOf(ctx.env.buildRecord)?.serviceFolders !== undefined;
+    if (!legacy && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
+    if (replace && recorded.length > 0) {
+      this.logger.info(`No container of another service of ${ctx.env.repository} exists: the paths of the repository that they mount are those of the model now.`);
+    }
     await this.updateEntry(ctx, (entry) => {
-      if (!entry.buildRecord || composeRecordOf(entry.buildRecord) === undefined || !isRecord(entry.buildRecord.compose)) return;
-      if (folders.length > 0) entry.buildRecord.compose.serviceFolders = [...folders];
-      else delete entry.buildRecord.compose.serviceFolders;
+      if (next.length > 0) entry.serviceFolders = [...next];
+      else delete entry.serviceFolders;
+      if (entry.buildRecord && isRecord(entry.buildRecord.compose)) delete entry.buildRecord.compose.serviceFolders;
     });
+  }
+
+  /**
+   * Review round 10 (D10-1): whether a container of the Docker Compose project of the environment exists other than the
+   * dev container of `compose` (a container of another service, of this or an earlier model). `true` when it cannot be
+   * read, so that the recorded paths of the services are kept.
+   */
+  private async otherServiceContainersExist(env: Environment, compose: LoadedCompose): Promise<boolean> {
+    try {
+      const containers = await this.composeContainers(env);
+      return containers.some((container) => container.name !== env.containerName && container.labels['com.docker.compose.service'] !== compose.service);
+    } catch (error) {
+      this.logger.warn(`The containers of the Docker Compose project of ${env.repository} could not be listed: ${errorMessage(error)}`);
+      return true;
+    }
   }
 
   /**
@@ -3160,7 +3226,7 @@ export class EnvironmentService {
 
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
       // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner).
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser, ctx.serviceFolders ?? serviceFoldersOf(env.buildRecord));
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, ctx.serviceFolders ?? serviceFoldersOf(env));
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
       // is still root when the ownership fix before `up` did not run or failed.
       await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
@@ -3552,7 +3618,8 @@ export class EnvironmentService {
             branch,
             token,
             // Review round 9 (D9-1): the restore of the owner leaves out the paths that the other services mount.
-            serviceFolders: serviceFoldersOf(env.buildRecord),
+            // Review round 10 (D10-1): all that their containers may mount (Environment.serviceFolders).
+            serviceFolders: serviceFoldersOf(env),
             onOutput: this.output,
             signal: options.signal,
           })
@@ -3701,7 +3768,8 @@ export class EnvironmentService {
       signal,
     });
     // Review round 9 (S9-1): a model beyond the limits counts as a change; the open refuses it.
-    if ('error' in output || composeModelLimit(output.model) !== undefined) return undefined;
+    // Review round 10 (S10-2): with the Dockerfiles, before the hashes read them.
+    if ('error' in output || composeModelLimit(output.model, output.dockerfiles) !== undefined) return undefined;
     return {
       configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
       inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),

@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CONTAINER_VERSION, composeProjectName, environmentImageRepository } from '../names';
 import {
@@ -23,6 +24,7 @@ import {
   composeServiceVolumeNames,
   composeUpModel,
   composeUserArgs,
+  type ComposeModelOutput,
   composeVolumeNames,
   decideServiceMount,
   decideServicePort,
@@ -801,7 +803,9 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     model.volumes = { pgdata: { name: 'devenv-3f2a9c1e_pgdata' } };
     model.services.app.volumes = [...(model.services.app.volumes as unknown[]), { type: 'bind', source: `${REPO}/dev-only`, target: '/dev-only', bind: {} }];
     const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: 'devenv-3f2a9c1e:7' });
-    expect(result.serviceFolders).toEqual([SOURCE, `${REPO}/seed`]);
+    // Review round 10, D10-3: without the read-only mount ./seed (before: [SOURCE, `${REPO}/seed`]); the owner restores give
+    // it back when root rewrote it.
+    expect(result.serviceFolders).toEqual([SOURCE]);
     expect(composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7' })).not.toHaveProperty('serviceFolders');
   });
 
@@ -859,5 +863,121 @@ describe('review round 9 (S9-2): each Dockerfile once in the output of the model
     expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: { s0: '/r/X' }, dockerfileTexts: {} }))).toThrow('invalid Compose model');
     expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: { s0: '/r/D' }, dockerfileTexts: { '/r/D': 3 } }))).toThrow('invalid Compose model');
     expect(() => parseComposeModelOutput(JSON.stringify({ ...base, dockerfiles: {}, dockerfileFiles: [] }))).toThrow('invalid Compose model');
+  });
+});
+
+describe('review round 10 (D10-2, D10-3): the recorded paths of the repository that other services mount', () => {
+  const up = (volumes: unknown[], overrides: Partial<ComposeRewriteParams> = {}) => {
+    const model = templateModel();
+    model.services.db.volumes = volumes;
+    return composeUpModel(model, { ...params(overrides), image: 'devenv-3f2a9c1e:7' });
+  };
+  const bind = (source: string, extra: Record<string, unknown> = {}) => ({ type: 'bind', source, target: `/t${source.length}`, bind: {}, ...extra });
+
+  it('records the real path of a mount behind a link in the repository too (D10-2)', () => {
+    const result = up([bind(`${REPO}/data`)], { realPaths: { [`${REPO}/data`]: `${REPO}/.local/pg` } });
+    // Before: only ./data; Docker resolves the subpath through the link, and ./.local/pg got the dev user as its owner.
+    expect(result.serviceFolders).toEqual([`${REPO}/data`, `${REPO}/.local/pg`]);
+    // The real path only when it differs and is below the repository folder.
+    expect(up([bind(`${REPO}/data`)], { realPaths: { [`${REPO}/data`]: `${REPO}/data` } }).serviceFolders).toEqual([`${REPO}/data`]);
+    expect(up([bind(`${REPO}/data`)], { realPaths: { [`${REPO}/data`]: REPO } }).serviceFolders).toEqual([`${REPO}/data`]);
+  });
+
+  it('records where a created folder below a linked folder lands (D10-2)', () => {
+    const source = `${REPO}/data/pg`;
+    const result = up([bind(source, { bind: { create_host_path: true } })], {
+      realPaths: { [source]: null },
+      mountAncestors: { [source]: `${REPO}/.local` },
+      mountCreateTargets: { [source]: `${REPO}/.local/pg` },
+    });
+    expect(result.createFolders).toEqual([source]);
+    expect(result.serviceFolders).toEqual([source, `${REPO}/.local/pg`]);
+    const line = JSON.stringify({ version: '2.40.3', dollarEscaped: true, model: { services: {} }, dockerfiles: {}, realPaths: {}, mountCreateTargets: { [source]: `${REPO}/.local/pg`, b: 3 } });
+    expect((parseComposeModelOutput(line) as ComposeModelOutput).mountCreateTargets).toEqual({ [source]: `${REPO}/.local/pg` });
+  });
+
+  it('does not record read-only mounts, nor .git or a path below it (D10-3)', () => {
+    const result = up([
+      bind(`${REPO}/init.sql`, { read_only: true }),
+      bind(`${REPO}/nginx`, { read_only: true }),
+      bind(`${REPO}/.git`),
+      bind(`${REPO}/.git/hooks`),
+      bind(`${REPO}/sub/.git`),
+      bind(`${REPO}/frontend`),
+      bind(`${REPO}/link`),
+    ], { realPaths: { [`${REPO}/link`]: `${REPO}/.git/objects` } });
+    // Before: every one of them, so the owner restores of Switch branch… left the files that root rewrote to root.
+    expect(result.serviceFolders).toEqual([`${REPO}/frontend`, `${REPO}/link`]);
+  });
+});
+
+describe('review round 10 (S10-1, S10-2): the bounds of the model in the extension host', () => {
+  /** composeInputsHash and composeConfigHash as they were before review round 10: the digests must not change. */
+  function oldFiles(dockerfiles: Readonly<Record<string, string>>): string {
+    return Object.keys(dockerfiles)
+      .sort()
+      .map((name) => `${JSON.stringify(name)}:${JSON.stringify(dockerfiles[name])}`)
+      .join(',');
+  }
+  function oldStableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(oldStableJson).join(',')}]`;
+    if (typeof value === 'object' && value !== null) {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${oldStableJson(record[key])}`)
+        .join(',')}}`;
+    }
+    return JSON.stringify(value) ?? 'null';
+  }
+  const sha = (text: string) => `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+  const oldInputsHash = (configText: string, inputsHash: string, dockerfiles: Record<string, string>) => sha(`${configText}\n${inputsHash}\n${oldFiles(dockerfiles)}`);
+  const oldConfigHash = (configText: string, model: ComposeModel, dockerfiles: Record<string, string>) => sha(`${configText}\n${oldStableJson(model)}\n${oldFiles(dockerfiles)}`);
+
+  it('keeps the digests of composeInputsHash and composeConfigHash byte for byte (S10-2)', () => {
+    const shared = 'FROM node:20\nRUN echo "ä € \\ \u2028 \u{1F600}"\n';
+    const fixtures: Array<Record<string, string>> = [{}, { app: 'FROM a' }, { b: shared, a: shared, 'x"y': 'FROM z\n', é: shared }];
+    for (const dockerfiles of fixtures) {
+      for (const configText of ['{}', '{ "name": "ä" }\n']) {
+        expect(composeInputsHash(configText, 'abc', dockerfiles)).toBe(oldInputsHash(configText, 'abc', dockerfiles));
+        expect(composeConfigHash(configText, templateModel(), dockerfiles)).toBe(oldConfigHash(configText, templateModel(), dockerfiles));
+      }
+    }
+  });
+
+  it('hashes one Dockerfile text that many services share once, and refuses a model whose Dockerfiles are too large together (S10-2)', () => {
+    const text = `FROM alpine\nRUN echo ${'a'.repeat(1024 * 1024)}`;
+    const services: Record<string, unknown> = { app: { image: 'alpine:3.22' } };
+    const dockerfiles: Record<string, string> = {};
+    for (let i = 0; i < 499; i++) {
+      services[`s${i}`] = { build: { context: REPO, dockerfile: 'Dockerfile' } };
+      dockerfiles[`s${i}`] = text;
+    }
+    // Before: no limit; 3 s and 1.7 GB in the extension host for the hashes, before the job size check of the worker.
+    expect(composeModelLimit({ services } as unknown as ComposeModel, dockerfiles)).toBe(`more than ${32 * 1024 * 1024} characters of Dockerfiles of the services`);
+    expect(composeModelLimit({ services } as unknown as ComposeModel, { s0: text })).toBeUndefined();
+    // Within the limit (30 services with 1 MiB each): each distinct text is turned into JSON once.
+    const some = Object.fromEntries(Object.entries(dockerfiles).slice(0, 30));
+    const start = performance.now();
+    const digest = composeInputsHash('{}', '', some);
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(digest).toBe(oldInputsHash('{}', '', some));
+  });
+
+  it('rewrites a model with many services and top-level volumes in linear time, and caps the top-level maps (S10-1)', () => {
+    const services: Record<string, unknown> = { app: { image: 'alpine:3.22' } };
+    for (let i = 0; i < 499; i++) services[`s${i}`] = { image: 'alpine:3.22' };
+    const volumes = Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`v${i}`, { name: `x_v${i}` }]));
+    const model = { services, volumes } as unknown as ComposeModel;
+    expect(composeModelLimit(model)).toBeUndefined();
+    const start = performance.now();
+    composeBuildModel(model, params({ realPaths: {}, mountAncestors: {} }));
+    // Before: the volume map was built once per service (500 x 5000).
+    expect(performance.now() - start).toBeLessThan(500);
+    const many = Object.fromEntries(Array.from({ length: 5001 }, (_, i) => [`k${i}`, {}]));
+    expect(composeModelLimit({ services: {}, volumes: many } as unknown as ComposeModel)).toBe('5001 top-level volumes (at most 5000)');
+    expect(composeModelLimit({ services: {}, networks: many } as unknown as ComposeModel)).toBe('5001 top-level networks (at most 5000)');
+    expect(composeModelLimit({ services: {}, configs: many } as unknown as ComposeModel)).toBe('5001 top-level configs (at most 5000)');
+    expect(composeModelLimit({ services: {}, secrets: many } as unknown as ComposeModel)).toBe('5001 top-level secrets (at most 5000)');
   });
 });

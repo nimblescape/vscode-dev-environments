@@ -38,7 +38,7 @@ import {
   splitPortAddress,
   withLoopbackAddress,
 } from './hostAccess';
-import { MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES } from './analysisLimits';
+import { MAX_ANALYSIS_JOB_CHARACTERS, MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES, MAX_COMPOSE_TOP_LEVEL_ENTRIES } from './analysisLimits';
 import { OVERRIDE_FOLDER } from './scripts';
 
 /** A service of the merged model (`services.<name>`), as `docker compose config --format json` prints it. */
@@ -174,6 +174,12 @@ export interface ComposeModelOutput {
    */
   mountAncestors?: Record<string, string | null>;
   /**
+   * Review round 10 (D10-2): of each source of mountAncestors whose nearest path is a folder, where the folder lands when
+   * the pipeline creates it (CREATE_FOLDERS_SCRIPT, which follows links like the system): the real path of that nearest
+   * folder plus the rest of the path. Missing in older outputs.
+   */
+  mountCreateTargets?: Record<string, string>;
+  /**
    * sha256 of the texts of the files that Compose read for the model (the compose files, the `.env` of the project
    * folder, the `env_file`s), computed in the helper (review round 1, P-4); `''` when the output has none.
    */
@@ -230,24 +236,54 @@ export function parseComposeModelOutput(stdout: string): ComposeModelOutput | { 
     ...(isRecord(value.mountAncestors)
       ? { mountAncestors: Object.fromEntries(Object.entries(value.mountAncestors).filter(([, real]) => real === null || typeof real === 'string')) as Record<string, string | null> }
       : {}),
+    // Review round 10 (D10-2): only the entries that are a path.
+    ...(isRecord(value.mountCreateTargets)
+      ? { mountCreateTargets: Object.fromEntries(Object.entries(value.mountCreateTargets).filter(([, real]) => typeof real === 'string')) as Record<string, string> }
+      : {}),
     ...(Array.isArray(value.missing) ? { missing: value.missing.filter((file): file is string => typeof file === 'string') } : {}),
     inputsHash: typeof value.inputsHash === 'string' ? value.inputsHash : '',
   };
 }
 
+/** Review round 10 (S10-1): the keyed top-level maps of a model whose entries composeModelLimit counts. */
+const COMPOSE_TOP_LEVEL_MAPS = ['volumes', 'networks', 'configs', 'secrets'] as const;
+
 /**
  * Review round 9 (S9-1): why a model is beyond the limits of the extension host (MAX_COMPOSE_SERVICES services,
  * MAX_COMPOSE_MOUNTS mounts of all services together), or `undefined`. Counted without a copy; the pipeline refuses such
- * a model as too large or too complex before any other work on it.
+ * a model as too large or too complex before any other work on it. Review round 10: also more than
+ * MAX_COMPOSE_TOP_LEVEL_ENTRIES entries of a top-level `volumes`, `networks`, `configs`, or `secrets` (S10-1), and, with
+ * the Dockerfiles of the services (ComposeModelOutput.dockerfiles), more than MAX_ANALYSIS_JOB_CHARACTERS characters of
+ * them over all services, a shared text once per service as the hashes and the analysis job read it (S10-2).
  */
-export function composeModelLimit(model: ComposeModel): string | undefined {
+export function composeModelLimit(model: ComposeModel, dockerfiles?: Readonly<Record<string, string>>): string | undefined {
   const services = isRecord(model.services) ? Object.values(model.services) : [];
   if (services.length > MAX_COMPOSE_SERVICES) return `${services.length} services (at most ${MAX_COMPOSE_SERVICES})`;
   let mounts = 0;
   for (const service of services) {
     if (isRecord(service) && Array.isArray(service.volumes)) mounts += service.volumes.length;
   }
-  return mounts > MAX_COMPOSE_MOUNTS ? `${mounts} mounts (at most ${MAX_COMPOSE_MOUNTS})` : undefined;
+  if (mounts > MAX_COMPOSE_MOUNTS) return `${mounts} mounts (at most ${MAX_COMPOSE_MOUNTS})`;
+  for (const key of COMPOSE_TOP_LEVEL_MAPS) {
+    const map: unknown = model[key];
+    // Counted with a loop that stops at the limit, not with Object.keys (a copy).
+    let entries = 0;
+    if (isRecord(map)) {
+      for (const name in map) {
+        if (Object.prototype.hasOwnProperty.call(map, name) && ++entries > MAX_COMPOSE_TOP_LEVEL_ENTRIES) break;
+      }
+    }
+    if (entries > MAX_COMPOSE_TOP_LEVEL_ENTRIES) {
+      return `${Object.keys(map as Record<string, unknown>).length} top-level ${key} (at most ${MAX_COMPOSE_TOP_LEVEL_ENTRIES})`;
+    }
+  }
+  let characters = 0;
+  for (const name in dockerfiles ?? {}) {
+    const text = dockerfiles?.[name];
+    if (typeof text === 'string') characters += text.length;
+    if (characters > MAX_ANALYSIS_JOB_CHARACTERS) return `more than ${MAX_ANALYSIS_JOB_CHARACTERS} characters of Dockerfiles of the services`;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -430,12 +466,29 @@ function stableJson(value: unknown): string {
  * value, or Dockerfile that changes what Compose runs changes it.
  */
 export function composeConfigHash(configText: string, model: ComposeModel, dockerfiles: Readonly<Record<string, string>>): string {
-  const files = Object.keys(dockerfiles)
+  const hash = crypto.createHash('sha256').update(`${configText}\n${stableJson(model)}\n`);
+  return `sha256:${updateDockerfiles(hash, dockerfiles).digest('hex')}`;
+}
+
+/**
+ * Review round 10 (S10-2): feeds `"<service>":<JSON of its Dockerfile text>` of each service (sorted by name, joined by
+ * `,`) to `hash`, the same bytes as the text that the hashes joined before (their digests do not change), piece by
+ * piece, and the JSON of each distinct text once: many services share one Dockerfile (parseComposeModelOutput).
+ */
+function updateDockerfiles(hash: crypto.Hash, dockerfiles: Readonly<Record<string, string>>): crypto.Hash {
+  const json = new Map<string, string>();
+  Object.keys(dockerfiles)
     .sort()
-    .map((name) => `${JSON.stringify(name)}:${JSON.stringify(dockerfiles[name])}`)
-    .join(',');
-  const text = `${configText}\n${stableJson(model)}\n${files}`;
-  return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+    .forEach((name, index) => {
+      const text = dockerfiles[name];
+      let value = json.get(text);
+      if (value === undefined) {
+        value = JSON.stringify(text);
+        json.set(text, value);
+      }
+      hash.update(`${index > 0 ? ',' : ''}${JSON.stringify(name)}:`).update(value);
+    });
+  return hash;
 }
 
 /**
@@ -445,11 +498,8 @@ export function composeConfigHash(configText: string, model: ComposeModel, docke
  * the same files as a different model now and then.
  */
 export function composeInputsHash(configText: string, inputsHash: string, dockerfiles: Readonly<Record<string, string>>): string {
-  const files = Object.keys(dockerfiles)
-    .sort()
-    .map((name) => `${JSON.stringify(name)}:${JSON.stringify(dockerfiles[name])}`)
-    .join(',');
-  return `sha256:${crypto.createHash('sha256').update(`${configText}\n${inputsHash}\n${files}`).digest('hex')}`;
+  const hash = crypto.createHash('sha256').update(`${configText}\n${inputsHash}\n`);
+  return `sha256:${updateDockerfiles(hash, dockerfiles).digest('hex')}`;
 }
 
 /**
@@ -676,6 +726,8 @@ export interface ComposeRewriteParams {
   realPaths?: Readonly<Record<string, string | null>>;
   /** ComposeModelOutput.mountAncestors (review round 8, P8-2). */
   mountAncestors?: Readonly<Record<string, string | null>>;
+  /** ComposeModelOutput.mountCreateTargets (review round 10, D10-2). */
+  mountCreateTargets?: Readonly<Record<string, string>>;
   /**
    * The sources of the named volumes of the `mounts` of devcontainer.json and of the Features: declared as external
    * volumes `<project>_<source>` (composeMountVolumeName), which the pipeline creates with the labels of the
@@ -754,8 +806,8 @@ function labelMap(labels: unknown): Record<string, string> {
   return {};
 }
 
-function mountContext(model: ComposeModel, p: ComposeRewriteParams, isDev: boolean): ComposeMountContext {
-  const volumeNames = new Map(composeVolumeNames(model, p.project).map((volume) => [volume.key, volume.name]));
+/** Review round 10 (S10-1): `volumeNames` once per model (composeVolumeNames), not once per service. */
+function mountContext(volumeNames: ReadonlyMap<string, string>, p: ComposeRewriteParams, isDev: boolean): ComposeMountContext {
   return {
     isDev,
     repositoryFolder: p.repositoryFolder,
@@ -786,6 +838,8 @@ function rewriteModel(
   // With the checks off, a refusal of the class `computer` is no refusal: the entry stays as the model has it.
   const lifted = (decision: ComposeEntryDecision): boolean =>
     !checksOn && decision.action === 'refuse' && decision.kind === 'hostAccess' && decision.guarded !== true;
+  // Review round 10 (S10-1): once, not once per service (services x top-level volumes in the extension host).
+  const volumeNames = new Map(composeVolumeNames(source, p.project).map((volume) => [volume.key, volume.name]));
   for (const [name, service] of Object.entries(model.services)) {
     if (!isRecord(service)) throw notChecked(`service ${name}`);
     const isDev = name === p.devService;
@@ -827,7 +881,7 @@ function rewriteModel(
       });
     }
     // Mounts: the workspace volume for the dev service; repository files from the workspace volume.
-    const ctx = mountContext(source, p, isDev);
+    const ctx = mountContext(volumeNames, p, isDev);
     const volumes: unknown[] = [];
     for (const entry of Array.isArray(service.volumes) ? service.volumes : []) {
       const decision = decideServiceMount(entry, ctx);
@@ -840,10 +894,18 @@ function rewriteModel(
       if (decision.action === 'replace') volumes.push(decision.value);
       if (decision.action === 'replace' && decision.createFolder !== undefined) createFolders.add(decision.createFolder);
       // Review round 9 (D9-1): a path of the repository that another service mounts (from the workspace volume) may hold
-      // the data of that service, with the owner that the service gives it: the ownership fix leaves it out.
-      if (!isDev && decision.action === 'replace') {
+      // the data of that service, with the owner that the service gives it: the ownership fix leaves it out. Review
+      // round 10 (D10-3): not a read-only mount (the service writes nothing there, and a file that root rewrote, for
+      // example at Switch branch…, must get its owner back), and never .git (serviceRepositoryPath). Review round 10
+      // (D10-2): also the real path, when a link in the repository leads elsewhere in it (Docker follows the link of
+      // the subpath), or where a created folder below a link lands.
+      if (!isDev && decision.action === 'replace' && !(isRecord(decision.value) && decision.value.read_only === true)) {
         const folder = serviceRepositoryPath(decision.value, p.repositoryFolder);
-        if (folder !== undefined) serviceFolders.add(folder);
+        if (folder !== undefined) {
+          serviceFolders.add(folder);
+          const real = realServicePath(entry, p);
+          if (real !== undefined && real !== folder && isServiceFolderPath(real, p.repositoryFolder)) serviceFolders.add(real);
+        }
       }
     }
     if (isDev) volumes.unshift({ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: WORKSPACES_ROOT });
@@ -924,7 +986,33 @@ function rewriteModel(
 function serviceRepositoryPath(value: unknown, repositoryFolder: string): string | undefined {
   if (!isRecord(value) || value.source !== WORKSPACE_VOLUME_KEY || !isRecord(value.volume) || typeof value.volume.subpath !== 'string') return undefined;
   const folder = path.posix.join(WORKSPACES_ROOT, value.volume.subpath);
-  return folder !== repositoryFolder && folder.startsWith(`${repositoryFolder}/`) ? folder : undefined;
+  return isServiceFolderPath(folder, repositoryFolder) ? folder : undefined;
+}
+
+/**
+ * Review round 10: whether `folder` may be recorded as a path that another service mounts: below the repository folder
+ * (never the folder itself), and (D10-3) never `.git` or a path in it, of the repository or of a nested repository
+ * (Git writes there as root, for example at Switch branch…, and the files must get their owner back).
+ */
+function isServiceFolderPath(folder: string, repositoryFolder: string): boolean {
+  if (folder === repositoryFolder || !folder.startsWith(`${repositoryFolder}/`)) return false;
+  return !folder.slice(repositoryFolder.length + 1).split('/').includes('.git');
+}
+
+/**
+ * Review round 10 (D10-2): where the bind mount source of `entry` is after links, in the helper (and in the dev
+ * container): its real path (ComposeModelOutput.realPaths), or, for a folder that the pipeline creates, where it lands
+ * (ComposeModelOutput.mountCreateTargets); `undefined` when neither is known.
+ */
+function realServicePath(entry: unknown, p: ComposeRewriteParams): string | undefined {
+  if (!isRecord(entry) || typeof entry.source !== 'string') return undefined;
+  const source = entry.source;
+  const own = (map: Readonly<Record<string, string | null>> | undefined): string | null | undefined =>
+    map !== undefined && Object.prototype.hasOwnProperty.call(map, source) ? map[source] : undefined;
+  const real = own(p.realPaths);
+  if (typeof real === 'string') return path.posix.normalize(real).replace(/(.)\/+$/, '$1');
+  const created = own(p.mountCreateTargets);
+  return typeof created === 'string' ? path.posix.normalize(created).replace(/(.)\/+$/, '$1') : undefined;
 }
 
 function portText(entry: unknown): string {

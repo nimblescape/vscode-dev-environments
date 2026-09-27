@@ -79,6 +79,8 @@ export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
     items: value.items,
   };
   if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
+  // Review round 10 (P10-3).
+  if (value.reason === 'size') refused.reason = 'size';
   return refused;
 }
 
@@ -418,20 +420,22 @@ export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRe
 }
 
 /**
- * Review round 9 (D9-1, D9-2): the paths of the repository that the other services of the Docker Compose environment
- * mounted at its last `up` (ComposeBuildRecord.serviceFolders); empty for a record without them.
+ * Review round 9 (D9-1, D9-2): the paths of the repository that the containers of the other services of the Docker
+ * Compose environment may mount. Review round 10 (D10-1): Environment.serviceFolders together with the list of a build
+ * record of review round 9 (ComposeBuildRecord.serviceFolders); empty for an entry without either.
  */
-export function serviceFoldersOf(record: BuildRecord | undefined): string[] {
-  return composeRecordOf(record)?.serviceFolders ?? [];
+export function serviceFoldersOf(env: Pick<Environment, 'buildRecord' | 'serviceFolders'>): string[] {
+  const own = Array.isArray(env.serviceFolders) ? env.serviceFolders.filter((folder) => typeof folder === 'string') : [];
+  return [...new Set([...own, ...(composeRecordOf(env.buildRecord)?.serviceFolders ?? [])])];
 }
 
 /**
  * Review round 9 (D9-2): serviceFoldersOf relative to the repository folder, as the user knows them (`./data/postgres`),
  * for the confirmation of Delete. Only the paths below the repository folder.
  */
-export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'buildRecord'>): string[] {
+export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'buildRecord' | 'serviceFolders'>): string[] {
   const folder = repositoryFolder(env.repository);
-  return serviceFoldersOf(env.buildRecord)
+  return serviceFoldersOf(env)
     .filter((path) => path.startsWith(`${folder}/`) && path.length > folder.length + 1)
     .map((path) => `./${path.slice(folder.length + 1)}`);
 }

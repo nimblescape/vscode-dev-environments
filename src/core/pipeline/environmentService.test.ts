@@ -3526,6 +3526,34 @@ describe('review round 9 (P9-1, P9-2): a failed analysis of the host access poli
     expect(h.ui.warnings).toEqual([]);
   });
 
+  it('remembers an update whose new image is beyond a size limit of the check, and does not build it at every open (review round 10, P10-3)', async () => {
+    h.cleanup();
+    // A deterministic size limit (for example an oversized devcontainer.metadata label of the new image).
+    const failing = failingAnalyzer(isMetadataJob, { kind: 'size', reason: 'the configuration is larger than 32 million characters' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: not remembered ("Try again"), so every open built the same update again and failed the same way.
+    const refused = (await h.registry.get(ENV_ID))?.refusedUpdate;
+    expect(refused).toMatchObject({ items: ANALYSIS_FAILED_ITEM, reason: 'size' });
+    expect(h.ui.warnings).toEqual([Messages.updateTooLarge(ANALYSIS_FAILED_ITEM)]);
+    expect(Messages.updateTooLarge('x')).toBe('The newer image of the environment is too large or too complex to check (x). The environment is started without the update.');
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.containersOf(ENV_ID)[0].image).toBe(IMAGE_1);
+    // The next open does not build the same update again, and says why.
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    h.ui.warnings.length = 0;
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.ui.warnings).toEqual([Messages.updateTooLarge(ANALYSIS_FAILED_ITEM)]);
+    // A rebuild tries again.
+    failing.enabled.on = false;
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+    expect(h.helper.builds).toHaveLength(2);
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+  });
+
   it('starts an existing environment when the analysis cannot run, with an internal-error text, and builds nothing (P9-2)', async () => {
     h.cleanup();
     const failing = failingAnalyzer(() => true, { kind: 'internal', reason: 'the worker did not start: Cannot find module' });

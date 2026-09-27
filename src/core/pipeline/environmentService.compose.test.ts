@@ -56,7 +56,7 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH, repositoryServiceDataFolders } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
@@ -1166,9 +1166,10 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
       serviceImages: [DB_IMAGE],
       version: '2.40.3',
       inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}),
-      // Review round 9, D9-1: the path of the repository that db mounts (init.sql).
-      serviceFolders: [`${FOLDER}/init.sql`],
+      // Review round 10, D10-1 and D10-3: no serviceFolders here any more (before: [`${FOLDER}/init.sql`]): the entry
+      // holds them (Environment.serviceFolders), and a read-only mount such as init.sql is not recorded.
     });
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
   });
 });
 
@@ -1822,21 +1823,27 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     withDataFolder();
     await h.service.open(TARGET, options());
     // Before: `[FOLDER, 'vscode']`: the fix after `up` (db has run) gave the data of Postgres to vscode.
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE, INIT_SQL]]);
+    // Review round 10, D10-3: without the read-only INIT_SQL (before: [FOLDER, 'vscode', SOURCE, INIT_SQL]).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE]]);
     // The fix before `up` of the new clone: no service has run on the files yet, so every file gets its owner.
     const before = h.docker.runs.filter((run) => run.all.includes('--entrypoint'));
     expect(before).toHaveLength(1);
     expect(before[0].args.slice(-2)).toEqual([FOLDER, 'vscode']);
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toEqual([SOURCE, INIT_SQL]);
+    // Review round 10, D10-1 and D10-3: in the entry, not in the build record, and without the read-only INIT_SQL
+    // (before: buildRecord.compose.serviceFolders [SOURCE, INIT_SQL]).
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toBeUndefined();
   });
 
   it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
     withDataFolder();
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
-    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE, INIT_SQL]]);
+    // Review round 10, D10-3: without the read-only INIT_SQL (before: [FOLDER, 'vscode', SOURCE, INIT_SQL] and
+    // [[SOURCE, INIT_SQL]]).
+    expect(fixArguments()).toEqual([[FOLDER, 'vscode', SOURCE]]);
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders).toEqual([[SOURCE, INIT_SQL]]);
+    expect(h.helper.switchServiceFolders).toEqual([[SOURCE]]);
   });
 
   it('records the paths at an up without a build, and leaves out nothing for a build record written before them', async () => {
@@ -1844,11 +1851,88 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     // A record without serviceFolders (written by an earlier version): Switch branch… leaves out nothing, as before.
     await h.service.switchBranch(ENV_ID, 'feature-x', options());
     expect(h.helper.switchServiceFolders).toEqual([[]]);
-    // The next start with up records the paths of the model (the default model: init.sql of db).
+    // The next start with up records the paths of the model. Review round 10, D10-3: with a data folder of db that
+    // exists (the read-only init.sql of the default model is no longer recorded); D10-1: in the entry (before:
+    // buildRecord.compose.serviceFolders [INIT_SQL]).
+    const out = output((m) => {
+      m.services.db.volumes = [...(m.services.db.volumes as unknown[]), { type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: SOURCE };
+    useCompose(h, out);
+    h.ui.configurationChangedAnswer = 'later';
     await h.service.openEnvironment(ENV_ID, options());
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.serviceFolders).toEqual([INIT_SQL]);
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
     await h.service.switchBranch(ENV_ID, 'main', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([INIT_SQL]);
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([SOURCE]);
+  });
+});
+
+describe('review round 10 of unit 6 (D10-1): the recorded paths of the services never shrink while a container may mount them', () => {
+  const OLD = `${FOLDER}/data/pg`;
+  const NEW = `${FOLDER}/pgdata`;
+
+  /** The default model with db's data in NEW (a folder that exists). */
+  function withNewFolder(): void {
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: NEW, target: '/var/lib/postgresql/data', bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [NEW]: NEW };
+    useCompose(h, out);
+  }
+
+  it('keeps the folder of the old model at an up --no-recreate (Rebuild later), for Switch branch… and Delete', async () => {
+    // A build record of review round 9 names OLD; the db container was created with it and is not created again.
+    await seedCompose({ dev: 'stopped', db: 'stopped', record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceFolders: [OLD] } } as Partial<BuildRecord> });
+    withNewFolder();
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups.map((up) => up.removeExistingContainer)).toEqual([false]);
+    const entry = await h.registry.get(ENV_ID);
+    // Before: [NEW] (in the build record), and the next Switch branch… gave the live data in OLD to the dev user.
+    expect(entry?.serviceFolders).toEqual([OLD, NEW]);
+    expect(entry?.buildRecord?.compose?.serviceFolders).toBeUndefined();
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([OLD, NEW]);
+    // The question of Delete names both.
+    expect(repositoryServiceDataFolders(entry!)).toEqual(['./data/pg', './pgdata']);
+    // Another start with the same model changes nothing.
+    h.docker.containersOf(ENV_ID).forEach((container) => (container.state = 'stopped'));
+    await h.service.openEnvironment(ENV_ID, options());
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([OLD, NEW]);
+  });
+
+  it('records the folders before a first up that fails, so that Switch branch… leaves them out', async () => {
+    // An entry without a build record (restored after a lost registry, or a first open that was cut off).
+    await seedEnvironment(h, { container: null, record: null });
+    h.docker.images.add(DB_IMAGE);
+    withNewFolder();
+    h.helper.upError = () => new Error('Error response from daemon: driver failed programming external connectivity');
+    // Compose created the db container (with NEW) before the failure.
+    h.helper.beforeUpError = () => {
+      h.docker.addContainer({ environmentId: ENV_ID, name: `${PROJECT}-db-1`, state: 'running', image: DB_IMAGE, labels: { [LABEL_COMPOSE_SERVICE]: 'db', ...COMPOSE_LABELS, 'com.docker.compose.service': 'db' } });
+    };
+    await expect(h.service.openEnvironment(ENV_ID, options())).rejects.toBeInstanceOf(UserFacingError);
+    expect((await h.registry.get(ENV_ID))?.buildRecord).toBeUndefined();
+    // Before: nothing was recorded without a build record, and Switch branch… gave the data of db to the dev user.
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW]);
+    await h.service.switchBranch(ENV_ID, 'feature-x', options());
+    expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW]);
+  });
+
+  it('replaces the list when no container of another service exists before up', async () => {
+    await seedCompose({ dev: 'stopped', db: null, record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceFolders: [OLD] } } as Partial<BuildRecord> });
+    withNewFolder();
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW]);
+    // With the db container of NEW, a model with OLD adds OLD.
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: OLD, target: '/var/lib/postgresql/data', bind: {} }];
+    });
+    out.realPaths = { ...out.realPaths, [OLD]: OLD };
+    useCompose(h, out);
+    h.docker.containersOf(ENV_ID).forEach((container) => (container.state = 'stopped'));
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW, OLD]);
   });
 });
 
@@ -1910,6 +1994,29 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
     expect(h.logger.warnings.some((line) => line.includes('503 services (at most 500)'))).toBe(true);
   });
 
+  it('refuses a model with too many top-level volumes, or too much Dockerfile text over its services, before it hashes it (review round 10, S10-1, S10-2)', async () => {
+    const text = `FROM alpine\nRUN echo ${'a'.repeat(1024 * 1024)}`;
+    const big = output((m) => {
+      for (let i = 0; i < 40; i++) m.services[`s${i}`] = { build: { context: FOLDER, dockerfile: 'Dockerfile' } };
+    });
+    big.dockerfiles = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`s${i}`, text]));
+    useCompose(h, big);
+    const error = await rejection(h.service.open(TARGET, options()));
+    // Before: 40 MiB of JSON text for each hash in the extension host, then the job size check of the worker.
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM));
+    expect(h.logger.warnings.some((line) => line.includes(`more than ${32 * 1024 * 1024} characters of Dockerfiles of the services`))).toBe(true);
+    useCompose(
+      h,
+      output((m) => {
+        m.volumes = Object.fromEntries(Array.from({ length: 5001 }, (_, i) => [`v${i}`, { name: `x_v${i}` }]));
+      }),
+    );
+    expect((await rejection(h.service.open(TARGET, options()))).code).toBe('hostAccess');
+    expect(h.logger.warnings.some((line) => line.includes('5001 top-level volumes (at most 5000)'))).toBe(true);
+    expect(h.helper.builds).toEqual([]);
+  });
+
   it('asks Docker about the image IDs of all services with one call, and not at all for a refused model (S9-3)', async () => {
     useCompose(
       h,
@@ -1947,5 +2054,24 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
     h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toContain('image a1b2c3 (an image ID; name the image)');
+  });
+
+  it('refuses the image ID of a service also when another reference cannot be inspected, and that reference too (review round 10, P10-1)', async () => {
+    useCompose(
+      h,
+      output((m) => {
+        m.services.cache = { image: '3f2a1b9c' };
+        m.services.unused = { image: 'foo/Bar' };
+      }),
+    );
+    h.docker.images.add('3f2a1b9c');
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.uninspectableImages.add('foo/Bar');
+    const error = await rejection(h.service.open(TARGET, options()));
+    // Before: the batch failed for foo/Bar ("invalid reference format"), and no reference of it was checked.
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain('service cache: image 3f2a1b9c (an image ID; name the image)');
+    expect(error.message).toContain('service unused: image foo/Bar (the image reference could not be checked)');
+    expect(h.helper.builds).toEqual([]);
   });
 });

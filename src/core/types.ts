@@ -62,6 +62,7 @@ export interface ComposeBuildRecord {
    * other services mount from the workspace volume (composeUpModel's `serviceFolders`), as the last `up` used them. They
    * may hold the data of those services with their own owner: the ownership fixes after `up` and of Switch branch… leave
    * them out, and the question of Delete names them. A record without it (written before) leaves nothing out.
+   * Review round 10 (D10-1): no longer written; Environment.serviceFolders holds them. Still read (serviceFoldersOf).
    */
   serviceFolders?: string[];
 }
@@ -114,6 +115,15 @@ export interface Environment {
    * data of the services (none ticked), whatever their label devenv.volume, also when the configuration cannot be read.
    */
   serviceVolumes?: string[];
+  /**
+   * Review round 10 (D10-1): the paths of the repository (absolute, for example `/workspaces/api/data/postgres`) that the
+   * containers of the other services of Docker Compose may mount from the workspace volume (composeUpModel's
+   * `serviceFolders`), written before each `up`, also before the first build record. The list does not shrink while such
+   * a container may still mount a path of it: an `up` adds the paths of its model; only an `up` before which no
+   * container of another service exists (all of them were removed) replaces it. The ownership fixes after `up` and of
+   * Switch branch… leave the data of the services there alone, and the question of Delete names them.
+   */
+  serviceFolders?: string[];
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
   /**
@@ -155,6 +165,11 @@ export interface RefusedUpdate {
    * is tried again with the other.
    */
   hostAccessChecks?: 'off';
+  /**
+   * Review round 10 (P10-3): `size` when the check of the new image failed for a size limit (AnalysisFailure `size`, for
+   * example an oversized devcontainer.metadata label), not for the policy (Messages.updateTooLarge); absent otherwise.
+   */
+  reason?: 'size';
 }
 
 /**

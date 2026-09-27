@@ -67,7 +67,8 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
     if (exceedsJobSize(job, this.maxJobCharacters)) {
       const reason = `the configuration is larger than ${Math.round(this.maxJobCharacters / (1024 * 1024))} million characters`;
       this.logger?.warn(`The host access analysis of the configuration failed (${reason}); the configuration is refused.`);
-      return Promise.resolve(analysisFailure(job, { kind: 'limit', reason }));
+      // Review round 10 (P10-3): a size, not a time or memory limit of the worker.
+      return Promise.resolve(analysisFailure(job, { kind: 'size', reason }));
     }
     return new Promise((resolve) => {
       let worker: Worker | undefined;

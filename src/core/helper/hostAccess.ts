@@ -974,6 +974,14 @@ export function imageIdItem(reference: string, what = 'image'): string {
   return `${what} ${reference.trim()} (an image ID; name the image)`;
 }
 
+/**
+ * Review round 10 (P10-1): the item of an image reference that Docker could not inspect (for another reason than a
+ * missing image, for example "invalid reference format"): it cannot be told apart from an image ID, so it is not supported.
+ */
+export function imageUncheckedItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (the image reference could not be checked)`;
+}
+
 /** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
 export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
   return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);

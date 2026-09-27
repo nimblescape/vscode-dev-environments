@@ -29,12 +29,14 @@ export const ANALYSIS_FAILED_ITEM = 'The configuration is too large or too compl
 
 /**
  * Review round 9 (P9-1, P9-2): why an analysis failed.
- * - `limit`: the configuration is beyond a limit (the time or the memory of the worker, or a size of analysisLimits.ts):
- *   ANALYSIS_FAILED_ITEM;
+ * - `size` (review round 10, P10-3): the configuration is beyond a size of analysisLimits.ts (the size of the job, the
+ *   caps of a Docker Compose model): ANALYSIS_FAILED_ITEM. Deterministic: the same configuration fails the same way;
+ * - `limit`: the analysis ran out of the time or the memory of the worker (or its stack): ANALYSIS_FAILED_ITEM. It may
+ *   pass on a less busy computer;
  * - `internal`: the analysis could not run (its worker did not start, ended or crashed without an answer, or answered
  *   with something else than a result): analysisInternalItem. Nothing says that the configuration is to blame.
  */
-export type AnalysisFailureKind = 'limit' | 'internal';
+export type AnalysisFailureKind = 'size' | 'limit' | 'internal';
 
 export interface AnalysisFailure {
   kind: AnalysisFailureKind;
@@ -49,7 +51,7 @@ export function analysisInternalItem(reason: string): string {
 
 /** The refused item of a failed analysis: ANALYSIS_FAILED_ITEM, or analysisInternalItem. */
 export function analysisFailureItem(failure: AnalysisFailure): string {
-  return failure.kind === 'limit' ? ANALYSIS_FAILED_ITEM : analysisInternalItem(failure.reason);
+  return failure.kind === 'internal' ? analysisInternalItem(failure.reason) : ANALYSIS_FAILED_ITEM;
 }
 
 /** One analysis of the host access policy. */

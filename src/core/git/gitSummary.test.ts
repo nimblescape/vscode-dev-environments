@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   GIT_SUMMARY_SCRIPT,
   OWNERSHIP_FIX_SCRIPT,
-  PRUNE_ARGUMENTS,
+  SERVICE_PATH_ARGUMENTS,
   gitSummaryCommand,
   ownershipFixCommand,
   parseGitSummaryOutput,
@@ -141,15 +141,19 @@ describe('review round 9 (D9-1): the ownership fix leaves out the paths that oth
       `${REPO}/x`,
     ]);
     expect(servicePrunePatterns(REPO, undefined)).toEqual([]);
+    // Review round 10 (D10-3): never .git or a path in it (Git writes there as root), also from a record written before.
+    expect(servicePrunePatterns(REPO, [`${REPO}/.git`, `${REPO}/.git/objects`, `${REPO}/sub/.git`, `${REPO}/.github`, `${REPO}/x.git`])).toEqual([`${REPO}/.github`, `${REPO}/x.git`]);
     expect(ownershipFixCommand(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', REPO, 'vscode', `${REPO}/data/postgres`]);
   });
 
-  it('turns the parameters into -path/-prune arguments without reading them as shell text', () => {
+  it('turns the parameters into -path arguments without reading them as shell text', () => {
     // As SWITCH_BRANCH_SCRIPT uses it: after `shift 3`.
-    const script = `shift 3\n${PRUNE_ARGUMENTS}printf '<%s>\\n' "$@"`;
+    const script = `shift 3\n${SERVICE_PATH_ARGUMENTS}printf '<%s>\\n' "$@"`;
     const result = spawnSync('sh', ['-c', script, 'sh', 'a', 'b', 'c', '/r/-x y', '/r/$(touch z)'], { encoding: 'utf8' });
-    expect(result.stdout).toBe('<-path>\n</r/-x y>\n<-prune>\n<-o>\n<-path>\n</r/$(touch z)>\n<-prune>\n<-o>\n');
-    expect(spawnSync('sh', ['-c', `shift 3\n${PRUNE_ARGUMENTS}echo "$#"`, 'sh', 'a', 'b', 'c'], { encoding: 'utf8' }).stdout).toBe('0\n');
+    // Review round 10, D10-3: the test "in a path of a service" (the paths and everything below them), no -prune: the fix
+    // still gives the files of root in them their owner (before: `-path P -prune -o` for each pattern).
+    expect(result.stdout).toBe('<-path>\n</r/-x y>\n<-o>\n<-path>\n</r/-x y/*>\n<-o>\n<-path>\n</r/$(touch z)>\n<-o>\n<-path>\n</r/$(touch z)/*>\n');
+    expect(spawnSync('sh', ['-c', `shift 3\n${SERVICE_PATH_ARGUMENTS}echo "$#"`, 'sh', 'a', 'b', 'c'], { encoding: 'utf8' }).stdout).toBe('0\n');
   });
 
   it('changes the owner of every file but the pruned paths and their content (with spaces and a leading -)', () => {
@@ -163,6 +167,11 @@ describe('review round 9 (D9-1): the ownership fix leaves out the paths that oth
     fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'chown'), `#!/bin/sh\nshift 2\nfor f do printf '%s\\n' "$f" >> '${log}'; done\n`, { mode: 0o755 });
+    // Review round 10, D10-3: the data of the services has the owner that they give it, not root (the tests may run as
+    // root): the fix leaves files of root in these paths no more.
+    if (process.getuid?.() === 0) {
+      for (const file of ['data/postgres', 'data/postgres/base', 'data/postgres/base/1', '-data/my db', '-data/my db/f']) fs.chownSync(path.join(repo, file), 999, 999);
+    }
     const [file, ...args] = ownershipFixCommand(repo, 'someone', [`${repo}/data/postgres`, `${repo}/-data/my db`]);
     const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
     expect(result.stderr).toBe('');
@@ -311,5 +320,47 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     const result = runSummary(tempDir());
     expect(result.status).not.toBe(0);
     expect(result.stderr).not.toBe('');
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 10 (D10-2, D10-3): the ownership fix in the paths that other services mount, with real tools as root', () => {
+  function run(repo: string, user: string, folders: string[]): void {
+    const [file, ...args] = ownershipFixCommand(repo, user, folders);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  }
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives files and folders of root in those paths their owner, and leaves the data of a service alone (D10-3)', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['data/base', 'frontend/src/new', 'nginx']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['data/PG_VERSION', 'data/base/1', 'data/tracked.conf', 'frontend/src/app.ts', 'frontend/src/new/b.ts', 'nginx/default.conf', 'top.txt']) {
+      fs.writeFileSync(path.join(repo, file), 'x');
+    }
+    // The data of Postgres (uid 999); tracked.conf and the source of the frontend were rewritten by root (git switch).
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    run(repo, 'nobody', [`${repo}/data`, `${repo}/frontend`, `${repo}/nginx`]);
+    // Before: every file of these paths kept its owner, also root.
+    for (const file of ['data/tracked.conf', 'frontend', 'frontend/src/app.ts', 'frontend/src/new', 'frontend/src/new/b.ts', 'nginx/default.conf', 'top.txt', '.']) {
+      expect(uidOf(path.join(repo, file)), file).toBe(nobody);
+    }
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) expect(uidOf(path.join(repo, file)), file).toBe(999);
+  });
+
+  it('leaves the real folder of a service behind a link in the repository alone, once it is recorded (D10-2)', () => {
+    const repo = path.join(tempDir(), 'api');
+    fs.mkdirSync(path.join(repo, '.local/pg'), { recursive: true });
+    fs.symlinkSync('.local/pg', path.join(repo, 'data'));
+    fs.writeFileSync(path.join(repo, '.local/pg/PG_VERSION'), '16');
+    fs.chownSync(path.join(repo, '.local/pg'), 999, 999);
+    fs.chownSync(path.join(repo, '.local/pg/PG_VERSION'), 999, 999);
+    // The paths as composeUpModel records them: the link and its real path.
+    run(repo, 'nobody', [`${repo}/data`, `${repo}/.local/pg`]);
+    expect(uidOf(path.join(repo, '.local/pg/PG_VERSION'))).toBe(999);
+    expect(uidOf(path.join(repo, '.local'))).toBe(nobody);
+    // The link itself belonged to root: it gets the owner (chown -h), its target does not.
+    expect(uidOf(path.join(repo, 'data'))).toBe(nobody);
   });
 });

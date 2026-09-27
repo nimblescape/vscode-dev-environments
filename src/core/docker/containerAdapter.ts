@@ -142,6 +142,14 @@ export interface ImageNames {
   repoDigests: string[];
 }
 
+/** The result of inspectImageNames (review round 10, P10-1). */
+export interface ImageInspection {
+  /** The local images that the references found. */
+  images: ImageNames[];
+  /** The references that Docker could not inspect for another reason than a missing image. */
+  unchecked: string[];
+}
+
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
 export function parseJsonLines(stdout: string): unknown[] {
   const values: unknown[] = [];
@@ -718,22 +726,42 @@ export class ContainerAdapter {
    * Review round 9 (S9-3): the ID, tags, and digests of the local images that `references` name, with one `docker image
    * inspect` per IMAGE_INSPECT_BATCH references (not one per reference), in the order that Docker prints them (the
    * order of the references; a missing one is left out). Which reference found which image: imageIdResolvedReferences.
-   * Throws CommandError when Docker fails for another reason than a missing image.
+   * Review round 10 (P10-1): when Docker fails for a batch for another reason than missing images only (every line of
+   * stderr "No such image"), for example an invalid reference, the references of that batch are inspected one by one;
+   * `unchecked` names each one whose own inspect fails for another reason than a missing image (and each reference of a
+   * batch that ran out of time), which the caller must not take for a missing image. Never throws for a failed inspect.
    */
-  async inspectImageNames(references: readonly string[]): Promise<ImageNames[]> {
-    const found: ImageNames[] = [];
-    for (let start = 0; start < references.length; start += IMAGE_INSPECT_BATCH) {
-      const batch = references.slice(start, start + IMAGE_INSPECT_BATCH);
+  async inspectImageNames(references: readonly string[]): Promise<ImageInspection> {
+    const images: ImageNames[] = [];
+    const unchecked: string[] = [];
+    const inspect = async (batch: readonly string[]): Promise<'done' | 'failed' | 'timedOut'> => {
       const args = ['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--', ...batch];
       const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
-      if (result.exitCode !== 0 && !this.isMissing(result, 'image')) throw this.commandError(args, result);
+      if (result.timedOut) return 'timedOut';
+      if (result.exitCode !== 0 && !this.onlyMissing(result, 'image')) return 'failed';
+      const found: ImageNames[] = [];
       const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
       for (const value of parseJsonLines(result.stdout)) {
-        if (!isRecord(value) || typeof value.id !== 'string') throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
+        if (!isRecord(value) || typeof value.id !== 'string') return 'failed';
         found.push({ id: value.id, repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) });
       }
+      images.push(...found);
+      return 'done';
+    };
+    for (let start = 0; start < references.length; start += IMAGE_INSPECT_BATCH) {
+      const batch = references.slice(start, start + IMAGE_INSPECT_BATCH);
+      const outcome = await inspect(batch);
+      if (outcome === 'done') continue;
+      // A daemon that does not answer in time would not answer each reference either.
+      if (outcome === 'timedOut' || batch.length === 1) {
+        unchecked.push(...batch);
+        continue;
+      }
+      for (const reference of batch) {
+        if ((await inspect([reference])) !== 'done') unchecked.push(reference);
+      }
     }
-    return found;
+    return { images, unchecked };
   }
 
   /**
@@ -934,13 +962,19 @@ export class ContainerAdapter {
   private async inspectBatch(args: readonly string[], kind: ObjectKind): Promise<unknown[]> {
     const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     const items = parseInspectArray(result.stdout);
-    if (result.exitCode !== 0) {
-      const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
-      const onlyMissing = errors.length > 0 && errors.every((line) => MISSING_PATTERNS[kind].test(line));
-      if (!onlyMissing || result.timedOut) throw this.commandError(args, result);
-    }
+    if (result.exitCode !== 0 && !this.onlyMissing(result, kind)) throw this.commandError(args, result);
     if (!items) throw this.commandError(args, result, `Unexpected output of docker ${kind} inspect.`);
     return items;
+  }
+
+  /**
+   * Review round 10 (P10-1): whether a failed command failed only for missing objects: every line of its (end of) stderr
+   * says so. Unlike isMissing, one "No such …" among other errors is not enough.
+   */
+  private onlyMissing(result: RunResult, kind: ObjectKind): boolean {
+    if (result.timedOut || result.exitCode === 0) return false;
+    const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
+    return errors.length > 0 && errors.every((line) => MISSING_PATTERNS[kind].test(line));
   }
 
   private isMissing(result: RunResult, kind: ObjectKind): boolean {

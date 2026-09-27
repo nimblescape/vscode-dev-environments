@@ -95,6 +95,11 @@ export const Messages = {
   hostAccessAndUnsupported: (items: string, unsupported: string) =>
     `This configuration needs access to your computer, which Dev Environments does not allow: ${items}. It also uses options that Dev Environments does not support: ${unsupported}. Change the configuration of the repository.`,
   /** Concept 7.7: the new environment image of an update was refused by the host access policy; the old one starts. */
+  /**
+   * Review round 10 (P10-3): the check of the new environment image of an update failed for a size limit (the item is
+   * ANALYSIS_FAILED_ITEM); the old one starts, and the same update is not built again.
+   */
+  updateTooLarge: (item: string) => `The newer image of the environment is too large or too complex to check (${item}). The environment is started without the update.`,
   updateRefused: (items: string) =>
     `The newer image of the environment needs access to your computer, which Dev Environments does not allow: ${items}. The environment is started without the update.`,
   /** Concept 7.5, section 9: a container of an older version of the extension is created again. */
