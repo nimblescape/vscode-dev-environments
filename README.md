@@ -53,6 +53,8 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 
 Deferred: Docker per account (Docker-in-Docker, rootless per user), builder isolation, VMs.
 
+Not relevant for now (user decision 2026-09-27): other local engines on macOS (Colima, OrbStack, Rancher Desktop, Podman) and their socket paths. The helper follows the current Docker context on Linux (rootless via `docker context use` covered since #38); branch `fix/helper-socket-context` is obsolete and can be deleted.
+
 ## Documents to read first (on `main` / the work branch)
 
 `docs/vscode-dev-environments.md` (concept — the source of requirements), `docs/implementation-notes.md` (technical decisions), `docs/container-restrictions.md` (every restriction on containers), `README.md`.
