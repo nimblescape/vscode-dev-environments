@@ -44,14 +44,23 @@ export function windowsDockerDesktopFolders(env: NodeJS.ProcessEnv = {}): string
 }
 
 /**
- * Extra folders to search after PATH: /usr/local/bin, /opt/homebrew/bin, /Applications/Docker.app/Contents/Resources/bin (darwin),
+ * Extra folders to search after PATH: /usr/local/bin, /opt/homebrew/bin, /Applications/Docker.app/Contents/Resources/bin, and with
+ * HOME ~/.docker/bin and ~/Applications/Docker.app/Contents/Resources/bin (darwin),
  * C:\Program Files\Docker\Docker\resources\bin (win32). On Linux: /usr/local/bin and /usr/bin.
  * `env` is optional: on Windows, it gives the Program Files folder if it is not on drive C.
  */
 export function extraSearchFolders(platform: NodeJS.Platform, env?: NodeJS.ProcessEnv): string[] {
   switch (platform) {
-    case 'darwin':
-      return ['/usr/local/bin', '/opt/homebrew/bin', '/Applications/Docker.app/Contents/Resources/bin'];
+    case 'darwin': {
+      const folders = ['/usr/local/bin', '/opt/homebrew/bin', '/Applications/Docker.app/Contents/Resources/bin'];
+      // Docker Desktop's per-user CLI setting ("User") puts the tools in ~/.docker/bin and leaves PATH to the user, and
+      // Docker.app may be installed in ~/Applications (user decision 2026-09-27: find these installations too).
+      const home = env?.HOME;
+      if (home && path.posix.isAbsolute(home)) {
+        folders.push(path.posix.join(home, '.docker', 'bin'), path.posix.join(home, 'Applications', 'Docker.app', 'Contents', 'Resources', 'bin'));
+      }
+      return folders;
+    }
     case 'win32':
       return windowsDockerDesktopFolders(env).map((folder) => path.win32.join(folder, 'resources', 'bin'));
     default:
