@@ -3459,6 +3459,59 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
+  describe('review round 4 (H1): another service that builds its image', () => {
+    const WORKER_DOCKERFILES = { worker: `FROM ${DB_IMAGE}\n` };
+    const withWorker = (m: ComposeModel) => {
+      m.services.worker = { build: { context: `${FOLDER}/worker`, dockerfile: 'Dockerfile' }, command: ['sleep', 'infinity'], networks: { default: null } };
+    };
+
+    async function seedWithWorker(configText: string): Promise<void> {
+      const changed = { ...output(withWorker), dockerfiles: WORKER_DOCKERFILES };
+      h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText } };
+      h.helper.composeOutput = changed;
+      // The build record is of this configuration: no configuration change, no "Rebuild later".
+      await seedCompose({
+        dbLabels: DB_IMAGE_ID,
+        record: {
+          configHash: composeConfigHash(configText, changed.model, WORKER_DOCKERFILES),
+          compose: {
+            service: 'app',
+            images: [`${PROJECT}-app`, `${PROJECT}-worker`],
+            serviceImages: [DB_IMAGE],
+            version: '2.40.3',
+            inputsHash: composeInputsHash(configText, 'inputs-1', WORKER_DOCKERFILES),
+          },
+        },
+      });
+      h.docker.images.add(`${PROJECT}-worker`);
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+    }
+
+    it('a service with build: (all services are started): no question, nothing removed, the log says why', async () => {
+      await seedWithWorker(CONFIG_TEXT);
+
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts.filter((prompt) => prompt.startsWith('recreateContainer'))).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('other services build their images (worker)'))).toBe(true);
+      expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop ') || line.startsWith('volume rm'))).toEqual([]);
+    });
+
+    it('runServices without the built service: offered as before, only the dev container is recreated', async () => {
+      await seedWithWorker(CONFIG_TEXT.replace('"service": "app",', '"service": "app",\n  "runServices": ["db"],'));
+      const dev = devContainer();
+      const db = dbContainer();
+
+      await h.service.openEnvironment(ENV_ID, options());
+
+      expect(h.ui.prompts).toContain(`recreateContainer ${REPO}`);
+      expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
+      expect(dbContainer()?.id).toBe(db?.id);
+    });
+  });
+
   describe('review round 3 (G2): another service that shares a namespace or the volumes of another service', () => {
     // Of a third service `cache` (the policy refuses `pid` and `volumes_from` of the dev service).
     it.each<[string, (db: Record<string, unknown>) => void, string]>([

@@ -43,6 +43,7 @@ import {
   stringList,
   containerMetadataUser,
   sharedNamespaceServices,
+  builtOtherServices,
   type ImageCheckState,
 } from './pipelineRules';
 
@@ -779,5 +780,24 @@ describe('sharedNamespaceServices (recreate offer, review round 3, G2)', () => {
     };
     expect(sharedNamespaceServices(model, 'app')).toEqual(['a: network_mode service:db', 'b: ipc service:db', 'b: pid service:db', 'c: volumes_from db:ro']);
     expect(sharedNamespaceServices({ services: { app: {}, db: {} } }, 'app')).toEqual([]);
+  });
+});
+
+describe('builtOtherServices (recreate offer, review round 4, H1)', () => {
+  const model = {
+    services: {
+      app: { build: { context: '.' } },
+      db: { image: 'postgres:16' },
+      worker: { build: { context: './worker' } },
+      tools: { build: null },
+    },
+  };
+
+  it('names the other services with build: that the up builds: all of them, or those of runServices', () => {
+    expect(builtOtherServices(model, 'app')).toEqual(['worker']);
+    expect(builtOtherServices(model, 'app', [])).toEqual(['worker']);
+    expect(builtOtherServices(model, 'app', ['db'])).toEqual([]);
+    expect(builtOtherServices(model, 'app', ['db', 'worker'])).toEqual(['worker']);
+    expect(builtOtherServices({ services: { app: {}, db: { image: 'x' } } }, 'app')).toEqual([]);
   });
 });

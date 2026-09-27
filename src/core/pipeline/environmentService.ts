@@ -189,6 +189,7 @@ import {
   isContainerFault,
   containerMetadataUser,
   sharedNamespaceServices,
+  builtOtherServices,
   unnamedVolumeFolders,
   isGitHubTokenRejected,
   isNetworkFailure,
@@ -2596,7 +2597,8 @@ export class EnvironmentService {
    * com.docker.compose.image from the ID of the image of the service now. So for each container of another service of
    * the project (not a one-off container) that the model has: the hash that the Compose of the workspace helper (the one
    * that runs `up`) computes from exactly `model` (WorkspaceHelper.composeServiceHashes) must equal its label, and the
-   * local ID of the image of the service must equal its image label. The hashes of one Compose binary cover every change
+   * local ID of the image of the service must equal its image label; and (review round 4, H1, as composeServicesStay) no
+   * other service that `up` builds first (builtOtherServices). The hashes of one Compose binary cover every change
    * of the model (the host access checks, a changed configuration) and of the hash method (another Compose version); the
    * image ID covers a tag that moved (also while the question was open). A difference, a missing label, or an error:
    * startFailed (composeServicesWouldBeRecreated), and nothing is changed.
@@ -2606,11 +2608,15 @@ export class EnvironmentService {
     const others = (await this.composeContainers(env)).filter(
       (c) => c.labels[COMPOSE_SERVICE_LABEL] !== compose.service && c.labels[COMPOSE_ONEOFF_LABEL] !== 'True' && model.services[c.labels[COMPOSE_SERVICE_LABEL] ?? ''] !== undefined,
     );
-    if (others.length === 0) return;
     const problems: Array<{ name: string; why: string }> = [];
+    // Review round 4 (H1): defense in depth, as composeServicesStay: services that `up` builds first.
+    for (const name of builtOtherServices(model, compose.service, compose.runServices)) {
+      problems.push({ name, why: 'its image is built by `up` first (build:), and a new image would make Docker Compose create its container again' });
+    }
+    if (others.length === 0 && problems.length === 0) return;
     let hashes: Map<string, string> | undefined;
     try {
-      hashes = await this.deps.helper.composeServiceHashes({
+      if (others.length > 0) hashes = await this.deps.helper.composeServiceHashes({
         volumeName: env.volumeName,
         repository: env.repository,
         model: JSON.stringify(model, null, 2),
@@ -2681,6 +2687,9 @@ export class EnvironmentService {
     // Review round 3 (G2): a shared namespace or `volumes_from` of another service never passes the direct check.
     const shared = sharedNamespaceServices(compose.output.model, compose.service);
     if (shared.length > 0) return refuse(`other services share a namespace or the volumes of another service (${shared.join('; ')}).`);
+    // Review round 4 (H1): without its dev container, `up` builds the other services with `build:` first.
+    const built = builtOtherServices(compose.output.model, compose.service, compose.runServices);
+    if (built.length > 0) return refuse(`other services build their images (${built.join(', ')}), which \`up\` builds again first; a new image would make Docker Compose create them again, and a failed build would end \`up\` after the dev container is gone.`);
     const recorded = composeRecordOf(record);
     if (recorded === undefined || recorded.version !== compose.output.version) return refuse('the version of Docker Compose differs from the one of the last build.');
     const others = (await this.composeContainers(env)).filter((c) => c.labels[COMPOSE_SERVICE_LABEL] !== compose.service);

@@ -483,6 +483,20 @@ export function sharedNamespaceServices(model: { services: Record<string, unknow
 }
 
 /**
+ * Recreate offer, review round 4 (H1): the other services (not `devService`) with a `build:` section that the `up` of
+ * the Dev Container CLI builds when the dev container does not exist (CLI 0.89.0: `docker compose build` of every
+ * service, or of `runServices` and the dev service, before `up -d` without `--no-recreate`): all of them without
+ * `runServices`, else those that `runServices` names. A new image of such a service, for example of a changed build
+ * context or a pruned build cache, makes Compose create its container again, after the direct check.
+ */
+export function builtOtherServices(model: { services: Record<string, unknown> }, devService: string, runServices?: readonly string[]): string[] {
+  return Object.entries(model.services)
+    .filter(([name, service]) => name !== devService && isRecord(service) && service.build !== undefined && service.build !== null)
+    .map(([name]) => name)
+    .filter((name) => runServices === undefined || runServices.length === 0 || runServices.includes(name));
+}
+
+/**
  * The remote user by the configuration alone, when neither `up` nor the image named it: its `remoteUser`, else the last
  * `--user`/`-u` of `runArgs`, else its `containerUser` (the order of imageRemoteUser, without the image). `undefined`
  * when the configuration names none.
