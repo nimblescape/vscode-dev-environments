@@ -1030,6 +1030,13 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
     ])('does not support %s, with the checks on and off', (_name, mount, variable, resolved) => {
       // hotfix review 1, N6: an object is named by the --mount text that the CLI makes of it.
       const text = resolved ?? (typeof mount === 'string' ? mount : 'type=volume,src=${localEnv:HOSTNAME},dst=/x');
+      if (where === 'metadata' && resolved !== undefined) {
+        // hotfix review 2, P1: in the label, the leftovers are decided on the raw string, which has none here. The CLI
+        // substitutes the label once at `up`, so Docker gets the resolved text as it is: a volume named
+        // `${localEnv:NOPE:devenv-other-abcdef12}`, not the volume of another environment (Docker refuses the `$`).
+        for (const checksOn of [true, false]) expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({ hostAccess: [], unsupported: [] });
+        return;
+      }
       for (const checksOn of [true, false]) {
         expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({
           hostAccess: [],

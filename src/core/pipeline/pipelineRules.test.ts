@@ -5,6 +5,7 @@
 import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
+import { helperCliVariables } from '../helper/cliVariables';
 import {
   baseImageKey,
   configHash,
@@ -341,6 +342,35 @@ describe('imageRemoteUser', () => {
     ['numeric users other than 0 stay', { User: 'root' }, ['-u', '1000'], '1000'],
   ])('%s', (_name, config, runArgs, expected) => {
     expect(imageRemoteUser(config, runArgs)).toBe(expected);
+  });
+
+  // hotfix review 2, P3: the CLI substitutes each entry of the label at `up` before it reads the users.
+  describe('reads the users of the label as the Dev Container CLI substitutes them', () => {
+    const variables = helperCliVariables('acme/api');
+
+    it.each<[string, unknown, readonly unknown[] | undefined, string]>([
+      ['a default of a variable that is not set in the helper', metadata([{ remoteUser: '${localEnv:DEVUSER:vscode}' }]), undefined, 'vscode'],
+      ['a default in containerUser', metadata([{ remoteUser: '' }, { containerUser: '${localEnv:NOPE:node}' }]), undefined, 'node'],
+      ['an empty result does not count (the earlier entry wins)', metadata([{ remoteUser: 'vscode' }, { remoteUser: '${localEnv:NOPE}' }]), undefined, 'vscode'],
+      ['the basename of the workspace folder', metadata([{ remoteUser: '${localWorkspaceFolderBasename}' }]), undefined, 'api'],
+      ['a containerUser with a leftover under a remoteUser', metadata([{ containerUser: '${localEnv:TERM}', remoteUser: 'vscode' }]), undefined, 'vscode'],
+      ['a containerUser with a leftover under runArgs --user', metadata([{ containerUser: '${localEnv:TERM}' }]), ['--user', 'node'], 'node'],
+    ])('%s', (_name, config, runArgs, expected) => {
+      expect(imageRemoteUser(config, runArgs, variables)).toBe(expected);
+    });
+
+    it.each<[string, unknown]>([
+      ['a remoteUser with a variable of the helper whose value is not known', metadata([{ remoteUser: '${localEnv:TERM:vscode}' }])],
+      ['a containerUser with such a variable', metadata([{ containerUser: '${env:HOSTNAME}' }])],
+      ['${containerEnv:…}', metadata([{ remoteUser: '${containerEnv:USER}' }])],
+    ])('is not known for %s', (_name, config) => {
+      expect(imageRemoteUser(config, undefined, variables)).toBeUndefined();
+    });
+
+    it('uses the variables of the workspace helper without the variables of the pipeline', () => {
+      expect(imageRemoteUser(metadata([{ remoteUser: '${localEnv:DEVUSER:vscode}' }]))).toBe('vscode');
+      expect(imageRemoteUser(metadata([{ remoteUser: '${localEnv:TERM:vscode}' }]))).toBeUndefined();
+    });
   });
 });
 

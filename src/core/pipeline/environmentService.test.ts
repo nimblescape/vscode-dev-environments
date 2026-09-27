@@ -371,6 +371,44 @@ describe('open: first open', () => {
     expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'node']);
   });
 
+  // hotfix review 2, P3: the CLI substitutes the label at `up` before it reads the remote user.
+  describe('a remote user of the label with a variable', () => {
+    const labelUser = (remoteUser: string): void => {
+      const { remoteUser: _remoteUser, ...config } = h.helper.config;
+      h.helper.config = config;
+      const build = h.helper.build.bind(h.helper);
+      h.helper.build = async (p) => {
+        const result = await build(p);
+        h.docker.imageConfigs.set(p.imageName, imageConfigWithUser(remoteUser));
+        return result;
+      };
+    };
+
+    it('gives the cloned files to the user that the CLI resolves before up', async () => {
+      labelUser('${localEnv:DEVUSER:vscode}');
+      await h.service.open(TARGET, options());
+      expect(h.docker.runs).toHaveLength(1);
+      expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    });
+
+    it('skips the fix before up when the user is not known, and gives the files to the user that up reports', async () => {
+      labelUser('${localEnv:TERM:vscode}');
+      await h.service.open(TARGET, options());
+      expect(h.docker.runs).toEqual([]);
+      expect(h.logger.infos.some((line) => line.includes('is not known before the container is created'))).toBe(true);
+      expect(h.docker.execs.find((e) => e.user === 'root')?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    });
+
+    it('does not store the text of the label as the remote user after a failed lifecycle command', async () => {
+      labelUser('${localEnv:TERM:vscode}');
+      h.helper.lifecycleFailure = () => 'postCreateCommand from devcontainer.json failed.';
+      await h.service.open(TARGET, options());
+      const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
+      expect(env.remoteUser).toBeUndefined();
+      expect(h.docker.execs.some((e) => e.command.includes('${localEnv:TERM:vscode}'))).toBe(false);
+    });
+  });
+
   it('continues when the files cannot be given to the remote user before up', async () => {
     h.docker.runError = new CommandError('docker run', 1, '', 'sh: find: not found');
     await h.service.open(TARGET, options());
@@ -3102,6 +3140,21 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-history', 'api-cache', 'feature-store'] }));
       for (const name of ['api-history', 'api-cache', 'feature-store']) expect(h.docker.volumes.has(name)).toBe(false);
       expect(h.docker.volumes.has('api-existing')).toBe(true);
+    });
+
+    // hotfix review 2, P5 (a known limit): an existing volume without labels (created by a version before the labels, or
+    // by Docker at `up`) is shared by every environment that mounts it; the pipeline names it in the log.
+    it('logs an existing volume without labels that the container mounts', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.config = { image: BASE_IMAGE, mounts: ['source=api-node_modules,target=/n,type=volume', 'source=api-labelled,target=/l,type=volume'] };
+      h.docker.volumes.set('api-node_modules', {});
+      h.docker.volumes.set('api-labelled', { 'com.example': 'x' });
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(h.logger.infos.filter((line) => line.includes('without labels'))).toEqual([
+        expect.stringContaining('The volume api-node_modules exists without labels'),
+      ]);
+      expect((await h.registry.get(ENV_ID))?.additionalVolumes).toBeUndefined();
     });
 
     it('creates no volume when the container exists already', async () => {

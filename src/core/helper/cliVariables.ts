@@ -23,7 +23,10 @@
 //   one of the override configuration, itself substituted first); `containerWorkspaceFolderBasename`: its basename.
 // - Other names (also `containerEnv` for a new container) stay as they are written.
 // - A second pass (tg) replaces `${devcontainerId}` (any expression with that name) by the ID of the container, a hash
-//   of its id labels (52 characters of base 32).
+//   of its id labels (52 characters of base 32). The checks use DEVCONTAINER_ID_PLACEHOLDER in its place, because the ID
+//   is not known before `up` (hotfix review 2, P6).
+// - `${containerEnv:…}` is resolved only for the lifecycle commands of an existing container (Hr), never in the
+//   arguments of `docker run` (hotfix review 2, P4).
 import * as path from 'path';
 import { HELPER_ENV_NAMES } from './localEnv';
 import { repositoryFolder } from '../names';
@@ -207,57 +210,138 @@ function substituteText(text: string, resolve: (match: string, name: string, arg
  * `${env}` or `${localEnv}` without a variable name, where the CLI stops with an error.
  */
 export function substituteCliVariables<T>(value: T, variables: CliVariables): T {
+  return resolveCliVariables(value, variables).value;
+}
+
+/**
+ * substituteCliVariables, with the leftovers of the first pass (hotfix review 2, P1): the expressions of the strings of
+ * `value`, as they are written there, that the first pass keeps as written and that name a variable that the Dev
+ * Container CLI resolves (CLI_VARIABLE_NAMES: a variable of the process that may be set, a workspace folder that is not
+ * known, `${containerEnv:…}`, `${env}` without a name). Found on the raw strings while they are substituted, never by a
+ * scan of the result: a result can hide such an expression (`${localEnv:A:$}{,src=${localEnv:TERM}` becomes
+ * `${,src=${localEnv:TERM}`, whose first match names no variable), and it can show one that the CLI never resolves (the
+ * CLI does not read a result again in the same pass). In order, without duplicates.
+ */
+export function resolveCliVariables<T>(value: T, variables: CliVariables): { value: T; leftovers: string[] } {
   const env = variables.env ?? {};
   const mayBeSet = variables.mayBeSet ?? (() => false);
+  const leftovers = new Set<string>();
+  const left = (match: string): string => {
+    leftovers.add(match);
+    return match;
+  };
+  // The leftovers of the workspaceFolder of the configuration, which the CLI substitutes first (see below): a use of
+  // `${containerWorkspaceFolder…}` leaves them too.
+  let folderLeftovers: string[] = [];
+  const folder = (match: string, value: string | undefined): string => {
+    if (value === undefined) return left(match);
+    for (const expression of folderLeftovers) leftovers.add(expression);
+    return value;
+  };
   const local = (match: string, name: string, args: string[], containerFolder: string | undefined): string => {
     switch (name) {
       case 'env':
       case 'localEnv': {
-        if (args.length === 0) return match;
+        if (args.length === 0) return left(match);
         const variable = args[0];
         const known = Object.prototype.hasOwnProperty.call(env, variable) ? env[variable] : undefined;
         if (typeof known === 'string') return known;
-        if (mayBeSet(variable)) return match;
+        if (mayBeSet(variable)) return left(match);
         return args.length > 1 ? args[1] : '';
       }
       case 'localWorkspaceFolder':
-        return variables.localWorkspaceFolder ?? match;
+        return variables.localWorkspaceFolder ?? left(match);
       case 'localWorkspaceFolderBasename':
-        return variables.localWorkspaceFolder !== undefined ? path.posix.basename(variables.localWorkspaceFolder) : match;
+        return variables.localWorkspaceFolder !== undefined ? path.posix.basename(variables.localWorkspaceFolder) : left(match);
       case 'containerWorkspaceFolder':
-        return containerFolder ?? match;
+        return folder(match, containerFolder);
       case 'containerWorkspaceFolderBasename':
-        return containerFolder !== undefined ? path.posix.basename(containerFolder) : match;
+        return folder(match, containerFolder !== undefined ? path.posix.basename(containerFolder) : undefined);
       default:
-        return match;
+        return CLI_VARIABLE_NAMES.includes(name) ? left(match) : match;
     }
   };
   // The CLI substitutes the workspaceFolder of the configuration itself first, with its unsubstituted value for
   // `${containerWorkspaceFolder}` (Fo); an empty one is used as it is.
   const raw = variables.containerWorkspaceFolder;
   const containerFolder = raw ? substituteText(raw, (match, name, args) => local(match, name, args, raw)) : raw;
+  folderLeftovers = [...leftovers];
+  leftovers.clear();
   const first = mapStrings(value, (text) => substituteText(text, (match, name, args) => local(match, name, args, containerFolder)));
   const id = variables.devcontainerId;
-  if (!id) return first as T;
-  return mapStrings(first, (text) => substituteText(text, (match, name) => (name === DEVCONTAINER_ID_VARIABLE ? id : match))) as T;
+  return { value: (id ? devcontainerIdPass(first, id) : first) as T, leftovers: [...leftovers] };
+}
+
+/** The second pass of the CLI (tg): every expression named `devcontainerId`, with or without arguments, becomes `id`. */
+function devcontainerIdPass(value: unknown, id: string): unknown {
+  return mapStrings(value, (text) => substituteText(text, (match, name) => (name === DEVCONTAINER_ID_VARIABLE ? id : match)));
 }
 
 /**
- * The expressions `${…}` that are left in a substituted text (substituteCliVariables) and name a variable that the
- * Dev Container CLI resolves: a variable of the process that may be set (its value is not known), a workspace folder
- * that is not known, `${containerEnv:…}`, or an expression without a variable name. Not `${devcontainerId}`, which the
- * CLI resolves to an opaque ID that cannot be the name of a volume of Dev Environments, and not unknown names, which
- * reach Docker as they are written (a `$` in the name of a volume is refused by Docker). In order, without duplicates.
+ * The ID that the checks put in place of `${devcontainerId}` (hotfix review 2, P6), shaped like the ID that the CLI
+ * computes (52 characters of base 32, `0-9a-v`), without any of `, = " $ { } :`, and named like no volume of Dev
+ * Environments or of the workspace helper. The ID of a container is not known before `up`, and the CLI replaces the
+ * whole expression, also one with arguments (`${devcontainerId:,type=bind}`), so its text must not be read as fields
+ * of a mount. A name with it is never the name of a real volume (mountedVolumeNames skips it), and a configuration that
+ * writes it is not supported (hostAccessFindings).
  */
-export function unresolvedCliVariables(text: string): string[] {
-  const found: string[] = [];
+export const DEVCONTAINER_ID_PLACEHOLDER = `devcontaineridplaceholder${'v'.repeat(27)}`;
+
+/**
+ * `value` after the second pass of the CLI with DEVCONTAINER_ID_PLACEHOLDER for the ID: what Docker gets, up to the
+ * ID, for a value that the first pass has substituted (hotfix review 2, P6).
+ */
+export function withDevcontainerIdPlaceholder<T>(value: T): T {
+  return devcontainerIdPass(value, DEVCONTAINER_ID_PLACEHOLDER) as T;
+}
+
+/**
+ * The names of the variables that the CLI resolves in its second pass over the runArgs and appPort of the override
+ * configuration at `up` (Fo): not `containerEnv`, which it resolves only for the lifecycle commands of an existing
+ * container, never in the arguments of `docker run` (hotfix review 2, P4).
+ */
+export const SECOND_PASS_VARIABLE_NAMES: readonly string[] = CLI_VARIABLE_NAMES.filter((name) => name !== 'containerEnv');
+
+/**
+ * The expressions `${…}` of a text that name a variable that the Dev Container CLI resolves (`names`, by default
+ * CLI_VARIABLE_NAMES): for a text that the CLI substitutes (again) as it is, such as the runArgs of the override
+ * configuration (secondPassProblems, with SECOND_PASS_VARIABLE_NAMES), or a text that the CLI has substituted already
+ * and that a mount of the configuration uses: a variable of the process that may be set (its value is not known), a
+ * workspace folder that is not known, `${containerEnv:…}`, or an expression without a variable name. Not
+ * `${devcontainerId}`, which the CLI resolves to an opaque ID, and not unknown names, which reach Docker as they are
+ * written (a `$` in the name of a volume is refused by Docker). In order, without duplicates. The leftovers of the
+ * image metadata are found on its raw strings instead (resolveCliVariables).
+ */
+export function unresolvedCliVariables(text: string, names: readonly string[] = CLI_VARIABLE_NAMES): string[] {
+  const found = new Set<string>();
   for (const match of variableMatches(text)) {
     const name = nameOf(match.inner);
-    if (name === DEVCONTAINER_ID_VARIABLE || !CLI_VARIABLE_NAMES.includes(name)) continue;
-    const expression = text.slice(match.start, match.end);
-    if (!found.includes(expression)) found.push(expression);
+    if (name === DEVCONTAINER_ID_VARIABLE || !names.includes(name)) continue;
+    found.add(text.slice(match.start, match.end));
   }
-  return found;
+  return [...found];
+}
+
+/** Whether a string of `value` (values and keys, recursively) holds `text`. */
+export function containsText(value: unknown, text: string): boolean {
+  const pending: unknown[] = [value];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (typeof next === 'string') {
+      if (next.includes(text)) return true;
+    } else if (next !== null && typeof next === 'object' && !seen.has(next)) {
+      seen.add(next);
+      if (Array.isArray(next)) for (const entry of next) pending.push(entry);
+      else {
+        for (const [key, entry] of Object.entries(next)) {
+          if (key.includes(text)) return true;
+          pending.push(entry);
+        }
+      }
+    }
+  }
+  return false;
 }
 
 /**

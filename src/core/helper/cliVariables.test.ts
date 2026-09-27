@@ -6,16 +6,22 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
+import { isDevContainersCloneVolumeName } from '../devContainers';
+import { ENVIRONMENT_VOLUME_PATTERN, HELPER_CACHE_VOLUME } from '../names';
 import {
+  DEVCONTAINER_ID_PLACEHOLDER,
   HELPER_KNOWN_ENV,
   HELPER_PROCESS_ENV_NAMES,
   MAX_CLI_TEXT_LENGTH,
+  SECOND_PASS_VARIABLE_NAMES,
   helperCliVariables,
   mayBeSetInHelper,
+  resolveCliVariables,
   substituteCliVariables,
   textLengths,
   unresolvedCliVariables,
   variableMatches,
+  withDevcontainerIdPlaceholder,
   type CliVariables,
 } from './cliVariables';
 import { helperRunArgs } from './workspaceHelper';
@@ -204,6 +210,55 @@ describe('unresolvedCliVariables (hotfix M1)', () => {
     ['plain', []],
   ])('%s', (text, expected) => {
     expect(unresolvedCliVariables(text)).toEqual(expected);
+  });
+});
+
+describe('resolveCliVariables: the leftovers of the raw strings (hotfix review 2, P1)', () => {
+  const variables = helperCliVariables('acme/api');
+  it.each<[string, unknown, string, string[]]>([
+    ['none', 'source=${localEnv:HOME}/.ssh,${localEnv:NOPE:x}', 'source=/root/.ssh,x', []],
+    ['a variable of the helper process', '${localEnv:TERM:x}-${env:PWD}', '${localEnv:TERM:x}-${env:PWD}', ['${localEnv:TERM:x}', '${env:PWD}']],
+    ['a leftover that the result hides', 'dst=/y${localEnv:NOPE:$}{,src=${localEnv:TERM:v}', 'dst=/y${,src=${localEnv:TERM:v}', ['${localEnv:TERM:v}']],
+    ['a result that only looks like a leftover', '${localEnv:NOPE:$}{localEnv:TERM}', '${localEnv:TERM}', []],
+    ['${containerEnv:…} and ${env} without a name', '${containerEnv:A}${env}', '${containerEnv:A}${env}', ['${containerEnv:A}', '${env}']],
+    ['not ${devcontainerId} and unknown names', '${devcontainerId:x}${unknown}', '${devcontainerId:x}${unknown}', []],
+    ['the strings of an object, once each', { a: ['${env:TERM}', '${env:TERM}'], b: '${localWorkspaceFolderBasename}' }, '', ['${env:TERM}']],
+  ])('%s', (_name, value, expected, leftovers) => {
+    const result = resolveCliVariables(value, variables);
+    if (typeof value === 'string') expect(result.value).toBe(expected);
+    expect(result.value).toEqual(substituteCliVariables(value, variables));
+    expect(result.leftovers).toEqual(leftovers);
+  });
+
+  it('counts the leftovers of the workspace folders that are not known, and of a workspaceFolder with a leftover', () => {
+    expect(resolveCliVariables('${localWorkspaceFolder}${containerWorkspaceFolderBasename}', {}).leftovers).toEqual(['${localWorkspaceFolder}', '${containerWorkspaceFolderBasename}']);
+    const folder = { ...variables, containerWorkspaceFolder: '/workspaces/${localEnv:TERM}' };
+    expect(resolveCliVariables('${containerWorkspaceFolder}/x', folder)).toEqual({ value: '/workspaces/${localEnv:TERM}/x', leftovers: ['${localEnv:TERM}'] });
+    expect(resolveCliVariables('plain', folder).leftovers).toEqual([]);
+  });
+});
+
+describe('the placeholder of ${devcontainerId} (hotfix review 2, P6)', () => {
+  it('is shaped like the ID of the CLI, and named like no volume of Dev Environments', () => {
+    expect(DEVCONTAINER_ID_PLACEHOLDER).toMatch(/^[0-9a-v]{52}$/);
+    expect(cli.Q_(ID_LABELS)).toMatch(/^[0-9a-v]{52}$/);
+    for (const name of [DEVCONTAINER_ID_PLACEHOLDER, `x-${DEVCONTAINER_ID_PLACEHOLDER}`, `devenv-x-${DEVCONTAINER_ID_PLACEHOLDER}`]) {
+      expect(ENVIRONMENT_VOLUME_PATTERN.test(name)).toBe(false);
+      expect(isDevContainersCloneVolumeName(name)).toBe(false);
+      expect(name).not.toBe(HELPER_CACHE_VOLUME);
+    }
+  });
+
+  it('replaces every expression named devcontainerId as the second pass of the CLI does', () => {
+    const text = 'a${devcontainerId}b${devcontainerId:,type=bind}c${devcontainerId:x:y}${other}';
+    expect(withDevcontainerIdPlaceholder(text)).toBe(`a${DEVCONTAINER_ID_PLACEHOLDER}b${DEVCONTAINER_ID_PLACEHOLDER}c${DEVCONTAINER_ID_PLACEHOLDER}\${other}`);
+    const id = cli.Q_(ID_LABELS);
+    expect(withDevcontainerIdPlaceholder(text).split(DEVCONTAINER_ID_PLACEHOLDER).join(id)).toBe(cli.tg(ID_LABELS, text));
+  });
+
+  it('leaves ${containerEnv:…} out of the names of the second pass (hotfix review 2, P4)', () => {
+    expect(SECOND_PASS_VARIABLE_NAMES).not.toContain('containerEnv');
+    expect(unresolvedCliVariables('X=${containerEnv:PATH}${env:TERM}', SECOND_PASS_VARIABLE_NAMES)).toEqual(['${env:TERM}']);
   });
 });
 
