@@ -110,9 +110,11 @@ export function isRunningState(state: string): boolean {
  * - no record at all → never acted on: no computer sent a heartbeat for it (for example an environment of the host's own
  *   local Docker, or of a build without heartbeats), so the monitor cannot know whether it is in use (coordinator
  *   decision of PR 2; the open pipeline writes the first heartbeat of every remote environment);
- * - a record of the environment says keepRunning → it keeps running;
- * - otherwise the last contact is the newest record (`at`), and the limit is its `limitSeconds`. It stops when more than
- *   the limit has passed since the last contact.
+ * - the newest record decides (review round 2 of PR #39, M1): the record with the latest `at` of all sources (the time
+ *   the host received it; for equal times, one that says keepRunning). It says keepRunning → it keeps running;
+ *   otherwise it stops when more than its `limitSeconds` has passed since its `at`. So a later choice of any computer
+ *   overrules an older keep of another one (for example of a computer that no longer sends), and the keep of a computer
+ *   that still sends holds until someone makes a newer choice.
  * The gap rule: when the time since the previous tick is larger than `gapMs` (the host or the container was paused, the
  * clock was changed), and at the first tick, nothing is stopped for `graceMs`: the computers that still use their
  * environments send heartbeats again first (they retry every tick of their Session Monitor).
@@ -155,11 +157,13 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     const records = recordsOf.get(environmentId) ?? [];
     // Without any record the monitor never acts on it.
     if (records.length === 0) continue;
-    if (records.some((record) => record.keepRunning)) {
+    const newest = records.reduce((best, record) =>
+      record.at > best.at || (record.at === best.at && record.keepRunning && !best.keepRunning) ? record : best,
+    );
+    if (newest.keepRunning) {
       kept.push(environmentId);
       continue;
     }
-    const newest = records.reduce((best, record) => (record.at > best.at ? record : best));
     if (grace || now - newest.at <= newest.limitSeconds * 1000) continue;
     const minutes = Math.round((now - newest.at) / 60_000);
     const reason = `no computer sent a heartbeat for ${minutes} minutes (limit ${newest.limitSeconds / 60} minutes)`;

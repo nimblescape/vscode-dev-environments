@@ -228,11 +228,11 @@ async function activateExtension(
     remoteMonitor: {
       ensure: async (host, helperTag, signal) =>
         remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal),
-      heartbeat: async (_host, environmentId, keepRunning) => {
+      heartbeat: async (_host, environmentId, keepRunning, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),
           limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
-          environments: [{ id: environmentId, keepRunning }],
+          environments: [{ id: environmentId, keepRunning, seq }],
         });
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },
@@ -346,11 +346,11 @@ async function activateExtension(
     }),
     // Unit 7, PR 2: Close and Keep Running tells the Session Monitor on the remote host at once.
     remoteMonitor: {
-      sendKeepRunning: async (environmentId) => {
+      sendKeepRunning: async (environmentId, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),
           limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
-          environments: [{ id: environmentId, keepRunning: true }],
+          environments: [{ id: environmentId, keepRunning: true, seq }],
         });
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },

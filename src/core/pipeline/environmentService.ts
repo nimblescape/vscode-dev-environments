@@ -293,9 +293,10 @@ export interface EnvironmentRemoteMonitor {
   ensure(host: string, helperTag: string, signal?: AbortSignal): Promise<unknown>;
   /**
    * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
-   * only on environments that a computer sent a heartbeat for.
+   * only on environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
+   * (HeartbeatEntry).
    */
-  heartbeat(host: string, environmentId: string, keepRunning: boolean): Promise<{ ok: true } | { ok: false; detail: string }>;
+  heartbeat(host: string, environmentId: string, keepRunning: boolean, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
   /** Removes the heartbeat record of this computer for a deleted environment (best effort). */
   forget(host: string, environmentId: string): Promise<void>;
 }
@@ -4663,7 +4664,9 @@ export class EnvironmentService {
       this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);
     }
     this.throwIfCancelled(ctx.signal);
-    const env = ctx.env;
+    // Review round 2 of PR #39 (L1): `seq` is the time at which the flags are read; the entry is read again for them.
+    const seq = this.deps.clock.now();
+    const env = (await this.deps.registry.get(ctx.env.id)) ?? ctx.env;
     const settings = this.deps.settings();
     const keepRunning =
       env.keepRunning === true ||
@@ -4671,7 +4674,7 @@ export class EnvironmentService {
       settings.stopOnClose === false ||
       (settings.respectShutdownActionNone === true && env.shutdownActionNone === true);
     try {
-      const sent = await remoteMonitor.heartbeat(target.host, env.id, keepRunning);
+      const sent = await remoteMonitor.heartbeat(target.host, env.id, keepRunning, seq);
       if (!sent.ok) {
         this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${target.host} failed; the Session Monitor of this computer tries again. ${sent.detail}`);
       }

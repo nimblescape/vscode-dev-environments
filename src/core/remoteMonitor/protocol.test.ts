@@ -53,7 +53,7 @@ describe('ids of the heartbeat protocol', () => {
 });
 
 describe('parseHeartbeatInput (strict)', () => {
-  const valid = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: false }] };
+  const valid = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: false, seq: 1_790_000_000_000 }] };
 
   it('accepts a valid heartbeat, also without environments', () => {
     expect(parseHeartbeatInput(input(valid))).toEqual(valid);
@@ -75,20 +75,26 @@ describe('parseHeartbeatInput (strict)', () => {
     ['a limit that is no integer', { ...valid, limitSeconds: 60.5 }],
     ['a limit as text', { ...valid, limitSeconds: '600' }],
     ['environments that are no list', { ...valid, environments: {} }],
-    ['an environment with an invalid id', { ...valid, environments: [{ id: '../x', keepRunning: true }] }],
-    ['an environment with keepRunning as text', { ...valid, environments: [{ id: ID, keepRunning: 'true' }] }],
-    ['an environment with an unknown key', { ...valid, environments: [{ id: ID, keepRunning: true, x: 1 }] }],
+    ['an environment with an invalid id', { ...valid, environments: [{ id: '../x', keepRunning: true, seq: 1 }] }],
+    ['an environment with keepRunning as text', { ...valid, environments: [{ id: ID, keepRunning: 'true', seq: 1 }] }],
+    ['an environment with an unknown key', { ...valid, environments: [{ id: ID, keepRunning: true, seq: 1, x: 1 }] }],
+    // Review round 2 of PR #39 (L1): every entry carries its seq, a safe non-negative integer.
+    ['an environment without seq', { ...valid, environments: [{ id: ID, keepRunning: true }] }],
+    ['a negative seq', { ...valid, environments: [{ id: ID, keepRunning: true, seq: -1 }] }],
+    ['a seq that is no integer', { ...valid, environments: [{ id: ID, keepRunning: true, seq: 1.5 }] }],
+    ['a seq beyond the safe integers', { ...valid, environments: [{ id: ID, keepRunning: true, seq: 2 ** 60 }] }],
+    ['a seq as text', { ...valid, environments: [{ id: ID, keepRunning: true, seq: '1' }] }],
     ['an environment that is no object', { ...valid, environments: [ID] }],
     [
       'too many environments',
-      { ...valid, environments: Array.from({ length: MAX_HEARTBEAT_ENVIRONMENTS + 1 }, () => ({ id: ID, keepRunning: false })) },
+      { ...valid, environments: Array.from({ length: MAX_HEARTBEAT_ENVIRONMENTS + 1 }, () => ({ id: ID, keepRunning: false, seq: 1 })) },
     ],
   ])('refuses %s', (_name, value) => {
     expect(parseHeartbeatInput(typeof value === 'string' ? value : input(value))).toBeUndefined();
   });
 
   it('accepts the largest number of environments', () => {
-    const environments = Array.from({ length: MAX_HEARTBEAT_ENVIRONMENTS }, () => ({ id: ID, keepRunning: true }));
+    const environments = Array.from({ length: MAX_HEARTBEAT_ENVIRONMENTS }, () => ({ id: ID, keepRunning: true, seq: 0 }));
     expect(parseHeartbeatInput(input({ ...valid, environments }))?.environments).toHaveLength(MAX_HEARTBEAT_ENVIRONMENTS);
   });
 
@@ -99,14 +105,17 @@ describe('parseHeartbeatInput (strict)', () => {
 
 describe('records and their file names', () => {
   it('parses a valid record and refuses invalid ones', () => {
-    expect(parseHeartbeatRecord(input({ at: 1000, keepRunning: true, limitSeconds: 600 }))).toEqual({ at: 1000, keepRunning: true, limitSeconds: 600 });
+    expect(parseHeartbeatRecord(input({ at: 1000, keepRunning: true, limitSeconds: 600, seq: 7 }))).toEqual({ at: 1000, keepRunning: true, limitSeconds: 600, seq: 7 });
     for (const value of [
-      { at: -1, keepRunning: true, limitSeconds: 600 },
-      { at: 1.5, keepRunning: true, limitSeconds: 600 },
-      { at: 1000, keepRunning: 'yes', limitSeconds: 600 },
-      { at: 1000, keepRunning: true, limitSeconds: 59 },
-      { at: 1000, keepRunning: true, limitSeconds: 86_401 },
-      { at: 1000, keepRunning: true },
+      { at: -1, keepRunning: true, limitSeconds: 600, seq: 7 },
+      { at: 1.5, keepRunning: true, limitSeconds: 600, seq: 7 },
+      { at: 1000, keepRunning: 'yes', limitSeconds: 600, seq: 7 },
+      { at: 1000, keepRunning: true, limitSeconds: 59, seq: 7 },
+      { at: 1000, keepRunning: true, limitSeconds: 86_401, seq: 7 },
+      { at: 1000, keepRunning: true, seq: 7 },
+      // A record without seq is invalid (review round 2 of PR #39, L1).
+      { at: 1000, keepRunning: true, limitSeconds: 600 },
+      { at: 1000, keepRunning: true, limitSeconds: 600, seq: -3 },
       [1000],
     ]) {
       expect(parseHeartbeatRecord(input(value)), JSON.stringify(value)).toBeUndefined();
@@ -128,7 +137,7 @@ describe('records and their file names', () => {
 
 describe('the subcommands of the remote monitor', () => {
   it('passes the heartbeat as one JSON argument, and the ids as arguments', () => {
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true }] };
+    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 5 }] };
     expect(heartbeatCommand(heartbeat)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(recordsCommand(ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', ID]);
     expect(forgetCommand(SOURCE, ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
@@ -149,9 +158,18 @@ describe('the subcommands of the remote monitor', () => {
     // The own record never counts.
     expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: now, keepRunning: false }] }, SOURCE)).toBe(false);
     expect(inUseByOtherComputer({ now, records: [] }, SOURCE)).toBe(false);
-    // Review round 1 of PR #39 (F2): another computer keeps it running, however old its record.
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 30 * 24 * 3_600_000, keepRunning: true }] }, SOURCE)).toBe(true);
+    // Another computer keeps it running, however old its record, as long as this computer made no newer choice.
+    const old = now - 30 * 24 * 3_600_000;
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }] }, SOURCE)).toBe(true);
     expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: 1, keepRunning: true }] }, SOURCE)).toBe(false);
+    // Review round 2 of PR #39 (M1): the newest record decides. A newer record of this computer overrules an older keep
+    // of another one (for example a computer that no longer sends); a keep that is at least as new still holds.
+    const own = (at: number) => ({ source: SOURCE, at, keepRunning: false });
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }, own(old + 1)] }, SOURCE)).toBe(false);
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old + 1, keepRunning: true }, own(old)] }, SOURCE)).toBe(true);
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }, own(old)] }, SOURCE)).toBe(true);
+    // A fresh heartbeat of another computer counts whatever this computer sent.
+    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 1000, keepRunning: false }, own(now)] }, SOURCE)).toBe(true);
   });
 });
 

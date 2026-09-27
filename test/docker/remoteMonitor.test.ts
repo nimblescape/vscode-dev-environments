@@ -88,7 +88,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
   }
 
   /** Writes a record into the volume of the monitor as a heartbeat of long ago would have left it. */
-  function writeRecord(source: string, environmentId: string, record: { at: number; keepRunning: boolean; limitSeconds: number }): void {
+  function writeRecord(source: string, environmentId: string, record: { at: number; keepRunning: boolean; limitSeconds: number; seq: number }): void {
     const file = `/state/heartbeats/${heartbeatFileName(source, environmentId)}`;
     cli.ok(['exec', '-i', containerName, 'sh', '-c', `mkdir -p /state/heartbeats && cat > ${file}`], JSON.stringify(record));
   }
@@ -136,9 +136,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
     startEnvironmentContainer(names.kept, ids.kept);
     startEnvironmentContainer(names.fresh, ids.fresh);
     const longAgo = Date.now() - 30 * 60_000;
-    writeRecord(SOURCE, ids.stale, { at: longAgo, keepRunning: false, limitSeconds: 60 });
-    writeRecord(OTHER_SOURCE, ids.kept, { at: longAgo, keepRunning: true, limitSeconds: 60 });
-    const heartbeat = await monitor.heartbeat({ source: SOURCE, limitSeconds: 60, environments: [{ id: ids.fresh, keepRunning: false }] });
+    writeRecord(SOURCE, ids.stale, { at: longAgo, keepRunning: false, limitSeconds: 60, seq: longAgo });
+    writeRecord(OTHER_SOURCE, ids.kept, { at: longAgo, keepRunning: true, limitSeconds: 60, seq: longAgo });
+    const heartbeat = await monitor.heartbeat({ source: SOURCE, limitSeconds: 60, environments: [{ id: ids.fresh, keepRunning: false, seq: Date.now() }] });
     expect(heartbeat.ok).toBe(true);
 
     await timings.measure('stop of the stale container', () => waitUntil(() => !running(names.stale), 'the stop of the stale container'));

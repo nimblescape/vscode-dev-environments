@@ -28,6 +28,7 @@ import {
   parseHeartbeatInput,
   parseHeartbeatRecord,
   type HeartbeatInput,
+  type HeartbeatRecord,
   type RecordsOutput,
 } from '../core/remoteMonitor/protocol';
 import {
@@ -86,32 +87,85 @@ export async function readRecords(dir: string): Promise<RemoteRecord[]> {
   for (const name of names) {
     const parts = parseHeartbeatFileName(name);
     if (!parts) continue;
-    try {
-      const file = path.join(dir, name);
-      const stat = await fs.promises.lstat(file);
-      if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) continue;
-      const record = parseHeartbeatRecord(await fs.promises.readFile(file, 'utf8'));
-      if (record) records.push({ ...parts, ...record });
-    } catch {
-      // Removed meanwhile, or not readable: ignored.
-    }
+    // Removed meanwhile, or not readable: ignored.
+    const record = await readRecordFile(path.join(dir, name));
+    if (record) records.push({ ...parts, ...record });
   }
   return records;
 }
 
-/** Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. */
-export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<void> {
+/** A lock of a record older than this is left over (a `docker exec` that was killed) and is removed. */
+const RECORD_LOCK_STALE_MS = 10_000;
+/** How long a heartbeat waits for the lock of a record. */
+const RECORD_LOCK_WAIT_MS = 5_000;
+
+/**
+ * Runs `fn` while holding the lock of one record (`.<name>.lock`, created with `wx`), so that two heartbeats of the same
+ * source (two `docker exec` at the same time) read and replace the record one after the other.
+ */
+async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
+  const lock = path.join(dir, `.${name}.lock`);
+  const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      await fs.promises.writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const stat = await fs.promises.lstat(lock).catch(() => undefined);
+      if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) {
+        await fs.promises.rm(lock, { force: true });
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await fs.promises.rm(lock, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. An entry whose
+ * `seq` is lower than the `seq` of the existing record of the same source is ignored (review round 2 of PR #39, L1): the
+ * newer choice of that computer stays. Returns the ids of the ignored entries.
+ */
+export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<string[]> {
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  const ignored: string[] = [];
   for (const environment of input.environments) {
     const name = heartbeatFileName(input.source, environment.id);
-    const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
-    const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds };
-    try {
-      await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
-      await fs.promises.rename(temp, path.join(dir, name));
-    } finally {
-      await fs.promises.rm(temp, { force: true }).catch(() => undefined);
-    }
+    const file = path.join(dir, name);
+    await withRecordLock(dir, name, async () => {
+      const existing = await readRecordFile(file);
+      if (existing !== undefined && existing.seq > environment.seq) {
+        ignored.push(environment.id);
+        return;
+      }
+      const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
+      const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
+      try {
+        await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
+        await fs.promises.rename(temp, file);
+      } finally {
+        await fs.promises.rm(temp, { force: true }).catch(() => undefined);
+      }
+    });
+  }
+  return ignored;
+}
+
+/** One record file: a regular file of at most 4 KB with a valid record; `undefined` for anything else. */
+async function readRecordFile(file: string): Promise<HeartbeatRecord | undefined> {
+  try {
+    const stat = await fs.promises.lstat(file);
+    if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) return undefined;
+    return parseHeartbeatRecord(await fs.promises.readFile(file, 'utf8'));
+  } catch {
+    return undefined;
   }
 }
 

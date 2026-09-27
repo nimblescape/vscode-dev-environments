@@ -181,7 +181,7 @@ describe('RemoteSessionMonitor.ensure', () => {
 describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
   it('sends a heartbeat with docker exec and a time limit', async () => {
     const docker = new FakeDocker(() => result(0));
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true }] };
+    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 1 }] };
     expect(await monitor(docker).heartbeat(heartbeat)).toEqual({ ok: true, stdout: '' });
     expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(docker.calls[0].options?.timeoutMs).toBe(20_000);

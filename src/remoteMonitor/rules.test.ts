@@ -64,11 +64,33 @@ describe('decide of the remote Session Monitor', () => {
     expect(decide({ now: T0, containers: [container(A)], records: later, state: running() }).stop).toEqual([]);
   });
 
-  it('keeps an environment that any record keeps running, however old', () => {
-    const records = [record(A, T0 - 5 * 24 * 60 * MINUTE, { keepRunning: true }), record(A, T0 - 60 * MINUTE, { source: OTHER })];
+  it('keeps an environment whose newest record keeps it running, however old', () => {
+    const records = [record(A, T0 - 5 * 24 * 60 * MINUTE, { keepRunning: true }), record(A, T0 - 6 * 24 * 60 * MINUTE, { source: OTHER })];
     const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
     expect(decision.stop).toEqual([]);
     expect(decision.kept).toEqual([A]);
+  });
+
+  // Review round 2 of PR #39 (M1): the newest record decides, across all sources.
+  it('an orphaned keep is overruled by a newer record without the flag of another source', () => {
+    // OTHER kept it long ago and never sent again (for example a computer.id that was replaced).
+    const records = [record(A, T0 - 30 * 24 * 60 * MINUTE, { source: OTHER, keepRunning: true }), record(A, T0 - 11 * MINUTE)];
+    const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
+    expect(decision.kept).toEqual([]);
+    expect(decision.stop.map((stop) => stop.environmentId)).toEqual([A]);
+  });
+
+  it('a newer keep of another source wins over an older record without the flag', () => {
+    const records = [record(A, T0 - 60 * MINUTE), record(A, T0 - 30 * MINUTE, { source: OTHER, keepRunning: true })];
+    const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
+    expect(decision.kept).toEqual([A]);
+    expect(decision.stop).toEqual([]);
+  });
+
+  it('for records of the same time, a keep wins', () => {
+    const records = [record(A, T0 - 60 * MINUTE), record(A, T0 - 60 * MINUTE, { source: OTHER, keepRunning: true })];
+    expect(decide({ now: T0, containers: [container(A)], records, state: running() }).kept).toEqual([A]);
+    expect(decide({ now: T0, containers: [container(A)], records: [...records].reverse(), state: running() }).kept).toEqual([A]);
   });
 
   it('a new heartbeat without the flag ends the keeping', () => {

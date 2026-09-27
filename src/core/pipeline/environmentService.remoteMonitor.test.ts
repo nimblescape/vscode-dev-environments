@@ -15,6 +15,8 @@ import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 
 let h: Harness | undefined;
+/** The seq of each first heartbeat (review round 2 of PR #39, L1). */
+let seqs: number[] = [];
 
 afterEach(() => {
   h?.cleanup();
@@ -35,6 +37,7 @@ function setup(
   } = {},
 ): Setup {
   const calls: string[] = [];
+  seqs = [];
   const remoteMonitor: EnvironmentRemoteMonitor = {
     ensure: async (host, helperTag) => {
       calls.push(`ensure ${host} ${helperTag}`);
@@ -42,8 +45,9 @@ function setup(
       created.helper.calls.push('remote monitor');
       return behavior.ensure?.();
     },
-    heartbeat: async (host, environmentId, keepRunning) => {
+    heartbeat: async (host, environmentId, keepRunning, seq) => {
       calls.push(`heartbeat ${host} ${environmentId} ${keepRunning}`);
+      seqs.push(seq);
       created.helper.calls.push('first heartbeat');
       return (await behavior.heartbeat?.()) ?? { ok: true };
     },
@@ -89,6 +93,15 @@ describe('the Session Monitor on a remote host in the open pipeline', () => {
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box', keepRunning: true } });
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
     expect(calls).toContain(`heartbeat build-box ${ENV_ID} true`);
+  });
+
+  it('reads the flags from the registry again, with seq = the time before that read', async () => {
+    const { h, calls } = setup(REMOTE);
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(seqs).toHaveLength(1);
+    expect(Number.isSafeInteger(seqs[0]) && seqs[0] > 0).toBe(true);
+    expect(calls).toContain(`heartbeat build-box ${ENV_ID} false`);
   });
 
   it('sends the flag for every environment while stopOnClose is off', async () => {

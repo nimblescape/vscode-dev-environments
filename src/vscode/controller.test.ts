@@ -3242,13 +3242,13 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
 describe('Close and Keep Running (unit 7, PR 2)', () => {
   const REMOTE_TARGET = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
   let current: DockerTarget;
-  let sendKeepRunning: ReturnType<typeof vi.fn<(environmentId: string) => Promise<{ ok: true } | { ok: false; detail: string }>>>;
+  let sendKeepRunning: ReturnType<typeof vi.fn<(environmentId: string, seq: number) => Promise<{ ok: true } | { ok: false; detail: string }>>>;
   const order: string[] = [];
 
   function remoteHarness(options: { leaveCheckMs?: number } = {}): void {
     current = REMOTE_TARGET;
     order.length = 0;
-    sendKeepRunning = vi.fn(async (id: string) => {
+    sendKeepRunning = vi.fn(async (id: string, _seq: number) => {
       order.push(`heartbeat ${id}`);
       return { ok: true as const };
     });
@@ -3293,7 +3293,8 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     await h.registry.add(env);
     await connectHere(env);
     await run('closeAndKeepRunning', row('acme/api', env));
-    expect(sendKeepRunning).toHaveBeenCalledWith(ENV_ID);
+    // Review round 2 of PR #39 (L1): seq is the time right after the flag was set.
+    expect(sendKeepRunning).toHaveBeenCalledWith(ENV_ID, NOW);
     expect(order).toEqual([`heartbeat ${ENV_ID}`, 'close']);
     expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
   });

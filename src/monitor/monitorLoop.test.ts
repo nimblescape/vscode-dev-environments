@@ -1022,8 +1022,12 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
   let heartbeatResult: () => RunResult;
   let recordsResult: () => RunResult;
 
+  type SentHeartbeat = { source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean; seq: number }> };
+  const sentHeartbeats = (): SentHeartbeat[] =>
+    h.docker.execCalls.filter((call) => call.command[2] === 'heartbeat').map((call) => JSON.parse(call.command[3]) as SentHeartbeat);
+  /** The heartbeats without the seq of their entries (checked on its own). */
   const heartbeats = (): Array<{ source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean }> }> =>
-    h.docker.execCalls.filter((call) => call.command[2] === 'heartbeat').map((call) => JSON.parse(call.command[3]));
+    sentHeartbeats().map((item) => ({ ...item, environments: item.environments.map(({ id, keepRunning }) => ({ id, keepRunning })) }));
   const recordsCalls = (): ExecCall[] => h.docker.execCalls.filter((call) => call.command[2] === 'records');
 
   beforeEach(() => {
@@ -1059,6 +1063,8 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     // At 0 s, 30 s (not at every tick of 5 s).
     expect(sent).toHaveLength(2);
     expect(sent[0]).toEqual({ source: SOURCE, limitSeconds: 900, environments: [{ id: ID_A, keepRunning: false }] });
+    // Review round 2 of PR #39 (L1): seq is the time of the tick (the registry was read after it).
+    expect(sentHeartbeats().map((item) => item.environments[0].seq)).toEqual([T0, T0 + 30_000]);
     const call = h.docker.execCalls.find((item) => item.command[2] === 'heartbeat')!;
     expect(call.container).toBe('devenv-session-monitor');
     expect(call.command.slice(0, 2)).toEqual(['node', '/opt/devenv/monitor.js']);
@@ -1239,6 +1245,23 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
       await runUntil(h, T0 + WAITING_MS + 10 * TICK_MS);
       expect(h.docker.count('stop')).toBe(0);
       expect(h.logger.lines.filter((line) => line.includes('kept running by another computer'))).toHaveLength(1);
+    });
+
+    // Review round 2 of PR #39 (M1): the newest record decides; an orphaned keep of another computer does not block.
+    it('stops an environment whose keep of another computer is older than the own newest record', async () => {
+      await closedWindowScenario(h, { dockerHost: 'build-box' });
+      recordsResult = () =>
+        ok(
+          JSON.stringify({
+            now: 1_000_000_000,
+            records: [
+              { source: OTHER_SOURCE, at: 1_000, keepRunning: true },
+              { source: SOURCE, at: 1_000_000_000 - 200_000, keepRunning: false },
+            ],
+          }),
+        );
+      const results = await runUntil(h, T0 + WAITING_MS + 2 * TICK_MS);
+      expect(results.flatMap((result) => result.stopped)).toEqual([ID_A]);
     });
 
     it('stops as before when only its own record is fresh', async () => {

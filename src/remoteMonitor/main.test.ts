@@ -57,30 +57,84 @@ function recordFiles(): string[] {
   return fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
 }
 
-function writeRecord(source: string, environmentId: string, record: unknown): void {
+/** Writes a record file; `seq` is 0 unless the record names one. */
+function writeRecord(source: string, environmentId: string, record: Record<string, unknown>): void {
   const dir = heartbeatDir(stateDir);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, heartbeatFileName(source, environmentId)), JSON.stringify(record));
+  fs.writeFileSync(path.join(dir, heartbeatFileName(source, environmentId)), JSON.stringify({ seq: 0, ...record }));
+}
+
+function readRecord(source: string, environmentId: string): unknown {
+  return JSON.parse(fs.readFileSync(path.join(heartbeatDir(stateDir), heartbeatFileName(source, environmentId)), 'utf8'));
 }
 
 describe('monitor.js heartbeat', () => {
   it('writes one record per environment with the clock of the host, mode 0600', async () => {
-    const heartbeat = { source: SOURCE, limitSeconds: 300, environments: [{ id: A, keepRunning: false }, { id: B, keepRunning: true }] };
+    const heartbeat = { source: SOURCE, limitSeconds: 300, environments: [{ id: A, keepRunning: false, seq: 10 }, { id: B, keepRunning: true, seq: 10 }] };
     expect(await run(['heartbeat', JSON.stringify(heartbeat)])).toEqual({ code: 0, out: '', err: '' });
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), heartbeatFileName(SOURCE, B)].sort());
     const file = path.join(heartbeatDir(stateDir), heartbeatFileName(SOURCE, B));
-    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ at: T0, keepRunning: true, limitSeconds: 300 });
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ at: T0, keepRunning: true, limitSeconds: 300, seq: 10 });
     if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     // A later heartbeat replaces the record.
-    await run(['heartbeat', JSON.stringify({ ...heartbeat, environments: [{ id: B, keepRunning: false }] })], T0 + 1000);
-    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ at: T0 + 1000, keepRunning: false, limitSeconds: 300 });
+    await run(['heartbeat', JSON.stringify({ ...heartbeat, environments: [{ id: B, keepRunning: false, seq: 11 }] })], T0 + 1000);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ at: T0 + 1000, keepRunning: false, limitSeconds: 300, seq: 11 });
+    // The same seq replaces it too.
+    await run(['heartbeat', JSON.stringify({ ...heartbeat, environments: [{ id: B, keepRunning: true, seq: 11 }] })], T0 + 2000);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ at: T0 + 2000, keepRunning: true });
+    expect(fs.readdirSync(heartbeatDir(stateDir)).filter((name) => name.startsWith('.'))).toEqual([]);
+  });
+
+  // Review round 2 of PR #39 (L1): a heartbeat of the Session Monitor that read the registry before Close and Keep Running
+  // set the flag reaches the host after the window's heartbeat. The newer choice stays.
+  it('ignores an entry with a lower seq than the record of the same source: the race of Close and Keep Running', async () => {
+    const monitorSnapshotAt = T0 - 3000;
+    const windowSetFlagAt = T0 - 1000;
+    // 1. The window's heartbeat with keepRunning (seq: right after it set the flag) arrives first.
+    const window = { source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: true, seq: windowSetFlagAt }] };
+    expect((await run(['heartbeat', JSON.stringify(window)], T0)).code).toBe(0);
+    // 2. The heartbeat of the monitor tick that read the registry before the flag was set arrives later.
+    const monitor = { source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: monitorSnapshotAt }, { id: B, keepRunning: false, seq: monitorSnapshotAt }] };
+    expect((await run(['heartbeat', JSON.stringify(monitor)], T0 + 500)).code).toBe(0);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: true, limitSeconds: 600, seq: windowSetFlagAt });
+    // The other entry of the same heartbeat is written.
+    expect(readRecord(SOURCE, B)).toEqual({ at: T0 + 500, keepRunning: false, limitSeconds: 600, seq: monitorSnapshotAt });
+    // 3. The next monitor tick (after the flag was set) replaces it.
+    const next = { source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: true, seq: T0 + 2000 }] };
+    await run(['heartbeat', JSON.stringify(next)], T0 + 5000);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0 + 5000, keepRunning: true, limitSeconds: 600, seq: T0 + 2000 });
+  });
+
+  it('a record of another source does not hold back an entry with a lower seq', async () => {
+    writeRecord(OTHER, A, { at: T0, keepRunning: true, limitSeconds: 600, seq: 9_999_999_999_999 });
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: 1 });
+  });
+
+  it('two heartbeats at the same time: the higher seq stays, whatever the order of the writes', async () => {
+    const entry = (seq: number, keepRunning: boolean) => JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning, seq }] });
+    await Promise.all([run(['heartbeat', entry(2, true)]), run(['heartbeat', entry(1, false)]), run(['heartbeat', entry(2, true)])]);
+    expect(readRecord(SOURCE, A)).toMatchObject({ keepRunning: true, seq: 2 });
+  });
+
+  it('a left-over lock of a killed heartbeat is taken over after 10 seconds', async () => {
+    const dir = heartbeatDir(stateDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, `.${heartbeatFileName(SOURCE, A)}.lock`);
+    fs.writeFileSync(lock, '1');
+    const old = new Date(Date.now() - 20_000);
+    fs.utimesSync(lock, old, old);
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
+    expect(readRecord(SOURCE, A)).toMatchObject({ seq: 1 });
+    expect(fs.existsSync(lock)).toBe(false);
   });
 
   it.each<[string, string[]]>([
     ['invalid JSON', ['heartbeat', '{']],
-    ['an invalid environment id', ['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: '../../x', keepRunning: true }] })]],
+    ['an invalid environment id', ['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: '../../x', keepRunning: true, seq: 1 }] })]],
     ['a missing argument', ['heartbeat']],
     ['an argument too many', ['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [] }), 'x']],
+    ['an entry without seq', ['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: true }] })]],
   ])('exits with 2 and writes nothing for %s', async (_name, argv) => {
     const result = await run(argv);
     expect(result.code).toBe(EXIT_INVALID);
@@ -128,6 +182,7 @@ describe('readRecords', () => {
     const dir = heartbeatDir(stateDir);
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     writeRecord(OTHER, A, { at: T0, keepRunning: 'yes', limitSeconds: 600 });
+    writeRecord('11111111111111111111111111111111', B, { at: T0, keepRunning: true, limitSeconds: 600, seq: undefined });
     fs.writeFileSync(path.join(dir, 'notes.json'), '{}');
     fs.writeFileSync(path.join(dir, `.${heartbeatFileName(SOURCE, B)}.1.tmp`), JSON.stringify({ at: T0, keepRunning: true, limitSeconds: 600 }));
     fs.mkdirSync(path.join(dir, heartbeatFileName(OTHER, B)));
@@ -138,7 +193,7 @@ describe('readRecords', () => {
       fs.writeFileSync(target, JSON.stringify({ at: T0, keepRunning: true, limitSeconds: 600 }));
       fs.symlinkSync(target, path.join(dir, heartbeatFileName('fedcba9876543210fedcba9876543212', B)));
     }
-    expect(await readRecords(dir)).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 600 }]);
+    expect(await readRecords(dir)).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 600, seq: 0 }]);
   });
 });
 

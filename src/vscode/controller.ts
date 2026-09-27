@@ -140,7 +140,13 @@ export interface ControllerDeps {
    * Docker host of the current context (Close and Keep Running). Without it, Close and Keep Running refuses a remote
    * environment.
    */
-  remoteMonitor?: { sendKeepRunning(environmentId: string): Promise<{ ok: true } | { ok: false; detail: string }> };
+  remoteMonitor?: {
+    /**
+     * `seq` (review round 2 of PR #39, L1): the wall clock right after the flag was set in the registry, so that a
+     * heartbeat of the Session Monitor that read the registry before cannot overwrite this one on the remote host.
+     */
+    sendKeepRunning(environmentId: string, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
+  };
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
   development?: boolean;
   clock?: Clock;
@@ -668,7 +674,8 @@ export class Controller implements vscode.Disposable {
       return;
     }
     if (host !== '') {
-      const sent = (await this.deps.remoteMonitor?.sendKeepRunning(environment.id)) ?? {
+      const seq = this.clock.now();
+      const sent = (await this.deps.remoteMonitor?.sendKeepRunning(environment.id, seq)) ?? {
         ok: false as const,
         detail: 'The Session Monitor on the remote host is not available in this window.',
       };

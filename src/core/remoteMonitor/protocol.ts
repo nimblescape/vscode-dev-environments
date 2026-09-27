@@ -54,18 +54,38 @@ export function isRemoteEnvironmentId(value: unknown): value is string {
   return typeof value === 'string' && ENVIRONMENT_ID_PATTERN.test(value);
 }
 
+/**
+ * One environment of a heartbeat. `seq` (review round 2 of PR #39, L1): the wall clock of the sending computer, in ms,
+ * at which it read the keep flag (the Session Monitor: its tick; a window: right after it changed the flag). The remote
+ * monitor never replaces a record of the same source with a higher `seq`, so a heartbeat that was under way while the
+ * flag changed cannot undo the newer choice.
+ */
+export interface HeartbeatEntry {
+  id: string;
+  keepRunning: boolean;
+  seq: number;
+}
+
 /** One heartbeat: the computer, its time limit, and the environments it uses or keeps. */
 export interface HeartbeatInput {
   source: string;
   limitSeconds: number;
-  environments: Array<{ id: string; keepRunning: boolean }>;
+  environments: HeartbeatEntry[];
 }
 
-/** A heartbeat record in the volume. `at` is the clock of the remote host at the write, so the clocks of the computers do not matter. */
+/**
+ * A heartbeat record in the volume. `at` is the clock of the remote host at the write, so the clocks of the computers do
+ * not matter; `seq` is the one of the entry (HeartbeatEntry).
+ */
 export interface HeartbeatRecord {
   at: number;
   keepRunning: boolean;
   limitSeconds: number;
+  seq: number;
+}
+
+function isSeq(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** A time limit in whole seconds within MIN_LIMIT_SECONDS..MAX_LIMIT_SECONDS; the default for a value that is no number. */
@@ -77,7 +97,8 @@ export function clampLimitSeconds(value: number): number {
 /**
  * The argument of `monitor.js heartbeat`, checked strictly: a JSON object with exactly `source` (isSourceId),
  * `limitSeconds` (an integer, clamped to MIN_LIMIT_SECONDS..MAX_LIMIT_SECONDS), and `environments` (at most
- * MAX_HEARTBEAT_ENVIRONMENTS objects with exactly `id` (isRemoteEnvironmentId) and `keepRunning` (a boolean)).
+ * MAX_HEARTBEAT_ENVIRONMENTS objects with exactly `id` (isRemoteEnvironmentId), `keepRunning` (a boolean), and `seq` (a
+ * safe non-negative integer)).
  * `undefined` for anything else; then nothing is written.
  */
 export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
@@ -94,9 +115,9 @@ export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
   if (!Array.isArray(environments) || environments.length > MAX_HEARTBEAT_ENVIRONMENTS) return undefined;
   const checked: HeartbeatInput['environments'] = [];
   for (const entry of environments) {
-    if (!isRecord(entry) || !hasExactKeys(entry, ['id', 'keepRunning'])) return undefined;
-    if (!isRemoteEnvironmentId(entry.id) || typeof entry.keepRunning !== 'boolean') return undefined;
-    checked.push({ id: entry.id, keepRunning: entry.keepRunning });
+    if (!isRecord(entry) || !hasExactKeys(entry, ['id', 'keepRunning', 'seq'])) return undefined;
+    if (!isRemoteEnvironmentId(entry.id) || typeof entry.keepRunning !== 'boolean' || !isSeq(entry.seq)) return undefined;
+    checked.push({ id: entry.id, keepRunning: entry.keepRunning, seq: entry.seq });
   }
   return { source, limitSeconds: clampLimitSeconds(limitSeconds), environments: checked };
 }
@@ -110,13 +131,13 @@ export function parseHeartbeatRecord(text: string): HeartbeatRecord | undefined 
     return undefined;
   }
   if (!isRecord(value)) return undefined;
-  const { at, keepRunning, limitSeconds } = value;
+  const { at, keepRunning, limitSeconds, seq } = value;
   if (typeof at !== 'number' || !Number.isSafeInteger(at) || at < 0) return undefined;
-  if (typeof keepRunning !== 'boolean') return undefined;
+  if (typeof keepRunning !== 'boolean' || !isSeq(seq)) return undefined;
   if (typeof limitSeconds !== 'number' || !Number.isInteger(limitSeconds) || limitSeconds < MIN_LIMIT_SECONDS || limitSeconds > MAX_LIMIT_SECONDS) {
     return undefined;
   }
-  return { at, keepRunning, limitSeconds };
+  return { at, keepRunning, limitSeconds, seq };
 }
 
 /** The file name of the record of `source` for `environmentId`. Throws for an invalid id. */
@@ -171,13 +192,18 @@ export function parseRecordsOutput(stdout: string): RecordsOutput | undefined {
 }
 
 /**
- * Shared engine (reviewer note of PR 2): true when a computer other than `ownSource` keeps the environment running (a
- * record with keepRunning, whatever its age; review round 1 of PR #39, F2), or sent a heartbeat for it less than
- * OTHER_COMPUTER_FRESH_MS ago (by the clock of the remote host). Then this computer does not stop it.
+ * Shared engine (reviewer note of PR 2), consistent with "the newest record decides" of the remote monitor (review round
+ * 2 of PR #39, M1): true when a computer other than `ownSource` sent a heartbeat for the environment less than
+ * OTHER_COMPUTER_FRESH_MS ago (it uses it), or has a record that keeps it running and that is at least as new as the
+ * newest record of this computer (by the clock of the remote host). A later choice of this computer (a heartbeat without
+ * the flag) overrules an older keep of another one, for example of a computer that no longer sends. Then this computer
+ * does not stop it.
  */
 export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): boolean {
+  const own = output.records.filter((record) => record.source === ownSource).reduce((newest, record) => Math.max(newest, record.at), Number.NEGATIVE_INFINITY);
   return output.records.some(
-    (record) => record.source !== ownSource && (record.keepRunning || Math.abs(output.now - record.at) < OTHER_COMPUTER_FRESH_MS),
+    (record) =>
+      record.source !== ownSource && (Math.abs(output.now - record.at) < OTHER_COMPUTER_FRESH_MS || (record.keepRunning && record.at >= own)),
   );
 }
 
