@@ -428,13 +428,15 @@ describe('review round 5 of unit 6 (S5-4)', () => {
     },
   );
 
-  it('checks dockerfile_inline of a remote build context', () => {
+  it('refuses only the remote build context, not its dockerfile_inline', () => {
     const context = 'https://github.com/acme/tool.git';
     const report = serviceReport('db', { build: { context, dockerfile_inline: 'FROM devenv-11111111:2' } }, { dockerfiles: { app: 'FROM alpine', db: 'FROM devenv-11111111:2' } });
     expect(report.unsupported).toEqual([REMOTE(context)]);
-    expect(report.hostAccess).toEqual(['service db: FROM image devenv-11111111:2 of another environment']);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image devenv-11111111:2 of another environment`.
+    expect(report.hostAccess).toEqual([]);
     const syntax = serviceReport('db', { build: { context, dockerfile_inline: '# syntax=evil/frontend:1\nFROM alpine' } }, { dockerfiles: { app: 'FROM alpine', db: '# syntax=evil/frontend:1\nFROM alpine' } });
-    expect(syntax.hostAccess).toEqual(['service db: syntax image evil/frontend:1 (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)']);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: syntax image evil/frontend:1 (only the official …)`.
+    expect(syntax.hostAccess).toEqual([]);
   });
 });
 
@@ -452,8 +454,8 @@ describe('review round 6 of unit 6 (P6-1)', () => {
 });
 
 describe('review round 8 of unit 6: the time of the check', () => {
-  it('S8-4: analyses a Dockerfile that several services build with the same arguments once', () => {
-    // Each analysis of this Dockerfile takes the whole budget of the pattern matcher (about 0.15 s).
+  it('S8-4: checks 40 services that build a Dockerfile of pattern forms quickly', () => {
+    // Each analysis of this Dockerfile took the whole budget of the former pattern matcher (about 0.15 s).
     const dockerfile = `ARG A=${'a'.repeat(4000)}\nARG P=${'*a'.repeat(500)}b\n${Array.from({ length: 20 }, (_, i) => `FROM \${A#$P}${i}`).join('\n')}\n`;
     const services: ComposeModel['services'] = {};
     const dockerfiles: Record<string, string> = {};
@@ -465,11 +467,9 @@ describe('review round 8 of unit 6: the time of the check', () => {
     const report = composeAccessReport(input({ model: { name: PROJECT, services }, devService: 's0', dockerfiles }));
     // Before: 40 analyses (with the matcher of review round 7: 20 s).
     expect(performance.now() - start).toBeLessThan(1000);
-    expect(report.hostAccess).toEqual([]);
-    // The first two references are too long, and name the same item.
-    expect(report.unsupported).toHaveLength(40 * 19);
-    expect(report.unsupported[0]).toMatch(/^service s0: FROM image a+… \(the image reference is too long\)$/);
-    expect(report.unsupported.at(-1)).toMatch(/^service s39: FROM image \$\{A#\$P\}19 \(the Dockerfile is too complex to check\)$/);
+    // Dockerfile refusals removed (user decision 2026-09-27): before, 40 · 19 items `… (the image reference is too long)`
+    // and `… (the Dockerfile is too complex to check)`.
+    expect(report).toEqual({ hostAccess: [], unsupported: [] });
   });
 
   it('S8-5: removes the duplicates of 20000 items in linear time', () => {

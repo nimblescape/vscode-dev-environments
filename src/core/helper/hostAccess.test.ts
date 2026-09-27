@@ -14,6 +14,7 @@ import {
 } from '../names';
 import { helperCliVariables, mayBeSetInHelper, substituteCliVariables, unresolvedCliVariables } from './cliVariables';
 import { GITHUB_CLI_ACCOUNT_REASON, containerEnvironment, remoteEnvironment } from './containerGit';
+import { runAnalysisJob } from './configurationAnalysis';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
   MAX_LISTED_ITEMS,
@@ -1147,20 +1148,18 @@ describe('foreignNetworkItem and runArgsNetworks', () => {
 });
 
 describe('the Dockerfile of a single container (review round 2, S2-01)', () => {
-  it('refuses a configured Dockerfile that could not be read as not supported', () => {
-    expect(hostAccessReport({ config: { build: { dockerfile: 'x' } }, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' })).toEqual({
-      hostAccess: [],
-      unsupported: ['Dockerfile ${localEnv:X}/Dockerfile (it could not be read, so its images cannot be checked)'],
-    });
-    // The text, when it was read, is checked instead.
-    expect(hostAccessReport({ config: {}, ownVolume: OWN, dockerfileText: 'FROM devenv-11111111:1', dockerfileUnreadable: 'x' }).hostAccess).toEqual([
-      'FROM image devenv-11111111:1 of another environment',
-    ]);
+  it('allows a configured Dockerfile that could not be read; the update check has no FROM images of it', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile ${localEnv:X}/Dockerfile (it could not
+    // be read, so its images cannot be checked)` (unsupported). The pipeline passes no text (resolvedDockerfile).
+    const config = { build: { dockerfile: '${localEnv:X}/Dockerfile' } };
+    const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config });
+    expect(analysis.report).toEqual({ hostAccess: [], unsupported: [] });
+    expect(analysis.references.images).toEqual([]);
   });
 });
 
 describe('the images that the Dockerfile of a single container names (review round 2, S2-02)', () => {
-  it('refuses the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
+  it('allows the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
     const dockerfileText = [
       '# syntax=docker.io/library/devenv-11111111:9',
       'FROM alpine AS base',
@@ -1170,14 +1169,14 @@ describe('the images that the Dockerfile of a single container names (review rou
       'RUN --mount=type=cache,from=devenv-44444444,target=/c true',
       'COPY --from=$IMAGE /d /d',
     ].join('\n');
-    const expected = [
-      'syntax image docker.io/library/devenv-11111111:9 of another environment',
-      'FROM image devenv-22222222${TARGETVARIANT} of another environment (a variable that is not resolved)',
-      'COPY --from image devenv-33333333:1 of another environment',
-      'RUN --mount image devenv-44444444 of another environment',
-    ];
+    const config = { build: { dockerfile: 'Dockerfile' } };
     for (const checksOn of [true, false]) {
-      expect(hostAccessReport({ config: { build: { dockerfile: 'Dockerfile' } }, ownVolume: OWN, dockerfileText }, checksOn)).toEqual({ hostAccess: expected, unsupported: [] });
+      // Dockerfile refusals removed (user decision 2026-09-27): before, the syntax, FROM, COPY --from, and RUN --mount images were refused (protected).
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn, config, dockerfileText });
+      expect(analysis.report).toEqual({ hostAccess: [], unsupported: [] });
+      expect(analysis.imageReferences).toEqual([]);
+      // The update check reads the FROM images it can resolve.
+      expect(analysis.references.images).toEqual(['alpine']);
     }
   });
 });

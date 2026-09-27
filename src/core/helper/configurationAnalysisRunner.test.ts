@@ -82,7 +82,7 @@ function composeInput(model: ComposeModel, extra: Partial<ComposeAccessInput> = 
 function singleJob(dockerfileText: string, config: Record<string, unknown> = { build: { dockerfile: 'Dockerfile' } }): AnalysisJob {
   return {
     kind: 'single',
-    input: { config, ownVolume: OWN, configFolder: `${REPO}/.devcontainer`, repositoryFolder: REPO, dockerfileText },
+    input: { config, ownVolume: OWN, configFolder: `${REPO}/.devcontainer`, repositoryFolder: REPO },
     checksOn: true,
     config,
     dockerfileText,
@@ -98,13 +98,17 @@ function doubling(first: string, lines: number, form: (i: number) => string): st
   return `${head}${body.join('\n')}\nFROM alpine\n`;
 }
 const BUDGET = `ARG A=${'a'.repeat(4000)}\nARG P=${'*a'.repeat(500)}b\n${Array.from({ length: 20 }, (_, i) => `FROM \${A#$P}${i}`).join('\n')}\n`;
+/** S8-2: 10000 ARGs of 64 KiB each, which run out of MAX_EXPANDED_CHARACTERS (about 35 ms in extractBaseImages). */
+const MEM4 = doubling('€€€€€€€€€€€€€€€€', 10_000, (i) => `X${i}=a$B13`);
+// Dockerfile refusals removed (user decision 2026-09-27): changed expectations, the Dockerfiles of mem4, budget, and
+// services were refused (too complex to check); now they are allowed, and the update check skips what it cannot read.
 const REPROS: Array<{ name: string; job: AnalysisJob; refused: boolean }> = [
-  // S8-2: 10000 ARGs of 64 KiB each (extractBaseImages: base; dockerfileImageFindings: mem4).
-  { name: 'mem4 and base', job: singleJob(doubling('€€€€€€€€€€€€€€€€', 10_000, (i) => `X${i}=a$B13`)), refused: true },
+  // S8-2: 10000 ARGs of 64 KiB each (extractBaseImages: base).
+  { name: 'mem4 and base', job: singleJob(MEM4), refused: false },
   // S8-1: 1000 forms on a value of 64 KiB (their results are not used: the Dockerfile passes).
   { name: 'trim', job: singleJob(doubling('xxxxxxxxxxxxxxxy', 1000, () => 'X=${B13%x}')), refused: false },
-  // S7-1 / S8-1: the budget of the pattern matcher.
-  { name: 'budget', job: singleJob(BUDGET), refused: true },
+  // S7-1 / S8-1: the budget of the former pattern matcher.
+  { name: 'budget', job: singleJob(BUDGET), refused: false },
   // S8-3: a directive with 40000 spaces (a valid Dockerfile).
   { name: 'directive', job: singleJob(`# check=a${' '.repeat(40_000)}b\nFROM alpine\n`), refused: false },
   // S8-5: 40000 bind mounts.
@@ -128,7 +132,7 @@ const REPROS: Array<{ name: string; job: AnalysisJob; refused: boolean }> = [
         { dockerfiles: Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`s${i}`, BUDGET])) },
       ),
     },
-    refused: true,
+    refused: false,
   },
 ];
 
@@ -179,16 +183,19 @@ describe('WorkerConfigurationAnalyzer', () => {
       const report = results[index].report;
       expect(report.hostAccess.length + report.unsupported.length > 0, name).toBe(refused);
     });
-    expect(results[0].report).toEqual({ hostAccess: [], unsupported: ['Dockerfile (the Dockerfile is too complex to check)'] });
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `Dockerfile (the Dockerfile is too complex to check)`.
+    expect(results[0].report).toEqual({ hostAccess: [], unsupported: [] });
+    expect(results[0]).toMatchObject({ references: { images: [] } });
   });
 
   it('refuses a job that takes longer than its time limit, and stops its worker', async () => {
-    // 40 services with Dockerfiles that differ in a build argument (no cache): seconds in this thread.
+    // 80 services whose Dockerfiles run out of the expansion budget of the update check (MEM4): seconds in this thread.
+    // Dockerfile refusals removed (user decision 2026-09-27): before, BUDGET, whose image check took the time.
     const services: ComposeModel['services'] = {};
     const dockerfiles: Record<string, string> = {};
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 80; i++) {
       services[`s${i}`] = { build: { context: REPO, dockerfile: 'Dockerfile', args: { N: String(i) } } };
-      dockerfiles[`s${i}`] = BUDGET;
+      dockerfiles[`s${i}`] = MEM4;
     }
     const job: AnalysisJob = { kind: 'compose', checksOn: true, input: composeInput({ name: PROJECT, services }, { dockerfiles }) };
     const logger = warnings();

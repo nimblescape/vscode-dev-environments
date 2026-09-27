@@ -8,6 +8,7 @@
 // of the extension, items whose class is not clear, and options that the policy does not support).
 import { describe, expect, it } from 'vitest';
 import { CONTAINER_CONFIG_UNKNOWN_LABEL, CONTAINER_VERSION_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL } from '../names';
+import { runAnalysisJob } from './configurationAnalysis';
 import { GITHUB_CLI_ACCOUNT_REASON } from './containerGit';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
@@ -17,7 +18,6 @@ import {
   overrideRunArgs,
   runArgsProblems,
   singleImageReferences,
-  unresolvedVariants,
   type HostAccessClass,
   type HostAccessInput,
 } from './hostAccess';
@@ -36,6 +36,23 @@ const HELPER_PATHS: Partial<HostAccessInput> = { configFolder: '/workspaces/api/
 const mount = (spec: unknown): Record<string, unknown> => ({ mounts: [spec] });
 const run = (...runArgs: string[]): Record<string, unknown> => ({ runArgs });
 const build = (...options: string[]): Record<string, unknown> => ({ build: { options } });
+
+/**
+ * Dockerfile refusals removed (user decision 2026-09-27): a single container that builds `text` as its Dockerfile,
+ * analysed as the pipeline analyses it (runAnalysisJob): the report of the host access policy, the image references for
+ * the question of image IDs, and the references of the update check (the FROM images).
+ */
+function single(text: string, buildMore: Record<string, unknown> = {}, checksOn = true) {
+  const config = { build: { dockerfile: 'Dockerfile', ...buildMore } };
+  return runAnalysisJob({ kind: 'single', input: input(config, HELPER_PATHS), checksOn, config, dockerfileText: text });
+}
+const ALLOWED = { hostAccess: [], unsupported: [] };
+
+/** Dockerfile refusals removed (user decision 2026-09-27): `text` is allowed, with the checks on and off. */
+function expectAllowed(text: string, buildMore: Record<string, unknown> = {}): void {
+  expect(single(text, buildMore).report).toEqual(ALLOWED);
+  expect(single(text, buildMore, false).report).toEqual(ALLOWED);
+}
 
 // Each row: what the configuration has, the item, and its class. Every rule of hostAccess.ts that refuses something.
 const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
@@ -172,7 +189,6 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['the image of another environment', input({ image: 'devenv-11111111:2' }), 'image devenv-11111111:2 of another environment', 'protected'],
   ['the image of another environment on Docker Hub', input({ image: 'index.docker.io/library/devenv-11111111:2' }), 'image index.docker.io/library/devenv-11111111:2 of another environment', 'protected'],
   ['an image ID', input({ image: `sha256:${'c'.repeat(64)}` }), `image sha256:${'c'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
-  ['FROM the image of another environment', input({ build: { dockerfile: 'Dockerfile', args: { B: 'devenv-11111111:2' } } }, { dockerfileText: 'ARG B\nFROM ${B}\n' }), 'FROM image devenv-11111111:2 of another environment', 'protected'],
   ['a build context of the image of another environment', input(build('--build-context', 'base=docker-image://docker.io/devenv-11111111:2')), 'build option --build-context image docker.io/devenv-11111111:2 of another environment', 'protected'],
   // Review round 1 (S3): the Compose network of another environment, by its name (also the long form) or its labels.
   ['the Compose network of another environment', input(run('--network', 'devenv-11111111_default')), 'network devenv-11111111_default of another environment', 'protected'],
@@ -234,15 +250,24 @@ describe('the switch of the host access checks: the class of every refused item'
 
 describe('review round 1: what stays allowed', () => {
   it('allows a build context and a Dockerfile in the repository, and the networks of the environment itself', () => {
-    const checked = input(
-      { build: { dockerfile: 'Dockerfile', context: '..' }, runArgs: ['--network', 'devenv-e0000001_default', '--network', 'mine'] },
-      {
-        ...HELPER_PATHS,
-        dockerfileText: 'FROM mcr.microsoft.com/devcontainers/base:ubuntu\nFROM alpine:3.22\n',
-        networks: { mine: { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ENVIRONMENT.id] } },
-      },
-    );
+    const config = { build: { dockerfile: 'Dockerfile', context: '..' }, runArgs: ['--network', 'devenv-e0000001_default', '--network', 'mine'] };
+    const checked = input(config, {
+      ...HELPER_PATHS,
+      networks: { mine: { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ENVIRONMENT.id] } },
+    });
     expect(hostAccessReport(checked)).toEqual({ hostAccess: [], unsupported: [] });
+    // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile goes to the analysis job only, for the update check.
+    const analysis = runAnalysisJob({ kind: 'single', input: checked, checksOn: true, config, dockerfileText: 'FROM mcr.microsoft.com/devcontainers/base:ubuntu\nFROM alpine:3.22\n' });
+    expect(analysis.report).toEqual(ALLOWED);
+    expect(analysis.references.images).toEqual(['mcr.microsoft.com/devcontainers/base:ubuntu', 'alpine:3.22']);
+  });
+
+  it('allows FROM the image of another environment (the Dockerfile is not checked)', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-11111111:2 of another environment` (protected).
+    const analysis = single('ARG B\nFROM ${B}\n', { args: { B: 'devenv-11111111:2' } });
+    expect(analysis.report).toEqual(ALLOWED);
+    expect(analysis.imageReferences).toEqual([]);
+    expect(analysis.references.images).toEqual(['devenv-11111111:2']);
   });
 
   it('refuses a build context outside of the repository, also one that is no path of the workspace helper', () => {
@@ -283,8 +308,9 @@ describe('the override configuration with the checks off', () => {
 });
 
 describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
-  const dockerfile = (text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
-    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, { ...HELPER_PATHS, dockerfileText: text });
+  // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile is no part of the input of the policy.
+  const dockerfile = (_text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
+    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, HELPER_PATHS);
   const classes = (checked: HostAccessInput) => hostAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
 
   it.each([
@@ -304,21 +330,25 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
   });
 
   const STAGES = 'ARG BASE=alpine\nFROM ${BASE} AS a\nFROM devenv-abcd1234:2 AS b\n';
-  it.each<[string, string, string[], Record<string, unknown>, string]>([
-    ['--build-arg K=V', STAGES, ['--build-arg', 'BASE=devenv-abcd1234:1'], {}, 'FROM image devenv-abcd1234:1 of another environment'],
-    ['--build-arg=K=V', STAGES, ['--build-arg=BASE=devenv-abcd1234:1'], { args: { BASE: 'alpine' } }, 'FROM image devenv-abcd1234:1 of another environment'],
-    [
-      '--build-arg K without a value',
-      'ARG BASE=alpine\nFROM devenv${BASE}\n',
-      ['--build-arg', 'BASE'],
-      { args: { BASE: 'alpine' } },
-      'FROM image devenv${BASE} of another environment (a variable that is not resolved)',
-    ],
-    ['--target over build.target', STAGES, ['--target', 'b'], { target: 'a' }, 'FROM image devenv-abcd1234:2 of another environment'],
-    ['BUILDKIT_SYNTAX of build.args', STAGES, [], { args: { BUILDKIT_SYNTAX: 'devenv-abcd1234:3' } }, 'syntax image devenv-abcd1234:3 of another environment'],
-    ['BUILDKIT_SYNTAX of build.options', STAGES, ['--build-arg', 'BUILDKIT_SYNTAX=docker.io/devenv-abcd1234:3'], {}, 'syntax image docker.io/devenv-abcd1234:3 of another environment'],
-  ])('reads %s as the CLI passes it to docker build (S3-2)', (_name, text, options, more, item) => {
-    expect(classes(dockerfile(text, { ...more, options }))).toContain(`protected: ${item}`);
+  it.each<[string, string, string[], Record<string, unknown>]>([
+    ['--build-arg K=V', STAGES, ['--build-arg', 'BASE=devenv-abcd1234:1'], {}],
+    ['--build-arg=K=V', STAGES, ['--build-arg=BASE=devenv-abcd1234:1'], { args: { BASE: 'alpine' } }],
+    ['--target over build.target', STAGES, ['--target', 'b'], { target: 'a' }],
+    ['BUILDKIT_SYNTAX of build.args', STAGES, [], { args: { BUILDKIT_SYNTAX: 'devenv-abcd1234:3' } }],
+    ['BUILDKIT_SYNTAX of build.options', STAGES, ['--build-arg', 'BUILDKIT_SYNTAX=docker.io/devenv-abcd1234:3'], {}],
+  ])('allows the Dockerfile with %s (S3-2)', (_name, text, options, more) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, the images of the Dockerfile were refused (protected).
+    expectAllowed(text, { ...more, options });
+  });
+
+  it('still refuses --build-arg K without a value, a build option of the configuration (S3-2, S4-1)', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): only the build option is refused, not `FROM devenv${BASE}`.
+    expect(single('ARG BASE=alpine\nFROM devenv${BASE}\n', { args: { BASE: 'alpine' }, options: ['--build-arg', 'BASE'] }).report).toEqual({
+      hostAccess: [],
+      unsupported: [
+        'build option --build-arg BASE without a value (the value would come from the environment of the workspace helper, or the argument would be dropped, so Dev Environments cannot check it)',
+      ],
+    });
   });
 
   it('reads the value of --build-arg K from the helper, as a variable that is not resolved (S3-2)', () => {
@@ -333,29 +363,31 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
     });
   });
 
-  it('keeps build.args when build.options set other arguments, and the last value wins (S3-2)', () => {
+  it('reads build.args and build.options for the FROM images of the update check (S3-2)', () => {
     const text = 'ARG BASE=alpine\nFROM ${BASE}\n';
-    expect(hostAccessReport(dockerfile(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'OTHER=1'] })).hostAccess).toEqual([
-      'FROM image devenv-abcd1234:1 of another environment',
-    ]);
-    // slim-down: the base image that only the Dev Container CLI reads is no longer checked; Docker builds FROM alpine:3.22.
-    expect(hostAccessReport(dockerfile(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'BASE=alpine:3.22'] }))).toEqual({ hostAccess: [], unsupported: [] });
-    expect(hostAccessReport(dockerfile(text, { args: { BASE: 'alpine:3.21' }, options: ['--build-arg', 'BASE=alpine:3.22'] }))).toEqual({ hostAccess: [], unsupported: [] });
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-abcd1234:1 of another environment`.
+    expectAllowed(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'OTHER=1'] });
+    expectAllowed(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'BASE=alpine:3.22'] });
+    expect(single(text, { args: { BASE: 'alpine:3.21' } }).references.images).toEqual(['alpine:3.21']);
   });
 
-  it('checks the images of every stage, whatever the target (S3-3)', () => {
+  it('allows the images of every stage, whatever the target (S3-3)', () => {
     for (const text of ['FROM alpine AS a\nCOPY --from=b /x /y\nFROM devenv-abcd1234:1 AS b\n', 'FROM alpine AS a\nRUN --mount=from=b,target=/m ls\nFROM devenv-abcd1234:1 AS b\n']) {
-      expect(hostAccessReport(dockerfile(text, { target: 'a' })).hostAccess).toEqual(['FROM image devenv-abcd1234:1 of another environment']);
+      // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-abcd1234:1 of another environment`.
+      expectAllowed(text, { target: 'a' });
+      expect(single(text, { target: 'a' }).references.images).toEqual(['alpine']);
     }
   });
 
   it.each([
-    ['FROM devenv${TARGETVARIANT}-abcd1234:1\n', 'FROM image devenv${TARGETVARIANT}-abcd1234:1'],
-    ['FROM ${TARGETVARIANT}devenv-abcd1234:1\n', 'FROM image ${TARGETVARIANT}devenv-abcd1234:1'],
-    ['FROM alpine\nCOPY --from=${NOPE}devenv-abcd1234:1 / /x\n', 'COPY --from image ${NOPE}devenv-abcd1234:1'],
-    ['FROM alpine\nRUN --mount=from=${NOPE}DevEnv-abcd1234:1,target=/m ls\n', 'RUN --mount image ${NOPE}DevEnv-abcd1234:1'],
-  ])('refuses the unresolved reference in %j that holds devenv (S3-4)', (text, item) => {
-    expect(classes(dockerfile(text))).toEqual([`protected: ${item} of another environment (a variable that is not resolved)`]);
+    'FROM devenv${TARGETVARIANT}-abcd1234:1\n',
+    'FROM ${TARGETVARIANT}devenv-abcd1234:1\n',
+    'FROM alpine\nCOPY --from=${NOPE}devenv-abcd1234:1 / /x\n',
+    'FROM alpine\nRUN --mount=from=${NOPE}DevEnv-abcd1234:1,target=/m ls\n',
+  ])('allows the unresolved reference in %j that holds devenv (S3-4)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… of another environment (a variable that is not resolved)`.
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual(text.startsWith('FROM alpine') ? ['alpine'] : []);
   });
 
   it.each([
@@ -364,14 +396,15 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
     "FROM alpine\nRUN --mount='type=bind, from=devenv-abcd1234:1' ls\n",
     'FROM alpine\nRUN --network=none --mount=type=bind,from=devenv-abcd1234:1 ls\n',
     'FROM alpine\nRUN --mount=type=bind,\\"from=devenv-abcd1234:1\\" ls\n',
-  ])('reads the quoted flags of %j as BuildKit does (S3-5)', (text) => {
-    expect(hostAccessReport(dockerfile(text)).hostAccess).toEqual(['RUN --mount image devenv-abcd1234:1 of another environment']);
+  ])('allows the quoted flags of %j (S3-5)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `RUN --mount image devenv-abcd1234:1 of another environment`.
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual(['alpine']);
   });
 
-  it('refuses a quoted COPY --from of another environment (S3-5)', () => {
-    expect(hostAccessReport(dockerfile('FROM alpine\nCOPY --from="devenv-abcd1234:1" /a /b\n')).hostAccess).toEqual([
-      'COPY --from image devenv-abcd1234:1 of another environment',
-    ]);
+  it('allows a quoted COPY --from of another environment (S3-5)', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `COPY --from image devenv-abcd1234:1 of another environment`.
+    expectAllowed('FROM alpine\nCOPY --from="devenv-abcd1234:1" /a /b\n');
   });
 
   it.each([
@@ -397,8 +430,9 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
 });
 
 describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
-  const dockerfile = (text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
-    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, { ...HELPER_PATHS, dockerfileText: text });
+  // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile is no part of the input of the policy.
+  const dockerfile = (_text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
+    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, HELPER_PATHS);
   const classes = (checked: HostAccessInput) => hostAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
   const WITHOUT_VALUE = (name: string) =>
     `unsupported: build option --build-arg ${name} without a value (the value would come from the environment of the workspace helper, or the argument would be dropped, so Dev Environments cannot check it)`;
@@ -438,55 +472,52 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   });
 
   it.each([
-    ['ARG A=devenv-abcd1234:1x\nFROM ${A%x}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=devenv-abcd1234:1xyx\nFROM ${A%%x*}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=xdevenv-abcd1234:1\nFROM ${A#x}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=a/b/devenv-abcd1234:1\nFROM ${A##*/}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=zzzenv-abcd1234:1\nFROM ${A/zzz/dev}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=zenv-abcd1234:1\nFROM ${A//z/dev}\n', 'FROM image devenv-abcd1234:1'],
-    ['ARG A=devenv-abcd1234:1?\nFROM ${A%\\?}\n', 'FROM image devenv-abcd1234:1'],
-    ['FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%x} / /x\n', 'COPY --from image devenv-abcd1234:1'],
-    ['FROM alpine\nARG A=devenv-abcd1234:1x\nRUN --mount=from=${A%x},target=/x ls\n', 'RUN --mount image devenv-abcd1234:1'],
-    ['FROM alpine\nENV A=devenv-abcd1234:1x\nCOPY --from=${A%?} / /x\n', 'COPY --from image devenv-abcd1234:1'],
-    ['ARG A=devenv-abcd1234:1x\nARG B=${A%x}\nFROM $B\n', 'FROM image devenv-abcd1234:1'],
-  ])('evaluates the pattern operator in %j as BuildKit does (S4-3)', (text, item) => {
-    expect(classes(dockerfile(text))).toEqual([`protected: ${item} of another environment`]);
+    'ARG A=devenv-abcd1234:1x\nFROM ${A%x}\n',
+    'ARG A=devenv-abcd1234:1xyx\nFROM ${A%%x*}\n',
+    'ARG A=xdevenv-abcd1234:1\nFROM ${A#x}\n',
+    'ARG A=a/b/devenv-abcd1234:1\nFROM ${A##*/}\n',
+    'ARG A=zzzenv-abcd1234:1\nFROM ${A/zzz/dev}\n',
+    'ARG A=zenv-abcd1234:1\nFROM ${A//z/dev}\n',
+    'ARG A=devenv-abcd1234:1?\nFROM ${A%\\?}\n',
+    'FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%x} / /x\n',
+    'FROM alpine\nARG A=devenv-abcd1234:1x\nRUN --mount=from=${A%x},target=/x ls\n',
+    'FROM alpine\nENV A=devenv-abcd1234:1x\nCOPY --from=${A%?} / /x\n',
+    'ARG A=devenv-abcd1234:1x\nARG B=${A%x}\nFROM $B\n',
+    'ARG A=devenv-abcd1234:1[x]\nFROM ${A%[x]}\n',
+    'ARG A=devenv-abcd1234:1x\nFROM ${A%[x]}\n',
+  ])('allows the pattern operator in %j, and the update check skips it (S4-3)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, evaluated and refused as `… of another environment`.
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual(text.startsWith('FROM alpine') ? ['alpine'] : []);
   });
 
-  it('evaluates [ literally, as BuildKit does (it has no bracket expressions) (S4-3)', () => {
-    expect(classes(dockerfile('ARG A=devenv-abcd1234:1[x]\nFROM ${A%[x]}\n'))).toEqual(['protected: FROM image devenv-abcd1234:1 of another environment']);
-    expect(classes(dockerfile('ARG A=devenv-abcd1234:1x\nFROM ${A%[x]}\n'))).toEqual(['protected: FROM image devenv-abcd1234:1x of another environment']);
-  });
-
-  it('allows a pattern operator that gives another image (S4-3)', () => {
-    expect(classes(dockerfile('ARG V=3.22.1\nFROM alpine:${V%.*}\n'))).toEqual([]);
-    // slim-down: Docker's view only (the Dev Container CLI's reading of the pattern operator is no longer checked).
-    expect(classes(dockerfile('ARG A=devenv-abcd1234:1\nFROM ${A#devenv-abcd1234:1}alpine\n'))).toEqual([]);
-    expect(classes(dockerfile('ARG A=abcd1234:1\nFROM ${A#abcd1234:1}alpine\n'))).toEqual([]);
+  it('allows a pattern operator that gives another image, and the update check skips it (S4-3)', () => {
+    for (const text of ['ARG V=3.22.1\nFROM alpine:${V%.*}\n', 'ARG A=devenv-abcd1234:1\nFROM ${A#devenv-abcd1234:1}alpine\n', 'ARG A=abcd1234:1\nFROM ${A#abcd1234:1}alpine\n']) {
+      expectAllowed(text);
+      // Dockerfile refusals removed (user decision 2026-09-27): the pattern forms are not evaluated.
+      expect(single(text).references.images).toEqual([]);
+    }
   });
 
   it.each([
-    // The value is not known (a platform ARG, a variable of the base image): protected.
-    ['FROM alpine:${TARGETARCH%64}\n', 'protected', 'FROM image alpine:${TARGETARCH%64}'],
-    ['FROM alpine\nCOPY --from=${NOPE#x} / /x\n', 'protected', 'COPY --from image ${NOPE#x}'],
-    // The value holds devenv: protected.
-    ['ARG A=devenv-abcd1234:1\nFROM ${A:1:3}\n', 'protected', 'FROM image ${A:1:3}'],
-    ['FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%${NOPE}} / /x\n', 'protected', 'COPY --from image ${A%${NOPE}}'],
-    ['ARG A=devenv-abcd1234:1x\nARG B=${A/x}\nFROM $B\n', 'protected', 'FROM image ${A/x}'],
-    // Any other value: unsupported.
-    ['ARG A=alpine\nFROM ${A:1:3}\n', 'unsupported', 'FROM image ${A:1:3}'],
-    // Review round 5, S5-1: `$0` is a name that is not set (BuildKit gives `aline`, see the test of S5-1); a `$` that
-    // stays in the replacement is the escaped one.
-    ['ARG A=alpine\nFROM ${A/p/\\$0}\n', 'unsupported', 'FROM image ${A/p/\\$0}'],
-    ['ARG A=alpine\nFROM ${A%\\x}\n', 'unsupported', 'FROM image ${A%\\x}'],
-  ])('refuses the form in %j that cannot be evaluated as %s (S4-3)', (text, kind, item) => {
-    const why = kind === 'protected' ? 'uses a variable form that Dev Environments cannot check, perhaps for an image of another environment' : 'uses a variable form that Dev Environments cannot check';
-    expect(classes(dockerfile(text))).toEqual([`${kind}: ${item} (${why})`]);
+    'FROM alpine:${TARGETARCH%64}\n',
+    'FROM alpine\nCOPY --from=${NOPE#x} / /x\n',
+    'ARG A=devenv-abcd1234:1\nFROM ${A:1:3}\n',
+    'FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%${NOPE}} / /x\n',
+    'ARG A=devenv-abcd1234:1x\nARG B=${A/x}\nFROM $B\n',
+    'ARG A=alpine\nFROM ${A:1:3}\n',
+    'ARG A=alpine\nFROM ${A/p/\\$0}\n',
+    'ARG A=alpine\nFROM ${A%\\x}\n',
+  ])('allows the form in %j that cannot be evaluated (S4-3)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, refused as protected or unsupported ("uses a variable form …").
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual(text.startsWith('FROM alpine\n') ? ['alpine'] : []);
   });
 
-  it('gives the image ID check the evaluated references (S4-3, S2-05)', () => {
-    // slim-down: Docker's view only (the image that the Dev Container CLI reads is no longer a reference).
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=abcdef12x\nFROM ${A%x}\n')).toEqual([{ reference: 'abcdef12', what: 'FROM image' }]);
+  it('gives the image ID check no references of the Dockerfile (S4-3, S2-05)', () => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `[{ reference: 'abcdef12', what: 'FROM image' }]`.
+    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } })).toEqual([]);
+    expect(single('ARG A=abcdef12x\nFROM ${A%x}\nFROM abcdef12\n').imageReferences).toEqual([]);
   });
 
   it.each([
@@ -499,8 +530,8 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
     `docker/dockerfile:1@sha256:${'a'.repeat(64)}`,
     `docker/dockerfile@sha256:${'a'.repeat(64)}`,
   ])('allows the official frontend %s (S4-4)', (frontend) => {
-    expect(classes(dockerfile(`# syntax=${frontend}\nFROM alpine\n`))).toEqual([]);
-    expect(classes(dockerfile('FROM alpine\n', { args: { BUILDKIT_SYNTAX: frontend } }))).toEqual([]);
+    expectAllowed(`# syntax=${frontend}\nFROM alpine\n`);
+    expectAllowed('FROM alpine\n', { args: { BUILDKIT_SYNTAX: frontend } });
   });
 
   it.each([
@@ -510,10 +541,11 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
     'docker/dockerfile-evil:1',
     'dockerfile:1',
     'localhost:5000/docker/dockerfile:1',
-  ])('refuses the frontend %s whatever the switch says (S4-4)', (frontend) => {
-    const item = `protected: syntax image ${frontend} (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)`;
-    expect(classes(dockerfile(`# syntax=${frontend}\nFROM alpine\n`))).toEqual([item]);
-    expect(classes(dockerfile('FROM alpine\n', { options: ['--build-arg', `BUILDKIT_SYNTAX=${frontend}`] }))).toEqual([item]);
+  ])('allows the frontend %s (S4-4)', (frontend) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `syntax image … (only the official Dockerfile frontends … may build)` (protected).
+    expectAllowed(`# syntax=${frontend}\nFROM alpine\n`);
+    expectAllowed('FROM alpine\n', { options: ['--build-arg', `BUILDKIT_SYNTAX=${frontend}`] });
+    expect(single(`# syntax=${frontend}\nFROM alpine\n`).references.images).toEqual(['alpine']);
   });
 
   it.each([
@@ -535,18 +567,21 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
     'FROM localhost:5000/devenv-tools:${TARGETARCH}\n',
     'FROM registry.example.com:443/team/devenv${TARGETVARIANT}\n',
   ])('allows the registry image in %j (S4-6)', (text) => {
-    expect(classes(dockerfile(text))).toEqual([]);
+    expectAllowed(text);
   });
 
   it.each([
-    ['FROM docker.io/example/devenv-base:${TARGETARCH}\n', 'FROM image docker.io/example/devenv-base:${TARGETARCH}'],
-    ['FROM index.docker.io/x/devenv${TARGETVARIANT}\n', 'FROM image index.docker.io/x/devenv${TARGETVARIANT}'],
-    ['FROM example/devenv-base:${TARGETARCH}\n', 'FROM image example/devenv-base:${TARGETARCH}'],
-    ['FROM localhost/devenv-base:${TARGETARCH}\n', 'FROM image localhost/devenv-base:${TARGETARCH}'],
-    ['FROM ${TARGETVARIANT}ghcr.io/devenv-abcd1234:1\n', 'FROM image ${TARGETVARIANT}ghcr.io/devenv-abcd1234:1'],
-    ['FROM ghcr.io${TARGETVARIANT}/devenv-abcd1234:1\n', 'FROM image ghcr.io${TARGETVARIANT}/devenv-abcd1234:1'],
-  ])('keeps the devenv rule for %j (S4-6)', (text, item) => {
-    expect(classes(dockerfile(text))).toEqual([`protected: ${item} of another environment (a variable that is not resolved)`]);
+    'FROM docker.io/example/devenv-base:${TARGETARCH}\n',
+    'FROM index.docker.io/x/devenv${TARGETVARIANT}\n',
+    'FROM example/devenv-base:${TARGETARCH}\n',
+    'FROM localhost/devenv-base:${TARGETARCH}\n',
+    'FROM ${TARGETVARIANT}ghcr.io/devenv-abcd1234:1\n',
+    'FROM ghcr.io${TARGETVARIANT}/devenv-abcd1234:1\n',
+  ])('allows %j, and the update check reads it with a platform build argument (S4-6)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… of another environment (a variable that is not resolved)`.
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual([]);
+    expect(single(text, { args: { TARGETARCH: 'amd64', TARGETVARIANT: '' } }).references.images).toHaveLength(1);
   });
 });
 
@@ -568,47 +603,46 @@ describe('the label devenv.config-path (review round 4, D4-2)', () => {
 });
 
 describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
-  const dockerfile = (text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
-    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, { ...HELPER_PATHS, dockerfileText: text });
+  // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile is no part of the input of the policy.
+  const dockerfile = (_text: string, buildMore: Record<string, unknown> = {}): HostAccessInput =>
+    input({ build: { dockerfile: 'Dockerfile', ...buildMore } }, HELPER_PATHS);
   const classes = (checked: HostAccessInput) => hostAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
-  const VARIANT = (item: string) => `protected: ${item} (with its variables that are not resolved, it can name an image of another environment or an image ID)`;
-  const FRONTEND = (reference: string) =>
-    `protected: syntax image ${reference} (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)`;
 
   it.each([
     // A positional parameter, a special parameter, and a name of Unicode letters: not set, so empty, as in BuildKit.
-    ['FROM dev$1env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM dev$12env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM dev$@env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM dev$$env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM dev${1}env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM dev$é\\env-abcd1234:1\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['ARG é=devenv-abcd1234:1\nFROM $é\n', 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    // In a stage, a variable that is not declared stays unresolved (it may come from the base image).
-    ['FROM alpine\nCOPY --from=dev$1env-abcd1234:1 / /x\n', VARIANT('COPY --from image dev$1env-abcd1234:1')],
-    ['FROM alpine\nCOPY --from=dev$@env-abcd1234:1 / /x\n', VARIANT('COPY --from image dev$@env-abcd1234:1')],
-    // An escape or a quote ends the name (the flags of COPY lose theirs before the expansion, as in BuildKit).
-    ['FROM alpine\nENV X=dev$é\\env-abcd1234:1\nCOPY --from=$X / /x\n', VARIANT('COPY --from image dev${é}env-abcd1234:1')],
-    ['FROM alpine\nENV X=dev$1"e"nv-abcd1234:1\nCOPY --from=$X / /x\n', VARIANT('COPY --from image dev${1}env-abcd1234:1')],
-    // A platform ARG that is not resolved, empty on most platforms.
-    ['FROM dev${TARGETVARIANT}env-abcd1234:1\n', VARIANT('FROM image dev${TARGETVARIANT}env-abcd1234:1')],
-    ['FROM dev$TARGETVARIANT\\env-abcd1234:1\n', VARIANT('FROM image dev${TARGETVARIANT}env-abcd1234:1')],
-    ['FROM dev${TARGETVARIANT:+x}env-abcd1234:1\n', VARIANT('FROM image dev${TARGETVARIANT:+x}env-abcd1234:1')],
-    ['FROM ${TARGETVARIANT:-dev}env-abcd1234:1\n', VARIANT('FROM image ${TARGETVARIANT:-dev}env-abcd1234:1')],
-    ['FROM ${TARGETVARIANT+d${TARGETARCH}ev}env-abcd1234:1\n', VARIANT('FROM image ${TARGETVARIANT+d${TARGETARCH}ev}env-abcd1234:1')],
-    // An image ID, or a prefix of one, after a variable that is not resolved.
-    ['FROM ${TARGETVARIANT}sha256:0123abcd\n', VARIANT('FROM image ${TARGETVARIANT}sha256:0123abcd')],
-    ['FROM ${TARGETVARIANT}0123abcd\n', VARIANT('FROM image ${TARGETVARIANT}0123abcd')],
-    ['FROM alpine\nCOPY --from=${TARGETARCH:+0123}abcd / /x\n', VARIANT('COPY --from image ${TARGETARCH:+0123}abcd')],
-  ])('reads the variables in %j as BuildKit does (S5-1)', (text, item) => {
-    expect(classes(dockerfile(text))).toEqual([item]);
+    ['FROM dev$1env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['FROM dev$12env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['FROM dev$@env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['FROM dev$$env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['FROM dev${1}env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['FROM dev$é\\env-abcd1234:1\n', ['devenv-abcd1234:1']],
+    ['ARG é=devenv-abcd1234:1\nFROM $é\n', ['devenv-abcd1234:1']],
+    ['FROM alpine\nCOPY --from=dev$1env-abcd1234:1 / /x\n', ['alpine']],
+    ['FROM alpine\nCOPY --from=dev$@env-abcd1234:1 / /x\n', ['alpine']],
+    ['FROM alpine\nENV X=dev$é\\env-abcd1234:1\nCOPY --from=$X / /x\n', ['alpine']],
+    ['FROM alpine\nENV X=dev$1"e"nv-abcd1234:1\nCOPY --from=$X / /x\n', ['alpine']],
+    // A platform ARG that is not resolved: the update check skips the reference.
+    ['FROM dev${TARGETVARIANT}env-abcd1234:1\n', []],
+    ['FROM dev$TARGETVARIANT\\env-abcd1234:1\n', []],
+    ['FROM dev${TARGETVARIANT:+x}env-abcd1234:1\n', []],
+    ['FROM ${TARGETVARIANT:-dev}env-abcd1234:1\n', []],
+    ['FROM ${TARGETVARIANT+d${TARGETARCH}ev}env-abcd1234:1\n', []],
+    ['FROM ${TARGETVARIANT}sha256:0123abcd\n', []],
+    ['FROM ${TARGETVARIANT}0123abcd\n', []],
+    ['FROM alpine\nCOPY --from=${TARGETARCH:+0123}abcd / /x\n', ['alpine']],
+  ])('allows %j, and reads its variables as BuildKit does for the update check (S5-1)', (text, images) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, refused (protected) as an image of another environment or an image ID.
+    expectAllowed(text);
+    expect(single(text).references.images).toEqual(images);
   });
 
   it('expands a name of Unicode letters that is not set to the empty text, as BuildKit does (S5-1)', () => {
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'FROM dev$éenv-abcd1234:1\n')).toEqual([{ reference: 'dev-abcd1234:1', what: 'FROM image' }]);
-    // `$0` in a replacement is a name too: BuildKit gives `aline`.
-    // slim-down: Docker's view only (the image that the Dev Container CLI reads is no longer a reference).
-    expect(singleImageReferences({ build: { dockerfile: 'Dockerfile' } }, 'ARG A=alpine\nFROM ${A/p/$0}\n')).toEqual([{ reference: 'aline', what: 'FROM image' }]);
+    // Dockerfile refusals removed (user decision 2026-09-27): the FROM images are references of the update check only,
+    // not of the question of image IDs (before: `[{ reference: 'dev-abcd1234:1', what: 'FROM image' }]`).
+    expect(single('FROM dev$éenv-abcd1234:1\n').references.images).toEqual(['dev-abcd1234:1']);
+    expect(single('FROM dev$éenv-abcd1234:1\n').imageReferences).toEqual([]);
+    // A pattern form is not evaluated (before: `aline`).
+    expect(single('ARG A=alpine\nFROM ${A/p/$0}\n').references.images).toEqual([]);
   });
 
   it.each([
@@ -619,19 +653,22 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
     // `$éenv` is one name: `dev-abcd1234:1` when it is empty.
     'FROM alpine\nCOPY --from=dev$éenv-abcd1234:1 / /x\n',
   ])('allows the reference with a variable that is not resolved in %j (S5-1)', (text) => {
-    expect(classes(dockerfile(text))).toEqual([]);
+    expectAllowed(text);
   });
 
   it.each([
-    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1'] }, 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1', 'x'] }, 'protected: FROM image devenv-abcd1234:1,x of another environment'],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: null }, 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: 1 }, 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: false }, 'protected: FROM image devenv-abcd1234:1 of another environment'],
-    ['FROM alpine\n', { BUILDKIT_SYNTAX: ['evil/fe'] }, FRONTEND('evil/fe')],
-    ['FROM alpine\n', { BUILDKIT_SYNTAX: null }, FRONTEND('null')],
-  ])('takes the value of build.args in %j as the CLI makes it a text: %j (S5-2)', (text, args, item) => {
-    expect(classes(dockerfile(text, { args }))).toEqual([item]);
+    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1'] }, ['alpine']],
+    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1', 'x'] }, ['alpine']],
+    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: null }, []],
+    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: 1 }, ['devenv-abcd1234:1']],
+    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: false }, ['devenv-abcd1234:1']],
+    ['FROM alpine\n', { BUILDKIT_SYNTAX: ['evil/fe'] }, ['alpine']],
+    ['FROM alpine\n', { BUILDKIT_SYNTAX: null }, ['alpine']],
+  ])('allows the value of build.args in %j: %j (S5-2)', (text, args, images) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, refused (protected) as an image of another environment or a frontend.
+    expectAllowed(text, { args });
+    // The update check takes the build arguments that are texts, numbers, or booleans (buildArgumentTexts).
+    expect(single(text, { args }).references.images).toEqual(images);
   });
 
   it('refuses an object as the value of a build argument (S5-2)', () => {
@@ -647,18 +684,20 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
     ['#!/bin/sh\n// escape=\\\n// syntax=FRONTEND\nFROM alpine\n'],
     ['{"syntax":"FRONTEND"}\n'],
     ['#!/bin/sh\n{"syntax": "FRONTEND", "x": "\\nFROM alpine"}\n'],
-  ])('finds the frontend in %j as BuildKit does (S5-3)', (text) => {
-    expect(classes(dockerfile(text.replace('FRONTEND', 'evil/frontend:1')))).toEqual([FRONTEND('evil/frontend:1')]);
-    expect(classes(dockerfile(text.replace('FRONTEND', 'docker/dockerfile:1')))).toEqual([]);
+  ])('allows any frontend in %j (S5-3)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `syntax image evil/frontend:1 (only the official …)` (protected).
+    expectAllowed(text.replace('FRONTEND', 'evil/frontend:1'));
+    expectAllowed(text.replace('FRONTEND', 'docker/dockerfile:1'));
   });
 
-  it('takes the frontend up to its first space, as BuildKit does (P5-2)', () => {
-    expect(classes(dockerfile('# syntax=docker/dockerfile:1 # comment\nFROM alpine\n'))).toEqual([]);
-    expect(classes(dockerfile('# syntax = docker/dockerfile:1.7-labs  x\nFROM alpine\n'))).toEqual([]);
-    expect(classes(dockerfile('FROM alpine\n', { args: { BUILDKIT_SYNTAX: ' docker/dockerfile:1 x' } }))).toEqual([]);
-    expect(classes(dockerfile('FROM alpine\n', { options: ['--build-arg', 'BUILDKIT_SYNTAX=docker/dockerfile:1 x'] }))).toEqual([]);
-    expect(classes(dockerfile('# syntax=evil/frontend:1 docker/dockerfile:1\nFROM alpine\n'))).toEqual([FRONTEND('evil/frontend:1')]);
-    expect(classes(dockerfile('FROM alpine\n', { args: { BUILDKIT_SYNTAX: 'evil/frontend:1 docker/dockerfile:1' } }))).toEqual([FRONTEND('evil/frontend:1')]);
+  it('allows a frontend up to its first space and after it (P5-2)', () => {
+    expectAllowed('# syntax=docker/dockerfile:1 # comment\nFROM alpine\n');
+    expectAllowed('# syntax = docker/dockerfile:1.7-labs  x\nFROM alpine\n');
+    expectAllowed('FROM alpine\n', { args: { BUILDKIT_SYNTAX: ' docker/dockerfile:1 x' } });
+    expectAllowed('FROM alpine\n', { options: ['--build-arg', 'BUILDKIT_SYNTAX=docker/dockerfile:1 x'] });
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `syntax image evil/frontend:1 (only the official …)` (protected).
+    expectAllowed('# syntax=evil/frontend:1 docker/dockerfile:1\nFROM alpine\n');
+    expectAllowed('FROM alpine\n', { args: { BUILDKIT_SYNTAX: 'evil/frontend:1 docker/dockerfile:1' } });
   });
 
   it('allows the label devenv.config-path of the override configuration for a folder that the discovery finds (D5-2)', () => {
@@ -679,8 +718,6 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
 });
 
 describe('review round 6 of unit 6 (S6-1, P6-2)', () => {
-  const dockerfile = (text: string): HostAccessInput => input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileText: text });
-  const classes = (checked: HostAccessInput) => hostAccessClassification(checked).map((finding) => `${finding.class}: ${finding.item}`);
   const VARIANTS8 = Array.from({ length: 8 }, (_, i) => `\${X${i}:-${'abcdefgh'[i]}}`).join('');
   const timed = <T,>(run: () => T): { result: T; ms: number } => {
     const start = Date.now();
@@ -688,69 +725,58 @@ describe('review round 6 of unit 6 (S6-1, P6-2)', () => {
     return { result, ms: Date.now() - start };
   };
 
-  it('refuses a COPY --from reference with 8 variables and 4000 characters quickly as too long (S6-1)', () => {
-    const { result, ms } = timed(() => hostAccessReport(dockerfile(`FROM alpine\nCOPY --from=${VARIANTS8}${'a'.repeat(4000)} / /\n`), false));
-    expect(result).toEqual({ hostAccess: [], unsupported: [`COPY --from image ${VARIANTS8}… (the image reference is too long)`] });
+  it('allows a COPY --from reference with 8 variables and 4000 characters, quickly (S6-1)', () => {
+    const { result, ms } = timed(() => single(`FROM alpine\nCOPY --from=${VARIANTS8}${'a'.repeat(4000)} / /\n`, {}, false));
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `COPY --from image … (the image reference is too long)`.
+    expect(result.report).toEqual(ALLOWED);
+    expect(result.references.images).toEqual(['alpine']);
     expect(ms).toBeLessThan(1000);
   });
 
-  it('makes the variants of a long reference in linear time (S6-1)', () => {
-    const { result, ms } = timed(() => unresolvedVariants(`${VARIANTS8}${'a'.repeat(4000)}`));
-    expect(result).toHaveLength(256);
-    expect(ms).toBeLessThan(1000);
-  });
-
-  it('refuses a value of FROM, --from, or from= longer than 1024 characters, also when it expands to a short text (S6-1)', () => {
+  it('skips a FROM value longer than 1024 characters for the update check, and still refuses such an image of the configuration (S6-1)', () => {
     const long = `\${A:-${'a'.repeat(1100)}}`;
-    const shown = `${long.slice(0, 64)}…`;
-    expect(classes(dockerfile(`ARG A=alpine\nFROM ${long}\n`))).toEqual([`unsupported: FROM image ${shown} (the image reference is too long)`]);
-    expect(classes(dockerfile(`FROM alpine\nARG A=x\nCOPY --from=${long} / /\n`))).toEqual([`unsupported: COPY --from image ${shown} (the image reference is too long)`]);
-    expect(classes(dockerfile(`FROM alpine\nARG A=x\nRUN --mount=type=bind,from=${long},target=/x true\n`))).toEqual([
-      `unsupported: RUN --mount image ${shown} (the image reference is too long)`,
-    ]);
-    // The image of the configuration too.
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `… image … (the image reference is too long)` for each.
+    for (const text of [`ARG A=alpine\nFROM ${long}\n`, `FROM alpine\nARG A=x\nCOPY --from=${long} / /\n`, `FROM alpine\nARG A=x\nRUN --mount=type=bind,from=${long},target=/x true\n`]) {
+      expectAllowed(text);
+    }
+    expect(single(`FROM ${'a'.repeat(1100)}\nFROM b\n`).references.images).toEqual(['b']);
+    // The image of the configuration is still checked.
     const image = `alpine:${'1'.repeat(1100)}`;
     expect(hostAccessReport(input({ image }), false)).toEqual({ hostAccess: [], unsupported: [`image ${image.slice(0, 64)}… (the image reference is too long)`] });
     // 1024 characters are still read.
-    expect(classes(dockerfile(`FROM alpine:${'1'.repeat(1024 - 'alpine:'.length)}\n`))).toEqual([]);
+    const tag = '1'.repeat(1024 - 'alpine:'.length);
+    expect(single(`FROM alpine:${tag}\n`).references.images).toEqual([`alpine:${tag}`]);
   });
 
   it.each([
     ['resolved', 'ARG A\nFROM NEST\n'],
     ['not resolved', 'FROM NEST\n'],
     ['in an ARG', 'ARG A\nARG B=NEST\nFROM alpine:$B\n'],
-  ])('refuses a nesting of ${…} deeper than 32 levels (%s) as unsupported, without an exception (S6-1)', (_, template) => {
+  ])('allows a nesting of ${…} deeper than 32 levels (%s), without an exception (S6-1)', (_, template) => {
     const nest = (levels: number, name: string) => `\${${name}:-`.repeat(levels) + 'x' + '}'.repeat(levels);
     const name = template.startsWith('FROM') ? 'TARGETARCH' : 'A';
     for (const levels of [33, 5000]) {
       const text = template.replace('NEST', nest(levels, name));
-      const { result, ms } = timed(() => hostAccessClassification(dockerfile(text)));
-      expect(result.length).toBe(1);
-      expect(result[0].class).toBe('unsupported');
+      const { result, ms } = timed(() => single(text));
+      // Dockerfile refusals removed (user decision 2026-09-27): before, refused as unsupported.
+      expect(result.report).toEqual(ALLOWED);
+      expect(result.references.images).toEqual([]);
       expect(ms).toBeLessThan(1000);
     }
     // 32 levels are evaluated.
-    // slim-down: Docker's view only (no finding of the base image that the Dev Container CLI reads).
-    const allowed = hostAccessClassification(dockerfile(template.replace('NEST', nest(32, name))));
-    expect(allowed.filter((finding) => finding.class === 'unsupported')).toEqual([]);
+    expectAllowed(template.replace('NEST', nest(32, name)));
   });
 
-  it('gives no variants for a nesting deeper than 32 levels, without an exception (S6-1)', () => {
-    const nest = (levels: number) => '${A:-'.repeat(levels) + 'x' + '}'.repeat(levels);
-    expect(unresolvedVariants(nest(32))).toEqual(['', 'x']);
-    expect(unresolvedVariants(nest(33))).toBeUndefined();
-    expect(unresolvedVariants(nest(20000))).toBeUndefined();
-  });
-
-  it('refuses ARGs that double their value as unsupported, without an exception (S6-1)', () => {
+  it('allows ARGs that double their value, without an exception (S6-1)', () => {
     for (const n of [20, 26, 40]) {
       const text =
         'ARG A0=abcdefgh\n' +
         Array.from({ length: n }, (_, i) => `ARG A${i + 1}=\${A${i}}\${A${i}}`).join('\n') +
         `\nFROM alpine:\${A${n}}\nARG A${n}\nCOPY --from=x\${A${n}}\${TARGETARCH} / /\n`;
-      const { result, ms } = timed(() => hostAccessClassification(dockerfile(text)));
-      expect(result.map((finding) => finding.class)).toEqual(['unsupported', 'unsupported']);
-      expect(result.every((finding) => finding.item.endsWith('(the image reference is too long)'))).toBe(true);
+      const { result, ms } = timed(() => single(text));
+      // Dockerfile refusals removed (user decision 2026-09-27): before, two items `… (the image reference is too long)`.
+      expect(result.report).toEqual(ALLOWED);
+      expect(result.references.images).toEqual([]);
       expect(ms).toBeLessThan(1000);
     }
   });
@@ -762,16 +788,15 @@ describe('review round 6 of unit 6 (S6-1, P6-2)', () => {
     'FROM alpine AS b1\nFROM b${TARGETVARIANT}1\n',
     'FROM alpine AS cafe\nFROM alpine\nCOPY --from=${STAGE:-CAFE} / /x\n',
   ])('allows a variant that names a stage or a stage index in %j (P6-2)', (text) => {
-    expect(classes(dockerfile(text))).toEqual([]);
+    expectAllowed(text);
   });
 
   it.each([
-    // A later stage is no stage for FROM; an index is no stage for FROM.
-    ['FROM ${TARGETVARIANT}cafe\nFROM alpine AS cafe\n', 'FROM image ${TARGETVARIANT}cafe'],
-    ['FROM ${TARGETVARIANT:-0}\n', 'FROM image ${TARGETVARIANT:-0}'],
-    // The other variant is still an image ID.
-    ['FROM alpine AS cafe\nFROM alpine\nCOPY --from=${STAGE:+be}cafe / /x\n', 'COPY --from image ${STAGE:+be}cafe'],
-  ])('still refuses %j (P6-2)', (text, item) => {
-    expect(classes(dockerfile(text))).toEqual([`protected: ${item} (with its variables that are not resolved, it can name an image of another environment or an image ID)`]);
+    'FROM ${TARGETVARIANT}cafe\nFROM alpine AS cafe\n',
+    'FROM ${TARGETVARIANT:-0}\n',
+    'FROM alpine AS cafe\nFROM alpine\nCOPY --from=${STAGE:+be}cafe / /x\n',
+  ])('allows %j (P6-2)', (text) => {
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `… (with its variables that are not resolved, it can name an image of another environment or an image ID)` (protected).
+    expectAllowed(text);
   });
 });

@@ -403,7 +403,8 @@ process.stdout.write(JSON.stringify(found) + '\n');
 /**
  * Review round 9 (S9-2): the function `readLimited(file, limit)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they
  * define `fs`): the text of a file, at most `limit + 1` characters of it, so that the length check of the extension
- * (MAX_DOCKERFILE_LENGTH, MAX_CONFIG_TEXT_LENGTH) still refuses a longer file, while a file of any size costs at most
+ * still sees a longer file (MAX_CONFIG_TEXT_LENGTH refuses it; beyond MAX_DOCKERFILE_LENGTH, the update check skips a
+ * Dockerfile, and the dev service of a Docker Compose configuration is refused), while a file of any size costs at most
  * 4 · (`limit` + 1) bytes (4 bytes per character of UTF-8 at most), never the whole file. Throws what `fs` throws.
  */
 const READ_LIMITED = String.raw`const readLimited = (file, limit) => {

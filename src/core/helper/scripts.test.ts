@@ -40,7 +40,7 @@ import {
 } from './scripts';
 import { MAX_SERVICE_REAL_PATHS } from '../git/gitSummary';
 import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
-import { parseComposeModelOutput } from './compose';
+import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import { composeAccessReport, type ComposeAccessInput } from './composeAccess';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
@@ -475,7 +475,8 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(Object.keys(raw.dockerfileFiles)).toEqual(['s0', 's1', 's2', 's3', 's4']);
     const parsed = parseComposeModelOutput(result.stdout);
     if ('error' in parsed) throw new Error(parsed.error);
-    // Each service has the text, one character longer than the limit: the check refuses it as too large.
+    // Each service has the text, one character longer than the limit: the update check skips it (and the dev service is
+    // refused, since its build writes the text). Dockerfile refusals removed (user decision 2026-09-27).
     for (let i = 0; i < 5; i++) expect(parsed.dockerfiles[`s${i}`]).toHaveLength(MAX_DOCKERFILE_LENGTH + 1);
     expect(parsed.dockerfiles.s0.startsWith('FROM alpine\nRUN echo aaa')).toBe(true);
   });
@@ -502,7 +503,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.model).toEqual(JSON.parse(env.FAKE_MODEL!));
     // Not a Dockerfile in the repository whose link leads out of it, and none of a remote context. Review round 1 (S1):
     // a Dockerfile outside the repository that is no path of the workspace helper is read now (with the checks off it
-    // may be built, and its FROM images must be checked); before, it was left out.
+    // may be built; its FROM images are the references of the update check); before, it was left out.
     expect(output.dockerfiles).toEqual({ app: 'FROM node:24\n', inline: 'FROM alpine:3.22', outside: 'FROM secret\n' });
     // Review round 1 (S1): the real paths of the build contexts and the Dockerfiles too.
     expect(output.realPaths).toEqual({
@@ -657,11 +658,15 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
 
   describe('review round 19 (S19-1): the checks see the texts that Compose and BuildKit use', () => {
     /** The model run of `printed` (as Compose prints it with $$), and the check of its output. */
-    function check(repo: string, env: NodeJS.ProcessEnv, printed: unknown): { hostAccess: string[]; unsupported: string[] } {
+    function modelRun(repo: string, env: NodeJS.ProcessEnv, printed: unknown): ComposeModelOutput {
       const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
       const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', env: { ...env, FAKE_MODEL: JSON.stringify(printed) } });
       const output = parseComposeModelOutput(result.stdout);
       if ('error' in output) throw new Error(output.error);
+      return output;
+    }
+    function check(repo: string, env: NodeJS.ProcessEnv, printed: unknown): { hostAccess: string[]; unsupported: string[] } {
+      const output = modelRun(repo, env, printed);
       const input: ComposeAccessInput = {
         model: output.model,
         devService: 'app',
@@ -678,13 +683,17 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     }
     const APP = { image: 'mcr.microsoft.com/devcontainers/base:bookworm', command: ['sleep', 'infinity'] };
 
-    it('refuses a dockerfile_inline of another service whose FROM resolves to the image of another environment', () => {
+    it('allows a dockerfile_inline of another service whose FROM resolves to the image of another environment, and reads it unescaped', () => {
       const { repo, env } = setup();
-      const report = check(repo, env, {
+      const printed = {
         name: 'devenv-3f2a9c1e',
         services: { app: APP, db: { build: { context: repo, dockerfile_inline: 'ARG img=devenv-0badc0de:3\nFROM $$img\n' } } },
-      });
-      expect([...report.hostAccess, ...report.unsupported].join('\n')).toContain('devenv-0badc0de:3');
+      };
+      // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… devenv-0badc0de:3 of another environment`.
+      expect(check(repo, env, printed)).toEqual({ hostAccess: [], unsupported: [] });
+      // The update check reads the text that BuildKit uses (`$img`, not `$$img`).
+      const output = modelRun(repo, env, printed);
+      expect(composeReferences(output.model, output.dockerfiles, undefined).images).toEqual(['mcr.microsoft.com/devcontainers/base:bookworm', 'devenv-0badc0de:3']);
     });
 
     it('checks a bind mount on the unescaped path (a link out of the repository)', () => {

@@ -52,7 +52,7 @@ separates accounts, so the environments of one account still share their Docker.
 ## What it protects, and what not
 
 - Protected (with the home-folder share switched off; not with a WSL 2 distribution, see the Windows row): the files and the Docker of the computer, and the images,
-  containers, volumes, and build cache of other accounts. The image and Dockerfile checks become a second line; the
+  containers, volumes, and build cache of other accounts. The checks of the images of the configuration become a second line; the
   host access checks stay as a guard rail.
 - Not protected:
   - the channels that VS Code opens from the container to the computer (SSH and GPG agents, the credential socket,

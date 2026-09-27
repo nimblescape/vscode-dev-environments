@@ -451,13 +451,16 @@ describe('first open of a Docker Compose configuration', () => {
     expect(h.helper.builds).toEqual([]);
   });
 
-  it('refuses a side service built FROM the image of another environment (review round 1, S4)', async () => {
+  it('allows a side service built FROM the image of another environment (review round 1, S4)', async () => {
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
       dockerfiles: { db: 'FROM index.docker.io/library/devenv-7c1d2e3f:3\n' },
     });
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.hostAccess('service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment'));
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment`.
+    // The fake Docker has no build of Compose: the image that Compose builds for the service.
+    h.docker.images.add('devenv-3f2a9c1e-db');
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
   });
 
   it('refuses the image of a side service that Docker would find by the prefix of its ID (review round 2, S2-05)', async () => {

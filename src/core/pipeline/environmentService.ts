@@ -338,7 +338,7 @@ export interface EnvironmentServiceDeps {
   newEnvironmentId?: () => string;
   /**
    * Review round 8: runs the host access analysis of a configuration (hostAccessReport, composeAccessReport, and the
-   * images of the Dockerfiles). The extension runs it in a worker thread with limits of time and memory
+   * FROM images of the Dockerfiles for the update check). The extension runs it in a worker thread with limits of time and memory
    * (WorkerConfigurationAnalyzer); a failed analysis refuses the configuration.
    */
   analyzer: ConfigurationAnalyzer;
@@ -1431,18 +1431,18 @@ export class EnvironmentService {
       signal: ctx.signal,
     });
     // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
-    // CLI resolves the build context and the Dockerfile, and the Dockerfile (review round 1, S1 and S4) at the path that
-    // the resolved configuration names (review round 2, S2-01).
+    // CLI resolves the build context and the Dockerfile (review round 1, S1 and S4). The Dockerfile at the path that the
+    // resolved configuration names (review round 2, S2-01) is not checked (Dockerfile refusals removed, user decision
+    // 2026-09-27): its FROM images are the references of the update check, and its text is part of the configuration hash.
     const repository = repositoryFolder(env.repository);
     const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
     const input: Omit<HostAccessInput, 'ownVolume'> = {
       config,
       configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
       repositoryFolder: repository,
-      ...(dockerfile.text !== undefined ? { dockerfileText: dockerfile.text } : {}),
-      ...(dockerfile.unreadable !== undefined ? { dockerfileUnreadable: dockerfile.unreadable } : {}),
     };
-    // Review round 8: in the worker (ConfigurationAnalyzer), with the image references of the configuration.
+    // Review round 8: in the worker (ConfigurationAnalyzer), with the image references of the configuration and the
+    // references of the update check.
     const singleAnalysis = async (checked: HostAccessInput) =>
       this.analyze(ctx, {
         kind: 'single',
@@ -1535,10 +1535,11 @@ export class EnvironmentService {
    * The Dockerfile of a single container at the path that the configuration names after the Dev Container CLI resolved
    * its variables (review round 2, S2-01: the text of the configuration may name it with a variable, for example
    * `${localEnv:NAME:Dockerfile}`, which READ_FILES_SCRIPT does not read): the text that readConfigFiles read when it is
-   * that file, or else the file at the resolved path. `unreadable`: the configuration names a Dockerfile that could not be
-   * read (outside of the repository, a link out of it, or a path with a variable that is not resolved): the check refuses
-   * it, because its images would escape the checks. `missing` (review round 3, P3-1): the Dockerfile does not exist in the
-   * repository (an error of the configuration, not a refusal).
+   * that file, or else the file at the resolved path. No text when the Dockerfile could not be read (outside of the
+   * repository, a link out of it, or a path with a variable that is not resolved): the update check skips its FROM
+   * images, and the configuration is not refused for it (Dockerfile refusals removed, user decision 2026-09-27).
+   * `missing` (review round 3, P3-1): the Dockerfile does not exist in the repository (an error of the configuration,
+   * not a refusal).
    */
   private async resolvedDockerfile(
     env: Environment,
@@ -1546,7 +1547,7 @@ export class EnvironmentService {
     config: DevcontainerConfig,
     files: ConfigFiles,
     signal: AbortSignal | undefined,
-  ): Promise<{ text?: string; unreadable?: string; missing?: string }> {
+  ): Promise<{ text?: string; missing?: string }> {
     const build: Record<string, unknown> = isRecord(config.build) ? config.build : {};
     const raw: Record<string, unknown> = config as Record<string, unknown>;
     const named = typeof build.dockerfile === 'string' ? build.dockerfile : typeof raw.dockerFile === 'string' ? raw.dockerFile : undefined;
@@ -1566,7 +1567,7 @@ export class EnvironmentService {
       signal,
     });
     if (read?.dockerfileText !== undefined) return { text: read.dockerfileText };
-    return read?.dockerfileMissing === true ? { missing: named } : { unreadable: named };
+    return read?.dockerfileMissing === true ? { missing: named } : {};
   }
 
   /** The warnings of a configuration that the pipeline uses: `${localWorkspaceFolder}`, and variables of the computer. */
