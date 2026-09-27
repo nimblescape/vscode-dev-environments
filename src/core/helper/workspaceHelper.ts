@@ -9,7 +9,7 @@
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
+import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
 import {
   CONFIG_FOLDER,
@@ -785,6 +785,23 @@ export class WorkspaceHelper {
       onStderr: this.logOutput,
     });
     if (result.exitCode !== 0) throw new CommandError('remove the GitHub token', result.exitCode, result.stdout, result.stderr);
+  }
+
+  /**
+   * Review round 15 (K3 = P15-1, D15-1, S15-3): gives the files in `folder` of the volume (the extension's internal folder,
+   * CONFIG_FOLDER) the owner `uid`:`gid` (numbers, as `id -u` and `id -g` print them in the dev container), in a helper
+   * container that mounts only the workspace volume (without the Docker socket, the cache volume, and network), with
+   * CONFIG_OWNERSHIP_FIX_SCRIPT. No mount of the dev container (for example through a link of the repository,
+   * `volumes_from`, or a tmpfs) is there: the fix walks only the folder of the volume. Throws for IDs that are not numbers
+   * (configOwnershipFixCommand); returns the result also for a non-zero exit code.
+   */
+  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string; timeoutMs?: number; signal?: AbortSignal }): Promise<RunResult> {
+    return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
+      docker: false,
+      network: false,
+      timeoutMs: p.timeoutMs,
+      signal: p.signal,
+    });
   }
 
   /**

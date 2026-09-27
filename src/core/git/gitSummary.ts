@@ -213,10 +213,14 @@ interface PathNode {
  * linear in the total length of the paths (a tree of their segments, in place of a lookup of each ancestor); a path over
  * MAX_SERVICE_PATH_LENGTH or MAX_SERVICE_PATH_DEPTH (isOverlongServicePath) stays in the list unless a path of the list
  * covers it, and makes the callers treat the list as overflow (boundServiceFolders, servicePathArguments).
+ * Review round 15 (K4 = D15-2): `gitPaths` keeps paths in `.git` for the targets of the mounts of the dev container
+ * (devMountFolders, for example a volume that db shares at `.git/pg`, or a bind of the computer at `.git/hooks`): they
+ * are mounts, not records of the services, and the fix would otherwise give their files to the remote user. Only the
+ * callers of those targets set it; the records of the services keep the filter.
  */
-export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined): string[] {
-  // Segments without a place in the list: empty, `.`, `..`, `.git`.
-  const invalidSegment = /(?:^|\/)(?:|\.|\.\.|\.git)(?:\/|$)/;
+export function serviceFolderPaths(repoFolder: string, folders: readonly string[] | undefined, gitPaths = false): string[] {
+  // Segments without a place in the list: empty, `.`, `..`, `.git` (review round 15, K4: except for `gitPaths`).
+  const invalidSegment = gitPaths ? /(?:^|\/)(?:|\.|\.\.)(?:\/|$)/ : /(?:^|\/)(?:|\.|\.\.|\.git)(?:\/|$)/;
   const valid: Array<{ folder: string; segments: string[] | undefined }> = [];
   const seen = new Set<string>();
   for (const folder of folders ?? []) {
@@ -278,14 +282,16 @@ export function servicePrunePatterns(repoFolder: string, folders: readonly strin
  * Review round 11 (G3, G5): the paths of `groups` (in their order: the paths of the model and those that containers
  * mount first, then the recorded ones), as serviceFolderPaths filters them, at most MAX_SERVICE_FOLDERS. `overflow`: there
  * were more (or `overflow` was set before, since the paths beyond the bound are not recorded): the ownership fixes then
- * leave the whole repository to the services (`'repository'`, ServiceFolders).
+ * leave the whole repository to the services (`'repository'`, ServiceFolders). `gitPaths`: as in serviceFolderPaths
+ * (review round 15, K4).
  */
 export function boundServiceFolders(
   repoFolder: string,
   groups: ReadonlyArray<readonly string[] | undefined>,
   overflow = false,
+  gitPaths = false,
 ): { folders: string[]; overflow: boolean } {
-  const paths = serviceFolderPaths(repoFolder, groups.flatMap((group) => group ?? []));
+  const paths = serviceFolderPaths(repoFolder, groups.flatMap((group) => group ?? []), gitPaths);
   // Review round 12 (S12-1): a path over the bounds is overflow; it is not recorded (the recorded overflow covers it).
   const within = paths.filter((path) => !isOverlongServicePath(repoFolder, path));
   return {
@@ -307,10 +313,10 @@ function findPathPattern(path: string): string {
  * characters: the test of the whole repository folder, so that only the files
  * of root get their owner.
  */
-export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined): string[] {
+export function servicePathArguments(repoFolder: string, folders: ServiceFolders | undefined, gitPaths = false): string[] {
   const whole = () => ['-path', findPathPattern(repoFolder), '-o', '-path', `${findPathPattern(repoFolder)}/*`];
   if (folders === 'repository') return whole();
-  const paths = serviceFolderPaths(repoFolder, folders);
+  const paths = serviceFolderPaths(repoFolder, folders, gitPaths);
   if (paths.length > MAX_SERVICE_FOLDERS || paths.some((path) => isOverlongServicePath(repoFolder, path))) return whole();
   const args: string[] = [];
   let characters = 0;
@@ -362,6 +368,37 @@ ${SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
 
 /**
+ * Review round 15 (K3 = P15-1, D15-1, S15-3): gives every file in the folder `$1` that does not have the user `$2` and
+ * the group `$3` (numbers) that owner (service_owner_fix without paths of services: `find -xdev`, `chown -h`). For the
+ * extension's internal folder (CONFIG_FOLDER), run in a container of the workspace helper that mounts only the workspace
+ * volume (WorkspaceHelper.fixConfigOwnership), not in the dev container: there, a mount of the dev container (through a
+ * link of the repository, `volumes_from`, or a tmpfs) can lie in the folder, and the fix would give its files (for
+ * example the data of a database) to the remote user. The helper sees the folder of the volume itself. A link or a
+ * missing folder in place of `$1` is not walked (exit code 1).
+ */
+export const CONFIG_OWNERSHIP_FIX_SCRIPT = `set -eu
+if [ -L "$1" ] || [ ! -d "$1" ]; then
+  echo "$1 is not a folder." >&2
+  exit 1
+fi
+${SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
+`;
+
+/** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */
+export function isNumericId(text: string): boolean {
+  return /^(0|[1-9][0-9]{0,9})$/.test(text) && Number(text) < 4294967295;
+}
+
+/**
+ * Review round 15 (K3): the command of CONFIG_OWNERSHIP_FIX_SCRIPT for the folder `folder` and the numeric IDs `uid` and
+ * `gid` (isNumericId; throws for anything else).
+ */
+export function configOwnershipFixCommand(folder: string, uid: string, gid: string): string[] {
+  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+  return ['sh', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT, 'sh', folder, uid, gid];
+}
+
+/**
  * Parses the output of GIT_SUMMARY_SCRIPT. Uses the last 4 lines, so that a banner before them does no harm.
  * Throws when the output does not have this form.
  */
@@ -396,8 +433,9 @@ export function gitSummaryCommand(repoFolder: string): string[] {
 
 /**
  * Command for `docker exec -u root` in the dev container after its first creation (implementation notes 7 "Ownership"):
- * the helper clones as root, so the files get the user and the primary group of `remoteUser`.
+ * the helper clones as root, so the files get the user and the primary group of `remoteUser`. `gitPaths`: as in
+ * serviceFolderPaths (review round 15, K4), for a list that holds the targets of the mounts of the dev container.
  */
-export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders): string[] {
-  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders)];
+export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths = false): string[] {
+  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders, gitPaths)];
 }

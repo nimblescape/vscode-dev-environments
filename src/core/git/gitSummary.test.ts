@@ -8,6 +8,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  CONFIG_OWNERSHIP_FIX_SCRIPT,
   GIT_SUMMARY_SCRIPT,
   OWNERSHIP_FIX_SCRIPT,
   MAX_SERVICE_ARGUMENT_CHARACTERS,
@@ -16,7 +17,9 @@ import {
   MAX_SERVICE_PATH_LENGTH,
   MAX_SERVICE_REAL_PATHS,
   boundServiceFolders,
+  configOwnershipFixCommand,
   gitSummaryCommand,
+  isNumericId,
   ownershipFixCommand,
   parseGitSummaryOutput,
   serviceFolderPaths,
@@ -757,5 +760,105 @@ describe.skipIf(process.getuid?.() !== 0)('review round 11 (G5): over the bound,
     expect(spawnSync(again, againArgs, { encoding: 'utf8' }).status).toBe(0);
     expect(uidOf(path.join(repo, 'top.txt'))).toBe(nobody);
     expect(uidOf(path.join(repo, 'data/host-7/PG_VERSION'))).toBe(999);
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 15 (K4 = D15-2): a mount of the dev container in .git, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('leaves the files of db in a volume at .git/pg alone, and gives the rest of .git the full fix', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['.git/objects/ab', '.git/pg/base', 'src']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['.git/HEAD', '.git/objects/ab/cd', '.git/pg/PG_VERSION', '.git/pg/base/1', 'src/a.ts']) fs.writeFileSync(path.join(repo, file), 'x');
+    // Postgres (uid 999) in the volume that db shares; a file of another user in .git (for example after a change of the
+    // uid of the remote user), which the full fix gives the user.
+    for (const file of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    fs.chownSync(path.join(repo, '.git/objects/ab/cd'), 1234, 1234);
+    // The paths as withDevMountFolders passes them (devMountFolders of the mounts of the dev container), with gitPaths.
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`], true);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    for (const name of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    for (const name of ['.', '.git', '.git/HEAD', '.git/objects', '.git/objects/ab', '.git/objects/ab/cd', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    // Without gitPaths (the records of the services), the path in .git is dropped as before (review round 10, D10-3).
+    expect(ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repo, 'nobody']);
+  });
+});
+
+describe('review round 15 (K3): the ownership fix of the internal folder with numeric IDs, for a helper container', () => {
+  it('takes only decimal user and group IDs', () => {
+    for (const id of ['0', '1000', '999', '4294967294']) expect(isNumericId(id), id).toBe(true);
+    for (const id of ['', ' 1000', '1000\n', '-1', '+1', '01', '1e3', '0x10', 'vscode', '4294967295', '99999999999', '1000:1000']) expect(isNumericId(id), id).toBe(false);
+    expect(configOwnershipFixCommand('/workspaces/.devenv+', '1000', '1001')).toEqual(['sh', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/.devenv+', '1000', '1001']);
+    expect(() => configOwnershipFixCommand('/workspaces/.devenv+', 'vscode', '1000')).toThrow();
+    expect(() => configOwnershipFixCommand('/workspaces/.devenv+', '1000', '$(reboot)')).toThrow();
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      const result = spawnSync(shell, ['-n', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT], { encoding: 'utf8' });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    }
+  });
+
+  it('refuses a link or a missing folder in place of the folder', () => {
+    const root = tempDir();
+    fs.mkdirSync(path.join(root, 'real'));
+    fs.symlinkSync(path.join(root, 'real'), path.join(root, 'link'));
+    for (const folder of [path.join(root, 'link'), path.join(root, 'missing')]) {
+      const [file, ...args] = configOwnershipFixCommand(folder, String(os.userInfo().uid), String(os.userInfo().gid));
+      const result = spawnSync(file, args, { encoding: 'utf8' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('is not a folder');
+    }
+  });
+});
+
+const canBindMount =
+  process.getuid?.() === 0 && spawnSync('unshare', ['-m', 'sh', '-c', 'mount --bind "$1" "$1"', 'sh', os.tmpdir()], { stdio: 'ignore' }).status === 0;
+
+describe.skipIf(!canBindMount)('review round 15 (K3): a mount of the dev container through a link does not reach the fix of the internal folder (real mounts as root)', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const nobodyGroup = Number(spawnSync('id', ['-g', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives the token the user in the helper, while in the dev container the data of db (uid 999) would have been walked', () => {
+    // The workspace volume as the helper mounts it: the internal folder with the token (root, written before `up`), and
+    // the repository with a link x -> ../.devenv+. The data of db (uid 999) in a volume of its own.
+    const root = tempDir();
+    const volume = path.join(root, 'workspaces');
+    const config = path.join(volume, '.devenv+');
+    const pgdata = path.join(root, 'pgdata');
+    fs.mkdirSync(path.join(config, 'gh'), { recursive: true });
+    fs.mkdirSync(path.join(volume, 'api'), { recursive: true });
+    fs.writeFileSync(path.join(config, 'github-token'), 'x');
+    fs.writeFileSync(path.join(config, 'gh', 'hosts.yml'), 'x');
+    fs.symlinkSync('../.devenv+', path.join(volume, 'api', 'x'));
+    fs.mkdirSync(path.join(pgdata, 'base'), { recursive: true });
+    fs.writeFileSync(path.join(pgdata, 'PG_VERSION'), '16');
+    const pgFiles = ['.', 'base', 'PG_VERSION'].map((name) => path.join(pgdata, name));
+    for (const file of pgFiles) fs.chownSync(file, 999, 999);
+
+    // The dev container: a volume mounted at /workspaces/api/x, which the kernel resolves through the link into the
+    // internal folder. The fix there (before this round: OWNERSHIP_FIX_SCRIPT in the dev container) walks the data of db.
+    const devFix = spawnSync(
+      'unshare',
+      ['-m', 'sh', '-c', 'mount --bind "$1" "$2" && shift 2 && exec sh -c "$@"', 'sh', pgdata, path.join(volume, 'api', 'x'), OWNERSHIP_FIX_SCRIPT, 'sh', config, 'nobody'],
+      { encoding: 'utf8' },
+    );
+    expect(devFix.status, devFix.stderr).toBe(0);
+    for (const file of pgFiles) expect(uidOf(file), file).toBe(nobody);
+    for (const file of pgFiles) fs.chownSync(file, 999, 999);
+
+    // The helper: only the workspace volume (here: no mount of the dev container in its mount namespace).
+    const [file, ...args] = configOwnershipFixCommand(config, String(nobody), String(nobodyGroup));
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    for (const name of ['.', 'github-token', 'gh', 'gh/hosts.yml']) expect(uidOf(path.join(config, name)), name).toBe(nobody);
+    for (const pg of pgFiles) expect(uidOf(pg), pg).toBe(999);
   });
 });

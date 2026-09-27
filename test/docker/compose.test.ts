@@ -116,6 +116,9 @@ describe('open pipeline for a Docker Compose configuration', () => {
   const app = environment('devenv-test/tiny-compose');
   const refused = environment('devenv-test/refused-compose');
   const unrestricted = environment('devenv-test/unrestricted-compose');
+  // Review round 15 (K1): a `mounts` entry that the Dev Container CLI would write as a bind of the Docker socket.
+  const tmpfsSource = environment('devenv-test/tmpfs-source-compose');
+  const TMPFS_SOURCE_MOUNT = 'type=tmpfs,src=/var/run/docker.sock,dst=/var/run/docker.sock';
   let apiVersion: string;
 
   /** The compose file: `db` publishes a port without an address and mounts a folder and a file of the repository. */
@@ -148,14 +151,14 @@ ${extra}volumes:
 `;
   }
 
-  async function seed(target: ReturnType<typeof environment>, compose: string): Promise<void> {
+  async function seed(target: ReturnType<typeof environment>, compose: string, mounts: readonly string[] = ['source=cache,target=/cache,type=volume']): Promise<void> {
     const devcontainerJson = JSON.stringify({
       name: 'Tiny Compose',
       dockerComposeFile: ['compose.yml'],
       service: 'app',
       workspaceFolder: target.folder,
       // A named volume of `mounts`: the Dev Container CLI declares it in the project; our model declares it external.
-      mounts: ['source=cache,target=/cache,type=volume'],
+      mounts,
     });
     const files = {
       [CONFIG_PATH]: devcontainerJson,
@@ -202,7 +205,7 @@ ${extra}volumes:
 
   /** The containers, networks, and volumes of the Compose projects: they carry the labels of the environment. */
   function removeProjectObjects(): void {
-    for (const target of [app, refused, unrestricted]) {
+    for (const target of [app, refused, unrestricted, tmpfsSource]) {
       for (const id of containers(target)) cli.run(['rm', '-f', id]);
       for (const id of cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${target.project}`])) cli.run(['network', 'rm', id]);
       for (const name of cli.lines(['volume', 'ls', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${target.id}`])) {
@@ -223,6 +226,7 @@ ${extra}volumes:
     expect(refusedFile).toContain('privileged: true');
     await seed(refused, refusedFile);
     await seed(unrestricted, composeFile());
+    await seed(tmpfsSource, composeFile(), [TMPFS_SOURCE_MOUNT]);
     // Delete removes the base images that no build record uses any more; a stopped container of the base image keeps it
     // for the other tests and for the baseline of the engine (Docker does not remove an image that a container uses).
     cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--name', `devenv-test-compose-guard-${run.runId}`, TEST_BASE_IMAGE, 'true']);
@@ -246,6 +250,23 @@ ${extra}volumes:
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(refused.id)}*`])).toEqual([]);
     expect(cli.volume(refused.name)).toBeDefined();
     expect(cli.volume(`${refused.project}_dbdata`)).toBeUndefined();
+  });
+
+  it('refuses a tmpfs mount with a source, which the CLI writes as a bind mount, also with the checks off: no container (review round 15, K1)', async () => {
+    settings = { ...settings, hostAccessChecksOff: [tmpfsSource.repository] };
+    let error: (Error & { code?: string }) | undefined;
+    try {
+      error = await service.openEnvironment(tmpfsSource.id, { progress: new RecordingProgress() }).then(
+        () => undefined,
+        (reason: unknown) => reason as Error & { code?: string },
+      );
+    } finally {
+      settings = { ...settings, hostAccessChecksOff: [] };
+    }
+    expect(error?.code).toBe('hostAccess');
+    expect(error?.message).toContain(`mount ${JSON.stringify(TMPFS_SOURCE_MOUNT)} is written differently by the Dev Container CLI and is not supported`);
+    expect(containers(tmpfsSource)).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(tmpfsSource.id)}*`])).toEqual([]);
   });
 
   it('first open: both services run with the labels, the port on 127.0.0.1, and repository files from the volume', async () => {

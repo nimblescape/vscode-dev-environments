@@ -617,7 +617,8 @@ describe('devMountFolders (review round 12, D12-2)', () => {
       ),
       // Review round 13, D13-1: the subpath mount of the workspace volume at /workspaces/api/src is protected too (an
       // alias of files of the volume, which `find -xdev` walks); before: left out like the mount at /workspaces.
-    ).toEqual(['/workspaces/api/src', '/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp']);
+      // Review round 15, K4: the volume at /workspaces/api/.git/x is protected too (before: dropped by the filter of .git).
+    ).toEqual(['/workspaces/api/src', '/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp', '/workspaces/api/.git/x']);
     expect(devMountFolders(undefined, env, 'on')).toEqual([]);
     expect(devMountFolders({}, env, 'on')).toEqual([]);
   });
@@ -656,5 +657,19 @@ describe('devMountFolders (review round 12, D12-2)', () => {
       '/workspaces/api/host',
       '/workspaces/api/odd',
     ]);
+  });
+
+  it('keeps the targets in .git: a volume that db shares, and a bind of the computer with the checks off (review round 15, K4)', () => {
+    const container = {
+      mountTargets: [
+        { type: 'volume', volume: 'proj_pgdata', target: '/workspaces/api/.git/pg' },
+        { type: 'bind', target: '/workspaces/api/.git/hooks' },
+        { type: 'volume', volume: 'proj_pgdata', target: '/workspaces/api/sub/.git/pg/' },
+      ],
+    };
+    expect(devMountFolders({ mountTargets: container.mountTargets.slice(0, 1) }, env, 'on')).toEqual(['/workspaces/api/.git/pg']);
+    expect(devMountFolders(container, env, 'off')).toEqual(['/workspaces/api/.git/pg', '/workspaces/api/.git/hooks', '/workspaces/api/sub/.git/pg']);
+    // Still not the repository folder, `..`, or a path outside of it.
+    expect(devMountFolders({ mountTargets: [{ type: 'bind', target: '/workspaces/api/.git/../..' }] }, env, 'off')).toEqual([]);
   });
 });

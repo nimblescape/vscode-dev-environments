@@ -260,7 +260,10 @@ export class FakeDocker implements EnvironmentDocker {
         ? command.slice(4).filter((folder) => !this.missingPaths.has(folder)).map((folder) => `${folder}\0`).join('')
         : command.length === 2 && command[0] === 'cat' && command[1] === '/proc/self/mountinfo'
           ? this.mountInfo(container)
-          : '';
+          : // Review round 15 (K3): the numeric IDs of the remote user for the fix of the internal folder.
+            command.length === 3 && command[0] === 'id' && (command[1] === '-u' || command[1] === '-g')
+            ? '1000\n'
+            : '';
     const result: RunResult = { exitCode: 0, stdout: existing, stderr: '', timedOut: false, ...this.execHandler(container, command, options.user) };
     // Like the process runner: an abort during the call kills the process and rejects.
     if (options.signal?.aborted) throw abortError();
@@ -891,6 +894,18 @@ export class FakeHelper implements EnvironmentHelper {
     this.calls.push('gitSummary');
     if (this.gitSummaryResult instanceof Error) throw this.gitSummaryResult;
     return { ...this.gitSummaryResult };
+  }
+
+  /** Review round 15 (K3): each fixConfigOwnership (the fix of the internal folder in a helper container). */
+  readonly configOwnershipFixes: Array<{ volumeName: string; folder: string; uid: string; gid: string }> = [];
+  /** Result of fixConfigOwnership (an Error is thrown). */
+  configOwnershipResult: Partial<RunResult> | Error = {};
+
+  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string }): Promise<RunResult> {
+    this.mount(p.volumeName);
+    this.configOwnershipFixes.push({ volumeName: p.volumeName, folder: p.folder, uid: p.uid, gid: p.gid });
+    if (this.configOwnershipResult instanceof Error) throw this.configOwnershipResult;
+    return { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...this.configOwnershipResult };
   }
 
   /** Review round 9 (D9-1): the serviceFolders of each switchBranch. */

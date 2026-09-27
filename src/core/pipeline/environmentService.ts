@@ -18,7 +18,9 @@ import {
   gitSummaryCommand,
   ownershipFixCommand,
   parseExistingPaths,
+  isNumericId,
   parseGitSummaryOutput,
+  serviceFolderPaths,
   type ServiceFolders,
 } from '../git/gitSummary';
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
@@ -249,6 +251,7 @@ export type EnvironmentHelper = Pick<
   | 'switchBranch'
   | 'prepareGit'
   | 'createRepositoryFolders'
+  | 'fixConfigOwnership'
 >;
 
 /** The part of EnvironmentRegistry that the service uses. */
@@ -1601,7 +1604,8 @@ export class EnvironmentService {
     // Review round 4 (P4-2): devcontainer.json itself before the paths that do not exist, so that a configuration that
     // the policy refuses (for example privileged mode) never counts as a plain error of the configuration, after which the
     // existing environment would start. The merged configuration follows below (it needs the read with our build model).
-    const ownReport = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: withoutComposeIgnored(config) }), checksOn);
+    // Review round 15 (K1, K2): `mounts` also as the Dev Container CLI writes them into its compose file (composeMounts).
+    const ownReport = await this.hostAccessReport(ctx, await this.hostAccessInput(env, { config: withoutComposeIgnored(config), composeMounts: true }), checksOn);
     if (isRefused(ownReport)) {
       this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(ownReport)}`);
       throw new HostAccessError(ownReport);
@@ -1633,6 +1637,7 @@ export class EnvironmentService {
     const checked = await this.hostAccessInput(env, {
       config: withoutComposeIgnored(config),
       ...(merged !== undefined ? { merged: withoutComposeIgnored(merged) } : {}),
+      composeMounts: true,
     });
     const report = await this.hostAccessReport(ctx, checked, checksOn);
     if (isRefused(report)) {
@@ -2717,7 +2722,7 @@ export class EnvironmentService {
         throw new HostAccessError(report);
       }
       const serviceLabels = await this.serviceImageLabelItems(ctx, compose);
-      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks === 'on', labels, serviceLabels);
+      await this.checkMetadataHostAccess(ctx, image, metadata, compose.hostAccessChecks === 'on', labels, serviceLabels, true);
     }
     // Review round 1 (P-2): also when `up` only adds containers (a service that the model gained, after a "Rebuild
     // later"): Compose would refuse an external volume that does not exist. Only the missing ones are created.
@@ -3219,6 +3224,7 @@ export class EnvironmentService {
    * checkImageHostAccess for the metadata of `image` that was read already. `labels`: the labels of the image; those by
    * which the extension, the CLI, and Compose find containers stay refused whatever the switch says (imageLabelItems,
    * review round 1, D2), and so do `moreItems` (the labels of the images of the other services of Docker Compose).
+   * `composeMounts`: the image of the dev service of Docker Compose (HostAccessInput.composeMounts).
    */
   private async checkMetadataHostAccess(
     ctx: PipelineContext,
@@ -3227,8 +3233,10 @@ export class EnvironmentService {
     checksOn: boolean,
     labels: Readonly<Record<string, string>> = {},
     moreItems: readonly string[] = [],
+    composeMounts = false,
   ): Promise<string[]> {
-    const checked = await this.hostAccessInput(ctx.env, { metadata });
+    // Review round 15 (K1, K2): for Docker Compose, the `mounts` of the metadata also as the CLI writes them (composeMounts).
+    const checked = await this.hostAccessInput(ctx.env, { metadata, ...(composeMounts ? { composeMounts: true } : {}) });
     const report = await this.hostAccessReport(ctx, checked, checksOn);
     for (const item of [...imageLabelItems(image, labels), ...moreItems]) if (!report.hostAccess.includes(item)) report.hostAccess.push(item);
     if (!isRefused(report)) return mountedVolumeNames(checked);
@@ -3394,10 +3402,11 @@ export class EnvironmentService {
     if ((outcome.created || ctx.cloned) && remoteUser && !isRootUser(remoteUser)) {
       // Review round 9 (D9-1): without the paths that the other services mount (their data keeps its owner). Review
       // round 12 (D12-2): nor the paths where the dev container mounts other volumes.
-      await this.fixOwnership(ctx, containerRef, folder, remoteUser, await this.withDevMountFolders(ctx, containerName, serviceFolders));
+      await this.fixOwnership(ctx, containerRef, folder, remoteUser, await this.withDevMountFolders(ctx, containerName, serviceFolders), true);
       // The token file and the Git configuration were written before `up` with the owner of the repository folder, which
-      // is still root when the ownership fix before `up` did not run or failed.
-      await this.fixOwnership(ctx, containerRef, CONFIG_FOLDER, remoteUser);
+      // is still root when the ownership fix before `up` did not run or failed. Review round 15 (K3): in a helper container
+      // that mounts only the workspace volume, not in the dev container, whose mounts may lie in the folder.
+      await this.fixConfigOwnership(ctx, containerRef, remoteUser);
     }
     if (outcome.created) await this.prepareHomeGitConfig(ctx, containerRef, remoteUser ?? 'root');
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
@@ -3487,6 +3496,10 @@ export class EnvironmentService {
    */
   private async withDevMountFolders(ctx: PipelineContext, containerName: string, serviceFolders: ServiceFolders | undefined): Promise<ServiceFolders | undefined> {
     if (serviceFolders === 'repository') return serviceFolders;
+    const repository = repositoryFolder(ctx.env.repository);
+    // Review round 15 (K4): the paths of the services without `.git` (their filter), before the targets of the mounts,
+    // which may lie in `.git` (the list is passed to the fix with `gitPaths`).
+    const records = serviceFolders === undefined ? undefined : serviceFolderPaths(repository, serviceFolders);
     let mounts: string[];
     try {
       const container = await this.deps.docker.findContainer(ctx.env.id, containerName);
@@ -3496,8 +3509,8 @@ export class EnvironmentService {
       this.logger.warn(`The mounts of the container of ${ctx.env.repository} could not be read: ${errorMessage(error)}`);
       return 'repository';
     }
-    if (mounts.length === 0) return serviceFolders;
-    const bounded = boundServiceFolders(repositoryFolder(ctx.env.repository), [serviceFolders, mounts]);
+    if (mounts.length === 0) return records;
+    const bounded = boundServiceFolders(repository, [records, mounts], false, true);
     return bounded.overflow ? 'repository' : bounded.folders;
   }
 
@@ -3520,8 +3533,61 @@ export class EnvironmentService {
     return new Set();
   }
 
+  /**
+   * Review round 15 (K3 = P15-1, D15-1, S15-3): the ownership fix of the extension's internal folder (CONFIG_FOLDER: the
+   * token, the Git configuration, the folders of Docker and the GitHub CLI) runs in a container of the workspace helper
+   * that mounts only the workspace volume (WorkspaceHelper.fixConfigOwnership), with the numeric user and group IDs of
+   * the remote user, which `id -u` and `id -g` print as root in the dev container. In the dev container, a mount could
+   * lie in the folder although no configuration may name a target there (configFolderTarget checks the text only): a
+   * link of the repository in a target (`x -> ../.devenv+`, followed by the runtime inside the container), `volumes_from`
+   * of a service that mounts there, or a tmpfs; the fix walked it in full and gave its files (for example the data of a
+   * database, uid 999) to the remote user. The helper sees only the folder of the volume. Such a mount can still hide the
+   * token and the Git configuration in the dev container, which breaks only the Git authentication of the owner. IDs that
+   * are not decimal numbers skip the fix. A failure is logged, it does not fail the pipeline (as fixOwnership).
+   */
+  private async fixConfigOwnership(ctx: PipelineContext, container: string, user: string): Promise<void> {
+    const folder = CONFIG_FOLDER;
+    try {
+      const ids: string[] = [];
+      for (const flag of ['-u', '-g']) {
+        const result = await this.deps.docker.exec(container, ['id', flag, user], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+        const id = result.stdout.trim();
+        if (result.exitCode !== 0 || !isNumericId(id)) {
+          this.logger.warn(
+            `The owner of the files in ${folder} could not be changed: \`id ${flag} ${user}\` in the container gave no user or group ID (${JSON.stringify((result.stderr || result.stdout).trim().slice(0, 200))}).`,
+          );
+          return;
+        }
+        ids.push(id);
+      }
+      const [uid, gid] = ids;
+      this.logger.info(`Giving the files in ${folder} to ${user} (${uid}:${gid}) in a helper container.`);
+      const result = await this.deps.helper.fixConfigOwnership({
+        volumeName: ctx.env.volumeName,
+        folder,
+        uid,
+        gid,
+        timeoutMs: OWNERSHIP_TIMEOUT_MS,
+        signal: ctx.signal,
+      });
+      if (result.exitCode !== 0) {
+        this.logger.warn(`The owner of the files in ${folder} could not be changed: ${(result.stderr || result.stdout).trim()}`);
+      }
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The owner of the files in ${folder} could not be changed: ${errorMessage(error)}`);
+    }
+  }
+
   /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */
-  private async fixOwnership(ctx: PipelineContext, container: string, folder: string, user: string, serviceFolders?: ServiceFolders): Promise<void> {
+  private async fixOwnership(
+    ctx: PipelineContext,
+    container: string,
+    folder: string,
+    user: string,
+    serviceFolders?: ServiceFolders,
+    gitPaths = false,
+  ): Promise<void> {
     const except =
       serviceFolders === 'repository'
         ? ' of root only (more paths of the repository are mounted by other services than the ownership fix can name)'
@@ -3530,7 +3596,7 @@ export class EnvironmentService {
           : '';
     this.logger.info(`Giving the files in ${folder} to ${user}${except}.`);
     try {
-      const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user, serviceFolders), {
+      const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user, serviceFolders, gitPaths), {
         user: 'root',
         signal: ctx.signal,
         timeoutMs: OWNERSHIP_TIMEOUT_MS,

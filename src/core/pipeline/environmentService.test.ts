@@ -196,11 +196,11 @@ describe('open: first open', () => {
 
     const ownership = h.docker.execs.find((e) => e.user === 'root');
     expect(ownership?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
-    // The configuration folder of the container gets the remote user too (written before `up`).
-    expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual([
-      '/workspaces/api',
-      '/workspaces/.devenv+',
-    ]);
+    // The configuration folder of the container gets the remote user too (written before `up`). Review round 15, K3: in a
+    // helper container that mounts only the workspace volume, with the numeric IDs of the remote user (before: a second
+    // OWNERSHIP_FIX_SCRIPT for /workspaces/.devenv+ in the dev container).
+    expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual(['/workspaces/api']);
+    expect(h.helper.configOwnershipFixes).toEqual([{ volumeName: env!.volumeName, folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' }]);
     // Before the first attach: the ~/.gitconfig of the remote user, which keeps the Dev Containers extension from copying
     // the Git configuration of the computer.
     expect(h.docker.execs.find((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toMatchObject({ user: 'root', command: homeGitConfigCommand('vscode') });

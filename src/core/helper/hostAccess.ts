@@ -108,6 +108,13 @@ export interface HostAccessInput {
    * The runArgs of the repository configuration may not.
    */
   overrideConfiguration?: boolean;
+  /**
+   * Review round 15 (K1, K2): the `mounts` of the sources belong to a Docker Compose configuration. The Dev Container CLI
+   * does not give them to `docker run --mount` then: it reads a text with its own parser and writes each mount into the
+   * compose file that it generates as `<source>:<target>` (composeCliMountProblems). They are checked in that reading
+   * too.
+   */
+  composeMounts?: boolean;
 }
 
 /**
@@ -457,7 +464,11 @@ function readHostAccessFindings(input: HostAccessInput, checksOn: boolean): Prob
   const volumes = volumeContext(input);
   for (const source of configurationSources(input)) {
     // Read as the Dev Container CLI merges them: any true-like `privileged`, and a single value in place of a list.
-    for (const mount of cliList(source.mounts)) add(mountProblems(parseMountEntry(mount), volumes));
+    for (const mount of cliList(source.mounts)) {
+      add(mountProblems(parseMountEntry(mount), volumes));
+      // Review round 15 (K1, K2): what the Dev Container CLI writes into its compose file, as Compose reads it.
+      if (input.composeMounts === true) add(composeCliMountProblems(mount, volumes));
+    }
     if (source.privileged) add([access('privileged mode')]);
     add(accessAll(capabilityProblems(cliList(source.capAdd))));
     add(accessAll(securityOptionProblems(cliList(source.securityOpt))));
@@ -1373,6 +1384,114 @@ function mountTypeProblems(mount: MountSpec, type: string, source: string, volum
     options.push(mount.otherVolumeOptions ? guarded(item) : access(item));
   }
   return [...options, ...volumeNameProblems(source, volumes)];
+}
+
+/**
+ * Review round 15 (K1, K2): the keys of a `mounts` text that the Dev Container CLI 0.89.0 renames (table `cj` of its
+ * function `lQ`); every other key keeps its spelling.
+ */
+const CLI_MOUNT_KEYS: ReadonlyMap<string, string> = new Map([
+  ['src', 'source'],
+  ['destination', 'target'],
+  ['dst', 'target'],
+]);
+
+/** The properties of a mount that the CLI writes into its compose file (function `nW`) or that decide how (`type`). */
+const CLI_MOUNT_PROPERTIES: ReadonlySet<string> = new Set(['source', 'target', 'type']);
+
+/**
+ * The variable that the CLI resolves in `mounts` before it writes the compose file (`${devcontainerId}`, a number in
+ * base 32), and what the characters of the text are checked with in its place.
+ */
+const CLI_RESOLVED_VARIABLE = /\$\{devcontainerId\}/g;
+const CLI_RESOLVED_PLACEHOLDER = '0'.repeat(52);
+
+/** A first character that YAML reads as an indicator in a plain scalar (a list item `- <text>` or a key `<text>:`). */
+const YAML_INDICATOR = /^[-?:,[\]{}#&*!|>'"%@`]/;
+
+/** Characters that change what Compose reads from `- <source>:<target>` (besides the indicators and `$`). */
+const COMPOSE_SHORT_SYNTAX_SPECIAL = /[\s"'`#:]/;
+
+/**
+ * Review round 15 (K1, K2): a `mounts` entry as the Dev Container CLI 0.89.0 reads it for Docker Compose (function `iW`
+ * with `lQ`): a text is split at `,` and each field at `=` (only the part before a second `=` is the value), the keys
+ * are case-sensitive, and only `src`, `dst`, and `destination` are renamed; an object is taken as it is. `undefined` when
+ * the text does not round-trip safely: a field of `source`, `target`, or `type` (also a variant by case or space, for
+ * example `SRC` or ` src`, which the CLI keeps under that key) that is not `<key>=<value>` with exactly one `=`, a
+ * variant, or such a property twice. Fields of other options (for example `readonly`) are not written by the CLI.
+ */
+function cliComposeMount(entry: unknown): { type: unknown; source: unknown; target: unknown } | undefined {
+  if (isRecord(entry)) return { type: entry.type, source: entry.source, target: entry.target };
+  if (typeof entry !== 'string') return undefined;
+  const read: Record<string, string> = {};
+  for (const field of entry.split(',')) {
+    const parts = field.split('=');
+    const key = parts[0];
+    const normal = key.trim().toLowerCase();
+    if (!CLI_MOUNT_KEYS.has(normal) && !CLI_MOUNT_PROPERTIES.has(normal)) continue;
+    const property = CLI_MOUNT_KEYS.get(key) ?? key;
+    if (!CLI_MOUNT_PROPERTIES.has(property) || parts.length !== 2 || Object.prototype.hasOwnProperty.call(read, property)) return undefined;
+    read[property] = parts[1];
+  }
+  return { type: read.type, source: read.source, target: read.target };
+}
+
+/** Review round 15 (K1, K2): the item of a mount that the CLI writes otherwise than the policy reads it. */
+function cliRewrittenMountItem(entry: unknown): Problem {
+  return unsupported(`mount ${JSON.stringify(entry)} is written differently by the Dev Container CLI and is not supported`);
+}
+
+/** Whether `text` (a source or a target after `${devcontainerId}`) is written by the CLI so that Compose reads it back. */
+function roundTrips(text: string): boolean {
+  return !text.includes('$') && !COMPOSE_SHORT_SYNTAX_SPECIAL.test(text) && !YAML_INDICATOR.test(text);
+}
+
+/**
+ * Review round 15 (K1 = S15-1, K2 = S15-2): a `mounts` entry of a Docker Compose configuration as it reaches the dev
+ * container. The Dev Container CLI 0.89.0 reads it with its own parser (cliComposeMount) and writes it unquoted as the
+ * list item `- <source>:<target>` (function `nW`, the type is dropped) into the `volumes` of the dev service of the
+ * compose file that it generates, which Compose reads (and interpolates) in the short syntax. mountProblems checks the
+ * entry as `docker run --mount` would read it; this checks the CLI's reading:
+ * - not supported (whatever the switch says), when it does not round-trip safely: a text that the CLI cannot read as
+ *   Docker does (cliComposeMount), a source, target, or type that is no text, any difference from Docker's reading
+ *   (parseMountEntry) in source, target, or type (also by case), `$` (Compose interpolation; `${devcontainerId}` is
+ *   resolved by the CLI before), white space, quotes, `#`, `:`, or a leading YAML indicator in the source or the target,
+ *   a target that is not absolute, and a source of a mount whose type is not `volume` (a path of any type is a bind
+ *   mount below; a name with another type would not be a declared volume, and a tmpfs mount with a source is a bind
+ *   mount in Compose);
+ * - a path source (isPathSource): Compose mounts it as a bind mount (access to the computer, like other bind mounts);
+ * - a name: a named volume, with the rules of volumeNameProblems;
+ * - no source: an anonymous volume (also for `tmpfs`, which the CLI writes without its type);
+ * - the target, as the dev service's mounts (decideServiceMount): not at or below CONFIG_FOLDER (configFolderTarget),
+ *   and not at WORKSPACES_ROOT, where the workspace volume is mounted.
+ * A text that Docker cannot read is refused by mountProblems already.
+ */
+function composeCliMountProblems(entry: unknown, volumes: VolumeContext): Problem[] {
+  const docker = parseMountEntry(entry);
+  if (docker.unreadable !== undefined) return [];
+  const cli = cliComposeMount(entry);
+  if (cli === undefined) return [cliRewrittenMountItem(entry)];
+  const { type, source, target } = cli;
+  if ((type !== undefined && typeof type !== 'string') || (source && typeof source !== 'string') || typeof target !== 'string') {
+    return [cliRewrittenMountItem(entry)];
+  }
+  const cliSource = typeof source === 'string' ? source : '';
+  if (type !== docker.type || cliSource !== (docker.source ?? '') || target !== docker.target) return [cliRewrittenMountItem(entry)];
+  const writtenSource = cliSource.replace(CLI_RESOLVED_VARIABLE, CLI_RESOLVED_PLACEHOLDER);
+  const writtenTarget = target.replace(CLI_RESOLVED_VARIABLE, CLI_RESOLVED_PLACEHOLDER);
+  if (!writtenTarget.startsWith('/') || !roundTrips(writtenTarget) || (writtenSource !== '' && !roundTrips(writtenSource))) {
+    return [cliRewrittenMountItem(entry)];
+  }
+  const problems: Problem[] = [...targetProblems(writtenTarget)];
+  const normal = path.posix.normalize(writtenTarget).replace(/(.)\/+$/, '$1');
+  if (normal === WORKSPACES_ROOT) problems.push(unsupported(`mount at ${WORKSPACES_ROOT}`));
+  if (writtenSource === '') return problems;
+  if (isPathSource(writtenSource)) {
+    if (type !== undefined && type !== 'bind' && type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
+    return [...problems, access(`bind mount ${cliSource}`)];
+  }
+  if (type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
+  return [...problems, ...volumeNameProblems(cliSource, volumes)];
 }
 
 /** The name of the named volume of a mount; `undefined` for other mounts and anonymous volumes. */

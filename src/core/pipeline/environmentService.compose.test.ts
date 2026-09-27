@@ -20,7 +20,7 @@ import {
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
-import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, servicePathArguments } from '../git/gitSummary';
+import { EXISTING_PATHS_SCRIPT, MAX_SERVICE_FOLDERS, OWNERSHIP_FIX_SCRIPT, servicePathArguments } from '../git/gitSummary';
 import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
@@ -2588,5 +2588,98 @@ describe('review round 12 of unit 6 (D12-2): the ownership fix in the dev contai
     h.helper.containerMounts = [{ type: 'volume', volume: 'c'.repeat(64), target: `${FOLDER}/node_modules` }];
     await h.service.open(TARGET, options());
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/node_modules`])]]);
+  });
+});
+
+describe('review round 15 of unit 6 (K1, K2): the `mounts` of a Compose configuration as the Dev Container CLI writes them', () => {
+  const REWRITTEN = (mount: unknown) => `mount ${JSON.stringify(mount)} is written differently by the Dev Container CLI and is not supported`;
+
+  it('refuses a tmpfs mount with a source in devcontainer.json before any build, also with the checks off', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    h.helper.files = {
+      [DEFAULT_CONFIG_PATH]: { configText: CONFIG_TEXT.replace('"source=cache,target=/cache,type=volume"', '"type=tmpfs,src=/,dst=/host"') },
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(REWRITTEN('type=tmpfs,src=/,dst=/host'));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('refuses a Feature that mounts the Docker socket as tmpfs before up (image metadata)', async () => {
+    const mount = { type: 'tmpfs', source: '/var/run/docker.sock', target: '/var/run/docker.sock' };
+    h.helper.buildMetadata = [{ id: 'ghcr.io/acme/features/sock:1', mounts: [mount] }];
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(REWRITTEN(mount));
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()).toBeUndefined();
+  });
+
+  it('refuses a volume at the internal folder by the target that the CLI cuts at the second `=` (K2)', async () => {
+    h.helper.files = {
+      [DEFAULT_CONFIG_PATH]: {
+        configText: CONFIG_TEXT.replace('"source=cache,target=/cache,type=volume"', '"type=volume,src=foo,dst=/workspaces/.devenv+=x"'),
+      },
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toContain(REWRITTEN('type=volume,src=foo,dst=/workspaces/.devenv+=x'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('still opens the usual named volume of `mounts` and a docker-in-docker Feature', async () => {
+    h.helper.buildMetadata = [
+      { id: 'ghcr.io/devcontainers/features/docker-in-docker:2', mounts: [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }] },
+    ];
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+});
+
+describe('review round 15 of unit 6 (K3, K4): the ownership fixes after up', () => {
+  const CONFIG = '/workspaces/.devenv+';
+
+  /** The execs in the dev container that walk a folder with an ownership fix: [folder, user, …]. */
+  function devFixes(): string[][] {
+    return h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command.slice(4));
+  }
+
+  it('fixes the internal folder in a helper container with the numeric IDs of the remote user, not in the dev container (K3)', async () => {
+    // A mount of the dev container through a link of the repository (x -> ../.devenv+) would lie in the internal folder
+    // in the dev container; the helper mounts only the workspace volume.
+    h.helper.containerMounts = [{ type: 'volume', volume: `${PROJECT}_pgdata`, target: `${FOLDER}/x` }];
+    await h.service.open(TARGET, options());
+    expect(devFixes().map((args) => args[0])).toEqual([FOLDER]);
+    expect(devFixes().some((args) => args[0] === CONFIG)).toBe(false);
+    const ids = h.docker.execs.filter((e) => e.command[0] === 'id');
+    expect(ids.map((e) => [e.command, e.user])).toEqual([
+      [['id', '-u', 'vscode'], 'root'],
+      [['id', '-g', 'vscode'], 'root'],
+    ]);
+    expect(h.helper.configOwnershipFixes).toEqual([{ volumeName: NAME, folder: CONFIG, uid: '1000', gid: '1000' }]);
+  });
+
+  it('skips the fix of the internal folder and logs it when the IDs are not numbers (K3)', async () => {
+    h.docker.execHandler = (_container, command) => (command[0] === 'id' && command[1] === '-g' ? { stdout: '1000 staff\n' } : {});
+    await h.service.open(TARGET, options());
+    expect(h.helper.configOwnershipFixes).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.includes(`The owner of the files in ${CONFIG} could not be changed`) && line.includes('id -g vscode'))).toBe(true);
+    expect(devFixes().some((args) => args[0] === CONFIG)).toBe(false);
+  });
+
+  it('logs a failed fix of the internal folder, and the open goes on (K3)', async () => {
+    h.helper.configOwnershipResult = { exitCode: 1, stderr: `${CONFIG} is not a folder.` };
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.logger.warnings).toContain(`The owner of the files in ${CONFIG} could not be changed: ${CONFIG} is not a folder.`);
+  });
+
+  it('leaves a volume that the dev container mounts in .git to its owners, and the rest of .git gets the full fix (K4)', async () => {
+    h.helper.containerMounts = [{ type: 'volume', volume: `${PROJECT}_pgdata`, target: `${FOLDER}/.git/pg` }];
+    await h.service.open(TARGET, options());
+    // Before: [FOLDER, 'vscode'] alone (the filter of .git dropped the target), and the fix gave the data of db to vscode.
+    expect(devFixes()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], true)]]);
+    expect(servicePathArguments(FOLDER, [`${FOLDER}/.git/pg`], true)).toEqual(['-path', `${FOLDER}/.git/pg`, '-o', '-path', `${FOLDER}/.git/pg/*`]);
   });
 });

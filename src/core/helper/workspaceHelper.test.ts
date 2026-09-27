@@ -8,7 +8,7 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
-import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
@@ -788,6 +788,32 @@ describe('WorkspaceHelper.removeGitToken (concept 7.5)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('WorkspaceHelper.fixConfigOwnership (review round 15, K3)', () => {
+  it('fixes the internal folder with numeric IDs, with only the workspace volume: no Docker socket, cache volume, or network', async () => {
+    const result = await createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 30_000 });
+    expect(result.exitCode).toBe(0);
+    expect(docker.runs).toHaveLength(1);
+    const run = docker.runs[0];
+    expect(commandOf(run.args)).toEqual(configOwnershipFixCommand('/workspaces/.devenv+', '1000', '1001'));
+    expect(run.args.join(' ')).toContain('source=vol,target=/workspaces');
+    expect(hasDockerAccess(run.args)).toBe(false);
+    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
+    expect(run.args).not.toContain('--tmpfs');
+    expect(run.args).not.toContain('-e');
+  });
+
+  it('refuses IDs that are not numbers before any run', async () => {
+    await expect(createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: 'vscode', gid: '1000' })).rejects.toThrow();
+    expect(docker.runs).toEqual([]);
+  });
+
+  it('returns a non-zero exit code', async () => {
+    docker.handler = () => ({ exitCode: 1, stderr: '/workspaces/.devenv+ is not a folder.\n' });
+    const result = await createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' });
+    expect(result.exitCode).toBe(1);
   });
 });
 

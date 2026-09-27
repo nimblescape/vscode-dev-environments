@@ -480,6 +480,9 @@ export function liveServiceFolders(
  * Review round 14 (P14-1): a mount of the workspace volume whose target is `identities` (workspaceIdentityMounts, checked
  * in the container with verifiedIdentityTargets) is not protected: it shows the folder of the volume at its own canonical
  * path (for example `../src:/workspaces/api/src`), no alias; its files get the full fix like the rest of the repository.
+ * Review round 15 (K4 = D15-2): a target in `.git` stays in the list (for example a volume that db shares at
+ * `/workspaces/api/.git/pg`, or with the checks off a bind of the computer at `.git/hooks`): serviceFolderPaths with
+ * `gitPaths`. The rest of `.git` still gets the full fix.
  */
 export function devMountFolders(
   container: Pick<ContainerInfo, 'mountTargets'> | undefined,
@@ -495,7 +498,8 @@ export function devMountFolders(
     .filter((mount) => !(identities.has(mount.target) && identityMountTarget(mount, env) === mount.target))
     .filter((mount) => !(hostAccessChecks === 'on' && mount.type === 'volume' && mount.volume !== undefined && isAnonymousVolumeName(mount.volume)))
     .map((mount) => mount.target);
-  return serviceFolderPaths(repositoryFolder(env.repository), targets);
+  // Review round 15 (K4 = D15-2): also a target in `.git` (the filter of `.git` is for the records of the services).
+  return serviceFolderPaths(repositoryFolder(env.repository), targets, true);
 }
 
 /** Review round 14 (P14-1): a mount of a subpath of the workspace volume at the path of that subpath (workspaceIdentityMounts). */
