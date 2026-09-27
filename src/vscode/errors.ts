@@ -17,13 +17,13 @@ export const OPERATION_FAILED = 'The operation failed.';
 /** Command of the welcome view and of the action "Sign in" (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
 /**
- * Command of the action "Install Docker…" (Show Docker Setup, hidden): looks for the Docker CLI again, then shows the
- * sidebar view, whose welcome view has the steps of the Docker setup while the CLI is missing.
+ * Command of the action "Install Docker…" (Show Docker Setup, hidden): shows the sidebar view, whose welcome view has
+ * the steps of the Docker setup while the CLI is missing (a CLI lost since it was found is reported by ContainerAdapter).
  */
 const INSTALL_DOCKER_COMMAND = 'devEnvironments.dockerSetup.show';
 /**
- * Command of the action "Start Docker" (Linux, Docker Engine): `sudo systemctl enable --now docker` in a terminal, after
- * a confirmation. The extension cannot start Docker Engine by itself (administrator rights).
+ * Command of the action "Start Docker" (Linux, Docker Engine; local windows only): `sudo systemctl enable --now docker`
+ * in a terminal, after a confirmation. The extension cannot start Docker Engine by itself (administrator rights).
  */
 const START_DOCKER_COMMAND = 'devEnvironments.dockerSetup.start';
 
@@ -86,6 +86,9 @@ function present(error: unknown, canRetry: boolean): Presentation {
   if (rule === 'retry') actions = canRetry ? ['showDetails', 'tryAgain'] : ['showDetails'];
   else if (rule === 'retryOnly') actions = canRetry ? ['tryAgain'] : ['showDetails'];
   else actions = rule;
+  // Start Docker of the Docker setup runs only in a local window (a terminal of a remote window runs on the remote
+  // computer); the message names the command to run on the Docker host.
+  if (vscode.env.remoteName !== undefined) actions = actions.filter((action) => action !== 'startDocker');
   return { message: error.message, severity: WARNINGS.has(error.code) ? 'warning' : 'error', actions };
 }
 

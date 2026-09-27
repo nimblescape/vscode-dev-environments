@@ -94,8 +94,9 @@ export interface ContainerAdapterOptions {
   onDaemonStatus?: (running: boolean) => void;
   /**
    * With `findDocker`: called when a CLI that was found before cannot be started anymore (ENOENT, for example Docker was
-   * uninstalled or moved while VS Code runs), after the adapter forgot its path. The Docker setup looks for the CLI again
-   * then, so that the sidebar shows the setup.
+   * uninstalled or moved while VS Code runs), after the adapter forgot its path. The Docker setup shows the setup in the
+   * sidebar then. The callback should not look the CLI up itself: that would count as the next lookup, and a CLI back
+   * seconds later (for example after Docker Desktop updated itself) would be found only 10 seconds later.
    */
   onCliLost?: () => void;
 }
@@ -350,7 +351,8 @@ export class ContainerAdapter {
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
-          // For example while Docker Desktop updates itself: the next call looks for the CLI again.
+          // For example while Docker Desktop updates itself: the next call looks for the CLI again (unless `onCliLost`
+          // looks it up first, see ContainerAdapterOptions).
           this.path = undefined;
           this.lookedUpAt = undefined;
           this.reportCliLost();

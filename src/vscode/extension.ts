@@ -104,7 +104,7 @@ async function activateExtension(
     findDocker: findDockerCli,
     onDaemonStatus: (running) => dockerSetup?.reportDaemonStatus(running),
     // Docker was uninstalled or moved while VS Code runs: the sidebar shows the Docker setup again.
-    onCliLost: () => dockerSetup?.checkCli(),
+    onCliLost: () => dockerSetup?.reportCliLost(),
   });
   const registry = new EnvironmentRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();

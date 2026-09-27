@@ -73,6 +73,23 @@ describe('showError (concept 6.5)', () => {
     expect(showLog).not.toHaveBeenCalled();
   });
 
+  it('offers no Start Docker in a remote window, where the Docker setup cannot start Docker (review round 2, W2-1)', async () => {
+    fakeVscode.env.remoteName = 'ssh-remote';
+    const { logger } = recordingLogger();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.showDetails);
+    showError(new UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning), { logger, showLog });
+    // The message names the command (sudo systemctl enable --now docker) to run on the Docker host.
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: Messages.dockerEngineNotRunning,
+      actions: ['Show details'],
+    });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalled();
+    expect(showLog).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['dockerStartFailed', Messages.dockerStartFailed],
     ['buildFailed', Messages.buildFailed],

@@ -50,7 +50,10 @@ import { errorMessage, isUserFacingError } from '../core/errors';
 import { Steps } from '../core/messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner } from '../core/ports';
 
-/** Command Start Docker (package.json), offered once an installation has put the CLI in place. */
+/**
+ * Command Start Docker (package.json), offered once an installation has put the CLI in place, and as the action of the
+ * error "Docker is not running." (Docker Engine on Linux) in a local window.
+ */
 export const DOCKER_SETUP_START_COMMAND = 'devEnvironments.dockerSetup.start';
 /** Shows the sidebar view (VS Code contributes `<view id>.focus` for each view of package.json). */
 const SHOW_SIDEBAR_COMMAND = 'devEnvironments.repositories.focus';
@@ -65,6 +68,8 @@ const OS_RELEASE_FILES = ['/etc/os-release', '/usr/lib/os-release'];
 export const DockerSetupUiTexts = {
   /** A terminal of a remote window runs on the remote computer, not on this one. */
   localWindowNeeded: 'Open a local window to install Docker.',
+  /** Start Docker in a remote window. */
+  localWindowNeededToStart: 'Open a local window to start Docker.',
   downloading: 'Downloading Docker Desktop',
   downloadProgress: (receivedMb: number, totalMb: number | undefined) =>
     totalMb === undefined ? `${receivedMb} MB` : `${receivedMb} of ${totalMb} MB`,
@@ -239,14 +244,27 @@ export class DockerSetup implements vscode.Disposable {
     if (this.dockerMissing) this.checkWslInBackground();
   }
 
-  /** Looks for the CLI (ContainerAdapter looks a missing CLI up again, at most every 10 seconds). */
+  /**
+   * Asks ContainerAdapter whether the CLI is found. A missing CLI is looked up again (at most every 10 seconds); a CLI
+   * that was found counts as found until a call of it fails with ENOENT (then ContainerAdapter reports `reportCliLost`).
+   */
   checkCli(): boolean {
     return this.lookUp(() => this.deps.docker.isInstalled());
   }
 
   /**
+   * ContainerAdapter option `onCliLost`: a CLI that was found cannot be started anymore. The sidebar shows the setup at
+   * once; no lookup runs here, so the next call of the adapter (or the check every 10 seconds) looks the CLI up again,
+   * for example after Docker Desktop has updated itself.
+   */
+  reportCliLost(): void {
+    this.apply({ kind: 'cli', found: false });
+  }
+
+  /**
    * Command devEnvironments.dockerSetup.show (action Install Docker… of the error "Docker Desktop is not installed."):
-   * looks for the CLI again, so that a CLI lost since the last check shows the setup, then shows the sidebar view.
+   * updates the context keys from the adapter (a missing CLI may be found again; a lost CLI was reported already by
+   * `reportCliLost`), then shows the sidebar view.
    */
   async show(): Promise<void> {
     this.checkCli();
@@ -294,7 +312,7 @@ export class DockerSetup implements vscode.Disposable {
    * terminal, after a confirmation.
    */
   async start(): Promise<void> {
-    if (this.refuseInRemoteWindow()) return;
+    if (this.refuseInRemoteWindow(DockerSetupUiTexts.localWindowNeededToStart, 'started')) return;
     try {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: Steps.startingDocker, cancellable: true },
@@ -480,11 +498,11 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /** In a remote window, a terminal would run on the remote computer: the user is asked to open a local window. */
-  private refuseInRemoteWindow(): boolean {
+  private refuseInRemoteWindow(text: string = DockerSetupUiTexts.localWindowNeeded, done = 'installed'): boolean {
     if (vscode.env.remoteName === undefined) return false;
-    this.deps.logger.info(`Docker is installed only from a local window (this window: ${vscode.env.remoteName}).`);
+    this.deps.logger.info(`Docker is ${done} only from a local window (this window: ${vscode.env.remoteName}).`);
     vscode.window
-      .showInformationMessage(DockerSetupUiTexts.localWindowNeeded)
+      .showInformationMessage(text)
       .then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));
     return true;
   }

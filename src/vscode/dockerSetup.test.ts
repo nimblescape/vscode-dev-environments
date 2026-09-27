@@ -223,7 +223,8 @@ describe('DockerSetup: context keys and CLI checks', () => {
     let dockerSetup: DockerSetup | undefined;
     const docker = new ContainerAdapter(runner, found, {}, logger, 'darwin', {
       findDocker: () => found,
-      onCliLost: () => dockerSetup?.checkCli(),
+      // As in extension.ts (review round 2, W2-2: reportCliLost instead of checkCli, which looked the CLI up at once).
+      onCliLost: () => dockerSetup?.reportCliLost(),
     });
     const changed = vi.fn();
     dockerSetup = new DockerSetup({
@@ -243,6 +244,60 @@ describe('DockerSetup: context keys and CLI checks', () => {
     expect(dockerSetup.setupRequired).toBe(true);
     expect(changed).toHaveBeenCalledTimes(1);
     expect(contextCalls()).toContainEqual([DockerContextKeys.setupRequired, true]);
+    dockerSetup.dispose();
+  });
+
+  it('looks for a lost CLI again at the next call, so a CLI back a second later is found (review round 2, W2-2)', async () => {
+    const DOCKER = '/usr/local/bin/docker';
+    let now = 1_000;
+    let gone = false;
+    let found: string | undefined = DOCKER;
+    const lookups: number[] = [];
+    const runner = {
+      run: vi.fn(async () => {
+        if (gone) throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+        return { exitCode: 0, stdout: 'ok', stderr: '', timedOut: false };
+      }),
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    let dockerSetup: DockerSetup | undefined;
+    const docker = new ContainerAdapter(runner, DOCKER, {}, logger, 'darwin', {
+      findDocker: () => {
+        lookups.push(now);
+        return found;
+      },
+      clock: { now: () => now },
+      onCliLost: () => dockerSetup?.reportCliLost(),
+    });
+    const changed = vi.fn();
+    dockerSetup = new DockerSetup({
+      docker,
+      runner,
+      logger,
+      showLog: vi.fn(),
+      platform: 'darwin',
+      env: {},
+      onDidChangeInstalled: changed,
+      remoteDockerHostConfigured: () => false,
+      clock: { now: () => now },
+    });
+    dockerSetup.initialize();
+    now += 20_000;
+    // For example while Docker Desktop updates itself: the CLI is gone for a moment.
+    gone = true;
+    found = undefined;
+    await expect(docker.run(['ps'])).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    // The sidebar shows the setup at the loss, without a lookup.
+    expect(dockerSetup.setupRequired).toBe(true);
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(lookups).toEqual([]);
+    // The CLI is back a second later: the next call looks it up and runs.
+    gone = false;
+    found = DOCKER;
+    now += 1_000;
+    expect(docker.isInstalled()).toBe(true);
+    await expect(docker.run(['ps'])).resolves.toMatchObject({ exitCode: 0 });
+    expect(lookups).toEqual([now]);
     dockerSetup.dispose();
   });
 
@@ -494,13 +549,21 @@ describe('DockerSetup: Install Docker (sidebar button Install Docker)', () => {
 
   it('asks for a local window in a remote window, and runs nothing', async () => {
     fakeVscode.env.remoteName = 'wsl';
-    const { dockerSetup, download, runner } = setup(false, { tools: ['brew'] });
+    const { dockerSetup, download, runner, logger } = setup(false, { tools: ['brew'] });
     await dockerSetup.install();
     await dockerSetup.start();
     await dockerSetup.installWsl();
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(3);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.localWindowNeeded);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith('Open a local window to install Docker.');
+    // Start Docker has its own text (review round 2, W2-1).
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith('Open a local window to start Docker.');
+    expect(fakeVscode.window.showInformationMessage.mock.calls.map((call) => call[0])).toEqual([
+      'Open a local window to install Docker.',
+      'Open a local window to start Docker.',
+      'Open a local window to install Docker.',
+    ]);
+    expect(logger.info).toHaveBeenCalledWith('Docker is started only from a local window (this window: wsl).');
     expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
     expect(fakeVscode.terminals).toEqual([]);
     expect(download).not.toHaveBeenCalled();
