@@ -28,6 +28,7 @@ This branch (`handoff/queue`) is not code. It carries the plan, the specificatio
 - **No model of the Dev Container CLI's reader**, and no Docker gate.
 - **The Dockerfile check is frozen.** Review rounds do not report, verify, or fix gaps in the image-reference refusals of the Dockerfile (`src/core/imageCheck/dockerfile.ts`, `dockerfileImageFindings`, expansion budgets). Tell every reviewer this in its prompt. Queued: remove those refusals, keep only the `FROM` extraction for the image update check (needs the user's explicit permission in the session; auto mode blocked it once).
 
+- **No builder isolation and no Docker isolation per account for now** (user decision 2026-09-27; also no VM). Plan kept in the session only: Docker-in-Docker per account, rootless Docker per user on Linux.
 - **Unit 6 (Docker Compose) is merged** (PR #8, 3df65f4 on main, 2026-09-27). Known leftover (low, accepted): after a failed forced rebuild where the user edited `service` in place in one devcontainer.json, the next open recreates the previous dev container, so its files outside the volumes are lost (same as a successful rebuild).
 
 ## Documents to read first (on `main` / the work branch)
