@@ -158,6 +158,12 @@ export const Messages = {
         'Kept: the repository with its uncommitted changes, unpushed commits, and stashes, and all files in the volumes of the environment. ' +
         'Lost: everything else in the container, for example installed packages, changes to the system, and files outside /workspaces and the volumes, such as the home folder. ' +
         'The setup commands of the configuration (onCreateCommand, postCreateCommand) run again. Cancel changes nothing.',
+  /**
+   * Recreate offer, review round 1 (D1): after Recreate, the environment was changed meanwhile (for example by another
+   * window): nothing is created again.
+   */
+  containerChangedMeanwhile:
+    'The environment was changed in the meantime, for example in another window. The container was not created again, and nothing was changed. Try again.',
   /** Recreate offer: the progress detail after the confirmation, as for the other recreations (concept 6.5). */
   containerRecreatedDamaged:
     'The container of the environment could not be started, so it is set up again. Your files in the repository and in the volumes are kept. Files in other folders of the container, for example in the home folder, are removed.',

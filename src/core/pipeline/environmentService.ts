@@ -182,6 +182,7 @@ import {
   isComposeRecreateLeftoverName,
   COMPOSE_CONTAINER_NUMBER_LABEL,
   COMPOSE_SERVICE_LABEL,
+  COMPOSE_IMAGE_LABEL,
   isContainerFault,
   isGitHubTokenRejected,
   isNetworkFailure,
@@ -598,6 +599,12 @@ interface PipelineContext {
    * service) after the checks, right before `up`.
    */
   recreateDevContainer?: ContainerInfo;
+  /**
+   * Review round 1 of the recreate offer (D2): this run starts the environment with the configuration and the images
+   * of its build record (UpdatePlan.current, no build), so the model of Docker Compose is the one its containers were
+   * created with. Unset: not known (for example "Rebuild later", or the fallback after a failed update).
+   */
+  modelOfContainers?: boolean;
 }
 
 /** A token together with the account of its session. */
@@ -621,6 +628,12 @@ interface UpdatePlan {
   build: boolean;
   forced: boolean;
   updateAvailable: boolean;
+  /**
+   * Review round 1 of the recreate offer (D2): the configuration and the digests are those of the build record (no
+   * change of the configuration, no newer image, also none that was refused), so the model of this run is the one the
+   * containers were created with.
+   */
+  current: boolean;
 }
 
 /** Reports each progress step once, and logs it. */
@@ -1284,6 +1297,7 @@ export class EnvironmentService {
       // A container of an older setup is created again (concept section 9); it does not count as a working container.
       const currentContainer = container !== undefined && containerIsCurrent(container.labels, true, ctx.hostAccessChecks);
       const plan = await this.planUpdate(ctx, loaded, record, imagePresent, currentContainer);
+      ctx.modelOfContainers = plan.current && !plan.build;
       try {
         if (plan.build) outcome = await this.buildAndReplace(ctx, loaded, plan, record, imagePresent, container);
       } catch (error) {
@@ -1957,6 +1971,8 @@ export class EnvironmentService {
     }
     // Concept 7.7: an update whose new image the host access policy refused is not built again for the same digests and
     // configuration; the existing environment starts. A changed digest or configuration, or a rebuild, tries again.
+    // Before a refused update counts as up to date below.
+    const newerImages = check.kind === 'checked' && !check.upToDate;
     const refused = refusedUpdateOf(ctx.env);
     const refusedAgain =
       !forced &&
@@ -1992,7 +2008,7 @@ export class EnvironmentService {
                 : 'the newer image needs access to the computer'
               : 'up to date';
     this.logger.info(`Decision for ${ctx.env.repository}: ${build ? 'build a new environment image' : 'no build'} (${reason}).`);
-    return { check, build, forced, updateAvailable };
+    return { check, build, forced, updateAvailable, current: !changed && !newerImages && !forced };
   }
 
   /**
@@ -2554,10 +2570,58 @@ export class EnvironmentService {
     if (ctx.helperUnavailable || ctx.kindKept || (compose && loaded?.compose === undefined)) return undefined;
     // Docker Compose: only the dev container of the service that the configuration names is ever recreated.
     if (compose && container.labels[COMPOSE_SERVICE_LABEL] !== loaded?.compose?.service) return undefined;
+    if (compose && loaded?.compose !== undefined && !(await this.composeServicesStay(ctx, loaded.compose, record))) return undefined;
     const image = record && imagePresent ? record.environmentImage : container.image;
     if (await this.deps.docker.imageExists(image).catch(() => false)) return image;
     this.logger.info(`The environment image ${image} of ${ctx.env.repository} does not exist; the container cannot be created again without a build.`);
     return undefined;
+  }
+
+  /**
+   * Review round 1 of the recreate offer (D1): after the answer and with the busy mark of this run, the container of the
+   * environment (for Docker Compose its dev container) is still the damaged one (the same ID), and the image of the
+   * recreation (of the build record of the current entry when it exists, else of the container) is still `image`.
+   * Otherwise startFailed, and nothing is changed (the mark goes in the `finally` of the open).
+   */
+  private async requireUnchangedSinceQuestion(ctx: PipelineContext, damaged: ContainerInfo, image: string): Promise<void> {
+    const env = ctx.env;
+    const current = await this.deps.docker.findContainer(env.id, env.containerName);
+    const record = env.buildRecord;
+    const imagePresent = record !== undefined && (await this.deps.docker.imageExists(record.environmentImage).catch(() => false));
+    const currentImage = current === undefined ? undefined : record && imagePresent ? record.environmentImage : current.image;
+    if (current !== undefined && current.id === damaged.id && currentImage === image) return;
+    this.logger.info(
+      `The environment ${env.repository} changed while the question was open (container ${current?.name ?? 'missing'}, image ${currentImage ?? 'none'}). The container is not created again; nothing was changed.`,
+    );
+    throw new UserFacingError('startFailed', PipelineTexts.startFailed, Messages.containerChangedMeanwhile);
+  }
+
+  /**
+   * Review round 1 of the recreate offer (D2): whether the `up` that creates the removed dev container again leaves the
+   * containers of the other services as they are. Without its dev container, the Dev Container CLI runs `docker compose
+   * up` without `--no-recreate` (CLI 0.89.0: `(s||e.expectExistingContainer)&&b.push("--no-recreate")`, `s` the existing
+   * dev container; `--expect-existing-container` fails without it: "The expected container does not exist."), so
+   * Compose recreates each other service whose configuration hash or image differs (label com.docker.compose.image).
+   * So the offer needs: the model of this run is the one of the build record (modelOfContainers: no changed
+   * configuration, no newer image, no build), the same Compose version as the build record, and each container of
+   * another service has the image that its reference names now (com.docker.compose.image is the ID of the local
+   * image). Otherwise nothing is offered, and the log says why.
+   */
+  private async composeServicesStay(ctx: PipelineContext, compose: LoadedCompose, record: BuildRecord | undefined): Promise<boolean> {
+    const env = ctx.env;
+    const refuse = (why: string): false => {
+      this.logger.info(`The dev container of ${env.repository} is not offered to be created again: ${why} Docker Compose would create the other services again too.`);
+      return false;
+    };
+    if (ctx.modelOfContainers !== true) return refuse('the configuration or the images differ from those of the last build (for example after "Rebuild later" or a failed update).');
+    const recorded = composeRecordOf(record);
+    if (recorded === undefined || recorded.version !== compose.output.version) return refuse('the version of Docker Compose differs from the one of the last build.');
+    const others = (await this.composeContainers(env)).filter((c) => c.labels[COMPOSE_SERVICE_LABEL] !== compose.service);
+    for (const other of others) {
+      const imageId = await this.deps.docker.imageId(other.image).catch(() => undefined);
+      if (imageId === undefined || other.labels[COMPOSE_IMAGE_LABEL] !== imageId) return refuse(`the container ${other.name} does not have the current image ${other.image}.`);
+    }
+    return true;
   }
 
   /**
@@ -2591,6 +2655,10 @@ export class EnvironmentService {
       throw new UserFacingError('startFailed', PipelineTexts.startFailed, `${cause}\nThe container was not created again; nothing was changed.`);
     }
     await this.markBusy(ctx, 'rebuild');
+    // Review round 1 (D1): the question had no busy mark, so another window may have changed the environment meanwhile
+    // (a new, healthy container, or a new environment image). Only the same damaged container, from the same image, is
+    // created again; otherwise nothing is changed.
+    await this.requireUnchangedSinceQuestion(ctx, container, image);
     ctx.steps.step('starting');
     ctx.steps.detail(Messages.containerRecreatedDamaged);
     this.logger.info(`The container ${container.name} of ${env.repository} is created again from ${image}; the files in the volumes are kept.`);

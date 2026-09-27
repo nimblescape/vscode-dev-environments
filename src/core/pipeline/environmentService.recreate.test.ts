@@ -187,6 +187,56 @@ describe('recreate offer: a stopped container that cannot be started or used', (
   });
 });
 
+describe('recreate offer, review round 1 (D1): the environment changed while the question was open', () => {
+  it('another window created a new, healthy container meanwhile: it is not removed, nothing is created', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    failFirstUp(PASSWD_DAMAGED);
+    let healthy = '';
+    h.ui.recreateContainer = async (repository) => {
+      h.ui.prompts.push(`recreateContainer ${repository}`);
+      const old = h.docker.containersOf(ENV_ID)[0];
+      h.docker.containers.delete(old.id);
+      healthy = h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'running', image: IMAGE_1 }).id;
+      return true;
+    };
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.containerChangedMeanwhile);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([healthy]);
+    expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([]);
+    expectVolumesKept();
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  it('another window built a new environment image meanwhile: the container is not created from the old one', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    const old = h.docker.containersOf(ENV_ID)[0];
+    failFirstUp(PASSWD_DAMAGED);
+    const image2 = environmentImageName(ENV_ID, 2);
+    h.ui.recreateContainer = async (repository) => {
+      h.ui.prompts.push(`recreateContainer ${repository}`);
+      h.docker.images.add(image2);
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        if (entry.buildRecord) entry.buildRecord = { ...entry.buildRecord, environmentImage: image2, buildNumber: 2 };
+      });
+      return true;
+    };
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.containerChangedMeanwhile);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
+    expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expectVolumesKept();
+  });
+});
+
 describe('recreate offer: a running container that the remote user cannot use', () => {
   /** The check of the running container (`docker exec -u <remote user> <id> /bin/sh -c 'exit 0'`) fails for `id`. */
   function failCheck(id: string, stderr: string, exitCode = 1): void {

@@ -464,6 +464,12 @@ export function nonEmptyString(value: unknown): string | undefined {
 export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /** Review round 22 (D22-1): label that Docker Compose gives each container of a project: the name of its service. */
 export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
+/**
+ * Recreate offer, review round 1 (D2): label that Docker Compose gives each container: the ID of the image that it was
+ * created from (verified with Compose 5.1.1). Compose creates a container again when it differs from the ID of the image
+ * of the service now.
+ */
+export const COMPOSE_IMAGE_LABEL = 'com.docker.compose.image';
 
 /**
  * Review round 22 (D22-1): the name that Docker Compose gives a container that it creates in place of another one while
