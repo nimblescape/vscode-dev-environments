@@ -15,6 +15,7 @@ import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { isRepositoryInScope, sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
+import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
 import { WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
@@ -169,6 +170,11 @@ async function activateExtension(
   });
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
+  // Review round 9 (P9-2): without its bundle every analysis fails (as an internal error, which refuses new and changed
+  // configurations): the log says why at once.
+  if (!fs.existsSync(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')))) {
+    logger.error('The bundle of the configuration check (dist/configurationAnalysisWorker.js) is missing. Reinstall Dev Environments.');
+  }
   const service = new EnvironmentService({
     docker,
     runner,
@@ -191,6 +197,8 @@ async function activateExtension(
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     // Concept 7.7: a private image on ghcr.io that the image check reads with the GitHub session is pulled with it too.
     pullCredentials: githubPackagesPullCredentials(credentials.provider(), auth),
+    // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
+    analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
   });
 
   const tree = new RepositoriesTreeProvider(logger);

@@ -10,13 +10,27 @@ import { devContainersSettings } from '../devContainers';
 import { CommandError, UserFacingError } from '../errors';
 import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
-import { runArgsProblems } from '../helper/hostAccess';
+import { hostAccessProblems } from '../helper/hostAccess';
+import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
+import {
+  ANALYSIS_FAILED_ITEM,
+  analysisFailure,
+  analysisInternalItem,
+  inProcessAnalyzer,
+  type AnalysisFailure,
+  type AnalysisJob,
+  type ConfigurationAnalyzer,
+} from '../helper/configurationAnalysis';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
 import type { EnsureImageOptions } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import {
+  CONTAINER_VERSION,
+  HOST_ACCESS_UNRESTRICTED,
+  LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
+  LABEL_HOST_ACCESS,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   environmentImageName,
@@ -48,6 +62,9 @@ import {
   imageConfigWithUser,
   seedEnvironment,
   type Harness,
+  type SeedOptions,
+  CLEARED_COMPOSE_LABELS,
+  CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 
@@ -152,7 +169,9 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', '--name', name, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', name, '--hostname', 'api']);
     expect(h.helper.ups[0].override).not.toHaveProperty('initializeCommand');
     // Concept section 9: the token and the Git configuration are in the volume before `up` runs the lifecycle commands.
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.indexOf(`up ${image}`));
@@ -177,11 +196,11 @@ describe('open: first open', () => {
 
     const ownership = h.docker.execs.find((e) => e.user === 'root');
     expect(ownership?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
-    // The configuration folder of the container gets the remote user too (written before `up`).
-    expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual([
-      '/workspaces/api',
-      '/workspaces/.devenv+',
-    ]);
+    // The configuration folder of the container gets the remote user too (written before `up`). Review round 15, K3: in a
+    // helper container that mounts only the workspace volume, with the numeric IDs of the remote user (before: a second
+    // OWNERSHIP_FIX_SCRIPT for /workspaces/.devenv+ in the dev container).
+    expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual(['/workspaces/api']);
+    expect(h.helper.configOwnershipFixes).toEqual([{ volumeName: env!.volumeName, folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' }]);
     // Before the first attach: the ~/.gitconfig of the remote user, which keeps the Dev Containers extension from copying
     // the Git configuration of the computer.
     expect(h.docker.execs.find((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toMatchObject({ user: 'root', command: homeGitConfigCommand('vscode') });
@@ -459,11 +478,14 @@ describe('open: first open', () => {
     expect(h.docker.volumes.size).toBe(0);
   });
 
-  it('refuses Docker Compose configurations', async () => {
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "docker-compose.yml", "service": "app" }' };
+  // Spec u6: Docker Compose configurations are supported (compose tests in environmentService.compose.test.ts); what is
+  // refused now is a compose file outside of the repository (resolveComposeFiles), before the model run.
+  it('refuses a Docker Compose configuration whose compose file is outside of the repository', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "../../docker-compose.yml", "service": "app" }' };
     const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('composeNotSupported');
-    expect(error.message).toBe(Messages.composeNotSupported);
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.unsupportedOptions('dockerComposeFile "../../docker-compose.yml" (outside of the repository)'));
+    expect(h.helper.composeModels).toEqual([]);
     expect(await h.registry.list()).toEqual([]);
   });
 
@@ -912,9 +934,11 @@ describe('open: existing environment', () => {
 
   it('starts the existing container when the configuration is broken', async () => {
     await seedEnvironment(h);
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "compose.yml" }' };
+    // Spec u6: Docker Compose is supported; a compose file that Docker Compose cannot read is the broken configuration.
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "dockerComposeFile": "compose.yml", "service": "app" }' };
+    h.helper.composeOutput = { error: 'yaml: line 3: mapping values are not allowed in this context' };
     await h.service.open(TARGET, options());
-    expect(h.ui.warnings).toEqual([Messages.composeNotSupported]);
+    expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
     expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
     expect(h.helper.builds).toEqual([]);
   });
@@ -1362,6 +1386,16 @@ describe('open: existing environment', () => {
       await h.service.open(TARGET, options());
       expect(h.helper.clones).toHaveLength(2);
       expect((await entry())?.busy).toBeUndefined();
+    });
+
+    it('leaves the recorded service folders out of the fix before up of a resumed clone of a single container (review round 12, D12-1)', async () => {
+      const pg = `/workspaces/${REPO.split('/')[1]}/pgdata`;
+      await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate, serviceFolders: [pg] } });
+      await h.service.open(TARGET, options());
+      const before = h.docker.runs.find((run) => run.args[0] === '-c');
+      expect(before).toBeDefined();
+      expect(before!.args).toContain(pg);
+      expect(before!.args).toContain(`${pg}/*`);
     });
 
     it('restores the mark of the ended window when the resumed clone is cancelled', async () => {
@@ -2541,7 +2575,9 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     for (const env of [override.containerEnv, override.remoteEnv]) {
       for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
     }
-    expect((override.runArgs as string[]).slice(-6)).toEqual(['--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect((override.runArgs as string[]).slice(-12)).toEqual(['--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('starts a current container as it is', async () => {
@@ -2550,6 +2586,18 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toBe(false);
     expect(h.progress.details).not.toContain(Messages.containerRecreated);
+  });
+
+  it('does not take a single container with the label of the project from its image for a container of Compose (review round 2, D2-4)', async () => {
+    // An image that Compose built for the project of the environment gave the container its labels (no number of a
+    // container, which only Compose sets on the containers that it creates).
+    await seedEnvironment(h, {
+      container: 'stopped',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app' },
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.logger.infos.some((line) => line.includes('was created for a Docker Compose configuration'))).toBe(false);
   });
 
   it('says so when a build replaces an old container, and names only the newer image for an update', async () => {
@@ -2744,6 +2792,196 @@ describe('the Git version of a new container (concept section 9 "Git inside the 
   });
 });
 
+describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () => {
+  // Review round 2 (S2-01): the Dockerfile that a configuration names must be readable (else it is refused as not
+  // supported); these configurations name `Dockerfile` next to the configuration.
+  beforeEach(() => {
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\n' };
+  });
+
+  it.each<[string, 'on' | 'off']>([
+    ['on', 'on'],
+    ['off', 'off'],
+  ])('refuses the cache volume of the workspace helper as build context with the checks %s (S1)', async (_name, checks) => {
+    if (checks === 'off') h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '/devenv-cache' } };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('build context /devenv-cache (a folder of the workspace helper)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses the folder with the token as build context, resolved against the folder of the configuration (S1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '../../.devenv+' } };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('build context ../../.devenv+ (a folder of the workspace helper)'));
+  });
+
+  it('allows the parent folder of the configuration as build context (S1)', async () => {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', context: '..' } };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses the image of another environment, also with the registry of Docker Hub, and FROM it (S4)', async () => {
+    h.helper.config = { image: 'docker.io/library/devenv-7c1d2e3f:2' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 of another environment'));
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.files[DEFAULT_CONFIG_PATH] = {
+      configText: '{ "build": { "dockerfile": "Dockerfile" } }',
+      dockerfilePath: '.devcontainer/Dockerfile',
+      dockerfileText: 'FROM devenv-7c1d2e3f:2\n',
+    };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('checks the Dockerfile at the path that the resolved configuration names (review round 2, S2-01)', async () => {
+    // The text names the Dockerfile with a variable of the computer; the CLI resolves it (here to its default).
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('FROM image devenv-7c1d2e3f:2 of another environment'));
+    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
+    expect(h.helper.builds).toEqual([]);
+    // Its FROM images are the references of the image check too.
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM node:24\n' };
+    await h.service.open(TARGET, options());
+    expect(h.checker.calls.at(-1)?.images).toEqual(['node:24']);
+  });
+
+  it('refuses a configured Dockerfile that cannot be read (review round 2, S2-01)', async () => {
+    h.helper.config = { build: { dockerfile: 'missing.Dockerfile' } };
+    // Review round 3, P3-1: changed setup, a Dockerfile that exists but cannot be read (for example a link out of the
+    // repository); a missing one is an error of the configuration (the tests of review round 3).
+    h.helper.unreadableDockerfiles = ['.devcontainer/missing.Dockerfile'];
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.unsupportedOptions('Dockerfile missing.Dockerfile (it could not be read, so its images cannot be checked)'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses an image that Docker would find by the prefix of its ID, and allows an image named with hexadecimal characters (review round 2, S2-05)', async () => {
+    // `a1b2c3d4` is no name of a local image: Docker takes it for the prefix of the ID of devenv-7c1d2e3f:2.
+    h.docker.images.add('a1b2c3d4');
+    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+    h.helper.config = { image: 'a1b2c3d4' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('image a1b2c3d4 (an image ID; name the image)'));
+    // In the Dockerfile too.
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine\nCOPY --from=a1b2c3d4 /a /a\n' };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('COPY --from image a1b2c3d4 (an image ID; name the image)'));
+    expect(h.helper.builds).toEqual([]);
+    // An image whose name is `a1b2c3d4`: Docker names it by that name.
+    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['a1b2c3d4:latest'], repoDigests: [] });
+    h.helper.config = { image: 'a1b2c3d4' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses the Compose network of another environment in runArgs, by its name and by its labels (S3)', async () => {
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
+    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=backend'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a network of another environment that runArgs name by its ID or a prefix of it (review round 2, S2-04)', async () => {
+    h.docker.networks.set('devenv-7c1d2e3f_default', {});
+    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    h.docker.networks.set('mine', {});
+    h.docker.networkIds.set('mine', `f00dcafe${'1'.repeat(56)}`);
+    for (const reference of ['f00dbabe', `f00dbabe${'0'.repeat(56)}`]) {
+      h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', reference] };
+      expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(`network ${reference} of another environment`));
+    }
+    // By its containers: a network of the computer with a container of an environment of another account.
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    h.docker.networkContainers.set('mine', [other.id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=f00dcafe'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network f00dcafe of another environment'));
+    expect(h.helper.builds).toEqual([]);
+    // A prefix that two networks share names none (Docker refuses it too).
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=f00d'] };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows a network of the user with a container of another environment of the same owner (review round 2, P2-2)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    h.docker.networks.set('devnet', {});
+    h.docker.networkContainers.set('devnet', [h.docker.containersOf(OTHER_ID)[0].id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devnet'] };
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+  });
+
+  it.each<[string, SeedOptions | undefined]>([
+    ['another owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: OTHER_ACCOUNT }],
+    ['an entry without owner', { id: OTHER_ID, repository: 'acme/web', container: 'running', owner: null }],
+    ['no entry', undefined],
+  ])('refuses a network of the user with a container of an environment of %s (review round 2, P2-2)', async (_name, seed) => {
+    if (seed) await seedEnvironment(h, seed);
+    else h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-web-7c1d2e3f', state: 'running', image: 'x' });
+    h.docker.networks.set('devnet', {});
+    h.docker.networkContainers.set('devnet', [h.docker.containersOf(OTHER_ID)[0].id]);
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devnet'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devnet of another environment'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses the Compose network of another environment of the same owner by its name and labels (review round 2, P2-2)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
+    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'backend'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
+  });
+
+  it('refuses a label of Docker Compose in runArgs (D3)', async () => {
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--label', `com.docker.compose.project=devenv-7c1d2e3f`] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('label com.docker.compose.project'));
+  });
+
+  it('refuses an environment image with a label of the extension before the container is created (D2)', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'devenv.compose-service': 'x', 'devcontainer.metadata': '[]' } });
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${IMAGE_1}`));
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('opens an environment image with the labels of another Compose project, and sets them empty on the container (review round 2, D2-1)', async () => {
+    await seedEnvironment(h, { container: null });
+    // An image that Docker Compose built for the project `app` of the user, inherited through FROM.
+    h.docker.imageConfigs.set(IMAGE_1, {
+      User: '',
+      Labels: { 'com.docker.compose.project': 'app', 'com.docker.compose.service': 'web', 'devcontainer.metadata': '[]' },
+    });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+    const runArgs = h.helper.ups[0].override.runArgs as string[];
+    expect(runArgs).toEqual(expect.arrayContaining([...CLEARED_COMPOSE_LABELS]));
+    // Docker gives the container the labels of runArgs after those of the image: `docker compose -p app down` does not
+    // find it.
+    const [container] = h.docker.containersOf(ENV_ID);
+    expect(container.labels['com.docker.compose.project']).toBe('');
+    expect(container.labels['com.docker.compose.service']).toBe('');
+  });
+
+  it('finds a container whose image gave it the label of a Compose service, and creates it again once the checks are on (D2)', async () => {
+    await seedEnvironment(h, {
+      container: 'running',
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED, 'devenv.compose-service': 'x' },
+    });
+    const old = h.docker.containersOf(ENV_ID)[0].id;
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+    expect(h.docker.containerByRef(old)?.labels[LABEL_HOST_ACCESS]).toBeUndefined();
+  });
+});
+
 describe('host access policy in the pipeline (concept section 9 "Host access")', () => {
   it('refuses a first open before any build, and leaves nothing behind', async () => {
     h.helper.config = { image: BASE_IMAGE, privileged: true, mounts: ['source=/Users/x,target=/x,type=bind'] };
@@ -2793,7 +3031,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     }
     // What Docker gets passes the policy as a whole: the extension's --label and --name included.
     const given = h.helper.ups[0].override.runArgs as string[];
-    expect(runArgsProblems(given, NAME)).toEqual([]);
+    // Review round 2 (D2-1): changed check, as the override configuration (its labels of Docker Compose set empty).
+    expect(hostAccessProblems({ config: { runArgs: given }, ownVolume: NAME, overrideConfiguration: true })).toEqual([]);
     expect(given.slice(-4)).toEqual(['--name', NAME, '--hostname', 'api']);
     expect(given.filter((arg) => arg === '--name')).toHaveLength(runArgs.includes('--label') ? 2 : 1);
   });
@@ -2818,14 +3057,18 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       return;
     }
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
     await seedEnvironment(h, { container: null });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', '--name', NAME, '--hostname', 'api']);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
+    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=4', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api']);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {
@@ -3267,5 +3510,302 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(error.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
       expect(h.helper.ups).toEqual([]);
     });
+  });
+});
+
+describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () => {
+  const MISSING_TEXT = '{ "build": { "dockerfile": "Dockerfile" } }';
+
+  function missingDockerfile(): void {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT, dockerfilePath: '.devcontainer/Dockerfile', dockerfileMissing: true };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = {};
+  }
+
+  it.each(['running', 'stopped'] as const)('starts an existing %s container whose Dockerfile is missing in the repository (P3-1)', async (state) => {
+    await seedEnvironment(h, { container: state, record: { configHash: configHash(MISSING_TEXT) } });
+    missingDockerfile();
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toContain(Messages.buildFileMissing('the Dockerfile Dockerfile'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('ends the first open with a plain error of the configuration, not a refusal, and builds nothing (P3-1)', async () => {
+    missingDockerfile();
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(error.message).toBe(Messages.buildFileMissing('the Dockerfile Dockerfile'));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('also for a Dockerfile that the resolved configuration names (P3-1)', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DF:Dockerfile}" } }' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = {};
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
+  });
+
+  it('still refuses a Dockerfile outside of the repository or one that cannot be read, also for an existing container (P3-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped', record: { configHash: configHash(MISSING_TEXT) } });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: MISSING_TEXT };
+    for (const [dockerfile, unreadable] of [
+      ['/opt/Dockerfile', []],
+      ['Dockerfile', ['.devcontainer/Dockerfile']],
+    ] as const) {
+      h.helper.config = { build: { dockerfile } };
+      h.helper.dockerfiles = {};
+      h.helper.unreadableDockerfiles = [...unreadable];
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toBe(Messages.unsupportedOptions(`Dockerfile ${dockerfile} (it could not be read, so its images cannot be checked)`));
+    }
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('detects a change of the Dockerfile that the configuration names with a variable (P3-2)', async () => {
+    const text = '{ "build": { "dockerfile": "${localEnv:DF:Dockerfile}" } }';
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: text };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.22\n' };
+    await h.service.open(TARGET, options());
+    const [env] = await h.registry.list();
+    expect(env.buildRecord?.configHash).toBe(configHash(text, 'FROM alpine:3.22\n'));
+    expect(await h.service.configurationChanged(env.id, options())).toBe(false);
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.23\n' };
+    expect(await h.service.configurationChanged(env.id, options())).toBe(true);
+    // The open finds the same change.
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(env.id, options());
+    expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
+  });
+
+  it('checks the images of a Dockerfile with the build arguments and target of build.options (S3-2)', async () => {
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile' };
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'ARG BASE=alpine:3.22\nFROM ${BASE} AS a\nFROM devenv-7c1d2e3f:2 AS b\n' };
+    h.helper.config = { build: { dockerfile: 'Dockerfile', args: { BASE: 'alpine:3.22' }, options: ['--build-arg', 'BASE=devenv-7c1d2e3f:1'] } };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(
+      Messages.hostAccess('FROM image devenv-7c1d2e3f:1 of another environment, FROM image devenv-7c1d2e3f:2 of another environment'),
+    );
+    expect(h.helper.builds).toEqual([]);
+  });
+});
+
+describe('review round 9 (P9-1, P9-2): a failed analysis of the host access policy', () => {
+  /** An analyzer that fails the jobs that `fails` picks, with `failure`, and runs the others in this thread. */
+  function failingAnalyzer(fails: (job: AnalysisJob) => boolean, failure: AnalysisFailure): { analyzer: ConfigurationAnalyzer; enabled: { on: boolean } } {
+    const enabled = { on: true };
+    return {
+      enabled,
+      analyzer: {
+        analyze: <J extends AnalysisJob>(job: J) => (enabled.on && fails(job) ? Promise.resolve(analysisFailure(job, failure)) : inProcessAnalyzer.analyze(job)),
+      },
+    };
+  }
+  const isMetadataJob = (job: AnalysisJob): boolean => job.kind === 'hostAccess' && job.input.metadata !== undefined;
+
+  it('does not remember an update whose new image could not be checked, and tries it again at the next open (P9-1)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(isMetadataJob, { kind: 'limit', reason: 'it took longer than 10000 ms' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: remembered as a refused update (Messages.updateRefused), so the next opens did not build it again.
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+    expect(h.ui.warnings).toEqual([Messages.updateCheckFailed(ANALYSIS_FAILED_ITEM)]);
+    expect(Messages.updateCheckFailed('x')).toBe('The configuration could not be checked. Try again. (x.) The environment is started without the update.');
+    // The old container started.
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.containersOf(ENV_ID)[0].image).toBe(IMAGE_1);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    // The next open (the worker works again) builds the update again, and uses it.
+    failing.enabled.on = false;
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    h.ui.warnings.length = 0;
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.builds).toHaveLength(2);
+    expect(h.ui.warnings).toEqual([]);
+  });
+
+  it('remembers an update whose new image is beyond a size limit of the check, and does not build it at every open (review round 10, P10-3)', async () => {
+    h.cleanup();
+    // A deterministic size limit (for example an oversized devcontainer.metadata label of the new image).
+    const failing = failingAnalyzer(isMetadataJob, { kind: 'size', reason: 'the configuration is larger than 32 million characters' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: not remembered ("Try again"), so every open built the same update again and failed the same way.
+    const refused = (await h.registry.get(ENV_ID))?.refusedUpdate;
+    expect(refused).toMatchObject({ items: ANALYSIS_FAILED_ITEM, reason: 'size' });
+    expect(h.ui.warnings).toEqual([Messages.updateTooLarge(ANALYSIS_FAILED_ITEM)]);
+    expect(Messages.updateTooLarge('x')).toBe('The newer image of the environment is too large or too complex to check (x). The environment is started without the update.');
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.docker.containersOf(ENV_ID)[0].image).toBe(IMAGE_1);
+    // The next open does not build the same update again, and says why.
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    h.ui.warnings.length = 0;
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.ui.warnings).toEqual([Messages.updateTooLarge(ANALYSIS_FAILED_ITEM)]);
+    // A rebuild tries again.
+    failing.enabled.on = false;
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+    expect(h.helper.builds).toHaveLength(2);
+    expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
+  });
+
+  it('starts an existing environment when the analysis cannot run, with an internal-error text, and builds nothing (P9-2)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(() => true, { kind: 'internal', reason: 'the worker did not start: Cannot find module' });
+    h = createHarness({ analyzer: failing.analyzer });
+    await seedEnvironment(h, { container: 'stopped' });
+    // A changed configuration: it is not applied (fail closed), the existing container starts as it is.
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: DEFAULT_CONFIG_TEXT.replace('{', '{ "name": "changed",') };
+    // Before: refused with "too large or too complex … Change the configuration of the repository"; nothing started.
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    const text = Messages.configurationCheckInternal(analysisInternalItem('the worker did not start: Cannot find module'));
+    expect(text).toBe('The configuration check failed to start (internal error): the worker did not start: Cannot find module. Try again; if it fails again, reinstall Dev Environments.');
+    expect(h.ui.warnings).toEqual([text]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.helper.ups[0].removeExistingContainer).toBe(false);
+  });
+
+  it('keeps refusing when the analysis cannot run and a container would be created (P9-2)', async () => {
+    h.cleanup();
+    const failing = failingAnalyzer(() => true, { kind: 'internal', reason: 'the worker ended with exit code 1' });
+    h = createHarness({ analyzer: failing.analyzer });
+    // A first open: nothing to start.
+    const first = await h.service.open(TARGET, { progress: h.progress }).then(
+      () => undefined,
+      (error: unknown) => error as UserFacingError,
+    );
+    expect(first?.code).toBe('hostAccess');
+    expect(first?.message).toBe(Messages.configurationCheckInternal(analysisInternalItem('the worker ended with exit code 1')));
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    h.cleanup();
+    // The image exists, the container not: `up` would create one.
+    h = createHarness({ analyzer: failingAnalyzer(() => true, { kind: 'internal', reason: 'crash' }).analyzer });
+    await seedEnvironment(h, { container: null });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'hostAccess' });
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('keeps refusing an existing environment whose configuration is beyond a limit of the analysis', async () => {
+    h.cleanup();
+    h = createHarness({ analyzer: failingAnalyzer(() => true, { kind: 'limit', reason: 'it used too much memory' }).analyzer });
+    await seedEnvironment(h, { container: 'stopped' });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({
+      code: 'hostAccess',
+      message: Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM),
+    });
+    expect(h.helper.ups).toEqual([]);
+  });
+});
+
+describe('review round 9 (S9-1, S9-3): the bounds of the extension host', () => {
+  it('refuses a devcontainer.json longer than MAX_CONFIG_TEXT_LENGTH before it parses it (S9-1)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${BASE_IMAGE}", "x": "${'a'.repeat(MAX_CONFIG_TEXT_LENGTH)}" }` };
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({
+      code: 'hostAccess',
+      message: Messages.configurationTooComplex(ANALYSIS_FAILED_ITEM),
+    });
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('opens a configuration with 30000 variables of the computer in less than 1 s, and names 20 of them (S9-1, P9-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    const containerEnv = Array.from({ length: 30_000 }, (_, i) => `"A${i}": "\${localEnv:V${i}}"`).join(', ');
+    const configText = `{ "image": "${BASE_IMAGE}", "containerEnv": { ${containerEnv} } }`;
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText };
+    const start = performance.now();
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    // Before: seconds in the extension host (names.includes for each name).
+    expect(performance.now() - start).toBeLessThan(1000);
+    const names = Array.from({ length: 20 }, (_, i) => `V${i}`).join(', ');
+    expect(h.ui.warnings).toContain(Messages.localEnvNotPassed(`${names}, and 29980 more`));
+  });
+
+  it('asks Docker about the image IDs of all references with one call, and not at all when the configuration is refused (S9-3)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "build": { "dockerfile": "Dockerfile" } }`, dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: `FROM ${BASE_IMAGE}\n` };
+    h.helper.config = { build: { dockerfile: 'Dockerfile' } };
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.docker.imageInspections).toHaveLength(1);
+    h.docker.imageInspections.length = 0;
+    h.helper.config = { image: BASE_IMAGE, privileged: true };
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${BASE_IMAGE}", "privileged": true }` };
+    h.docker.containersOf(ENV_ID)[0].state = 'stopped';
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'hostAccess' });
+    // Before: one `docker image inspect` per reference, also for a refused configuration.
+    expect(h.docker.imageInspections).toEqual([]);
+  });
+});
+
+describe('review round 12 (D12-2): the ownership fix of a single container leaves its other mounts below the repository alone', () => {
+  it('protects the target of a volume of the mounts of devcontainer.json, not the workspace volume', async () => {
+    // For example "mounts": ["source=pgdata,target=${containerWorkspaceFolder}/.pgdata,type=volume"], a volume that
+    // another container uses too.
+    h.helper.containerMounts = [
+      { type: 'volume', volume: NAME, target: '/workspaces' },
+      { type: 'volume', volume: 'pgdata', target: '/workspaces/api/.pgdata' },
+      { type: 'volume', target: '/workspaces/api/../elsewhere' },
+      { type: 'bind', target: '/workspaces/api' },
+    ];
+    await h.service.open(TARGET, options());
+    const fix = h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT && e.command[4] === '/workspaces/api');
+    // Before: ['/workspaces/api', 'vscode'] alone: the files of the volume were given to vscode.
+    // review round 16, L2: the target of the mount is marked with `(` and `)` (DevMountPaths).
+    expect(fix.map((e) => e.command.slice(4))).toEqual([
+      ['/workspaces/api', 'vscode', '(', '-path', '/workspaces/api/.pgdata', '-o', '-path', '/workspaces/api/.pgdata/*', ')'],
+    ]);
+    expect((await entry())?.serviceFolders).toBeUndefined();
+  });
+});
+
+describe('review round 19 (S19-4, P19-2): the checks of a single container before the read of the merged configuration', () => {
+  const BASE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm AS x\n';
+
+  function useDockerfile(text: string, build: Record<string, unknown> = {}): void {
+    h.helper.config = { build: { dockerfile: 'Dockerfile', ...build } };
+    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile', dockerfileText: text };
+  }
+
+  it('S19-4: a refused image of the Dockerfile leads to no read of the merged configuration', async () => {
+    // slim-down: the base image that only the Dev Container CLI reads is no longer checked; a FROM image that Docker
+    // reads keeps the order of the reads under test.
+    useDockerfile(`${BASE}FROM devenv-0badc0de:3 AS y\n`);
+    h.helper.merged = { privileged: false };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.hostAccess('FROM image devenv-0badc0de:3 of another environment'));
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('S19-4: a refused configuration leads to no read of the merged configuration, and the merged one is still checked', async () => {
+    h.helper.config = { image: BASE_IMAGE, privileged: true };
+    h.helper.merged = {};
+    let error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }]);
+    // Only the merged configuration asks for privileged mode (the metadata of the image).
+    h.helper.readConfigurations.length = 0;
+    h.helper.config = { image: BASE_IMAGE };
+    h.helper.merged = { privileged: true };
+    error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false }, { configPath: DEFAULT_CONFIG_PATH }]);
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('P19-2: builds a single container whose base image comes only from `--build-arg` of build.options', async () => {
+    useDockerfile('ARG BASE\nFROM ${BASE}\n', { options: ['--build-arg', `BASE=${BASE_IMAGE}`] });
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
   });
 });

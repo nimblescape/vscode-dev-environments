@@ -15,16 +15,33 @@
 // Pure functions, no I/O.
 import * as path from 'path';
 import {
+  analyzeDockerfileImages,
+  cutAtSpace,
+  MAX_NESTING,
+  MAX_REFERENCE_LENGTH,
+  SHELL_NAME,
+  type DockerfileImages,
+  type ImageReferenceKind,
+} from '../imageCheck/dockerfile';
+import { isDockerHub, parseImageReference } from '../imageCheck/reference';
+import {
+  COMPOSE_CLEARED_LABELS,
+  CONFIG_FOLDER,
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
   ENVIRONMENT_VOLUME_PATTERN,
+  HELPER_CACHE_FOLDER,
   HELPER_CACHE_VOLUME,
+  HELPER_DOCKER_SOCKET,
   HOST_ACCESS_UNRESTRICTED_LABEL,
+  LABEL_CONFIG_PATH,
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_VOLUME,
   VOLUME_KIND_ADDITIONAL,
   WORKSPACES_ROOT,
+  composeProjectName,
+  isConfigPathLabelValue,
 } from '../names';
 import {
   DEV_CONTAINERS_VOLUMES,
@@ -78,6 +95,41 @@ export interface HostAccessInput {
    */
   environment?: { id: string; ownerId?: string };
   /**
+   * The networks that the configuration names (runArgsNetworks, or the networks of a Docker Compose model) and that
+   * exist, by name: their labels and the environments of the containers attached to them (foreignNetworkItem).
+   */
+  networks?: Readonly<Record<string, NetworkState>>;
+  /**
+   * The folder of the configuration in the workspace helper (for example `/workspaces/api/.devcontainer`), against which
+   * the CLI resolves `build.context` and `build.dockerfile` of a single container. Without it, they are not checked.
+   */
+  configFolder?: string;
+  /** The folder of the repository in the workspace helper (for example `/workspaces/api`), for isHelperPath. */
+  repositoryFolder?: string;
+  /**
+   * The Dockerfile of a single container, read at the path that the configuration names after the CLI resolved its
+   * variables (review round 2, S2-01): the images that it names (dockerfileImageFindings).
+   */
+  dockerfileText?: string;
+  /**
+   * The Dockerfile that the configuration of a single container names, when it could not be read (review round 2,
+   * S2-01): refused as not supported, because the images that it names would escape the checks.
+   */
+  dockerfileUnreadable?: string;
+  /**
+   * `config` is the override configuration of `up` (the final check of its runArgs, review round 2, D2-1): its runArgs
+   * may carry the labels of Docker Compose with empty values that the override configuration adds (COMPOSE_CLEARED_LABELS).
+   * The runArgs of the repository configuration may not.
+   */
+  overrideConfiguration?: boolean;
+  /**
+   * Review round 15 (K1, K2): the `mounts` of the sources belong to a Docker Compose configuration. The Dev Container CLI
+   * does not give them to `docker run --mount` then: it reads a text with its own parser and writes each mount into the
+   * compose file that it generates as `<source>:<target>` (composeCliMountProblems). They are checked in that reading
+   * too.
+   */
+  composeMounts?: boolean;
+  /**
    * The variables of the Dev Container CLI at `up` (helperCliVariables in ./cliVariables.ts): the image metadata is
    * checked as the CLI substitutes it before it passes it to Docker, with the repository folder for
    * `${localWorkspaceFolder}`, as `up` uses it for every repository name (hotfix review 5, A5-1). `config` and `merged`
@@ -87,6 +139,25 @@ export interface HostAccessInput {
    * (HELPER_KNOWN_ENV, mayBeSetInHelper).
    */
   variables?: CliVariables;
+}
+
+/**
+ * What the check knows of an existing network (HostAccessInput.networks), by the reference that the configuration writes
+ * (its name, its ID, or a unique prefix of its ID, as Docker resolves it; review round 2, S2-04).
+ */
+export interface NetworkState {
+  /** The name of the network that the reference resolves to; the rules on names apply to it too. */
+  name?: string;
+  /** The labels of the network (`docker network inspect`). */
+  labels: Readonly<Record<string, string>>;
+  /** The label devenv.environment-id of each container attached to the network that has it. */
+  environments: readonly string[];
+  /**
+   * Of `environments`, those of registry entries of the owner of the checked environment (review round 2, P2-2): the
+   * environments of one account may share a network of their own (as they share additional volumes). An environment
+   * of another owner, of an entry without owner, or without an entry stays another environment's.
+   */
+  sameOwnerEnvironments?: readonly string[];
 }
 
 /**
@@ -137,8 +208,9 @@ const unsupported = (item: string): Problem => ({ item, class: 'unsupported' });
 /** How a flag of `docker run` or `docker build` is treated. */
 type FlagRule =
   | { kind: 'allow'; value: boolean }
-  // Allowed, but not passed to Docker (overrideRunArgs); `reason` tells the log why (removedRunArgs).
-  | { kind: 'remove'; value: boolean; reason: string }
+  // Allowed, but not passed to Docker (overrideRunArgs); `reason` tells the log why (removedRunArgs). With `check`, its
+  // value is checked first (review round 8, S8-6: `--restart`).
+  | { kind: 'remove'; value: boolean; reason: string; check?: (value: string) => Problem[] }
   // `guarded`: refused whatever the switch of the host access checks says (HostAccessClass `protected`).
   | { kind: 'refuse'; value: boolean; item?: string; guarded?: boolean }
   | { kind: 'check'; check: (value: string) => Problem[] };
@@ -158,6 +230,8 @@ function checkGuarded(check: (value: string) => string[]): FlagRule {
 }
 
 const REMOVED_NAME = 'the container gets the name of the environment';
+const REMOVED_RESTART =
+  'Dev Environments starts and stops the container itself; Docker would start the container again when Docker starts, outside the Session Monitor';
 const REMOVED_LIFE_CYCLE = 'Dev Environments stops, starts, and recreates the container; --rm would delete it at each stop';
 const REMOVED_TERMINAL = 'the container runs without a terminal; -i with -t would make its start fail';
 const REMOVED_DETACH = 'the Dev Container CLI stays attached to the container; -d would make its start fail';
@@ -177,8 +251,9 @@ const removeDetach: FlagRule = { kind: 'remove', value: false, reason: REMOVED_D
 // Assumption (V-10): Dev Container CLI 0.89.0 puts the runArgs into `docker run --sig-proxy=false -a STDOUT -a STDERR`
 // before its own `--entrypoint /bin/sh`, and runs it without a terminal (no node-pty in the workspace helper).
 const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
-  '--network': { kind: 'check', check: networkProblems },
-  '--net': { kind: 'check', check: networkProblems },
+  // Checked in runArgsFindings (networkProblems, with the labels of the networks).
+  '--network': { kind: 'check', check: (value) => networkProblems(value) },
+  '--net': { kind: 'check', check: (value) => networkProblems(value) },
   '--add-host': allowValue,
   // An address or another name of the container in a network of Docker: network only.
   '--ip': allowValue,
@@ -261,8 +336,10 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--stop-signal': allowValue,
   // Only up to MAX_STOP_TIMEOUT_SECONDS, so that a stop of the Session Monitor ends in time (stopTimeoutProblems).
   '--stop-timeout': { kind: 'check', check: stopTimeoutProblems },
-  // Only `no` and `on-failure`: the others start the container together with Docker (restartProblems).
-  '--restart': { kind: 'check', check: restartProblems },
+  // Only `no` and `on-failure`: the others start the container together with Docker (restartProblems). Review round 8
+  // (S8-6): removed before `up` too, with a log line: Docker would start a container with `on-failure` again when the
+  // Docker daemon starts, outside the Session Monitor (D-14).
+  '--restart': { kind: 'remove', value: true, reason: REMOVED_RESTART, check: restartProblems },
   // Only drivers that keep the log in files of the container, or no log (logDriverProblems). Stays refused with the
   // checks off, like the other options of the log (user decision 2026-09-26).
   '--log-driver': checkGuarded(logDriverProblems),
@@ -312,12 +389,16 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
   // Without the OOM killer, a container without a memory limit can make the computer hang. Not named by the user
   // decision on the switch, so it stays refused with the checks off (the safer choice for an unclear item).
   '--oom-kill-disable': { kind: 'refuse', value: false, guarded: true },
-  '--pid': refuseValue,
+  // Review round 22 (H22-6): the processes of another container (for example a dev container, which holds the GitHub
+  // token, or one of another environment) stay refused whatever the switch says.
+  '--pid': { kind: 'check', check: (value) => [(/^container:/i.test(value.trim()) ? guarded : access)(`--pid=${value}`)] },
   '--ipc': refuseValue,
   '--uts': refuseValue,
   '--userns': refuseValue,
   '--cgroupns': refuseValue,
-  '--volumes-from': refuseValue,
+  // Review round 22 (H22-2): the volumes of another container (for example the workspace volume of a dev container, with
+  // the GitHub token, or the volumes of another environment): refused whatever the switch says.
+  '--volumes-from': { kind: 'refuse', value: true, guarded: true },
   // Another container, whose environment variables older versions of Docker copy into this one.
   '--link': refuseValue,
   // Checked in runArgsProblems with the rules of `mounts`: only volumes (not of another environment) and tmpfs.
@@ -329,18 +410,20 @@ const RUN_FLAGS: Readonly<Record<string, FlagRule>> = {
 const BUILD_FLAGS: Readonly<Record<string, FlagRule>> = {
   '--network': allowValue,
   '--add-host': allowValue,
-  '--build-arg': allowValue,
+  // Review round 4 (S4-1): not without a value (buildArgOptionProblems).
+  '--build-arg': { kind: 'check', check: (value) => buildArgOptionProblems(value) },
   '--target': allowValue,
   '--label': allowValue,
   '--platform': allowValue,
   '--pull': allowFlag,
   '--no-cache': allowFlag,
-  '--secret': refuseValue,
-  '--ssh': refuseValue,
+  // Review round 3 (S3-6): the build client reads their files in the workspace helper (buildFileProblems).
+  '--secret': { kind: 'check', check: (value) => buildSecretOptionProblems(value) },
+  '--ssh': { kind: 'check', check: (value) => buildSshOptionProblems(value) },
   '--allow': refuseValue,
-  '--output': refuseValue,
-  '-o': refuseValue,
-  '--build-context': checkAccess(buildContextProblems),
+  '--output': { kind: 'check', check: (value) => buildOutputOptionProblems('--output', value) },
+  '-o': { kind: 'check', check: (value) => buildOutputOptionProblems('-o', value) },
+  '--build-context': { kind: 'check', check: buildContextProblems },
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -404,7 +487,7 @@ export function truncated(text: string, max: number): string {
  * after the items are without duplicates and the placeholder of an ID is named as the configuration writes it (add in
  * hostAccessFindings), so that both see the whole text.
  */
-function capped(items: readonly string[]): string[] {
+export function capped(items: readonly string[]): string[] {
   const listed = items.slice(0, MAX_LISTED_ITEMS).map((item) => truncated(item, MAX_ITEM_LENGTH));
   return items.length <= MAX_LISTED_ITEMS ? listed : [...listed, `and ${items.length - MAX_LISTED_ITEMS} more`];
 }
@@ -427,7 +510,11 @@ function applicable(problems: readonly Problem[], checksOn: boolean): Problem[] 
   return checksOn ? [...problems] : problems.filter((problem) => problem.class !== 'computer');
 }
 
-function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Problem[] {
+function hostAccessFindings(input: HostAccessInput, checksOn: boolean): Problem[] {
+  return withDockerfileCache(() => readHostAccessFindings(input, checksOn));
+}
+
+function readHostAccessFindings(original: HostAccessInput, checksOn: boolean): Problem[] {
   // First, and alone (hotfix review 2, P2): the other checks take more than linear time on some texts.
   const tooLong = textLengthProblems(original);
   if (tooLong.length > 0) return tooLong;
@@ -450,10 +537,18 @@ function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Probl
   const volumes = volumeContext(input);
   for (const { source, raw } of configurationSources(input, original)) {
     // Read as the Dev Container CLI merges them: any true-like `privileged`, and a single value in place of a list.
-    for (const { entry, leftovers } of mountEntries(source.mounts, raw, input.variables ?? {})) add(mountEntryProblems(entry, leftovers, volumes));
+    for (const { entry, leftovers } of mountEntries(source.mounts, raw, input.variables ?? {})) {
+      add(mountEntryProblems(entry, leftovers, volumes));
+      // Review round 15 (K1, K2): what the Dev Container CLI writes into its compose file, as Compose reads it. Checked on
+      // the substituted entry (resolvedInput), as mountEntryProblems checks it; a mount with leftovers is refused there
+      // already (merge of #27: the raw label of the image metadata no longer reaches this check, review round 16, L3).
+      if (input.composeMounts === true && leftovers.length === 0) add(composeCliMountProblems(entry, volumes));
+    }
     if (source.privileged) add([access('privileged mode')]);
     add(accessAll(capabilityProblems(cliList(source.capAdd))));
     add(accessAll(securityOptionProblems(cliList(source.securityOpt))));
+    // Review round 16 (L1): what the Dev Container CLI writes as text into its compose file, whatever the switch says.
+    if (input.composeMounts === true) add(composeTextProblems(source));
     const gpu = isRecord(source.hostRequirements) ? source.hostRequirements.gpu : undefined;
     if (gpu !== undefined && gpu !== false && gpu !== null) add([access('GPU access (hostRequirements.gpu)')]);
     // It would run in the workspace helper, which has the Docker socket (not on the computer): the integrity of the
@@ -473,9 +568,12 @@ function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Probl
       const left = secondPassProblems('runArgs', written.runArgs);
       if (left.length > 0) add(left);
       else {
-        add(runArgsFindings(source.runArgs, volumes));
+        // The labels of Docker Compose with empty values: only those that the override configuration adds (D2-1), which
+        // the merged configuration of an existing container holds too.
+        const cleared = source === input.merged || input.overrideConfiguration === true;
+        add(runArgsFindings(source.runArgs, volumes, cleared));
         // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
-        add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes));
+        add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared));
       }
     }
     if (source.appPort !== undefined) {
@@ -490,6 +588,10 @@ function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Probl
   // an earlier version of the extension. The image metadata has none of them (the build runs without it). The identity
   // of the owner account: stays refused with the checks off.
   for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(environmentProblems(source));
+  // The build of a single container: no folder of the workspace helper as its context or Dockerfile, and no image of
+  // another environment (as image, FROM image, or additional context). Not the merged configuration: it holds the
+  // values of the configuration, and the image of an existing container.
+  if (input.config) add(singleBuildProblems(input.config, input));
   return [...problems.values()];
 }
 
@@ -509,6 +611,664 @@ function secondPassProblems(what: string, entries: readonly unknown[]): Problem[
     if (left.length > 0) problems.push(unsupported(`${what} ${JSON.stringify(entry)} uses ${listedVariables(left)}, which cannot be checked`));
   }
   return problems;
+}
+
+/**
+ * `build.context` and `build.dockerfile` (and the older `context` and `dockerFile`) of a single container, resolved as
+ * the Dev Container CLI resolves them (against the folder of the configuration): a path of the workspace helper
+ * (isHelperPath) stays refused whatever the switch says; the CLI builds in the helper, where the cache volume, the
+ * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
+ * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
+ * of the computer), and the check does not resolve its links. `image`, and the images of the Dockerfile: no image of
+ * another environment, and no image ID (imageReferenceFinding), with the build arguments and the target of `build.args`,
+ * `build.target`, and `build.options` as the CLI passes them (singleBuildArguments, review round 3, S3-2).
+ */
+function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
+  const problems: Problem[] = [];
+  const build = isRecord(config.build) ? config.build : {};
+  if (input.configFolder !== undefined && input.repositoryFolder !== undefined) {
+    const repository = input.repositoryFolder;
+    const context = typeof build.context === 'string' ? build.context : typeof config.context === 'string' ? config.context : undefined;
+    const dockerfile = typeof build.dockerfile === 'string' ? build.dockerfile : typeof config.dockerFile === 'string' ? config.dockerFile : undefined;
+    for (const [what, value] of [['build context', context], ['Dockerfile', dockerfile]] as const) {
+      // Review round 4 (S4-2): no exception for a value that looks like a URL. The CLI 0.89.0 resolves it as a path
+      // (path.posix.resolve against the folder of the configuration), so `x://../../devenv-cache` is a folder.
+      if (value === undefined || value.trim() === '') continue;
+      const resolved = path.posix.resolve(input.configFolder, value.trim());
+      if (isHelperPath(resolved, repository)) problems.push(guarded(`${what} ${value} (a folder of the workspace helper)`));
+      else if (what === 'build context' && resolved !== repository && !resolved.startsWith(`${repository}/`)) {
+        problems.push(guarded(`${what} ${value} (outside of the repository)`));
+      }
+    }
+  }
+  if (typeof config.image === 'string') {
+    const finding = imageReferenceFinding(config.image);
+    if (finding) problems.push(finding);
+  }
+  // Review round 5 (S5-2): the CLI passes an object as `[object Object]`; the check refuses it.
+  if (isRecord(build.args)) {
+    for (const [name, value] of Object.entries(build.args)) {
+      if (isRecord(value)) problems.push(unsupported(`build.args ${name} (an object; the value of a build argument is a text)`));
+    }
+  }
+  if (input.dockerfileText !== undefined) {
+    const { args, target } = singleBuildArguments(build);
+    problems.push(...dockerfileImageFindings(input.dockerfileText, args, target));
+  } else if (input.dockerfileUnreadable !== undefined) {
+    problems.push(unsupported(`Dockerfile ${input.dockerfileUnreadable} (it could not be read, so its images cannot be checked)`));
+  }
+  return problems;
+}
+
+/**
+ * The build arguments and the target of the build of a single container as `docker build` gets them (review round 3,
+ * S3-2): the CLI 0.89.0 passes `--target` of `build.target`, then `--build-arg` of each `build.args`, then
+ * `build.options`, and the last value of an argument or of the target wins. `--build-arg NAME` without a value takes the
+ * value of the variable NAME of the workspace helper, or (buildx drops it when the helper has no such variable) the
+ * earlier value or the default of the ARG: it stays `${NAME}` here, and buildArgOptionProblems refuses it (review round
+ * 4, S4-1). Review round 5 (S5-2): each value of `build.args` as the CLI's template literal `${k}=${v}` makes it a
+ * text (`String(value)`: an array gives its items with commas, `null` gives `null`); singleBuildProblems refuses an
+ * object.
+ */
+export function singleBuildArguments(build: Readonly<Record<string, unknown>>): { args: Record<string, string>; target?: string } {
+  const fromArgs: Record<string, string> = {};
+  if (isRecord(build.args)) {
+    for (const [name, value] of Object.entries(build.args)) fromArgs[name] = String(value);
+  }
+  // Review round 18 (S18-1): a Map, then own properties (Object.fromEntries), so that `--build-arg __proto__=…` of
+  // `build.options`, which the CLI passes to `docker build` as it is, stays an argument. `build.args` above keeps its
+  // assignment: the CLI's parser of devcontainer.json drops a key `__proto__` with a text value too.
+  const args = new Map(Object.entries(fromArgs));
+  let target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
+  if (Array.isArray(build.options)) {
+    for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
+      if (flag.value === undefined) continue;
+      if (flag.name === '--build-arg') {
+        const equals = flag.value.indexOf('=');
+        if (equals < 0) args.set(flag.value, `\${${flag.value}}`);
+        else if (equals > 0) args.set(flag.value.slice(0, equals), flag.value.slice(equals + 1));
+      } else if (flag.name === '--target') {
+        target = flag.value !== '' ? flag.value : undefined;
+      }
+    }
+  }
+  const texts = Object.fromEntries(args);
+  return target !== undefined ? { args: texts, target } : { args: texts };
+}
+
+/** An image reference of a configuration, and how an item names it (for example `FROM image`). */
+export interface NamedImageReference {
+  reference: string;
+  what: string;
+}
+
+/**
+ * The image references that a Dockerfile names without a variable that is not resolved (extractImageReferences), for
+ * the question whether Docker takes one of them for an image ID (resolvedByImageId, review round 2, S2-05).
+ * `_target`: not used (review round 3, S3-3, see dockerfileImageFindings).
+ */
+export function dockerfileImageReferences(text: string, args: Readonly<Record<string, string>>, _target?: string): NamedImageReference[] {
+  return dockerfileReferences(text, args)
+    .references.filter(({ reference, unchecked, tooLong }) => !reference.includes('$') && unchecked === undefined && tooLong === undefined)
+    .map(({ reference, kind }) => ({ reference, what: DOCKERFILE_IMAGE_WHAT[kind] }));
+}
+
+/**
+ * Every image reference of the Dockerfile (extractImageReferences) of all stages, whatever the target (review round 3,
+ * S3-3: the target stage can use a later stage with `COPY --from`), and the frontend that the build argument
+ * BUILDKIT_SYNTAX names (review round 3, S3-2: BuildKit uses it in place of the directive `# syntax=`).
+ */
+function dockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
+  // Review round 8 (S8-4): one analysis for each Dockerfile and its build arguments within one check.
+  const cache = activeDockerfileCache;
+  const key = cache !== undefined ? JSON.stringify([text, Object.entries(args).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))]) : '';
+  const cached = cache?.get(key);
+  if (cached !== undefined) return cached;
+  const images = analyzeDockerfileReferences(text, args);
+  cache?.set(key, images);
+  return images;
+}
+
+/**
+ * Review round 8 (S8-4): the analyses of the Dockerfiles (dockerfileReferences) of the check that runs, by the text and
+ * the build arguments (the target does not matter, see dockerfileImageFindings); `undefined` outside of one.
+ */
+let activeDockerfileCache: Map<string, DockerfileImages> | undefined;
+
+/**
+ * Runs `fn` as one check (review round 8, S8-4): a Dockerfile that several services (or the report and the image
+ * references) read with the same build arguments is analysed once. Nested calls share the cache of the outer one.
+ */
+export function withDockerfileCache<T>(fn: () => T): T {
+  if (activeDockerfileCache !== undefined) return fn();
+  activeDockerfileCache = new Map();
+  try {
+    return fn();
+  } finally {
+    activeDockerfileCache = undefined;
+  }
+}
+
+function analyzeDockerfileReferences(text: string, args: Readonly<Record<string, string>>): DockerfileImages {
+  const images = analyzeDockerfileImages(text, { ...args }, { withStages: true });
+  // Review round 7 (S7-2): a Dockerfile that is too large is refused (dockerfileImageFindings), BUILDKIT_SYNTAX with it;
+  // review round 8 (S8-2): so is one that is too complex.
+  if (images.tooLarge === true || images.tooComplex === true) return images;
+  const references = images.references;
+  // Review round 5 (P5-2): BuildKit takes the value up to its first space; (S5-2) a value of `build.args` as a text.
+  const syntax = Object.prototype.hasOwnProperty.call(args, 'BUILDKIT_SYNTAX') ? cutAtSpace(String(args.BUILDKIT_SYNTAX).trim()) : '';
+  if (syntax !== '' && !references.some((reference) => reference.kind === 'syntax' && reference.reference === syntax)) {
+    references.unshift({ reference: syntax, kind: 'syntax' });
+  }
+  return images;
+}
+
+/**
+ * The image references of a single container (review round 2, S2-05): `image`, the images of its Dockerfile
+ * (dockerfileImageReferences, with `build.args` and `build.target`), and the images of `--build-context` of
+ * `build.options`.
+ */
+export function singleImageReferences(config: Readonly<Record<string, unknown>>, dockerfileText: string | undefined): NamedImageReference[] {
+  const references: NamedImageReference[] = [];
+  if (typeof config.image === 'string' && config.image.trim() !== '') references.push({ reference: config.image.trim(), what: 'image' });
+  const build = isRecord(config.build) ? config.build : {};
+  if (dockerfileText !== undefined) {
+    // Review round 3 (S3-2): with the build arguments of `build.options`.
+    const { args, target } = singleBuildArguments(build);
+    references.push(...dockerfileImageReferences(dockerfileText, args, target));
+  }
+  if (Array.isArray(build.options)) {
+    for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
+      if (flag.name !== '--build-context' || flag.value === undefined) continue;
+      const image = /^docker-image:\/\/(.*)$/i.exec(flag.value.slice(flag.value.indexOf('=') + 1).trim());
+      if (image) references.push({ reference: image[1].trim(), what: 'build option --build-context image' });
+    }
+  }
+  return references;
+}
+
+/** How an item names an image of a Dockerfile, by where the Dockerfile names it. */
+const DOCKERFILE_IMAGE_WHAT: Readonly<Record<ImageReferenceKind, string>> = {
+  FROM: 'FROM image',
+  'COPY --from': 'COPY --from image',
+  'RUN --mount from': 'RUN --mount image',
+  syntax: 'syntax image',
+};
+
+/**
+ * The images that a Dockerfile names (extractImageReferences: FROM, `COPY --from`, `RUN --mount=…,from=`, the
+ * directive `# syntax=`, and the build argument BUILDKIT_SYNTAX) that a configuration may not use (imageReferenceFinding,
+ * D-17, review round 2, S2-02). The stages of the whole file count, whatever `_target` says (review round 3, S3-3). A
+ * reference whose variable could not be resolved is refused when the text before its first `$` already names an image of
+ * the namespace of Dev Environments (for example `devenv-$SUFFIX`), or when its text holds `devenv` anywhere (review
+ * round 3, S3-4: for example `devenv${TARGETVARIANT}-…`, where the variable is empty on most platforms); any other one
+ * cannot be told apart and is left. Review round 4: the rule on `devenv` anywhere does not apply to a reference with a
+ * registry other than Docker Hub before the first `$` (S4-6, namedRegistry); the pattern operators of variables are
+ * evaluated, and a form that cannot be evaluated is refused (S4-3, DockerfileImageReference.unchecked); a frontend
+ * (`# syntax=`, BUILDKIT_SYNTAX) other than the official Dockerfile frontends is refused (S4-4, isOfficialFrontend).
+ */
+export function dockerfileImageFindings(text: string, args: Readonly<Record<string, string>>, _target?: string): HostAccessFinding[] {
+  const findings: HostAccessFinding[] = [];
+  const images = dockerfileReferences(text, args);
+  // Review round 7 (S7-2): longer than MAX_DOCKERFILE_LENGTH or with more than MAX_DOCKERFILE_INSTRUCTIONS.
+  if (images.tooLarge === true) return [{ item: 'Dockerfile (the Dockerfile is too large to check)', class: 'unsupported' }];
+  // Review round 8 (S8-2): its expansions made more than MAX_EXPANDED_CHARACTERS characters.
+  if (images.tooComplex === true) return [{ item: 'Dockerfile (the Dockerfile is too complex to check)', class: 'unsupported' }];
+  // Review round 7 (S7-2): each stage name once, with the index of its first FROM (a reference names the first
+  // `stagesBefore` of them as stages), instead of a Set for each reference.
+  const firstStage = new Map<string, number>();
+  images.stageNames.forEach((name, index) => {
+    if (!firstStage.has(name)) firstStage.set(name, index);
+  });
+  for (const { reference, kind, unchecked, tooLong, tooComplex, stagesBefore } of images.references) {
+    const what = DOCKERFILE_IMAGE_WHAT[kind];
+    if (unchecked === 'protected') {
+      findings.push({ item: `${what} ${shortReference(reference)} (uses a variable form that Dev Environments cannot check, perhaps for an image of another environment)`, class: 'protected' });
+      continue;
+    }
+    // Review round 6 (S6-1): before the variants, whose number grows with the length.
+    if (tooLong === true || reference.length > MAX_REFERENCE_LENGTH) {
+      findings.push(tooLongFinding(reference, what));
+      continue;
+    }
+    // Review round 7 (S7-1): the Dockerfile ran out of the budget of the pattern matcher.
+    if (tooComplex === true) {
+      findings.push({ item: `${what} ${shortReference(reference)} (the Dockerfile is too complex to check)`, class: 'unsupported' });
+      continue;
+    }
+    if (unchecked === 'unsupported') {
+      findings.push({ item: `${what} ${reference} (uses a variable form that Dev Environments cannot check)`, class: 'unsupported' });
+      continue;
+    }
+    if (kind === 'syntax' && !isOfficialFrontend(reference) && (reference.includes('$') || imageReferenceFinding(reference, what) === undefined)) {
+      findings.push({
+        item: `${what} ${reference} (only the official Dockerfile frontends docker/dockerfile and docker/dockerfile-upstream may build)`,
+        class: 'protected',
+      });
+      continue;
+    }
+    if (!reference.includes('$')) {
+      const finding = imageReferenceFinding(reference, what);
+      if (finding) findings.push(finding);
+      continue;
+    }
+    // Review round 6 (P6-2): a variant that names a stage (by its name, or by its index for `COPY --from` and
+    // `RUN --mount from`) is no image, as extractImageReferences leaves out such a resolved text.
+    const isStage = (name: string): boolean => (firstStage.get(name) ?? Infinity) < (stagesBefore ?? 0);
+    const isImage = (variant: string): boolean => !isStage(variant.trim().toLowerCase()) && (kind === 'FROM' || !/^\d+$/.test(variant.trim()));
+    const finding = unresolvedReferenceFinding(reference, what, isImage);
+    if (finding) findings.push(finding);
+  }
+  return findings;
+}
+
+/**
+ * The finding of an image reference with a variable that is not resolved (a `$`): refused (`protected`) when the text
+ * before its first `$` already names an image of the namespace of Dev Environments, or when its text holds `devenv`
+ * anywhere (review round 3, S3-4), except behind a registry other than Docker Hub (review round 4, S4-6); and when one of
+ * the texts that it can become (unresolvedVariants, review round 5, S5-1: its variables empty, or giving an operand of
+ * `:-` or `:+`) for which `isImage` holds names such an image or has the form of an image ID. `undefined` otherwise.
+ */
+function unresolvedReferenceFinding(reference: string, what: string, isImage: (variant: string) => boolean = () => true): HostAccessFinding | undefined {
+  const dollar = reference.indexOf('$');
+  const prefix = reference.slice(0, dollar).trim();
+  if ((prefix !== '' && /^devenv-/.test(localImageRepository(prefix))) || (!namedRegistry(reference, dollar) && /devenv/i.test(reference))) {
+    return { item: `${what} ${reference} of another environment (a variable that is not resolved)`, class: 'protected' };
+  }
+  const variants = unresolvedVariants(reference)?.filter(isImage);
+  if (variants === undefined || (!namedRegistry(reference, dollar) && variants.some((variant) => /devenv/i.test(variant) || IMAGE_ID_FORM.test(variant.trim())))) {
+    return {
+      item: `${what} ${reference} (with its variables that are not resolved, it can name an image of another environment or an image ID)`,
+      class: 'protected',
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Review round 5 (S5-1): the form of an image ID or of a prefix of one (`sha256:<hex>`, hexadecimal characters), for a
+ * text that a reference with a variable that is not resolved can become. Docker takes a prefix of an ID too.
+ */
+const IMAGE_ID_FORM = /^(?:sha256:)?[0-9a-f]+$/i;
+/** The most texts that unresolvedVariants makes; a reference with more cannot be checked. */
+const MAX_VARIANTS = 256;
+
+/** Review round 6 (S6-1): a reference in an item, cut after 64 characters. */
+function shortReference(reference: string): string {
+  return reference.length > 64 ? `${reference.slice(0, 64)}…` : reference;
+}
+
+/** Review round 6 (S6-1): the finding of a reference longer than MAX_REFERENCE_LENGTH. */
+function tooLongFinding(reference: string, what: string): HostAccessFinding {
+  return { item: `${what} ${shortReference(reference.trim())} (the image reference is too long)`, class: 'unsupported' };
+}
+
+/**
+ * The texts that an expanded image reference (extractImageReferences) can become through its variables that are not
+ * resolved (review round 5, S5-1): each such variable (`$NAME`, `${NAME…}`, names as SHELL_NAME reads them) is left out,
+ * and a `${NAME:-word}`, `${NAME-word}`, `${NAME:+word}`, or `${NAME+word}` also gives its word (with its own variants).
+ * A `$` without a name stays. `undefined` for more than MAX_VARIANTS texts, or for a nesting of `${…}` deeper than
+ * MAX_NESTING (review round 6, S6-1). The text between two variables is added in one step (review round 6, S6-1).
+ */
+export function unresolvedVariants(reference: string, level = 0): string[] | undefined {
+  if (level > MAX_NESTING) return undefined;
+  let variants: string[] = [''];
+  const append = (options: readonly string[]): boolean => {
+    const next = new Set<string>();
+    for (const variant of variants) for (const option of options) next.add(variant + option);
+    variants = [...next];
+    return variants.length <= MAX_VARIANTS;
+  };
+  let i = 0;
+  while (i < reference.length) {
+    const char = reference[i];
+    if (char !== '$') {
+      const next = reference.indexOf('$', i);
+      const end = next < 0 ? reference.length : next;
+      if (!append([reference.slice(i, end)])) return undefined;
+      i = end;
+      continue;
+    }
+    if (reference[i + 1] === '{') {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < reference.length && depth > 0; j++) {
+        if (reference[j] === '$' && reference[j + 1] === '{') {
+          depth++;
+          j++;
+        } else if (reference[j] === '}') depth--;
+      }
+      const inner = reference.slice(i + 2, depth === 0 ? j - 1 : reference.length);
+      const name = SHELL_NAME.exec(inner)?.[0] ?? '';
+      const operator = /^:?[-+]/.exec(inner.slice(name.length))?.[0];
+      const options = [''];
+      if (operator !== undefined) {
+        const word = unresolvedVariants(inner.slice(name.length + operator.length), level + 1);
+        if (word === undefined) return undefined;
+        options.push(...word);
+      }
+      if (!append(options)) return undefined;
+      i = j;
+      continue;
+    }
+    const name = SHELL_NAME.exec(reference.slice(i + 1))?.[0];
+    if (name === undefined) {
+      if (!append(['$'])) return undefined;
+      i++;
+      continue;
+    }
+    i += 1 + name.length;
+  }
+  return variants;
+}
+
+/** The registries of Docker Hub, whose images Docker keeps under their short names (`devenv-…` is local then). */
+const DOCKER_HUB_HOSTS: ReadonlySet<string> = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
+
+/**
+ * Whether a reference names a registry other than Docker Hub before its first `/`, and its first variable (`dollar`)
+ * comes after that `/` (review round 4, S4-6): such an image is never a local image of Dev Environments, whatever the
+ * variable gives (`ghcr.io/example/devenv-base:${TARGETARCH}`). A registry host has a `.` or a `:` (`localhost:5000`).
+ */
+function namedRegistry(reference: string, dollar: number): boolean {
+  const slash = reference.indexOf('/');
+  if (slash <= 0 || dollar < slash) return false;
+  const host = reference.slice(0, slash).trim().toLowerCase();
+  return /[.:]/.test(host) && !DOCKER_HUB_HOSTS.has(host);
+}
+
+/**
+ * Whether a frontend (`# syntax=`, BUILDKIT_SYNTAX) is one of the official Dockerfile frontends (review round 4, S4-4):
+ * `docker/dockerfile` or `docker/dockerfile-upstream` of Docker Hub (also written with `docker.io/`, `index.docker.io/`,
+ * or `registry-1.docker.io/`), with any tag (also the `-labs` ones) and any digest. Any other frontend is a program of
+ * its own that builds with the images of the local store, also those of other environments (D-17).
+ */
+export function isOfficialFrontend(reference: string): boolean {
+  return /^(?:(?:docker\.io|index\.docker\.io|registry-1\.docker\.io)\/)?docker\/dockerfile(?:-upstream)?(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?$/.test(
+    reference.trim(),
+  );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Paths and images of the workspace helper and of other environments
+
+/** Whether `file` is `folder`, a path in it, or a folder that contains it. */
+function overlaps(file: string, folder: string): boolean {
+  return file === folder || file.startsWith(`${folder}/`) || folder.startsWith(`${file}/`);
+}
+
+/**
+ * The folders of the kernel in the workspace helper (review round 3, S3-1): their links lead anywhere, for example
+ * `/proc/self/root/devenv-cache` to the cache volume, and the check does not resolve links of a single container.
+ */
+export const KERNEL_FOLDERS: readonly string[] = ['/proc', '/sys', '/dev'];
+
+/**
+ * A path of the workspace helper that no build context, Dockerfile, or bind mount may name, whatever the switch of the
+ * host access checks says (HostAccessClass `protected`): the root `/`; the cache volume that all environments share
+ * (HELPER_CACHE_FOLDER); the folder with the token (CONFIG_FOLDER); the Docker socket; the folders of the kernel
+ * (KERNEL_FOLDERS, review round 3, S3-1); and every path below WORKSPACES_ROOT that is not in the repository folder (the
+ * folder with the token, other folders of the volume). A folder that contains one of them counts too (for example `/var`
+ * with the socket). `file` is absolute.
+ */
+export function isHelperPath(file: string, repositoryFolder: string): boolean {
+  const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
+  if (normal === '/') return true;
+  if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET, ...KERNEL_FOLDERS].some((helperPath) => overlaps(normal, helperPath))) return true;
+  const inRepository = normal === repositoryFolder || normal.startsWith(`${repositoryFolder}/`);
+  return !inRepository && overlaps(normal, WORKSPACES_ROOT);
+}
+
+/** Review round 14 (S14-1): the reason of configFolderMountItem. */
+export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal folder are not supported";
+
+/**
+ * Review round 14 (S14-1): the target of a mount of the dev container, normalized (`.`, `..`, double and trailing
+ * slashes), when it is CONFIG_FOLDER or a path below it (on segment boundaries: `/workspaces/.devenv+x` is not);
+ * `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
+ * every file there the remote user (`find -xdev`, no paths left out): a mount there would shadow them, and would give
+ * the files of the mounted folder (for example the data of another service, or the whole repository through an alias)
+ * to the remote user. Other paths of WORKSPACES_ROOT outside the repository (for example a cache volume at
+ * `/workspaces/.cache`) are not concerned. Only absolute targets (Docker refuses others).
+ */
+export function configFolderTarget(target: string): string | undefined {
+  if (!target.startsWith('/')) return undefined;
+  const normal = path.posix.normalize(target).replace(/(.)\/+$/, '$1');
+  return normal === CONFIG_FOLDER || normal.startsWith(`${CONFIG_FOLDER}/`) ? normal : undefined;
+}
+
+/** Review round 14 (S14-1): the item of a mount at configFolderTarget `target` (class `unsupported`). */
+export function configFolderMountItem(target: string, what = 'mount at'): string {
+  return `${what} ${target} (${CONFIG_FOLDER_MOUNT_REASON})`;
+}
+
+/**
+ * An image ID in place of a name by its form alone: `sha256:<hex>`, or 64 hexadecimal characters. A shorter prefix of an
+ * ID looks like a name (for example `a1b2c3d4`, which may also be the name of an image): the pipeline asks Docker which
+ * image such a reference names (resolvedByImageId, review round 2, S2-05).
+ */
+const IMAGE_ID = /^(sha256:[0-9a-f]{1,64}|[0-9a-f]{64})$/i;
+
+/**
+ * The repository of an image reference as Docker names it locally: Docker Hub's names without the registry and
+ * without `library/` (`docker.io/library/devenv-1:2`, `index.docker.io/devenv-1`, and `devenv-1` all give `devenv-1`),
+ * others with the registry. Lower case.
+ */
+export function localImageRepository(reference: string): string {
+  const text = reference.trim();
+  const parsed = parseImageReference(text);
+  if (parsed) return isDockerHub(parsed.registry) ? parsed.repository.replace(/^library\//, '') : `${parsed.registry}/${parsed.repository}`;
+  // A reference that Docker would not accept either: read as it is written.
+  return text
+    .toLowerCase()
+    .replace(/[@].*$/, '')
+    .replace(/:[^/]*$/, '')
+    .replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '')
+    .replace(/^library\//, '');
+}
+
+/**
+ * An image reference that a configuration may not use, with its class: the image of another environment (a name of
+ * the namespace `devenv-` of Dev Environments, also written with Docker Hub's registry or `library/`, D-17), perhaps of
+ * another account: `protected`; an image ID in place of a name (it can name any local image, also one of another
+ * environment): `unsupported`. `undefined` for any other reference. `what` names it in the item.
+ */
+export function imageReferenceFinding(reference: string, what = 'image'): HostAccessFinding | undefined {
+  const text = reference.trim();
+  // Review round 6 (S6-1).
+  if (text.length > MAX_REFERENCE_LENGTH) return tooLongFinding(text, what);
+  if (IMAGE_ID.test(text)) return { item: imageIdItem(text, what), class: 'unsupported' };
+  if (/^devenv-/.test(localImageRepository(text))) return { item: `${what} ${text} of another environment`, class: 'protected' };
+  return undefined;
+}
+
+/**
+ * Whether Docker took `reference` for the ID (or a prefix of the ID) of the image that it inspected, not for its name
+ * (review round 2, S2-05): neither the tags nor the digests of the image (`RepoTags`, `RepoDigests` of
+ * `docker image inspect`) name it. Compared normalized (parseImageReference: `postgres` is
+ * `docker.io/library/postgres:latest`); a reference with a digest by its digest. `false` for a reference that is no
+ * image name (it cannot be compared).
+ */
+export function resolvedByImageId(reference: string, repoTags: readonly string[], repoDigests: readonly string[]): boolean {
+  const parsed = parseImageReference(reference);
+  if (!parsed) return false;
+  const repository = `${parsed.registry}/${parsed.repository}`;
+  const matches = (other: string, byDigest: boolean): boolean => {
+    const name = parseImageReference(other);
+    if (!name || `${name.registry}/${name.repository}` !== repository) return false;
+    return byDigest ? name.digest === parsed.digest : name.tag === parsed.tag;
+  };
+  return parsed.digest !== undefined ? !repoDigests.some((other) => matches(other, true)) : !repoTags.some((other) => matches(other, false));
+}
+
+/**
+ * Review round 9 (S9-3): of `references` (distinct), those that Docker resolves by the ID of an image, from the images
+ * that one `docker image inspect` of all of them found (`found`, each with its ID, tags, and digests), as Docker resolves
+ * a reference: by its name first (a tag, or a digest of the repository: resolvedByImageId is false for a found image),
+ * else by the ID: a prefix of the hexadecimal ID (also with `sha256:`), or a digest that is the ID. A reference that
+ * resolves to no found image is missing.
+ */
+export function imageIdResolvedReferences(
+  references: readonly string[],
+  found: ReadonlyArray<{ id: string; repoTags: readonly string[]; repoDigests: readonly string[] }>,
+): string[] {
+  const result: string[] = [];
+  for (const reference of references) {
+    if (found.some((image) => !resolvedByImageId(reference, image.repoTags, image.repoDigests))) continue;
+    const text = reference.trim().toLowerCase();
+    const hex = /^(sha256:)?([0-9a-f]+)$/.exec(text)?.[2];
+    const digest = /@(sha256:[0-9a-f]{64})$/.exec(text)?.[1];
+    const byId = found.some((image) => {
+      const id = image.id.toLowerCase();
+      return (hex !== undefined && id.startsWith(`sha256:${hex}`)) || (digest !== undefined && id === digest);
+    });
+    if (byId) result.push(reference);
+  }
+  return result;
+}
+
+/** The item of an image reference that Docker resolved by the ID of the image (resolvedByImageId): not supported. */
+export function imageIdItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (an image ID; name the image)`;
+}
+
+/**
+ * Review round 10 (P10-1): the item of an image reference that Docker could not inspect (for another reason than a
+ * missing image, for example "invalid reference format"): it cannot be told apart from an image ID, so it is not supported.
+ */
+export function imageUncheckedItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (the image reference could not be checked)`;
+}
+
+/**
+ * Review round 11 (G2): whether `reference` follows Docker's reference grammar (github.com/distribution/reference, as
+ * parseImageReference reads it: lowercase path components, the separators `.`, `_`, `__`, and `-`, a tag of at most 128
+ * characters, a digest), written without surrounding whitespace. Conservative: a reference that the grammar rejects is
+ * never accepted, whatever Docker would make of it. Review round 12 (P12-1): also the rules of go-digest for the digest
+ * (isValidDigest), and the bound of 255 characters on the normalized name (normalizedImageName), as Docker checks them.
+ */
+export function isValidImageReference(reference: string): boolean {
+  if (reference !== reference.trim() || parseImageReference(reference) === undefined) return false;
+  // Review round 12 (P12-1): what Docker checks beyond the grammar of parseImageReference (which other callers use).
+  const at = reference.indexOf('@');
+  if (at >= 0 && !isValidDigest(reference.slice(at + 1))) return false;
+  let name = at >= 0 ? reference.slice(0, at) : reference;
+  const colon = name.lastIndexOf(':');
+  if (colon > name.lastIndexOf('/')) name = name.slice(0, colon);
+  return normalizedImageName(name).length <= IMAGE_NAME_MAX_LENGTH;
+}
+
+/** Review round 12 (P12-1): the most characters of the normalized name of an image (distribution/reference). */
+const IMAGE_NAME_MAX_LENGTH = 255;
+
+/**
+ * Review round 12 (P12-1): the digest algorithms that Docker accepts (go-digest, with the lengths of their lowercase hex
+ * encodings): any other algorithm, length, or uppercase hex is refused ("unsupported digest algorithm", "invalid checksum
+ * digest length", "invalid checksum digest format").
+ */
+const DIGEST_HEX_LENGTHS: ReadonlyMap<string, number> = new Map([
+  ['sha256', 64],
+  ['sha384', 96],
+  ['sha512', 128],
+]);
+
+function isValidDigest(digest: string): boolean {
+  const colon = digest.indexOf(':');
+  const length = colon > 0 ? DIGEST_HEX_LENGTHS.get(digest.slice(0, colon)) : undefined;
+  const hex = digest.slice(colon + 1);
+  return length !== undefined && hex.length === length && /^[0-9a-f]+$/.test(hex);
+}
+
+/**
+ * Review round 12 (P12-1): the name of an image reference (without tag and digest) as Docker normalizes it before it
+ * checks its length (distribution/reference ParseNormalizedNamed): a name without a registry, or on `docker.io` or
+ * `index.docker.io`, becomes `docker.io/<path>`, with `library/` before a path of one component.
+ */
+function normalizedImageName(name: string): string {
+  const slash = name.indexOf('/');
+  let domain: string | undefined;
+  let path = name;
+  if (slash > 0) {
+    const first = name.slice(0, slash);
+    if (/[.:]/.test(first) || first === 'localhost' || first !== first.toLowerCase()) {
+      domain = first;
+      path = name.slice(slash + 1);
+    }
+  }
+  if (domain !== undefined && domain !== 'docker.io' && domain !== 'index.docker.io') return `${domain}/${path}`;
+  return `docker.io/${path.includes('/') ? path : `library/${path}`}`;
+}
+
+/** Review round 11 (G2): the item of an image reference that is not valid in Docker's grammar: not supported. */
+export function imageInvalidReferenceItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (not a valid image reference)`;
+}
+
+/** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
+export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
+  return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);
+}
+
+/**
+ * The network that a reference of a configuration names, of the networks that `docker network inspect <references>`
+ * printed (review round 2, S2-04), as Docker resolves it: its full ID, else its name, else a unique prefix of its ID.
+ * `undefined` when none matches (or the prefix is not unique).
+ */
+export function resolveNetworkReference<T extends { name: string; id: string }>(reference: string, networks: readonly T[]): T | undefined {
+  const text = reference.trim();
+  if (text === '') return undefined;
+  const byId = networks.find((network) => network.id !== '' && network.id === text);
+  if (byId) return byId;
+  const byName = networks.find((network) => network.name === text);
+  if (byName) return byName;
+  const byPrefix = networks.filter((network) => network.id !== '' && network.id.startsWith(text));
+  return new Set(byPrefix.map((network) => network.id)).size === 1 ? byPrefix[0] : undefined;
+}
+
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+
+/**
+ * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass
+ * `protected`): named like the Compose project of another environment (isOtherEnvironmentProjectName), labelled by
+ * Docker Compose for the project of another environment (`devenv-<8 hex>`), or with a container of another environment
+ * attached (label devenv.environment-id) that is not an environment of the same owner (NetworkState.sameOwnerEnvironments,
+ * review round 2, P2-2). The name rules apply to the written reference and to the name of the network that it resolves
+ * to (NetworkState.name). `environmentId`: the environment that is checked (its own project and containers); without it,
+ * every such network counts as another environment's. `undefined` for any other network.
+ */
+export function foreignNetworkItem(name: string, state: NetworkState | undefined, environmentId: string | undefined): string | undefined {
+  const project = environmentId === undefined ? '' : composeProjectName(environmentId);
+  const item = `network ${name} of another environment`;
+  if (isOtherEnvironmentProjectName(name, project)) return item;
+  if (!state) return undefined;
+  // The network that the reference names (for example by its ID): its own name counts too (S2-04).
+  if (state.name !== undefined && isOtherEnvironmentProjectName(state.name, project)) return item;
+  const owner = state.labels[COMPOSE_PROJECT_LABEL];
+  if (owner !== undefined && /^devenv-[0-9a-f]{8}$/i.test(owner) && owner !== project) return item;
+  // A container of another environment: only of the same owner may share the network (P2-2).
+  const sameOwner = state.sameOwnerEnvironments ?? [];
+  if (state.environments.some((id) => id !== environmentId && !sameOwner.includes(id))) return item;
+  return undefined;
+}
+
+/**
+ * The labels of an image that a container created from it would carry, and that Dev Environments, the Dev Container
+ * CLI, and Docker Compose use to find and set up containers: `devenv.…`, `devcontainer.…`, and `com.docker.compose.…`,
+ * except `devcontainer.metadata`, the only label that the Dev Container CLI puts on the images that it builds (CLI
+ * 0.89.0: `var EI="devcontainer.metadata"`; `devcontainer.local_folder` and `devcontainer.config_file` are labels of
+ * containers). For example `LABEL devenv.compose-service=x` in a Dockerfile would hide the container from the lookups
+ * of the extension. Refused whatever the switch says (HostAccessClass `protected`).
+ * The labels of Docker Compose (`com.docker.compose.…`) are not refused (review round 2, D2-1): Compose puts them on
+ * each image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
+ * containers that it creates; the override configuration of a single container sets them empty (COMPOSE_CLEARED_LABELS),
+ * so that such an image does not make `docker compose -p <project> down` remove the dev container.
+ */
+export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
+  return Object.keys(labels)
+    .map((key) => key.trim())
+    .filter((key) => key !== 'devcontainer.metadata' && RESERVED_LABEL.test(key))
+    .map((key) => `label ${key} of the image ${image}`);
 }
 
 /**
@@ -607,14 +1367,18 @@ function mountEntries(mounts: unknown, raw: Record<string, unknown> | undefined,
   });
 }
 
-function volumeContext(input: HostAccessInput): VolumeContext {
+function volumeContext(input: VolumeInput): VolumeContext {
   return {
     own: input.ownVolume,
     foreign: new Set(input.foreignVolumes ?? []),
     labels: input.volumeLabels ?? {},
     environment: input.environment,
+    networks: input.networks ?? {},
   };
 }
+
+/** The part of HostAccessInput that decides which named volumes a mount may use. */
+export type VolumeInput = Pick<HostAccessInput, 'ownVolume' | 'foreignVolumes' | 'volumeLabels' | 'environment' | 'networks'>;
 
 /**
  * `mounts`, `capAdd`, and `securityOpt` as the Dev Container CLI reads them from each metadata entry
@@ -644,7 +1408,7 @@ const INVALID_VARIABLE_NAME = /[\s\p{Cc}]/u;
  * `name` before the first `=`, without surrounding spaces: Docker passes a `containerEnv` key `GH_TOKEN=x` as
  * `GH_TOKEN=x=<value>`, which sets GH_TOKEN. `where` is `containerEnv`, `remoteEnv`, or `runArgs`.
  */
-function refusedVariable(name: string, where: string): Problem | undefined {
+export function refusedVariable(name: string, where: string): Problem | undefined {
   const index = name.indexOf('=');
   const variable = (index < 0 ? name : name.slice(0, index)).trim();
   if (isContainerGitVariable(variable)) return guarded(`variable ${variable} in ${where}`);
@@ -675,6 +1439,63 @@ function environmentProblems(config: Record<string, unknown>): Problem[] {
   return problems;
 }
 
+/** Review round 16 (L1): a user name or ID, optionally with a group name or ID (`containerUser` for Docker Compose). */
+const COMPOSE_USER = /^[A-Za-z0-9_][A-Za-z0-9._-]*(:[A-Za-z0-9_][A-Za-z0-9._-]*)?$/;
+/** Review round 16 (L1): the name of a variable of `containerEnv` for Docker Compose. */
+const COMPOSE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+/**
+ * Review round 16 (L1): what an `entrypoint` may not hold for Docker Compose: quotes, a backslash, `$`, and line breaks
+ * and other control characters (`\p{Cc}` holds `\n`, `\r`, `\t`, and NEL; the parser of Compose also breaks lines at
+ * U+2028 and U+2029).
+ */
+const COMPOSE_ENTRYPOINT_REFUSED = /["'\\$\p{Cc}\u2028\u2029]/u;
+/** Review round 16 (L1): a capability of `capAdd` for Docker Compose. */
+const COMPOSE_CAPABILITY = /^[A-Za-z0-9_]+$/;
+/**
+ * Review round 16 (L1): an option of `securityOpt` for Docker Compose (for example `seccomp=/etc/p.json`, `label=disable`,
+ * `no-new-privileges:true`). Not with `:` at its end: YAML would read `- <option>:` as a mapping.
+ */
+const COMPOSE_SECURITY_OPTION = /^[A-Za-z0-9_](?:[A-Za-z0-9_.:=/,+@-]*[A-Za-z0-9_.=/,+@-])?$/;
+const COMPOSE_TEXT = 'the Dev Container CLI writes it into its compose file as it is';
+
+/**
+ * Review round 16 (L1 = D16-1 = S16-1): the values of `source` (the configuration, the merged configuration, or an entry
+ * of the image metadata, substituted as the CLI substitutes it) that the Dev Container CLI 0.89.0 writes as text into
+ * the compose file that it generates for the dev service of a Docker Compose configuration (function `iW`), without
+ * escaping them: `user: <containerUser>`, the names of `containerEnv` inside `- '<name>=<value>'` (the values are
+ * escaped), each `entrypoint` (the `entrypoints` of the merged configuration) inside a double-quoted string, and each
+ * `capAdd` and `securityOpt` as `- <value>`. A value that is not a plain token could add keys to the dev service (for
+ * example `privileged: true`), or Compose would interpolate its `$`: not supported, whatever the switch says. A value
+ * that is not a text is refused too: the CLI writes it with String(), and a list of one text is that text. A single
+ * container does not need this: the CLI passes these values to `docker run` as separate arguments.
+ */
+function composeTextProblems(source: Record<string, unknown>): Problem[] {
+  const problems: Problem[] = [];
+  const user = source.containerUser;
+  if (user !== undefined && user !== null && user !== '' && !(typeof user === 'string' && COMPOSE_USER.test(user))) {
+    problems.push(unsupported(`containerUser ${JSON.stringify(user)} (${COMPOSE_TEXT}: only a user name or ID, optionally with a group, is supported)`));
+  }
+  if (isRecord(source.containerEnv)) {
+    for (const name of Object.keys(source.containerEnv)) {
+      if (COMPOSE_ENV_NAME.test(name)) continue;
+      problems.push(unsupported(`containerEnv variable ${JSON.stringify(name)} (the Dev Container CLI writes its name into its compose file as it is: only letters, digits, _, ., and - are supported)`));
+    }
+  }
+  for (const entrypoint of [...cliList(source.entrypoint), ...cliList(source.entrypoints)]) {
+    if (typeof entrypoint === 'string' && !COMPOSE_ENTRYPOINT_REFUSED.test(entrypoint)) continue;
+    problems.push(unsupported(`entrypoint ${JSON.stringify(entrypoint)} (${COMPOSE_TEXT}: quotes, backslashes, $, line breaks, and control characters are not supported)`));
+  }
+  for (const capability of cliList(source.capAdd)) {
+    if (typeof capability === 'string' && COMPOSE_CAPABILITY.test(capability)) continue;
+    problems.push(unsupported(`capability ${JSON.stringify(capability)} (${COMPOSE_TEXT}: only a plain name is supported)`));
+  }
+  for (const option of cliList(source.securityOpt)) {
+    if (typeof option === 'string' && COMPOSE_SECURITY_OPTION.test(option)) continue;
+    problems.push(unsupported(`security option ${JSON.stringify(option)} (${COMPOSE_TEXT}: only a plain option is supported)`));
+  }
+  return problems;
+}
+
 /**
  * `remote.localPortHost` other than `localhost` in the VS Code settings of a configuration (exposingLocalPortHostValues,
  * ../devContainers.ts: the window applies the settings of the container, and forwards ports on all addresses of the
@@ -692,6 +1513,8 @@ export interface MountSpec {
   /** Lower case. `undefined` when the entry names none. */
   type?: string;
   source?: string;
+  /** Review round 14 (S14-1): the target (`target`, `dst`, or `destination`). */
+  target?: string;
   /**
    * Options of the volume other than `volume-nocopy` and `volume-subpath`: `volume-driver` and `volume-opt` (a "volume"
    * that can be a folder of the computer) and `volume-label` (labels of a volume that the mount creates, for example the
@@ -754,6 +1577,7 @@ export function parseMountString(spec: string): MountSpec {
     const value = index < 0 ? '' : field.slice(index + 1).trim();
     if (key === 'type') mount.type = value.toLowerCase();
     else if (key === 'source' || key === 'src') mount.source = value;
+    else if (key === 'target' || key === 'dst' || key === 'destination') mount.target = value;
     else if (key.startsWith('volume-') && key !== 'volume-nocopy' && key !== 'volume-subpath') {
       mount.volumeOptions = true;
       if (key !== 'volume-driver' && key !== 'volume-opt') mount.otherVolumeOptions = true;
@@ -814,6 +1638,8 @@ interface VolumeContext {
   labels: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** HostAccessInput.environment. */
   environment: { id: string; ownerId?: string } | undefined;
+  /** HostAccessInput.networks. */
+  networks: Readonly<Record<string, NetworkState>>;
 }
 
 /** The type of a mount: without a type, a path is a bind mount and a name a volume (Docker's default of --mount). */
@@ -833,7 +1659,19 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
   if (mount.unreadable !== undefined) return [guarded(`mount ${JSON.stringify(mount.unreadable)}`)];
   const source = mount.source ?? '';
   const type = mountType(mount);
-  if (type === 'tmpfs') return [];
+  // Review round 14 (S14-1): whatever the type, and whatever the switch says.
+  const internal = targetProblems(mount.target);
+  if (type === 'tmpfs') return internal;
+  return [...internal, ...mountTypeProblems(mount, type, source, volumes)];
+}
+
+/** Review round 14 (S14-1): a mount target in the extension's internal folder (configFolderTarget). */
+function targetProblems(target: string | undefined): Problem[] {
+  const internal = target === undefined ? undefined : configFolderTarget(target);
+  return internal === undefined ? [] : [unsupported(configFolderMountItem(internal))];
+}
+
+function mountTypeProblems(mount: MountSpec, type: string, source: string, volumes: VolumeContext): Problem[] {
   if (type === 'bind' || (type === 'volume' && isPathSource(source))) return [access(source ? `bind mount ${shownBindSource(source)}` : 'bind mount')];
   if (type === 'npipe') return [access(`mount of the type ${type}`)];
   if (type !== 'volume') return [guarded(`mount of the type ${type}`)];
@@ -843,6 +1681,114 @@ function mountProblems(mount: MountSpec, volumes: VolumeContext): Problem[] {
     options.push(mount.otherVolumeOptions ? guarded(item) : access(item));
   }
   return [...options, ...volumeNameProblems(source, volumes)];
+}
+
+/**
+ * Review round 15 (K1, K2): the keys of a `mounts` text that the Dev Container CLI 0.89.0 renames (table `cj` of its
+ * function `lQ`); every other key keeps its spelling.
+ */
+const CLI_MOUNT_KEYS: ReadonlyMap<string, string> = new Map([
+  ['src', 'source'],
+  ['destination', 'target'],
+  ['dst', 'target'],
+]);
+
+/** The properties of a mount that the CLI writes into its compose file (function `nW`) or that decide how (`type`). */
+const CLI_MOUNT_PROPERTIES: ReadonlySet<string> = new Set(['source', 'target', 'type']);
+
+/**
+ * The variable that the CLI resolves in `mounts` before it writes the compose file (`${devcontainerId}`, a number in
+ * base 32), and what the characters of the text are checked with in its place.
+ */
+const CLI_RESOLVED_VARIABLE = /\$\{devcontainerId\}/g;
+const CLI_RESOLVED_PLACEHOLDER = '0'.repeat(52);
+
+/** A first character that YAML reads as an indicator in a plain scalar (a list item `- <text>` or a key `<text>:`). */
+const YAML_INDICATOR = /^[-?:,[\]{}#&*!|>'"%@`]/;
+
+/** Characters that change what Compose reads from `- <source>:<target>` (besides the indicators and `$`). */
+const COMPOSE_SHORT_SYNTAX_SPECIAL = /[\s"'`#:]/;
+
+/**
+ * Review round 15 (K1, K2): a `mounts` entry as the Dev Container CLI 0.89.0 reads it for Docker Compose (function `iW`
+ * with `lQ`): a text is split at `,` and each field at `=` (only the part before a second `=` is the value), the keys
+ * are case-sensitive, and only `src`, `dst`, and `destination` are renamed; an object is taken as it is. `undefined` when
+ * the text does not round-trip safely: a field of `source`, `target`, or `type` (also a variant by case or space, for
+ * example `SRC` or ` src`, which the CLI keeps under that key) that is not `<key>=<value>` with exactly one `=`, a
+ * variant, or such a property twice. Fields of other options (for example `readonly`) are not written by the CLI.
+ */
+function cliComposeMount(entry: unknown): { type: unknown; source: unknown; target: unknown } | undefined {
+  if (isRecord(entry)) return { type: entry.type, source: entry.source, target: entry.target };
+  if (typeof entry !== 'string') return undefined;
+  const read: Record<string, string> = {};
+  for (const field of entry.split(',')) {
+    const parts = field.split('=');
+    const key = parts[0];
+    const normal = key.trim().toLowerCase();
+    if (!CLI_MOUNT_KEYS.has(normal) && !CLI_MOUNT_PROPERTIES.has(normal)) continue;
+    const property = CLI_MOUNT_KEYS.get(key) ?? key;
+    if (!CLI_MOUNT_PROPERTIES.has(property) || parts.length !== 2 || Object.prototype.hasOwnProperty.call(read, property)) return undefined;
+    read[property] = parts[1];
+  }
+  return { type: read.type, source: read.source, target: read.target };
+}
+
+/** Review round 15 (K1, K2): the item of a mount that the CLI writes otherwise than the policy reads it. */
+function cliRewrittenMountItem(entry: unknown): Problem {
+  return unsupported(`mount ${JSON.stringify(entry)} is written differently by the Dev Container CLI and is not supported`);
+}
+
+/** Whether `text` (a source or a target after `${devcontainerId}`) is written by the CLI so that Compose reads it back. */
+function roundTrips(text: string): boolean {
+  return !text.includes('$') && !COMPOSE_SHORT_SYNTAX_SPECIAL.test(text) && !YAML_INDICATOR.test(text);
+}
+
+/**
+ * Review round 15 (K1 = S15-1, K2 = S15-2): a `mounts` entry of a Docker Compose configuration as it reaches the dev
+ * container. The Dev Container CLI 0.89.0 reads it with its own parser (cliComposeMount) and writes it unquoted as the
+ * list item `- <source>:<target>` (function `nW`, the type is dropped) into the `volumes` of the dev service of the
+ * compose file that it generates, which Compose reads (and interpolates) in the short syntax. mountProblems checks the
+ * entry as `docker run --mount` would read it; this checks the CLI's reading:
+ * - not supported (whatever the switch says), when it does not round-trip safely: a text that the CLI cannot read as
+ *   Docker does (cliComposeMount), a source, target, or type that is no text, any difference from Docker's reading
+ *   (parseMountEntry) in source, target, or type (also by case), `$` (Compose interpolation; `${devcontainerId}` is
+ *   resolved by the CLI before), white space, quotes, `#`, `:`, or a leading YAML indicator in the source or the target,
+ *   a target that is not absolute, and a source of a mount whose type is not `volume` (a path of any type is a bind
+ *   mount below; a name with another type would not be a declared volume, and a tmpfs mount with a source is a bind
+ *   mount in Compose);
+ * - a path source (isPathSource): Compose mounts it as a bind mount (access to the computer, like other bind mounts);
+ * - a name: a named volume, with the rules of volumeNameProblems;
+ * - no source: an anonymous volume (also for `tmpfs`, which the CLI writes without its type);
+ * - the target, as the dev service's mounts (decideServiceMount): not at or below CONFIG_FOLDER (configFolderTarget),
+ *   and not at WORKSPACES_ROOT, where the workspace volume is mounted.
+ * A text that Docker cannot read is refused by mountProblems already.
+ */
+function composeCliMountProblems(entry: unknown, volumes: VolumeContext): Problem[] {
+  const docker = parseMountEntry(entry);
+  if (docker.unreadable !== undefined) return [];
+  const cli = cliComposeMount(entry);
+  if (cli === undefined) return [cliRewrittenMountItem(entry)];
+  const { type, source, target } = cli;
+  if ((type !== undefined && typeof type !== 'string') || (source && typeof source !== 'string') || typeof target !== 'string') {
+    return [cliRewrittenMountItem(entry)];
+  }
+  const cliSource = typeof source === 'string' ? source : '';
+  if (type !== docker.type || cliSource !== (docker.source ?? '') || target !== docker.target) return [cliRewrittenMountItem(entry)];
+  const writtenSource = cliSource.replace(CLI_RESOLVED_VARIABLE, CLI_RESOLVED_PLACEHOLDER);
+  const writtenTarget = target.replace(CLI_RESOLVED_VARIABLE, CLI_RESOLVED_PLACEHOLDER);
+  if (!writtenTarget.startsWith('/') || !roundTrips(writtenTarget) || (writtenSource !== '' && !roundTrips(writtenSource))) {
+    return [cliRewrittenMountItem(entry)];
+  }
+  const problems: Problem[] = [...targetProblems(writtenTarget)];
+  const normal = path.posix.normalize(writtenTarget).replace(/(.)\/+$/, '$1');
+  if (normal === WORKSPACES_ROOT) problems.push(unsupported(`mount at ${WORKSPACES_ROOT}`));
+  if (writtenSource === '') return problems;
+  if (isPathSource(writtenSource)) {
+    if (type !== undefined && type !== 'bind' && type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
+    return [...problems, access(`bind mount ${shownBindSource(cliSource)}`)];
+  }
+  if (type !== 'volume') return [...problems, cliRewrittenMountItem(entry)];
+  return [...problems, ...volumeNameProblems(cliSource, volumes)];
 }
 
 /**
@@ -916,6 +1862,15 @@ export function mountedVolumeNames(original: HostAccessInput): string[] {
 const ANONYMOUS_VOLUME_NAME = /^[0-9a-f]{64}$/;
 
 /**
+ * Review round 13 (D13-3): whether `name` is Docker's name of an anonymous volume (64 hexadecimal characters). The host
+ * access policy refuses a configuration that names such a volume (foreignVolumeName: "another container"), so with the
+ * checks on, a volume mount of the dev container with such a name is an anonymous volume of the dev container itself.
+ */
+export function isAnonymousVolumeName(name: string): boolean {
+  return ANONYMOUS_VOLUME_NAME.test(name);
+}
+
+/**
  * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
  * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume
@@ -951,13 +1906,15 @@ export function isOwnVolume(labels: Readonly<Record<string, string>>, environmen
  */
 export function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
   const keys = Object.keys(labels);
+  // Before the labels of Docker Compose: a volume of the Compose project of an environment carries both (whether it is
+  // the environment's own is decided by isOwnVolume first everywhere).
+  if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   if (keys.some((key) => key.startsWith('com.docker.compose.'))) {
     const project = labels['com.docker.compose.project'];
     return project ? `the Docker Compose project ${project}` : 'Docker Compose';
   }
   if (hasDevContainersVolumeLabel(labels)) return 'the Dev Containers extension';
   if (keys.includes('com.docker.volume.anonymous')) return 'another container';
-  if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   return undefined;
 }
 
@@ -1027,6 +1984,25 @@ function volumeNameProblems(name: string, volumes: VolumeContext): Problem[] {
 }
 
 /**
+ * The items of a named volume that belongs to something else (the rules of `mounts`: the workspace helper, another
+ * environment, the Dev Containers extension, or another program, by the name and the labels of the volume), for the
+ * volumes of a Docker Compose configuration (composeAccess.ts). Empty for the workspace volume and a volume that may be
+ * used.
+ */
+export function volumeNameItems(name: string, input: VolumeInput): string[] {
+  return volumeNameFindings(name, input).map((finding) => finding.item);
+}
+
+/**
+ * volumeNameItems with the class of each item (HostAccessClass), for the switch of the host access checks in the Docker
+ * Compose policy: a volume of another environment or of the workspace helper stays refused (`protected`), a volume of
+ * another program is access to the computer (`computer`), as for the `mounts` of a single container.
+ */
+export function volumeNameFindings(name: string, input: VolumeInput): HostAccessFinding[] {
+  return volumeNameProblems(name, volumeContext(input)).map((problem) => ({ item: problem.item, class: problem.class }));
+}
+
+/**
  * Source of a `-v`/`--volume` value `source:target[:options]`; `undefined` for an anonymous volume (only a target).
  * A colon of a Windows drive letter does not end the source.
  */
@@ -1036,14 +2012,35 @@ export function volumeFlagSource(spec: string): string | undefined {
   return index > 0 ? spec.slice(0, index) : undefined;
 }
 
+/**
+ * Review round 14 (S14-1): the target of a `-v`/`--volume` value `source:target[:options]` (after volumeFlagSource, the
+ * text up to the next colon), or `target[:options]` of an anonymous volume: without a colon, the value; when the text
+ * after the first colon is no absolute path (for example `/data:ro`), the text before it, as Docker reads it.
+ */
+export function volumeFlagTarget(spec: string): string {
+  const source = volumeFlagSource(spec);
+  if (source === undefined) return spec;
+  const rest = spec.slice(source.length + 1);
+  const index = rest.indexOf(':');
+  const target = index >= 0 ? rest.slice(0, index) : rest;
+  return target.startsWith('/') ? target : source;
+}
+
 function volumeFlagProblems(value: string, volumes: VolumeContext): Problem[] {
   // As in mountEntryProblems: a variable that is left makes the volume or the target unknown, also of a bind mount.
   const left = unresolvedCliVariables(value);
   if (left.length > 0) return [unsupported(`volume ${JSON.stringify(value)} uses ${listedVariables(left)}, which cannot be checked`)];
+  const internal = targetProblems(volumeFlagTarget(value));
   const source = volumeFlagSource(value);
-  if (source === undefined) return [];
-  if (isPathSource(source)) return [access(`bind mount ${shownBindSource(source)}`)];
-  return volumeNameProblems(source, volumes);
+  if (source === undefined) return internal;
+  if (isPathSource(source)) return [...internal, access(`bind mount ${shownBindSource(source)}`)];
+  return [...internal, ...volumeNameProblems(source, volumes)];
+}
+
+/** Review round 14 (S14-1): `--tmpfs <target>[:options]`. */
+function tmpfsFlagProblems(value: string): Problem[] {
+  const index = value.indexOf(':');
+  return targetProblems(index >= 0 ? value.slice(0, index) : value);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1074,24 +2071,80 @@ function networkNames(value: string): string[] | undefined {
  * `key=value` pair, it reads the text as CSV with each field in lower case, and the last `name` is the network. Each
  * `name` is checked; a text that Docker would read otherwise (csvFields) is not supported.
  */
-function networkProblems(value: string): Problem[] {
+function networkProblems(value: string, volumes?: VolumeContext): Problem[] {
   const networks = networkNames(value);
   if (!networks) return [unsupported(`network ${JSON.stringify(value)}`)];
   const joined = networks.some((network) => /^container:/i.test(network.trim()));
-  return joined ? [access(`network of another container (${value.trim()})`)] : [];
+  if (joined) return [access(`network of another container (${value.trim()})`)];
+  // The network of another environment (its Compose project, perhaps of another account): account separation.
+  const foreign: Problem[] = [];
+  for (const network of networks.map((name) => name.trim())) {
+    const item = foreignNetworkItem(network, volumes?.networks[network], volumes?.environment?.id);
+    if (item !== undefined) foreign.push(guarded(item));
+  }
+  return foreign;
 }
 
-function capabilityProblems(values: readonly unknown[]): string[] {
+/**
+ * The networks that `runArgs` names (`--network`/`--net`, also the long form `name=…`), other than the modes of Docker
+ * (`host`, `none`, `bridge`, `default`, `container:…`): the networks whose labels and containers the check reads.
+ */
+export function runArgsNetworks(runArgs: unknown): string[] {
+  if (!Array.isArray(runArgs)) return [];
+  const names = new Set<string>();
+  for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
+    if ((flag.name !== '--network' && flag.name !== '--net') || flag.value === undefined) continue;
+    for (const name of networkNames(flag.value) ?? []) {
+      const network = name.trim();
+      if (network !== '' && !isDockerNetworkMode(network)) names.add(network);
+    }
+  }
+  return [...names];
+}
+
+/** The network modes of Docker that name no network of their own. */
+export function isDockerNetworkMode(name: string): boolean {
+  return /^(host|none|bridge|default)$/i.test(name) || /^(container|service):/i.test(name);
+}
+
+/**
+ * Review round 22 (H22-3): the capabilities that Docker gives every container (its default set), which a hardened
+ * configuration adds again after `cap_drop: [ALL]`, and SYS_PTRACE (for debuggers).
+ */
+const ALLOWED_CAPABILITIES: ReadonlySet<string> = new Set([
+  'CHOWN',
+  'DAC_OVERRIDE',
+  'FOWNER',
+  'FSETID',
+  'KILL',
+  'SETGID',
+  'SETUID',
+  'SETPCAP',
+  'NET_BIND_SERVICE',
+  'NET_RAW',
+  'SYS_CHROOT',
+  'MKNOD',
+  'AUDIT_WRITE',
+  'SETFCAP',
+  'SYS_PTRACE',
+]);
+
+/**
+ * `capAdd`, `--cap-add`, and `cap_add`: every capability except ALLOWED_CAPABILITIES (with or without `CAP_`, in any
+ * case); `ALL` too.
+ */
+export function capabilityProblems(values: readonly unknown[]): string[] {
   const items: string[] = [];
   for (const value of values) {
     const name = String(value).trim();
-    if (/^(CAP_)?SYS_PTRACE$/i.test(name)) continue;
+    if (ALLOWED_CAPABILITIES.has(name.toUpperCase().replace(/^CAP_/, ''))) continue;
     items.push(`capability ${name}`);
   }
   return items;
 }
 
-function securityOptionProblems(values: readonly unknown[]): string[] {
+/** `securityOpt`, `--security-opt`, and `security_opt`: every option except seccomp=unconfined and no-new-privileges. */
+export function securityOptionProblems(values: readonly unknown[]): string[] {
   const items: string[] = [];
   for (const value of values) {
     const option = String(value).trim();
@@ -1178,7 +2231,9 @@ export function loopbackAppPorts(appPort: unknown): string[] | undefined {
 // Values of flags of `docker run`
 
 /** Label keys of Dev Environments (`devenv.`) and of the Dev Container CLI and the Dev Containers extension (`devcontainer.`). */
-const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
+export const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
+/** Label keys of Docker Compose, which finds the containers, networks, and volumes of a project by them. */
+export const RESERVED_COMPOSE_LABEL = /^com\.docker\.compose\./i;
 
 /**
  * The labels that the override configuration adds to runArgs itself, with their values. The merged configuration of an
@@ -1197,7 +2252,8 @@ function labelProblems(value: string): Problem[] {
   if (OWN_LABELS.includes(value)) return [];
   const index = value.indexOf('=');
   const key = (index < 0 ? value : value.slice(0, index)).trim();
-  return RESERVED_LABEL.test(key) ? [unsupported(`label ${key}`)] : [];
+  // Docker Compose too: a label com.docker.compose.project would make Delete of that project remove the container.
+  return RESERVED_LABEL.test(key) || RESERVED_COMPOSE_LABEL.test(key) ? [unsupported(`label ${key}`)] : [];
 }
 
 /**
@@ -1249,8 +2305,11 @@ function stopTimeoutProblems(value: string): Problem[] {
  * Docker, without a window and outside the Session Monitor (concept 7.9).
  */
 function restartProblems(value: string): Problem[] {
-  return /^(no|on-failure(:\d+)?)$/.test(value) ? [] : [unsupported(`--restart=${value}`)];
+  return RESTART_POLICY.test(value) ? [] : [unsupported(`--restart=${value}`)];
 }
+
+/** The restart policies that may be used (restartProblems): `no` and `on-failure[:<count>]`. */
+export const RESTART_POLICY = /^(no|on-failure(:\d+)?)$/;
 
 /**
  * `--oom-score-adj`: 0 or more, in decimal digits. A negative value makes the kernel end other processes of the
@@ -1265,7 +2324,7 @@ function oomScoreProblems(value: string): Problem[] {
  * Log drivers that keep the log in files of the container, or keep none. Other drivers write to a socket or the journal
  * of the computer (syslog, journald, fluentd), or use credentials of Docker (awslogs, gcplogs).
  */
-const LOG_DRIVERS: readonly string[] = ['json-file', 'local', 'none'];
+export const LOG_DRIVERS: readonly string[] = ['json-file', 'local', 'none'];
 
 function logDriverProblems(value: string): string[] {
   return LOG_DRIVERS.includes(value.toLowerCase()) ? [] : [`--log-driver=${value}`];
@@ -1275,7 +2334,7 @@ function logDriverProblems(value: string): string[] {
  * Keys of `--log-opt`: the size and the rotation of the log files, the mode, and what an entry contains. The options of
  * other drivers name sockets, files, or servers, and apply when Docker uses such a driver by default.
  */
-const LOG_OPTIONS: readonly string[] = [
+export const LOG_OPTIONS: readonly string[] = [
   'max-size',
   'max-file',
   'compress',
@@ -1323,6 +2382,11 @@ function ruleOf(name: string, rules: Readonly<Record<string, FlagRule>>): FlagRu
 
 function takesValue(rule: FlagRule): boolean {
   return rule.kind === 'check' || rule.value;
+}
+
+/** A rule whose value is checked: `check`, or `remove` with a check (review round 8, S8-6). */
+function checksValue(rule: FlagRule): boolean {
+  return rule.kind === 'check' || (rule.kind === 'remove' && rule.check !== undefined);
 }
 
 /**
@@ -1397,7 +2461,8 @@ function flagProblems(flag: ParsedFlag, label: (text: string) => string): Proble
   if (flag.name === undefined) return [unsupported(label(`argument ${flag.raw}`))];
   const rule = flag.rule;
   if (!rule) return [unsupported(label(flag.name.startsWith('--') ? flag.name : flag.raw))];
-  if (rule.kind === 'allow' || rule.kind === 'remove') return [];
+  if (rule.kind === 'allow') return [];
+  if (rule.kind === 'remove') return rule.check !== undefined ? rule.check(flag.value ?? '') : [];
   if (rule.kind === 'refuse') {
     const refused = rule.guarded ? guarded : access;
     if (rule.item) return [refused(rule.item)];
@@ -1420,19 +2485,39 @@ export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, 
   return uniqueItems(left.length > 0 ? left : runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
 }
 
-function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext): Problem[] {
+/** The label devenv.config-path of the override configuration, with a configuration path (review round 4, D4-2). */
+function isOwnConfigPathLabel(value: string): boolean {
+  const prefix = `${LABEL_CONFIG_PATH}=`;
+  return value.startsWith(prefix) && isConfigPathLabelValue(value.slice(prefix.length));
+}
+
+/**
+ * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
+ * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, and the label devenv.config-path
+ * of the override configuration (review round 4, D4-2).
+ */
+function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
   const problems: Problem[] = [];
   for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     const rule = flag.rule;
     // At the end, without its value, the flag would take the next argument that the extension or the CLI adds.
     const last = flag.index === runArgs.length - 1 && flag.value === undefined;
-    if (last && rule !== undefined && (rule.kind === 'allow' || rule.kind === 'check') && takesValue(rule)) {
+    if (last && rule !== undefined && (rule.kind === 'allow' || checksValue(rule)) && takesValue(rule)) {
       problems.push(unsupported(`${flag.raw} without a value`));
+    } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && COMPOSE_CLEARED_LABELS.includes(flag.value)) {
+      continue;
+    } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && isOwnConfigPathLabel(flag.value)) {
+      // Review round 4 (D4-2): the label devenv.config-path that the override configuration adds.
+      continue;
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));
     } else if (flag.name === '--mount') {
       // The text that Docker gets (its variables: as in mountEntries for the configuration).
       problems.push(...mountEntryProblems(flag.value ?? '', unresolvedCliVariables(flag.value ?? ''), volumes));
+    } else if (flag.name === '--tmpfs' && flag.value !== undefined) {
+      problems.push(...tmpfsFlagProblems(flag.value));
+    } else if (flag.name === '--network' || flag.name === '--net') {
+      problems.push(...networkProblems(flag.value ?? '', volumes));
     } else {
       problems.push(...flagProblems(flag, (text) => text));
     }
@@ -1454,12 +2539,111 @@ function buildOptionFindings(options: readonly unknown[]): Problem[] {
   return problems;
 }
 
-/** `--build-context name=value`: an image or a URL is allowed, a folder of the computer is not. */
-function buildContextProblems(value: string): string[] {
+/**
+ * `--build-context name=value`: an image or a URL is allowed, a folder of the computer is not; the image of another
+ * environment or an image ID stays refused (imageReferenceFinding). The build client reads a folder (also of
+ * `oci-layout://`) in the workspace helper (review round 2, S2-03): a path of the workspace helper (isHelperPath; the
+ * workspace volume holds only the repository besides the folder with the token) or a relative path (resolved against
+ * the working folder of the build in the helper, which the check does not know) stays refused whatever the switch says.
+ */
+function buildContextProblems(value: string): Problem[] {
   const index = value.indexOf('=');
   const source = index < 0 ? value : value.slice(index + 1);
-  if (/^(docker-image|https?):\/\//i.test(source)) return [];
-  return [`build option --build-context=${value}`];
+  const image = /^docker-image:\/\/(.*)$/i.exec(source.trim());
+  if (image) {
+    const finding = imageReferenceFinding(image[1], 'build option --build-context image');
+    return finding ? [finding] : [];
+  }
+  if (/^https?:\/\//i.test(source)) return [];
+  const item = `build option --build-context=${value}`;
+  const folder = localContextPath(source);
+  if (folder === undefined) return [access(item)];
+  if (!folder.startsWith('/')) return [guarded(item)];
+  if (isHelperPath(folder, WORKSPACES_ROOT)) return [guarded(item)];
+  return [access(item)];
+}
+
+/**
+ * A file or folder of `build.options` that the build client reads or writes in the workspace helper (review round 3,
+ * S3-6, the rule of the Compose build files, review round 2, S2-03): a path of the workspace helper (isHelperPath) or a
+ * relative path (resolved against the working folder of the build in the helper, which the check does not know) stays
+ * refused whatever the switch says. Otherwise nothing: the rule of the option itself decides (the class `computer`).
+ */
+function buildFileProblems(item: string, file: string): Problem[] {
+  if (!file.startsWith('/')) return [guarded(`${item} (a relative path)`)];
+  if (isHelperPath(file, WORKSPACES_ROOT)) return [guarded(item)];
+  return [];
+}
+
+/** The `key=value` fields of a value of `docker build` (CSV, as buildx reads them), by lower-case key. */
+function optionFields(value: string): Map<string, string> {
+  const fields = new Map<string, string>();
+  for (const field of csvFields(value) ?? value.split(',')) {
+    const equals = field.indexOf('=');
+    if (equals > 0) fields.set(field.slice(0, equals).trim().toLowerCase(), field.slice(equals + 1).trim());
+  }
+  return fields;
+}
+
+/**
+ * `--secret id=…[,src=<file>|,env=<variable>]`: without `src`/`source` and `env` (and not of `type=env`), buildx reads
+ * the variable of the name `id` of the helper, or else the file `id`.
+ */
+function buildSecretOptionProblems(value: string): Problem[] {
+  const fields = optionFields(value);
+  const file = fields.get('src') ?? fields.get('source') ?? (fields.has('env') || fields.get('type') === 'env' ? undefined : fields.get('id'));
+  return [access('build option --secret'), ...(file === undefined || file === '' ? [] : buildFileProblems(`build option --secret ${value}`, file))];
+}
+
+/** `--ssh default|<id>[=<socket>|<key>[,<key>]]`: the files after `=`. */
+function buildSshOptionProblems(value: string): Problem[] {
+  const equals = value.indexOf('=');
+  const files = equals < 0 ? [] : value.slice(equals + 1).split(',').map((file) => file.trim()).filter((file) => file !== '');
+  return [access('build option --ssh'), ...files.flatMap((file) => buildFileProblems(`build option --ssh ${value}`, file))];
+}
+
+/**
+ * `--build-arg NAME` without a value (review round 4, S4-1): buildx takes the value of the variable NAME of the workspace
+ * helper, and drops the argument when the helper has none, so the value of `build.args` or the default of the ARG
+ * applies. Which one the build gets cannot be told here: refused.
+ */
+function buildArgOptionProblems(value: string): Problem[] {
+  if (value.includes('=')) return [];
+  return [
+    unsupported(
+      `build option --build-arg ${value} without a value (the value would come from the environment of the workspace helper, or the argument would be dropped, so Dev Environments cannot check it)`,
+    ),
+  ];
+}
+
+/**
+ * `--output`/`-o` `type=…,dest=<path>`, or `<path>` alone (a local export); `-` is the standard output. Review round 4
+ * (S4-5): read as buildx reads it: a value whose CSV fields are one field that does not start with `type=` is the
+ * destination as a whole (also with `=` in it); otherwise the field `dest=`.
+ */
+function buildOutputOptionProblems(name: string, value: string): Problem[] {
+  const fields = csvFields(value) ?? value.split(',');
+  const dest = fields.length === 1 && !fields[0].startsWith('type=') ? value.trim() : optionFields(value).get('dest');
+  return [access(`build option ${name}`), ...(dest === undefined || dest === '' || dest === '-' ? [] : buildFileProblems(`build option ${name} ${value}`, dest))];
+}
+
+/**
+ * The folder of a local build context (`--build-context`, `additional_contexts`): the path itself, or the path of an
+ * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` for other kinds of source (for example `service:…` of
+ * Docker Compose, or another scheme).
+ */
+export function localContextPath(source: string): string | undefined {
+  const text = source.trim();
+  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
+  if (oci) {
+    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
+    const last = folder.lastIndexOf('/');
+    const colon = folder.indexOf(':', last + 1);
+    if (colon >= 0) folder = folder.slice(0, colon);
+    return folder;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text)) return undefined;
+  return text;
 }
 
 /**
@@ -1546,8 +2730,9 @@ export function withoutNameArgs(runArgs: readonly string[]): string[] {
 /**
  * The flags of `runArgs` that the override configuration does not pass to Docker (overrideRunArgs), in order, for the
  * log: `--name` (the extension adds the name of the environment), `--rm` (the extension stops, starts, and recreates
- * the container itself), and `-i`, `-t`, and `-d`, also in a group such as `-it`: with the arguments of the Dev
- * Container CLI, they do nothing or make the start fail.
+ * the container itself), `--restart` (review round 8, S8-6: Docker would start the container again when Docker
+ * starts, outside the Session Monitor), and `-i`, `-t`, and `-d`, also in a group such as `-it`: with the arguments of
+ * the Dev Container CLI, they do nothing or make the start fail.
  */
 export function removedRunArgs(runArgs: readonly string[]): RemovedRunArg[] {
   return [...removals(runArgs)].map(([index, flags]) => {

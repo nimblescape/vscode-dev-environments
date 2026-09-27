@@ -29,6 +29,42 @@ export interface BuildRecord {
   images: Record<string, string>;
   /** Feature reference as written in the configuration → digest read right before the build. */
   features: Record<string, string>;
+  /**
+   * A Docker Compose configuration (implementation notes, section "Docker Compose"): the dev service, and the images
+   * that Compose and the Dev Container CLI built for the project (builtServiceImages), which Delete removes. The
+   * environment image is the image of the dev service.
+   */
+  compose?: ComposeBuildRecord;
+}
+
+/** BuildRecord.compose. */
+export interface ComposeBuildRecord {
+  /** `service` of devcontainer.json: the dev service. */
+  service: string;
+  /** `devenv-<short id>-<service>` of each service that Compose builds. */
+  images: string[];
+  /**
+   * The `image` references of the other services that are not built (for example `postgres:16`), as the image check
+   * names them in `images` of the build record (review round 1, D5). They are images of the user, pulled for the
+   * services, not base images of the environment image: removeUnusedBaseImages never removes them. A record without it
+   * (written before) removes no base images.
+   */
+  serviceImages?: string[];
+  /**
+   * Review round 1 (P-4): the version of the Compose plugin that printed the model of `configHash`, and composeInputsHash
+   * of the files as written. A new Compose version can print the same files as another model: with equal files, a
+   * different model counts as a change only with the same version (composeConfigurationChange).
+   */
+  version?: string;
+  inputsHash?: string;
+  /**
+   * Review round 9 (D9-1): the paths of the repository (absolute, for example `/workspaces/api/data/postgres`) that the
+   * other services mount from the workspace volume (composeUpModel's `serviceFolders`), as the last `up` used them. They
+   * may hold the data of those services with their own owner: the ownership fixes after `up` and of Switch branch… leave
+   * them out, and the question of Delete names them. A record without it (written before) leaves nothing out.
+   * Review round 10 (D10-1): no longer written; Environment.serviceFolders holds them. Still read (serviceFoldersOf).
+   */
+  serviceFolders?: string[];
 }
 
 export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';
@@ -73,6 +109,32 @@ export interface Environment {
   shutdownActionNone?: boolean;
   /** Named volumes of the configuration (`mounts` with `type=volume`), without the workspace volume. */
   additionalVolumes?: string[];
+  /**
+   * Docker Compose (review round 1, D1): the named volumes that services other than the dev service mounted, recorded at
+   * each open from the checked model (composeServiceVolumeNames) and kept once recorded. Delete lists these volumes as
+   * data of the services (none ticked), whatever their label devenv.volume, also when the configuration cannot be read.
+   */
+  serviceVolumes?: string[];
+  /**
+   * Review round 10 (D10-1): the paths of the repository (absolute, for example `/workspaces/api/data/postgres`) that the
+   * containers of the other services of Docker Compose may mount from the workspace volume (composeUpModel's
+   * `serviceFolders`), written before each `up`, also before the first build record. The list does not shrink while such
+   * a container may still mount a path of it: an `up` adds the paths of its model; only an `up` before which no
+   * container of another service exists (all of them were removed) replaces it. The ownership fixes after `up` and of
+   * Switch branch… leave the data of the services there alone, and the question of Delete names them.
+   * Review round 11 (G3, G4, G5): the record of the list that the pipeline computes from facts at each `up`
+   * (boundServiceFolders): the paths of the model, the paths that the existing containers of the other services mount
+   * (their volume subpaths), and the recorded paths of earlier models while they still exist in the volume; at most
+   * MAX_SERVICE_FOLDERS. Before an `up` it only grows (a failed `up` leaves the containers of the earlier models); after
+   * it, a path that no model, no container, and no file names any more is dropped. reconcileFromVolumes fills it from
+   * the mounts of the containers that it finds.
+   */
+  serviceFolders?: string[];
+  /**
+   * Review round 11 (G5): the list had more than MAX_SERVICE_FOLDERS paths, so not all are recorded: the ownership fixes
+   * leave the whole repository to the services (only the files of root get their owner). It stays set.
+   */
+  serviceFoldersOverflow?: boolean;
   /** Highest build number used so far for this environment. */
   lastBuildNumber?: number;
   /**
@@ -114,6 +176,11 @@ export interface RefusedUpdate {
    * is tried again with the other.
    */
   hostAccessChecks?: 'off';
+  /**
+   * Review round 10 (P10-3): `size` when the check of the new image failed for a size limit (AnalysisFailure `size`, for
+   * example an oversized devcontainer.metadata label), not for the policy (Messages.updateTooLarge); absent otherwise.
+   */
+  reason?: 'size';
 }
 
 /**
@@ -312,6 +379,8 @@ export interface DevcontainerResult {
   message?: string;
   description?: string;
   containerId?: string;
+  /** `devcontainer up` of a Docker Compose configuration: the project name that the CLI used. */
+  composeProjectName?: string;
   imageName?: string | string[];
   remoteUser?: string;
   remoteWorkspaceFolder?: string;
@@ -335,6 +404,10 @@ export interface DevcontainerConfig {
   /** Deprecated form of `build.dockerfile`. */
   dockerFile?: string;
   dockerComposeFile?: string | string[];
+  /** Docker Compose: the dev service. */
+  service?: string;
+  /** Docker Compose: the services that `up` starts besides the dev service (default: all). */
+  runServices?: string[];
   features?: Record<string, unknown>;
   runArgs?: string[];
   appPort?: number | string | Array<number | string>;

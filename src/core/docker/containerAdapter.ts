@@ -10,9 +10,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
+import { IMAGE_INSPECT_BATCH, MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID } from '../names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import {
+  abortError,
   isAbortError,
   systemClock,
   type Clock,
@@ -37,11 +39,55 @@ export interface ContainerInfo {
   image: string;
   /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
   volumes?: string[];
+  /**
+   * Review round 11 (G3, G4): the subpaths of named volumes that the container mounts (`HostConfig.Mounts`, and
+   * `Mounts`, with `Type` volume and `VolumeOptions.Subpath`), as Docker Compose creates them for a bind mount of
+   * repository files that the pipeline rewrote to the workspace volume.
+   */
+  volumeSubpaths?: VolumeSubpathMount[];
+  /**
+   * Review round 12 (D12-2): the targets of the mounts of the container in it (`Mounts`: volumes, bind mounts, tmpfs;
+   * and the tmpfs of `HostConfig.Tmpfs`), for the ownership fix in the dev container (devMountFolders).
+   */
+  mountTargets?: MountTarget[];
+}
+
+/** Review round 12 (D12-2): a mount of a container (ContainerInfo.mountTargets). */
+export interface MountTarget {
+  /** `volume`, `bind`, `tmpfs`, … */
+  type: string;
+  /** The name of a named volume. */
+  volume?: string;
+  /** The path in the container (`Destination`). */
+  target: string;
+  /**
+   * Review round 14 (P14-1): the subpath of a named volume (`VolumeOptions.Subpath` of the entry of `HostConfig.Mounts`
+   * with the same volume and target; the top-level `Mounts` do not have it). Missing: the whole volume, or not known.
+   */
+  subpath?: string;
+}
+
+/** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
+export interface VolumeSubpathMount {
+  volume: string;
+  /** Relative to the root of the volume, as Docker has it (for example `api/data/postgres`). */
+  subpath: string;
+  readOnly: boolean;
 }
 
 export interface VolumeInfo {
   name: string;
   labels: Record<string, string>;
+}
+
+/** A network of `docker network inspect`. */
+export interface NetworkInfo {
+  name: string;
+  /** The full ID of the network (review round 2, S2-04: a configuration may name a network by its ID or a prefix). */
+  id: string;
+  labels: Record<string, string>;
+  /** The IDs of the containers attached to it. */
+  containers: string[];
 }
 
 /** A local image of `docker image ls`. */
@@ -101,13 +147,17 @@ export interface ContainerAdapterOptions {
   onCliLost?: () => void;
 }
 
-type ObjectKind = 'container' | 'volume' | 'image';
+type ObjectKind = 'container' | 'volume' | 'image' | 'network';
 
 const MISSING_PATTERNS: Record<ObjectKind, RegExp> = {
   container: /no such (container|object)/i,
   volume: /no such (volume|object)/i,
   image: /no such (image|object)/i,
+  network: /no such (network|object)|network \S+ not found/i,
 };
+
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 
 /** Docker refuses to remove an image that a container or another image uses. */
 const IMAGE_IN_USE_PATTERN = /conflict|in use|being used|is using|dependent child images/i;
@@ -126,6 +176,40 @@ export function mapContainerState(rawState: string): ContainerState {
       return 'stopped';
   }
 }
+
+/** Review round 9 (S9-3): an image as `docker image inspect` describes it: its ID, tags, and digests. */
+export interface ImageNames {
+  id: string;
+  repoTags: string[];
+  repoDigests: string[];
+}
+
+/**
+ * Review round 11 (G1): why inspectImageNames could not check a reference. `invalid`: Docker's answer is about the
+ * reference itself ("invalid reference format", or an image ID prefix that matches more than one image), the same at
+ * every call. `transient`: the answer says nothing about the reference (a timeout, a daemon that cannot be reached or
+ * fails, an unknown error, a Docker CLI that cannot be started, or a reference beyond MAX_IMAGE_INSPECT_SINGLE_CALLS).
+ */
+export type ImageUncheckedReason = 'invalid' | 'transient';
+
+/** The result of inspectImageNames (review round 10, P10-1). */
+export interface ImageInspection {
+  /** The local images that the references found. */
+  images: ImageNames[];
+  /** The references that Docker could not inspect for another reason than a missing image, each with its reason. */
+  unchecked: Array<{ reference: string; reason: ImageUncheckedReason }>;
+}
+
+/**
+ * Review round 11 (G1): the errors of `docker image inspect` about a reference itself, matched loosely: an invalid
+ * reference ("invalid reference format", "repository name must be lowercase", "invalid tag format"), and an ID prefix
+ * that matches several images (the classic image store: "multiple IDs found with provided prefix"; the containerd image
+ * store: "ambiguous reference", "ambiguous image", "multiple images match"). Review round 12 (P12-1): also the errors
+ * of go-digest ("invalid checksum digest format", "invalid checksum digest length", "unsupported digest algorithm") and
+ * of the length of a name ("repository name must not be more than 255 characters").
+ */
+const IMAGE_REFERENCE_ERROR =
+  /invalid reference|reference format|must be lowercase|invalid (repository|tag|digest|image)|checksum digest|digest algorithm|must not be more than|ambiguous|multiple (ids|images|digests|matches)|matches multiple|more than one/i;
 
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
 export function parseJsonLines(stdout: string): unknown[] {
@@ -201,8 +285,49 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
     labels: toLabels(isRecord(config) ? config.Labels : undefined),
     image,
     volumes: mountedVolumes(value.Mounts),
+    volumeSubpaths: volumeSubpathMounts([
+      ...(Array.isArray(value.Mounts) ? value.Mounts : []),
+      ...(isRecord(value.HostConfig) && Array.isArray(value.HostConfig.Mounts) ? value.HostConfig.Mounts : []),
+    ]),
+    mountTargets: mountTargets(
+      value.Mounts,
+      isRecord(value.HostConfig) ? value.HostConfig.Tmpfs : undefined,
+      isRecord(value.HostConfig) ? value.HostConfig.Mounts : undefined,
+    ),
     created: typeof value.Created === 'string' ? value.Created : '',
   };
+}
+
+/** A target path as Docker compares it: normalized, without a trailing slash. */
+function cleanTarget(target: string): string {
+  const normal = path.posix.normalize(target);
+  return normal.length > 1 ? normal.replace(/\/+$/, '') : normal;
+}
+
+/**
+ * Review round 12 (D12-2): the mounts of `docker container inspect` with their targets (ContainerInfo.mountTargets).
+ * Review round 14 (P14-1): a volume mount with the subpath of the entry of `HostConfig.Mounts` (`hostMounts`) with the
+ * same volume (`Source`) and target; with more than one such entry of different subpaths, none (not known).
+ */
+function mountTargets(mounts: unknown, tmpfs: unknown, hostMounts: unknown): MountTarget[] {
+  const subpaths = new Map<string, string | null>();
+  for (const mount of Array.isArray(hostMounts) ? hostMounts : []) {
+    if (!isRecord(mount) || mount.Type !== 'volume' || typeof mount.Target !== 'string' || !mount.Target.startsWith('/')) continue;
+    if (typeof mount.Source !== 'string' || mount.Source === '' || !isRecord(mount.VolumeOptions)) continue;
+    const subpath = mount.VolumeOptions.Subpath;
+    if (typeof subpath !== 'string' || subpath === '') continue;
+    const key = `${mount.Source}\0${cleanTarget(mount.Target)}`;
+    subpaths.set(key, subpaths.has(key) && subpaths.get(key) !== subpath ? null : subpath);
+  }
+  const result: MountTarget[] = [];
+  for (const mount of Array.isArray(mounts) ? mounts : []) {
+    if (!isRecord(mount) || typeof mount.Destination !== 'string' || mount.Destination === '' || typeof mount.Type !== 'string') continue;
+    const volume = mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : undefined;
+    const subpath = volume !== undefined && mount.Destination.startsWith('/') ? subpaths.get(`${volume}\0${cleanTarget(mount.Destination)}`) : undefined;
+    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination, ...(typeof subpath === 'string' ? { subpath } : {}) });
+  }
+  if (isRecord(tmpfs)) for (const target of Object.keys(tmpfs)) if (target !== '') result.push({ type: 'tmpfs', target });
+  return result;
 }
 
 function mountedVolumes(mounts: unknown): string[] {
@@ -212,14 +337,56 @@ function mountedVolumes(mounts: unknown): string[] {
     .map((mount) => mount.Name as string);
 }
 
+/**
+ * Review round 11 (G3, G4): the volume mounts with a subpath of `docker container inspect` (`HostConfig.Mounts` has
+ * `Source`, the name of the volume; `Mounts` has `Name`), without duplicates.
+ */
+function volumeSubpathMounts(mounts: readonly unknown[]): VolumeSubpathMount[] {
+  const result = new Map<string, VolumeSubpathMount>();
+  for (const mount of mounts) {
+    if (!isRecord(mount) || mount.Type !== 'volume' || !isRecord(mount.VolumeOptions)) continue;
+    const subpath = mount.VolumeOptions.Subpath;
+    const volume = typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : mount.Source;
+    if (typeof subpath !== 'string' || subpath === '' || typeof volume !== 'string' || volume === '') continue;
+    const readOnly = mount.ReadOnly === true || mount.RW === false;
+    const key = `${volume}\0${subpath}\0${readOnly}`;
+    if (!result.has(key)) result.set(key, { volume, subpath, readOnly });
+  }
+  return [...result.values()];
+}
+
 function toVolumeInfo(value: unknown): VolumeInfo | undefined {
   if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
   return { name: value.Name, labels: toLabels(value.Labels) };
 }
 
+function toNetworkInfo(value: unknown): NetworkInfo | undefined {
+  if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
+  const containers = isRecord(value.Containers) ? Object.keys(value.Containers) : [];
+  return { name: value.Name, id: typeof value.Id === 'string' ? value.Id : '', labels: toLabels(value.Labels), containers };
+}
+
+/**
+ * Whether a container of an environment is its dev container (findContainer): without the label devenv.compose-service
+ * of the other services of Docker Compose, or with the name of the environment.
+ */
+export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>, containerName: string): boolean {
+  return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
+}
+
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, volumes } = container;
-  return { id, name, state, rawState, labels, image, ...(volumes && volumes.length > 0 ? { volumes } : {}) };
+  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths, mountTargets } = container;
+  return {
+    id,
+    name,
+    state,
+    rawState,
+    labels,
+    image,
+    ...(volumes && volumes.length > 0 ? { volumes } : {}),
+    ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
+    ...(mountTargets && mountTargets.length > 0 ? { mountTargets } : {}),
+  };
 }
 
 /** Newest first; a running container before a stopped one. */
@@ -448,20 +615,105 @@ export class ContainerAdapter {
     return (await this.daemonStatus(signal)).running;
   }
 
-  /** The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. */
-  async findContainer(environmentId: string): Promise<ContainerInfo | undefined> {
-    const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+  /**
+   * The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. The
+   * other services of a Docker Compose environment carry the label too, with devenv.compose-service: they are skipped,
+   * so this is always the dev container. A container with the name of the environment (`containerName`, the name of
+   * the dev container) is never skipped, whatever labels its image gave it (review round 1, D2: an image with the label
+   * devenv.compose-service would hide a single container, which then kept running after the checks were turned on).
+   * That container comes first (final review, FC-1: the previous dev container of a Select configuration…, renamed and
+   * without devenv.compose-service, or a stray container of the environment never wins over it); without it (an older
+   * container, a failed switch), a running one, then the newest.
+   */
+  async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
+    const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
+    const containers = all.filter((container) => isDevContainer(container, containerName));
     if (containers.length === 0) return undefined;
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
     }
-    return publicInfo([...containers].sort(preferred)[0]);
+    const named = containers.find((container) => container.name === containerName);
+    return publicInfo(named ?? [...containers].sort(preferred)[0]);
+  }
+
+  /**
+   * The API version of the Docker Engine (`docker version --format '{{.Server.APIVersion}}'`, for example `1.48`), or
+   * `undefined` when the engine does not tell it. Docker Compose configurations need it for `volume.subpath`
+   * (supportsVolumeSubpath). Rejects only with an AbortError.
+   */
+  async engineApiVersion(signal?: AbortSignal): Promise<string | undefined> {
+    let result: RunResult;
+    try {
+      result = await this.run(['version', '--format', '{{.Server.APIVersion}}'], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.logger.warn(`The API version of the Docker Engine could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
+    const version = result.stdout.trim();
+    if (result.exitCode === 0 && /^\d+\.\d+$/.test(version)) return version;
+    this.logger.warn(`The API version of the Docker Engine could not be read: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
+    return undefined;
   }
 
   /** All containers with the label devenv.environment-id, running or not. */
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));
     return containers.map(publicInfo);
+  }
+
+  /**
+   * All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not, also
+   * those without the label devenv.environment-id (for example one-off containers of `docker compose run`).
+   */
+  async listProjectContainers(project: string): Promise<ContainerInfo[]> {
+    const containers = await this.inspectContainers(await this.containerIds(`label=${COMPOSE_PROJECT_LABEL}=${project}`));
+    return containers.map(publicInfo);
+  }
+
+  /** The names of the networks of the Docker Compose project `project` (label com.docker.compose.project). */
+  async listProjectNetworks(project: string): Promise<string[]> {
+    const args = ['network', 'ls', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${project}`, '--format', '{{json .Name}}'];
+    const names = parseJsonLines(await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS }));
+    return [...new Set(names.filter((name): name is string => typeof name === 'string' && name !== ''))];
+  }
+
+  /** `docker network rm`. A missing network is not an error; a network in use is (CommandError). */
+  async removeNetwork(name: string): Promise<void> {
+    this.logger.info(`Removing network ${name}.`);
+    const args = ['network', 'rm', name];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode === 0 || (!result.timedOut && /not found|no such network/i.test(result.stderr))) return;
+    throw this.commandError(args, result);
+  }
+
+  /**
+   * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
+   * devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
+   */
+  async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
+    const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
+    const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    const images = new Set<string>();
+    for (const item of parseJsonLines(stdout)) {
+      if (!isRecord(item) || typeof item.Repository !== 'string' || typeof item.Tag !== 'string') continue;
+      if (!item.Repository.startsWith(`${project}-`) || !item.Tag || item.Tag === '<none>') continue;
+      images.add(`${item.Repository}:${item.Tag}`);
+    }
+    const sorted = [...images].sort();
+    if (environmentId === undefined || sorted.length === 0) return sorted;
+    const foreign = new Set<string>();
+    for (const batch of chunks(sorted, INSPECT_BATCH_SIZE)) {
+      const items = await this.inspectBatch(['image', 'inspect', ...batch], 'image');
+      items.forEach((item) => {
+        const config = isRecord(item) ? item.Config : undefined;
+        const owner = toLabels(isRecord(config) ? config.Labels : undefined)[LABEL_ENVIRONMENT_ID];
+        const tags = isRecord(item) && Array.isArray(item.RepoTags) ? item.RepoTags.filter((tag): tag is string => typeof tag === 'string') : [];
+        if (owner !== undefined && owner !== environmentId) for (const tag of tags) foreign.add(tag);
+      });
+    }
+    return sorted.filter((image) => !foreign.has(image));
   }
 
   /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */
@@ -488,6 +740,16 @@ export class ContainerAdapter {
       return;
     }
     throw this.commandError(args, result);
+  }
+
+  /**
+   * Review round 22 (D22-1): `docker rename`. Throws when the container does not exist or the name is taken.
+   */
+  async renameContainer(nameOrId: string, newName: string): Promise<void> {
+    this.logger.info(`Renaming container ${nameOrId} to ${newName}.`);
+    const args = ['rename', nameOrId, newName];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) throw this.commandError(args, result);
   }
 
   /** `docker rm -f`. A missing container is not an error. */
@@ -561,6 +823,21 @@ export class ContainerAdapter {
     return volumes;
   }
 
+  /**
+   * The networks of `names` that exist, with their labels and the IDs of the containers attached to them
+   * (`docker network inspect`); missing ones are left out. Throws CommandError.
+   */
+  async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
+    const networks: NetworkInfo[] = [];
+    for (const batch of chunks([...new Set(names)], INSPECT_BATCH_SIZE)) {
+      for (const item of await this.inspectBatch(['network', 'inspect', ...batch], 'network')) {
+        const network = toNetworkInfo(item);
+        if (network) networks.push(network);
+      }
+    }
+    return networks;
+  }
+
   /** True if the image exists locally. Throws CommandError for other errors (for example an invalid reference). */
   async imageExists(reference: string): Promise<boolean> {
     const args = ['image', 'inspect', '--format', '{{json .Id}}', reference];
@@ -581,6 +858,99 @@ export class ContainerAdapter {
     const id = parseJsonOutput(result.stdout);
     if (typeof id !== 'string' || id === '') throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
     return id;
+  }
+
+  /**
+   * The names of the local image that `reference` names (`RepoTags` and `RepoDigests` of `docker image inspect`), or
+   * `undefined` if it does not exist (review round 2, S2-05: whether Docker took the reference for an image ID,
+   * resolvedByImageId). Throws CommandError for other errors.
+   */
+  async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
+    const args = ['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', reference];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) {
+      if (this.isMissing(result, 'image')) return undefined;
+      throw this.commandError(args, result);
+    }
+    const value = parseJsonOutput(result.stdout);
+    if (!isRecord(value)) throw this.commandError(args, result, 'Unexpected output of docker image inspect.');
+    const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
+    return { repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) };
+  }
+
+  /**
+   * Review round 9 (S9-3): the ID, tags, and digests of the local images that `references` name, with one `docker image
+   * inspect` per IMAGE_INSPECT_BATCH references (not one per reference), in the order that Docker prints them (the
+   * order of the references; a missing one is left out). Which reference found which image: imageIdResolvedReferences.
+   * Review round 10 (P10-1): when Docker fails for a batch only for missing references (every line of stderr "No such
+   * image") and references that it takes for invalid (IMAGE_REFERENCE_ERROR), the references of that batch are
+   * inspected one by one; `unchecked` names each one whose own inspect fails for another reason than a missing image,
+   * which the caller must not take for a missing image.
+   * Review round 11 (G1, G2): each unchecked reference has its reason (ImageUncheckedReason). After the first timeout,
+   * or the first failure that is neither a missing nor an invalid reference (a daemon that cannot be reached, an
+   * unknown error, an answer that cannot be read, a Docker CLI that cannot be started), of a batch or of a single
+   * reference, it asks no more: that reference and all that are not checked yet are `transient`. At most
+   * MAX_IMAGE_INSPECT_SINGLE_CALLS single calls; the references beyond are `transient`. `signal` is passed to each call
+   * and checked between them. Throws only an AbortError (when `signal` aborts); every other failure is in `unchecked`.
+   */
+  async inspectImageNames(references: readonly string[], signal?: AbortSignal): Promise<ImageInspection> {
+    const images: ImageNames[] = [];
+    const unchecked: ImageInspection['unchecked'] = [];
+    type Outcome = 'done' | 'invalid' | 'transient';
+    const inspect = async (batch: readonly string[]): Promise<Outcome> => {
+      if (signal?.aborted) throw abortError();
+      const args = ['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--', ...batch];
+      let result: RunResult;
+      try {
+        result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) throw error;
+        this.logger.warn(`docker image inspect failed: ${errorMessage(error)}`);
+        return 'transient';
+      }
+      if (result.timedOut) return 'transient';
+      if (result.exitCode !== 0 && !this.onlyMissing(result, 'image')) {
+        // Only missing and invalid references: which ones are invalid, the single calls tell.
+        const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
+        const aboutReferences = errors.length > 0 && errors.every((line) => MISSING_PATTERNS.image.test(line) || IMAGE_REFERENCE_ERROR.test(line));
+        return aboutReferences && errors.some((line) => IMAGE_REFERENCE_ERROR.test(line)) ? 'invalid' : 'transient';
+      }
+      const found: ImageNames[] = [];
+      const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
+      for (const value of parseJsonLines(result.stdout)) {
+        if (!isRecord(value) || typeof value.id !== 'string') return 'transient';
+        found.push({ id: value.id, repoTags: texts(value.repoTags), repoDigests: texts(value.repoDigests) });
+      }
+      images.push(...found);
+      return 'done';
+    };
+    const giveUp = (from: number): ImageInspection => {
+      unchecked.push(...references.slice(from).map((reference) => ({ reference, reason: 'transient' as const })));
+      return { images, unchecked };
+    };
+    let singleCalls = 0;
+    for (let start = 0; start < references.length; start += IMAGE_INSPECT_BATCH) {
+      const batch = references.slice(start, start + IMAGE_INSPECT_BATCH);
+      const outcome = await inspect(batch);
+      if (outcome === 'done') continue;
+      // A daemon that does not answer (in time) would not answer each reference either.
+      if (outcome === 'transient') return giveUp(start);
+      if (batch.length === 1) {
+        unchecked.push({ reference: batch[0], reason: 'invalid' });
+        continue;
+      }
+      for (let index = 0; index < batch.length; index++) {
+        if (singleCalls >= MAX_IMAGE_INSPECT_SINGLE_CALLS) {
+          this.logger.warn(`docker image inspect: more than ${MAX_IMAGE_INSPECT_SINGLE_CALLS} references to inspect one by one.`);
+          return giveUp(start + index);
+        }
+        singleCalls++;
+        const single = await inspect([batch[index]]);
+        if (single === 'transient') return giveUp(start + index);
+        if (single === 'invalid') unchecked.push({ reference: batch[index], reason: 'invalid' });
+      }
+    }
+    return { images, unchecked };
   }
 
   /**
@@ -781,13 +1151,19 @@ export class ContainerAdapter {
   private async inspectBatch(args: readonly string[], kind: ObjectKind): Promise<unknown[]> {
     const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     const items = parseInspectArray(result.stdout);
-    if (result.exitCode !== 0) {
-      const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
-      const onlyMissing = errors.length > 0 && errors.every((line) => MISSING_PATTERNS[kind].test(line));
-      if (!onlyMissing || result.timedOut) throw this.commandError(args, result);
-    }
+    if (result.exitCode !== 0 && !this.onlyMissing(result, kind)) throw this.commandError(args, result);
     if (!items) throw this.commandError(args, result, `Unexpected output of docker ${kind} inspect.`);
     return items;
+  }
+
+  /**
+   * Review round 10 (P10-1): whether a failed command failed only for missing objects: every line of its (end of) stderr
+   * says so. Unlike isMissing, one "No such …" among other errors is not enough.
+   */
+  private onlyMissing(result: RunResult, kind: ObjectKind): boolean {
+    if (result.timedOut || result.exitCode === 0) return false;
+    const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
+    return errors.length > 0 && errors.every((line) => MISSING_PATTERNS[kind].test(line));
   }
 
   private isMissing(result: RunResult, kind: ObjectKind): boolean {

@@ -4,9 +4,13 @@
 
 // Pure decisions and helpers of the open pipeline (concept 7.6, 7.7, 7.12). No I/O.
 import * as crypto from 'crypto';
+import * as path from 'path';
+import type { ContainerInfo, MountTarget } from '../docker/containerAdapter';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
-import { runArgsUser, truncated } from '../helper/hostAccess';
+import { serviceFolderPaths } from '../git/gitSummary';
+import { composeMountVolumeName } from '../helper/compose';
+import { isAnonymousVolumeName, runArgsUser, truncated } from '../helper/hostAccess';
 import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessChecks } from '../hostAccessChecks';
@@ -14,11 +18,15 @@ import {
   CONTAINER_CONFIG_UNKNOWN,
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
+  LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_CONFIG,
   LABEL_CONTAINER_VERSION,
+  LABEL_ENVIRONMENT_ID,
   LABEL_HOST_ACCESS,
+  WORKSPACES_ROOT,
+  repositoryFolder,
 } from '../names';
-import type { DevcontainerResult, RefusedUpdate } from '../types';
+import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
 
 export type { RefusedUpdate };
 
@@ -86,6 +94,8 @@ export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
     items: truncated(value.items, MAX_REFUSED_ITEMS_LENGTH),
   };
   if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
+  // Review round 10 (P10-3).
+  if (value.reason === 'size') refused.reason = 'size';
   return refused;
 }
 
@@ -413,4 +423,284 @@ export function stringList(value: unknown): string[] | undefined {
 /** A non-empty string, otherwise `undefined`. */
 export function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Docker Compose (implementation notes, section "Docker Compose")
+
+/** Label that Docker Compose gives each container, network, and volume of a project. */
+export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+/** Review round 22 (D22-1): label that Docker Compose gives each container of a project: the name of its service. */
+export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
+
+/**
+ * Review round 22 (D22-1): the name that Docker Compose gives a container that it creates in place of another one while
+ * it recreates a service (`<first 12 characters of the ID>_<name>`), which stays behind when that fails.
+ */
+export function isComposeRecreateLeftoverName(name: string): boolean {
+  return /^[0-9a-f]{12}_/.test(name);
+}
+
+/** BuildRecord.compose, when it is valid: the build record of a Docker Compose configuration. */
+export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRecord | undefined {
+  const value: unknown = record?.compose;
+  if (!isRecord(value) || typeof value.service !== 'string' || value.service === '') return undefined;
+  if (!Array.isArray(value.images) || !value.images.every((image) => typeof image === 'string')) return undefined;
+  const serviceImages = Array.isArray(value.serviceImages) && value.serviceImages.every((image) => typeof image === 'string') ? [...value.serviceImages] : undefined;
+  return {
+    service: value.service,
+    images: [...value.images],
+    ...(serviceImages !== undefined ? { serviceImages } : {}),
+    ...(typeof value.version === 'string' ? { version: value.version } : {}),
+    ...(typeof value.inputsHash === 'string' ? { inputsHash: value.inputsHash } : {}),
+    // Review round 9 (D9-1): only a list of texts; the scripts take only the paths below the repository folder.
+    ...(Array.isArray(value.serviceFolders) && value.serviceFolders.every((folder) => typeof folder === 'string')
+      ? { serviceFolders: [...(value.serviceFolders as string[])] }
+      : {}),
+  };
+}
+
+/**
+ * Review round 9 (D9-1, D9-2): the paths of the repository that the containers of the other services of the Docker
+ * Compose environment may mount. Review round 10 (D10-1): Environment.serviceFolders together with the list of a build
+ * record of review round 9 (ComposeBuildRecord.serviceFolders); empty for an entry without either.
+ */
+export function serviceFoldersOf(env: Pick<Environment, 'buildRecord' | 'serviceFolders'>): string[] {
+  const own = Array.isArray(env.serviceFolders) ? env.serviceFolders.filter((folder) => typeof folder === 'string') : [];
+  return [...new Set([...own, ...(composeRecordOf(env.buildRecord)?.serviceFolders ?? [])])];
+}
+
+/**
+ * Review round 11 (G3, G4): the paths of the repository that the existing containers of the other services of the
+ * Docker Compose environment mount (not the dev container: the container with the name of the environment, or with the
+ * label of the environment and without devenv.compose-service; a container of the project without the labels of the
+ * environment, for example of `docker compose run`, counts as another service), from their mounts of subpaths of the
+ * workspace volume `volumeName` (ContainerInfo.volumeSubpaths): the subpath joined to WORKSPACES_ROOT, where the dev
+ * container and the helper mount the volume. As composeUpModel records them: not a read-only mount, and only a path
+ * below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them). Only the path as
+ * Docker has it, not the real path behind a link of the repository: review round 12 (P12-2), the ownership fixes resolve
+ * the paths in the volume themselves (SERVICE_OWNER_FIX).
+ */
+export function liveServiceFolders(
+  containers: ReadonlyArray<Pick<ContainerInfo, 'name' | 'labels' | 'volumeSubpaths'>>,
+  env: Pick<Environment, 'repository' | 'volumeName' | 'containerName'>,
+): string[] {
+  const paths = containers
+    .filter((container) => container.name !== env.containerName && !(LABEL_ENVIRONMENT_ID in container.labels && container.labels[LABEL_COMPOSE_SERVICE] === undefined))
+    .flatMap((container) => container.volumeSubpaths ?? [])
+    .filter((mount) => mount.volume === env.volumeName && !mount.readOnly)
+    .map((mount) => path.posix.join(WORKSPACES_ROOT, mount.subpath));
+  return serviceFolderPaths(repositoryFolder(env.repository), paths);
+}
+
+/**
+ * Review round 12 (D12-2): the paths of the repository at which the dev container `container` mounts something else than
+ * the workspace volume (a named volume, such as a `node_modules` volume or one that another service shares, a tmpfs, or
+ * a bind mount; of the Docker Compose model, of the `mounts` of devcontainer.json, or of runArgs), as `docker inspect`
+ * reads them (ContainerInfo.mountTargets). `find -xdev` stays only out of other file systems, and a local named volume
+ * lies on the file system of the workspace volume: the ownership fix in the dev container leaves these paths to their
+ * owners (only the files of root change: the folder of a new volume that Docker created as root still gets the remote
+ * user). Only paths below the repository folder (serviceFolderPaths filters them, and so the repository folder itself).
+ * Review round 13 (D13-1): a mount of the workspace volume (whole, or a subpath of it) below the repository folder is
+ * protected too: it is an alias of files of the volume (for example `./data:/workspaces/api/pgview` of the dev service,
+ * rewritten to a subpath of the workspace volume, with db mounting `./data`, or `..` mounted below the repository), which
+ * `find -xdev` walks. Only the mount at WORKSPACES_ROOT is left out. The same files are still fixed in full under their
+ * canonical path (unless that path is protected itself).
+ * Review round 13 (D13-3): an anonymous volume of the dev container (a mount of Type volume whose name is 64 hexadecimal
+ * characters, isAnonymousVolumeName) is not protected when the host access checks are on: it is always the dev
+ * container's own (fresh per container, or inherited by Docker Compose from the previous dev container), because the
+ * policy refuses a configuration that names such a volume; so its content (for example a `node_modules` that the image
+ * populated as uid 1000) gets the remote user in full. With the checks off, a configuration may mount the anonymous
+ * volume of another container by its name, so it stays protected. Named volumes and bind mounts stay protected, since
+ * they can be shared with another container or environment; a tmpfs needs nothing (`-xdev` does not go into it).
+ * Review round 14 (P14-1): a mount of the workspace volume whose target is `identities` (workspaceIdentityMounts, checked
+ * in the container with verifiedIdentityTargets) is not protected: it shows the folder of the volume at its own canonical
+ * path (for example `../src:/workspaces/api/src`), no alias; its files get the full fix like the rest of the repository.
+ * Review round 15 (K4 = D15-2): a target in `.git` stays in the list (for example a volume that db shares at
+ * `/workspaces/api/.git/pg`, or with the checks off a bind of the computer at `.git/hooks`): serviceFolderPaths with
+ * `gitPaths`. The rest of `.git` still gets the full fix.
+ */
+export function devMountFolders(
+  container: Pick<ContainerInfo, 'mountTargets'> | undefined,
+  env: Pick<Environment, 'repository' | 'volumeName'>,
+  hostAccessChecks: HostAccessChecks,
+  identities: ReadonlySet<string> = new Set(),
+): string[] {
+  const targets = (container?.mountTargets ?? [])
+    .filter((mount) => mount.target.startsWith('/'))
+    .map((mount) => ({ ...mount, target: path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') }))
+    .filter((mount) => !(mount.type === 'volume' && mount.volume === env.volumeName && mount.target === WORKSPACES_ROOT))
+    // Review round 14 (P14-1): a mount of the workspace volume at its own canonical path, checked in the container.
+    .filter((mount) => !(identities.has(mount.target) && identityMountTarget(mount, env) === mount.target))
+    .filter((mount) => !(hostAccessChecks === 'on' && mount.type === 'volume' && mount.volume !== undefined && isAnonymousVolumeName(mount.volume)))
+    .map((mount) => mount.target);
+  // Review round 15 (K4 = D15-2): also a target in `.git` (the filter of `.git` is for the records of the services).
+  return serviceFolderPaths(repositoryFolder(env.repository), targets, true);
+}
+
+/** Review round 14 (P14-1): a mount of a subpath of the workspace volume at the path of that subpath (workspaceIdentityMounts). */
+export interface WorkspaceIdentityMount {
+  /** The normalized target, below the repository folder, for example `/workspaces/api/src`. */
+  target: string;
+  /** The subpath, normalized, for example `api/src`. */
+  subpath: string;
+}
+
+/**
+ * Review round 14 (P14-1): the mounts of the workspace volume of the dev container below the repository folder whose
+ * target is the path of their subpath in the volume (`/workspaces/<subpath>` equals the target), for example
+ * `../src:/workspaces/api/src` of a dev service (rewritten to the subpath `api/src`). Only lexically: a link in the
+ * volume can make the mounted folder another one, so verifiedIdentityTargets checks them in the container. A mount
+ * without a known subpath (MountTarget.subpath) is never one.
+ */
+export function workspaceIdentityMounts(container: Pick<ContainerInfo, 'mountTargets'> | undefined, env: Pick<Environment, 'repository' | 'volumeName'>): WorkspaceIdentityMount[] {
+  const result: WorkspaceIdentityMount[] = [];
+  for (const mount of container?.mountTargets ?? []) {
+    const target = identityMountTarget(mount, env);
+    if (target !== undefined && !result.some((known) => known.target === target)) result.push({ target, subpath: target.slice(WORKSPACES_ROOT.length + 1) });
+  }
+  return result;
+}
+
+/** The normalized target of a mount of the workspace volume below the repository folder at `/workspaces/<subpath>`. */
+function identityMountTarget(mount: MountTarget, env: Pick<Environment, 'repository' | 'volumeName'>): string | undefined {
+  if (mount.type !== 'volume' || mount.volume !== env.volumeName || mount.subpath === undefined || mount.subpath === '' || !mount.target.startsWith('/')) return undefined;
+  if (mount.subpath.startsWith('/') || mount.subpath.includes('\0')) return undefined;
+  const target = path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1');
+  const canonical = path.posix.join(WORKSPACES_ROOT, mount.subpath).replace(/(.)\/+$/, '$1');
+  return canonical === target && target.startsWith(`${repositoryFolder(env.repository)}/`) ? target : undefined;
+}
+
+/** The kernel's escapes of `/proc/self/mountinfo` (`\040` for a space, `\011`, `\012`, `\134`). */
+function mountInfoPath(text: string): string {
+  return text.replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+}
+
+/**
+ * Review round 14 (P14-1): of `candidates` (workspaceIdentityMounts), the targets whose mount shows the folder of the
+ * volume at its canonical path, from `/proc/self/mountinfo` of the dev container (`mountInfo`): the mount at the target
+ * lies on the same file system (`major:minor`) as the mount at WORKSPACES_ROOT (the whole workspace volume), and its root
+ * in that file system is the root of the mount at WORKSPACES_ROOT joined with the subpath. The kernel records the real
+ * folder: a link in the volume (Docker follows links in a subpath within the volume) gives another root, and the mount
+ * stays protected. The topmost mount of a path counts (the last line). Without a clear answer, none.
+ */
+export function verifiedIdentityTargets(candidates: readonly WorkspaceIdentityMount[], mountInfo: string): Set<string> {
+  const mounts = new Map<string, { device: string; root: string }>();
+  for (const line of mountInfo.split('\n')) {
+    const fields = line.split(' ');
+    if (fields.length < 5 || !/^\d+:\d+$/.test(fields[2])) continue;
+    mounts.set(mountInfoPath(fields[4]), { device: fields[2], root: mountInfoPath(fields[3]) });
+  }
+  const verified = new Set<string>();
+  const workspaces = mounts.get(WORKSPACES_ROOT);
+  if (workspaces === undefined || !workspaces.root.startsWith('/')) return verified;
+  const base = workspaces.root === '/' ? '' : workspaces.root.replace(/\/+$/, '');
+  for (const candidate of candidates) {
+    const mount = mounts.get(candidate.target);
+    if (mount !== undefined && mount.device === workspaces.device && mount.root === `${base}/${candidate.subpath}`) verified.add(candidate.target);
+  }
+  return verified;
+}
+
+/**
+ * Review round 9 (D9-2): serviceFoldersOf relative to the repository folder, as the user knows them (`./data/postgres`),
+ * for the confirmation of Delete. Only the paths below the repository folder.
+ */
+export function repositoryServiceDataFolders(env: Pick<Environment, 'repository' | 'buildRecord' | 'serviceFolders'>): string[] {
+  const folder = repositoryFolder(env.repository);
+  return serviceFoldersOf(env)
+    .filter((path) => path.startsWith(`${folder}/`) && path.length > folder.length + 1)
+    .map((path) => `./${path.slice(folder.length + 1)}`);
+}
+
+/**
+ * Whether the Docker Compose configuration changed since the build of `record` (review round 1, P-4), from the model
+ * hash (composeConfigHash, `configHash`), the hash of the files as written (composeInputsHash), and the version of the
+ * Compose plugin that printed the model:
+ * - `changed`: the files differ, or they are equal and the same Compose version printed another model (for example a
+ *   value of the environment of the helper that the model uses);
+ * - `rebaseline`: only the Compose version and with it the printed model differ: no change for the user; the record
+ *   takes the new model hash and version;
+ * - `unchanged`: otherwise.
+ * A record without the hash of the files or the version (written before) compares the model hash alone.
+ */
+export function composeConfigurationChange(
+  record: Pick<BuildRecord, 'configHash' | 'compose'>,
+  current: { configHash: string; inputsHash: string; version: string },
+): 'changed' | 'unchanged' | 'rebaseline' {
+  const compose = composeRecordOf(record as BuildRecord);
+  if (compose?.inputsHash === undefined || compose.version === undefined) return record.configHash === current.configHash ? 'unchanged' : 'changed';
+  if (compose.inputsHash !== current.inputsHash) return 'changed';
+  if (record.configHash === current.configHash) return compose.version === current.version ? 'unchanged' : 'rebaseline';
+  return compose.version === current.version ? 'changed' : 'rebaseline';
+}
+
+/**
+ * A container that Docker Compose created for the project `project` (the dev container or another service): the label
+ * of the project together with a label that Compose puts only on containers, never on images (the number of the
+ * container, or the hash of its configuration). Review round 2 (D2-4): the label of the project alone can come from the
+ * image (a single container created from an image that Compose built for the project).
+ */
+export function isComposeContainer(labels: Readonly<Record<string, string>>, project: string): boolean {
+  return labels[COMPOSE_PROJECT_LABEL] === project && (labels[COMPOSE_CONTAINER_NUMBER_LABEL] !== undefined || labels[COMPOSE_CONFIG_HASH_LABEL] !== undefined);
+}
+
+/** Labels that Docker Compose puts on the containers that it creates (not on images): isComposeContainer. */
+export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-number';
+export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
+
+/**
+ * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the
+ * other services (label devenv.compose-service) first and the dev container last, so that a database runs before the
+ * lifecycle commands of the dev container need it; `stop` the reverse (the dev container first, D-20).
+ */
+export function composeContainerOrder<T extends { labels: Readonly<Record<string, string>> }>(containers: readonly T[], order: 'start' | 'stop'): T[] {
+  const services = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
+  const dev = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
+  return order === 'start' ? [...services, ...dev] : [...dev, ...services];
+}
+
+/**
+ * What Docker Compose accepts as the key of a top-level volume (compose-go schema, `volumes` patternProperties; Compose
+ * does not interpolate keys). Review round 17 (D17-1).
+ */
+export const COMPOSE_VOLUME_KEY = /^[a-zA-Z0-9._-]+$/;
+
+/**
+ * The named volumes of the `mounts` of devcontainer.json, of the merged configuration, and of the image metadata in a
+ * Docker Compose configuration (each argument is one `mounts` value: a list, or a single mount). The Dev Container CLI
+ * puts them into the project (`<project>_<source>`, composeMountVolumeName), unless the mount says `external`:
+ * - `names`: their Docker names, which the pipeline creates before `up` with the labels of the environment;
+ * - `sources`: the sources of the project volumes, which our model declares as external volumes (mountVolumeSources).
+ * Review round 17 (D17-1): each mount is first substituted with `variables` as the CLI substitutes it at `up`
+ * (helperCliVariables with the real `${devcontainerId}` of the environment, environmentDevcontainerId; never
+ * DEVCONTAINER_ID_PLACEHOLDER), so that the names are those that the CLI writes. A source (or the name of an external
+ * mount) that is still no valid key of a Compose volume (COMPOSE_VOLUME_KEY: for example a `${localEnv:…}` whose value
+ * is not known) is left out of both lists and returned in `skipped`: our model does not name it, the pipeline does not
+ * create it, and it never reaches a command; the CLI writes it into its compose file as it is.
+ */
+export function composeMountVolumes(
+  project: string,
+  mounts: readonly unknown[],
+  variables?: CliVariables,
+): { names: string[]; sources: string[]; skipped: string[] } {
+  const names = new Set<string>();
+  const sources = new Set<string>();
+  const skipped = new Set<string>();
+  for (const value of mounts) {
+    for (const written of Array.isArray(value) ? value : value === undefined || value === null ? [] : [value]) {
+      const mount = variables !== undefined ? resolveCliVariables(written, variables).value : written;
+      const name = composeMountVolumeName(project, mount);
+      if (name === undefined) continue;
+      const external = isRecord(mount) && mount.external === true;
+      const source = external ? name : name.slice(project.length + 1);
+      if (!COMPOSE_VOLUME_KEY.test(source)) {
+        skipped.add(source);
+        continue;
+      }
+      names.add(name);
+      if (!external) sources.add(source);
+    }
+  }
+  return { names: [...names], sources: [...sources], skipped: [...skipped] };
 }

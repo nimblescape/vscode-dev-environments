@@ -68,6 +68,7 @@ import {
   timedChecker,
   type CheckRecord,
 } from './harness';
+import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 
 const REPOSITORY = 'devenv-test/tiny';
 const FOLDER = '/workspaces/tiny';
@@ -170,6 +171,7 @@ describe('open pipeline on a seeded environment', () => {
   function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): EnvironmentService {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
     return new EnvironmentService({
+      analyzer: inProcessAnalyzer,
       docker,
       runner,
       helper: workspaceHelper,
@@ -409,6 +411,11 @@ describe('open pipeline on a seeded environment', () => {
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
     expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
+    // Review round 2 (D2-1): Docker accepts the labels of Docker Compose with empty values, so an image cannot give the
+    // container the project of another Compose configuration.
+    expect(cli.container(containerName)?.Config.Labels).toMatchObject({ 'com.docker.compose.project': '', 'com.docker.compose.service': '' });
+    // Review round 4 (D4-2): the configuration path, for the restore after a lost registry.
+    expect(cli.container(containerName)?.Config.Labels?.['devenv.config-path']).toBe(CONFIG_PATH);
     const env = containerEnv();
     expect(env).toMatchObject({
       GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',

@@ -184,6 +184,11 @@ export class FakeUi implements PipelineUi {
     return 'later';
   }
 
+  async configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'> {
+    this.events.push({ kind: 'configurationKindChanged', text: `${repository}: ${message}` });
+    return 'later';
+  }
+
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
     this.events.push({ kind: 'filesMissing', text: repository });
     return undefined;

@@ -13,7 +13,7 @@ import { isBusyMarkLive } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { errorMessage } from '../core/errors';
 import { gitSummaryCommand, parseGitSummaryOutput } from '../core/git/gitSummary';
-import { LABEL_ENVIRONMENT_ID, repositoryFolder, shortId } from '../core/names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, repositoryFolder, shortId } from '../core/names';
 import { isoTime, sleep, systemClock, type Clock, type Logger, type RunResult } from '../core/ports';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
@@ -54,6 +54,16 @@ export function environmentLabel(
   const repository = environment.repository.toLowerCase();
   const shared = environments.some((other) => other.id !== environment.id && other.repository.toLowerCase() === repository);
   return shared ? `${environment.repository} (${shortId(environment.id)})` : environment.repository;
+}
+
+/**
+ * The containers of one environment in the order of the stop (D-20): the dev container (the name of the environment, or
+ * without the label devenv.compose-service) first, then the other services of a Docker Compose environment.
+ */
+export function devContainerFirst(containers: readonly ContainerInfo[], containerName: string): ContainerInfo[] {
+  const rank = (container: ContainerInfo): number =>
+    container.name === containerName ? 0 : container.labels[LABEL_COMPOSE_SERVICE] === undefined ? 1 : 2;
+  return [...containers].sort((a, b) => rank(a) - rank(b));
 }
 
 /** Settings when monitor.json is missing or invalid: the defaults of concept section 8. */
@@ -293,11 +303,14 @@ export class MonitorLoop {
 
   /**
    * Stops the running containers of one environment: check again that it is not in use, record the Git summary
-   * (docker exec, then a registry update under the lock), check again, then `docker stop`.
+   * (docker exec in the dev container, then a registry update under the lock), check again, then `docker stop` of each
+   * container. A Docker Compose environment has several (the other services carry the label devenv.compose-service,
+   * D-20): the dev container goes first, and the lock is refreshed before each further one, because each stop can take
+   * up to the time limit of a Docker call.
    */
-  private async stopEnvironment(id: string, containers: ContainerInfo[]): Promise<StopOutcome> {
+  private async stopEnvironment(id: string, running: ContainerInfo[]): Promise<StopOutcome> {
     const { logger } = this.deps;
-    if (containers.length === 0) return 'skipped';
+    if (running.length === 0) return 'skipped';
     const retry = this.stopRetries.get(id);
     if (retry && this.clock.now() < retry.retryAt) return 'skipped';
     if (!this.deps.refreshLock()) return 'lockLost';
@@ -306,9 +319,14 @@ export class MonitorLoop {
     const idle = await this.idleEnvironment(id);
     if (!idle) return 'skipped';
     const { environment, label } = idle;
-    const target = containers.find((container) => container.name === environment.containerName) ?? containers[0];
+    const containers = devContainerFirst(running, environment.containerName);
+    // The Git summary comes from the dev container (its name, whatever labels its image gave it); the other services of a
+    // Docker Compose environment have no repository.
+    const target = containers.find(
+      (container) => container.name === environment.containerName || container.labels[LABEL_COMPOSE_SERVICE] === undefined,
+    );
 
-    const summary = await this.readGitSummary(environment, label, target);
+    const summary = target ? await this.readGitSummary(environment, label, target) : undefined;
     if (this.stopRequested) return 'skipped';
     if (summary) {
       // Read before the registry update: its mutator runs under the registry lock and does no I/O.
@@ -341,7 +359,11 @@ export class MonitorLoop {
     if (this.stopRequested || !(await this.idleEnvironment(id))) return 'skipped';
 
     let failed = false;
-    for (const container of containers) {
+    for (const [index, container] of containers.entries()) {
+      if (index > 0 && !this.deps.refreshLock()) return 'lockLost';
+      // Review round 1 (D4): each stop can take up to the time limit of a Docker call, and a window can start a session
+      // meanwhile; the containers that still run then stay running (the window starts a stopped one again).
+      if (index > 0 && (this.stopRequested || !(await this.idleEnvironment(id)))) return 'skipped';
       try {
         logger.info(`Stopping the container ${container.name} of ${label}: no window uses it.`);
         await this.deps.docker.stopContainer(container.id);

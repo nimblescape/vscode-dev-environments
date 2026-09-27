@@ -5,17 +5,26 @@
 import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
-import { helperCliVariables } from '../helper/cliVariables';
+import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import {
   baseImageKey,
+  composeContainerOrder,
+  COMPOSE_VOLUME_KEY,
+  composeMountVolumes,
+  composeConfigurationChange,
+  composeRecordOf,
   configHash,
   containerIsCurrent,
   digestReference,
   errorDetail,
   configRemoteUser,
   containerUserName,
+  devMountFolders,
+  verifiedIdentityTargets,
+  workspaceIdentityMounts,
   imageRemoteUser,
   imagesToPull,
+  isComposeContainer,
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
@@ -485,5 +494,248 @@ describe('isGitHubTokenRejected', () => {
     "error: pathspec 'feature' did not match any file(s) known to git",
   ])('not a rejected token: %s', (text) => {
     expect(isGitHubTokenRejected(text)).toBe(false);
+  });
+});
+
+describe('Docker Compose rules (unit 6)', () => {
+  const record = { builtAt: '', environmentImage: 'devenv-3f2a9c1e:1', buildNumber: 1, configPath: 'c', configHash: 'h', images: {}, features: {} };
+
+  it.each([
+    ['no compose part', undefined, undefined],
+    ['a valid part', { service: 'app', images: ['devenv-3f2a9c1e-app'] }, { service: 'app', images: ['devenv-3f2a9c1e-app'] }],
+    ['an empty service', { service: '', images: [] }, undefined],
+    ['images that are no list of texts', { service: 'app', images: [1] }, undefined],
+    ['no object', 'app', undefined],
+  ])('composeRecordOf: %s', (_name, compose, expected) => {
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(expected);
+  });
+
+  it('composeRecordOf keeps the service images, the Compose version, and the hash of the files (review round 1, D5, P-4)', () => {
+    const compose = { service: 'app', images: [], serviceImages: ['postgres:16'], version: '2.40.3', inputsHash: 'sha256:x' };
+    expect(composeRecordOf({ ...record, compose } as never)).toEqual(compose);
+    expect(composeRecordOf({ ...record, compose: { ...compose, serviceImages: [1], version: 2 } } as never)).toEqual({ service: 'app', images: [], inputsHash: 'sha256:x' });
+  });
+
+  it.each<[string, Record<string, unknown> | undefined, { configHash: string; inputsHash: string; version: string }, string]>([
+    ['the same model, files, and version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.40' }, 'unchanged'],
+    ['other files', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'g', version: '2.40' }, 'changed'],
+    ['other files and another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'g', version: '2.41' }, 'changed'],
+    ['the same files, another model of the same version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.40' }, 'changed'],
+    ['the same files, another model of another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['the same files and model, another version', { version: '2.40', inputsHash: 'f' }, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'rebaseline'],
+    ['an older record: the model hash alone', {}, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+    ['an older record with the same model', {}, { configHash: 'h', inputsHash: 'f', version: '2.41' }, 'unchanged'],
+    ['no compose part', undefined, { configHash: 'h2', inputsHash: 'f', version: '2.41' }, 'changed'],
+  ])('composeConfigurationChange: %s (review round 1, P-4)', (_name, compose, current, expected) => {
+    const withCompose = compose === undefined ? record : { ...record, compose: { service: 'app', images: [], ...compose } };
+    expect(composeConfigurationChange(withCompose as never, current)).toBe(expected);
+  });
+
+  it('isComposeContainer: only a container of the project of the environment', () => {
+    // Review round 2 (D2-4): changed input, a container of Compose also has a label that only containers have.
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.config-hash': 'x' }, 'devenv-3f2a9c1e')).toBe(true);
+    expect(isComposeContainer({ 'com.docker.compose.project': 'api_devcontainer', 'com.docker.compose.container-number': '1' }, 'devenv-3f2a9c1e')).toBe(false);
+    expect(isComposeContainer({}, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('isComposeContainer: not by the labels that an image of the project gave a single container (review round 2, D2-4)', () => {
+    const fromImage = { 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(isComposeContainer(fromImage, 'devenv-3f2a9c1e')).toBe(false);
+  });
+
+  it('composeContainerOrder: the services start first and stop last', () => {
+    const dev = { id: 'dev', labels: {} };
+    const db = { id: 'db', labels: { 'devenv.compose-service': 'db' } };
+    const cache = { id: 'cache', labels: { 'devenv.compose-service': 'cache' } };
+    expect(composeContainerOrder([dev, db, cache], 'start').map((c) => c.id)).toEqual(['db', 'cache', 'dev']);
+    expect(composeContainerOrder([db, dev, cache], 'stop').map((c) => c.id)).toEqual(['dev', 'db', 'cache']);
+  });
+
+  it('composeMountVolumes: named volumes of mounts become volumes of the project, unless external', () => {
+    expect(
+      composeMountVolumes('devenv-3f2a9c1e', [
+        ['source=cache,target=/cache,type=volume', 'source=/tmp,target=/tmp,type=bind', 'type=tmpfs,target=/run'],
+        { source: 'shared', target: '/shared', type: 'volume', external: true },
+        undefined,
+        [{ source: 'cache', target: '/other', type: 'volume' }],
+      ]),
+      // review round 17, D17-1: with the sources that are no key of a Compose volume.
+    ).toEqual({ names: ['devenv-3f2a9c1e_cache', 'shared'], sources: ['cache'], skipped: [] });
+  });
+
+  it('composeMountVolumes: sources substituted as the CLI does at up, with the real ID; the rest is skipped (review round 17, D17-1)', () => {
+    const id = environmentDevcontainerId('3f2a9c1e-0000-4000-8000-000000000001');
+    const variables = { ...helperCliVariables('acme/api'), devcontainerId: id };
+    const mounts = [
+      [{ source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' }],
+      ['source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume'],
+      // A variable of the process whose value is not known, and a name that Compose does not accept as a key.
+      ['source=${localEnv:TERM}-x,target=/x,type=volume', 'source=a@b,target=/y,type=volume'],
+      { source: 'shared-${localEnv:TERM}', target: '/s', type: 'volume', external: true },
+    ];
+    expect(composeMountVolumes('devenv-3f2a9c1e', mounts, variables)).toEqual({
+      names: [`devenv-3f2a9c1e_dind-var-lib-docker-${id}`, 'devenv-3f2a9c1e_api-node_modules'],
+      sources: [`dind-var-lib-docker-${id}`, 'api-node_modules'],
+      skipped: ['${localEnv:TERM}-x', 'a@b', 'shared-${localEnv:TERM}'],
+    });
+    // Without the variables, a source with `${…}` is never a volume of the model (and never the placeholder of the checks).
+    const raw = composeMountVolumes('devenv-3f2a9c1e', mounts);
+    expect(raw.sources).toEqual([]);
+    expect(raw.names).toEqual([]);
+    expect(JSON.stringify(composeMountVolumes('devenv-3f2a9c1e', mounts, variables))).not.toContain(DEVCONTAINER_ID_PLACEHOLDER);
+    for (const source of composeMountVolumes('devenv-3f2a9c1e', mounts, variables).sources) expect(source).toMatch(COMPOSE_VOLUME_KEY);
+  });
+});
+
+describe('workspace-volume mounts at their own canonical path (review round 14, P14-1)', () => {
+  const env = { repository: 'acme/api', volumeName: 'acme-api-3f2a9c1e' };
+  const V = env.volumeName;
+  const container = {
+    mountTargets: [
+      { type: 'volume', volume: V, target: '/workspaces' },
+      { type: 'volume', volume: V, target: '/workspaces/api', subpath: 'api' },
+      { type: 'volume', volume: V, target: '/workspaces/api/src/', subpath: 'api/src/' },
+      { type: 'volume', volume: V, target: '/workspaces/api/lib', subpath: 'api/./x/../lib' },
+      // ./data:/workspaces/api/pgview: an alias.
+      { type: 'volume', volume: V, target: '/workspaces/api/pgview', subpath: 'api/data' },
+      // Subpath not known, another volume, a subpath outside the repository.
+      { type: 'volume', volume: V, target: '/workspaces/api/docs' },
+      { type: 'volume', volume: 'other', target: '/workspaces/api/tools', subpath: 'api/tools' },
+      { type: 'bind', target: '/workspaces/api/bin', subpath: 'api/bin' },
+    ],
+  };
+  const root = `/var/lib/docker/volumes/${V}/_data`;
+  const info = (lines: string[]) => ['1 0 0:30 / / rw - overlay overlay rw', ...lines].join('\n');
+
+  it('names the candidates lexically, below the repository folder only', () => {
+    expect(workspaceIdentityMounts(container, env)).toEqual([
+      { target: '/workspaces/api/src', subpath: 'api/src' },
+      { target: '/workspaces/api/lib', subpath: 'api/lib' },
+    ]);
+    expect(workspaceIdentityMounts(undefined, env)).toEqual([]);
+  });
+
+  it('verifies them with /proc/self/mountinfo: same device, and the root of /workspaces joined with the subpath', () => {
+    const candidates = workspaceIdentityMounts(container, env);
+    expect(
+      verifiedIdentityTargets(
+        candidates,
+        info([`2 1 8:1 ${root} /workspaces rw - ext4 /dev/sda1 rw`, `3 1 8:1 ${root}/api/src /workspaces/api/src rw - ext4 /dev/sda1 rw`, `4 1 8:1 ${root}/api/lib /workspaces/api/lib rw`]),
+      ),
+    ).toEqual(new Set(['/workspaces/api/src', '/workspaces/api/lib']));
+    // A link in the volume: lib -> data, Docker mounted data there.
+    expect(verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `4 1 8:1 ${root}/api/data /workspaces/api/lib rw`]))).toEqual(new Set());
+    // Another device, a mount over it later (the last line counts), no mount at /workspaces, an empty text.
+    expect(verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `3 1 8:2 ${root}/api/src /workspaces/api/src rw`]))).toEqual(new Set());
+    expect(
+      verifiedIdentityTargets(candidates, info([`2 1 8:1 ${root} /workspaces rw`, `3 1 8:1 ${root}/api/src /workspaces/api/src rw`, `5 3 0:50 / /workspaces/api/src rw - tmpfs tmpfs rw`])),
+    ).toEqual(new Set());
+    expect(verifiedIdentityTargets(candidates, info([`3 1 8:1 ${root}/api/src /workspaces/api/src rw`]))).toEqual(new Set());
+    expect(verifiedIdentityTargets(candidates, '')).toEqual(new Set());
+    // A volume that is its own file system (root `/`), and the kernel's escapes.
+    const spaced = [{ target: '/workspaces/api/my src', subpath: 'api/my src' }];
+    expect(verifiedIdentityTargets(spaced, info(['2 1 0:77 / /workspaces rw', '3 1 0:77 /api/my\\040src /workspaces/api/my\\040src rw']))).toEqual(new Set(['/workspaces/api/my src']));
+  });
+
+  it('leaves the verified targets out of devMountFolders, and keeps a real alias (pgview) protected', () => {
+    expect(devMountFolders(container, env, 'on', new Set(['/workspaces/api/src', '/workspaces/api/pgview', '/workspaces/api/tools', '/workspaces/api/bin']))).toEqual([
+      '/workspaces/api/lib',
+      '/workspaces/api/pgview',
+      '/workspaces/api/docs',
+      '/workspaces/api/tools',
+      '/workspaces/api/bin',
+    ]);
+    // Without verification: all protected, as before.
+    expect(devMountFolders(container, env, 'on')).toEqual([
+      '/workspaces/api/src',
+      '/workspaces/api/lib',
+      '/workspaces/api/pgview',
+      '/workspaces/api/docs',
+      '/workspaces/api/tools',
+      '/workspaces/api/bin',
+    ]);
+  });
+});
+
+describe('devMountFolders (review round 12, D12-2)', () => {
+  const env = { repository: 'acme/api', volumeName: 'acme-api-3f2a9c1e' };
+  it('names the targets below the repository of every mount but the workspace volume', () => {
+    expect(
+      devMountFolders(
+        {
+          mountTargets: [
+            { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+            { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces/api/src' },
+            { type: 'volume', volume: 'node_modules', target: '/workspaces/api/node_modules/' },
+            { type: 'volume', target: '/workspaces/api/.cache//x' },
+            { type: 'tmpfs', target: '/workspaces/api/tmp' },
+            { type: 'bind', target: '/workspaces/api/node_modules/sub' },
+            { type: 'bind', target: '/workspaces/api' },
+            { type: 'bind', target: '/workspaces/api/../other' },
+            { type: 'volume', volume: 'x', target: '/workspaces/api/.git/x' },
+            { type: 'volume', volume: 'y', target: 'relative' },
+            { type: 'bind', target: '/home/vscode' },
+          ],
+        },
+        env,
+        'on',
+      ),
+      // Review round 13, D13-1: the subpath mount of the workspace volume at /workspaces/api/src is protected too (an
+      // alias of files of the volume, which `find -xdev` walks); before: left out like the mount at /workspaces.
+      // Review round 15, K4: the volume at /workspaces/api/.git/x is protected too (before: dropped by the filter of .git).
+    ).toEqual(['/workspaces/api/src', '/workspaces/api/node_modules', '/workspaces/api/.cache/x', '/workspaces/api/tmp', '/workspaces/api/.git/x']);
+    expect(devMountFolders(undefined, env, 'on')).toEqual([]);
+    expect(devMountFolders({}, env, 'on')).toEqual([]);
+  });
+
+  it('protects the alias mounts of the workspace volume below the repository, only not the mount at /workspaces (review round 13, D13-1)', () => {
+    const mounts = (targets: string[]) => ({
+      mountTargets: [
+        { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+        ...targets.map((target) => ({ type: 'volume', volume: 'acme-api-3f2a9c1e', target })),
+      ],
+    });
+    // ./data:/workspaces/api/pgview of the dev service, rewritten to a subpath of the workspace volume (db mounts ./data).
+    expect(devMountFolders(mounts(['/workspaces/api/pgview']), env, 'on')).toEqual(['/workspaces/api/pgview']);
+    // `..` (the subpath `` or `api/..`) mounted below the repository; the repository folder itself is not protected.
+    expect(devMountFolders(mounts(['/workspaces/api/parent/', '/workspaces/api', '/workspaces/api/']), env, 'on')).toEqual(['/workspaces/api/parent']);
+    expect(devMountFolders(mounts(['/workspaces/', '/workspaces/other']), env, 'on')).toEqual([]);
+  });
+
+  it('gives an anonymous volume of the dev container the full fix, and keeps named volumes and binds protected (review round 13, D13-3)', () => {
+    const anonymous = 'a'.repeat(64);
+    const container = {
+      mountTargets: [
+        { type: 'volume', volume: anonymous, target: '/workspaces/api/node_modules' },
+        { type: 'volume', volume: 'api-cache', target: '/workspaces/api/.cache' },
+        { type: 'volume', volume: `${'b'.repeat(63)}g`, target: '/workspaces/api/x' },
+        { type: 'bind', target: '/workspaces/api/host' },
+        { type: 'bind', volume: anonymous, target: '/workspaces/api/odd' },
+      ],
+    };
+    expect(devMountFolders(container, env, 'on')).toEqual(['/workspaces/api/.cache', '/workspaces/api/x', '/workspaces/api/host', '/workspaces/api/odd']);
+    // With the checks off, a configuration may name the anonymous volume of another container: it stays protected.
+    expect(devMountFolders(container, env, 'off')).toEqual([
+      '/workspaces/api/node_modules',
+      '/workspaces/api/.cache',
+      '/workspaces/api/x',
+      '/workspaces/api/host',
+      '/workspaces/api/odd',
+    ]);
+  });
+
+  it('keeps the targets in .git: a volume that db shares, and a bind of the computer with the checks off (review round 15, K4)', () => {
+    const container = {
+      mountTargets: [
+        { type: 'volume', volume: 'proj_pgdata', target: '/workspaces/api/.git/pg' },
+        { type: 'bind', target: '/workspaces/api/.git/hooks' },
+        { type: 'volume', volume: 'proj_pgdata', target: '/workspaces/api/sub/.git/pg/' },
+      ],
+    };
+    expect(devMountFolders({ mountTargets: container.mountTargets.slice(0, 1) }, env, 'on')).toEqual(['/workspaces/api/.git/pg']);
+    expect(devMountFolders(container, env, 'off')).toEqual(['/workspaces/api/.git/pg', '/workspaces/api/.git/hooks', '/workspaces/api/sub/.git/pg']);
+    // Still not the repository folder, `..`, or a path outside of it.
+    expect(devMountFolders({ mountTargets: [{ type: 'bind', target: '/workspaces/api/.git/../..' }] }, env, 'off')).toEqual([]);
   });
 });

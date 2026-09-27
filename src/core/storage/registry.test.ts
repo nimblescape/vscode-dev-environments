@@ -124,6 +124,10 @@ describe('EnvironmentRegistry reading', () => {
       busy: { operation: 'rebuild', since: 'x', pid: 12, windowId: 'w' },
       owner: { id: '1001', login: 'octo' },
       refusedUpdate: { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:1', images: { 'node:20': 'sha256:a' }, features: {}, items: 'privileged mode' },
+      // Review round 1 of unit 6 (D1).
+      serviceVolumes: ['myapp-db'],
+      // Review round 10 of unit 6 (D10-1).
+      serviceFolders: ['/workspaces/r/data'],
     });
     writeRaw({
       version: 1,
@@ -139,6 +143,8 @@ describe('EnvironmentRegistry reading', () => {
           remoteUser: 5,
           shutdownActionNone: 'yes',
           additionalVolumes: ['a', 3],
+          serviceVolumes: ['', 'b'],
+          serviceFolders: ['/workspaces/c/data', 7],
           lastBuildNumber: 1.5,
           owner: { id: '../1001', login: 'octo' },
           refusedUpdate: { configPath: '.devcontainer/devcontainer.json', configHash: 'sha256:1', images: { 'node:20': 1 }, features: {}, items: 'x' },

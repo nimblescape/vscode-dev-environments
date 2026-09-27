@@ -10,14 +10,14 @@ import { isBlockingBusyMark } from '../core/busy';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage, isUserFacingError } from '../core/errors';
-import { Actions, Messages, formatChanges } from '../core/messages';
+import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import type { WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo, type ClaimMode, type EnvironmentClaims } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
-import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
-import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
+import { PipelineTexts, type ConfigurationKindChange, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
+import { containerIsCurrent, isUnrestrictedContainer, repositoryServiceDataFolders } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import { pendingVolumesToRemove, type SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -612,9 +612,20 @@ export class Controller implements vscode.Disposable {
           : '';
         // Without a summary (the volume is missing), the confirmation follows at once.
         const changes = summary ? formatChanges(summary) : '';
+        // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
+        // confirmation names them, as the question about the data volumes of the services (D-19) names those.
+        // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
+        // of an entry that was restored from its volumes, without a record).
+        const repositoryData = [
+          ...new Set([
+            ...repositoryServiceDataFolders((await this.deps.registry.get(environment.id)) ?? environment),
+            ...(await this.deps.service.repositoryServiceData(environment.id).catch(() => [])),
+          ]),
+        ];
+        const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
         if (changes !== '') {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteUnsaved(repository, changes)}${otherWindow}`,
+            `${Messages.deleteUnsaved(repository, changes)}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.openEnvironment,
             Actions.deleteAnyway,
@@ -623,7 +634,7 @@ export class Controller implements vscode.Disposable {
           if (choice !== Actions.deleteAnyway) return;
         } else {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteConfirm(repository)}${otherWindow}`,
+            `${Messages.deleteConfirm(repository)}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.delete,
           );
@@ -643,6 +654,24 @@ export class Controller implements vscode.Disposable {
           );
           if (choice === undefined) return;
           additionalVolumesToRemove = choice === Actions.remove ? [...volumes] : [];
+        }
+        // D-19: the volumes of a Docker Compose project hold the data of its services (for example a database). They are
+        // listed apart, none ticked: only the ticked ones are removed, and Escape cancels the Delete.
+        const serviceData = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableServiceDataVolumes(confirmed.id) : [];
+        if (serviceData.length > 0) {
+          // Review round 3 (P3-4): an environment whose services are not known lists its additional volumes as possible data.
+          const possibly = await this.deps.service.possibleServiceDataVolumes(confirmed.id);
+          const placeHolder = possibly.length > 0 ? Messages.deleteServiceDataPossiblePlaceholder : Messages.deleteServiceDataPlaceholder;
+          const picked = await vscode.window.showQuickPick(
+            serviceData.map((name) => ({
+              label: name,
+              description: possibly.includes(name) ? Messages.deleteServiceDataPossibleItem : Messages.deleteServiceDataItem,
+              picked: false,
+            })),
+            { title: Messages.deleteServiceDataTitle, placeHolder, canPickMany: true, ignoreFocusOut: true },
+          );
+          if (picked === undefined) return;
+          additionalVolumesToRemove = [...additionalVolumesToRemove, ...picked.map((item) => item.label)];
         }
         // Concept 7.15: Delete is possible in every state; during an operation of another window it runs afterwards.
         if (!(await this.waitForOtherWindowOperation(repository, environment.id))) return;
@@ -1201,7 +1230,7 @@ export class Controller implements vscode.Disposable {
   private async switchEnvironmentBranch(target: Target, environment: Environment, branch: string): Promise<void> {
     const repository = this.displayName(target);
     const connectedHere = this.isConnectedHere(environment);
-    let configurationChanged = false;
+    let configurationChanged: boolean | ConfigurationKindChange = false;
     const switched = await this.operation(
       repository,
       'Switch branch',
@@ -1224,8 +1253,16 @@ export class Controller implements vscode.Disposable {
         this.current.branch = branch;
         this.updateStatusBar();
       }
-      // Concept 7.12: a changed configuration offers Rebuild now; Later keeps the window connected.
-      if (configurationChanged && (await this.deps.ui.configurationChanged(repository)) === 'rebuildNow') {
+      // Concept 7.12: a changed configuration offers Rebuild now; Later keeps the window connected. Review round 5 (D5-3):
+      // a switch between Docker Compose and a single container asks as the pipeline asks (configurationKindChanged).
+      const changed = configurationChanged as boolean | ConfigurationKindChange;
+      const answer =
+        typeof changed === 'object'
+          ? await this.deps.ui.configurationKindChanged(repository, changed.question)
+          : changed
+            ? await this.deps.ui.configurationChanged(repository)
+            : 'later';
+      if (answer === 'rebuildNow') {
         await this.handOff(target, environment, { operation: 'rebuild', reason: 'configChanged' }, 'rebuild');
       }
       return;
@@ -1808,7 +1845,7 @@ export class Controller implements vscode.Disposable {
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;
     try {
-      const container = await this.deps.docker.findContainer(environment.id);
+      const container = await this.deps.docker.findContainer(environment.id, environment.containerName);
       if (container === undefined) return undefined;
       const checks = hostAccessChecks(environment.repository, this.deps.settings());
       if (containerIsCurrent(container.labels, true, checks)) return undefined;

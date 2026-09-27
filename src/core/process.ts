@@ -3,10 +3,34 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { spawn } from 'child_process';
+import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
 import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
 
-/** ProcessRunner with `child_process.spawn`, without a shell. */
+/**
+ * Review round 9 (S9-2): a program printed more than MAX_CAPTURED_OUTPUT_BYTES on its standard output. It was stopped,
+ * and its run fails: an output cut at the limit is never used as a result.
+ */
+export class OutputTooLargeError extends Error {
+  readonly code = 'EOUTPUTTOOLARGE';
+  constructor(file: string, limitBytes: number) {
+    super(`The output of ${file} is larger than ${Math.round(limitBytes / (1024 * 1024))} MB. It was stopped.`);
+    this.name = 'OutputTooLargeError';
+  }
+}
+
+/**
+ * ProcessRunner with `child_process.spawn`, without a shell. Review round 9 (S9-2): at most `maxStdoutBytes` of
+ * standard output are kept; beyond, the program is stopped and `run` rejects with OutputTooLargeError. Review round 10
+ * (S10-5): of the standard error output, only the last `maxStderrCharacters` characters are kept (the program goes on;
+ * `onStderr` still gets all of it), so that an endless log (for example of a lifecycle command of `devcontainer up`,
+ * which has no time limit) cannot fill the memory of the extension host.
+ */
 export class NodeProcessRunner implements ProcessRunner {
+  constructor(
+    private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
+    private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
+  ) {}
+
   run(file: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     return new Promise((resolve, reject) => {
       if (options.signal?.aborted) {
@@ -22,6 +46,8 @@ export class NodeProcessRunner implements ProcessRunner {
       });
       let stdout = '';
       let stderr = '';
+      let stdoutBytes = 0;
+      let tooLarge = false;
       let timedOut = false;
       let aborted = false;
       let settled = false;
@@ -39,9 +65,21 @@ export class NodeProcessRunner implements ProcessRunner {
       const onStderr = (text: string) => {
         if (text === '') return;
         stderr += text;
+        // Cut to the limit only once it is twice as long: linear time, however small the chunks are.
+        if (stderr.length > 2 * this.maxStderrCharacters) stderr = stderr.slice(-this.maxStderrCharacters);
         options.onStderr?.(text);
       };
-      child.stdout.on('data', (chunk: Buffer) => onStdout(stdoutDecoder.decode(chunk, { stream: true })));
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (tooLarge) return;
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > this.maxStdoutBytes) {
+          tooLarge = true;
+          stdout = '';
+          child.kill();
+          return;
+        }
+        onStdout(stdoutDecoder.decode(chunk, { stream: true }));
+      });
       child.stderr.on('data', (chunk: Buffer) => onStderr(stderrDecoder.decode(chunk, { stream: true })));
 
       const timer =
@@ -72,13 +110,18 @@ export class NodeProcessRunner implements ProcessRunner {
         if (settled) return;
         settled = true;
         finish();
-        // The rest of an incomplete character at the end of the output.
-        onStdout(stdoutDecoder.decode());
-        onStderr(stderrDecoder.decode());
         if (aborted) {
           reject(abortError());
           return;
         }
+        if (tooLarge) {
+          reject(new OutputTooLargeError(file, this.maxStdoutBytes));
+          return;
+        }
+        // The rest of an incomplete character at the end of the output.
+        onStdout(stdoutDecoder.decode());
+        onStderr(stderrDecoder.decode());
+        if (stderr.length > this.maxStderrCharacters) stderr = stderr.slice(-this.maxStderrCharacters);
         resolve({ exitCode: code, stdout, stderr, timedOut });
       });
 

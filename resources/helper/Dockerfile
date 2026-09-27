@@ -11,8 +11,9 @@ FROM ${BASE_IMAGE}
 # Passed by the extension (DEVCONTAINER_CLI_VERSION in src/core/helper/helperImage.ts).
 ARG DEVCONTAINER_CLI_VERSION
 
-# Git, the Docker CLI with the buildx plugin (from download.docker.com), and tini as init process,
-# so that a stop signal reaches the Dev Container CLI and Git.
+# Git, the Docker CLI with the buildx and the Compose plugins (from download.docker.com), and tini as init process,
+# so that a stop signal reaches the Dev Container CLI and Git. The Compose plugin runs Docker Compose configurations
+# (implementation notes, section "Docker Compose").
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
@@ -23,7 +24,8 @@ RUN set -eux; \
     . /etc/os-release; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin; \
+    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin; \
+    docker compose version; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 

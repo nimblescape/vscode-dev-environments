@@ -452,6 +452,11 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['remoteWorkspaceFolder', isString],
   ['shutdownActionNone', (value) => typeof value === 'boolean'],
   ['additionalVolumes', (value) => Array.isArray(value) && value.every(isNonEmptyString)],
+  ['serviceVolumes', (value) => Array.isArray(value) && value.every(isNonEmptyString)],
+  // Review round 10 (D10-1).
+  ['serviceFolders', (value) => Array.isArray(value) && value.every(isNonEmptyString)],
+  // Review round 11 (G5).
+  ['serviceFoldersOverflow', (value) => typeof value === 'boolean'],
   ['lastBuildNumber', isCount],
   ['owner', isOwner],
   ['refusedUpdate', isRefusedUpdate],

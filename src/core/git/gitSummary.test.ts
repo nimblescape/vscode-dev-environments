@@ -8,12 +8,25 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  CONFIG_OWNERSHIP_FIX_SCRIPT,
   GIT_SUMMARY_SCRIPT,
   OWNERSHIP_FIX_SCRIPT,
+  MAX_SERVICE_ARGUMENT_CHARACTERS,
+  MAX_SERVICE_FOLDERS,
+  MAX_SERVICE_PATH_DEPTH,
+  MAX_SERVICE_PATH_LENGTH,
+  MAX_SERVICE_REAL_PATHS,
+  boundServiceFolders,
+  configOwnershipFixCommand,
   gitSummaryCommand,
+  isNumericId,
   ownershipFixCommand,
   parseGitSummaryOutput,
+  serviceFolderPaths,
+  servicePathArguments,
+  servicePrunePatterns,
 } from './gitSummary';
+import { devMountFolders, verifiedIdentityTargets, workspaceIdentityMounts } from '../pipeline/pipelineRules';
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';
 
@@ -122,6 +135,75 @@ describe('commands', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     expect(fs.statSync(path.join(dir, 'sub', 'file.txt')).uid).toBe(os.userInfo().uid);
+  });
+});
+
+describe('review round 9 (D9-1): the ownership fix leaves out the paths that other services mount', () => {
+  const REPO = '/workspaces/api';
+
+  it('passes each path as one argument, escaped as a pattern of find -path, and only paths below the repository', () => {
+    expect(servicePrunePatterns(REPO, [`${REPO}/data/postgres`, `${REPO}/-data/my db`, `${REPO}/a*b/[x]?\\y`])).toEqual([
+      `${REPO}/data/postgres`,
+      `${REPO}/-data/my db`,
+      `${REPO}/a\\*b/\\[x]\\?\\\\y`,
+    ]);
+    // Never the repository itself, a path outside of it, a relative path, `..`, or a duplicate.
+    expect(servicePrunePatterns(REPO, [REPO, `${REPO}/`, '/workspaces/other/data', 'data', `${REPO}/../other`, `${REPO}//x`, `${REPO}/x`, `${REPO}/x`])).toEqual([
+      `${REPO}/x`,
+    ]);
+    expect(servicePrunePatterns(REPO, undefined)).toEqual([]);
+    // Review round 10 (D10-3): never .git or a path in it (Git writes there as root), also from a record written before.
+    expect(servicePrunePatterns(REPO, [`${REPO}/.git`, `${REPO}/.git/objects`, `${REPO}/sub/.git`, `${REPO}/.github`, `${REPO}/x.git`])).toEqual([`${REPO}/.github`, `${REPO}/x.git`]);
+    // Review round 11, G5: the command holds the ready arguments of find (servicePathArguments), not the patterns.
+    expect(ownershipFixCommand(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual([
+      'sh',
+      '-c',
+      OWNERSHIP_FIX_SCRIPT,
+      'sh',
+      REPO,
+      'vscode',
+      '-path',
+      `${REPO}/data/postgres`,
+      '-o',
+      '-path',
+      `${REPO}/data/postgres/*`,
+    ]);
+  });
+
+  it('turns the parameters into -path arguments without reading them as shell text', () => {
+    // Review round 11, G5: servicePathArguments builds the arguments in TypeScript (before: the shell text
+    // SERVICE_PATH_ARGUMENTS from the positional parameters); the shell still gets each one as one argument.
+    const script = `shift 3\nprintf '<%s>\\n' "$@"`;
+    const result = spawnSync('sh', ['-c', script, 'sh', 'a', 'b', 'c', ...servicePathArguments('/r', ['/r/-x y', '/r/$(touch z)'])], { encoding: 'utf8' });
+    // Review round 10, D10-3: the test "in a path of a service" (the paths and everything below them), no -prune: the fix
+    // still gives the files of root in them their owner (before: `-path P -prune -o` for each pattern).
+    expect(result.stdout).toBe('<-path>\n</r/-x y>\n<-o>\n<-path>\n</r/-x y/*>\n<-o>\n<-path>\n</r/$(touch z)>\n<-o>\n<-path>\n</r/$(touch z)/*>\n');
+    expect(servicePathArguments('/r', [])).toEqual([]);
+    expect(servicePathArguments('/r', undefined)).toEqual([]);
+  });
+
+  it('changes the owner of every file but the pruned paths and their content (with spaces and a leading -)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'api');
+    const bin = path.join(root, 'bin');
+    const log = path.join(root, 'chown.log');
+    for (const folder of ['src', 'data/postgres/base', '-data/my db', 'datax']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'data/postgres/base/1', 'data/keep.txt', '-data/my db/f', 'datax/g']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The user 4242 owns none of the files: the fix would change all of them; chown only writes its arguments.
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'chown'), `#!/bin/sh\nshift 2\nfor f do printf '%s\\n' "$f" >> '${log}'; done\n`, { mode: 0o755 });
+    // Review round 10, D10-3: the data of the services has the owner that they give it, not root (the tests may run as
+    // root): the fix leaves files of root in these paths no more.
+    if (process.getuid?.() === 0) {
+      for (const file of ['data/postgres', 'data/postgres/base', 'data/postgres/base/1', '-data/my db', '-data/my db/f']) fs.chownSync(path.join(repo, file), 999, 999);
+    }
+    const [file, ...args] = ownershipFixCommand(repo, 'someone', [`${repo}/data/postgres`, `${repo}/-data/my db`]);
+    const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const changed = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => path.relative(repo, line)).sort();
+    expect(changed).toEqual(['', '-data', 'data', 'data/keep.txt', 'datax', 'datax/g', 'src', 'src/a.ts']);
   });
 });
 
@@ -264,5 +346,578 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     const result = runSummary(tempDir());
     expect(result.status).not.toBe(0);
     expect(result.stderr).not.toBe('');
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 10 (D10-2, D10-3): the ownership fix in the paths that other services mount, with real tools as root', () => {
+  function run(repo: string, user: string, folders: string[]): void {
+    const [file, ...args] = ownershipFixCommand(repo, user, folders);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  }
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives files and folders of root in those paths their owner, and leaves the data of a service alone (D10-3)', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['data/base', 'frontend/src/new', 'nginx']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['data/PG_VERSION', 'data/base/1', 'data/tracked.conf', 'frontend/src/app.ts', 'frontend/src/new/b.ts', 'nginx/default.conf', 'top.txt']) {
+      fs.writeFileSync(path.join(repo, file), 'x');
+    }
+    // The data of Postgres (uid 999); tracked.conf and the source of the frontend were rewritten by root (git switch).
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    run(repo, 'nobody', [`${repo}/data`, `${repo}/frontend`, `${repo}/nginx`]);
+    // Before: every file of these paths kept its owner, also root.
+    for (const file of ['data/tracked.conf', 'frontend', 'frontend/src/app.ts', 'frontend/src/new', 'frontend/src/new/b.ts', 'nginx/default.conf', 'top.txt', '.']) {
+      expect(uidOf(path.join(repo, file)), file).toBe(nobody);
+    }
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) expect(uidOf(path.join(repo, file)), file).toBe(999);
+  });
+
+  it('leaves the real folder of a service behind a link in the repository alone, once it is recorded (D10-2)', () => {
+    const repo = path.join(tempDir(), 'api');
+    fs.mkdirSync(path.join(repo, '.local/pg'), { recursive: true });
+    fs.symlinkSync('.local/pg', path.join(repo, 'data'));
+    fs.writeFileSync(path.join(repo, '.local/pg/PG_VERSION'), '16');
+    fs.chownSync(path.join(repo, '.local/pg'), 999, 999);
+    fs.chownSync(path.join(repo, '.local/pg/PG_VERSION'), 999, 999);
+    // The paths as composeUpModel records them: the link and its real path.
+    run(repo, 'nobody', [`${repo}/data`, `${repo}/.local/pg`]);
+    expect(uidOf(path.join(repo, '.local/pg/PG_VERSION'))).toBe(999);
+    expect(uidOf(path.join(repo, '.local'))).toBe(nobody);
+    // The link itself belonged to root: it gets the owner (chown -h), its target does not.
+    expect(uidOf(path.join(repo, 'data'))).toBe(nobody);
+  });
+});
+
+describe('review round 11 (G3, G5): the list of the paths of the services, bounded, and its arguments of find', () => {
+  const REPO = '/workspaces/api';
+
+  it('drops a path below another path of the list, and keeps the order', () => {
+    expect(serviceFolderPaths(REPO, [`${REPO}/data/pg`, `${REPO}/x`, `${REPO}/data`, `${REPO}/data/pg/base`, `${REPO}/datax`, `${REPO}/x`])).toEqual([
+      `${REPO}/x`,
+      `${REPO}/data`,
+      `${REPO}/datax`,
+    ]);
+    // Before: a pattern for each path, also the ones that the test `-path <path>/*` of another covers.
+    expect(servicePrunePatterns(REPO, [`${REPO}/a*`, `${REPO}/a*/b`])).toEqual([`${REPO}/a\\*`]);
+  });
+
+  it('bounds the list that per-run paths (such as ./data/${HOSTNAME}) grow at each open', () => {
+    let record: { folders: string[]; overflow: boolean } = { folders: [], overflow: false };
+    // Each open: the path of this run in the model, and the recorded paths of the earlier runs, which still exist.
+    for (let run = 0; run < 1500; run++) record = boundServiceFolders(REPO, [[`${REPO}/data/host-${run}`], [], record.folders], record.overflow);
+    // Before: the union never shrank, and grew by one path per open.
+    expect(record.folders).toHaveLength(MAX_SERVICE_FOLDERS);
+    expect(record.folders[0]).toBe(`${REPO}/data/host-1499`);
+    expect(record.overflow).toBe(true);
+    // Over the bound, the ownership fixes leave the whole repository to the services (only the files of root change).
+    expect(servicePathArguments(REPO, record.overflow ? 'repository' : record.folders)).toEqual(['-path', REPO, '-o', '-path', `${REPO}/*`]);
+    // The overflow stays: the paths beyond the bound are not recorded.
+    expect(boundServiceFolders(REPO, [[`${REPO}/data/pg`]], true)).toEqual({ folders: [`${REPO}/data/pg`], overflow: true });
+    expect(boundServiceFolders(REPO, [[`${REPO}/data/pg`], undefined, [`${REPO}/data/pg`, REPO]])).toEqual({ folders: [`${REPO}/data/pg`], overflow: false });
+  });
+
+  it('builds the arguments of 5000 paths in linear time, and falls back to the whole repository over the bounds', () => {
+    const many = Array.from({ length: 5000 }, (_, i) => `${REPO}/data/host-${i}`);
+    const started = performance.now();
+    const over = servicePathArguments(REPO, many);
+    const list = serviceFolderPaths(REPO, many);
+    const bounded = boundServiceFolders(REPO, [many]);
+    const exact = servicePathArguments(REPO, many.slice(0, MAX_SERVICE_FOLDERS));
+    const elapsed = performance.now() - started;
+    // Before: SERVICE_PATH_ARGUMENTS rebuilt "$@" in the shell for each pattern: 51 s for 5000 patterns in dash.
+    expect(elapsed).toBeLessThan(1000);
+    expect(list).toHaveLength(5000);
+    expect(bounded.folders).toHaveLength(MAX_SERVICE_FOLDERS);
+    expect(over).toEqual(['-path', REPO, '-o', '-path', `${REPO}/*`]);
+    expect(exact).toHaveLength(6 * MAX_SERVICE_FOLDERS - 1);
+    expect(exact.slice(0, 6)).toEqual(['-path', `${REPO}/data/host-0`, '-o', '-path', `${REPO}/data/host-0/*`, '-o']);
+    // The command line stays below the bound of its characters (Windows: 32767 for the whole command line).
+    expect(exact.join(' ').length).toBeLessThan(MAX_SERVICE_ARGUMENT_CHARACTERS + 20 * MAX_SERVICE_FOLDERS);
+    const long = Array.from({ length: 300 }, (_, i) => `${REPO}/${'x'.repeat(1000)}/${i}`);
+    expect(servicePathArguments(REPO, long)).toEqual(['-path', REPO, '-o', '-path', `${REPO}/*`]);
+    // The whole repository folder is escaped as a pattern too.
+    expect(servicePathArguments('/workspaces/a*b', 'repository')).toEqual(['-path', '/workspaces/a\\*b', '-o', '-path', '/workspaces/a\\*b/*']);
+  });
+
+  it.skipIf(!hasDash)('runs the ownership fix with the arguments of 1000 paths in dash quickly', () => {
+    const repo = path.join(tempDir(), 'api');
+    fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), 'x');
+    const [, ...args] = ownershipFixCommand(repo, os.userInfo().username, Array.from({ length: MAX_SERVICE_FOLDERS }, (_, i) => `${repo}/data/host-${i}`));
+    const started = performance.now();
+    const result = spawnSync('dash', args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe('review round 12 (S12-1): the nested-path filter in linear time, with bounds of length and depth', () => {
+  const REPO = '/workspaces/repo';
+  const WHOLE = ['-path', REPO, '-o', '-path', `${REPO}/*`];
+
+  it('filters 1000 paths at depth 2000 in well under 100 ms, as overflow', () => {
+    const deep = Array.from({ length: 1000 }, (_, i) => `${REPO}/${'a/'.repeat(2000)}x${i}`);
+    let started = performance.now();
+    const list = serviceFolderPaths(REPO, deep);
+    // Before: 6 s for serviceFolderPaths alone (the lookup of each ancestor, O(depth x length) per path).
+    expect(performance.now() - started).toBeLessThan(100);
+    started = performance.now();
+    const bounded = boundServiceFolders(REPO, [deep, deep, deep]);
+    const args = servicePathArguments(REPO, deep);
+    // Before: about 12 s together.
+    expect(performance.now() - started).toBeLessThan(500);
+    // Never dropped: the paths over the bounds stay in the list, and make it overflow.
+    expect(list).toHaveLength(1000);
+    expect(bounded).toEqual({ folders: [], overflow: true });
+    expect(args).toEqual(WHOLE);
+  });
+
+  it('filters 1000 long paths within the bounds in linear time', () => {
+    // Depth 251 and about 4000 characters each: at the bounds.
+    const deep = `${REPO}/${'abcdefghijklmno/'.repeat(250)}`;
+    const paths = Array.from({ length: 1000 }, (_, i) => `${deep}x${i}`);
+    let started = performance.now();
+    const list = serviceFolderPaths(REPO, paths);
+    // Before: several seconds (a lookup of each of the 250 ancestors of each path).
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(list).toEqual(paths);
+    // With a path that covers them all, after them: only it stays.
+    started = performance.now();
+    expect(serviceFolderPaths(REPO, [...paths, `${REPO}/abcdefghijklmno`])).toEqual([`${REPO}/abcdefghijklmno`]);
+    expect(serviceFolderPaths(REPO, [...paths, `${deep}x1/y`, deep.slice(0, -1)])).toEqual([deep.slice(0, -1)]);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it('treats a path over the length or depth bound as overflow, unless a path of the list covers it', () => {
+    const long = `${REPO}/${'x'.repeat(MAX_SERVICE_PATH_LENGTH)}`;
+    const deep = `${REPO}/${'d/'.repeat(MAX_SERVICE_PATH_DEPTH)}e`;
+    const atDepth = `${REPO}/${'d/'.repeat(MAX_SERVICE_PATH_DEPTH - 1)}e`;
+    expect(boundServiceFolders(REPO, [[`${REPO}/pg`, long]])).toEqual({ folders: [`${REPO}/pg`], overflow: true });
+    expect(boundServiceFolders(REPO, [[deep, `${REPO}/pg`]])).toEqual({ folders: [`${REPO}/pg`], overflow: true });
+    expect(servicePathArguments(REPO, [`${REPO}/pg`, deep])).toEqual(WHOLE);
+    // At the bound, a path is named on its own.
+    expect(boundServiceFolders(REPO, [[atDepth]])).toEqual({ folders: [atDepth], overflow: false });
+    expect(servicePathArguments(REPO, [atDepth])).toEqual(['-path', atDepth, '-o', '-path', `${atDepth}/*`]);
+    // Covered by a path of the list: its test `-path <path>/*` names it.
+    expect(boundServiceFolders(REPO, [[deep, `${REPO}/d`]])).toEqual({ folders: [`${REPO}/d`], overflow: false });
+    expect(boundServiceFolders(REPO, [[`${REPO}/${'x'.repeat(MAX_SERVICE_PATH_LENGTH)}/y`, `${REPO}/${'x'.repeat(10)}`]])).toMatchObject({ overflow: true });
+  });
+
+  it('keeps the results for normal inputs, in the input order', () => {
+    expect(serviceFolderPaths(REPO, [`${REPO}/b/c`, `${REPO}/a`, `${REPO}/b`, `${REPO}/a/x`, `${REPO}/a-b`, `${REPO}/a b/c`, `${REPO}/b/c`])).toEqual([
+      `${REPO}/a`,
+      `${REPO}/b`,
+      `${REPO}/a-b`,
+      `${REPO}/a b/c`,
+    ]);
+    expect(serviceFolderPaths(REPO, [`${REPO}/a/b/c`, `${REPO}/a/b`, `${REPO}/a/bc`])).toEqual([`${REPO}/a/b`, `${REPO}/a/bc`]);
+  });
+});
+
+describe('review round 12 (P12-2): the ownership fix resolves the paths of the services behind links', () => {
+  /** Runs the ownership fix with a fake `find` that prints its arguments (one per line), and `id` that prints 4242. */
+  function findArguments(repo: string, folders: string[] | 'repository'): string[] {
+    const bin = path.join(path.dirname(repo), 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'find'), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o755 });
+    const [file, ...args] = ownershipFixCommand(repo, 'someone', folders);
+    const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    return result.stdout.split('\n').slice(0, -1);
+  }
+  const test = (paths: string[]) => paths.flatMap((p, i) => [...(i > 0 ? ['-o'] : []), '-path', p, '-o', '-path', `${p}/*`]);
+  const fix = (repo: string, inPaths: string[]) => [repo, '-xdev', '(', '(', ...inPaths, ')', '-user', '0', '-o', '!', '(', ...inPaths, ')', '(', '!', '-user', '4242', '-o', '!', '-group', '4242', ')', ')', '-exec', 'chown', '-h', '4242:4242', '{}', '+'];
+
+  function repository(): string {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['storage/pg', 'lib/x', '.git/objects']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'storage/app.conf'), 'x');
+    return repo;
+  }
+
+  it('adds the real path of a folder and of a file behind a link, in the repository', () => {
+    const repo = repository();
+    fs.symlinkSync('storage/pg', path.join(repo, 'data'));
+    fs.symlinkSync(`${repo}/storage/app.conf`, path.join(repo, 'app.conf'));
+    // A path below a link, and a path without a link (unchanged).
+    fs.symlinkSync('storage', path.join(repo, 'store'));
+    expect(findArguments(repo, [`${repo}/data`, `${repo}/app.conf`, `${repo}/store/pg`, `${repo}/lib/x`])).toEqual(
+      fix(repo, [
+        ...test([`${repo}/data`, `${repo}/app.conf`, `${repo}/store/pg`, `${repo}/lib/x`]),
+        '-o',
+        // Review round 13, D13-2: a real path is added once (before: storage/pg twice, for data and for store/pg).
+        ...test([`${repo}/storage/pg`, `${repo}/storage/app.conf`]),
+      ]),
+    );
+  });
+
+  it('adds no real path outside the repository, of the repository itself, or in .git', () => {
+    const repo = repository();
+    const outside = path.join(path.dirname(repo), 'outside');
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(repo, 'out'));
+    fs.symlinkSync('.', path.join(repo, 'self'));
+    fs.symlinkSync('.git/objects', path.join(repo, 'objects'));
+    fs.symlinkSync('missing', path.join(repo, 'dangling'));
+    const folders = [`${repo}/out`, `${repo}/self`, `${repo}/objects`, `${repo}/nothing`];
+    expect(findArguments(repo, folders)).toEqual(fix(repo, test(folders)));
+    // A link that leads nowhere: its target in the repository (readlink -f) is protected too.
+    expect(findArguments(repo, [`${repo}/dangling`])).toEqual(fix(repo, [...test([`${repo}/dangling`]), '-o', ...test([`${repo}/missing`])]));
+  });
+
+  it('counts the whole repository as a path of the services for a real path with a pattern character, or too many', () => {
+    const repo = repository();
+    fs.mkdirSync(path.join(repo, 'st*rage'));
+    fs.symlinkSync('st*rage', path.join(repo, 'data'));
+    const onlyRoot = [repo, '-xdev', '-user', '0', '-exec', 'chown', '-h', '4242:4242', '{}', '+'];
+    expect(findArguments(repo, [`${repo}/data`])).toEqual(onlyRoot);
+    // A path of a service with a pattern character (escaped with a backslash for -path): it cannot be resolved as written.
+    expect(findArguments(repo, [`${repo}/st*rage`])).toEqual(onlyRoot);
+    const links = Array.from({ length: MAX_SERVICE_REAL_PATHS + 1 }, (_, i) => {
+      fs.mkdirSync(path.join(repo, `real/${i}`), { recursive: true });
+      fs.symlinkSync(`real/${i}`, path.join(repo, `link-${i}`));
+      return `${repo}/link-${i}`;
+    });
+    expect(findArguments(repo, links)).toEqual(onlyRoot);
+    expect(findArguments(repo, links.slice(0, MAX_SERVICE_REAL_PATHS)).filter((arg) => arg.startsWith(`${repo}/real/`))).toHaveLength(4 * MAX_SERVICE_REAL_PATHS);
+    // 'repository' stays the whole repository.
+    expect(findArguments(repo, 'repository')).toEqual(fix(repo, ['-path', repo, '-o', '-path', `${repo}/*`]));
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 12 (D12-2): the ownership fix with the mounts of the dev container, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives the folder of a new node_modules volume the user, and leaves the files of db in a shared volume alone', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src', 'node_modules/left-pad', '.pgdata/base']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'node_modules/left-pad/index.js', 'node_modules/.other', '.pgdata/PG_VERSION', '.pgdata/base/1']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The files of Postgres (uid 999) in the volume that db shares; a file of another user in node_modules.
+    for (const file of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    fs.chownSync(path.join(repo, 'node_modules/.other'), 1234, 1234);
+    // The paths as withDevMountFolders adds them (devMountFolders of the mounts of the dev container).
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.pgdata`, `${repo}/node_modules`]);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // The folder that Docker created as root for the volume, and what root wrote in it, get the user.
+    for (const name of ['.', 'src', 'src/a.ts', 'node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    // Before (without the paths): 'nobody' too.
+    for (const name of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    expect(uidOf(path.join(repo, 'node_modules/.other'))).toBe(1234);
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 13 (D13-1, D13-3): the ownership fix with the mounts of the dev container, with real tools and bind mounts as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const VOLUME = 'acme-api-3f2a9c1e';
+
+  /** devMountFolders of `mounts` (targets below /workspaces/api), moved to `repo`. */
+  function devFolders(repo: string, mounts: Array<{ type: string; volume?: string; target: string; subpath?: string }>, identities?: ReadonlySet<string>): string[] {
+    return devMountFolders({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }, 'on', identities).map((folder) => repo + folder.slice('/workspaces/api'.length));
+  }
+
+  /** Runs `body` with `source` bind-mounted at `target`; skips the test when the sandbox does not allow `mount --bind`. */
+  function withBind(skip: () => void, source: string, target: string, body: () => void): void {
+    fs.mkdirSync(target, { recursive: true });
+    if (spawnSync('mount', ['--bind', source, target], { stdio: 'ignore' }).status !== 0) {
+      skip();
+      return;
+    }
+    try {
+      body();
+    } finally {
+      spawnSync('umount', [target], { stdio: 'ignore' });
+    }
+  }
+
+  function fixAll(repo: string, folders: string[], loop = false): void {
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', folders);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    if (!loop) {
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      return;
+    }
+    // find reports the loop of an ancestor mounted below itself (and exits with 1), but goes on with the rest.
+    for (const line of result.stderr.split('\n').filter((text) => text !== '')) expect(line).toMatch(/^find: File system loop detected/);
+  }
+
+  it('leaves the files of db alone behind an alias of the workspace volume (./data:/workspaces/api/pgview)', ({ skip }) => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src', 'data/base']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'data/PG_VERSION', 'data/base/1']) fs.writeFileSync(path.join(repo, file), 'x');
+    for (const file of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    withBind(skip, path.join(repo, 'data'), path.join(repo, 'pgview'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/pgview' },
+      ];
+      // Before: devMountFolders was empty, and `find -xdev` gave the files of db to nobody through pgview.
+      expect(devFolders(repo, mounts)).toEqual([`${repo}/pgview`]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts)]);
+      for (const name of ['data', 'data/base', 'data/base/1', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+      for (const name of ['.', 'src', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    });
+  });
+
+  it('fixes the repository in full under its canonical path when `..` is mounted below it', ({ skip }) => {
+    const base = tempDir();
+    const repo = path.join(base, 'api');
+    for (const folder of ['src', 'data']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'src/b.ts', 'data/PG_VERSION']) fs.writeFileSync(path.join(repo, file), 'x');
+    fs.chownSync(path.join(repo, 'src/b.ts'), 1234, 1234);
+    for (const file of ['data', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    withBind(skip, base, path.join(repo, 'parent'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/parent' },
+      ];
+      expect(devFolders(repo, mounts)).toEqual([`${repo}/parent`]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts)], true);
+      // The files of db stay theirs also through parent/api/data; the others get the user under their canonical path.
+      for (const name of ['data', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+      for (const name of ['.', 'src', 'src/a.ts', 'src/b.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    });
+  });
+
+  it('gives the image content of an anonymous volume the user, and leaves a named volume to its owners', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['node_modules/left-pad', '.cache']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['node_modules/left-pad/index.js', '.cache/entry']) fs.writeFileSync(path.join(repo, file), 'x');
+    // Copied up from the image as uid 1000 (the remote user has another uid).
+    for (const file of ['node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js', '.cache', '.cache/entry']) fs.chownSync(path.join(repo, file), 1000, 1000);
+    const folders = devFolders(repo, [
+      { type: 'volume', volume: 'd'.repeat(64), target: '/workspaces/api/node_modules' },
+      { type: 'volume', volume: 'api-cache', target: '/workspaces/api/.cache' },
+    ]);
+    expect(folders).toEqual([`${repo}/.cache`]);
+    fixAll(repo, folders);
+    // Before (review round 12): uid 1000 kept, and `npm install` as the remote user failed with EACCES.
+    for (const name of ['node_modules', 'node_modules/left-pad', 'node_modules/left-pad/index.js']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    for (const name of ['.cache', '.cache/entry']) expect(uidOf(path.join(repo, name)), name).toBe(1000);
+  });
+
+  it('gives src the full fix after a change of the uid when the dev service mounts ../src at its own path (review round 14, P14-1)', ({ skip }) => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src/lib', 'data']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'src/lib/b.ts', 'data/PG_VERSION']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The files of the remote user of the previous container (uid 1000); the remote user now has another uid.
+    for (const file of ['.', 'src', 'src/a.ts', 'src/lib', 'src/lib/b.ts']) fs.chownSync(path.join(repo, file), 1000, 1000);
+    for (const file of ['data', 'data/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    // ..:/workspaces/api and ../src:/workspaces/api/src, rewritten to the subpaths api and api/src.
+    withBind(skip, path.join(repo, 'src'), path.join(repo, 'src'), () => {
+      const mounts = [
+        { type: 'volume', volume: VOLUME, target: '/workspaces' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api', subpath: 'api' },
+        { type: 'volume', volume: VOLUME, target: '/workspaces/api/src', subpath: 'api/src' },
+      ];
+      const root = `/var/lib/docker/volumes/${VOLUME}/_data`;
+      const identities = verifiedIdentityTargets(
+        workspaceIdentityMounts({ mountTargets: mounts }, { repository: 'acme/api', volumeName: VOLUME }),
+        `2 1 8:1 ${root} /workspaces rw\n3 2 8:1 ${root}/api /workspaces/api rw\n4 3 8:1 ${root}/api/src /workspaces/api/src rw\n`,
+      );
+      // Before: [src], and only the files of root in src changed: uid 1000 stayed (EACCES for the remote user).
+      expect(devFolders(repo, mounts, identities)).toEqual([]);
+      fixAll(repo, [`${repo}/data`, ...devFolders(repo, mounts, identities)]);
+      for (const name of ['.', 'src', 'src/a.ts', 'src/lib', 'src/lib/b.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+      for (const name of ['data', 'data/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    });
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 11 (G5): over the bound, the ownership fix changes only the files of root, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives the files of root their owner, and leaves the files of every other owner alone', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['src', 'data/host-7/base', 'other']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['src/a.ts', 'data/host-7/PG_VERSION', 'data/host-7/base/1', 'other/f', 'top.txt']) fs.writeFileSync(path.join(repo, file), 'x');
+    // The data of a service in a path beyond the bound (uid 999), and a file of another user (uid 1234).
+    for (const file of ['data/host-7', 'data/host-7/PG_VERSION', 'data/host-7/base', 'data/host-7/base/1']) fs.chownSync(path.join(repo, file), 999, 999);
+    fs.chownSync(path.join(repo, 'other/f'), 1234, 1234);
+    const folders = Array.from({ length: MAX_SERVICE_FOLDERS + 1 }, (_, i) => `${repo}/data/host-${i + 1000}`);
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', folders);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Before: a list over the bound was passed whole (and host-7, which it no longer names, was given to nobody).
+    for (const name of ['.', 'src', 'src/a.ts', 'data', 'other', 'top.txt']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    for (const name of ['data/host-7', 'data/host-7/PG_VERSION', 'data/host-7/base', 'data/host-7/base/1']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    expect(uidOf(path.join(repo, 'other/f'))).toBe(1234);
+    // The same with 'repository' (Environment.serviceFoldersOverflow).
+    fs.chownSync(path.join(repo, 'top.txt'), 0, 0);
+    const [again, ...againArgs] = ownershipFixCommand(repo, 'nobody', 'repository');
+    expect(spawnSync(again, againArgs, { encoding: 'utf8' }).status).toBe(0);
+    expect(uidOf(path.join(repo, 'top.txt'))).toBe(nobody);
+    expect(uidOf(path.join(repo, 'data/host-7/PG_VERSION'))).toBe(999);
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 15 (K4 = D15-2): a mount of the dev container in .git, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('leaves the files of db in a volume at .git/pg alone, and gives the rest of .git the full fix', () => {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['.git/objects/ab', '.git/pg/base', 'src']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['.git/HEAD', '.git/objects/ab/cd', '.git/pg/PG_VERSION', '.git/pg/base/1', 'src/a.ts']) fs.writeFileSync(path.join(repo, file), 'x');
+    // Postgres (uid 999) in the volume that db shares; a file of another user in .git (for example after a change of the
+    // uid of the remote user), which the full fix gives the user.
+    for (const file of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
+    fs.chownSync(path.join(repo, '.git/objects/ab/cd'), 1234, 1234);
+    // The paths as withDevMountFolders passes them (devMountFolders of the mounts of the dev container), with gitPaths.
+    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`], true);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    for (const name of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    for (const name of ['.', '.git', '.git/HEAD', '.git/objects', '.git/objects/ab', '.git/objects/ab/cd', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+    // Without gitPaths (the records of the services), the path in .git is dropped as before (review round 10, D10-3).
+    expect(ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repo, 'nobody']);
+  });
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 16 (L2 = D16-2): a mount of the dev container at a link into .git, with real tools as root', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const PG = ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION'];
+
+  /** A repository with the data of db (uid 999) in .git/pg, a link `data -> .git/pg`, and a file of root in .git. */
+  function repository(): string {
+    const repo = path.join(tempDir(), 'api');
+    for (const folder of ['.git/pg/base', '.git/objects', 'src']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    for (const file of ['.git/HEAD', '.git/objects/x', '.git/pg/PG_VERSION', '.git/pg/base/1', 'src/a.ts']) fs.writeFileSync(path.join(repo, file), 'x');
+    fs.symlinkSync('.git/pg', path.join(repo, 'data'));
+    for (const file of PG) fs.chownSync(path.join(repo, file), 999, 999);
+    return repo;
+  }
+
+  function run(command: string[]): void {
+    const [file, ...args] = command;
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  }
+
+  it('keeps the owner of the data behind the link, when the target of the mount names the link (probe of D16-2)', () => {
+    const repo = repository();
+    // The target of the mount as withDevMountFolders passes it: marked as a mount (before: 999 -> nobody).
+    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`], new Set([`${repo}/data`])));
+    for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(999);
+    for (const name of ['.git/HEAD', '.git/objects/x', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+  });
+
+  it('marks each mount on its own: a path of the services behind a link into .git still gets no real path there', () => {
+    const repo = repository();
+    fs.mkdirSync(path.join(repo, 'cache'));
+    fs.writeFileSync(path.join(repo, 'cache/c'), 'x');
+    fs.chownSync(path.join(repo, 'cache/c'), 999, 999);
+    // `data` is a path of the services (a record), `cache` the target of a mount of the dev container, in one list.
+    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`, `${repo}/cache`], new Set([`${repo}/cache`])));
+    expect(uidOf(path.join(repo, 'cache/c'))).toBe(999);
+    // The real path of the record lies in .git: not protected (review round 10, D10-3), as before.
+    for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
+  });
+
+  it('writes the marker only around the patterns of the mounts', () => {
+    const repo = '/workspaces/api';
+    expect(servicePathArguments(repo, [`${repo}/db`, `${repo}/data`], new Set([`${repo}/data`]))).toEqual([
+      '-path', `${repo}/db`, '-o', '-path', `${repo}/db/*`,
+      '-o', '(', '-path', `${repo}/data`, '-o', '-path', `${repo}/data/*`, ')',
+    ]);
+    // A path of the services named `(` or `)` below the repository is a path, never a marker.
+    expect(servicePathArguments(repo, [`${repo}/(`], new Set())).toEqual(['-path', `${repo}/(`, '-o', '-path', `${repo}/(/*`]);
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      expect(spawnSync(shell, ['-n', '-c', OWNERSHIP_FIX_SCRIPT], { encoding: 'utf8' }).status, shell).toBe(0);
+    }
+  });
+});
+
+describe('review round 15 (K3): the ownership fix of the internal folder with numeric IDs, for a helper container', () => {
+  it('takes only decimal user and group IDs', () => {
+    for (const id of ['0', '1000', '999', '4294967294']) expect(isNumericId(id), id).toBe(true);
+    for (const id of ['', ' 1000', '1000\n', '-1', '+1', '01', '1e3', '0x10', 'vscode', '4294967295', '99999999999', '1000:1000']) expect(isNumericId(id), id).toBe(false);
+    expect(configOwnershipFixCommand('/workspaces/.devenv+', '1000', '1001')).toEqual(['sh', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/.devenv+', '1000', '1001']);
+    expect(() => configOwnershipFixCommand('/workspaces/.devenv+', 'vscode', '1000')).toThrow();
+    expect(() => configOwnershipFixCommand('/workspaces/.devenv+', '1000', '$(reboot)')).toThrow();
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      const result = spawnSync(shell, ['-n', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT], { encoding: 'utf8' });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    }
+  });
+
+  it('refuses a link or a missing folder in place of the folder', () => {
+    const root = tempDir();
+    fs.mkdirSync(path.join(root, 'real'));
+    fs.symlinkSync(path.join(root, 'real'), path.join(root, 'link'));
+    for (const folder of [path.join(root, 'link'), path.join(root, 'missing')]) {
+      const [file, ...args] = configOwnershipFixCommand(folder, String(os.userInfo().uid), String(os.userInfo().gid));
+      const result = spawnSync(file, args, { encoding: 'utf8' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('is not a folder');
+    }
+  });
+});
+
+const canBindMount =
+  process.getuid?.() === 0 && spawnSync('unshare', ['-m', 'sh', '-c', 'mount --bind "$1" "$1"', 'sh', os.tmpdir()], { stdio: 'ignore' }).status === 0;
+
+describe.skipIf(!canBindMount)('review round 15 (K3): a mount of the dev container through a link does not reach the fix of the internal folder (real mounts as root)', () => {
+  const uidOf = (file: string) => fs.lstatSync(file).uid;
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+  const nobodyGroup = Number(spawnSync('id', ['-g', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  it('gives the token the user in the helper, while in the dev container the data of db (uid 999) would have been walked', () => {
+    // The workspace volume as the helper mounts it: the internal folder with the token (root, written before `up`), and
+    // the repository with a link x -> ../.devenv+. The data of db (uid 999) in a volume of its own.
+    const root = tempDir();
+    const volume = path.join(root, 'workspaces');
+    const config = path.join(volume, '.devenv+');
+    const pgdata = path.join(root, 'pgdata');
+    fs.mkdirSync(path.join(config, 'gh'), { recursive: true });
+    fs.mkdirSync(path.join(volume, 'api'), { recursive: true });
+    fs.writeFileSync(path.join(config, 'github-token'), 'x');
+    fs.writeFileSync(path.join(config, 'gh', 'hosts.yml'), 'x');
+    fs.symlinkSync('../.devenv+', path.join(volume, 'api', 'x'));
+    fs.mkdirSync(path.join(pgdata, 'base'), { recursive: true });
+    fs.writeFileSync(path.join(pgdata, 'PG_VERSION'), '16');
+    const pgFiles = ['.', 'base', 'PG_VERSION'].map((name) => path.join(pgdata, name));
+    for (const file of pgFiles) fs.chownSync(file, 999, 999);
+
+    // The dev container: a volume mounted at /workspaces/api/x, which the kernel resolves through the link into the
+    // internal folder. The fix there (before this round: OWNERSHIP_FIX_SCRIPT in the dev container) walks the data of db.
+    const devFix = spawnSync(
+      'unshare',
+      ['-m', 'sh', '-c', 'mount --bind "$1" "$2" && shift 2 && exec sh -c "$@"', 'sh', pgdata, path.join(volume, 'api', 'x'), OWNERSHIP_FIX_SCRIPT, 'sh', config, 'nobody'],
+      { encoding: 'utf8' },
+    );
+    expect(devFix.status, devFix.stderr).toBe(0);
+    for (const file of pgFiles) expect(uidOf(file), file).toBe(nobody);
+    for (const file of pgFiles) fs.chownSync(file, 999, 999);
+
+    // The helper: only the workspace volume (here: no mount of the dev container in its mount namespace).
+    const [file, ...args] = configOwnershipFixCommand(config, String(nobody), String(nobodyGroup));
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    for (const name of ['.', 'github-token', 'gh', 'gh/hosts.yml']) expect(uidOf(path.join(config, name)), name).toBe(nobody);
+    for (const pg of pgFiles) expect(uidOf(pg), pg).toBe(999);
   });
 });

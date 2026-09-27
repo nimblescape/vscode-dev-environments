@@ -23,13 +23,14 @@ export const HELPER_ENV_NAMES: readonly string[] = ['HOME', 'PATH', 'HOSTNAME', 
  * without duplicates. Variables in comments are ignored.
  */
 export function findLocalEnvNames(text: string): string[] {
-  const names: string[] = [];
+  // Review round 9 (P9-3): a Set, so that thousands of names cost linear time in the extension host.
+  const names = new Set<string>();
   for (const match of stripJsonc(text).matchAll(VARIABLE)) {
     const name = match[1].trim();
-    if (name === '' || name.includes('=') || name.includes('\0') || names.includes(name)) continue;
-    names.push(name);
+    if (name === '' || name.includes('=') || name.includes('\0')) continue;
+    names.add(name);
   }
-  return names;
+  return [...names];
 }
 
 /** Those of `names` that the workspace helper sets itself (HELPER_ENV_NAMES), in their order. */

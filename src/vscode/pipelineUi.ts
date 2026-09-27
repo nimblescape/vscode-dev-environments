@@ -48,6 +48,14 @@ export class VsCodePipelineUi implements PipelineUi {
     return choice === rebuildNow ? 'rebuildNow' : 'later';
   }
 
+  async configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'> {
+    const rebuildNow: vscode.MessageItem = { title: Actions.rebuildNow };
+    // Keeping the kind is the answer of a dismissed dialog (it removes nothing).
+    const later: vscode.MessageItem = { title: Actions.later, isCloseAffordance: true };
+    const choice = await vscode.window.showWarningMessage(message, { modal: true, detail: repository }, rebuildNow, later);
+    return choice === rebuildNow ? 'rebuildNow' : 'later';
+  }
+
   /**
    * Concept 7.5: asks whether the entry of an older version of `repository` is assigned to the account `login`
    * (EnvironmentClaims in the mode `interactive`). True for Assign; Not now and a dismissed dialog are false.

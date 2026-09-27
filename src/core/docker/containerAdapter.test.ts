@@ -15,7 +15,9 @@ import {
   parseJsonLines,
   registryLoginConfig,
   toLabels,
+  type ImageInspection,
 } from './containerAdapter';
+import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 
 interface Call {
   file: string;
@@ -259,7 +261,7 @@ describe('containers', () => {
         ]),
       );
     });
-    const info = await docker.findContainer('env-1');
+    const info = await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e');
     expect(runner.calls[0].args).toEqual([
       'ps',
       '-a',
@@ -282,7 +284,7 @@ describe('containers', () => {
 
   it('returns undefined without a container and does not call inspect', async () => {
     const { docker, runner } = adapter(() => ok(''));
-    expect(await docker.findContainer('env-1')).toBeUndefined();
+    expect(await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')).toBeUndefined();
     expect(runner.calls).toHaveLength(1);
   });
 
@@ -297,7 +299,58 @@ describe('containers', () => {
         ]),
       );
     });
-    expect((await docker.findContainer('env-1'))?.id).toBe('run');
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('run');
+  });
+
+  it('skips the other services of a Docker Compose environment: the dev container is found (unit 6, D-4)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db', 'dev']));
+      return ok(
+        inspectOutput([
+          // The running side service would win without the rule (a running container comes first).
+          containerJson({ id: 'db', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', labels: { 'devenv.environment-id': 'env-1' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
+  });
+
+  it('finds the container with the name of the environment even when its image gave it the label of a service (review round 1, D2)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['dev']));
+      return ok(
+        inspectOutput([
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'x' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
+  });
+
+  it('prefers the container with the name of the environment over other dev containers, even running and newer ones (final review, FC-1)', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['old', 'dev', 'stray']));
+      return ok(
+        inspectOutput([
+          // The previous dev container of a Select configuration… (renamed, without devenv.compose-service), running.
+          containerJson({ id: 'old', name: 'devenv-3f2a9c1e-app-1', status: 'running', created: '2026-01-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', created: '2026-02-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'stray', name: 'stray', status: 'running', created: '2026-03-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+        ]),
+      );
+    });
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e'))?.id).toBe('dev');
+    // Without a container of that name (an older container, a failed switch), a running one, then the newest.
+    expect((await docker.findContainer('env-1', 'devenv-acme-api-00000000'))?.id).toBe('stray');
+  });
+
+  it('finds no container when only other services of a Docker Compose environment exist', async () => {
+    const { docker } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db']));
+      return ok(inspectOutput([containerJson({ id: 'db', name: 'db', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } })]));
+    });
+    expect(await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')).toBeUndefined();
   });
 
   it('skips a container that was removed between list and inspect', async () => {
@@ -388,6 +441,13 @@ describe('containers', () => {
   it('stopContainer throws for other errors', async () => {
     const { docker } = adapter(() => fail('Error response from daemon: cannot stop container: permission denied'));
     await expect(docker.stopContainer('x')).rejects.toBeInstanceOf(CommandError);
+  });
+
+  it('renameContainer runs docker rename and throws when it fails (review round 22, D22-1)', async () => {
+    const { docker, runner } = adapter((call) => (call.args[2] === 'taken' ? fail('Error response from daemon: Conflict. The container name "/taken" is already in use') : ok()));
+    await docker.renameContainer('x', 'devenv-3f2a9c1e-app-1');
+    expect(runner.calls[0].args).toEqual(['rename', 'x', 'devenv-3f2a9c1e-app-1']);
+    await expect(docker.renameContainer('x', 'taken')).rejects.toBeInstanceOf(CommandError);
   });
 
   it('removeContainer uses rm -f and ignores a missing container', async () => {
@@ -511,6 +571,25 @@ describe('volumes', () => {
     expect(runner.calls.map((call) => call.args)).toEqual([['volume', 'inspect', 'db', 'cache', 'gone']]);
   });
 
+  it('inspects the networks of a list that exist, with their labels and containers (review round 1, S2)', async () => {
+    const { docker, runner } = adapter(() =>
+      fail(
+        'Error response from daemon: network gone not found',
+        1,
+        inspectOutput([
+          { Name: 'backend', Id: 'a1b2', Labels: { 'com.docker.compose.project': 'devenv-11111111' }, Containers: { c1: { Name: 'x' }, c2: { Name: 'y' } } },
+          { Name: 'shared', Labels: null, Containers: {} },
+        ]),
+      ),
+    );
+    // Review round 2 (S2-04): changed expectation, with the ID of each network (empty when Docker prints none).
+    expect(await docker.inspectNetworks(['backend', 'shared', 'gone', 'backend'])).toEqual([
+      { name: 'backend', id: 'a1b2', labels: { 'com.docker.compose.project': 'devenv-11111111' }, containers: ['c1', 'c2'] },
+      { name: 'shared', id: '', labels: {}, containers: [] },
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['network', 'inspect', 'backend', 'shared', 'gone']]);
+  });
+
   it('inspects nothing for an empty list, and throws for errors other than a missing volume', async () => {
     const { docker, runner } = adapter(() => fail('Cannot connect to the Docker daemon at unix:///var/run/docker.sock.'));
     expect(await docker.inspectVolumes([])).toEqual([]);
@@ -632,6 +711,211 @@ describe('images', () => {
     ]);
   });
 
+  it('inspectImageNames asks about many references with one call per batch, and leaves out missing ones (review round 9, S9-3)', async () => {
+    const line = (id: string, tag: string) => JSON.stringify({ id, repoTags: [tag], repoDigests: null });
+    const { docker, runner } = adapter((call) => {
+      const refs = call.args.slice(call.args.indexOf('--') + 1);
+      if (refs.includes('broken')) return fail('Cannot connect to the Docker daemon');
+      const found = refs.filter((ref) => !ref.startsWith('gone'));
+      const stdout = found.map((ref) => line(`sha256:${ref.length}`, ref)).join('\n') + '\n';
+      return found.length === refs.length ? ok(stdout) : { exitCode: 1, stdout, stderr: 'Error response from daemon: No such image: gone', timedOut: false };
+    });
+    const references = Array.from({ length: 150 }, (_, i) => (i === 3 ? 'gone:1' : `r${i}:1`));
+    // Review round 10, P10-1: the result names the found images and the references that could not be checked.
+    const { images: found, unchecked } = await docker.inspectImageNames(references);
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[0].args.slice(0, 5)).toEqual(['image', 'inspect', '--format', '{"id":{{json .Id}},"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', '--']);
+    expect(runner.calls[0].args).toHaveLength(105);
+    expect(found).toHaveLength(149);
+    expect(unchecked).toEqual([]);
+    expect(found[0]).toEqual({ id: 'sha256:4', repoTags: ['r0:1'], repoDigests: [] });
+    // Review round 10, P10-1: before, it threw for the whole batch; now the reference that Docker cannot inspect is named.
+    // Review round 11, G1: with its reason; a daemon that cannot be reached says nothing about the reference.
+    expect(await docker.inspectImageNames(['broken'])).toEqual({ images: [], unchecked: [{ reference: 'broken', reason: 'transient' }] });
+    expect(await docker.inspectImageNames([])).toEqual({ images: [], unchecked: [] });
+  });
+
+  describe('review round 10 (P10-1): one reference that Docker cannot inspect does not leave the others of its batch unchecked', () => {
+    const ID = `sha256:3f2a1b9c${'0'.repeat(56)}`;
+    // As Docker 27: every reference is inspected; a missing one gives "No such image", an invalid one "invalid reference
+    // format"; exit code 1 when any failed; the found ones on stdout.
+    function daemon(call: { args: string[] }): RunResult {
+      const refs = call.args.slice(call.args.indexOf('--') + 1);
+      const lines: string[] = [];
+      const errors: string[] = [];
+      for (const ref of refs) {
+        if (ref === '3f2a1b9c') lines.push(JSON.stringify({ id: ID, repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] }));
+        else if (ref === 'postgres:16') lines.push(JSON.stringify({ id: `sha256:${'1'.repeat(64)}`, repoTags: ['postgres:16'], repoDigests: [] }));
+        else if (ref === 'foo/Bar') errors.push(`Error response from daemon: invalid reference format: repository name (library/foo/Bar) must be lowercase`);
+        else errors.push(`Error response from daemon: No such image: ${ref}`);
+      }
+      const stdout = lines.map((line) => `${line}\n`).join('');
+      return errors.length === 0 ? ok(stdout) : { exitCode: 1, stdout, stderr: `${errors.join('\n')}\n`, timedOut: false };
+    }
+
+    it('inspects the references of a batch one by one when Docker fails for another reason than a missing image', async () => {
+      const { docker, runner } = adapter(daemon);
+      const result = await docker.inspectImageNames(['foo/Bar', '3f2a1b9c', 'postgres:16']);
+      // Before: a CommandError for the batch, and the pipeline checked none of them.
+      // Review round 11, G1: with its reason.
+      expect(result.unchecked).toEqual([{ reference: 'foo/Bar', reason: 'invalid' }]);
+      expect(result.images.map((image) => image.id)).toEqual([ID, `sha256:${'1'.repeat(64)}`]);
+      expect(runner.calls).toHaveLength(4);
+    });
+
+    it('does not take a batch with a missing and an invalid reference for missing images only', async () => {
+      const { docker, runner } = adapter(daemon);
+      const result = await docker.inspectImageNames(['gone:1', 'foo/Bar', '3f2a1b9c']);
+      // Before: "No such image" anywhere in stderr counted as missing, and foo/Bar was left unchecked without a word.
+      // Review round 11, G1: with its reason.
+      expect(result.unchecked).toEqual([{ reference: 'foo/Bar', reason: 'invalid' }]);
+      expect(result.images.map((image) => image.id)).toEqual([ID]);
+      expect(runner.calls).toHaveLength(4);
+    });
+
+    it('still asks with one call when Docker only misses images, and names all references of a batch that timed out', async () => {
+      const { docker, runner } = adapter(daemon);
+      expect((await docker.inspectImageNames(['gone:1', 'postgres:16'])).unchecked).toEqual([]);
+      expect(runner.calls).toHaveLength(1);
+      const slow = adapter(() => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }));
+      // Review round 11, G1: with their reason.
+      expect(await slow.docker.inspectImageNames(['a:1', 'b:1'])).toEqual({
+        images: [],
+        unchecked: [
+          { reference: 'a:1', reason: 'transient' },
+          { reference: 'b:1', reason: 'transient' },
+        ],
+      });
+      expect(slow.runner.calls).toHaveLength(1);
+    });
+  });
+
+  describe('review round 11 (G1, G2): why a reference was not checked, and the bounds of the single calls', () => {
+    const line = (ref: string) => JSON.stringify({ id: `sha256:${'1'.repeat(64)}`, repoTags: [ref], repoDigests: [] });
+    /** Like Docker 27: the references in `answers` fail with their text; the others are found. */
+    function daemon(answers: Record<string, string>): Handler {
+      return (call) => {
+        const refs = call.args.slice(call.args.indexOf('--') + 1);
+        const errors = refs.filter((ref) => answers[ref] !== undefined).map((ref) => answers[ref]);
+        const stdout = refs.filter((ref) => answers[ref] === undefined).map((ref) => `${line(ref)}\n`).join('');
+        return errors.length === 0 ? ok(stdout) : { exitCode: 1, stdout, stderr: `${errors.join('\n')}\n`, timedOut: false };
+      };
+    }
+    const unchecked = (result: ImageInspection) => result.unchecked.map((entry) => `${entry.reference} ${entry.reason}`);
+
+    it('takes an invalid reference and an ambiguous ID prefix of both image stores for answers about the reference', async () => {
+      const { docker, runner } = adapter(
+        daemon({
+          'foo/Bar': 'Error response from daemon: invalid reference format: repository name (library/foo/Bar) must be lowercase',
+          a1b2: 'Error response from daemon: multiple IDs found with provided prefix: a1b2',
+          c3d4: 'Error response from daemon: ambiguous reference: c3d4',
+          gone: 'Error response from daemon: No such image: gone:latest',
+        }),
+      );
+      const result = await docker.inspectImageNames(['foo/Bar', 'a1b2', 'c3d4', 'gone', 'postgres:16']);
+      expect(unchecked(result)).toEqual(['foo/Bar invalid', 'a1b2 invalid', 'c3d4 invalid']);
+      expect(result.images).toHaveLength(1);
+      expect(runner.calls).toHaveLength(6);
+    });
+
+    it('takes the answers of go-digest and of the length of a name for answers about the reference (review round 12, P12-1)', async () => {
+      const upper = `alpine@sha256:${'A'.repeat(64)}`;
+      const short = `alpine@sha256:${'a'.repeat(40)}`;
+      const md5 = `alpine@md5:${'a'.repeat(32)}`;
+      const long = `${'a'.repeat(250)}:1`;
+      const { docker } = adapter(
+        daemon({
+          [upper]: 'Error response from daemon: invalid checksum digest format',
+          [short]: 'Error response from daemon: invalid checksum digest length',
+          [md5]: 'Error response from daemon: unsupported digest algorithm',
+          [long]: 'Error response from daemon: invalid reference format: repository name (library/aaa…) must not be more than 255 characters',
+        }),
+      );
+      const result = await docker.inspectImageNames([upper, short, md5, long, 'postgres:16']);
+      // Before: transient, and the open failed with the internal error ("reinstall Dev Environments") at each attempt.
+      expect(unchecked(result)).toEqual([`${upper} invalid`, `${short} invalid`, `${md5} invalid`, `${long} invalid`]);
+      const single = adapter(daemon({ 'x:1': 'Error response from daemon: repository name must not be more than 255 characters' }));
+      expect(unchecked(await single.docker.inspectImageNames(['x:1']))).toEqual(['x:1 invalid']);
+    });
+
+    it('asks no more after a daemon error of a batch, and names every reference transient', async () => {
+      const references = Array.from({ length: 250 }, (_, i) => `r${i}:1`);
+      const { docker, runner } = adapter(daemon({ 'r0:1': 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?' }));
+      const result = await docker.inspectImageNames(references);
+      // Before: the batch was inspected one by one (100 calls), then the next batches.
+      expect(runner.calls).toHaveLength(1);
+      expect(result.unchecked).toHaveLength(250);
+      expect(result.unchecked.every((entry) => entry.reason === 'transient')).toBe(true);
+    });
+
+    it('asks no more after a timed-out batch', async () => {
+      const references = Array.from({ length: 250 }, (_, i) => `r${i}:1`);
+      const { docker, runner } = adapter((call) => (call.args.includes('r100:1') ? { exitCode: null, stdout: '', stderr: '', timedOut: true } : daemon({})(call)));
+      const result = await docker.inspectImageNames(references);
+      // Before: the third batch was asked too (and each batch after a timeout waited up to 60 s).
+      expect(runner.calls).toHaveLength(2);
+      expect(result.images).toHaveLength(100);
+      expect(unchecked(result)).toEqual(references.slice(100).map((ref) => `${ref} transient`));
+    });
+
+    it('stops the single calls at the first daemon error or unknown answer', async () => {
+      const { docker, runner } = adapter(daemon({ 'a:1': 'Error response from daemon: multiple IDs found with provided prefix: a', 'b:1': 'error during connect: EOF' }));
+      const result = await docker.inspectImageNames(['a:1', 'b:1', 'c:1', 'd:1']);
+      // The batch mixes an answer about a reference with a connection error: no single calls.
+      expect(runner.calls).toHaveLength(1);
+      expect(unchecked(result)).toEqual(['a:1 transient', 'b:1 transient', 'c:1 transient', 'd:1 transient']);
+      let calls = 0;
+      const flaky = adapter((call) => {
+        calls++;
+        // The batch fails for an invalid reference; the second single call hits a daemon that restarts.
+        if (calls === 3) return fail('Error response from daemon: something unknown happened');
+        return daemon({ 'x/Y': 'invalid reference format' })(call);
+      });
+      const second = await flaky.docker.inspectImageNames(['x/Y', 'b:1', 'c:1', 'd:1']);
+      expect(flaky.runner.calls).toHaveLength(3);
+      expect(unchecked(second)).toEqual(['x/Y invalid', 'b:1 transient', 'c:1 transient', 'd:1 transient']);
+    });
+
+    it(`makes at most ${MAX_IMAGE_INSPECT_SINGLE_CALLS} single calls; the references beyond are transient`, async () => {
+      // One reference of each batch that Docker calls invalid: before, all 1000 references were inspected one by one.
+      const references = Array.from({ length: 1000 }, (_, i) => (i % 100 === 0 ? `bad${i}` : `r${i}:1`));
+      const answers = Object.fromEntries(references.filter((ref) => ref.startsWith('bad')).map((ref) => [ref, 'Error response from daemon: invalid reference format']));
+      const { docker, runner } = adapter(daemon(answers));
+      const result = await docker.inspectImageNames(references);
+      expect(runner.calls).toHaveLength(2 + MAX_IMAGE_INSPECT_SINGLE_CALLS);
+      // The first batch uses up the single calls; the second batch fails too, and its references and all after it are
+      // not checked.
+      expect(unchecked(result).slice(0, 2)).toEqual(['bad0 invalid', 'bad100 transient']);
+      expect(result.unchecked.filter((entry) => entry.reason === 'transient')).toHaveLength(900);
+      expect(result.images).toHaveLength(99);
+    });
+
+    it('passes the signal to each call and stops between the single calls when it aborts', async () => {
+      const controller = new AbortController();
+      const { docker, runner } = adapter((call) => {
+        if (runner.calls.length === 3) controller.abort();
+        return daemon({ 'x/Y': 'invalid reference format' })(call);
+      });
+      const error = await docker.inspectImageNames(['x/Y', 'b:1', 'c:1', 'd:1', 'e:1'], controller.signal).catch((e: unknown) => e);
+      expect(isAbortError(error)).toBe(true);
+      // Before: all four single calls ran, without the signal.
+      expect(runner.calls).toHaveLength(3);
+      expect(runner.calls.every((call) => call.options.signal === controller.signal)).toBe(true);
+    });
+
+    it('does not throw when the Docker CLI cannot be started (dockerNotInstalled)', async () => {
+      const runner = new FakeRunner(() => ok());
+      const docker = new ContainerAdapter(runner, undefined, {}, silentLogger, 'linux');
+      // Before: the UserFacingError of run, although the doc comment said "Never throws".
+      expect(unchecked(await docker.inspectImageNames(['a:1', 'b:1']))).toEqual(['a:1 transient', 'b:1 transient']);
+      expect(runner.calls).toHaveLength(0);
+      const gone = adapter(() => {
+        throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });
+      });
+      expect(unchecked(await gone.docker.inspectImageNames(['a:1']))).toEqual(['a:1 transient']);
+    });
+  });
+
   it('imageId returns the ID, undefined for a missing image, and throws for other errors', async () => {
     const id = `sha256:${'7'.repeat(64)}`;
     const { docker, runner } = adapter((call) => {
@@ -646,6 +930,23 @@ describe('images', () => {
     expect(await docker.imageId('gone:1')).toBeUndefined();
     await expect(docker.imageId('odd:1')).rejects.toBeInstanceOf(CommandError);
     await expect(docker.imageId('other:1')).rejects.toBeInstanceOf(CommandError);
+  });
+
+  it('imageNames returns the tags and digests of an image, undefined for a missing image (review round 2, S2-05)', async () => {
+    const { docker, runner } = adapter((call) => {
+      const ref = call.args[call.args.length - 1];
+      if (ref === 'a1b2c3d4') return ok('{"repoTags":["postgres:16"],"repoDigests":["postgres@sha256:' + 'e'.repeat(64) + '"]}\n');
+      if (ref === 'dangling') return ok('{"repoTags":null,"repoDigests":[]}\n');
+      if (ref === 'gone') return fail('Error response from daemon: No such image: gone');
+      if (ref === 'odd') return ok('\n');
+      return fail('Cannot connect to the Docker daemon');
+    });
+    expect(await docker.imageNames('a1b2c3d4')).toEqual({ repoTags: ['postgres:16'], repoDigests: [`postgres@sha256:${'e'.repeat(64)}`] });
+    expect(runner.calls[0].args).toEqual(['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', 'a1b2c3d4']);
+    expect(await docker.imageNames('dangling')).toEqual({ repoTags: [], repoDigests: [] });
+    expect(await docker.imageNames('gone')).toBeUndefined();
+    await expect(docker.imageNames('odd')).rejects.toBeInstanceOf(CommandError);
+    await expect(docker.imageNames('other')).rejects.toBeInstanceOf(CommandError);
   });
 
   it('listImagesByLabel lists the images with the label, one entry per ID, dangling ones without tags', async () => {
@@ -1005,5 +1306,171 @@ describe('ContainerAdapter.pullImage with credentials', () => {
     expect(JSON.parse(registryLoginConfig({ registry: 'ghcr.io', username: 'a', password: 'b:c' }))).toEqual({
       auths: { 'ghcr.io': { auth: Buffer.from('a:b:c').toString('base64') } },
     });
+  });
+});
+
+describe('ContainerAdapter.engineApiVersion', () => {
+  it('reads the API version of the engine', async () => {
+    const { docker, runner } = adapter(() => ok('1.48\n'));
+    expect(await docker.engineApiVersion()).toBe('1.48');
+    expect(runner.calls[0].args).toEqual(['version', '--format', '{{.Server.APIVersion}}']);
+  });
+
+  it.each([
+    ['a failed call', fail('Cannot connect to the Docker daemon', 1, '')],
+    ['an output that is no version', ok('<no value>\n')],
+  ])('is undefined after %s', async (_name, result) => {
+    const { docker } = adapter(() => result);
+    expect(await docker.engineApiVersion()).toBeUndefined();
+  });
+});
+
+// Unit 6, package C: Delete and a failed first open of a Docker Compose environment remove the whole project.
+describe('ContainerAdapter: the objects of a Docker Compose project', () => {
+  it('lists the containers of the project by its label, also those without the label of the environment', async () => {
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['run1']));
+      return ok(inspectOutput([containerJson({ id: 'run1', name: 'devenv-3f2a9c1e-db-run-1', status: 'exited', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } })]));
+    });
+    expect((await docker.listProjectContainers('devenv-3f2a9c1e')).map((c) => c.id)).toEqual(['run1']);
+    expect(runner.calls[0].args).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=com.docker.compose.project=devenv-3f2a9c1e', '--format', '{{json .ID}}']);
+  });
+
+  it('reads the subpaths of volumes that each container mounts, with one inspect for all (review round 11, G3, G4)', async () => {
+    const db = {
+      ...containerJson({ id: 'db1', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      // As Docker 27 prints a container that Compose created with a volume subpath: HostConfig.Mounts names the volume in
+      // Source; Mounts (the mount points) has no subpath.
+      HostConfig: {
+        Mounts: [
+          { Type: 'volume', Source: 'acme-api-3f2a9c1e', Target: '/var/lib/postgresql/data', VolumeOptions: { NoCopy: true, Subpath: 'api/data/pg' } },
+          { Type: 'volume', Source: 'acme-api-3f2a9c1e', Target: '/init.sql', ReadOnly: true, VolumeOptions: { Subpath: 'api/init.sql' } },
+          { Type: 'volume', Source: 'devenv-3f2a9c1e_cache', Target: '/cache', VolumeOptions: {} },
+          { Type: 'bind', Source: '/etc/hosts', Target: '/x' },
+        ],
+      },
+      Mounts: [{ Type: 'volume', Name: 'acme-api-3f2a9c1e', Source: '/var/lib/docker/volumes/acme-api-3f2a9c1e/_data', Destination: '/var/lib/postgresql/data', RW: true }],
+    };
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'ps') return ok(idLines(['db1', 'dev1']));
+      return ok(inspectOutput([db, containerJson({ id: 'dev1', name: 'acme-api-3f2a9c1e', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } })]));
+    });
+    const containers = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(containers[0].volumeSubpaths).toEqual([
+      { volume: 'acme-api-3f2a9c1e', subpath: 'api/data/pg', readOnly: false },
+      { volume: 'acme-api-3f2a9c1e', subpath: 'api/init.sql', readOnly: true },
+    ]);
+    expect(containers[1].volumeSubpaths).toBeUndefined();
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ['ps', '-a'],
+      ['container', 'inspect'],
+    ]);
+  });
+
+  it('reads the targets of the mounts of a container (review round 12, D12-2)', async () => {
+    const dev = {
+      ...containerJson({ id: 'dev1', name: 'acme-api-3f2a9c1e', status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      HostConfig: { Tmpfs: { '/workspaces/api/tmp': 'rw' } },
+      Mounts: [
+        { Type: 'volume', Name: 'acme-api-3f2a9c1e', Source: '/var/lib/docker/volumes/acme-api-3f2a9c1e/_data', Destination: '/workspaces', RW: true },
+        { Type: 'volume', Name: 'devenv-3f2a9c1e_pgdata', Source: '/var/lib/docker/volumes/devenv-3f2a9c1e_pgdata/_data', Destination: '/workspaces/api/.pgdata', RW: true },
+        { Type: 'bind', Source: '/home/me/.ssh', Destination: '/home/vscode/.ssh', RW: false },
+        { Type: 'tmpfs', Destination: '/run/x' },
+        { Type: 'volume', Name: 'broken' },
+      ],
+    };
+    const { docker } = adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['dev1'])) : ok(inspectOutput([dev]))));
+    const [container] = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(container.mountTargets).toEqual([
+      { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
+      { type: 'volume', volume: 'devenv-3f2a9c1e_pgdata', target: '/workspaces/api/.pgdata' },
+      { type: 'bind', target: '/home/vscode/.ssh' },
+      { type: 'tmpfs', target: '/run/x' },
+      { type: 'tmpfs', target: '/workspaces/api/tmp' },
+    ]);
+  });
+
+  it('reads the subpath of a volume mount from HostConfig.Mounts, matched by volume and target (review round 14, P14-1)', async () => {
+    const V = 'acme-api-3f2a9c1e';
+    const source = `/var/lib/docker/volumes/${V}/_data`;
+    const dev = {
+      ...containerJson({ id: 'dev1', name: V, status: 'running', labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } }),
+      HostConfig: {
+        Mounts: [
+          { Type: 'volume', Source: V, Target: '/workspaces' },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/', VolumeOptions: { NoCopy: true, Subpath: 'api' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/src', VolumeOptions: { Subpath: 'api/src' } },
+          // Another volume at the same target does not count; two different subpaths at one target: not known.
+          { Type: 'volume', Source: 'other', Target: '/workspaces/api/pgview', VolumeOptions: { Subpath: 'x' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/twice', VolumeOptions: { Subpath: 'api/a' } },
+          { Type: 'volume', Source: V, Target: '/workspaces/api/twice', VolumeOptions: { Subpath: 'api/b' } },
+        ],
+      },
+      // The top-level Mounts have no VolumeOptions.
+      Mounts: [
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/src', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/pgview', RW: true },
+        { Type: 'volume', Name: V, Source: source, Destination: '/workspaces/api/twice', RW: true },
+      ],
+    };
+    const { docker } = adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['dev1'])) : ok(inspectOutput([dev]))));
+    const [container] = await docker.listProjectContainers('devenv-3f2a9c1e');
+    expect(container.mountTargets).toEqual([
+      { type: 'volume', volume: V, target: '/workspaces' },
+      { type: 'volume', volume: V, target: '/workspaces/api', subpath: 'api' },
+      { type: 'volume', volume: V, target: '/workspaces/api/src', subpath: 'api/src' },
+      { type: 'volume', volume: V, target: '/workspaces/api/pgview' },
+      { type: 'volume', volume: V, target: '/workspaces/api/twice' },
+    ]);
+  });
+
+  it('lists the networks of the project by its label', async () => {
+    const { docker, runner } = adapter(() => ok('"devenv-3f2a9c1e_default"\n"devenv-3f2a9c1e_backend"\n'));
+    expect(await docker.listProjectNetworks('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e_default', 'devenv-3f2a9c1e_backend']);
+    expect(runner.calls[0].args).toEqual(['network', 'ls', '--filter', 'label=com.docker.compose.project=devenv-3f2a9c1e', '--format', '{{json .Name}}']);
+  });
+
+  it('removes a network; a missing one is no error, a network in use is', async () => {
+    const { docker, runner } = adapter(() => ok());
+    await docker.removeNetwork('devenv-3f2a9c1e_default');
+    expect(runner.calls[0].args).toEqual(['network', 'rm', 'devenv-3f2a9c1e_default']);
+    await expect(adapter(() => fail('Error response from daemon: network devenv-3f2a9c1e_default not found')).docker.removeNetwork('x')).resolves.toBeUndefined();
+    await expect(adapter(() => fail('Error: No such network: x')).docker.removeNetwork('x')).resolves.toBeUndefined();
+    await expect(adapter(() => fail('Error response from daemon: error while removing network: network x has active endpoints')).docker.removeNetwork('x')).rejects.toThrow('active endpoints');
+  });
+
+  it('lists the images that Compose built for the project, and only those', async () => {
+    const lines = [
+      { Repository: 'devenv-3f2a9c1e-app', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-worker', Tag: 'latest' },
+      // Docker's filter is a pattern: the result is checked again.
+      { Repository: 'devenv-3f2a9c1e', Tag: '2' },
+      { Repository: 'devenv-3f2a9c1e-old', Tag: '<none>' },
+    ].map((line) => JSON.stringify(line));
+    const { docker, runner } = adapter(() => ok(`${lines.join('\n')}\n`));
+    expect(await docker.listProjectImages('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-worker:latest']);
+    expect(runner.calls[0].args).toEqual(['image', 'ls', '--filter', 'reference=devenv-3f2a9c1e-*', '--format', '{{json .}}']);
+  });
+
+  it('leaves out the images whose label names another environment (review round 1, D3)', async () => {
+    const lines = [
+      { Repository: 'devenv-3f2a9c1e-app', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-db', Tag: 'latest' },
+      { Repository: 'devenv-3f2a9c1e-tool', Tag: 'latest' },
+    ].map((line) => JSON.stringify(line));
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'ls') return ok(`${lines.join('\n')}\n`);
+      return ok(
+        inspectOutput([
+          { RepoTags: ['devenv-3f2a9c1e-app:latest'], Config: { Labels: { 'devenv.environment-id': 'env-1' } } },
+          { RepoTags: ['devenv-3f2a9c1e-db:latest'], Config: { Labels: { 'devenv.environment-id': 'env-2' } } },
+          { RepoTags: ['devenv-3f2a9c1e-tool:latest'], Config: { Labels: null } },
+        ]),
+      );
+    });
+    expect(await docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-tool:latest']);
+    expect(runner.calls[1].args).toEqual(['image', 'inspect', 'devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-db:latest', 'devenv-3f2a9c1e-tool:latest']);
   });
 });

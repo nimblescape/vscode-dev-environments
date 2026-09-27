@@ -7,13 +7,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { isDevContainersCloneVolumeName } from '../devContainers';
-import { ENVIRONMENT_VOLUME_PATTERN, HELPER_CACHE_VOLUME } from '../names';
+import { ENVIRONMENT_VOLUME_PATTERN, HELPER_CACHE_VOLUME, environmentIdLabel } from '../names';
 import {
   DEVCONTAINER_ID_PLACEHOLDER,
   HELPER_KNOWN_ENV,
   HELPER_PROCESS_ENV_NAMES,
   MAX_CLI_TEXT_LENGTH,
   SECOND_PASS_VARIABLE_NAMES,
+  devcontainerIdOf,
+  environmentDevcontainerId,
   helperCliVariables,
   mayBeSetInHelper,
   resolveCliVariables,
@@ -25,6 +27,7 @@ import {
   type CliVariables,
 } from './cliVariables';
 import { helperRunArgs } from './workspaceHelper';
+import { composeMountVolumes } from '../pipeline/pipelineRules';
 
 // Guard (hotfix M1): the substitution functions of Dev Container CLI 0.89.0, copied verbatim from
 // node_modules/@devcontainers/cli/dist/spec-node/devContainersSpecCLI.js (Fo, tg, Hr, za, a_, cN, lN, I_, C_, B_, E_, hN,
@@ -395,5 +398,55 @@ describe('helperCliVariables: the workspace folder as `devcontainer up` uses it 
     expect(substituteCliVariables('${localWorkspaceFolderBasename}-node_modules', helperCliVariables('acme/x.code-workspace'))).toBe('x.code-workspace-node_modules');
     expect(substituteCliVariables('${localWorkspaceFolderBasename}', helperCliVariables('acme/.code-workspace'))).toBe('.code-workspace');
     expect(substituteCliVariables('${localWorkspaceFolderBasename}', helperCliVariables('acme/x.CODE-WORKSPACE'))).toBe('x.CODE-WORKSPACE');
+  });
+});
+
+describe('devcontainerIdOf: `${devcontainerId}` as Dev Container CLI 0.89.0 computes it (review round 17, D17-1)', () => {
+  // The CLI's function `ht`, which makes the object of the `--id-label` values for Q_, copied verbatim (checked below).
+  const CLI_ID_LABELS_SOURCE = 'function ht(e){return(e||[]).reduce((A,t)=>{let i=t.indexOf("=");return i!==-1&&(A[t.substring(0,i)]=t.substring(i+1)),A},{})}';
+  const ht = new Function(`${CLI_ID_LABELS_SOURCE}\nreturn ht;`)() as (labels: readonly string[]) => Record<string, string>;
+  const cliId = (labels: readonly string[]): string => cli.Q_(ht(labels));
+
+  it('the copy of `ht` is the code of the installed CLI', () => {
+    const bundle = fs.readFileSync(path.join(CLI_FOLDER, 'dist', 'spec-node', 'devContainersSpecCLI.js'), 'utf8');
+    expect(bundle.includes(CLI_ID_LABELS_SOURCE)).toBe(true);
+  });
+
+  it.each<[string, string[]]>([
+    ['the id label of the pipeline', [environmentIdLabel('3f2a9c1e-0000-4000-8000-000000000001')]],
+    ['another environment', [environmentIdLabel('7c1d2e3f-1111-4222-8333-444444444444')]],
+    ['two labels, not sorted', ['z.label=1', 'a.label=2']],
+    ['a value with `=`, quotes, and non-ASCII text', ['k=a=b"c\\d', 'ü=ß']],
+    ['a label without `=` is dropped, a later one of the same name wins', ['nolabel', 'k=1', 'k=2']],
+    ['no labels', []],
+    ['an empty value', ['k=']],
+  ])('%s', (_name, labels) => {
+    const ours = devcontainerIdOf(labels);
+    expect(ours).toBe(cliId(labels));
+    expect(ours).toMatch(/^[0-9a-v]{52}$/);
+  });
+
+  it('environmentDevcontainerId: the ID for the single id label that the pipeline passes', () => {
+    const id = '3f2a9c1e-0000-4000-8000-000000000001';
+    expect(environmentDevcontainerId(id)).toBe(cli.Q_(ID_LABELS));
+    expect(environmentDevcontainerId(id)).toBe(cliId([`devenv.environment-id=${id}`]));
+    expect(environmentDevcontainerId(id)).not.toBe(DEVCONTAINER_ID_PLACEHOLDER);
+    expect(environmentDevcontainerId(id)).not.toBe(environmentDevcontainerId('7c1d2e3f-1111-4222-8333-444444444444'));
+  });
+});
+
+describe('helperCliVariables of a Docker Compose run (review round 18, D18-1)', () => {
+  it('knows COMPOSE_PROJECT_NAME, which the pipeline passes to the CLI runs of Docker Compose, with its value', () => {
+    const variables = helperCliVariables('acme/api', { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
+    expect(variables.env).toEqual({ HOME: '/root', COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
+    expect(substituteCliVariables('source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume', variables)).toBe('source=cachedevenv-3f2a9c1e,target=/c,type=volume');
+    const { names } = composeMountVolumes('devenv-3f2a9c1e', [['source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume']], variables);
+    expect(names).toEqual(['devenv-3f2a9c1e_cachedevenv-3f2a9c1e']);
+  });
+
+  it('a single container: COMPOSE_PROJECT_NAME is not set, and no variable of the helper process', () => {
+    expect(helperCliVariables('acme/api').env).toEqual({ HOME: '/root' });
+    expect(substituteCliVariables('cache${localEnv:COMPOSE_PROJECT_NAME}', helperCliVariables('acme/api'))).toBe('cache');
+    expect(HELPER_PROCESS_ENV_NAMES).not.toContain('COMPOSE_PROJECT_NAME');
   });
 });

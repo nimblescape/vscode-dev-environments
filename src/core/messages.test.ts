@@ -31,6 +31,20 @@ describe('Messages.olderEnvironmentNotAssigned', () => {
   });
 });
 
+describe('Messages.containerComposeReplaced (review round 1 of unit 6, P-1)', () => {
+  // The containers of the other services are removed: their volumes without a name are left behind, not kept in use.
+  it('does not claim that all data of the services is kept', () => {
+    const text = Messages.containerComposeReplaced;
+    expect(text).not.toMatch(/data of the services are kept/);
+    expect(text).toContain('named volumes are kept');
+    expect(text).toContain('volumes without a name is no longer used');
+  });
+
+  it('says that files outside the repository are removed when a single container becomes Docker Compose', () => {
+    expect(Messages.containerComposeCreated).toContain('Files in other folders of the container');
+  });
+});
+
 describe('Messages.dockerEngineNotRunning', () => {
   // The same command as the action Start Docker of the Docker setup: the service also starts with the computer then.
   it('names the command that enables and starts the Docker service', () => {

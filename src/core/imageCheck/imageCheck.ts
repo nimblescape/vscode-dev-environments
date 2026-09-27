@@ -7,7 +7,7 @@
 import { errorMessage } from '../errors';
 import { abortError, silentLogger, type Logger } from '../ports';
 import type { BuildRecord, DevcontainerConfig } from '../types';
-import { extractBaseImages } from './dockerfile';
+import { buildArgumentTexts, extractBaseImages } from './dockerfile';
 import { hasDigest, isOciFeatureReference, parseFeatureReference, parseImageReference, registryDisplayName } from './reference';
 import type { DigestResult, RegistryClient } from './registryClient';
 
@@ -33,12 +33,8 @@ export function collectReferences(config: DevcontainerConfig, dockerfileText?: s
   if (!usesDockerfile && typeof config.image === 'string' && config.image.trim() !== '') images.push(config.image.trim());
   if (dockerfileText !== undefined) {
     const build: { args?: unknown; target?: unknown } = isRecord(config.build) ? config.build : {};
-    const args: Record<string, string> = {};
-    if (isRecord(build.args)) {
-      for (const [name, value] of Object.entries(build.args)) {
-        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') args[name] = String(value);
-      }
-    }
+    // Review round 18 (S18-1): own properties, also for an argument named `__proto__`.
+    const args = buildArgumentTexts(build.args);
     const target = typeof build.target === 'string' && build.target !== '' ? build.target : undefined;
     images.push(...extractBaseImages(dockerfileText, args, { target }));
   }

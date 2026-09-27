@@ -31,6 +31,8 @@ export const TreeTexts = {
   archived: 'Archived repository',
   /** Tooltip line of a kept environment (Keep Running When Closed, user decision 2026-09-26). */
   kept: 'Keeps running when closed: stop it yourself.',
+  /** Review round 7, P7-2: tooltip line of an environment whose dev container does not run while another service does. */
+  servicesRunning: 'Other services of Docker Compose run. Stop stops them.',
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
   signIn: 'Sign in with GitHub',
   signInTooltip: 'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
@@ -38,8 +40,11 @@ export const TreeTexts = {
 
 /** Container and volume state of one environment, as Docker reports it. */
 export interface EnvironmentRuntime {
+  /** The state of the dev container (review round 7, P7-2: not of the other services of Docker Compose). */
   container: ContainerState;
   volume: boolean;
+  /** Review round 7, P7-2: a container of another service of Docker Compose runs. */
+  servicesRunning?: boolean;
 }
 
 export interface TreeInput {
@@ -291,11 +296,13 @@ export function rowActions(
   state: EnvironmentState | undefined,
   info: RepositoryInfo | undefined,
   busyOperation?: BusyOperation,
+  servicesRunning = false,
 ): RowActions {
   const hasEnvironment = state !== undefined;
   return {
     canStart: state !== 'connected' && state !== 'updating',
-    canStop: containerRuns(state),
+    // Review round 7, P7-2: also while only other services of Docker Compose run (the dev container is stopped).
+    canStop: containerRuns(state) || (servicesRunning && hasEnvironment && state !== 'updating'),
     canDelete: hasEnvironment && !(state === 'updating' && busyOperation === 'delete'),
     canRebuild: hasEnvironment && state !== 'updating',
     multiConfig: (info?.configPaths.length ?? 0) > 1,
@@ -619,7 +626,9 @@ function environmentRow(
   const repository = info?.nameWithOwner ?? environment.repository;
   const { owner, name } = info ? { owner: info.owner, name: info.name } : splitName(repository);
   const state = environmentState(environment, input);
-  const actions = rowActions(state, info, state === 'updating' ? environment.busy?.operation : undefined);
+  // Review round 7, P7-2: the state is the one of the dev container; running side services keep Stop and are named.
+  const servicesRunning = input.runtime?.get(environment.id)?.servicesRunning === true && !containerRuns(state) && state !== 'updating';
+  const actions = rowActions(state, info, state === 'updating' ? environment.busy?.operation : undefined, servicesRunning);
   const liveBranch = containerRuns(state) || state === 'updating' ? input.liveBranches.get(environment.id) : undefined;
   const branch = nonEmpty(liveBranch) ?? nonEmpty(environment.gitSummary?.branch ?? undefined);
   const configuration = actions.multiConfig ? configurationName(environment.configPath) : undefined;
@@ -636,14 +645,16 @@ function environmentRow(
   const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   const left = [branch, configuration !== undefined ? `(${configuration})` : undefined].filter(isText).join(' ');
   const kept = environment.keepRunning === true;
-  const right = [rowStateText(state, kept), changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
+  const services = servicesRunning ? StateTexts.servicesRunning : undefined;
+  const right = [rowStateText(state, kept), services, changes, notOnGitHub ? StateTexts.notOnGitHub : undefined, unrestricted].filter(isText).join(' · ');
   const description = [left, right].filter(isText).join('   ');
 
   const formatTime = input.formatTime ?? defaultFormatTime;
   const tooltip = [
     repository,
-    [rowStateText(state, kept), changes].filter(isText).join(' · '),
+    [rowStateText(state, kept), services, changes].filter(isText).join(' · '),
     kept ? TreeTexts.kept : undefined,
+    servicesRunning ? TreeTexts.servicesRunning : undefined,
     branch !== undefined ? TreeTexts.branch(branch) : undefined,
     configuration !== undefined ? TreeTexts.configuration(configuration) : undefined,
     timeValue(environment.lastUsedAt) > 0 ? TreeTexts.lastUsed(formatTime(environment.lastUsedAt)) : undefined,
