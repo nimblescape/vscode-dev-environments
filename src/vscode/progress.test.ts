@@ -8,7 +8,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import { Messages } from '../core/messages';
 import type { ProgressReporter } from '../core/ports';
-import { currentOperation, onDidChangeBusy, progressMessage, runWithProgress, type BusyChange } from './progress';
+import { currentOperation, hideProgressNotification, onDidChangeBusy, progressMessage, runWithProgress, type BusyChange } from './progress';
 import { EventEmitter, fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 interface FakeProgressRun {
@@ -61,7 +61,10 @@ describe('runWithProgress', () => {
     expect(result).toBe(42);
     expect(runs).toHaveLength(1);
     expect(runs[0].options).toEqual({ location: fakeVscode.ProgressLocation.Notification, cancellable: false });
-    expect(runs[0].messages.map((message) => message.replace(' [Show details](command:devEnvironments.showLog)', ''))).toEqual([
+    // User decision 2026-09-28: changed expectation, the link Show details names the operation (and closes the
+    // notification, see below).
+    expect(runs[0].messages.every((message) => /\[Show details\]\(command:devEnvironments\.showProgressDetails\?%5B\d+%5D\)$/.test(message))).toBe(true);
+    expect(runs[0].messages.map((message) => message.replace(/ \[Show details\]\(command:[^)]*\)$/, ''))).toEqual([
       'Opening acme/api…',
       'Opening acme/api… Checking for a newer image.',
       'Opening acme/api… Downloading the new image.',
@@ -146,6 +149,74 @@ describe('runWithProgress', () => {
       { busy: true, title: 'Stopping acme/web…' },
       { busy: false },
     ]);
+  });
+
+  it('closes the notification on Show details, and the operation goes on and settles (user decision 2026-09-28)', async () => {
+    let notificationClosed = false;
+    const runs: FakeProgressRun[] = [];
+    fakeVscode.window.withProgress.mockImplementation(async (options, task) => {
+      const cancellation = new EventEmitter<void>();
+      const run: FakeProgressRun = { options, messages: [], cancel: () => cancellation.fire() };
+      runs.push(run);
+      const value = await task(
+        { report: (report: { message?: string }) => run.messages.push(report.message ?? '') },
+        { isCancellationRequested: false, onCancellationRequested: cancellation.event },
+      );
+      notificationClosed = true;
+      return value;
+    });
+    let finish: (value: number) => void = () => undefined;
+    let reporter: ProgressReporter | undefined;
+    const promise = runWithProgress({
+      title: 'Opening acme/api…',
+      repository: 'acme/api',
+      cancellable: true,
+      task: (progress) => {
+        reporter = progress;
+        progress.step('downloadingImage');
+        return new Promise<number>((resolve) => {
+          finish = resolve;
+        });
+      },
+    });
+    await Promise.resolve();
+    const link = /command:devEnvironments\.showProgressDetails\?([^)]*)\)$/.exec(runs[0].messages.at(-1) ?? '');
+    expect(link).not.toBeNull();
+    const [id] = JSON.parse(decodeURIComponent(link![1])) as [number];
+    // Another ID closes nothing.
+    hideProgressNotification(id + 1000);
+    hideProgressNotification('x');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notificationClosed).toBe(false);
+    hideProgressNotification(id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notificationClosed).toBe(true);
+    // The operation goes on: still busy (the status bar shows it), and no more reports to the closed notification.
+    expect(currentOperation()).toEqual({ title: 'Opening acme/api…', repository: 'acme/api' });
+    const reported = runs[0].messages.length;
+    reporter!.step('starting');
+    expect(runs[0].messages).toHaveLength(reported);
+    finish(7);
+    await expect(promise).resolves.toBe(7);
+    expect(currentOperation()).toBeUndefined();
+  });
+
+  it('passes a failure of the task on after Show details closed the notification', async () => {
+    const runs = scriptWithProgress();
+    let fail: (error: Error) => void = () => undefined;
+    const promise = runWithProgress({
+      title: 'x',
+      task: () =>
+        new Promise<number>((_resolve, reject) => {
+          fail = reject;
+        }),
+    });
+    await Promise.resolve();
+    const [id] = JSON.parse(decodeURIComponent(/\?([^)]*)\)$/.exec(runs[0].messages.at(-1) ?? '')![1])) as [number];
+    hideProgressNotification(id);
+    fail(new Error('failed'));
+    await expect(promise).rejects.toThrow('failed');
+    expect(currentOperation()).toBeUndefined();
   });
 
   it('ends the busy state also when the notification cannot be shown', async () => {

@@ -52,7 +52,7 @@ import { showError as presentError } from './errors';
 import type { OutputChannelLogger } from './logger';
 import { selectOwners } from './ownerSelector';
 import type { VsCodePipelineUi } from './pipelineUi';
-import { runWithProgress, type BusyChange } from './progress';
+import { hideProgressNotification, runWithProgress, type BusyChange } from './progress';
 import type { RemoteDockerCommands } from './remoteDockerCommands';
 import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { SessionCoordinator } from './sessionCoordinator';
@@ -312,10 +312,14 @@ export class Controller implements vscode.Disposable {
       useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
       useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
       rowActivated: (argument) => this.rowActivated(argument),
+      showProgressDetails: async (argument) => {
+        this.logger.show();
+        hideProgressNotification(argument);
+      },
     };
     // Unit 7: each command is one operation on the Docker host that is current when it starts; the two commands that
     // change the host read it themselves. A click on a row is no operation: only the Start of a double-click is one.
-    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'rowActivated']);
+    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'rowActivated', 'showProgressDetails']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
         if (ownTarget.has(name)) await handlers[name](argument);

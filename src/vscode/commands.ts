@@ -51,6 +51,8 @@ export const Commands = {
   // The command of a repository row (TreeItem.command, hidden in the Command Palette): a double-click runs Start (user
   // request 2026-09-27, "double-clicking a repo shall start the machine"; rowActivation.ts).
   rowActivated: 'devEnvironments.rowActivated',
+  // User decision 2026-09-28: the link "Show details" of a progress notification (hidden from the Command Palette).
+  showProgressDetails: 'devEnvironments.showProgressDetails',
 } as const;
 
 export type CommandName = keyof typeof Commands;
