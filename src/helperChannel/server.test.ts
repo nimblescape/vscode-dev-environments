@@ -315,6 +315,20 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(docker.children).toHaveLength(6);
   });
 
+  it('waits for the cleanup of a late cancel before it exits, also when the input ends right after it (review round 3, K1)', async () => {
+    const { server, send, docker, exits } = setup({ docker: fakeDocker({ respond: cleanupAnswers([ID_1]) }) });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '-d', 'img'], cleanup: LABEL } });
+    docker.children[0].exit(0);
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'cancel', id: 1 });
+    server.inputEnded();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(exits).toEqual([]);
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1], PS_OF_LABEL, ['rm', '-f', ID_1]]);
+    expect(exits).toEqual([0]);
+  });
+
   it('pauses the output of the calls while the answers wait to be written, and resumes it when they are (review round 2, A2)', async () => {
     let congested = false;
     let drain: (() => void) | undefined;

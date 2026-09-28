@@ -137,8 +137,9 @@ export class HelperChannels {
 
   /**
    * The open channel to the engine of `target`, opened now if needed. Undefined for a target that is not remote, after
-   * dispose, and when it cannot be opened (logged once per attempt; the next attempt after CHANNEL_RETRY_AFTER_FAILURE_MS).
-   * Never throws.
+   * dispose, when it cannot be opened (logged once per attempt; the next attempt after CHANNEL_RETRY_AFTER_FAILURE_MS),
+   * and when it is not open within `wait.waitMs`. Rejects only with an AbortError when `wait.signal` aborts (review
+   * round 3, K5), as every call with that signal does.
    */
   async get(target: DockerTarget, wait: { signal?: AbortSignal; waitMs?: number } = {}): Promise<HelperChannel | undefined> {
     if (wait.signal?.aborted) throw abortError();

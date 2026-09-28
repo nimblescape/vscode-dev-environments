@@ -149,6 +149,8 @@ export class ChannelServer {
   private readonly running = new Map<number, Running>();
   /** Review round 2 (A1): the cleanup labels of operations that ended by themselves, for a cancel that comes late. */
   private readonly endedCleanups = new Map<number, { labels: string[]; timer: ReturnType<typeof setTimeout> }>();
+  /** Review round 3 (K1): the cleanups of late cancels that run; the exit waits for them. */
+  private readonly lateCleanups = new Set<Promise<void>>();
   /** Review round 2 (A2): the output of the calls is paused until the waiting answers are written. */
   private outputPaused = false;
   private readonly splitter: LineSplitter;
@@ -276,7 +278,9 @@ export class ChannelServer {
         if (ended) {
           this.endedCleanups.delete(message.id);
           clearTimeout(ended.timer);
-          void this.cleanupLabels(ended.labels);
+          const cleanup = this.cleanupLabels(ended.labels);
+          this.lateCleanups.add(cleanup);
+          void cleanup.then(() => this.lateCleanups.delete(cleanup));
         }
         return;
       }
@@ -545,7 +549,8 @@ export class ChannelServer {
     const deadline = setTimeout(() => this.deps.exit(0), this.killGraceMs + CHANNEL_CLEANUP_TIMEOUT_MS + 5_000);
     const runs = [...this.running.values()];
     for (const run of runs) this.cancel(run, false);
-    void Promise.all(runs.map((run) => run.finished)).then(() => {
+    // Review round 3 (K1): also the cleanups of late cancels (a cancel that crossed a result, then the input ended).
+    void Promise.all([...runs.map((run) => run.finished), ...this.lateCleanups]).then(() => {
       clearTimeout(deadline);
       this.deps.exit(0);
     });

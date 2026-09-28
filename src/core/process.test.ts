@@ -156,6 +156,34 @@ describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)'
     expect(Date.now() - killedAt).toBeGreaterThanOrEqual(250);
   });
 
+  it('sends no pkill for a program that exited already (review round 3, K2: its pid may be another program now)', async () => {
+    if (process.platform === 'win32') return;
+    const killed: number[] = [];
+    const runner = new NodeProcessRunner(undefined, undefined, {
+      startKillGraceMs: 200,
+      killChildren: (pid, done) => {
+        killed.push(pid);
+        done();
+      },
+    });
+    // It exits on SIGTERM, but a detached grandchild keeps its stdout open, so 'close' comes late.
+    const script = [
+      'const { spawn } = require("child_process");',
+      'spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { detached: true, stdio: ["ignore", "inherit", "inherit"] }).unref();',
+      'process.on("SIGTERM", () => process.exit(0));',
+      'process.stdout.write("ready");',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = runner.start(node, ['-e', script]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout !== 'ready'; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    started.kill();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(killed).toEqual([]);
+    await started.exited;
+  });
+
   it('the SIGKILL goes first to the programs that it started (review round 2, A3: the ssh of the Docker CLI)', async () => {
     if (process.platform === 'win32') return;
     const killed: number[] = [];
@@ -192,11 +220,13 @@ describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)'
     started.kill();
     await started.exited;
     // Ended: gone, or a zombie that nobody reaps (its parent was killed; process 1 of a container may not reap it).
+    // Review round 3 (K6): only "no such process" counts as gone; without `ps` the test fails instead of passing.
     const alive = () => {
       try {
         const state = execFileSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).trim();
         return state !== '' && !state.startsWith('Z');
-      } catch {
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
         return false;
       }
     };

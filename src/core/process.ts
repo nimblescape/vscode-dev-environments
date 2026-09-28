@@ -233,7 +233,9 @@ export class NodeProcessRunner implements ProcessRunner {
         // Review round 1 (L2): `docker run -i` passes SIGTERM on to its container over its connection and waits; over a
         // hung connection it would never end. So SIGKILL after START_KILL_GRACE_MS (Windows: taskkill /F ended it).
         const timer = setTimeout(() => {
-          if (ended) return;
+          // Review round 3 (K2): `exitCode`/`signalCode` are set on 'exit', which can come well before 'close' (a
+          // program that still holds its pipes); after it, the pid may belong to another program already.
+          if (ended || child.exitCode !== null || child.signalCode !== null) return;
           // Review round 2 (A3): first the programs that it started (the Docker CLI starts `ssh` in a session of its own,
           // which no signal to docker reaches; on Linux it would die with it, on macOS it would stay), then docker. Only
           // after pkill ended (at most 1 s): a docker killed before would leave its children to process 1, where

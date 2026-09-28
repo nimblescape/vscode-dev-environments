@@ -65,9 +65,14 @@ describe('the helper channel with the real Docker engine', () => {
   let script = '';
   let helperTag = '';
 
-  /** The container of the channel of `process` (by the name in its arguments). */
+  /**
+   * The channel containers of this run. Review round 3 (K3): only those with the label of the run, so that the channel
+   * of another run or of a real window on the same engine is never listed or removed.
+   */
   const channelContainers = () =>
-    cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--format', '{{.Names}}']);
+    cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.Names}}']);
+  /** The label of the run, on every channel container of this file. */
+  const runLabelArgs = ['--label', `${TEST_RUN_LABEL}=${run.runId}`];
 
   /** Opens a channel as the extension does; `extraArgs` go before the image (for example `-e`), `process` is kept. */
   async function open(extraArgs: string[] = []): Promise<{ channel: HelperChannel; process: StartedProcess; name: string }> {
@@ -77,7 +82,7 @@ describe('the helper channel with the real Docker engine', () => {
       {
         start: (args) => {
           const all = [...args];
-          all.splice(all.indexOf(helperTag), 0, ...extraArgs);
+          all.splice(all.indexOf(helperTag), 0, ...runLabelArgs, ...extraArgs);
           name = all[all.indexOf('--name') + 1];
           started = docker.start(all);
           return started;
@@ -163,7 +168,7 @@ describe('the helper channel with the real Docker engine', () => {
     const label = newCleanupLabel();
     const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script) });
     // Review round 1 (P8): long enough for the step to start and be seen on a slow runner.
-    args.splice(args.indexOf(helperTag), 0, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');
+    args.splice(args.indexOf(helperTag), 0, ...runLabelArgs, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');
     const process = docker.start(args)!;
     let stdout = '';
     process.onStdout((text) => (stdout += text));
