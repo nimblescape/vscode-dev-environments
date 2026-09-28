@@ -761,7 +761,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(error?.code).not.toBe('hostAccess');
   });
 
-  it('lists the images of the environments only when a reference names a local image, once per check', async () => {
+  it('lists the images of the environments only when a reference names a local image or a missing environment image, once per check', async () => {
     h.helper.config = { image: 'missing:1' };
     await h.service.open(TARGET, options()).catch(() => undefined);
     expect(h.docker.environmentImageLists).toBe(0);
@@ -773,9 +773,14 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.docker.environmentImageLists).toBe(h.docker.imageInspections.length - inspections);
     expect(h.docker.environmentImageLists).toBeGreaterThan(0);
     expect(h.docker.imageInspections.every((references) => !references.includes(THEIRS))).toBe(true);
+    // Review round 6 (V1): a missing name of an environment image (review round 3, S1) is decided with the list too.
+    const lists = h.docker.environmentImageLists;
+    h.helper.config = { image: environmentImageName(ENV_ID, 9) };
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.environmentImageLists).toBe(lists + 1);
   });
 
-  it('lists the volumes only for an image of no owner that the registry knows, and only when a reference found it', async () => {
+  it('lists the volumes only for a short ID that the registry does not know, of a found image or of a missing environment image', async () => {
     // The open lists the volumes for other reasons too: only the lists of the check of the images count.
     let ownerLists = 0;
     const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
@@ -799,6 +804,14 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     h.helper.config = { image: environmentImageName(gone, 2) };
     await rejection(h.service.open(TARGET, options()));
     expect(ownerLists).toBe(1);
+    // Review round 6 (V2): a missing name of an environment image of no known owner: one list.
+    h.helper.config = { image: environmentImageName('1b2c3d4e-0000-4000-8000-000000000011', 1) };
+    await rejection(h.service.open(TARGET, options()));
+    expect(ownerLists).toBe(2);
+    // A missing name of the environment of the other account, which the registry knows: none.
+    h.helper.config = { image: environmentImageName(ENV_ID, 9) };
+    await rejection(h.service.open(TARGET, options()));
+    expect(ownerLists).toBe(2);
   });
 
   it('does not take the owner of an environment on another Docker host for the owner of an image here', async () => {
