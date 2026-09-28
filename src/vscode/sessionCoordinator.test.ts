@@ -14,8 +14,8 @@ import type { ExtensionSettings, WindowStatus } from '../core/types';
 import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
-// Versions reset to 1 (user decision 2026-09-27): no monitor older than version 1 exists. To test the retirement of an
-// older monitor, a test sets the protocol version of the window to a future version 2 (`windowVersion.value`); the
+// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58. To test the retirement of an older
+// monitor, a test sets the protocol version of the window to a future version 3 (`windowVersion.value`); the
 // protocol version of the monitor module stays the real one otherwise.
 const windowVersion = vi.hoisted(() => ({ value: undefined as number | undefined }));
 vi.mock('../monitor/lock', async (importOriginal) => {
@@ -263,10 +263,11 @@ describe('SessionCoordinator', () => {
   // A Session Monitor of an older protocol version may decide wrongly with the files of a newer window. A window asks it
   // to exit and starts the current monitor, which waits for it (monitor protocol version, monitor.version next to
   // monitor.lock). It never sends a signal (round-2 review of PR #26): a monitor without a version is left alone.
-  // Versions reset to 1 (user decision 2026-09-27): the window runs as a future version 2, the older monitor is version 1.
+  // The window runs as a future version, the older monitor is of the current version.
   describe('a monitor of an older version', () => {
-    const FUTURE_VERSION = 2;
-    const OLDER_VERSION = 1;
+    // Review round 3 of PR #58 (F1): the current version is 2, so the future window is 3 and the older monitor is 2.
+    const FUTURE_VERSION = 3;
+    const OLDER_VERSION = 2;
     beforeEach(() => {
       windowVersion.value = FUTURE_VERSION;
     });
@@ -297,7 +298,8 @@ describe('SessionCoordinator', () => {
       expect(exitRequestPid()).toBe(OTHER_PID);
       expect(h.spawns).toHaveLength(1);
       expect(h.logger.lines.join('\n')).toContain(
-        `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version 1, older than 2.`,
+        // Review round 3 of PR #58 (F1): the versions of the fixture moved up by one.
+        `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version ${OLDER_VERSION}, older than ${FUTURE_VERSION}.`,
       );
     });
 
@@ -309,7 +311,7 @@ describe('SessionCoordinator', () => {
       expect(h.spawns).toEqual([]);
     });
 
-    it('leaves a monitor of version 1 alone while the window is of version 1 too', async () => {
+    it('leaves a monitor of the current version alone while the window is of that version too', async () => {
       windowVersion.value = undefined;
       expect(MONITOR_PROTOCOL_VERSION).toBe(OLDER_VERSION);
       writeLock(3_000);

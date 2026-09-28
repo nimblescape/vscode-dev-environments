@@ -24,6 +24,12 @@ export const REMOTE_MONITOR_SCRIPT_PATH = '/opt/devenv/monitor.js';
 export const REMOTE_MONITOR_STATE_DIR = '/state';
 /** The folder of the heartbeat records in the volume: `<source>.<environment id>.json`. */
 export const HEARTBEAT_FOLDER = 'heartbeats';
+/** The kernel lock (`flock`) of the heartbeat records, in the volume (heartbeatCommand). */
+export const HEARTBEAT_LOCK_PATH = `${REMOTE_MONITOR_STATE_DIR}/.heartbeats.lock`;
+/** How long a heartbeat waits for HEARTBEAT_LOCK_PATH, in seconds. */
+export const HEARTBEAT_LOCK_WAIT_SECONDS = 5;
+/** A heartbeat that holds HEARTBEAT_LOCK_PATH longer than this, in seconds, is killed (the lock with it). */
+export const HEARTBEAT_RUN_LIMIT_SECONDS = 10;
 
 /** Default of the setting devEnvLauncher.remoteStopAfterMinutes (10 minutes). */
 export const DEFAULT_REMOTE_STOP_AFTER_SECONDS = 600;
@@ -187,9 +193,63 @@ export function parseHeartbeatFileName(name: string): { source: string; environm
   return match ? { source: match[1], environmentId: match[2] } : undefined;
 }
 
-/** The command of `docker exec` that writes a heartbeat. The argument holds no secret (ids and flags only). */
+/** The exit code of a command under the lock of the records that did not get the lock in time (`flock -E`). */
+export const RECORDS_LOCK_BUSY_EXIT = 75;
+/** The exit code of a command under the lock of the records that `timeout -s KILL` ended (128 + SIGKILL). */
+export const RECORDS_RUN_LIMIT_EXIT = 137;
+
+/**
+ * `command` under the kernel lock `flock` (util-linux) of HEARTBEAT_LOCK_PATH.
+ *
+ * Review round 2 of PR #58 (after review round 10 of PR #57): two heartbeats (two `docker exec` at the same time) read and
+ * replace the records one after the other. The kernel releases the lock when its process ends, also when it is killed,
+ * so no lock is ever left over; a command that does not get the lock within HEARTBEAT_LOCK_WAIT_SECONDS fails with
+ * RECORDS_LOCK_BUSY_EXIT (review round 3, F7) and writes nothing, and one that holds it longer than
+ * HEARTBEAT_RUN_LIMIT_SECONDS is killed (`timeout`, coreutils; RECORDS_RUN_LIMIT_EXIT), so a hanging heartbeat cannot
+ * block the others. Together at most 15 s, within the 20 s of a `docker exec` of a heartbeat.
+ */
+function underRecordsLock(command: readonly string[]): string[] {
+  return [
+    'flock',
+    '-w',
+    String(HEARTBEAT_LOCK_WAIT_SECONDS),
+    '-E',
+    String(RECORDS_LOCK_BUSY_EXIT),
+    HEARTBEAT_LOCK_PATH,
+    'timeout',
+    '-s',
+    'KILL',
+    String(HEARTBEAT_RUN_LIMIT_SECONDS),
+    ...command,
+  ];
+}
+
+/** Whether `command` runs under the lock of the records (heartbeatCommand, forgetCommand). */
+export function isUnderRecordsLock(command: readonly string[]): boolean {
+  return command[0] === 'flock';
+}
+
+/**
+ * The reason of a failed `docker exec` of the monitor: its stderr, else (review round 3 of PR #58, F7) for a command
+ * under the lock of the records (`underLock`) the busy lock or a kill by their exit codes, else the exit code. Review
+ * round 4 (H2): 137 is any SIGKILL (the time limit, an OOM kill, a container removed meanwhile), so the text names both;
+ * a command without the lock (records) gets the bare exit code.
+ */
+export function monitorExecFailure(exitCode: number | null, stderr: string, underLock: boolean): string {
+  const text = stderr.trim();
+  if (text !== '') return text;
+  if (underLock && exitCode === RECORDS_LOCK_BUSY_EXIT) {
+    return `the heartbeat records stayed locked by another command for ${HEARTBEAT_LOCK_WAIT_SECONDS} s`;
+  }
+  if (underLock && exitCode === RECORDS_RUN_LIMIT_EXIT) {
+    return `the command was killed (its limit of ${HEARTBEAT_RUN_LIMIT_SECONDS} s, or a kill from outside)`;
+  }
+  return `exit code ${exitCode}`;
+}
+
+/** The command of `docker exec` that writes a heartbeat, under the lock of the records. No secret (ids and flags only). */
 export function heartbeatCommand(input: HeartbeatInput): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(input)];
+  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(input)]);
 }
 
 /** The command of `docker exec` that prints the records of an environment (RecordsOutput). */
@@ -197,9 +257,12 @@ export function recordsCommand(environmentId: string): string[] {
   return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', environmentId];
 }
 
-/** The command of `docker exec` that removes the record of `source` for an environment (Delete). */
+/**
+ * The command of `docker exec` that removes the record of `source` for an environment (Delete). Review round 3 of PR #58
+ * (F6): under the lock of the records, so a heartbeat that read the record before cannot write it back after.
+ */
 export function forgetCommand(source: string, environmentId: string): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId];
+  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId]);
 }
 
 // ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the

@@ -10,6 +10,8 @@ import {
   MAX_SCRIPT_LENGTH,
   MAX_WINDOWS_COMMAND_LINE,
   REMOTE_MONITOR_SCRIPT_PATH,
+  forgetCommand,
+  heartbeatCommand,
   remoteMonitorLabelValue,
   windowsCommandLineLength,
 } from './protocol';
@@ -198,7 +200,9 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     const docker = new FakeDocker(() => result(0));
     const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 1 }] };
     expect(await monitor(docker).heartbeat(heartbeat)).toEqual({ ok: true, stdout: '' });
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
+    // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records (heartbeatCommand).
+    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...heartbeatCommand(heartbeat)]);
+    expect(heartbeatCommand(heartbeat).slice(-4)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
   });
 
@@ -209,6 +213,16 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(await monitor(new FakeDocker(() => stopped)).heartbeat(heartbeat)).toMatchObject({ ok: false, missing: true });
     const invalid = result(2, '', 'Invalid heartbeat.');
     expect(await monitor(new FakeDocker(() => invalid)).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Invalid heartbeat.' });
+    // Review round 3 of PR #58 (F7): a lock that stayed busy and the time limit are named.
+    expect(await monitor(new FakeDocker(() => result(75))).heartbeat(heartbeat)).toEqual({
+      ok: false,
+      missing: false,
+      detail: 'the heartbeat records stayed locked by another command for 5 s',
+    });
+    // Review round 4 (H2): 137 is any SIGKILL (a command without the lock gets the bare exit code: protocol.test.ts).
+    expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({
+      detail: 'the command was killed (its limit of 10 s, or a kill from outside)',
+    });
     const thrown = new FakeDocker(() => Promise.reject(new Error('Docker Desktop is not installed.')));
     expect(await monitor(thrown).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Docker Desktop is not installed.' });
   });
@@ -224,11 +238,18 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     const logger = new Log();
     const docker = new FakeDocker(() => result(0));
     await monitor(docker, logger).forget(SOURCE, ID);
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    // Review round 3 of PR #58 (F6): under the lock of the records, as a heartbeat.
+    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...forgetCommand(SOURCE, ID)]);
+    expect(forgetCommand(SOURCE, ID).slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
     await monitor(new FakeDocker(() => MISSING), logger).forget(SOURCE, ID);
     expect(logger.lines).toEqual([]);
     await monitor(new FakeDocker(() => result(1, '', 'boom')), logger).forget(SOURCE, ID);
     expect(logger.lines).toEqual([`warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`]);
+    // Review round 5 of PR #58 (J2): forget runs under the lock of the records, so a kill is named in the log.
+    await monitor(new FakeDocker(() => result(137)), logger).forget(SOURCE, ID);
+    expect(logger.lines[1]).toBe(
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
+    );
   });
 
   it('isMissingContainer', () => {

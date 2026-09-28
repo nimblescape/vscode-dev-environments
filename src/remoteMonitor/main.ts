@@ -115,40 +115,6 @@ export async function readRecords(dir: string): Promise<RemoteRecord[]> {
   return records;
 }
 
-/** A lock of a record older than this is left over (a `docker exec` that was killed) and is removed. */
-const RECORD_LOCK_STALE_MS = 10_000;
-/** How long a heartbeat waits for the lock of a record. */
-const RECORD_LOCK_WAIT_MS = 5_000;
-
-/**
- * Runs `fn` while holding the lock of one record (`.<name>.lock`, created with `wx`), so that two heartbeats of the same
- * source (two `docker exec` at the same time) read and replace the record one after the other.
- */
-async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
-  const lock = path.join(dir, `.${name}.lock`);
-  const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      await fs.promises.writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const stat = await fs.promises.lstat(lock).catch(() => undefined);
-      if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) {
-        await fs.promises.rm(lock, { force: true });
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await fs.promises.rm(lock, { force: true }).catch(() => undefined);
-  }
-}
-
 /**
  * Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. An entry is
  * ignored (no write, the record stays as it is):
@@ -157,33 +123,46 @@ async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>
  *   while an older record is replaced whatever its `seq` (a clock of the computer that was set back);
  * - when it is `clearOnly` and the existing record of the same source does not say keepRunning (review round 3, N1):
  *   it only withdraws a keep of this source, and must not create or refresh a record.
- * Returns the ids of the ignored entries.
+ * Returns the ids of the ignored entries. The caller holds the kernel lock of the records (heartbeatCommand runs
+ * `heartbeat` under `flock`), so two heartbeats read and replace the records one after the other.
  */
 export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<string[]> {
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  await removeLeftoverTemporaryFiles(dir);
   const ignored: string[] = [];
   for (const environment of input.environments) {
     const name = heartbeatFileName(input.source, environment.id);
     const file = path.join(dir, name);
-    await withRecordLock(dir, name, async () => {
-      const existing = await readRecordFile(file);
-      const olderEntry = existing !== undefined && existing.seq > environment.seq && Math.abs(now - existing.at) <= SEQ_ORDER_WINDOW_MS;
-      const nothingToClear = environment.clearOnly === true && existing?.keepRunning !== true;
-      if (olderEntry || nothingToClear) {
-        ignored.push(environment.id);
-        return;
-      }
-      const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
-      const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
-      try {
-        await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
-        await fs.promises.rename(temp, file);
-      } finally {
-        await fs.promises.rm(temp, { force: true }).catch(() => undefined);
-      }
-    });
+    const existing = await readRecordFile(file);
+    const olderEntry = existing !== undefined && existing.seq > environment.seq && Math.abs(now - existing.at) <= SEQ_ORDER_WINDOW_MS;
+    const nothingToClear = environment.clearOnly === true && existing?.keepRunning !== true;
+    if (olderEntry || nothingToClear) {
+      ignored.push(environment.id);
+      continue;
+    }
+    const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
+    const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
+    try {
+      await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
+      await fs.promises.rename(temp, file);
+    } finally {
+      await fs.promises.rm(temp, { force: true }).catch(() => undefined);
+    }
   }
   return ignored;
+}
+
+/**
+ * Review round 3 of PR #58 (F5): removes the temporary files of heartbeats that were killed between the write and the
+ * rename (`timeout -s KILL`, a killed container), `.<record name>.<pid>.tmp`. Only under the lock of the records
+ * (heartbeatCommand), where no other heartbeat writes one. Nothing else is touched; a failure is ignored.
+ */
+async function removeLeftoverTemporaryFiles(dir: string): Promise<void> {
+  const names = await fs.promises.readdir(dir).catch(() => [] as string[]);
+  for (const name of names) {
+    const match = /^\.(.+)\.[0-9]+\.tmp$/.exec(name);
+    if (match && parseHeartbeatFileName(match[1])) await fs.promises.rm(path.join(dir, name), { force: true }).catch(() => undefined);
+  }
 }
 
 /** One record file: a regular file of at most 4 KB with a valid record; `undefined` for anything else. */

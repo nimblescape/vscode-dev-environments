@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
@@ -166,22 +166,24 @@ describe('monitor.js heartbeat', () => {
     expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: 1 });
   });
 
-  it('two heartbeats at the same time: the higher seq stays, whatever the order of the writes', async () => {
-    const entry = (seq: number, keepRunning: boolean) => JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning, seq }] });
-    await Promise.all([run(['heartbeat', entry(2, true)]), run(['heartbeat', entry(1, false)]), run(['heartbeat', entry(2, true)])]);
-    expect(readRecord(SOURCE, A)).toMatchObject({ keepRunning: true, seq: 2 });
+  // Review round 2 of PR #58: the lock of the records moved from files in this folder to the kernel lock `flock` around
+  // the `docker exec` (heartbeatCommand); the tests of two heartbeats at the same time, of a killed holder, and of the
+  // wait run real processes in heartbeatLock.test.ts. No lock file is written here anymore.
+  it('writes no lock file next to the records', async () => {
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
+    expect(fs.readdirSync(heartbeatDir(stateDir))).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
-  it('a left-over lock of a killed heartbeat is taken over after 10 seconds', async () => {
+  // Review round 3 of PR #58 (F5): a heartbeat killed between its write and its rename leaves its temporary file; the
+  // next heartbeat (under the lock of the records) removes it, and nothing else.
+  it('removes the temporary files of killed heartbeats, and only those', async () => {
     const dir = heartbeatDir(stateDir);
     fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, `.${heartbeatFileName(SOURCE, A)}.lock`);
-    fs.writeFileSync(lock, '1');
-    const old = new Date(Date.now() - 20_000);
-    fs.utimesSync(lock, old, old);
+    const leftover = `.${heartbeatFileName(OTHER, B)}.4242.tmp`;
+    const foreign = ['.other.4242.tmp', `${heartbeatFileName(OTHER, B)}.tmp`, 'notes.txt'];
+    for (const name of [leftover, ...foreign]) fs.writeFileSync(path.join(dir, name), '{');
     await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
-    expect(readRecord(SOURCE, A)).toMatchObject({ seq: 1 });
-    expect(fs.existsSync(lock)).toBe(false);
+    expect(fs.readdirSync(dir).sort()).toEqual([...foreign, heartbeatFileName(SOURCE, A)].sort());
   });
 
   it.each<[string, string[]]>([
@@ -485,8 +487,8 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(0);
     time += 120_000;
     const first = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(passes).toBe(1);
+    // Review round 3 of PR #58: waits for the pass to start instead of 10 ms, which a loaded full run exceeded.
+    await vi.waitFor(() => expect(passes).toBe(1));
     // A pass that is still running: the next one is left out.
     await schedule.run();
     expect(passes).toBe(1);
@@ -550,8 +552,9 @@ describe('the settings and the schedule of the image maintenance', () => {
     const running = schedule.run();
     await schedule.check();
     expect(observed).toBe(1);
-    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check).
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check). Review round
+    // 4 of PR #58 (H4): waits for the pass to start instead of 10 ms, after which `release` could still be unset.
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     release();
     await running;
   });
@@ -571,14 +574,15 @@ describe('the settings and the schedule of the image maintenance', () => {
       },
     });
     const first = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(observed).toBe(1));
     await schedule.check();
     expect(observed).toBe(1);
     release();
     await first;
     const next = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(observed).toBe(2);
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(observed).toBe(2));
     release();
     await next;
   });
@@ -598,7 +602,8 @@ describe('the settings and the schedule of the image maintenance', () => {
       },
     });
     const check = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(order).toEqual(['observe']));
     const run = schedule.run();
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(order).toEqual(['observe']);
