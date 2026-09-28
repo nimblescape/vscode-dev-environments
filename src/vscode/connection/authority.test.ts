@@ -7,6 +7,7 @@ import { ATTACHED_CONTAINER } from '../../core/devContainers';
 import {
   containerNameOfUri,
   decodeAuthority,
+  decodeAuthorityParts,
   encodeAuthority,
   folderUriParts,
   folderUriString,
@@ -38,6 +39,37 @@ describe('encodeAuthority', () => {
   it('rejects an empty name', () => {
     expect(() => encodeAuthority('')).toThrow();
     expect(() => encodeAuthority('/')).toThrow();
+  });
+});
+
+// User report 2026-09-28: Dev Containers' own attach to a container on another Docker host writes this form.
+describe('Docker context in the authority', () => {
+  const OWN_FORM = '{"containerName":"/devenv-majikmate-module-oop-a1b86a08","settings":{"context":"devenv-remote-2e9f507b"}}';
+
+  it('encodes the context exactly as the Dev Containers extension does', () => {
+    expect(encodeAuthority('devenv-majikmate-module-oop-a1b86a08', 'devenv-remote-2e9f507b')).toBe(`attached-container+${hexOf(OWN_FORM)}`);
+  });
+
+  it('leaves settings out without a context', () => {
+    expect(encodeAuthority(NAME, undefined)).toBe(`attached-container+${HEX}`);
+  });
+
+  it('rejects an empty context', () => {
+    expect(() => encodeAuthority(NAME, ' ')).toThrow();
+  });
+
+  it('decodes the name and the context, and the name alone for decodeAuthority', () => {
+    const authority = `attached-container+${hexOf(OWN_FORM)}`;
+    expect(decodeAuthorityParts(authority)).toEqual({ containerName: 'devenv-majikmate-module-oop-a1b86a08', dockerContext: 'devenv-remote-2e9f507b' });
+    expect(decodeAuthority(authority)).toBe('devenv-majikmate-module-oop-a1b86a08');
+    expect(decodeAuthorityParts(`attached-container+${HEX}`)).toEqual({ containerName: NAME });
+  });
+
+  it('puts the context into the folder URI', () => {
+    expect(folderUriParts(NAME, '/workspaces/api', 'devenv-remote-2e9f507b').authority).toBe(encodeAuthority(NAME, 'devenv-remote-2e9f507b'));
+    expect(folderUriString(NAME, '/workspaces/api', 'devenv-remote-2e9f507b')).toBe(
+      `vscode-remote://${encodeAuthority(NAME, 'devenv-remote-2e9f507b')}/workspaces/api`,
+    );
   });
 });
 

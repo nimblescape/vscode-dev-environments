@@ -8,7 +8,7 @@
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
+import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost, remoteContextName } from '../core/docker/dockerHost';
 import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
@@ -1176,8 +1176,9 @@ export class Controller implements vscode.Disposable {
           this.logger.info(`${repository} is open in another window. That window is shown.`);
           const folder = environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository);
           // A request for a new window never replaces the current window, also if VS Code does not find the other one.
-          if (this.opensNewWindow(options.window ?? 'default', false)) await connection.openInNewWindow(environment.containerName, folder);
-          else await connection.open(environment.containerName, folder);
+          const args = this.windowArgs(environment, environment.containerName, folder);
+          if (this.opensNewWindow(options.window ?? 'default', false)) await connection.openInNewWindow(...args);
+          else await connection.open(...args);
           return;
         }
         // Concept 6.2 "Stopped: the next Start starts it": the other window has lost its connection, so the container
@@ -1309,10 +1310,10 @@ export class Controller implements vscode.Disposable {
     }
     await this.deps.coordinator.writePending(result.environment.id);
     if (request.newWindow) {
-      await this.deps.connection.openInNewWindow(result.containerName, result.remoteWorkspaceFolder);
+      await this.deps.connection.openInNewWindow(...this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder));
       return;
     }
-    await this.deps.connection.open(result.containerName, result.remoteWorkspaceFolder);
+    await this.deps.connection.open(...this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder));
   }
 
   /**
@@ -1909,7 +1910,7 @@ export class Controller implements vscode.Disposable {
     if (!environment || !isAvailableTo(environment, account)) return false;
     this.left = undefined;
     this.logger.info(`The signed-in GitHub account may use ${left.repository} again. The window reloads to open it.`);
-    await this.deps.connection.open(left.containerName, environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository));
+    await this.deps.connection.open(...this.windowArgs(environment, left.containerName, environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository)));
     return true;
   }
 
@@ -2466,6 +2467,21 @@ export class Controller implements vscode.Disposable {
 
   private owner(): { windowId: string; pid: number } {
     return { windowId: this.deps.coordinator.windowId, pid: process.pid };
+  }
+
+  /**
+   * The arguments of ConnectionAdapter.open and openInNewWindow for `environment`: the container, the folder, and for an
+   * environment on another Docker host its Docker context (user report 2026-09-28: without it in the authority, the Dev
+   * Containers extension asks the local Docker first and reports the container as one that "no longer exists"). The
+   * context is the one of the running operation when that is on the environment's host (a context that the user made;
+   * none when DOCKER_HOST decides), else the one that "Use a Remote Docker Host…" creates for the host.
+   */
+  private windowArgs(environment: Environment, containerName: string, folder: string): [containerName: string, folder: string, dockerContext?: string] {
+    const host = dockerHostOf(environment);
+    if (host === '') return [containerName, folder];
+    const target = operationDockerTarget();
+    const context = target && isOnDockerHost(environment, target.host) ? target.context : remoteContextName(host);
+    return context === undefined ? [containerName, folder] : [containerName, folder, context];
   }
 
   /**

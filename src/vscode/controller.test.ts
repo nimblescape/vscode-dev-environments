@@ -3399,6 +3399,28 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
+  // User report 2026-09-28: without the context in the authority, the Dev Containers extension asks the local Docker
+  // first and reports the container of a remote environment as one that "no longer exists".
+  it('names the Docker context of the operation in the window of a remote environment', async () => {
+    current = dockerTargetOf('ssh://build-box', 'my-build-box');
+    await h.registry.add(remoteEnvironment());
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box');
+  });
+
+  it('names no context when DOCKER_HOST decides the remote host (the Dev Containers extension follows it too)', async () => {
+    current = dockerTargetOf('ssh://build-box', undefined);
+    await h.registry.add(remoteEnvironment());
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.connection.open.mock.calls[0]).toEqual(['devenv-acme-api-a1b2c3d4', '/workspaces/api']);
+  });
+
+  it('names no context in the window of a local environment', async () => {
+    await h.registry.add(environment());
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.open.mock.calls[0]).toEqual([CONTAINER, '/workspaces/api']);
+  });
+
   // Review round 3 (H1): the check reads the current context itself, although the operation's calls are pinned to its
   // own context (DOCKER_CONTEXT), with the real DockerTargets.
   it('does not connect the window when the current context changed during the start (real DockerTargets)', async () => {
@@ -3448,7 +3470,8 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote');
     await h.registry.add(remoteEnvironment());
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api');
+    // User report 2026-09-28: the window of a remote environment names the Docker context of its operation.
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'devenv-remote');
     const calls = h.docker.run.mock.calls.map(([args]) => (args as string[]).join(' '));
     expect(calls).toContain('context show');
     expect(calls).toContain('inspect --type container /devenv-acme-api-a1b2c3d4 --format {{.Id}} {{.State.Status}}');

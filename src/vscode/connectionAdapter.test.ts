@@ -56,8 +56,8 @@ vi.mock('vscode', () => fake.vscode);
 
 const NAME = 'devenv-acme-api-3f2a9c1e';
 
-function remoteFolder(name: string, folder = '/workspaces/api'): { uri: FakeUri } {
-  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name), path: folder }) };
+function remoteFolder(name: string, folder = '/workspaces/api', dockerContext?: string): { uri: FakeUri } {
+  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name, dockerContext), path: folder }) };
 }
 
 describe('ConnectionAdapter', () => {
@@ -91,6 +91,27 @@ describe('ConnectionAdapter', () => {
     fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/other')];
     await new ConnectionAdapter().open(NAME, '/workspaces/api');
     expect(fake.state.commands.map((call) => call[0])).toEqual([OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
+  });
+
+  // User report 2026-09-28: the Docker context of a remote environment is part of the window's authority.
+  it('opens the folder URI with the Docker context, in this window and in a new one', async () => {
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    for (const call of fake.state.commands) {
+      expect((call as [string, FakeUri])[1]).toMatchObject({ authority: encodeAuthority(NAME, 'devenv-remote-2e9f507b'), path: '/workspaces/api' });
+    }
+    expect(fake.state.commands).toHaveLength(2);
+  });
+
+  it('reloads only a window with the same context; a window without it (or with another) opens the new URI', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-2e9f507b')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    expect(fake.state.commands.map((call) => call[0])).toEqual([RELOAD_WINDOW_COMMAND, OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
   });
 
   it('opens the folder URI of the container in a new window (Start in New Window, unit 14)', async () => {
