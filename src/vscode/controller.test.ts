@@ -30,6 +30,7 @@ import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
 import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
+import { REMOTE_DOCKER_HOST_CONTEXT_KEY } from './dockerHostIndicator';
 import { DOUBLE_CLICK_INTERVAL_MS, type ListOpenMode } from './rowActivation';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
@@ -612,7 +613,8 @@ describe('Controller commands', () => {
     // 30 since unit 7, PR 2: Close and Keep Running.
     // 31 with the command of a repository row (hidden): a double-click runs Start (user request 2026-09-27).
     // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
-    expect(declared).toHaveLength(32);
+    // 33 with the choice of the Docker host, the title-bar icon of the view on a remote host (user request 2026-09-28).
+    expect(declared).toHaveLength(33);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -3260,7 +3262,12 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
   let operations: DockerTarget[];
   let resolves: number;
   let depth = 0;
-  let remote: { useRemoteHost: ReturnType<typeof vi.fn>; useLocalDocker: ReturnType<typeof vi.fn>; offerSwitchBack: ReturnType<typeof vi.fn> };
+  let remote: {
+    useRemoteHost: ReturnType<typeof vi.fn>;
+    useLocalDocker: ReturnType<typeof vi.fn>;
+    chooseDockerHost: ReturnType<typeof vi.fn>;
+    offerSwitchBack: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(() => {
     h.controller.dispose();
@@ -3269,7 +3276,12 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     operations = [];
     resolves = 0;
     depth = 0;
-    remote = { useRemoteHost: vi.fn(async () => {}), useLocalDocker: vi.fn(async () => {}), offerSwitchBack: vi.fn(async () => false) };
+    remote = {
+      useRemoteHost: vi.fn(async () => {}),
+      useLocalDocker: vi.fn(async () => {}),
+      chooseDockerHost: vi.fn(async () => {}),
+      offerSwitchBack: vi.fn(async () => false),
+    };
     const dockerTargets = {
       resolve: vi.fn(async () => {
         resolves++;
@@ -3310,6 +3322,35 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     expect(remote.useRemoteHost).toHaveBeenCalledTimes(1);
     expect(remote.useLocalDocker).toHaveBeenCalledTimes(1);
     expect(operations).toEqual([]);
+  });
+
+  // User request 2026-09-28: the icon of the view's title bar, "Use a Remote Docker Host…" on the local Docker and the
+  // choice of the Docker host on a remote one.
+  it('runs the choice of the Docker host without an operation, and shows one of the two icons in the title bar', async () => {
+    await run('chooseDockerHost');
+    expect(remote.chooseDockerHost).toHaveBeenCalledTimes(1);
+    expect(operations).toEqual([]);
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: {
+        commands: Array<{ command: string; icon?: string }>;
+        menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
+      };
+    };
+    const title = manifest.contributes.menus['view/title'];
+    expect(title).toContainEqual({
+      command: 'devEnvironments.useRemoteDockerHost',
+      when: `view == devEnvironments.repositories && !${REMOTE_DOCKER_HOST_CONTEXT_KEY}`,
+      group: 'navigation@3',
+    });
+    expect(title).toContainEqual({
+      command: 'devEnvironments.chooseDockerHost',
+      when: `view == devEnvironments.repositories && ${REMOTE_DOCKER_HOST_CONTEXT_KEY}`,
+      group: 'navigation@3',
+    });
+    const icons = Object.fromEntries(manifest.contributes.commands.map((command) => [command.command, command.icon]));
+    expect(icons['devEnvironments.useRemoteDockerHost']).toBe('$(remote)');
+    expect(icons['devEnvironments.chooseDockerHost']).toBe('$(vm-active)');
+    expect(manifest.contributes.menus.commandPalette).toContainEqual({ command: 'devEnvironments.chooseDockerHost', when: 'false' });
   });
 
   it('runs every other command as one operation on the host that is current when it starts', async () => {

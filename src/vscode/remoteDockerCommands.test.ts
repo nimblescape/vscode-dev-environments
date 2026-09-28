@@ -321,6 +321,35 @@ describe('Use a Remote Docker Host…', () => {
   });
 });
 
+// User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host.
+describe('Remote Docker Host… (the choice of the title bar)', () => {
+  it('names the current host and runs "Use a Remote Docker Host…" or "Use the Local Docker"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    const choose = commands.chooseDockerHost.bind(commands);
+    const useRemote = vi.spyOn(commands, 'useRemoteHost').mockResolvedValue();
+    const useLocal = vi.spyOn(commands, 'useLocalDocker').mockResolvedValue();
+    window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) => items[0]);
+    await choose();
+    window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) => items[1]);
+    await choose();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string }>, { title: string }];
+    expect(items.map((item) => item.label)).toEqual([`$(remote) ${RemoteDockerTexts.useAnotherHost}`, `$(vm) ${RemoteDockerTexts.useLocal}`]);
+    expect(options.title).toBe('Docker host: build-box');
+    expect(useRemote).toHaveBeenCalledTimes(1);
+    expect(useLocal).toHaveBeenCalledTimes(1);
+  });
+
+  it('changes nothing when the choice is cancelled', async () => {
+    const useRemote = vi.spyOn(commands, 'useRemoteHost');
+    const useLocal = vi.spyOn(commands, 'useLocalDocker');
+    await commands.chooseDockerHost();
+    expect(useRemote).not.toHaveBeenCalled();
+    expect(useLocal).not.toHaveBeenCalled();
+    expect(cli.changes).toEqual([]);
+  });
+});
+
 describe('Use the Local Docker', () => {
   it('goes back to the remembered context and forgets it', async () => {
     cli.hosts.set('build-box', engineInfo());

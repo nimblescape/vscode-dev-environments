@@ -77,6 +77,10 @@ export const RemoteDockerTexts = {
     `${name} is set in the environment of VS Code, so Docker ignores the Docker context. Remove ${name} and start VS Code again, then try again.`,
   switchFailed: 'The Docker context could not be changed.',
   /** The mismatch of an environment and the current Docker host (a restored window, for example from Open Recent). */
+  /** User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host. */
+  chooseTitle: (host: string) => `Docker host: ${host}`,
+  choosePlaceholder: 'Use another remote host, or switch back to the local Docker',
+  useAnotherHost: 'Use Another Remote Docker Host…',
   mismatch: (environmentHost: string, currentHost: string) =>
     `This environment is on ${describeDockerHost(environmentHost)}, but Docker is set to ${describeDockerHost(currentHost)}. Use ${describeDockerHost(environmentHost)} again?`,
 } as const;
@@ -114,6 +118,29 @@ export class RemoteDockerCommands {
       const host = await this.pickHost();
       if (host === undefined) return;
       await this.switchToRemote(host);
+    } catch (error) {
+      this.showFailure(error);
+    }
+  }
+
+  /**
+   * The title-bar icon of the view while Docker is set to a remote host (user request 2026-09-28): another remote host
+   * ("Use a Remote Docker Host…") or the local Docker ("Use the Local Docker"). Never throws.
+   */
+  async chooseDockerHost(): Promise<void> {
+    try {
+      const current = await this.deps.targets.resolve();
+      const items: Array<vscode.QuickPickItem & { choice: 'remote' | 'local' }> = [
+        { label: `$(remote) ${RemoteDockerTexts.useAnotherHost}`, choice: 'remote' },
+        { label: `$(vm) ${RemoteDockerTexts.useLocal}`, choice: 'local' },
+      ];
+      const picked = await vscode.window.showQuickPick(items, {
+        title: RemoteDockerTexts.chooseTitle(describeDockerHost(current.host)),
+        placeHolder: RemoteDockerTexts.choosePlaceholder,
+      });
+      if (!picked) return;
+      if (picked.choice === 'remote') await this.useRemoteHost();
+      else await this.useLocalDocker();
     } catch (error) {
       this.showFailure(error);
     }

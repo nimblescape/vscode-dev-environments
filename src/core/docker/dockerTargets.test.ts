@@ -152,3 +152,29 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
     expect(cli.calls.find((call) => call.args[0] === 'ps')?.options.env).not.toHaveProperty('DOCKER_CONTEXT');
   });
 });
+
+// User request 2026-09-28: the view shows the Docker host of every read.
+describe('DockerTargets.onDidResolve', () => {
+  it('gives every read target to the listener until it is removed', async () => {
+    const { targets, cli } = setup();
+    const seen: string[] = [];
+    const remove = targets.onDidResolve((target) => seen.push(`${target.kind}:${target.host}`));
+    await targets.resolve();
+    cli.context = 'devenv-remote';
+    await targets.resolve();
+    remove();
+    await targets.resolve();
+    expect(seen).toEqual(['local:', 'remote:box']);
+  });
+
+  it('keeps reading when a listener throws, and tells the others', async () => {
+    const { targets } = setup();
+    const seen: string[] = [];
+    targets.onDidResolve(() => {
+      throw new Error('broken');
+    });
+    targets.onDidResolve((target) => seen.push(target.kind));
+    await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local' });
+    expect(seen).toEqual(['local']);
+  });
+});

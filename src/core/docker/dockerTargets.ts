@@ -56,6 +56,7 @@ export interface ContextReader {
 /** Reads the current Docker target, and runs operations with it. */
 export class DockerTargets {
   private lastTarget: DockerTarget | undefined;
+  private readonly listeners = new Set<(target: DockerTarget) => void>();
 
   constructor(
     private readonly docker: ContextReader,
@@ -77,7 +78,23 @@ export class DockerTargets {
   async resolve(): Promise<DockerTarget> {
     const target = await this.read();
     this.lastTarget = target;
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(target);
+      } catch (error) {
+        this.logger.warn(`A listener of the Docker host failed: ${errorMessage(error)}`);
+      }
+    }
     return target;
+  }
+
+  /**
+   * User request 2026-09-28 (the Docker host in the sidebar): `listener` gets every target that `resolve` reads. Returns
+   * the function that removes it.
+   */
+  onDidResolve(listener: (target: DockerTarget) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   /** The target of the running operation, or a fresh read outside of one. */
