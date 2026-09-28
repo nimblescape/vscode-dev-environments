@@ -226,10 +226,10 @@ Green always means that the container runs; the shape tells which window uses it
 
 | Symbol | State text | Meaning |
 |---|---|---|
-| ● (green, filled circle) | Connected | This window is connected to the environment. |
-| green window icon | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
+| green monitor with the remote sign | Connected | This window is connected to the environment. |
+| green monitor | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
 | green play icon (circled) | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
-| ○ (grey ring) | Stopped | The container is stopped. The next **Start** starts it. |
+| grey monitor | Stopped | The container is stopped. The next **Start** starts it. |
 | ↻ | Updating | An update, a rebuild, or a delete is in progress. |
 | ◌ | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
 | ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |

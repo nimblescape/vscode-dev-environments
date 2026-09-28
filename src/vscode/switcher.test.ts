@@ -79,8 +79,9 @@ describe('switcher (concept 6.4)', () => {
     const items = showQuickPick.mock.calls[0][0] as Item[];
     expect(items.map((item) => [item.label, item.description ?? ''])).toEqual([
       ['Recent environments', ''],
-      ['$(circle-filled) acme/api', 'main   Connected'],
-      ['$(circle-outline) acme/web', 'main   Stopped'],
+      // User request 2026-09-28: the monitor icons of the states (stateIcon).
+      ['$(vm-connect) acme/api', 'main   Connected'],
+      ['$(vm) acme/web', 'main   Stopped'],
       ['', ''],
       ['$(repo) Open repository…', ''],
     ]);

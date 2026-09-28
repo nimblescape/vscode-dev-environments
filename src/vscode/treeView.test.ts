@@ -95,7 +95,8 @@ describe('RepositoriesTreeProvider', () => {
       // Unit 7, PR 2: Close and Keep Running for the environment of this window.
       contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning',
     });
-    expect((apiItem.iconPath as ThemeIcon).id).toBe('circle-filled');
+    // User request 2026-09-28: a green monitor with the remote sign for the environment of this window.
+    expect((apiItem.iconPath as ThemeIcon).id).toBe('vm-connect');
     // A repository without environment has no state symbol.
     expect(((provider.getTreeItem(web) as unknown as TreeItem).iconPath as ThemeIcon).id).toBe('blank');
 

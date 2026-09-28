@@ -218,11 +218,15 @@ export interface StateIcon {
 
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
-  connected: { id: 'circle-filled', color: 'charts.green' },
-  connectedOtherWindow: { id: 'window', color: 'charts.green' },
+  // User request 2026-09-28: a monitor, green while the container runs; with the remote sign in this window. `vm` and
+  // `vm-connect` draw the frame of the monitor at the same place (x 1 to 15), so the remote sign in the lower right
+  // corner does not move the frame ("the monitor icons are left aligned").
+  connected: { id: 'vm-connect', color: 'charts.green' },
+  connectedOtherWindow: { id: 'vm', color: 'charts.green' },
   // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
   running: { id: 'play-circle', color: 'charts.green' },
-  stopped: { id: 'circle-outline' },
+  // User request 2026-09-28: inactive, a grey monitor without the remote sign.
+  stopped: { id: 'vm', color: 'disabledForeground' },
   updating: { id: 'sync~spin' },
   // A dashed circle (◌) is not available as a codicon.
   noContainer: { id: 'circle-large-outline' },
@@ -230,8 +234,8 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
 };
 
 /**
- * Icon of a state: green ● connected (this window), green window icon connected in another window, green running machine
- * without a window, grey ○ stopped, ↻ updating, ◌ no container, ⚠ files missing. Green always means that the container
+ * Icon of a state: green monitor with the remote sign connected (this window), green monitor connected in another
+ * window, green running machine without a window, grey monitor stopped, ↻ updating, ◌ no container, ⚠ files missing. Green always means that the container
  * runs.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
