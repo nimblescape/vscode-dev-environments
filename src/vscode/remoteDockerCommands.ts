@@ -78,8 +78,10 @@ export const RemoteDockerTexts = {
   switchFailed: 'The Docker context could not be changed.',
   /** User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host. */
   chooseTitle: (host: string) => `Docker host: ${host}`,
-  choosePlaceholder: 'Use another remote host, or switch back to the local Docker',
-  useAnotherHost: 'Use Another Remote Docker Host…',
+  /** User request 2026-09-28 ("it shall show the config list again"): one list of the hosts and the local Docker. */
+  choosePlaceholder: 'Choose a host of your SSH config, enter an SSH address, or use the local Docker',
+  current: 'current',
+  alreadyHost: (host: string) => `Docker already uses ${host}.`,
   /** Review of the sidebar host (S1): the Docker CLI of this computer talks to the remote host. */
   cliMissing: 'A remote Docker host needs the Docker CLI on this computer. Install Docker first (Docker Desktop brings the CLI).',
   /** User decision 2026-09-28: the second button of each Docker host question. */
@@ -115,7 +117,12 @@ export interface RemoteDockerDeps {
 
 interface HostItem extends vscode.QuickPickItem {
   host?: string;
+  /** The entry "Use the Local Docker" of the title-bar choice. */
+  local?: boolean;
 }
+
+/** pickHost: the user chose the local Docker. */
+const LOCAL_CHOICE = Symbol('local Docker');
 
 export class RemoteDockerCommands {
   constructor(private readonly deps: RemoteDockerDeps) {}
@@ -124,13 +131,9 @@ export class RemoteDockerCommands {
   async useRemoteHost(): Promise<void> {
     try {
       if (this.refuseOverride()) return;
-      if (!this.deps.docker.isInstalled()) {
-        this.deps.logger.warn('No Docker CLI on this computer; no remote Docker host is set.');
-        this.showError(RemoteDockerTexts.cliMissing);
-        return;
-      }
+      if (this.refuseMissingCli()) return;
       const host = await this.pickHost();
-      if (host === undefined) return;
+      if (host === undefined || host === LOCAL_CHOICE) return;
       await this.switchToRemote(host);
     } catch (error) {
       this.showFailure(error);
@@ -143,20 +146,29 @@ export class RemoteDockerCommands {
    */
   async chooseDockerHost(): Promise<void> {
     try {
-      // Review of the sidebar host (S5): with DOCKER_HOST or DOCKER_CONTEXT set for VS Code, both choices are refused.
+      // Review of the sidebar host (S5): with DOCKER_HOST or DOCKER_CONTEXT set for VS Code, every choice is refused.
       if (this.refuseOverride()) return;
       const current = await this.deps.targets.resolve();
-      const items: Array<vscode.QuickPickItem & { choice: 'remote' | 'local' }> = [
-        { label: `$(remote) ${RemoteDockerTexts.useAnotherHost}`, choice: 'remote' },
-        { label: `$(vm) ${RemoteDockerTexts.useLocal}`, choice: 'local' },
-      ];
-      const picked = await vscode.window.showQuickPick(items, {
+      const currentHost = current.kind === 'remote' ? current.host : undefined;
+      // User request 2026-09-28 ("it shall show the config list again"): the hosts of the SSH config right away, the
+      // current one marked, and the local Docker last.
+      const picked = await this.pickHost({
         title: RemoteDockerTexts.chooseTitle(describeDockerHost(current.host)),
         placeHolder: RemoteDockerTexts.choosePlaceholder,
+        currentHost,
+        offerLocal: true,
       });
-      if (!picked) return;
-      if (picked.choice === 'remote') await this.useRemoteHost();
-      else await this.useLocalDocker();
+      if (picked === undefined) return;
+      if (picked === LOCAL_CHOICE) {
+        await this.useLocalDocker();
+        return;
+      }
+      if (picked === currentHost) {
+        this.inform(RemoteDockerTexts.alreadyHost(picked));
+        return;
+      }
+      if (this.refuseMissingCli()) return;
+      await this.switchToRemote(picked);
     } catch (error) {
       this.showFailure(error);
     }
@@ -267,22 +279,45 @@ export class RemoteDockerCommands {
     return now.kind === 'local';
   }
 
-  private async pickHost(): Promise<string | undefined> {
+  /** No Docker CLI on this computer (review of the sidebar host, S1): says so, true when refused. */
+  private refuseMissingCli(): boolean {
+    if (this.deps.docker.isInstalled()) return false;
+    this.deps.logger.warn('No Docker CLI on this computer; no remote Docker host is set.');
+    this.showError(RemoteDockerTexts.cliMissing);
+    return true;
+  }
+
+  /**
+   * The host of the SSH config or a typed SSH address. With `offerLocal` (the title-bar choice), the local Docker is the
+   * last entry (LOCAL_CHOICE), and `currentHost` is marked.
+   */
+  private async pickHost(
+    options: { title?: string; placeHolder?: string; currentHost?: string; offerLocal?: boolean } = {},
+  ): Promise<string | typeof LOCAL_CHOICE | undefined> {
     let hosts: SshHostEntry[] = [];
     try {
       hosts = this.deps.sshHosts();
     } catch (error) {
       this.deps.logger.warn(`The SSH config could not be read: ${errorMessage(error)}`);
     }
-    const items: HostItem[] = hosts.map((entry) => ({ label: entry.alias, description: describeEntry(entry), host: entry.alias }));
+    const items: HostItem[] = hosts.map((entry) => {
+      const description = describeEntry(entry);
+      if (entry.alias !== options.currentHost) return { label: entry.alias, description, host: entry.alias };
+      return { label: `$(check) ${entry.alias}`, description: description ? `${description} · ${RemoteDockerTexts.current}` : RemoteDockerTexts.current, host: entry.alias };
+    });
     if (items.length > 0) items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
     items.push({ label: RemoteDockerTexts.enterAddress, description: RemoteDockerTexts.enterAddressDetail });
+    if (options.offerLocal) {
+      items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+      items.push({ label: `$(vm) ${RemoteDockerTexts.useLocal}`, local: true });
+    }
     const picked = await vscode.window.showQuickPick(items, {
-      title: RemoteDockerTexts.pickTitle,
-      placeHolder: RemoteDockerTexts.pickPlaceholder,
+      title: options.title ?? RemoteDockerTexts.pickTitle,
+      placeHolder: options.placeHolder ?? RemoteDockerTexts.pickPlaceholder,
       matchOnDescription: true,
     });
     if (!picked) return undefined;
+    if (picked.local) return LOCAL_CHOICE;
     if (picked.host !== undefined) return picked.host;
     const typed = await vscode.window.showInputBox({
       title: RemoteDockerTexts.pickTitle,

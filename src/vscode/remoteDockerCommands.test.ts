@@ -335,20 +335,38 @@ describe('Use a Remote Docker Host…', () => {
 
 // User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host.
 describe('Remote Docker Host… (the choice of the title bar)', () => {
-  it('names the current host and runs "Use a Remote Docker Host…" or "Use the Local Docker"', async () => {
+  // User request 2026-09-28 ("it shall show the config list again"): the hosts right away, the local Docker last.
+  it('lists the hosts of the SSH config with the current one marked, "Enter an SSH address…", and the local Docker', async () => {
     cli.contexts.set(BUILD_BOX, 'ssh://build-box');
     cli.current = BUILD_BOX;
-    const choose = commands.chooseDockerHost.bind(commands);
-    const useRemote = vi.spyOn(commands, 'useRemoteHost').mockResolvedValue();
-    const useLocal = vi.spyOn(commands, 'useLocalDocker').mockResolvedValue();
-    window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) => items[0]);
-    await choose();
-    window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) => items[1]);
-    await choose();
-    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string }>, { title: string }];
-    expect(items.map((item) => item.label)).toEqual([`$(remote) ${RemoteDockerTexts.useAnotherHost}`, `$(vm) ${RemoteDockerTexts.useLocal}`]);
+    await commands.chooseDockerHost();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>, { title: string }];
+    expect(items.map((item) => [item.label, item.description])).toEqual([
+      ['$(check) build-box', 'me@build-box.example.com · current'],
+      ['gpu', 'gpu:2222'],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+      ['', undefined],
+      [`$(vm) ${RemoteDockerTexts.useLocal}`, undefined],
+    ]);
     expect(options.title).toBe('Docker host: build-box');
-    expect(useRemote).toHaveBeenCalledTimes(1);
+  });
+
+  it('switches to the picked host, says so for the current one, and goes local on "Use the Local Docker"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    cli.hosts.set('gpu', engineInfo());
+    const useLocal = vi.spyOn(commands, 'useLocalDocker').mockResolvedValue();
+    answer('gpu');
+    await commands.chooseDockerHost();
+    expect(cli.current).toBe(GPU);
+    cli.current = BUILD_BOX;
+    answer('$(check) build-box');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(cli.current).toBe(BUILD_BOX);
+    answer(`$(vm) ${RemoteDockerTexts.useLocal}`);
+    await commands.chooseDockerHost();
     expect(useLocal).toHaveBeenCalledTimes(1);
   });
 
