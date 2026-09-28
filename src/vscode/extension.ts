@@ -9,8 +9,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
+import { dockerHostOf } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets } from '../core/docker/dockerTargets';
 import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
@@ -427,6 +429,17 @@ async function activateExtension(
   if (view.visible) background(sidebar.refreshStates(), 'update the sidebar');
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
+
+  if (containerName && docker.isInstalled()) {
+    // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window.
+    const host = currentEnvironment ? dockerHostOf(currentEnvironment) : '';
+    background(
+      attachDiagnostics(docker, docker.processEnv(), containerName, host).then((lines) => {
+        for (const line of lines) logger.info(`While this window connects: ${line}`);
+      }),
+      'log the Docker of this window',
+    );
+  }
 
   if (currentEnvironment && containerName) {
     // Role A: the open pipeline runs before VS Code connects this window (awaited).

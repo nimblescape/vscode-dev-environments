@@ -306,6 +306,21 @@ describe('open: first open', () => {
     expect([...h.docker.images].filter((image) => image.startsWith('devenv-'))).toEqual([]);
   });
 
+  // User decision 2026-09-28: the container is made only from an image that the engine has after the build.
+  it('reports a build that ended without its image as buildFailed and starts no container', async () => {
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      h.docker.images.delete(p.imageName); // the connection to a remote engine broke at the end of the build
+      return result;
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.containers.size).toBe(0);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
   it('removes the container when up fails on a first open', async () => {
     h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'port is already allocated');
     const error = await rejection(h.service.open(TARGET, options()));

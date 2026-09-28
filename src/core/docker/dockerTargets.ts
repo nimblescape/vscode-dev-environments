@@ -29,6 +29,11 @@ export function operationDockerTarget(): DockerTarget | undefined {
   return scope?.active ? scope.target : undefined;
 }
 
+/** Runs `fn` outside of any operation: its Docker calls read the current context themselves (attachDiagnostics.ts). */
+export function outsideOperation<T>(fn: () => Promise<T>): Promise<T> {
+  return operationTargets.exit(fn);
+}
+
 /** Runs `fn` as an operation on `target` (see the module comment). */
 export async function runWithDockerTarget<T>(target: DockerTarget, fn: () => Promise<T>): Promise<T> {
   const scope: OperationScope = { target, active: true };

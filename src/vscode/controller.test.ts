@@ -21,7 +21,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import { availableEnvironments } from '../core/ownership';
-import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import { dockerTargetOf, remoteContextName, type DockerTarget } from '../core/docker/dockerHost';
 import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
@@ -203,6 +203,8 @@ interface Harness {
     findContainer: ReturnType<typeof vi.fn>;
     exec: ReturnType<typeof vi.fn>;
     volumeExists: ReturnType<typeof vi.fn>;
+    run: ReturnType<typeof vi.fn>;
+    processEnv: ReturnType<typeof vi.fn>;
   };
   service: {
     open: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
@@ -296,6 +298,9 @@ function createHarness(
     findContainer: vi.fn(async (_id: string) => containerInfo(String(CONTAINER_VERSION))),
     exec: vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false })),
     volumeExists: vi.fn(async (_name: string) => true),
+    // The Docker calls of the attach diagnostics (user request 2026-09-28): answered, never failing.
+    run: vi.fn(async (_args: readonly string[]) => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false })),
+    processEnv: vi.fn(() => ({})),
   };
   const service: Harness['service'] = {
     open: vi.fn(async () => openResult(environment())),
@@ -403,6 +408,7 @@ function createHarness(
       reopenCheckDelayMs: 0,
       disconnectAnswerMs: options.disconnectAnswerMs ?? 60_000,
       busyPollMs: 5,
+      readyPollMs: 0,
     },
   } as unknown as ControllerDeps;
   const controller = new Controller(deps);
@@ -500,6 +506,19 @@ async function otherWindowBusy(env: Environment): Promise<void> {
 }
 
 /** Window 2 is connected to `env` (its status file references it). */
+/**
+ * The pipeline starts the container: after openEnvironment, Docker reports it as running (user decision 2026-09-28:
+ * the window connects only to a container that runs).
+ */
+function pipelineStartsContainer(): void {
+  const start = h.service.openEnvironment.getMockImplementation();
+  h.service.openEnvironment.mockImplementation(async (id: string, options: OpenOptions) => {
+    const result = await start!(id, options);
+    h.docker.containerState.mockResolvedValue('running');
+    return result;
+  });
+}
+
 function otherWindowConnected(environmentId = ENV_ID): void {
   h.coordinator.otherActiveWindows.mockResolvedValue([
     { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId, state: 'active', updatedAt: iso(NOW) },
@@ -783,6 +802,7 @@ describe('Start', () => {
     await h.registry.add(env);
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
+    pipelineStartsContainer();
     await run('start', { environmentId: ENV_ID });
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
@@ -805,6 +825,7 @@ describe('Start', () => {
     await h.registry.add(env);
     otherWindowConnected();
     h.docker.containerState.mockResolvedValue('stopped');
+    pipelineStartsContainer();
     await run('start', row('acme/api', env));
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
@@ -817,6 +838,7 @@ describe('Start', () => {
     await h.registry.add(env);
     otherWindowConnected();
     h.docker.containerState.mockRejectedValue(new Error('Cannot connect to the Docker daemon'));
+    pipelineStartsContainer();
     await run('start', row('acme/api', env));
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
@@ -3009,6 +3031,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
+    pipelineStartsContainer();
     await run('startInNewWindow', { environmentId: ENV_ID });
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
@@ -3258,6 +3281,46 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote');
     await run('stop', row('acme/api', environment()));
     expect(operations.map((target) => target.host)).toEqual(['', 'build-box']);
+  });
+
+  // User decision 2026-09-28: the window connects only when the current Docker context is the environment's host and
+  // the container runs, and the log shows which Docker the Dev Containers extension will ask.
+  it('does not connect the window when the Docker context changed to another host during the start', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    await h.registry.add(remoteEnvironment());
+    h.service.openEnvironment.mockImplementation(async (id: string) => {
+      current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+      return openResult((await h.registry.get(id))!);
+    });
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.otherDockerHost('acme/api', 'build-box', ''));
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('does not connect the window when the container does not run after the start', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    await h.registry.add(remoteEnvironment());
+    h.docker.containerState.mockResolvedValue('stopped');
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.docker.containerState.mock.calls.filter(([name]) => name === 'devenv-acme-api-a1b2c3d4').length).toBeGreaterThanOrEqual(5);
+    expect(fakeVscode.window.showErrorMessage.mock.calls[0]?.[0]).toBe(Messages.containerNotReady('acme/api', 'devenv-acme-api-a1b2c3d4'));
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('logs the current context and both inspects before the window connects', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    await h.registry.add(remoteEnvironment());
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api');
+    const calls = h.docker.run.mock.calls.map(([args]) => (args as string[]).join(' '));
+    expect(calls).toContain('context show');
+    expect(calls).toContain('inspect --type container /devenv-acme-api-a1b2c3d4 --format {{.Id}} {{.State.Status}}');
+    expect(calls).toContain(`--context ${remoteContextName('build-box')} inspect --type container /devenv-acme-api-a1b2c3d4 --format {{.Id}} {{.State.Status}}`);
+    const logged = h.logger.info.mock.calls.map(([line]) => String(line));
+    expect(logged.some((line) => line.startsWith('Before the window connects: Current Docker context:'))).toBe(true);
   });
 });
 

@@ -7,6 +7,7 @@
 // Session Coordinator, and the Connection Adapter.
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
+import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
 import type { DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
@@ -1290,6 +1291,7 @@ export class Controller implements vscode.Disposable {
     }
     progress.step('connecting');
     await this.requireReadyForWindow(result.environment, result.containerName);
+    await this.logAttachDiagnostics(result.environment, result.containerName);
     await this.deps.coordinator.writePending(result.environment.id);
     if (request.newWindow) {
       await this.deps.connection.openInNewWindow(result.containerName, result.remoteWorkspaceFolder);
@@ -2449,6 +2451,16 @@ export class Controller implements vscode.Disposable {
    * and the container answers as running (a few checks, 1 s apart, for an engine that answers late). Otherwise the
    * window does not connect, with a message.
    */
+  /**
+   * Logs which Docker the Dev Containers extension will ask when the window switches to `containerName` (user request
+   * 2026-09-28, attachDiagnostics.ts). Only log lines; never throws.
+   */
+  private async logAttachDiagnostics(environment: Environment, containerName: string): Promise<void> {
+    if (!this.deps.docker.isInstalled()) return;
+    const lines = await attachDiagnostics(this.deps.docker, this.deps.docker.processEnv(), containerName, dockerHostOf(environment));
+    for (const line of lines) this.logger.info(`Before the window connects: ${line}`);
+  }
+
   private async requireReadyForWindow(environment: Environment, containerName: string): Promise<void> {
     const repository = this.displayName({ repository: environment.repository });
     if (this.deps.dockerTargets) {
