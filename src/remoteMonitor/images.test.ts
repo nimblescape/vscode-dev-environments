@@ -45,7 +45,7 @@ function fakeEngine(options: {
   const idOf = (line: string) => (JSON.parse(line) as { ID: string }).ID;
   const docker = async (args: readonly string[]): Promise<DockerResult> => {
     calls.push([...args]);
-    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a') {
+    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a' && args[3] === '-q') {
       return { code: 0, stdout: [...new Set([...images.map(idOf), ...Object.keys(options.layers ?? {}), ...Object.keys(options.dangling ?? {})])].join('\n'), stderr: '' };
     }
     // Review round 6 of PR #57 (F1): the ID of a reference, and the tags and time of an ID (`pulled`: what a pull of a
@@ -348,7 +348,9 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     // v1 is replaced by v2 and listed as <none> <none> (not in `docker image ls` of the repository): two versions stay.
     dangling['sha256:v1'] = '2026-09-01T00:00:00Z';
     await run();
-    expect(stored).toEqual({ [DEV]: ['sha256:v1'] });
+    // Review round 7 of PR #57: the store keeps every ID seen with a tag of the repository, so also the current v2.
+    expect(Object.keys(stored)).toEqual([DEV]);
+    expect([...stored[DEV]].sort()).toEqual(['sha256:v1', 'sha256:v2']);
     expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
     // The next update: v1 is now the third version and is removed by its ID.
     const second = fakeEngine({ images: [image(DEV, '2', 'sha256:v2', '2026-09-28')], pulled: { [`${DEV}:2`]: 'sha256:v3' }, dangling });
@@ -365,6 +367,33 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     expect(stored[DEV]).toContain('sha256:v2');
     expect(parseReplacedImages('{"ghcr.io/a/b":["sha256:x",3],"ubuntu":["sha256:y"]}')).toEqual({ 'ghcr.io/a/b': ['sha256:x'] });
     expect(parseReplacedImages('not json')).toEqual({});
+  });
+
+  // Review round 7 of PR #57: the update of the extension at each open (or a user) pulls `:<major>` before the monitor;
+  // the image that it replaced was never known as replaced and stayed for ever.
+  it('removes older versions also when another tool pulled the new ones', async () => {
+    const dangling: Record<string, string> = {};
+    let stored: ReplacedImages = {};
+    const replaced = { read: async () => stored, write: async (value: ReplacedImages) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) };
+    // Each pass sees `:2` on the image that another tool pulled since; the monitor's own pull changes nothing.
+    const pass = async (current: string, created: string) => {
+      const engine = fakeEngine({ images: [image(DEV, '2', current, created)], dangling });
+      await new ImageMaintenance({
+        docker: engine.docker,
+        httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+        log: () => {},
+        prefixes: () => PREFIXES,
+        knownRepositories: async () => [],
+        replaced,
+      }).pass();
+      return engine;
+    };
+    await pass('sha256:v1', '2026-09-01');
+    dangling['sha256:v1'] = '2026-09-01T00:00:00Z';
+    await pass('sha256:v2', '2026-09-10');
+    dangling['sha256:v2'] = '2026-09-10T00:00:00Z';
+    const engine = await pass('sha256:v3', '2026-09-20');
+    expect(engine.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:v1']]);
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.

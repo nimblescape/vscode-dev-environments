@@ -230,9 +230,11 @@ export interface ImageMaintenanceDeps {
   /** The repositories of the list that the extension sent (none when it sent none). */
   knownRepositories: () => Promise<string[]>;
   /**
-   * Review round 6 of PR #57 (F1): the IDs that a pull replaced, by repository, kept in the volume. With the containerd
-   * image store of Docker, the image that a pull replaces is listed without its repository (`<none>`), so without these
-   * IDs no older version would ever be removed. Without it: kept for the pass only.
+   * Review round 6 of PR #57 (F1): the IDs that were seen as images of a repository, by repository, kept in the volume.
+   * The image that a pull replaces loses its tag, and `docker image ls` shows it without its repository (the containerd
+   * image store) or not at all (the classic store without `-a`), so without these IDs no older version would ever be
+   * removed. Review round 7: every ID that a pass sees with a tag of the repository, not only those that the monitor's
+   * own pull replaced (the update of the extension at each open, or a user, pulls too). Without it: kept for the pass.
    */
   replaced?: { read(): Promise<ReplacedImages>; write(value: ReplacedImages): Promise<void> };
 }
@@ -276,9 +278,11 @@ export class ImageMaintenance {
     try {
       if (this.deps.replaced) this.replaced = await this.deps.replaced.read();
       const local = await this.repositories(prefixes);
+      await this.remember(local);
       const known = (await this.deps.knownRepositories()).filter((repository) => prefixes.some((prefix) => repository.startsWith(prefix)));
       for (const repository of new Set([...local.keys(), ...known])) await this.update(repository);
       const after = await this.repositories(prefixes);
+      await this.remember(after);
       for (const repository of Object.keys(this.replaced)) {
         if (!after.has(repository) && prefixes.some((prefix) => repository.startsWith(prefix))) after.set(repository, []);
       }
@@ -289,6 +293,22 @@ export class ImageMaintenance {
     } finally {
       await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
+  }
+
+  /**
+   * Review round 7 of PR #57: keeps the IDs that carry a tag of a repository now, and writes the store at once (a monitor
+   * that ends in the middle of a pass loses nothing).
+   */
+  private async remember(images: ReadonlyMap<string, readonly LocalImage[]>): Promise<void> {
+    let changed = false;
+    for (const [repository, list] of images) {
+      for (const image of list) {
+        if (image.tag === '<none>' || (this.replaced[repository] ?? []).includes(image.id)) continue;
+        this.replaced[repository] = [...(this.replaced[repository] ?? []), image.id].slice(-MAX_REPLACED_PER_REPOSITORY);
+        changed = true;
+      }
+    }
+    if (changed) await this.deps.replaced?.write(this.replaced).catch(() => undefined);
   }
 
   /** The ID of an image reference, or undefined. */
@@ -319,7 +339,8 @@ export class ImageMaintenance {
 
   /** The images of the repositories with one of the prefixes, by repository. */
   private async repositories(prefixes: readonly string[]): Promise<Map<string, LocalImage[]>> {
-    const listed = await this.deps.docker(['image', 'ls', '--no-trunc', '--format', '{{json .}}'], IMAGE_LIST_TIMEOUT_MS);
+    // Review round 7 of PR #57: `-a`, as the Docker CLI 29 shows untagged images (`<repository> <none>`) only with it.
+    const listed = await this.deps.docker(['image', 'ls', '-a', '--no-trunc', '--format', '{{json .}}'], IMAGE_LIST_TIMEOUT_MS);
     if (listed.code !== 0) throw new Error(`docker image ls failed: ${listed.stderr.trim()}`);
     const byRepository = new Map<string, LocalImage[]>();
     for (const image of parseImageList(listed.stdout)) {
@@ -354,6 +375,7 @@ export class ImageMaintenance {
     const now = await this.imageId(reference);
     if (before !== undefined && now !== undefined && before !== now) {
       this.replaced[repository] = [...(this.replaced[repository] ?? []).filter((id) => id !== before), before].slice(-MAX_REPLACED_PER_REPOSITORY);
+      await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
   }
 
