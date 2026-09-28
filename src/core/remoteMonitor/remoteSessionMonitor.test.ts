@@ -219,7 +219,10 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
       missing: false,
       detail: 'the heartbeat records stayed locked by another command for 5 s',
     });
-    expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({ detail: 'the command was stopped after 10 s' });
+    // Review round 4 (H2): 137 is any SIGKILL; a command without the lock gets the bare exit code.
+    expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({
+      detail: 'the command was killed (its limit of 10 s, or a kill from outside)',
+    });
     const thrown = new FakeDocker(() => Promise.reject(new Error('Docker Desktop is not installed.')));
     expect(await monitor(thrown).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Docker Desktop is not installed.' });
   });

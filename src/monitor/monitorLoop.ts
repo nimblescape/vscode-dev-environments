@@ -587,7 +587,7 @@ export class MonitorLoop {
       const result = await this.deps.docker.exec(REMOTE_MONITOR_CONTAINER, heartbeatCommand(input), { timeoutMs: REMOTE_EXEC_TIMEOUT_MS });
       if (result.exitCode !== 0 || result.timedOut) {
         missing = !result.timedOut && /no such container|is not running/i.test(result.stderr);
-        failure = result.timedOut ? 'no answer in time' : monitorExecFailure(result.exitCode, result.stderr);
+        failure = result.timedOut ? 'no answer in time' : monitorExecFailure(result.exitCode, result.stderr, true);
       }
     } catch (error) {
       failure = errorMessage(error);

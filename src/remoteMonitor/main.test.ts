@@ -552,8 +552,9 @@ describe('the settings and the schedule of the image maintenance', () => {
     const running = schedule.run();
     await schedule.check();
     expect(observed).toBe(1);
-    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check).
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check). Review round
+    // 4 of PR #58 (H4): waits for the pass to start instead of 10 ms, after which `release` could still be unset.
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     release();
     await running;
   });

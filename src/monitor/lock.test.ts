@@ -428,7 +428,7 @@ describe('monitor protocol version and exit request', () => {
 
   // Round-2 review finding 3 of PR #26: transient file errors of Windows (a virus scanner holds the file).
   it('retries transient errors when it reads the version, and an unreadable version is unknown, never older', () => {
-    // Versions reset to 1 (user decision 2026-09-27): version 1 is the one that a window of version 2 will retire.
+    // Version 1 is older than the current version 2 (review round 3 of PR #58), so a window retires it.
     writeMonitorVersion(versionFile, 1111, 1);
     let failures = 0;
     fsHooks.readFileSync = (file) => {

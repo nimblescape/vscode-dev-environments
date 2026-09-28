@@ -19,6 +19,7 @@ import {
   REMOTE_MONITOR_VOLUME,
   forgetCommand,
   heartbeatCommand,
+  isUnderRecordsLock,
   monitorExecFailure,
   imageSettingsCommand,
   imagesCommand,
@@ -237,7 +238,7 @@ export class RemoteSessionMonitor {
       if (result.exitCode === 0 && !result.timedOut) return { ok: true, stdout: result.stdout };
       const detail = result.timedOut
         ? `docker exec did not end within ${REMOTE_MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`
-        : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '');
+        : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '', isUnderRecordsLock(command));
       return { ok: false, missing: isMissingContainer(result), detail };
     } catch (error) {
       return { ok: false, missing: false, detail: errorMessage(error) };

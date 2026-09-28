@@ -13,6 +13,7 @@ import {
   clampLimitSeconds,
   forgetCommand,
   heartbeatCommand,
+  isUnderRecordsLock,
   monitorExecFailure,
   heartbeatFileName,
   inUseByOtherComputer,
@@ -161,11 +162,17 @@ describe('the subcommands of the remote monitor', () => {
   });
 
   // Review round 3 of PR #58 (F7): a busy lock and the time limit are named in the log, not only their exit codes.
+  // Review round 4 (H2): 137 is any SIGKILL, and only commands under the lock get these texts.
   it('names the reason of a failed command under the lock of the records', () => {
-    expect(monitorExecFailure(75, '')).toBe('the heartbeat records stayed locked by another command for 5 s');
-    expect(monitorExecFailure(137, '')).toBe('the command was stopped after 10 s');
-    expect(monitorExecFailure(2, 'Invalid heartbeat.\n')).toBe('Invalid heartbeat.');
-    expect(monitorExecFailure(1, ' ')).toBe('exit code 1');
+    expect(monitorExecFailure(75, '', true)).toBe('the heartbeat records stayed locked by another command for 5 s');
+    expect(monitorExecFailure(137, '', true)).toBe('the command was killed (its limit of 10 s, or a kill from outside)');
+    expect(monitorExecFailure(2, 'Invalid heartbeat.\n', true)).toBe('Invalid heartbeat.');
+    expect(monitorExecFailure(1, ' ', true)).toBe('exit code 1');
+    expect(monitorExecFailure(137, '', false)).toBe('exit code 137');
+    expect(monitorExecFailure(75, '', false)).toBe('exit code 75');
+    expect(isUnderRecordsLock(heartbeatCommand({ source: SOURCE, limitSeconds: 600, environments: [] }))).toBe(true);
+    expect(isUnderRecordsLock(forgetCommand(SOURCE, ID))).toBe(true);
+    expect(isUnderRecordsLock(recordsCommand(ID))).toBe(false);
   });
 
   it('parses the output of records, and refuses anything else', () => {

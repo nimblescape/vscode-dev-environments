@@ -174,8 +174,12 @@ describe.skipIf(process.platform !== 'linux')('the lock of the heartbeat records
   // Review round 3 of PR #58 (F4): the cleanup of the tests also ends `timeout` and its child, which hold the lock.
   it('killGroup ends a heartbeat under timeout with the lock it holds', { timeout: 20_000 }, async () => {
     const hanging = heartbeatCommand(heartbeat(1, true));
-    const child = start([...hanging.slice(0, hanging.indexOf('node')).map((part) => (part === HEARTBEAT_LOCK_PATH ? lockPath() : part)), 'sleep', '60']);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    const marker = path.join(stateDir, 'inside');
+    const prefix = hanging.slice(0, hanging.indexOf('node')).map((part) => (part === HEARTBEAT_LOCK_PATH ? lockPath() : part));
+    const child = start([...prefix, 'sh', '-c', `touch '${marker}'; exec sleep 60`]);
+    // Review round 4 of PR #58 (H3): kills only once the whole tree runs (flock, timeout in its own group, the command),
+    // instead of after 300 ms, so no `timeout` forked between the scan and the kill escapes with the lock.
+    while (!fs.existsSync(marker)) await new Promise((resolve) => setTimeout(resolve, 10));
     killGroup(child);
     await exited(child);
     const startedAt = Date.now();

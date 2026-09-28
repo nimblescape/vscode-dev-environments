@@ -224,15 +224,26 @@ function underRecordsLock(command: readonly string[]): string[] {
   ];
 }
 
+/** Whether `command` runs under the lock of the records (heartbeatCommand, forgetCommand). */
+export function isUnderRecordsLock(command: readonly string[]): boolean {
+  return command[0] === 'flock';
+}
+
 /**
- * The reason of a failed `docker exec` of the monitor: its stderr, else (review round 3 of PR #58, F7) the lock of the
- * records or the time limit by their exit codes, else the exit code.
+ * The reason of a failed `docker exec` of the monitor: its stderr, else (review round 3 of PR #58, F7) for a command
+ * under the lock of the records (`underLock`) the busy lock or a kill by their exit codes, else the exit code. Review
+ * round 4 (H2): 137 is any SIGKILL (the time limit, an OOM kill, a container removed meanwhile), so the text names both;
+ * a command without the lock (records) gets the bare exit code.
  */
-export function monitorExecFailure(exitCode: number | null, stderr: string): string {
+export function monitorExecFailure(exitCode: number | null, stderr: string, underLock: boolean): string {
   const text = stderr.trim();
   if (text !== '') return text;
-  if (exitCode === RECORDS_LOCK_BUSY_EXIT) return `the heartbeat records stayed locked by another command for ${HEARTBEAT_LOCK_WAIT_SECONDS} s`;
-  if (exitCode === RECORDS_RUN_LIMIT_EXIT) return `the command was stopped after ${HEARTBEAT_RUN_LIMIT_SECONDS} s`;
+  if (underLock && exitCode === RECORDS_LOCK_BUSY_EXIT) {
+    return `the heartbeat records stayed locked by another command for ${HEARTBEAT_LOCK_WAIT_SECONDS} s`;
+  }
+  if (underLock && exitCode === RECORDS_RUN_LIMIT_EXIT) {
+    return `the command was killed (its limit of ${HEARTBEAT_RUN_LIMIT_SECONDS} s, or a kill from outside)`;
+  }
   return `exit code ${exitCode}`;
 }
 
