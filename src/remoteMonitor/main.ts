@@ -375,8 +375,13 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
   const file = path.join(stateDir, name);
   // Review round 9 of PR #57 (T1): a name of its own for each write, so two writes at the same time never mix.
   const temporary = `${file}.${process.pid}.${++temporaryFiles}.tmp`;
-  await fs.promises.writeFile(temporary, text, { mode: 0o600 });
-  await fs.promises.rename(temporary, file);
+  try {
+    await fs.promises.writeFile(temporary, text, { mode: 0o600 });
+    await fs.promises.rename(temporary, file);
+  } finally {
+    // Review round 10 of PR #57 (U2): a failed write (a full volume) leaves no temporary file behind.
+    await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 /** The stored list of repositories; none when it is missing or invalid. */
@@ -511,7 +516,14 @@ export class ImageSchedule {
     } else {
       this.checkedUntil = Math.max(this.checkedUntil, time);
     }
-    if (due !== undefined && due <= time) await this.run();
+    if (due === undefined || due > time) return;
+    await this.run();
+    // Review round 10 of PR #57 (U1): the times of the schedule that came during the pass are left out (logged); the
+    // checks of those minutes were not run (`checking`), so without this a second pass would follow at once.
+    const after = this.deps.now();
+    const missed = nextCronTime(time, cron, timeZone);
+    if (missed !== undefined && missed <= after) this.deps.log('An image update was still running; the times of the schedule during it are left out.');
+    this.checkedUntil = Math.max(this.checkedUntil, after);
   }
 
   /** One pass now, unless one runs. Never throws. */

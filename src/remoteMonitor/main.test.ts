@@ -439,6 +439,13 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(log).toHaveLength(1);
   });
 
+  // Review round 10 of PR #57 (U2): a failed write leaves no temporary file in the volume.
+  it('leaves no temporary file behind when a write fails', async () => {
+    fs.mkdirSync(path.join(stateDir, 'image-settings.json'));
+    await expect(settings(JSON.stringify(SETTINGS))).rejects.toThrow();
+    expect(fs.readdirSync(stateDir).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+  });
+
   it('refuses anything else and keeps the stored settings', async () => {
     expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
     for (const input of [
@@ -598,6 +605,34 @@ describe('the settings and the schedule of the image maintenance', () => {
     release();
     await Promise.all([check, run]);
     expect(order).toEqual(['observe', 'observed', 'pass']);
+  });
+
+  // Review round 10 of PR #57 (U1): the times during a pass that a check started are left out, not caught up at once.
+  it('leaves out the times of the schedule during a pass that a check started, and logs it', async () => {
+    let time = Date.parse('2026-09-29T06:04:30Z');
+    const log: string[] = [];
+    let passes = 0;
+    const settings = new CurrentImageSettings({ ...ENV, DEVENV_IMAGE_SCHEDULE: '*/5 * * * *', DEVENV_IMAGE_TZ: 'UTC' }, stateDir, () => {});
+    const schedule = new ImageSchedule({
+      now: () => time,
+      log: (message) => log.push(message),
+      settings,
+      pass: async () => {
+        passes++;
+        // The pass takes until 06:17.
+        time = Date.parse('2026-09-29T06:17:00Z');
+      },
+    });
+    time = Date.parse('2026-09-29T06:05:10Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    expect(log).toEqual(['An image update was still running; the times of the schedule during it are left out.']);
+    time = Date.parse('2026-09-29T06:18:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T06:20:10Z');
+    await schedule.check();
+    expect(passes).toBe(2);
   });
 
   it('follows new settings of another computer at the next check', async () => {
