@@ -76,7 +76,7 @@ export const RemoteDockerTexts = {
   variableSet: (name: string) =>
     `${name} is set in the environment of VS Code, so Docker ignores the Docker context. Remove ${name} and start VS Code again, then try again.`,
   switchFailed: 'The Docker context could not be changed.',
-  /** User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host. */
+  /** User request 2026-09-28: the title of the choice of the Docker host (the first row of the view). */
   chooseTitle: (host: string) => `Docker host: ${host}`,
   /** User request 2026-09-28 ("it shall show the config list again"): one list of the hosts and the local Docker. */
   choosePlaceholder: 'Choose a host of your SSH config, enter an SSH address, or use the local Docker',
@@ -117,7 +117,7 @@ export interface RemoteDockerDeps {
 
 interface HostItem extends vscode.QuickPickItem {
   host?: string;
-  /** The entry "Use the Local Docker" of the title-bar choice. */
+  /** The entry "Use the Local Docker" of the choice of the Docker host. */
   local?: boolean;
 }
 
@@ -141,8 +141,8 @@ export class RemoteDockerCommands {
   }
 
   /**
-   * The first row of the sidebar, which names the Docker host (user request 2026-09-28; it replaced the icons of the
-   * title bar): another remote host ("Use a Remote Docker Host…") or the local Docker ("Use the Local Docker"), the
+   * The first row of the sidebar, which names the Docker host (user request 2026-09-28; it replaced the icons that the
+   * view had): another remote host ("Use a Remote Docker Host…") or the local Docker ("Use the Local Docker"), the
    * current one marked. Never throws.
    */
   async chooseDockerHost(): Promise<void> {
