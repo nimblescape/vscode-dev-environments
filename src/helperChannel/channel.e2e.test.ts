@@ -140,9 +140,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     process.write(encodeMessage({ t: 'op', id: 1, op: 'docker', params: { args: ['sleep', 'two'], cleanup: LABEL_TWO } }));
     await waitUntil(() => stdout.includes('"t":"hello"'), 'the answer to hello');
     await waitUntil(() => calls().some((call) => call[0] === 'sleep' && call[1] === 'two'), 'the start of the call');
-    // Nothing more is written and the input stays open. Review round 3 (K4): the silence, the kill, and both passes of
-    // the cleanup (each a new process of the fake) take about 7 s; the wait allows for a slow runner.
-    await waitUntil(ended, 'the end of the script after the silence', 25_000);
+    // Nothing more is written and the input stays open.
+    await waitUntil(ended, 'the end of the script after the silence');
     expect(calls()).toContainEqual(['SIGTERM', 'sleep', 'two']);
     expect(calls()).toContainEqual(psOf(LABEL_TWO));
     process.end();
