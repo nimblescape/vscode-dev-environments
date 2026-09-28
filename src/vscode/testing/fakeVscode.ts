@@ -52,10 +52,6 @@ export class TreeItem {
 export const Uri = {
   parse: (value: string) => ({ scheme: value.split(':')[0], toString: () => value }),
   file: (fsPath: string) => ({ scheme: 'file', fsPath, toString: () => `file://${fsPath}` }),
-  joinPath: (base: { fsPath?: string; toString(): string }, ...parts: string[]) => {
-    const fsPath = [base.fsPath ?? base.toString(), ...parts].join('/');
-    return { scheme: 'file', fsPath, toString: () => `file://${fsPath}` };
-  },
 };
 
 export interface FakeTerminal {

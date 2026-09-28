@@ -79,10 +79,9 @@ describe('switcher (concept 6.4)', () => {
     const items = showQuickPick.mock.calls[0][0] as Item[];
     expect(items.map((item) => [item.label, item.description ?? ''])).toEqual([
       ['Recent environments', ''],
-      // User request 2026-09-28: the monitor icons of the states; review round 1 of PR #59 (P1): Stopped keeps the ring in
-      // a Quick Pick, which cannot color the grey monitor (pickerIconId).
-      ['$(vm-connect) acme/api', 'main   Connected'],
-      ['$(circle-outline) acme/web', 'main   Stopped'],
+      // User requests 2026-09-28: the monitors of the states (the icon font of the extension, review round 2 of PR #59).
+      ['$(devenv-monitor-connected) acme/api', 'main   Connected'],
+      ['$(devenv-monitor-off) acme/web', 'main   Stopped'],
       ['', ''],
       ['$(repo) Open repository…', ''],
     ]);

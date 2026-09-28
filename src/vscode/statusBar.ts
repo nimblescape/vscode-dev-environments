@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { Actions } from '../core/messages';
 import { SHOW_LOG_COMMAND } from './progress';
+import { MonitorIcons } from './treeModel';
 
 export const STATUS_BAR_ITEM_ID = 'devEnvironments.status';
 const SWITCH_ENVIRONMENT_COMMAND = 'devEnvironments.switchEnvironment';
@@ -91,12 +92,15 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     const state = this.base;
     switch (state.kind) {
       case 'connected':
-        item.text = state.branch ? `$(vm) ${state.repository} · ${state.branch}` : `$(vm) ${state.repository}`;
+        // Review round 2 of PR #59 (K2): the monitors of the sidebar, with the connection sign for this window.
+        item.text = state.branch
+          ? `$(${MonitorIcons.connected}) ${state.repository} · ${state.branch}`
+          : `$(${MonitorIcons.connected}) ${state.repository}`;
         item.tooltip = StatusBarTexts.connectedTooltip(state.repository);
         item.command = SWITCH_ENVIRONMENT_COMMAND;
         return;
       case 'notConnected':
-        item.text = `$(vm) ${StatusBarTexts.openEnvironment}`;
+        item.text = `$(${MonitorIcons.off}) ${StatusBarTexts.openEnvironment}`;
         item.tooltip = StatusBarTexts.notConnectedTooltip;
         item.command = SWITCH_ENVIRONMENT_COMMAND;
         return;

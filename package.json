@@ -35,6 +35,20 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "icons": {
+      "devenv-monitor-off": {
+        "description": "Dev Environments: an environment that no window uses (a monitor switched off).",
+        "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E001" }
+      },
+      "devenv-monitor-on": {
+        "description": "Dev Environments: an environment that another window uses (a monitor switched on).",
+        "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E002" }
+      },
+      "devenv-monitor-connected": {
+        "description": "Dev Environments: the environment of this window (a monitor switched on, with the connection sign).",
+        "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E003" }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {

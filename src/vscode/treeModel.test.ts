@@ -19,7 +19,6 @@ import {
   rootNodes,
   rowActions,
   rowStateText,
-  pickerIconId,
   stateIcon,
   stateText,
   TreeTexts,
@@ -801,25 +800,24 @@ describe('state texts and icons', () => {
   });
 
   it('maps every state to a codicon', () => {
-    // User requests 2026-09-28: a filled monitor with the connection sign in this window, a filled monitor in another
-    // window, the silhouette of a monitor when stopped (icons of the extension; the codicon for the Quick Picks).
-    expect(stateIcon('connected')).toEqual({ id: 'vm-connect', file: 'monitor-connected' });
-    // Green always means that the container runs; the shape tells which window uses it (user decision 2026-09-26).
-    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'vm', file: 'monitor-on' });
+    // User requests 2026-09-28: a switched-on monitor with the connection sign in this window, a switched-on monitor in
+    // another window, the silhouette of a monitor when stopped (the icon font of the extension, review round 2, K1).
+    expect(stateIcon('connected')).toEqual({ id: 'devenv-monitor-connected' });
+    // Review round 2 of PR #59 (K3): no longer green; the filled screen tells that another window uses it.
+    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'devenv-monitor-on' });
     // A play symbol, not the monitor of vm-running, which looked like a connected window (user, 2026-09-26).
     expect(stateIcon('running')).toEqual({ id: 'play-circle', color: 'charts.green' });
-    expect(stateIcon('stopped')).toEqual({ id: 'vm', file: 'monitor-off' });
+    expect(stateIcon('stopped')).toEqual({ id: 'devenv-monitor-off' });
     expect(stateIcon('updating').id).toBe('sync~spin');
     expect(stateIcon('noContainer').id).toBe('circle-large-outline');
     expect(stateIcon('filesMissing').id).toBe('warning');
   });
 
-  // Review round 1 of PR #59 (P1): a Quick Pick cannot color icons, so Stopped keeps a shape of its own there.
-  it('gives every state a Quick Pick icon that tells Stopped from Connected · other window', () => {
-    expect(pickerIconId('stopped')).toBe('circle-outline');
-    expect(pickerIconId('connectedOtherWindow')).toBe('vm');
-    expect(pickerIconId('connected')).toBe('vm-connect');
-    for (const state of ['running', 'updating', 'noContainer', 'filesMissing'] as const) expect(pickerIconId(state)).toBe(stateIcon(state).id);
+  // Review round 1 of PR #59 (P1): a Quick Pick cannot color icons, so every state needs a shape of its own there. Round
+  // 2 (K1): the icons of the extension are shapes (switched off, switched on, with the sign), so the icon of the state.
+  it('gives every state an icon of its own shape, also without color', () => {
+    const states = ['connected', 'connectedOtherWindow', 'running', 'stopped', 'updating', 'noContainer', 'filesMissing'] as const;
+    expect(new Set(states.map((state) => stateIcon(state).id)).size).toBe(states.length);
   });
 });
 

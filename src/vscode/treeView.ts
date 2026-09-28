@@ -73,11 +73,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
 
   readonly onDidChangeTreeData: vscode.Event<TreeNode | undefined> = this.changeEmitter.event;
 
-  /** `extensionUri`: the root of the extension, for the icons in resources/icons; without it, the codicons. */
-  constructor(
-    private readonly logger: Logger,
-    private readonly extensionUri?: vscode.Uri,
-  ) {}
+  constructor(private readonly logger: Logger) {}
 
   /**
    * Replaces the model and refreshes the view. `signedIn: false` adds the sign-in row at the top when the view is not
@@ -121,7 +117,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
         case 'group':
           return groupItem(node);
         case 'repository':
-          return repositoryItem(node, this.extensionUri);
+          return repositoryItem(node);
         case 'hint':
           return hintItem(node);
         case 'signIn':
@@ -172,7 +168,7 @@ function groupItem(node: GroupNode): vscode.TreeItem {
   return item;
 }
 
-function repositoryItem(row: RepositoryRow, extensionUri: vscode.Uri | undefined): vscode.TreeItem {
+function repositoryItem(row: RepositoryRow): vscode.TreeItem {
   const item = new vscode.TreeItem(row.label, vscode.TreeItemCollapsibleState.None);
   item.id = row.id;
   item.description = row.description;
@@ -180,13 +176,7 @@ function repositoryItem(row: RepositoryRow, extensionUri: vscode.Uri | undefined
   item.contextValue = row.contextValue;
   if (row.state) {
     const icon = stateIcon(row.state);
-    item.iconPath =
-      icon.file && extensionUri
-        ? {
-            light: vscode.Uri.joinPath(extensionUri, 'resources', 'icons', `${icon.file}-light.svg`),
-            dark: vscode.Uri.joinPath(extensionUri, 'resources', 'icons', `${icon.file}-dark.svg`),
-          }
-        : new vscode.ThemeIcon(icon.id, icon.color ? new vscode.ThemeColor(icon.color) : undefined);
+    item.iconPath = new vscode.ThemeIcon(icon.id, icon.color ? new vscode.ThemeColor(icon.color) : undefined);
   } else {
     // A repository without environment has no symbol; the blank icon keeps the names aligned.
     item.iconPath = new vscode.ThemeIcon('blank');

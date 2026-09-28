@@ -224,7 +224,7 @@ The example shows the nodes expanded. The tooltip of a row names the full `owner
 
 States of an environment (see also [7.15](#715-environment-states)):
 
-A monitor shows the environments of windows: switched off (the silhouette) while stopped, switched on (filled) while a window uses it, with the connection sign when this window uses it. The three monitors share the same frame, so the sign does not move it. Green marks a container that runs without a window.
+A monitor shows the environments of windows: switched off (the silhouette) while stopped, switched on (filled) while a window uses it, with the connection sign when this window uses it. The three monitors share the same frame, so the sign does not move it. They are icons of the extension (`contributes.icons`, the font `resources/icons/devenv-icons.woff`, built by `scripts/build-icon-font.py`), so VS Code colors them like its own icons, also in a selected row, and the switcher and the status bar show the same monitors. Green marks a container that runs without a window.
 
 | Symbol | State text | Meaning |
 |---|---|---|
@@ -267,8 +267,8 @@ One item on the left side of the status bar:
 
 | State | Text | Click action |
 |---|---|---|
-| Connected | `$(vm) acme-university/api · main` | Opens the switcher |
-| Not connected | `$(vm) Open environment…` | Opens the switcher |
+| Connected | `$(devenv-monitor-connected) acme-university/api · main` (the monitor with the connection sign) | Opens the switcher |
+| Not connected | `$(devenv-monitor-off) Open environment…` (the monitor switched off) | Opens the switcher |
 | Busy | `$(sync~spin) Updating acme-university/api…` | Shows the progress details |
 | Connection lost | `$(warning) Reconnect acme-university/api` | Runs the open pipeline again |
 

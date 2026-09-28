@@ -23,17 +23,20 @@ describe('EnvironmentStatusBar (concept 6.3)', () => {
     expect(fakeVscode.statusBarItems).toHaveLength(1);
     expect(item.alignment).toBe(fakeVscode.StatusBarAlignment.Left);
     expect(item.visible).toBe(true);
-    expect(item.text).toBe('$(vm) Open environment…');
+    // Review round 2 of PR #59 (K2): the switched-off monitor of the sidebar.
+    expect(item.text).toBe('$(devenv-monitor-off) Open environment…');
     expect(item.command).toBe('devEnvironments.switchEnvironment');
   });
 
   it('shows the connected environment and its branch; a click opens the switcher', () => {
     const { bar, item } = create();
     bar.showConnected('acme-university/api', 'main');
-    expect(item.text).toBe('$(vm) acme-university/api · main');
+    // Review round 2 of PR #59 (K2): the monitor of the sidebar with the connection sign.
+    expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api · main');
     expect(item.command).toBe('devEnvironments.switchEnvironment');
     bar.showConnected('acme-university/api', undefined);
-    expect(item.text).toBe('$(vm) acme-university/api');
+    // Review round 2 of PR #59 (K2): the monitor of the sidebar with the connection sign.
+    expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api');
   });
 
   it('shows Updating over the current state until the operation ends; a click shows the details', () => {
@@ -45,7 +48,8 @@ describe('EnvironmentStatusBar (concept 6.3)', () => {
     bar.showConnected('acme-university/api', 'dev');
     expect(item.text).toBe('$(sync~spin) Updating acme-university/web…');
     bar.clearBusy();
-    expect(item.text).toBe('$(vm) acme-university/api · dev');
+    // Review round 2 of PR #59 (K2): the monitor of the sidebar with the connection sign.
+    expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api · dev');
   });
 
   it('offers Reconnect when the connection is lost; a click runs Start for the environment', () => {
@@ -55,7 +59,8 @@ describe('EnvironmentStatusBar (concept 6.3)', () => {
     expect(item.command).toMatchObject({ command: 'devEnvironments.start', arguments: [{ environmentId: 'env-1' }] });
     expect(item.backgroundColor?.id).toBe('statusBarItem.warningBackground');
     bar.showNotConnected();
-    expect(item.text).toBe('$(vm) Open environment…');
+    // Review round 2 of PR #59 (K2): the switched-off monitor of the sidebar.
+    expect(item.text).toBe('$(devenv-monitor-off) Open environment…');
     expect(item.backgroundColor).toBeUndefined();
   });
 
