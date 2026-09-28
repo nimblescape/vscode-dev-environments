@@ -437,6 +437,7 @@ export class Controller implements vscode.Disposable {
     // token file is removed) when the environment is not the account's.
     if (!(await this.stillAvailable(environment))) return;
     const repository = this.displayName({ repository: environment.repository });
+    let ready = true;
     if (pipelineJustRan(pending, environment.id, this.clock.now())) {
       this.logger.info(`The open pipeline of ${repository} has just run for this window.`);
     } else {
@@ -458,6 +459,7 @@ export class Controller implements vscode.Disposable {
         { retry: () => this.start({ kind: 'environment', environmentId: environment.id }) },
       );
       if (!succeeded) {
+        ready = false;
         // "Delete environment" for missing files (concept 7.12) removed the environment of this window.
         if (await this.leaveDeletedEnvironment(environment.id)) return;
         // Concept section 9: the pipeline did not make the container of an older version again (for example the host
@@ -486,7 +488,27 @@ export class Controller implements vscode.Disposable {
         }
       }
     }
+    if (ready && (await this.moveToContextAuthority(environment, containerName))) return;
     this.background(this.readWindowBranch(), 'read the branch of the environment');
+  }
+
+  /**
+   * Review of the attach context (A3): a window of a remote environment whose authority lacks its Docker context (a
+   * window of an earlier version, restored or from Open Recent) would attach through the local Docker. It opens the same
+   * folder with the context instead; the pending connection file keeps the pipeline from running again. Returns true
+   * when the window moves.
+   */
+  private async moveToContextAuthority(environment: Environment, containerName: string): Promise<boolean> {
+    if (dockerHostOf(environment) === '') return false;
+    const folder = environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository);
+    const args = await this.windowArgs(environment, containerName, folder);
+    const own = this.deps.connection.currentDockerContext();
+    if (args[2] === own) return false;
+    const repository = this.displayName({ repository: environment.repository });
+    this.logger.info(`The window of ${repository} connects again through the Docker context ${args[2] ?? '(none)'} (it had ${own ?? 'none'}).`);
+    await this.deps.coordinator.writePending(environment.id);
+    await this.deps.connection.open(...args);
+    return true;
   }
 
   /**
@@ -1176,7 +1198,7 @@ export class Controller implements vscode.Disposable {
           this.logger.info(`${repository} is open in another window. That window is shown.`);
           const folder = environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository);
           // A request for a new window never replaces the current window, also if VS Code does not find the other one.
-          const args = this.windowArgs(environment, environment.containerName, folder);
+          const args = await this.otherWindowArgs(environment, folder);
           if (this.opensNewWindow(options.window ?? 'default', false)) await connection.openInNewWindow(...args);
           else await connection.open(...args);
           return;
@@ -1310,10 +1332,10 @@ export class Controller implements vscode.Disposable {
     }
     await this.deps.coordinator.writePending(result.environment.id);
     if (request.newWindow) {
-      await this.deps.connection.openInNewWindow(...this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder));
+      await this.deps.connection.openInNewWindow(...(await this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder)));
       return;
     }
-    await this.deps.connection.open(...this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder));
+    await this.deps.connection.open(...(await this.windowArgs(result.environment, result.containerName, result.remoteWorkspaceFolder)));
   }
 
   /**
@@ -1910,7 +1932,7 @@ export class Controller implements vscode.Disposable {
     if (!environment || !isAvailableTo(environment, account)) return false;
     this.left = undefined;
     this.logger.info(`The signed-in GitHub account may use ${left.repository} again. The window reloads to open it.`);
-    await this.deps.connection.open(...this.windowArgs(environment, left.containerName, environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository)));
+    await this.deps.connection.open(...(await this.windowArgs(environment, left.containerName, environment.remoteWorkspaceFolder ?? repositoryFolder(environment.repository))));
     return true;
   }
 
@@ -2114,6 +2136,16 @@ export class Controller implements vscode.Disposable {
 
   private isConnectedHere(environment: Environment): boolean {
     return this.current?.environment.id === environment.id;
+  }
+
+  /** The status of another active window that is connected to the environment, if any. */
+  private async otherWindowOf(environmentId: string): Promise<WindowStatus | undefined> {
+    try {
+      return (await this.deps.coordinator.otherActiveWindows()).find((window) => window.environmentId === environmentId);
+    } catch (error) {
+      this.logger.warn(`The other windows could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   private async connectedInOtherWindow(environmentId: string): Promise<boolean> {
@@ -2410,8 +2442,9 @@ export class Controller implements vscode.Disposable {
    * Unit 7: a restored window whose environment is on another Docker host than the current Docker context asks "Use
    * <host> again?" (RemoteDockerCommands.offerSwitchBack: the same test and modal as the commands). True when Docker uses
    * the environment's host (then the open continues); otherwise the window closes its remote connection with the
-   * message, and nothing runs on the other host. Assumption (V-2): VS Code waits for activate() before it resolves the
-   * authority, so the Dev Containers extension connects through the context that is current afterwards.
+   * message, and nothing runs on the other host. The pipeline of this extension runs on the current context; the Dev
+   * Containers extension attaches through the context in the window's authority (moveToContextAuthority puts it there
+   * for a window without one). Assumption (V-2): VS Code waits for activate() before it resolves the authority.
    */
   private async onWindowHost(environment: Environment): Promise<boolean> {
     if (!this.deps.dockerTargets) return true;
@@ -2472,16 +2505,46 @@ export class Controller implements vscode.Disposable {
   /**
    * The arguments of ConnectionAdapter.open and openInNewWindow for `environment`: the container, the folder, and for an
    * environment on another Docker host its Docker context (user report 2026-09-28: without it in the authority, the Dev
-   * Containers extension asks the local Docker first and reports the container as one that "no longer exists"). The
-   * context is the one of the running operation when that is on the environment's host (a context that the user made;
-   * none when DOCKER_HOST decides), else the one that "Use a Remote Docker Host…" creates for the host.
+   * Containers extension asks the local Docker first and reports the container as one that "no longer exists").
+   * The context, in this order (review of the attach context, A1):
+   * - the one of the running operation, when that is on the environment's host (a context that the user made; none when
+   *   DOCKER_HOST decides);
+   * - outside an operation, the one in the authority of this window when it shows the same container;
+   * - the current context, when that is on the environment's host (read outside any operation);
+   * - else the one that "Use a Remote Docker Host…" creates for the host.
    */
-  private windowArgs(environment: Environment, containerName: string, folder: string): [containerName: string, folder: string, dockerContext?: string] {
+  private async windowArgs(
+    environment: Environment,
+    containerName: string,
+    folder: string,
+  ): Promise<[containerName: string, folder: string, dockerContext?: string]> {
     const host = dockerHostOf(environment);
     if (host === '') return [containerName, folder];
+    const withContext = (context: string | undefined): [string, string, string?] =>
+      context === undefined ? [containerName, folder] : [containerName, folder, context];
     const target = operationDockerTarget();
-    const context = target && isOnDockerHost(environment, target.host) ? target.context : remoteContextName(host);
-    return context === undefined ? [containerName, folder] : [containerName, folder, context];
+    if (target && isOnDockerHost(environment, target.host)) return withContext(target.context);
+    if (this.deps.connection.currentContainerName() === containerName) {
+      const own = this.deps.connection.currentDockerContext();
+      if (own !== undefined) return withContext(own);
+    }
+    const targets = this.deps.dockerTargets;
+    if (targets) {
+      const current = await outsideOperation(() => targets.resolve());
+      if (isOnDockerHost(environment, current.host)) return withContext(current.context);
+    }
+    return withContext(remoteContextName(host));
+  }
+
+  /**
+   * The arguments that show the other window of `environment` (concept 7.11): exactly the URI of that window, with the
+   * context of its status file (none in a file of an earlier version), so that VS Code finds it (review of the attach
+   * context, A2).
+   */
+  private async otherWindowArgs(environment: Environment, folder: string): Promise<[containerName: string, folder: string, dockerContext?: string]> {
+    if (dockerHostOf(environment) === '') return [environment.containerName, folder];
+    const other = await this.otherWindowOf(environment.id);
+    return other?.dockerContext === undefined ? [environment.containerName, folder] : [environment.containerName, folder, other.dockerContext];
   }
 
   /**
@@ -2502,7 +2565,7 @@ export class Controller implements vscode.Disposable {
 
   /**
    * User decision 2026-09-28: the window connects only to a container that the Docker of the window finds running. The
-   * Dev Containers extension of the window attaches through the current Docker context, and reports a container that it
+   * Dev Containers extension of the window attaches through the Docker context in the window's authority (or, without one, the local Docker), and reports a container that it
    * does not find as one that "no longer exists". So right before the window connects: the current Docker context is
    * still on the host of the environment (another window or Docker Desktop may have changed it while the pipeline ran),
    * and the container answers as running (a few checks, 1 s apart, for an engine that answers late). Returns the error

@@ -164,6 +164,18 @@ describe('ConnectionAdapter', () => {
     expect(new ConnectionAdapter().currentContainerName()).toBe('devenv-acme-web-7c1d2e3f');
   });
 
+  // Review of the attach context (A2, A3): the context in the window's own authority.
+  it('reads the Docker context of the attached window, and none without one or outside an attached window', () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBe('devenv-remote-5709ff28');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+    fake.state.remoteName = 'ssh-remote';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+  });
+
   it('has no container in a local window, in a window of another remote type, and in an attached window without folder', () => {
     const adapter = new ConnectionAdapter();
     fake.state.workspaceFolders = [{ uri: fake.uri({ scheme: 'file', path: '/Users/me/project' }) }];

@@ -51,6 +51,8 @@ export interface SessionCoordinatorDeps {
   /** Absolute path of dist/sessionMonitor.js. */
   monitorScript: string;
   settings: () => ExtensionSettings;
+  /** The Docker context in the authority of this window (ConnectionAdapter.currentDockerContext), for its status file. */
+  windowDockerContext?: () => string | undefined;
   clock?: Clock;
   // For tests:
   /** Default: `crypto.randomUUID()`. */
@@ -330,12 +332,14 @@ export class SessionCoordinator implements vscode.Disposable {
   private async writeActiveStatus(environmentId: string | null): Promise<boolean> {
     if (this.stopped) return false;
     const generation = ++this.writeGeneration;
+    const dockerContext = environmentId === null ? undefined : this.deps.windowDockerContext?.();
     const status: WindowStatus = {
       windowId: this.windowId,
       pid: this.pid,
       environmentId,
       state: 'active',
       updatedAt: isoTime(this.clock),
+      ...(dockerContext ? { dockerContext } : {}),
     };
     const file = this.paths.sessionFile(this.windowId);
     const temp = path.join(

@@ -222,7 +222,8 @@ export function isWindowStatus(value: unknown): value is WindowStatus {
     isPid(value.pid) &&
     (value.environmentId === null || isNonEmptyString(value.environmentId)) &&
     (value.state === 'active' || value.state === 'closing') &&
-    isTime(value.updatedAt)
+    isTime(value.updatedAt) &&
+    (value.dockerContext === undefined || isNonEmptyString(value.dockerContext))
   );
 }
 

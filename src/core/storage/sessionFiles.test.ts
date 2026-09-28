@@ -335,6 +335,10 @@ describe('validators', () => {
     expect(isWindowStatus({ ...status(WIN_1), environmentId: undefined })).toBe(false);
     expect(isWindowStatus({ ...status(WIN_1), updatedAt: 'later' })).toBe(false);
     expect(isWindowStatus([])).toBe(false);
+    // Review of the attach context (A2): an optional, non-empty Docker context.
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: 'devenv-remote-5709ff28' })).toBe(true);
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: '' })).toBe(false);
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: 3 })).toBe(false);
     expect(isPendingConnection({ environmentId: ENV_A, windowId: WIN_1, createdAt: '2026-09-24T17:40:15Z' })).toBe(true);
     expect(isPendingConnection({ environmentId: ENV_A, windowId: '', createdAt: '2026-09-24T17:40:15Z' })).toBe(false);
     expect(isPendingOperation(operation(ENV_A))).toBe(true);

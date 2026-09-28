@@ -43,6 +43,26 @@ export class ConnectionAdapter {
   }
 
   /**
+   * The Docker context named in the authority of this window (`settings.context`, authority.ts), or `undefined` for a
+   * window without one (the local Docker, DOCKER_HOST, a window of an earlier version, or no attached container).
+   */
+  currentDockerContext(): string | undefined {
+    const remoteName = vscode.env.remoteName;
+    if (remoteName !== undefined && remoteName !== ATTACHED_CONTAINER) return undefined;
+    const candidates: vscode.Uri[] = [];
+    const workspaceFile = vscode.workspace.workspaceFile;
+    if (workspaceFile) candidates.push(workspaceFile);
+    const firstFolder = vscode.workspace.workspaceFolders?.[0];
+    if (firstFolder) candidates.push(firstFolder.uri);
+    for (const uri of candidates) {
+      if (uri.scheme !== REMOTE_SCHEME) continue;
+      const parts = decodeAuthorityParts(uri.authority);
+      if (parts) return parts.dockerContext;
+    }
+    return undefined;
+  }
+
+  /**
    * True for an empty local window: no remote, no folder, and no workspace (concept 7.10 #2, 7.14 step 3). A window of
    * a remote (SSH, WSL, a tunnel, an attached container) without a folder is not empty: the user opened it for that
    * remote, so the reopen rule and the pending operations do not take it over.

@@ -194,6 +194,18 @@ describe('SessionCoordinator', () => {
     expect(sessionFileNames(h)).toEqual(['window-1.json']);
   });
 
+  // Review of the attach context (A2): the status file names the Docker context of the window's authority.
+  it('writes the Docker context of the window into its status file, only for a window with an environment', async () => {
+    h.coordinator.dispose();
+    h.coordinator = h.create({ windowDockerContext: () => 'devenv-remote-5709ff28' });
+    await h.coordinator.start(ID_A);
+    expect(readStatus(h)).toMatchObject({ environmentId: ID_A, dockerContext: 'devenv-remote-5709ff28' });
+    h.coordinator.dispose();
+    h.coordinator = h.create({ windowDockerContext: () => 'devenv-remote-5709ff28' });
+    await h.coordinator.start(null);
+    expect(readStatus(h)).not.toHaveProperty('dockerContext');
+  });
+
   it('start resolves with the fresh pending file of its environment that it removes, so the caller knows the pipeline ran', async () => {
     await h.sessionFiles.writePending(ID_A, 'window-0');
     expect(await h.coordinator.start(ID_A)).toEqual({ environmentId: ID_A, windowId: 'window-0', createdAt: iso(T0) });
