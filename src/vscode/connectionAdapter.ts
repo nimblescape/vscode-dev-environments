@@ -47,6 +47,15 @@ export class ConnectionAdapter {
    * window without one (the local Docker, DOCKER_HOST, a window of an earlier version, or no attached container).
    */
   currentDockerContext(): string | undefined {
+    const shown = this.shownAttachedUri();
+    return shown ? decodeAuthorityParts(shown.authority)?.dockerContext : undefined;
+  }
+
+  /**
+   * The URI through which this window is attached to a container: its workspace file when that is an attached-container
+   * URI, else its first folder when that is one (round 3, C1: a local or untitled workspace file of remote folders).
+   */
+  private shownAttachedUri(): vscode.Uri | undefined {
     const remoteName = vscode.env.remoteName;
     if (remoteName !== undefined && remoteName !== ATTACHED_CONTAINER) return undefined;
     const candidates: vscode.Uri[] = [];
@@ -54,12 +63,7 @@ export class ConnectionAdapter {
     if (workspaceFile) candidates.push(workspaceFile);
     const firstFolder = vscode.workspace.workspaceFolders?.[0];
     if (firstFolder) candidates.push(firstFolder.uri);
-    for (const uri of candidates) {
-      if (uri.scheme !== REMOTE_SCHEME) continue;
-      const parts = decodeAuthorityParts(uri.authority);
-      if (parts) return parts.dockerContext;
-    }
-    return undefined;
+    return candidates.find((uri) => uri.scheme === REMOTE_SCHEME && decodeAuthorityParts(uri.authority) !== undefined);
   }
 
   /**
@@ -125,12 +129,13 @@ export class ConnectionAdapter {
    * false when the window shows no attached container.
    */
   async reopenWithDockerContext(dockerContext: string): Promise<boolean> {
-    const workspaceFile = vscode.workspace.workspaceFile;
-    const shown = workspaceFile ?? vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (!shown || shown.scheme !== REMOTE_SCHEME) return false;
-    const parts = decodeAuthorityParts(shown.authority);
-    if (!parts) return false;
-    const uri = vscode.Uri.from({ scheme: REMOTE_SCHEME, authority: encodeAuthority(parts.containerName, dockerContext), path: shown.path });
+    const shown = this.shownAttachedUri();
+    const parts = shown ? decodeAuthorityParts(shown.authority) : undefined;
+    if (!shown || !parts) return false;
+    // Round 3 (C2): an `@<parent remote>` suffix stays.
+    const at = shown.authority.indexOf('@');
+    const suffix = at >= 0 ? shown.authority.slice(at) : '';
+    const uri = vscode.Uri.from({ scheme: REMOTE_SCHEME, authority: `${encodeAuthority(parts.containerName, dockerContext)}${suffix}`, path: shown.path });
     this.logger.info(`Connecting the window to ${parts.containerName} again through the Docker context ${dockerContext} (${uri.toString()}).`);
     await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: false, forceReuseWindow: true });
     return true;

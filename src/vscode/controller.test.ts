@@ -3342,6 +3342,18 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
+  // Round 3 (C1): when the window shows nothing it can reopen, no pending connection file stays behind.
+  it('removes the pending connection file when the window cannot reopen with the context', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    h.coordinator.writePending.mockImplementation(async (id: string) => h.sessionFiles.writePending(id, WINDOW_ID));
+    h.connection.reopenWithDockerContext.mockResolvedValue(false);
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(h.connection.reopenWithDockerContext).toHaveBeenCalledWith('devenv-remote');
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
   // Round 2 (B1): the operation's context does not replace a context that the window names already (a user-made one).
   it('a restored window that names another working context keeps it, also inside the operation', async () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote');
@@ -3370,12 +3382,14 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
   it('uses the status of the other window that it decided on, not a second read', async () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote');
     await h.registry.add(remoteEnvironment());
+    // Round 3 (C3): a context other than the operation's, and no pipeline, so only the other-window branch can pass.
     h.coordinator.otherActiveWindows.mockResolvedValueOnce([
-      { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: REMOTE_ENV_ID, state: 'active', updatedAt: iso(NOW), dockerContext: 'devenv-remote' },
+      { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: REMOTE_ENV_ID, state: 'active', updatedAt: iso(NOW), dockerContext: 'my-build-box' },
     ]);
     h.coordinator.otherActiveWindows.mockResolvedValue([]);
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.connection.open.mock.calls).toEqual([['devenv-acme-api-a1b2c3d4', '/workspaces/api', 'devenv-remote']]);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open.mock.calls).toEqual([['devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box']]);
   });
 
   // Review of the attach context (A2): the other window is shown by exactly its URI, with the context of its status file.

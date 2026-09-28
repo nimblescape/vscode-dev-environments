@@ -189,6 +189,19 @@ describe('ConnectionAdapter', () => {
     expect(uris[1]).toMatchObject({ authority: encodeAuthority(NAME, 'devenv-remote-5709ff28'), path: '/workspaces/api/api.code-workspace' });
   });
 
+  // Round 3 (C1, C2): a local workspace file of remote folders reopens its first folder; an @<parent> suffix stays.
+  it('reopens the first remote folder under a local workspace file, and keeps an @<parent> suffix', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFile = fake.uri({ scheme: 'file', authority: '', path: '/Users/me/api.code-workspace' });
+    fake.state.workspaceFolders = [
+      { uri: fake.uri({ scheme: 'vscode-remote', authority: `${encodeAuthority(NAME)}@ssh-remote+box`, path: '/workspaces/api' }) },
+    ];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+    expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(true);
+    const uri = (fake.state.commands[0] as [string, FakeUri])[1];
+    expect(uri).toMatchObject({ authority: `${encodeAuthority(NAME, 'devenv-remote-5709ff28')}@ssh-remote+box`, path: '/workspaces/api' });
+  });
+
   it('does not reopen a window that shows no attached container', async () => {
     fake.state.workspaceFolders = [{ uri: fake.uri({ scheme: 'file', authority: '', path: '/home/api' }) }];
     expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(false);

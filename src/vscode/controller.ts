@@ -509,7 +509,12 @@ export class Controller implements vscode.Disposable {
     this.logger.info(`The window of ${repository} connects again through the Docker context ${context}.`);
     await this.deps.coordinator.writePending(environment.id);
     // Round 2 (B3): the same folder or workspace file, only with the context in the authority.
-    return this.deps.connection.reopenWithDockerContext(context);
+    if (await this.deps.connection.reopenWithDockerContext(context)) return true;
+    // Round 3 (C1): the window shows no attached-container URI to reopen; no pending connection file stays behind.
+    await this.deps.sessionFiles
+      .removePending(environment.id)
+      .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
+    return false;
   }
 
   /**
