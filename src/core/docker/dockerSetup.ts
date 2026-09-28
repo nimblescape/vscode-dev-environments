@@ -72,6 +72,10 @@ export const DockerSetupTexts = {
   descriptionBrew: 'Docker Desktop is installed with Homebrew from its official cask docker-desktop.',
   brewStaleCask:
     'Homebrew still lists Docker Desktop, but the app is missing. Homebrew first removes its old entry (your Docker data stays), then installs Docker Desktop.',
+  // User decision 2026-09-28: Homebrew removes the quarantine attribute of Docker.app with xattr, which macOS refuses
+  // ("Operation not permitted") unless the app of the terminal may manage other apps.
+  brewAppManagementNote:
+    'If the terminal shows "Operation not permitted" (xattr), allow VS Code in System Settings › Privacy & Security › App Management, then choose Install Docker… again.',
   descriptionWinget: 'Docker Desktop is installed with winget from its official package Docker.DockerDesktop.',
   descriptionEngine: (distribution: string) =>
     `Docker Engine is installed from the official package repository of Docker for ${distribution} (download.docker.com).`,
@@ -234,9 +238,10 @@ export function installPlan(input: InstallPlanInput): InstallPlan {
           commands: [`${brew} uninstall --cask --force docker-desktop`, command],
           needsAdmin: true,
           description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+          note: DockerSetupTexts.brewAppManagementNote,
         };
       }
-      return { kind: 'terminal', commands: [command], needsAdmin: true, description: DockerSetupTexts.descriptionBrew };
+      return { kind: 'terminal', commands: [command], needsAdmin: true, description: DockerSetupTexts.descriptionBrew, note: DockerSetupTexts.brewAppManagementNote };
     }
     if (platform === 'win32' && input.has('winget')) {
       return { kind: 'terminal', commands: [WINGET_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionWinget };
