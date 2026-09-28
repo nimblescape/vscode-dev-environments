@@ -2,12 +2,13 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Image references of a configuration (concept D-17): the image of another environment, an image ID in place of a name,
-// references that Docker's grammar does not accept, and the labels of an image by which Dev Environments, the Dev
-// Container CLI, and Docker Compose find containers. The pipeline asks Docker about the references
-// (imageReferencesToInspect, inspectedImageItems). Pure functions, no I/O.
+// Image references of a configuration (concept D-17): an image of the environments of another account, an image ID in
+// place of a name, references that Docker's grammar does not accept, and the labels of an image by which Dev
+// Environments, the Dev Container CLI, and Docker Compose find containers. The pipeline asks Docker about the
+// references (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, shortId } from '../names';
 import type { HostAccessFinding } from './report';
 import { isReservedLabel } from './rules';
 
@@ -53,17 +54,19 @@ function tooLongFinding(reference: string, what: string): HostAccessFinding {
 }
 
 /**
- * An image reference that a configuration may not use, with its class: the image of another environment (a name of
- * the namespace `devenv-` of Dev Environments, also written with Docker Hub's registry or `library/`, D-17), perhaps of
- * another account: `protected`; an image ID in place of a name (it can name any local image, also one of another
- * environment): `unsupported`. `undefined` for any other reference. `what` names it in the item.
+ * An image reference that a configuration may not use by its form alone, with its class: an image ID in place of a name
+ * (it can name any local image, also one of another account): `unsupported`; a reference longer than
+ * MAX_REFERENCE_LENGTH: `unsupported`. `undefined` for any other reference. `what` names it in the item. Whether a name
+ * refers to an image of the environments of another account is decided by the ID of the local image that it names, not
+ * by its name (otherAccountImageItems, user decision 2026-09-28): a name like `devenv-…` of a local image whose ID is
+ * not another account's is allowed; only a name of an environment image that Docker found missing is decided by the
+ * name (isOtherEnvironmentImageName).
  */
 export function imageReferenceFinding(reference: string, what = 'image'): HostAccessFinding | undefined {
   const text = reference.trim();
   // Review round 6 (S6-1).
   if (text.length > MAX_REFERENCE_LENGTH) return tooLongFinding(text, what);
   if (IMAGE_ID.test(text)) return { item: imageIdItem(text, what), class: 'unsupported' };
-  if (/^devenv-/.test(localImageRepository(text))) return { item: `${what} ${text} of another environment`, class: 'protected' };
   return undefined;
 }
 
@@ -215,7 +218,7 @@ export function imageLabelItems(image: string, labels: Readonly<Record<string, s
  * Review round 11 (G1, G2): of `references` (of a configuration, ImageReferences of the analysis), each once (by its
  * item), those that Docker is asked about (`named`), and the items of those that are not valid in Docker's grammar
  * (`invalid`, imageInvalidReferenceItem), which are refused before any inspect. A reference that imageReferenceFinding
- * refuses already (the image of another environment, an image ID) is left out: the check names it.
+ * refuses already (an image ID, a reference that is too long) is left out: the check names it.
  */
 export function imageReferencesToInspect(references: readonly NamedImageReference[]): { named: NamedImageReference[]; invalid: string[] } {
   const named: NamedImageReference[] = [];
@@ -256,4 +259,148 @@ export function inspectedImageItems(
     ...(notChecked.has(entry.reference) ? [imageUncheckedItem(entry.reference, entry.what)] : []),
   ]);
   return { items, transient, notChecked: [...notChecked] };
+}
+
+/** A local image as `docker image inspect` gives it (inspectImageNames): its ID, tags, and digests. */
+export interface InspectedImage {
+  id: string;
+  repoTags: readonly string[];
+  repoDigests: readonly string[];
+}
+
+/**
+ * The IDs of the images of the environments on one Docker host (the environment images and the images that Docker
+ * Compose built for them, environmentImageShortId), split by owner: `own`, of the environments of the account of the
+ * checked environment (also of the checked environment itself); `others`, of the environments of other accounts and of
+ * environments whose owner is not known (built from another computer and without a volume here, or left behind by a
+ * Delete).
+ */
+export interface EnvironmentImageIds {
+  own: ReadonlySet<string>;
+  others: ReadonlySet<string>;
+  /** The short IDs of the environments of the account of the checked environment (for a name without a local image). */
+  ownShortIds?: ReadonlySet<string>;
+}
+
+/**
+ * The image of `images` that Docker gives for `reference` by its name (a tag, or a digest of the repository;
+ * resolvedByImageId), `undefined` when none of them. A reference that Docker resolves by the ID of an image is refused
+ * as an image ID (imageIdResolvedReferences).
+ */
+export function imageNamedBy(reference: string, images: readonly InspectedImage[]): InspectedImage | undefined {
+  if (parseImageReference(reference) === undefined) return undefined;
+  return images.find((image) => !resolvedByImageId(reference, image.repoTags, image.repoDigests));
+}
+
+/**
+ * The short ID of the environment whose image `reference` names: `devenv-<short id>:<build>` (environmentImageName) or
+ * `devenv-<short id>-<service>` (composeServiceImage), also written with Docker Hub's registry or `library/`
+ * (localImageRepository). `undefined` for any other name.
+ */
+export function environmentImageShortId(reference: string): string | undefined {
+  return /^devenv-([0-9a-f]{8})(?:-[^/]+)?$/.exec(localImageRepository(reference))?.[1];
+}
+
+/**
+ * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag`), by the
+ * owner account of each short ID (`owners`: of the registry entries, and of the labels of the volumes of the host) and
+ * the account `accountId`. An image with a short ID of no known owner counts as another account's.
+ */
+export function environmentImageIds(
+  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
+  owners: ReadonlyMap<string, string>,
+  accountId: string,
+): EnvironmentImageIds {
+  const own = new Set<string>();
+  const others = new Set<string>();
+  for (const image of images) {
+    for (const tag of image.tags) {
+      const short = environmentImageShortId(tag);
+      if (short === undefined) continue;
+      (owners.get(short) === accountId ? own : others).add(image.id.toLowerCase());
+    }
+  }
+  const ownShortIds = new Set([...owners].filter(([, owner]) => owner === accountId).map(([short]) => short));
+  return { own, others, ownShortIds };
+}
+
+/**
+ * The short IDs of `images` (environmentImageShortId) that `owners` does not know; with `ids`, only of the images with
+ * one of these IDs (the images that the references of a configuration found).
+ */
+export function unknownEnvironmentShortIds(
+  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
+  owners: ReadonlyMap<string, string>,
+  ids?: ReadonlySet<string>,
+): string[] {
+  const unknown = new Set<string>();
+  for (const image of images) {
+    if (ids !== undefined && !ids.has(image.id.toLowerCase())) continue;
+    for (const tag of image.tags) {
+      const short = environmentImageShortId(tag);
+      if (short !== undefined && !owners.has(short)) unknown.add(short);
+    }
+  }
+  return [...unknown];
+}
+
+/**
+ * The owner account of each environment short ID by the labels of `volumes` (nimblescape.devenv.environment-id and
+ * nimblescape.devenv.owner-id). A short ID whose volumes carry different owners is left out: its images count as
+ * another account's (environmentImageIds).
+ */
+export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): Map<string, string> {
+  const owners = new Map<string, string | undefined>();
+  for (const volume of volumes) {
+    const id = volume.labels[LABEL_ENVIRONMENT_ID];
+    const owner = volume.labels[LABEL_OWNER_ID];
+    if (!id || !owner) continue;
+    const short = shortId(id).toLowerCase();
+    owners.set(short, owners.has(short) && owners.get(short) !== owner ? undefined : owner);
+  }
+  return new Map([...owners].filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+/** The item of an image reference that names an image of the environments of another account (protected). */
+export function otherAccountImageItem(reference: string, what = 'image'): string {
+  return `${what} ${reference.trim()} (an image of an environment of another GitHub account)`;
+}
+
+/**
+ * The items (otherAccountImageItem) of the references `named` whose image, as Docker gives it by the name
+ * (imageNamedBy, of the images that one `docker image inspect` found), is an image of an environment of another account
+ * or of no known owner (`ids.others`) and of none of the account of the checked environment (`ids.own`), user decision
+ * 2026-09-28; a reference that names no local image and that Docker found missing (`missing`; not one that it could not
+ * inspect: review round 4, T1), by its name (isOtherEnvironmentImageName). The image ID says
+ * what the image holds, not whose it is: two environments with the same configuration can
+ * build the same image (the same ID), and an image with the ID of an image of the account's own environments holds
+ * nothing that the account could not build itself. Not recognized: a copy of such an image with other labels or layers
+ * (another ID) and without a name of an environment. Refused whatever the switch says (HostAccessClass `protected`):
+ * account separation.
+ */
+export function otherAccountImageItems(
+  named: readonly NamedImageReference[],
+  images: readonly InspectedImage[],
+  ids: EnvironmentImageIds,
+  missing: ReadonlySet<string>,
+): string[] {
+  const items: string[] = [];
+  for (const entry of named) {
+    const id = imageNamedBy(entry.reference, images)?.id.toLowerCase();
+    const byName = missing.has(entry.reference) && isOtherEnvironmentImageName(entry.reference, ids);
+    if (id !== undefined ? ids.others.has(id) && !ids.own.has(id) : byName) {
+      items.push(otherAccountImageItem(entry.reference, entry.what));
+    }
+  }
+  return items;
+}
+
+/**
+ * Review round 3 (S1): whether `reference`, which names no local image, is the name of an image of an environment of
+ * another account or of no known owner (environmentImageShortId; `ids.ownShortIds`). No registry has such a name, so it
+ * has no use but to catch that environment's next build between the check and the start.
+ */
+export function isOtherEnvironmentImageName(reference: string, ids: EnvironmentImageIds): boolean {
+  const short = environmentImageShortId(reference);
+  return short !== undefined && !(ids.ownShortIds?.has(short) ?? false);
 }

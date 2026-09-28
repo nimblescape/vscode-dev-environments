@@ -1002,6 +1002,33 @@ describe('images', () => {
     await expect(docker.listImagesByLabel('nimblescape.devenv.helper=true')).rejects.toBeInstanceOf(CommandError);
   });
 
+  it('listEnvironmentImages lists the named images of devenv-… repositories, each ID once with its references (user decision 2026-09-28)', async () => {
+    const id1 = `sha256:${'1'.repeat(64)}`;
+    const id2 = `sha256:${'2'.repeat(64)}`;
+    const lines = [
+      { ID: id1, Repository: 'devenv-1a2b3c4d', Tag: '2', CreatedAt: 'a' },
+      { ID: id1, Repository: 'devenv-1a2b3c4d', Tag: '3', CreatedAt: 'a' },
+      { ID: id2, Repository: 'devenv-1a2b3c4d-db', Tag: 'latest', CreatedAt: 'b' },
+      { ID: `sha256:${'3'.repeat(64)}`, Repository: '<none>', Tag: '<none>' },
+      { ID: '', Repository: 'devenv-x', Tag: '1' },
+    ];
+    const { docker, runner } = adapter(() => ok(`${lines.map((line) => JSON.stringify(line)).join('\n')}\nWARNING: not JSON\n`));
+    expect(await docker.listEnvironmentImages()).toEqual([
+      { id: id1, tags: ['devenv-1a2b3c4d:2', 'devenv-1a2b3c4d:3'], createdAt: 'a' },
+      { id: id2, tags: ['devenv-1a2b3c4d-db:latest'], createdAt: 'b' },
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['image', 'ls', '--filter', 'reference=devenv-*', '--no-trunc', '--format', '{{json .}}']]);
+  });
+
+  it('listEnvironmentImages throws CommandError, and an AbortError when cancelled', async () => {
+    const { docker } = adapter(() => fail('Cannot connect to the Docker daemon'));
+    await expect(docker.listEnvironmentImages()).rejects.toBeInstanceOf(CommandError);
+    const controller = new AbortController();
+    controller.abort();
+    const { docker: cancelled } = adapter(() => ok(''));
+    await expect(cancelled.listEnvironmentImages(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   it('buildImage throws CommandError', async () => {
     const { docker } = adapter(() => fail('failed to solve'));
     await expect(docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).rejects.toBeInstanceOf(CommandError);

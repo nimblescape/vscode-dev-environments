@@ -12,6 +12,7 @@ import type { ComposeModel } from './compose';
 import {
   composeAccessClassification,
   composeAccessReport,
+  composeImageReferences,
   composeMissingBuildPaths,
   GITHUB_CLI_ACCOUNT_REASON,
   type ComposeAccessInput,
@@ -101,7 +102,6 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['a network driver', input((m) => (m.networks = { lan: { driver: 'macvlan' } })), 'network lan: driver macvlan', 'computer'],
   ['a volume of another program', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'com.docker.compose.project': 'shop' } } }), `volume ${PROJECT}_pgdata of the Docker Compose project shop`, 'computer'],
   // Account separation, the GitHub token, the owner account, and items whose class is not clear.
-  ['the image of another environment', input(service('db', { image: 'devenv-11111111:3' })), 'service db: image devenv-11111111:3 of another environment', 'protected'],
   ['a volume of another environment by its project name', input((m) => (m.volumes = { pgdata: { name: 'devenv-11111111_pgdata' } })), 'volume devenv-11111111_pgdata of another environment', 'protected'],
   ['a volume of another environment by its labels', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'nimblescape.devenv.environment-id': 'other' } } }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['a volume of an environment of another account', input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`] }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
@@ -138,14 +138,12 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // Dockerfile refusals removed (user decision 2026-09-27): changed row, only the Dockerfile of the dev service must be
   // read (the build writes its text); before, any local build whose Dockerfile could not be read was refused.
   ['a dev service whose Dockerfile could not be read', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: {} }), `service app: Dockerfile ${REPO}/Dockerfile (it could not be read, and the dev service is built from the text that Dev Environments read)`, 'unsupported'],
-  // Review round 1, S4: images of other environments, however they are written, and image IDs.
-  ['the image of another environment with index.docker.io', input(service('db', { image: 'index.docker.io/library/devenv-11111111:3' })), 'service db: image index.docker.io/library/devenv-11111111:3 of another environment', 'protected'],
-  ['the image of another environment with registry-1.docker.io', input(service('db', { image: 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64) })), `service db: image registry-1.docker.io/devenv-11111111-db@sha256:${'a'.repeat(64)} of another environment`, 'protected'],
+  // Review round 1, S4: image IDs. (User decision 2026-09-28: the rows of the images named `devenv-…` are allowed now,
+  // below.)
   ['an image ID', input(service('db', { image: `sha256:${'b'.repeat(64)}` })), `service db: image sha256:${'b'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
   // Review round 2 (S2-05): changed row, a short prefix of an ID may be a name (the pipeline asks Docker); 64 hexadecimal
   // characters are an ID by their form.
   ['a long image ID', input(service('db', { image: 'b'.repeat(64) })), `service db: image ${'b'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
-  ['an additional context of the image of another environment', input(service('db', { build: { context: REPO, additional_contexts: { base: 'docker-image://devenv-11111111:2' } } })), 'service db: build additional_contexts base image devenv-11111111:2 of another environment', 'protected'],
   // Review round 2 (S2-03): the files and folders that the build client reads in the workspace helper.
   ['an additional context in the cache volume', input(service('db', { build: { context: REPO, additional_contexts: { x: '/devenv-cache' } } })), 'service db: build additional_contexts x=/devenv-cache', 'protected'],
   ['an additional context that links to the folder with the token', input(service('db', { build: { context: REPO, additional_contexts: { x: `${REPO}/ctx` } } }), { realPaths: { [`${REPO}/ctx`]: '/workspaces/.devenv+' } }), `service db: build additional_contexts x=${REPO}/ctx (a link to /workspaces/.devenv+, outside of the repository)`, 'protected'],
@@ -246,6 +244,25 @@ describe('the Dockerfiles of the services are not checked', () => {
     expect(composeAccessClassification(checked)).toEqual([]);
     expect(composeAccessReport(checked)).toEqual(ALLOWED);
     expect(composeAccessReport(checked, false)).toEqual(ALLOWED);
+  });
+});
+
+// User decision 2026-09-28: the former rows of the images named `devenv-…` (each refused as protected `… of another
+// environment`); now allowed by the policy, with the checks on and off, and still asked about (composeImageReferences):
+// the pipeline refuses a reference whose image is an image of the environments of another account by its ID
+// (otherAccountImageItems).
+describe('images named devenv-… are not refused by their name', () => {
+  const ALLOWED = { hostAccess: [], unsupported: [] };
+  it.each<[string, ComposeAccessInput, string]>([
+    ['devenv-11111111:3', input(service('db', { image: 'devenv-11111111:3' })), 'devenv-11111111:3'],
+    ['index.docker.io/library/devenv-11111111:3', input(service('db', { image: 'index.docker.io/library/devenv-11111111:3' })), 'index.docker.io/library/devenv-11111111:3'],
+    ['registry-1.docker.io/devenv-11111111-db@sha256:…', input(service('db', { image: 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64) })), 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64)],
+    ['an additional context docker-image://devenv-11111111:2', input(service('db', { build: { context: REPO, additional_contexts: { base: 'docker-image://devenv-11111111:2' } } })), 'devenv-11111111:2'],
+  ])('allows %s', (_name, checked, reference) => {
+    expect(composeAccessClassification(checked)).toEqual([]);
+    expect(composeAccessReport(checked)).toEqual(ALLOWED);
+    expect(composeAccessReport(checked, false)).toEqual(ALLOWED);
+    expect(composeImageReferences(checked.model).map((entry) => entry.reference)).toContain(reference);
   });
 });
 

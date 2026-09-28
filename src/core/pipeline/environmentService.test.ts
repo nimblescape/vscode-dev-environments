@@ -2800,9 +2800,20 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('refuses the image of another environment, also with the registry of Docker Hub, and allows FROM it (S4)', async () => {
+  it('refuses the image of an environment of another account, also with the registry of Docker Hub, and allows FROM it (S4)', async () => {
+    // User decision 2026-09-28: changed setup and item (it was refused by the name devenv-…, as `image
+    // docker.io/library/devenv-7c1d2e3f:2 of another environment`): the image of an environment of another account, by
+    // its ID.
+    const theirs = environmentImageName(OTHER_ID, 2);
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false, record: { environmentImage: theirs, buildNumber: 2 } });
+    h.docker.images.add('docker.io/library/devenv-7c1d2e3f:2');
+    h.docker.imageIds.set(theirs, `sha256:${'e'.repeat(64)}`);
+    h.docker.imageIds.set('docker.io/library/devenv-7c1d2e3f:2', `sha256:${'e'.repeat(64)}`);
+    h.docker.imageRepoNames.set('docker.io/library/devenv-7c1d2e3f:2', { repoTags: [theirs], repoDigests: [] });
     h.helper.config = { image: 'docker.io/library/devenv-7c1d2e3f:2' };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 of another environment'));
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(
+      Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 (an image of an environment of another GitHub account)'),
+    );
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
     h.helper.files[DEFAULT_CONFIG_PATH] = {
       configText: '{ "build": { "dockerfile": "Dockerfile" } }',

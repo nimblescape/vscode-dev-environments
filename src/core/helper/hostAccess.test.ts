@@ -30,7 +30,14 @@ import {
   hostAccessProblems,
   hostAccessReport,
   imageLabelItems,
+  environmentImageIds,
+  environmentImageShortId,
+  imageNamedBy,
+  isOtherEnvironmentImageName,
   imageReferenceFinding,
+  otherAccountImageItems,
+  unknownEnvironmentShortIds,
+  volumeOwners,
   resolveNetworkReference,
   resolvedByImageId,
   imageIdResolvedReferences,
@@ -1138,8 +1145,11 @@ describe('imageReferenceFinding and localImageRepository', () => {
   });
 
   it.each([
-    ['devenv-11111111:2', { item: 'image devenv-11111111:2 of another environment', class: 'protected' }],
-    ['Docker.io/Library/devenv-1', { item: 'image Docker.io/Library/devenv-1 of another environment', class: 'protected' }],
+    // User decision 2026-09-28: changed expectation (it was protected, `… of another environment`), a name is not
+    // refused by its form; the pipeline refuses an image of the environments of another account by its ID
+    // (otherAccountImageItems).
+    ['devenv-11111111:2', undefined],
+    ['Docker.io/Library/devenv-1', undefined],
     [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
     ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
     // Review round 2 (S2-05): changed expectation, 12 hexadecimal characters may be a name; the pipeline asks Docker
@@ -1149,6 +1159,105 @@ describe('imageReferenceFinding and localImageRepository', () => {
     ['postgres:16', undefined],
   ])('%s', (reference, expected) => {
     expect(imageReferenceFinding(reference)).toEqual(expected);
+  });
+});
+
+describe('otherAccountImageItems (user decision 2026-09-28)', () => {
+  const THEIRS = { id: `sha256:${'a'.repeat(64)}`, repoTags: ['devenv-11111111:2'], repoDigests: [] };
+  const COPY = { id: THEIRS.id, repoTags: ['mine:1'], repoDigests: [] };
+  const OURS = { id: `sha256:${'b'.repeat(64)}`, repoTags: ['devenv-22222222:1'], repoDigests: [] };
+  const named = (reference: string, what = 'image') => [{ reference, what }];
+
+  it('gives the image of a reference by its name, also written with the registry of Docker Hub, never by an ID prefix', () => {
+    expect(imageNamedBy('devenv-11111111:2', [OURS, THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy('docker.io/library/devenv-11111111:2', [THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy('aaaaaaaa', [THEIRS])).toBeUndefined();
+    expect(imageNamedBy('Not A Reference', [THEIRS])).toBeUndefined();
+  });
+
+  it.each([
+    ['devenv-1a2b3c4d:2', '1a2b3c4d'],
+    ['devenv-1a2b3c4d-db:latest', '1a2b3c4d'],
+    ['docker.io/library/devenv-1a2b3c4d:2', '1a2b3c4d'],
+    ['index.docker.io/devenv-1a2b3c4d-app', '1a2b3c4d'],
+    ['devenv-tools:1', undefined],
+    ['devenv-1a2b3c4:1', undefined],
+    ['ghcr.io/acme/devenv-1a2b3c4d:1', undefined],
+    ['postgres:16', undefined],
+  ])('gives the short ID of the environment of %s: %s', (reference, expected) => {
+    expect(environmentImageShortId(reference)).toBe(expected);
+  });
+
+  it('splits the images of the environments by the owner of their short ID; an unknown owner counts as another account', () => {
+    const images = [
+      { id: 'sha256:A', tags: ['devenv-11111111:2', 'devenv-11111111:3'] },
+      { id: 'sha256:B', tags: ['devenv-22222222-db:latest'] },
+      { id: 'sha256:C', tags: ['devenv-33333333:1'] },
+      { id: 'sha256:D', tags: ['devenv-tools:1'] },
+    ];
+    const owners = new Map([
+      ['11111111', '2002'],
+      ['22222222', '1001'],
+    ]);
+    expect(environmentImageIds(images, owners, '1001')).toEqual({
+      own: new Set(['sha256:b']),
+      others: new Set(['sha256:a', 'sha256:c']),
+      ownShortIds: new Set(['22222222']),
+    });
+    expect(unknownEnvironmentShortIds(images, owners)).toEqual(['33333333']);
+    // Only of the images that the references found.
+    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:a']))).toEqual([]);
+    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:c']))).toEqual(['33333333']);
+  });
+
+  it('refuses a name of an environment image without a local image unless the environment is the account\'s (review round 3, S1)', () => {
+    const ids = { own: new Set<string>(), others: new Set<string>(), ownShortIds: new Set(['22222222']) };
+    expect(isOtherEnvironmentImageName('devenv-11111111:4', ids)).toBe(true);
+    expect(isOtherEnvironmentImageName('docker.io/library/devenv-11111111-db', ids)).toBe(true);
+    expect(isOtherEnvironmentImageName('devenv-22222222:4', ids)).toBe(false);
+    expect(isOtherEnvironmentImageName('devenv-tools:1', ids)).toBe(false);
+    const missing = new Set(['devenv-11111111:4', 'devenv-22222222:4']);
+    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, missing)).toEqual(['image devenv-11111111:4 (an image of an environment of another GitHub account)']);
+    expect(otherAccountImageItems(named('devenv-22222222:4'), [], ids, missing)).toEqual([]);
+    // Review round 5 (U1): a reference that Docker could not inspect (not in `missing`) is not decided by its name.
+    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, new Set())).toEqual([]);
+    expect(environmentImageIds([], new Map([['22222222', '1001'], ['11111111', '2002']]), '1001').ownShortIds).toEqual(new Set(['22222222']));
+  });
+
+  it('names the owner of each environment by the labels of its volumes, none when they differ', () => {
+    const volume = (id: string, owner?: string) => ({ labels: { 'nimblescape.devenv.environment-id': id, ...(owner ? { 'nimblescape.devenv.owner-id': owner } : {}) } });
+    expect(
+      volumeOwners([
+        volume('11111111-0000-4000-8000-000000000001', '1001'),
+        volume('11111111-0000-4000-8000-000000000001', '1001'),
+        volume('22222222-0000-4000-8000-000000000002', '1001'),
+        volume('22222222-0000-4000-8000-000000000002', '2002'),
+        volume('22222222-0000-4000-8000-000000000002', '1001'),
+        volume('33333333-0000-4000-8000-000000000003'),
+        { labels: {} },
+      ]),
+    ).toEqual(new Map([['11111111', '1001']]));
+  });
+
+  it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
+    ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
+    ['an image of another account that is also the account\'s own (the same build)', [THEIRS], { own: [THEIRS.id], others: [THEIRS.id] }, []],
+    // Review round 3 (S1): changed data (the image of the account is named by the reference; before, the reference named
+    // no image of the list, so the row did not test the image of the account).
+    ['an image of the account', [{ ...OURS, repoTags: ['devenv-11111111:2'] }], { own: [OURS.id], others: [THEIRS.id] }, []],
+    ['no image of an environment', [{ id: 'sha256:c', repoTags: ['devenv-11111111:2'], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
+    // Review round 3 (S1): changed expectation (it was allowed), the name of an image of an environment of no known
+    // owner that is not there is refused by its name (isOtherEnvironmentImageName).
+    ['a missing image', [], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
+  ])('%s', (_name, images, ids, expected) => {
+    const missing = new Set(images.length === 0 ? ['devenv-11111111:2'] : []);
+    expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) }, missing)).toEqual(expected);
+  });
+
+  it('refuses a copy under another name by its ID, with the name of the setting', () => {
+    expect(otherAccountImageItems(named('mine:1', 'service db: image'), [COPY], { own: new Set(), others: new Set([THEIRS.id]) }, new Set())).toEqual([
+      'service db: image mine:1 (an image of an environment of another GitHub account)',
+    ]);
   });
 });
 
