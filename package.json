@@ -282,6 +282,11 @@
         "icon": "$(vm-active)"
       },
       {
+        "command": "devEnvironments.askAgainDockerHost",
+        "title": "Ask Again Before Changing the Docker Host",
+        "category": "Dev Environments"
+      },
+      {
         "command": "devEnvironments.rowActivated",
         "title": "Start on Double-Click",
         "category": "Dev Environments"

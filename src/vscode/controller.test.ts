@@ -614,7 +614,8 @@ describe('Controller commands', () => {
     // 31 with the command of a repository row (hidden): a double-click runs Start (user request 2026-09-27).
     // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
     // 33 with the choice of the Docker host, the title-bar icon of the view on a remote host (user request 2026-09-28).
-    expect(declared).toHaveLength(33);
+    // 34 with Ask Again Before Changing the Docker Host (user decision 2026-09-28: "Don't Ask Again" for all questions).
+    expect(declared).toHaveLength(34);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -3266,6 +3267,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     useRemoteHost: ReturnType<typeof vi.fn>;
     useLocalDocker: ReturnType<typeof vi.fn>;
     chooseDockerHost: ReturnType<typeof vi.fn>;
+    askAgain: ReturnType<typeof vi.fn>;
     offerSwitchBack: ReturnType<typeof vi.fn>;
   };
 
@@ -3280,6 +3282,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       useRemoteHost: vi.fn(async () => {}),
       useLocalDocker: vi.fn(async () => {}),
       chooseDockerHost: vi.fn(async () => {}),
+      askAgain: vi.fn(async () => {}),
       offerSwitchBack: vi.fn(async () => false),
     };
     const dockerTargets = {
@@ -3329,6 +3332,9 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
   it('runs the choice of the Docker host without an operation, and shows one of the two icons in the title bar', async () => {
     await run('chooseDockerHost');
     expect(remote.chooseDockerHost).toHaveBeenCalledTimes(1);
+    // User decision 2026-09-28: Ask Again Before Changing the Docker Host, also without an operation.
+    await run('askAgainDockerHost');
+    expect(remote.askAgain).toHaveBeenCalledTimes(1);
     expect(operations).toEqual([]);
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
       contributes: {
