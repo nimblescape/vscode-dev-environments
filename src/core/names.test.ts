@@ -4,7 +4,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { EXTENSION_LABEL_KEYS, LABEL_PREFIX } from './names';
 
@@ -26,23 +25,25 @@ function codeFiles(tests: boolean): string[] {
 }
 
 /**
- * The label keys with the prefix `prefix` in the string and template literals of `files` (not in comments), with the
- * file. A key that the code builds (`'devenv.' + name`, `devenv.${name}`) is the prefix alone.
+ * `source` without its comments: block comments, and line comments that start at the beginning of a line or after white
+ * space (so `https://…` in a string stays). TypeScript 7 has no compiler API in its npm package, so the files are not
+ * parsed; label keys contain dots and hyphens and never occur as identifiers, so the rest of the text is searched.
+ */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+}
+
+/**
+ * The label keys with the prefix `prefix` in the code of `files` (not in comments), with the file. A key that the code
+ * builds (`'devenv.' + name`, `devenv.${name}`) is the prefix alone.
  */
 function labelKeysInCode(files: readonly string[], prefix: string): Array<{ key: string; file: string }> {
   const pattern = new RegExp(`(?<![\\w.-])${prefix.replace(/[.-]/g, '\\$&')}([a-z0-9._-]*)`, 'gi');
   const found: Array<{ key: string; file: string }> = [];
   for (const file of files) {
-    const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, false);
-    const visit = (node: ts.Node) => {
-      if (ts.isStringLiteralLike(node) || ts.isTemplateLiteralToken(node)) {
-        for (const match of node.text.matchAll(pattern)) {
-          found.push({ key: `${prefix}${match[1].replace(/\.+$/, '')}`, file: path.relative(ROOT, file) });
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(source);
+    for (const match of withoutComments(fs.readFileSync(file, 'utf8')).matchAll(pattern)) {
+      found.push({ key: `${prefix}${match[1].replace(/\.+$/, '')}`, file: path.relative(ROOT, file) });
+    }
   }
   return found;
 }
