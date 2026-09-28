@@ -1216,8 +1216,11 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     expect(isOtherEnvironmentImageName('docker.io/library/devenv-11111111-db', ids)).toBe(true);
     expect(isOtherEnvironmentImageName('devenv-22222222:4', ids)).toBe(false);
     expect(isOtherEnvironmentImageName('devenv-tools:1', ids)).toBe(false);
-    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids)).toEqual(['image devenv-11111111:4 (an image of an environment of another GitHub account)']);
-    expect(otherAccountImageItems(named('devenv-22222222:4'), [], ids)).toEqual([]);
+    const missing = new Set(['devenv-11111111:4', 'devenv-22222222:4']);
+    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, missing)).toEqual(['image devenv-11111111:4 (an image of an environment of another GitHub account)']);
+    expect(otherAccountImageItems(named('devenv-22222222:4'), [], ids, missing)).toEqual([]);
+    // Review round 5 (U1): a reference that Docker could not inspect (not in `missing`) is not decided by its name.
+    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, new Set())).toEqual([]);
     expect(environmentImageIds([], new Map([['22222222', '1001'], ['11111111', '2002']]), '1001').ownShortIds).toEqual(new Set(['22222222']));
   });
 
@@ -1247,11 +1250,12 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     // owner that is not there is refused by its name (isOtherEnvironmentImageName).
     ['a missing image', [], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
   ])('%s', (_name, images, ids, expected) => {
-    expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) })).toEqual(expected);
+    const missing = new Set(images.length === 0 ? ['devenv-11111111:2'] : []);
+    expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) }, missing)).toEqual(expected);
   });
 
   it('refuses a copy under another name by its ID, with the name of the setting', () => {
-    expect(otherAccountImageItems(named('mine:1', 'service db: image'), [COPY], { own: new Set(), others: new Set([THEIRS.id]) })).toEqual([
+    expect(otherAccountImageItems(named('mine:1', 'service db: image'), [COPY], { own: new Set(), others: new Set([THEIRS.id]) }, new Set())).toEqual([
       'service db: image mine:1 (an image of an environment of another GitHub account)',
     ]);
   });

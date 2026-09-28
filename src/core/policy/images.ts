@@ -370,8 +370,8 @@ export function otherAccountImageItem(reference: string, what = 'image'): string
  * The items (otherAccountImageItem) of the references `named` whose image, as Docker gives it by the name
  * (imageNamedBy, of the images that one `docker image inspect` found), is an image of an environment of another account
  * or of no known owner (`ids.others`) and of none of the account of the checked environment (`ids.own`), user decision
- * 2026-09-28; a reference that names no local image (with `missing`, only one that Docker answered for: review round 4,
- * T1), by its name (isOtherEnvironmentImageName). The image ID says
+ * 2026-09-28; a reference that names no local image and that Docker found missing (`missing`; not one that it could not
+ * inspect: review round 4, T1), by its name (isOtherEnvironmentImageName). The image ID says
  * what the image holds, not whose it is: two environments with the same configuration can
  * build the same image (the same ID), and an image with the ID of an image of the account's own environments holds
  * nothing that the account could not build itself. Not recognized: a copy of such an image with other labels or layers
@@ -382,12 +382,12 @@ export function otherAccountImageItems(
   named: readonly NamedImageReference[],
   images: readonly InspectedImage[],
   ids: EnvironmentImageIds,
-  missing?: ReadonlySet<string>,
+  missing: ReadonlySet<string>,
 ): string[] {
   const items: string[] = [];
   for (const entry of named) {
     const id = imageNamedBy(entry.reference, images)?.id.toLowerCase();
-    const byName = (missing === undefined || missing.has(entry.reference)) && isOtherEnvironmentImageName(entry.reference, ids);
+    const byName = missing.has(entry.reference) && isOtherEnvironmentImageName(entry.reference, ids);
     if (id !== undefined ? ids.others.has(id) && !ids.own.has(id) : byName) {
       items.push(otherAccountImageItem(entry.reference, entry.what));
     }
