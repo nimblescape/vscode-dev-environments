@@ -53,6 +53,16 @@ describe('DockerHostIndicator', () => {
     expect(setContextCalls().map((call) => call[2])).toEqual([true, true, false]);
   });
 
+  // User report 2026-09-28: the first row of the list names the remote host (the merged header did not show it).
+  it('gives the list the remote host for its first row, and none for the local Docker', () => {
+    const rows: Array<string | undefined> = [];
+    const indicator = new DockerHostIndicator({}, silentLogger, (host) => rows.push(host));
+    indicator.update(dockerTargetOf('ssh://htldvmhn', 'devenv-remote-2e9f507b'));
+    indicator.update(dockerTargetOf('ssh://machines', 'devenv-remote-5709ff28'));
+    indicator.update(LOCAL_DOCKER_TARGET);
+    expect(rows).toEqual(['htldvmhn', 'machines', undefined]);
+  });
+
   it('uses the view name of package.json as the title on the local Docker', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
       contributes: { views: { devEnvironments: Array<{ id: string; name: string }> } };

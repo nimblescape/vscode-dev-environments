@@ -13,7 +13,7 @@ import type { Environment, RepositoryInfo } from '../core/types';
 import { resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
 import { parseRepositoryGroups } from './repositoryGroups';
 import { buildTreeModel, type GroupNode, type HintRow, type OwnerGroup, type RepositoryRow } from './treeModel';
-import { RepositoriesTreeProvider, type TreeNode } from './treeView';
+import { DOCKER_HOST_ROW_ID, DockerHostRowTexts, RepositoriesTreeProvider, type TreeNode } from './treeView';
 
 function repo(nameWithOwner: string): RepositoryInfo {
   const [owner, name] = nameWithOwner.split('/');
@@ -138,6 +138,37 @@ describe('RepositoriesTreeProvider', () => {
     expect(rest).toEqual(groups);
     provider.setModel(groups, { signedIn: true });
     expect(provider.getChildren()).toEqual(groups);
+    provider.dispose();
+  });
+
+  // User report 2026-09-28 ("remote connection is not shown anymore"): the list names the remote Docker host.
+  it('shows the remote Docker host as the first row above a list, never in an empty view, and not for the local Docker', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    let changes = 0;
+    provider.onDidChangeTreeData(() => changes++);
+    provider.setDockerHost('htldvmhn');
+    provider.setModel([], { signedIn: true });
+    expect(provider.getChildren()).toEqual([]);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false });
+    const [host, signIn, ...rest] = provider.getChildren();
+    expect(host).toEqual({ kind: 'dockerHost', id: DOCKER_HOST_ROW_ID, host: 'htldvmhn' });
+    expect(signIn).toMatchObject({ kind: 'signIn' });
+    expect(rest).toEqual(groups);
+    const item = provider.getTreeItem(host) as unknown as TreeItem;
+    expect(item.label).toBe(DockerHostRowTexts.label('htldvmhn'));
+    expect(item.label).toBe('Remote Docker host: htldvmhn');
+    expect((item.iconPath as ThemeIcon).id).toBe('remote');
+    expect(item.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
+    expect(item.contextValue).toBe('dockerHost');
+    expect(provider.getParent(host)).toBeUndefined();
+    expect(provider.getChildren(host)).toEqual([]);
+    const before = changes;
+    provider.setDockerHost('htldvmhn');
+    expect(changes).toBe(before);
+    provider.setDockerHost(undefined);
+    expect(changes).toBe(before + 1);
+    expect(provider.getChildren()[0]).toMatchObject({ kind: 'signIn' });
     provider.dispose();
   });
 

@@ -38,6 +38,8 @@ export class DockerHostIndicator {
   constructor(
     private readonly view: DescribedView,
     private readonly logger: Logger,
+    /** User report 2026-09-28: the first row of the list names the remote host (treeView.ts, DockerHostRow). */
+    private readonly showHostRow: (host: string | undefined) => void = () => {},
   ) {}
 
   /** Shows `target`: the host of a remote target, nothing for the local Docker (or an endpoint that is not supported). */
@@ -48,6 +50,7 @@ export class DockerHostIndicator {
     this.shown = { remote, description };
     this.view.description = description;
     this.view.title = remote ? DockerHostTexts.remoteTitle(target.host) : DockerHostTexts.localTitle;
+    this.showHostRow(remote ? target.host : undefined);
     vscode.commands.executeCommand('setContext', REMOTE_DOCKER_HOST_CONTEXT_KEY, remote).then(undefined, (error: unknown) => {
       this.logger.warn(`The context key ${REMOTE_DOCKER_HOST_CONTEXT_KEY} could not be set: ${errorMessage(error)}`);
     });
