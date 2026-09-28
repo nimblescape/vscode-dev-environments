@@ -28,6 +28,7 @@ import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
 import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
+import { DOUBLE_CLICK_INTERVAL_MS, type ListOpenMode } from './rowActivation';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
 import { contextValue as treeContextValue, rowActions } from './treeModel';
@@ -258,6 +259,8 @@ interface Harness {
   settings: ExtensionSettings;
   /** The clock of the controller, the registry and the session files; a test may replace `now`. */
   clock: { now: () => number };
+  /** The VS Code setting workbench.list.openMode (double-click on a row); a test may change it. */
+  listOpenMode: { value: ListOpenMode };
 }
 
 function createHarness(
@@ -272,6 +275,7 @@ function createHarness(
     remoteMonitor?: ControllerDeps['remoteMonitor'];
   } = {},
 ): Harness {
+  const listOpenMode: Harness['listOpenMode'] = { value: 'singleClick' };
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const clock = { now: () => NOW };
   const paths = new StoragePaths(root);
@@ -387,6 +391,7 @@ function createHarness(
     dockerTargets: options.dockerTargets,
     remoteDocker: options.remoteDocker,
     remoteMonitor: options.remoteMonitor,
+    listOpenMode: () => listOpenMode.value,
     clock,
     isAlive: (pid: number) => alive.has(pid),
     timing: {
@@ -445,6 +450,7 @@ function createHarness(
     alive,
     settings,
     clock,
+    listOpenMode,
   };
 }
 
@@ -574,7 +580,8 @@ describe('Controller commands', () => {
     // 27 with Show Docker Setup (hidden), the action Install Docker… of an error: it looks for the CLI, then shows the view.
     // 29 since unit 7: Use a Remote Docker Host… and Use the Local Docker.
     // 30 since unit 7, PR 2: Close and Keep Running.
-    expect(declared).toHaveLength(30);
+    // 31 with the command of a repository row (hidden): a double-click runs Start (user request 2026-09-27).
+    expect(declared).toHaveLength(31);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -3379,5 +3386,122 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     expect(matches(treeContextValue(rowActions('connected', undefined), 'on', false, true))).toBe(true);
     expect(matches(treeContextValue(rowActions('connected', undefined), 'on', true, true))).toBe(true);
     expect(matches(treeContextValue(rowActions('running', undefined), 'on', false))).toBe(false);
+  });
+});
+
+describe('Double-click on a repository row (user request 2026-09-27)', () => {
+  /** A row as the view gives it to its command: with the actions of its state. */
+  function viewRow(repository: string, env: Environment | undefined, state?: Parameters<typeof rowActions>[0]): unknown {
+    return { ...(row(repository, env) as object), actions: rowActions(state, undefined) };
+  }
+
+  /** One click at `at` milliseconds after NOW. */
+  async function click(argument: unknown, at: number): Promise<void> {
+    h.clock.now = () => NOW + at;
+    await run('rowActivated', argument);
+  }
+
+  it('is hidden in the Command Palette', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { commands: Array<{ command: string }>; menus: Record<string, Array<{ command?: string; when?: string }>> };
+    };
+    expect(manifest.contributes.commands.some((entry) => entry.command === Commands.rowActivated)).toBe(true);
+    const entries = manifest.contributes.menus.commandPalette.filter((item) => item.command === Commands.rowActivated);
+    expect(entries.map((item) => item.when)).toEqual(['false']);
+    // Only the row itself runs it: no menu offers it.
+    for (const [menu, items] of Object.entries(manifest.contributes.menus)) {
+      if (menu !== 'commandPalette') expect(items.some((item) => item.command === Commands.rowActivated)).toBe(false);
+    }
+  });
+
+  it('only selects the row on a single click', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    await h.registry.add(environment());
+    await click(viewRow('acme/api', environment(), 'stopped'), 0);
+    expect(start).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.quickPicks).toEqual([]);
+  });
+
+  it('runs Start with the row on two clicks of the same row within the interval', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    await h.registry.add(environment());
+    const argument = viewRow('acme/api', environment(), 'stopped');
+    await click(argument, 0);
+    await click(argument, DOUBLE_CLICK_INTERVAL_MS);
+    expect(start).toHaveBeenCalledTimes(1);
+    // The same argument as the Start button of the row.
+    expect(start).toHaveBeenCalledWith({ kind: 'row', repository: 'acme/api', info: undefined, environmentId: ENV_ID });
+    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
+  });
+
+  it('starts nothing on two clicks of different rows', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    await click(viewRow('acme/api', undefined), 0);
+    await click(viewRow('acme/web', undefined), 100);
+    await click(viewRow('acme/api', undefined), 200);
+    expect(start).not.toHaveBeenCalled();
+    expect(h.service.open).not.toHaveBeenCalled();
+  });
+
+  it('starts nothing on clicks slower than the interval', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    const argument = viewRow('acme/api', undefined);
+    await click(argument, 0);
+    await click(argument, DOUBLE_CLICK_INTERVAL_MS + 1);
+    await click(argument, 2 * DOUBLE_CLICK_INTERVAL_MS + 2);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('starts once on a triple click', async () => {
+    const start = vi.spyOn(h.controller, 'start').mockResolvedValue(undefined);
+    const argument = viewRow('acme/api', undefined);
+    await click(argument, 0);
+    await click(argument, 150);
+    await click(argument, 300);
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs Start on the first activation when workbench.list.openMode is doubleClick', async () => {
+    h.listOpenMode.value = 'doubleClick';
+    const start = vi.spyOn(h.controller, 'start').mockResolvedValue(undefined);
+    await click(viewRow('acme/api', undefined), 0);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledWith({ kind: 'row', repository: 'acme/api', info: undefined, environmentId: undefined });
+    // VS Code sends each double-click once: the next one starts again (Start's own rules decide).
+    await click(viewRow('acme/api', undefined), 100);
+    expect(start).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts nothing in the row of the environment of this window', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await click(viewRow('acme/api', env, 'connected'), 0);
+    await click(viewRow('acme/api', env, 'connected'), 100);
+    // Also a row from before the connection, which still shows Start.
+    await click(viewRow('acme/api', env, 'stopped'), 1000);
+    await click(viewRow('acme/api', env, 'stopped'), 1100);
+    expect(start).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('starts nothing where the row shows no Start (updating)', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    await click(viewRow('acme/api', environment(), 'updating'), 0);
+    await click(viewRow('acme/api', environment(), 'updating'), 100);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('ignores an argument that is no repository row', async () => {
+    const start = vi.spyOn(h.controller, 'start');
+    for (const argument of [undefined, { kind: 'owner', id: 'owner:acme' }, { kind: 'hint', id: 'hint:acme' }, { environmentId: ENV_ID }]) {
+      await click(argument, 0);
+      await click(argument, 100);
+    }
+    expect(start).not.toHaveBeenCalled();
   });
 });
