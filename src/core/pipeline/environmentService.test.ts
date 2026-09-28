@@ -306,6 +306,21 @@ describe('open: first open', () => {
     expect([...h.docker.images].filter((image) => image.startsWith('devenv-'))).toEqual([]);
   });
 
+  // User decision 2026-09-28: the container is made only from an image that the engine has after the build.
+  it('reports a build that ended without its image as buildFailed and starts no container', async () => {
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      h.docker.images.delete(p.imageName); // the connection to a remote engine broke at the end of the build
+      return result;
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.containers.size).toBe(0);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
   it('removes the container when up fails on a first open', async () => {
     h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'port is already allocated');
     const error = await rejection(h.service.open(TARGET, options()));
@@ -752,6 +767,24 @@ describe('open: existing environment', () => {
     const env = await entry();
     expect(env?.buildRecord).toMatchObject({ environmentImage: IMAGE_1, images: { [BASE_IMAGE]: DIGEST_OLD } });
     expect(env?.busy).toBeUndefined();
+    expect(h.docker.images.has(IMAGE_1)).toBe(true);
+  });
+
+  // Review round 1 (F6): when the check of the built image fails, the update falls back and removes that image.
+  it('keeps the old container and removes the new image when its check after the build fails', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    const imageExists = h.docker.imageExists.bind(h.docker);
+    h.docker.imageExists = async (reference: string) => {
+      if (reference === h.helper.builds[0]?.imageName) throw new Error('Cannot connect to the Docker daemon');
+      return imageExists(reference);
+    };
+    await h.service.open(TARGET, options());
+    const built = h.helper.builds[0]?.imageName;
+    expect(built).toBeDefined();
+    expect(built).not.toBe(IMAGE_1);
+    expect(h.ui.warnings).toEqual([Messages.buildFailed]);
+    expect(h.helper.ups).toEqual([expect.objectContaining({ image: IMAGE_1, removeExistingContainer: false })]);
+    expect(h.docker.images.has(built!)).toBe(false);
     expect(h.docker.images.has(IMAGE_1)).toBe(true);
   });
 

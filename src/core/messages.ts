@@ -280,6 +280,18 @@ export const Messages = {
   /** Unit 7: the current Docker context points to another computer without SSH (for example `tcp://`). */
   dockerEndpointUnsupported: (endpoint: string) =>
     `Docker is set to ${endpoint}. Dev Environments uses Docker on another computer only over SSH. Choose "Dev Environments: Use a Remote Docker Host…" or "Dev Environments: Use the Local Docker".`,
+  /**
+   * User decision 2026-09-28: the window is not connected, because the container did not answer as running on the Docker
+   * host that the window uses (checked right before the window connects).
+   */
+  containerNotReady: (repository: string, container: string) =>
+    `The container ${container} of ${repository} does not run. Its state is in the details; start ${repository} again when the cause is fixed.`,
+  /**
+   * User decision 2026-09-28, review round 3 (H2): the pipeline ran, but the current Docker context changed to another
+   * host meanwhile, so the window does not connect. The container stays on its host.
+   */
+  otherDockerHostAfterStart: (repository: string, environmentHost: string, currentHost: string) =>
+    `The environment of ${repository} runs on ${describeHost(environmentHost)}, but Docker is now set to ${describeHost(currentHost)}, so this window does not connect to it. Choose "Dev Environments: Use a Remote Docker Host…" or "Dev Environments: Use the Local Docker" for ${describeHost(environmentHost)}, then start ${repository} again.`,
   /** Unit 7: an environment of another Docker host is never acted on. */
   otherDockerHost: (repository: string, environmentHost: string, currentHost: string) =>
     `The environment of ${repository} is on ${describeHost(environmentHost)}, but Docker is set to ${describeHost(currentHost)}. Nothing was changed.`,

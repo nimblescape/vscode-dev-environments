@@ -7,8 +7,9 @@
 // Session Coordinator, and the Connection Adapter.
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
+import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
-import type { DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
@@ -162,8 +163,16 @@ export interface ControllerDeps {
     reopenCheckDelayMs?: number;
     disconnectAnswerMs?: number;
     busyPollMs?: number;
+    /** User decision 2026-09-28: the pause between the checks of the container before the window connects. */
+    readyPollMs?: number;
   };
 }
+
+/** User decision 2026-09-28: the checks of the container before the window connects (readyForWindow). */
+const READY_CHECKS = 5;
+const READY_POLL_MS = 1_000;
+/** Review round 1 (F3): the longest wait for the log lines of the attach before the window connects. */
+const ATTACH_DIAGNOSTICS_WAIT_MS = 3_000;
 
 /** What a command works on. */
 interface Target {
@@ -1255,6 +1264,15 @@ export class Controller implements vscode.Disposable {
    * `pipelineJustRan`), and removes it. This window keeps its own environment, status file, and reopen record.
    */
   private async connect(result: OpenResult, progress: ProgressReporter, request: ConnectRequest, signal: AbortSignal): Promise<void> {
+    progress.step('connecting');
+    // User decision 2026-09-28: the checks of the container come first, so Cancel, a newer request, and an account
+    // change during them still keep the window as it is (review round 1, F1). The log lines of the attach run meanwhile.
+    const diagnostics = this.logAttachDiagnostics(result.containerName);
+    const notReady = await this.readyForWindow(result.environment, result.containerName, signal);
+    const waited = new AbortController();
+    // Review round 2 (G2): Cancel also ends this wait.
+    await Promise.race([diagnostics, this.delay(ATTACH_DIAGNOSTICS_WAIT_MS, AbortSignal.any([waited.signal, signal]))]);
+    waited.abort();
     if (!request.newWindow && [...this.activeConnectRequests].some((other) => other > request.number)) {
       this.logger.info(`${result.environment.repository} is not connected: another environment is opening in this window.`);
       return;
@@ -1282,7 +1300,13 @@ export class Controller implements vscode.Disposable {
         ? new UserFacingError('otherAccount', Messages.otherAccount(repository))
         : new UserFacingError('signInRequired', Messages.signInRequired);
     }
-    progress.step('connecting');
+    if (notReady) {
+      // Review round 1 (F2): without the pending connection file, the container stops after the waiting time as usual.
+      await this.deps.sessionFiles
+        .removePending(result.environment.id)
+        .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
+      throw notReady;
+    }
     await this.deps.coordinator.writePending(result.environment.id);
     if (request.newWindow) {
       await this.deps.connection.openInNewWindow(result.containerName, result.remoteWorkspaceFolder);
@@ -2045,6 +2069,16 @@ export class Controller implements vscode.Disposable {
     }
   }
 
+  /** The state of the container as Docker reports it, or why it could not be read. */
+  private async containerStateText(containerName: string): Promise<string> {
+    if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
+    try {
+      return String(await this.deps.docker.containerState(containerName));
+    } catch (error) {
+      return `not readable: ${errorMessage(error)}`;
+    }
+  }
+
   private async containerRuns(containerName: string): Promise<boolean> {
     if (!this.deps.docker.isInstalled()) return false;
     try {
@@ -2434,13 +2468,71 @@ export class Controller implements vscode.Disposable {
     return { windowId: this.deps.coordinator.windowId, pid: process.pid };
   }
 
-  private delay(ms: number): Promise<void> {
+  /**
+   * Logs which Docker the Dev Containers extension will ask when the window switches to `containerName` (user request
+   * 2026-09-28, attachDiagnostics.ts), with the context of the running operation (review round 1, F4). Only log lines;
+   * never rejects.
+   */
+  private async logAttachDiagnostics(containerName: string): Promise<void> {
+    try {
+      if (!this.deps.docker.isInstalled()) return;
+      const context = operationDockerTarget()?.context;
+      const lines = await attachDiagnostics(this.deps.docker, this.deps.docker.processEnv(), containerName, context);
+      for (const line of lines) this.logger.info(`Before the window connects: ${line}`);
+    } catch (error) {
+      this.logger.warn(`The Docker of the attach could not be logged: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User decision 2026-09-28: the window connects only to a container that the Docker of the window finds running. The
+   * Dev Containers extension of the window attaches through the current Docker context, and reports a container that it
+   * does not find as one that "no longer exists". So right before the window connects: the current Docker context is
+   * still on the host of the environment (another window or Docker Desktop may have changed it while the pipeline ran),
+   * and the container answers as running (a few checks, 1 s apart, for an engine that answers late). Returns the error
+   * of the refusal, or undefined when the window may connect. Stops early when `signal` aborts (the caller then reports
+   * the cancel).
+   */
+  private async readyForWindow(environment: Environment, containerName: string, signal: AbortSignal): Promise<UserFacingError | undefined> {
+    const repository = this.displayName({ repository: environment.repository });
+    const targets = this.deps.dockerTargets;
+    if (targets) {
+      // Review round 3 (H1): the current context itself, not the one this operation is pinned to (DOCKER_CONTEXT).
+      const current = await outsideOperation(() => targets.resolve());
+      if (!isOnDockerHost(environment, current.host)) {
+        const environmentHost = dockerHostOf(environment);
+        this.logger.warn(
+          `${repository} is not connected: Docker is set to ${describeDockerHost(current.host)} now, the container runs on ${describeDockerHost(environmentHost)}.`,
+        );
+        return new UserFacingError('otherDockerHost', Messages.otherDockerHostAfterStart(repository, environmentHost, current.host));
+      }
+    }
+    // Review round 3 (H3): the last state that Docker reported goes into the log (Show details).
+    let state = 'not read';
+    for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
+      if (signal.aborted) return undefined;
+      state = await this.containerStateText(containerName);
+      if (state === 'running') return undefined;
+      if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS, signal);
+    }
+    if (signal.aborted) return undefined;
+    this.logger.warn(`${repository} is not connected: the container ${containerName} does not run (state: ${state}).`);
+    return new UserFacingError('startFailed', Messages.containerNotReady(repository, containerName));
+  }
+
+  /** Waits `ms`; ends early when `signal` aborts, at once when it has aborted already (review round 2, G1). */
+  private delay(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve();
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      const done = (): void => {
+        clearTimeout(timer);
         this.timers.delete(timer);
+        signal?.removeEventListener('abort', done);
         resolve();
-      }, ms);
+      };
+      const timer = setTimeout(done, ms);
       this.timers.add(timer);
+      signal?.addEventListener('abort', done, { once: true });
     });
   }
 }
