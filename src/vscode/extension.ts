@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { dockerHostOf } from '../core/docker/dockerHost';
+import { dockerHostOf, remoteContextName } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets } from '../core/docker/dockerTargets';
 import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
@@ -430,11 +430,13 @@ async function activateExtension(
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
 
-  if (containerName && docker.isInstalled()) {
-    // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window.
-    const host = currentEnvironment ? dockerHostOf(currentEnvironment) : '';
+  if (currentEnvironment && containerName && docker.isInstalled()) {
+    // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window. Only for an
+    // environment of this extension (review round 1, F5); its context is the one of its host.
+    const host = dockerHostOf(currentEnvironment);
+    const context = host === '' ? undefined : remoteContextName(host);
     background(
-      attachDiagnostics(docker, docker.processEnv(), containerName, host).then((lines) => {
+      attachDiagnostics(docker, docker.processEnv(), containerName, context).then((lines) => {
         for (const line of lines) logger.info(`While this window connects: ${line}`);
       }),
       'log the Docker of this window',

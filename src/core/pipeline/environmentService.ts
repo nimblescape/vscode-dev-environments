@@ -2236,7 +2236,12 @@ export class EnvironmentService {
       });
       // User decision 2026-09-28: the container is made only from an image that the engine has (a build that ended
       // without its image, for example on a remote host whose connection broke at the end, is a failed build).
-      if (!(await this.deps.docker.imageExists(imageName))) throw new Error(`The environment image ${imageName} is missing after the build.`);
+      // Review round 1 (F6): when the check itself fails, the built image is removed like after any later failure.
+      const present = await this.deps.docker.imageExists(imageName).catch(async (error: unknown) => {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        throw error;
+      });
+      if (!present) throw new Error(`The environment image ${imageName} is missing after the build.`);
     } catch (error) {
       return this.updateFailed(ctx, error, canFallBack, plan.check);
     }

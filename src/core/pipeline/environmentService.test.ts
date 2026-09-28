@@ -770,6 +770,24 @@ describe('open: existing environment', () => {
     expect(h.docker.images.has(IMAGE_1)).toBe(true);
   });
 
+  // Review round 1 (F6): when the check of the built image fails, the update falls back and removes that image.
+  it('keeps the old container and removes the new image when its check after the build fails', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+    const imageExists = h.docker.imageExists.bind(h.docker);
+    h.docker.imageExists = async (reference: string) => {
+      if (reference === h.helper.builds[0]?.imageName) throw new Error('Cannot connect to the Docker daemon');
+      return imageExists(reference);
+    };
+    await h.service.open(TARGET, options());
+    const built = h.helper.builds[0]?.imageName;
+    expect(built).toBeDefined();
+    expect(built).not.toBe(IMAGE_1);
+    expect(h.ui.warnings).toEqual([Messages.buildFailed]);
+    expect(h.helper.ups).toEqual([expect.objectContaining({ image: IMAGE_1, removeExistingContainer: false })]);
+    expect(h.docker.images.has(built!)).toBe(false);
+    expect(h.docker.images.has(IMAGE_1)).toBe(true);
+  });
+
   it('keeps the old environment when a download of an update fails', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     h.docker.images.add(BASE_IMAGE);

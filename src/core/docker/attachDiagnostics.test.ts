@@ -38,7 +38,7 @@ describe('attachDiagnostics (user request 2026-09-28)', () => {
       if (text.startsWith('--context')) return ok('abc123 running\n');
       return { exitCode: 1, stdout: '', stderr: `Error: No such container: /${NAME}\n`, timedOut: false };
     });
-    const lines = await attachDiagnostics(docker, { DOCKER_CONTEXT: 'x' }, NAME, 'build-box', 'linux');
+    const lines = await attachDiagnostics(docker, { DOCKER_CONTEXT: 'x' }, NAME, CONTEXT, 'linux');
     expect(lines).toEqual([
       'DOCKER_HOST: not set; DOCKER_CONTEXT: x.',
       'Current Docker context: devenv-remote-5709ff28, endpoint ssh://machines.',
@@ -55,24 +55,25 @@ describe('attachDiagnostics (user request 2026-09-28)', () => {
     expect(docker.calls.every((call) => call.timeoutMs !== undefined)).toBe(true);
   });
 
+  // Review round 1 (F4): the caller passes the context of the operation; none for the local Docker or DOCKER_HOST.
   it('names no context for the local Docker and inspects once', async () => {
     const docker = fakeDocker((args) => (args[0] === 'inspect' ? ok('abc123 running') : ok('default')));
-    const lines = await attachDiagnostics(docker, { DOCKER_HOST: 'unix:///var/run/docker.sock' }, `/${NAME}`, '', 'linux');
+    const lines = await attachDiagnostics(docker, { DOCKER_HOST: 'unix:///var/run/docker.sock' }, `/${NAME}`, undefined, 'linux');
     expect(lines[0]).toBe('DOCKER_HOST: unix:///var/run/docker.sock; DOCKER_CONTEXT: not set.');
-    expect(lines[2]).toBe('Docker context of the environment: the local Docker (none named).');
+    expect(lines[2]).toBe('Docker context of the environment: none named.');
     expect(lines).toHaveLength(4);
     expect(docker.calls.filter((call) => call.args.includes('inspect --type container'))).toHaveLength(1);
   });
 
   it('runs its calls outside of the operation, so they are not pinned to its context', async () => {
     const docker = fakeDocker(() => ok(''));
-    await runWithDockerTarget(dockerTargetOf('ssh://build-box', CONTEXT), () => attachDiagnostics(docker, {}, NAME, 'build-box', 'linux'));
+    await runWithDockerTarget(dockerTargetOf('ssh://build-box', CONTEXT), () => attachDiagnostics(docker, {}, NAME, CONTEXT, 'linux'));
     expect(docker.calls.map((call) => call.operationContext)).toEqual([undefined, undefined, undefined, undefined]);
   });
 
   it('never throws: a failing call becomes a line', async () => {
     const docker = fakeDocker(() => new Error('spawn docker ENOENT'));
-    const lines = await attachDiagnostics(docker, {}, NAME, '', 'linux');
+    const lines = await attachDiagnostics(docker, {}, NAME, undefined, 'linux');
     expect(lines[1]).toBe('Current Docker context: failed: spawn docker ENOENT, endpoint failed: spawn docker ENOENT.');
     expect(lines[3]).toContain('failed: spawn docker ENOENT');
   });

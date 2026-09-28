@@ -10,7 +10,6 @@
 import { errorMessage } from '../errors';
 import type { RunOptions, RunResult } from '../ports';
 import { envValue } from './dockerCli';
-import { remoteContextName } from './dockerHost';
 import { outsideOperation } from './dockerTargets';
 
 /** Time limit of each call (context reads are local files; an inspect may go over SSH). */
@@ -38,14 +37,15 @@ function inspectArgs(containerName: string, context?: string): string[] {
 }
 
 /**
- * The lines about the Docker of an attach to `containerName`, whose environment runs on `environmentHost` ('' = the
- * local Docker). `env` is the environment of VS Code's Docker calls.
+ * The lines about the Docker of an attach to `containerName`. `environmentContext` is the Docker context that the
+ * operation of the environment used (review round 1, F4), or undefined for none named (the local Docker, DOCKER_HOST).
+ * `env` is the environment of VS Code's Docker calls.
  */
 export async function attachDiagnostics(
   docker: DiagnosticsDocker,
   env: NodeJS.ProcessEnv,
   containerName: string,
-  environmentHost: string,
+  environmentContext: string | undefined,
   platform: NodeJS.Platform = process.platform,
 ): Promise<string[]> {
   const dockerHost = envValue(env, 'DOCKER_HOST', platform)?.trim();
@@ -55,12 +55,11 @@ export async function attachDiagnostics(
   const lines = [
     `DOCKER_HOST: ${dockerHost ? dockerHost : 'not set'}; DOCKER_CONTEXT: ${dockerContext ? dockerContext : 'not set'}.`,
     `Current Docker context: ${current}, endpoint ${currentEndpoint}.`,
+    `Docker context of the environment: ${environmentContext ?? 'none named'}.`,
+    `Inspect of ${containerName} without a context (as the first call of Dev Containers): ${await answer(docker, inspectArgs(containerName))}.`,
   ];
-  const context = environmentHost === '' ? undefined : remoteContextName(environmentHost);
-  lines.push(`Docker context of the environment: ${context ?? 'the local Docker (none named)'}.`);
-  lines.push(`Inspect of ${containerName} without a context (as the first call of Dev Containers): ${await answer(docker, inspectArgs(containerName))}.`);
-  if (context !== undefined) {
-    lines.push(`Inspect of ${containerName} with the context ${context}: ${await answer(docker, inspectArgs(containerName, context))}.`);
+  if (environmentContext !== undefined) {
+    lines.push(`Inspect of ${containerName} with the context ${environmentContext}: ${await answer(docker, inspectArgs(containerName, environmentContext))}.`);
   }
   return lines;
 }
