@@ -10,7 +10,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import { silentLogger } from '../core/ports';
 import type { Environment, RepositoryInfo } from '../core/types';
-import { resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
+import { fakeVscode, resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
 import { parseRepositoryGroups } from './repositoryGroups';
 import { buildTreeModel, type GroupNode, type HintRow, type OwnerGroup, type RepositoryRow } from './treeModel';
 import { DOCKER_HOST_ROW_ID, DockerHostRowTexts, RepositoriesTreeProvider, type TreeNode } from './treeView';
@@ -95,8 +95,14 @@ describe('RepositoriesTreeProvider', () => {
       // Unit 7, PR 2: Close and Keep Running for the environment of this window.
       contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning',
     });
-    // User request 2026-09-28: a green monitor with the remote sign for the environment of this window.
+    // User requests 2026-09-28: without the root of the extension, the codicon of the monitor with the remote sign.
     expect((apiItem.iconPath as ThemeIcon).id).toBe('vm-connect');
+    // With it, the filled monitor with the connection sign of resources/icons, in a light and a dark variant.
+    const withIcons = new RepositoriesTreeProvider(silentLogger, fakeVscode.Uri.file('/ext') as never);
+    withIcons.setModel(groups);
+    const iconPath = (withIcons.getTreeItem(api) as unknown as TreeItem).iconPath as { light: { fsPath: string }; dark: { fsPath: string } };
+    expect(iconPath.light.fsPath).toBe('/ext/resources/icons/monitor-connected-light.svg');
+    expect(iconPath.dark.fsPath).toBe('/ext/resources/icons/monitor-connected-dark.svg');
     // A repository without environment has no state symbol.
     expect(((provider.getTreeItem(web) as unknown as TreeItem).iconPath as ThemeIcon).id).toBe('blank');
 

@@ -171,7 +171,7 @@ DEV ENVIRONMENTS   [Select Organizations] [Search] [Refresh] [Collapse All]
         website                                               [Start] [⋯]
 ```
 
-In the sketch, ● stands for the green monitor with the remote sign (connected in this window) and ○ for the grey monitor (stopped); see the table of symbols below.
+In the sketch, ● stands for the filled monitor with the connection sign (connected in this window) and ○ for the silhouette of the monitor (stopped); see the table of symbols below.
 
 The list groups the repositories by owner. In each group, the repositories are in alphabetical order; a repository with an environment keeps its place.
 
@@ -224,19 +224,19 @@ The example shows the nodes expanded. The tooltip of a row names the full `owner
 
 States of an environment (see also [7.15](#715-environment-states)):
 
-Green always means that the container runs; the shape tells which window uses it.
+A monitor shows the environments of windows: switched off (the silhouette) while stopped, switched on (filled) while a window uses it, with the connection sign when this window uses it. The three monitors share the same frame, so the sign does not move it. Green marks a container that runs without a window.
 
 | Symbol | State text | Meaning |
 |---|---|---|
-| green monitor with the remote sign | Connected | This window is connected to the environment. |
-| green monitor | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
+| filled monitor with the connection sign | Connected | This window is connected to the environment. |
+| filled monitor | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
 | green play icon (circled) | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
-| grey monitor | Stopped | The container is stopped. The next **Start** starts it. |
+| monitor silhouette (switched off) | Stopped | The container is stopped. The next **Start** starts it. |
 | ↻ | Updating | An update, a rebuild, or a delete is in progress. |
 | ◌ | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
 | ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
 
-**Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (green while the container runs, the grey monitor while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
+**Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (the filled monitor or the green play icon while the container runs, the silhouette of the monitor while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
 
 **Other services of Docker Compose.** The state of a Docker Compose environment is the state of its dev container, the container that VS Code connects to. When the dev container is stopped or missing while another service still runs (for example a database), the row adds ` · services running` (for example `Stopped · services running`) with the tooltip line "Other services of Docker Compose run. Stop stops them.", and offers **Stop** as well as **Start** (review round 7 of unit 6, P7-2).
 

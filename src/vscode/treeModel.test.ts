@@ -801,14 +801,14 @@ describe('state texts and icons', () => {
   });
 
   it('maps every state to a codicon', () => {
-    // User request 2026-09-28: green monitor with the remote sign in this window, green monitor in another window, grey
-    // monitor when stopped.
-    expect(stateIcon('connected')).toEqual({ id: 'vm-connect', color: 'charts.green' });
+    // User requests 2026-09-28: a filled monitor with the connection sign in this window, a filled monitor in another
+    // window, the silhouette of a monitor when stopped (icons of the extension; the codicon for the Quick Picks).
+    expect(stateIcon('connected')).toEqual({ id: 'vm-connect', file: 'monitor-connected' });
     // Green always means that the container runs; the shape tells which window uses it (user decision 2026-09-26).
-    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'vm', color: 'charts.green' });
+    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'vm', file: 'monitor-on' });
     // A play symbol, not the monitor of vm-running, which looked like a connected window (user, 2026-09-26).
     expect(stateIcon('running')).toEqual({ id: 'play-circle', color: 'charts.green' });
-    expect(stateIcon('stopped')).toEqual({ id: 'vm', color: 'disabledForeground' });
+    expect(stateIcon('stopped')).toEqual({ id: 'vm', file: 'monitor-off' });
     expect(stateIcon('updating').id).toBe('sync~spin');
     expect(stateIcon('noContainer').id).toBe('circle-large-outline');
     expect(stateIcon('filesMissing').id).toBe('warning');

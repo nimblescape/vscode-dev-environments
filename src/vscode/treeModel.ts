@@ -210,23 +210,30 @@ export interface GroupNode {
   children: Array<GroupNode | RepositoryRow>;
 }
 
-/** Icon of a state (concept 6.2), as a codicon ID and an optional theme color ID. */
+/**
+ * Icon of a state (concept 6.2), as a codicon ID and an optional theme color ID. `file` names icons of the extension in
+ * resources/icons (`<file>-light.svg`, `<file>-dark.svg`), which the sidebar shows instead of the codicon.
+ */
 export interface StateIcon {
   id: string;
   color?: string;
+  file?: StateIconFile;
 }
 
+/** The monitor icons of the extension (resources/icons), each in a light and a dark variant. */
+export type StateIconFile = 'monitor-off' | 'monitor-on' | 'monitor-connected';
+
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
-  // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
-  // User request 2026-09-28: a monitor, green while the container runs; with the remote sign in this window. `vm` and
-  // `vm-connect` draw the frame of the monitor at the same place (x 1 to 15), so the remote sign in the lower right
-  // corner does not move the frame ("the monitor icons are left aligned").
-  connected: { id: 'vm-connect', color: 'charts.green' },
-  connectedOtherWindow: { id: 'vm', color: 'charts.green' },
+  // User requests 2026-09-28: a monitor for the three states of a window, all with the frame of the codicon `vm` at the
+  // same place, so the connection sign does not move it ("the monitor icons are left aligned"). A disconnected one is
+  // the silhouette only (switched off), connected in another window it is filled (switched on), connected in this
+  // window filled with the connection sign of `vm-connect` (resources/icons, in the colors of the codicons: no codicon
+  // is a filled monitor). The codicon stays for the Quick Picks (pickerIconId).
+  connected: { id: 'vm-connect', file: 'monitor-connected' },
+  connectedOtherWindow: { id: 'vm', file: 'monitor-on' },
   // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
   running: { id: 'play-circle', color: 'charts.green' },
-  // User request 2026-09-28: inactive, a grey monitor without the remote sign.
-  stopped: { id: 'vm', color: 'disabledForeground' },
+  stopped: { id: 'vm', file: 'monitor-off' },
   updating: { id: 'sync~spin' },
   // A dashed circle (◌) is not available as a codicon.
   noContainer: { id: 'circle-large-outline' },
@@ -234,18 +241,18 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
 };
 
 /**
- * Icon of a state: green monitor with the remote sign connected (this window), green monitor connected in another
- * window, green play icon running without a window, grey monitor stopped, ↻ updating, ◌ no container, ⚠ files missing.
- * Green always means that the container runs.
+ * Icon of a state: a filled monitor with the connection sign connected (this window), a filled monitor connected in
+ * another window, a green play icon running without a window, the silhouette of a monitor stopped, ↻ updating, ◌ no
+ * container, ⚠ files missing.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
 }
 
 /**
- * The codicon of a state in a Quick Pick label (the switcher, the environment pickers). Review round 1 of PR #59 (P1): a
- * Quick Pick cannot color an icon, so the grey monitor of Stopped would look like the green monitor of Connected · other
- * window; Stopped keeps the ring there. Every other state has the codicon of the sidebar.
+ * The codicon of a state in a Quick Pick label (the switcher, the environment pickers), which shows codicons only.
+ * Review round 1 of PR #59 (P1): the codicon `vm` of Stopped would look like the one of Connected · other window, as no
+ * codicon is a filled monitor; Stopped keeps the ring there. Every other state has the codicon of its icon.
  */
 export function pickerIconId(state: EnvironmentState): string {
   return state === 'stopped' ? 'circle-outline' : STATE_ICONS[state].id;

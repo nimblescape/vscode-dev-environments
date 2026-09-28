@@ -346,7 +346,7 @@ async function activateExtension(
       ),
   });
 
-  const tree = new RepositoriesTreeProvider(logger);
+  const tree = new RepositoriesTreeProvider(logger, context.extensionUri);
   const view = vscode.window.createTreeView<TreeNode>(REPOSITORIES_VIEW_ID, {
     treeDataProvider: tree,
     showCollapseAll: true,
