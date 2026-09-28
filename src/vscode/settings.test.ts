@@ -14,6 +14,7 @@ import {
   DEFAULT_SETTINGS,
   MAX_REFRESH_INTERVAL_MINUTES,
   normalizeSettings,
+  readListOpenMode,
   readSettings,
   SETTINGS_SECTION,
   warnInvalidHostAccessChecksOff,
@@ -52,6 +53,15 @@ describe('settings (concept section 8)', () => {
     expect(readSettings()).toEqual({ ...DEFAULT_SETTINGS, stopOnClose: false, owners: ['acme'] });
     expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
     expect(SETTINGS_SECTION).toBe('devEnvLauncher');
+  });
+
+  it('reads the VS Code setting workbench.list.openMode (double-click on a row)', () => {
+    let value: unknown = 'doubleClick';
+    fakeVscode.workspace.getConfiguration.mockReturnValue({ get: (key: string) => (key === 'openMode' ? value : undefined) });
+    expect(readListOpenMode()).toBe('doubleClick');
+    expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith('workbench.list');
+    value = undefined;
+    expect(readListOpenMode()).toBe('singleClick');
   });
 
   it('replaces values of a wrong type with the default, and cleans the owners', () => {

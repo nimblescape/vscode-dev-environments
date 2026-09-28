@@ -273,6 +273,11 @@
         "command": "devEnvironments.useLocalDocker",
         "title": "Use the Local Docker",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.rowActivated",
+        "title": "Start on Double-Click",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [
@@ -331,6 +336,10 @@
         {
           "command": "devEnvironments.closeAndKeepRunning",
           "when": "devEnvironments.connected"
+        },
+        {
+          "command": "devEnvironments.rowActivated",
+          "when": "false"
         }
       ],
       "view/title": [

@@ -9,6 +9,7 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../cor
 import { Messages } from '../core/messages';
 import type { Logger } from '../core/ports';
 import type { ExtensionSettings } from '../core/types';
+import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
 
@@ -85,6 +86,14 @@ export function warnInvalidHostAccessChecksOff(logger: Logger, warned: string): 
     logger.warn(`The warning about the setting hostAccessChecksOff could not be shown: ${errorMessage(error)}`),
   );
   return invalid;
+}
+
+/**
+ * The VS Code setting `workbench.list.openMode`, read at each activation of a row (a double-click on a repository row
+ * runs Start, see rowActivation.ts), so a change applies at once.
+ */
+export function readListOpenMode(): ListOpenMode {
+  return normalizeListOpenMode(vscode.workspace.getConfiguration('workbench.list').get<unknown>('openMode'));
 }
 
 /** True if a configuration change affects these settings. */

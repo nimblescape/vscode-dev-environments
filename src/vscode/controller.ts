@@ -56,7 +56,8 @@ import { runWithProgress, type BusyChange } from './progress';
 import type { RemoteDockerCommands } from './remoteDockerCommands';
 import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { SessionCoordinator } from './sessionCoordinator';
-import { SETTINGS_SECTION, hostAccessChecksOffValue } from './settings';
+import { RowActivationTracker, activatedRow, type ListOpenMode } from './rowActivation';
+import { SETTINGS_SECTION, hostAccessChecksOffValue, readListOpenMode } from './settings';
 import type { Sidebar } from './sidebar';
 import type { EnvironmentStatusBar } from './statusBar';
 import { pickRepository, showSwitcher } from './switcher';
@@ -147,6 +148,8 @@ export interface ControllerDeps {
      */
     sendKeepRunning(environmentId: string, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
   };
+  /** The VS Code setting `workbench.list.openMode` (double-click on a row, rowActivation.ts). Default: `readListOpenMode`. */
+  listOpenMode?: () => ListOpenMode;
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule of concept 7.10 is relaxed. */
   development?: boolean;
   clock?: Clock;
@@ -248,10 +251,13 @@ export class Controller implements vscode.Disposable {
   private disposed = false;
   /** The last value of CONNECTED_CONTEXT_KEY (unit 7, PR 2). */
   private connectedContext: boolean | undefined;
+  /** Tells a double-click on a repository row from a single click (rowActivated). */
+  private readonly rowActivations: RowActivationTracker;
 
   constructor(private readonly deps: ControllerDeps) {
     this.clock = deps.clock ?? systemClock;
     this.isAlive = deps.isAlive ?? isProcessAlive;
+    this.rowActivations = new RowActivationTracker(this.clock);
   }
 
   private get logger(): OutputChannelLogger {
@@ -272,7 +278,7 @@ export class Controller implements vscode.Disposable {
     );
   }
 
-  /** Registers the 30 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
+  /** Registers the 31 commands of package.json. A command never rejects: errors are shown (concept 6.5). */
   registerCommands(): vscode.Disposable[] {
     const handlers: Record<CommandName, (argument: unknown) => Promise<void>> = {
       start: (argument) => this.start(parseCommandArgument(argument)),
@@ -305,10 +311,11 @@ export class Controller implements vscode.Disposable {
       dockerSetupShow: () => this.deps.dockerSetup.show(),
       useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
       useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
+      rowActivated: (argument) => this.rowActivated(argument),
     };
     // Unit 7: each command is one operation on the Docker host that is current when it starts; the two commands that
-    // change the host read it themselves.
-    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker']);
+    // change the host read it themselves. A click on a row is no operation: only the Start of a double-click is one.
+    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'rowActivated']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
         if (ownTarget.has(name)) await handlers[name](argument);
@@ -587,6 +594,22 @@ export class Controller implements vscode.Disposable {
   async start(argument: CommandArgument, window: WindowRequest = 'default'): Promise<void> {
     const target = await this.resolveTarget(argument, 'open', ControllerTexts.selectRepositoryToStart);
     if (target) await this.startTarget(target, { window });
+  }
+
+  /**
+   * The command of a repository row (concept 6.2): VS Code runs it on a click, Enter, or Space in the row. A double-click
+   * runs Start with the row, the same as its Start button (rowActivation.ts); a single click only selects the row.
+   * Nothing happens where the row shows no Start: this window is connected to the environment, or it is updating.
+   */
+  async rowActivated(argument: unknown): Promise<void> {
+    const row = activatedRow(argument);
+    const parsed = parseCommandArgument(argument);
+    if (!row || parsed.kind !== 'row') return;
+    const openMode = (this.deps.listOpenMode ?? readListOpenMode)();
+    if (!this.rowActivations.activate(row.id, openMode) || !row.canStart) return;
+    // The row may be older than the connection of this window; a lost connection shows Start (Reconnect).
+    if (parsed.environmentId !== undefined && this.current?.environment.id === parsed.environmentId && !this.current.lost) return;
+    await this.withDockerTarget(() => this.start(parsed));
   }
 
   /** Stop (concept 6.2): the container stops at once; a connected window closes its connection first. */

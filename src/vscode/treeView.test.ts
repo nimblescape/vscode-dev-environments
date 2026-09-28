@@ -13,7 +13,7 @@ import type { Environment, RepositoryInfo } from '../core/types';
 import { resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
 import { parseRepositoryGroups } from './repositoryGroups';
 import { buildTreeModel, type GroupNode, type HintRow, type OwnerGroup, type RepositoryRow } from './treeModel';
-import { RepositoriesTreeProvider } from './treeView';
+import { RepositoriesTreeProvider, type TreeNode } from './treeView';
 
 function repo(nameWithOwner: string): RepositoryInfo {
   const [owner, name] = nameWithOwner.split('/');
@@ -223,6 +223,39 @@ describe('nodes of the setting repositoryGroups', () => {
       for (const { when } of manifest.contributes.menus[menu]) {
         for (const regex of (when ?? '').matchAll(/viewItem =~ \/(.+?)\//g)) expect(new RegExp(regex[1]).test(value)).toBe(false);
       }
+    }
+    provider.dispose();
+  });
+
+  it('gives only repository rows the command that starts on a double-click (user request 2026-09-27)', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const rowCommands = (node: TreeNode): string[] => {
+      const command = (provider.getTreeItem(node) as unknown as TreeItem).command as { command: string } | undefined;
+      return [command?.command ?? '', ...provider.getChildren(node).flatMap(rowCommands)];
+    };
+    provider.setModel(model(), { signedIn: false });
+    const [signIn, owner] = provider.getChildren();
+    const [hint, api] = provider.getChildren(owner) as [HintRow, RepositoryRow];
+    // The row itself is the argument, as for the row actions of package.json.
+    expect((provider.getTreeItem(api) as unknown as TreeItem).command).toEqual({
+      command: 'devEnvironments.rowActivated',
+      title: 'Start',
+      arguments: [api],
+    });
+    expect(rowCommands(owner)).toEqual(['', 'vscode.open', 'devEnvironments.rowActivated', 'devEnvironments.rowActivated']);
+    expect(rowCommands(signIn)).toEqual(['devEnvironments.signIn']);
+    expect((provider.getTreeItem(hint) as unknown as TreeItem).command).toMatchObject({ command: 'vscode.open' });
+    provider.setModel(groupedModel());
+    const [school] = provider.getChildren();
+    const [courses] = provider.getChildren(school) as GroupNode[];
+    expect((provider.getTreeItem(courses) as unknown as TreeItem).command).toBeUndefined();
+    // Every node below: owners and group nodes have no command, repository rows have the command of the row.
+    const walk = (node: TreeNode): TreeNode[] => [node, ...provider.getChildren(node).flatMap(walk)];
+    const nodes = walk(school);
+    expect(nodes.some((node) => node.kind === 'repository')).toBe(true);
+    for (const node of nodes) {
+      const command = ((provider.getTreeItem(node) as unknown as TreeItem).command as { command: string } | undefined)?.command;
+      expect(command).toBe(node.kind === 'repository' ? 'devEnvironments.rowActivated' : undefined);
     }
     provider.dispose();
   });

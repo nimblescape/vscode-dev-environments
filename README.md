@@ -24,7 +24,7 @@ Git on your computer is not needed.
 1. Select the **Dev Environments** icon in the activity bar. If Docker is not installed, the view shows the steps to set it up instead of the repositories (see [Installing Docker](#installing-docker)).
 2. Select **Sign in with GitHub**. The list shows your repositories with a Dev Container configuration, grouped by owner.
 3. Use the actions of a repository:
-   - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window.
+   - **Start**: creates the environment on the first use (this can take several minutes), starts the container, and connects the current window. A double-click on the repository does the same.
    - **Start in New Window** (context menu of a repository, and **⋯**): the same, but a new window connects. The current window keeps its environment. If another window has the environment open already, that window comes to the front; an environment is never open in two windows.
    - **Stop**: stops the container at once. Your files are kept.
    - **Delete**: removes the container and the volume with the repository, after you confirm it. If the volume has uncommitted changes, unpushed commits, or stashes, the confirmation shows them.
