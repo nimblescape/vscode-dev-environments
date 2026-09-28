@@ -4,7 +4,7 @@
 
 // Double-click on a repository row runs Start (concept 6.2; user request 2026-09-27, "double-clicking a repo shall start
 // the machine"). VS Code has no double-click event for tree views: it runs the command of a row (`TreeItem.command`) on
-// each click, Enter, and Space while the setting `workbench.list.openMode` is `singleClick` (the default), and only on a
+// each click and Enter while the setting `workbench.list.openMode` is `singleClick` (the default), and only on a
 // double-click and Enter while it is `doubleClick`. No `vscode` import, so the rules are unit-tested.
 import type { Clock } from '../core/ports';
 
@@ -33,8 +33,10 @@ export function activatedRow(argument: unknown): { id: string; canStart: boolean
 /**
  * Tells a double-click from a single click. In `singleClick` mode a double-click arrives as two activations of the same
  * row; the second one within DOUBLE_CLICK_INTERVAL_MS completes the double-click, and the tracker starts over, so that a
- * triple-click starts once (its third click begins a new pair). Enter and Space arrive as one activation, so they only
- * select, as a single click does. In `doubleClick` mode VS Code already filters: every activation counts.
+ * triple-click starts once (its third click begins a new pair). Enter arrives as one activation, like a click, and the
+ * tracker cannot tell them apart: one Enter only selects, but two Enter presses (or Enter and a click) on the same row
+ * within the interval start it too (review of PR #44, accepted). In `doubleClick` mode VS Code already filters: every
+ * activation counts.
  */
 export class RowActivationTracker {
   private last: { rowId: string; at: number } | undefined;
