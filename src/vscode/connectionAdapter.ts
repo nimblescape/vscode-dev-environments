@@ -8,7 +8,7 @@
 import * as vscode from 'vscode';
 import { ATTACHED_CONTAINER } from '../core/devContainers';
 import { silentLogger, type Logger } from '../core/ports';
-import { containerNameOfUri, decodeAuthorityParts, folderUriParts, REMOTE_SCHEME } from './connection/authority';
+import { containerNameOfUri, decodeAuthorityParts, encodeAuthority, folderUriParts, REMOTE_SCHEME } from './connection/authority';
 
 /** Opens a folder or workspace URI (built-in command of VS Code). */
 export const OPEN_FOLDER_COMMAND = 'vscode.openFolder';
@@ -117,6 +117,23 @@ export class ConnectionAdapter {
     const uri = vscode.Uri.from(folderUriParts(containerName, remoteWorkspaceFolder, dockerContext));
     this.logger.info(`Connecting a new window to ${containerName} (${uri.toString()}).`);
     await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: true });
+  }
+
+  /**
+   * Review of the attach context (round 2, B3): opens what this attached window shows (its workspace file, else its
+   * first folder) again in this window, with `dockerContext` in the authority and everything else unchanged. Returns
+   * false when the window shows no attached container.
+   */
+  async reopenWithDockerContext(dockerContext: string): Promise<boolean> {
+    const workspaceFile = vscode.workspace.workspaceFile;
+    const shown = workspaceFile ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!shown || shown.scheme !== REMOTE_SCHEME) return false;
+    const parts = decodeAuthorityParts(shown.authority);
+    if (!parts) return false;
+    const uri = vscode.Uri.from({ scheme: REMOTE_SCHEME, authority: encodeAuthority(parts.containerName, dockerContext), path: shown.path });
+    this.logger.info(`Connecting the window to ${parts.containerName} again through the Docker context ${dockerContext} (${uri.toString()}).`);
+    await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: false, forceReuseWindow: true });
+    return true;
   }
 
   /** "Close Remote Connection": the window becomes an empty local window, and the extension activates again in it. */

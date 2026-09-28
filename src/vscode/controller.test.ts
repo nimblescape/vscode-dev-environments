@@ -233,6 +233,7 @@ interface Harness {
     isEmptyWindow: ReturnType<typeof vi.fn<() => boolean>>;
     currentContainerName: ReturnType<typeof vi.fn<() => string | undefined>>;
     currentDockerContext: ReturnType<typeof vi.fn<() => string | undefined>>;
+    reopenWithDockerContext: ReturnType<typeof vi.fn<(dockerContext: string) => Promise<boolean>>>;
   };
   coordinator: {
     windowId: string;
@@ -334,6 +335,7 @@ function createHarness(
     isEmptyWindow: vi.fn(() => false),
     currentContainerName: vi.fn(() => undefined),
     currentDockerContext: vi.fn(() => undefined),
+    reopenWithDockerContext: vi.fn(async (_dockerContext: string) => true),
   };
   const coordinator: Harness['coordinator'] = {
     windowId: WINDOW_ID,
@@ -3335,7 +3337,22 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.coordinator.writePending).toHaveBeenCalledWith(REMOTE_ENV_ID);
-    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'devenv-remote');
+    // Round 2 (B3): what the window shows opens again with the context (not the repository folder).
+    expect(h.connection.reopenWithDockerContext).toHaveBeenCalledWith('devenv-remote');
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  // Round 2 (B1): the operation's context does not replace a context that the window names already (a user-made one).
+  it('a restored window that names another working context keeps it, also inside the operation', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    h.connection.currentContainerName.mockReturnValue(env.containerName);
+    h.connection.currentDockerContext.mockReturnValue('my-build-box');
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.connection.reopenWithDockerContext).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
   });
 
   it('a restored window that names the context already stays as it is', async () => {
@@ -3346,6 +3363,19 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     h.connection.currentDockerContext.mockReturnValue('devenv-remote');
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
     expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.connection.reopenWithDockerContext).not.toHaveBeenCalled();
+  });
+
+  // Round 2 (B2): the status of the other window is read once; it closing meanwhile does not drop the context.
+  it('uses the status of the other window that it decided on, not a second read', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    await h.registry.add(remoteEnvironment());
+    h.coordinator.otherActiveWindows.mockResolvedValueOnce([
+      { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: REMOTE_ENV_ID, state: 'active', updatedAt: iso(NOW), dockerContext: 'devenv-remote' },
+    ]);
+    h.coordinator.otherActiveWindows.mockResolvedValue([]);
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.connection.open.mock.calls).toEqual([['devenv-acme-api-a1b2c3d4', '/workspaces/api', 'devenv-remote']]);
   });
 
   // Review of the attach context (A2): the other window is shown by exactly its URI, with the context of its status file.
@@ -3386,10 +3416,11 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     h.connection.currentDockerContext.mockReturnValue('my-build-box');
     await h.controller.openAttachedWindow(env, env.containerName, pending);
     expect(h.connection.open).not.toHaveBeenCalled();
-    // 2. No context in the window: the current context on the environment's host.
+    // 2. No context in the window: the current context on the environment's host (round 2, B3: the window reopens
+    // what it shows with it).
     h.connection.currentDockerContext.mockReturnValue(undefined);
     await h.controller.openAttachedWindow(env, env.containerName, pending);
-    expect(h.connection.open).toHaveBeenLastCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'devenv-remote-11111111');
+    expect(h.connection.reopenWithDockerContext).toHaveBeenLastCalledWith('devenv-remote-11111111');
   });
 
   it('without a Docker target names the context that "Use a Remote Docker Host…" creates for the host', async () => {
@@ -3397,7 +3428,8 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     const env = remoteEnvironment();
     await h.registry.add(env);
     await h.controller.openAttachedWindow(env, env.containerName, { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) });
-    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', remoteContextName('build-box'));
+    // Round 2 (B3): the window reopens what it shows with the context.
+    expect(h.connection.reopenWithDockerContext).toHaveBeenCalledWith(remoteContextName('build-box'));
   });
 
   it('a restored window of another host asks "Use <host> again?"; declined, it runs nothing and closes its connection', async () => {
