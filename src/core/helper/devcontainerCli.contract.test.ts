@@ -101,7 +101,7 @@ function contractProblems(args: readonly string[], options: Map<string, Document
 
 describe('options of the helper against `devcontainer <command> --help`', () => {
   const folder = '/workspaces/api';
-  const idLabel = 'devenv.environment-id=3f2a9c1e-0000-4000-8000-000000000000';
+  const idLabel = 'nimblescape.devenv.environment-id=3f2a9c1e-0000-4000-8000-000000000000';
 
   it('read-configuration', () => {
     // WorkspaceHelper.readConfiguration runs `devcontainer <args>` without a script.

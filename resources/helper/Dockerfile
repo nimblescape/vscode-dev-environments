@@ -38,6 +38,6 @@ RUN set -eux; \
     devcontainer --version; \
     git config --system --add safe.directory '*'
 
-LABEL devenv.helper=true
+LABEL nimblescape.devenv.helper=true
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["sh"]

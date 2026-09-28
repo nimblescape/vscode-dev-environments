@@ -17,7 +17,7 @@ describe('hotfix review 4, Q1: a repository named *.code-workspace', () => {
     const metadata = [{ mounts: ['type=volume,source=${localWorkspaceFolderBasename}-node_modules,target=/x'] }];
     // hotfix review 5, A5-1: `up` mounts evil.code-workspace-node_modules (the repository folder), not workspaces-node_modules.
     expect(mountedVolumeNames({ ...input, metadata })).toEqual(['evil.code-workspace-node_modules']);
-    const victim = { 'devenv.environment-id': 'victimenv', 'devenv.owner-id': '2', 'devenv.volume': 'additional' };
+    const victim = { 'nimblescape.devenv.environment-id': 'victimenv', 'nimblescape.devenv.owner-id': '2', 'nimblescape.devenv.volume': 'additional' };
     // hotfix review 5, A5-1: the volume that `up` mounts.
     const report = hostAccessReport({ ...input, metadata, volumeLabels: { 'evil.code-workspace-node_modules': victim } }, false);
     expect(report.hostAccess).toHaveLength(1);

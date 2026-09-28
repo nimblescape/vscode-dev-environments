@@ -229,17 +229,17 @@ export function stripNameArgs(runArgs: readonly string[]): string[] {
 /**
  * Override configuration for `up` (implementation notes 8, concept 7.6): only image, workspaceMount, workspaceFolder,
  * runArgs (the repository values as the host access policy checks them, overrideRunArgs: without any --name and with
- * 127.0.0.1 for published ports without an address; plus `--label devenv.container-version=<n>`, the labels
- * `com.docker.compose.project` and `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and
- * `--name <container name>`, and `--hostname <repository name>` (containerHostname) unless the runArgs decide the host
- * name themselves, runArgsDecideHostname, and last, unit 15, `--tmpfs TOKEN_TMPFS`, the folder of the token in memory),
- * appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev
- * Containers extension in customizations (container-only Git, concept section 9), and shutdownAction 'none'
- * (ATTACHED_SHUTDOWN_ACTION, ../devContainers.ts).
- * `hostAccessChecks` `off` (the switch of the repository, ../policy/hostAccessChecks.ts): the published ports of runArgs and
- * appPort keep the address that the configuration gives them (appPort as the configuration writes it), and runArgs get
- * `--label devenv.host-access=unrestricted`, so that the container is created again once the checks are on.
- * `initializeCommand` is never passed: the host access policy refuses a configuration with one.
+ * 127.0.0.1 for published ports without an address; plus `--label nimblescape.devenv.container-version=<n>`, the labels
+ * `com.docker.compose.project` and `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and `--name
+ * <container name>`, and `--hostname <repository name>` (containerHostname) unless the runArgs decide the host name
+ * themselves, runArgsDecideHostname, and last, unit 15, `--tmpfs TOKEN_TMPFS`, the folder of the token in memory),
+ * appPort (if set, on 127.0.0.1), containerEnv, remoteEnv, and the settings of the Dev Containers extension in
+ * customizations (container-only Git, concept section 9), and shutdownAction 'none' (ATTACHED_SHUTDOWN_ACTION,
+ * ../devContainers.ts). `hostAccessChecks` `off` (the switch of the repository, ../policy/hostAccessChecks.ts): the
+ * published ports of runArgs and appPort keep the address that the configuration gives them (appPort as the
+ * configuration writes it), and runArgs get `--label nimblescape.devenv.host-access=unrestricted`, so that the
+ * container is created again once the checks are on. `initializeCommand` is never passed: the host access policy
+ * refuses a configuration with one.
  */
 export function buildOverrideConfig(p: {
   environmentImage: string;
@@ -249,7 +249,7 @@ export function buildOverrideConfig(p: {
   runArgs?: string[];
   appPort?: DevcontainerConfig['appPort'];
   hostAccessChecks?: HostAccessChecks;
-  /** Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path. */
+  /** Review round 4 (D4-2): the configuration path of the environment, as the label nimblescape.devenv.config-path. */
   configPath?: string;
 }): Record<string, unknown> {
   const checksOn = p.hostAccessChecks !== 'off';

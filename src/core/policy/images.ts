@@ -9,7 +9,7 @@
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import type { HostAccessFinding } from './report';
-import { RESERVED_LABEL } from './rules';
+import { isReservedLabel } from './rules';
 
 /** An image reference of a configuration, and how an item names it (for example `FROM image`). */
 export interface NamedImageReference {
@@ -191,20 +191,23 @@ export function imageInvalidReferenceItem(reference: string, what = 'image'): st
 
 /**
  * The labels of an image that a container created from it would carry, and that Dev Environments, the Dev Container
- * CLI, and Docker Compose use to find and set up containers: `devenv.…`, `devcontainer.…`, and `com.docker.compose.…`,
- * except `devcontainer.metadata`, the only label that the Dev Container CLI puts on the images that it builds (CLI
- * 0.89.0: `var EI="devcontainer.metadata"`; `devcontainer.local_folder` and `devcontainer.config_file` are labels of
- * containers). For example `LABEL devenv.compose-service=x` in a Dockerfile would hide the container from the lookups
- * of the extension. Refused whatever the switch says (HostAccessClass `protected`).
- * The labels of Docker Compose (`com.docker.compose.…`) are not refused (review round 2, D2-1): Compose puts them on
- * each image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
- * containers that it creates; the override configuration of a single container sets them empty (COMPOSE_CLEARED_LABELS),
- * so that such an image does not make `docker compose -p <project> down` remove the dev container.
+ * CLI, and Docker Compose use to find and set up containers: the labels of the extension (EXTENSION_LABEL_KEYS),
+ * `devcontainer.…`, and `com.docker.compose.…`, except `devcontainer.metadata`, the only label that the Dev Container
+ * CLI puts on the images that it builds (CLI 0.89.0: `var EI="devcontainer.metadata"`; `devcontainer.local_folder` and
+ * `devcontainer.config_file` are labels of containers). For example `LABEL nimblescape.devenv.compose-service=x` in a
+ * Dockerfile would hide the container from the lookups of the extension. Refused whatever the switch says
+ * (HostAccessClass `protected`). The labels of the extension are all those with LABEL_PREFIX (isReservedLabel); labels
+ * with the prefix `devenv.` are allowed: other tools use it on their images, and the extension never reads them. The
+ * labels of Docker Compose (`com.docker.compose.…`) are not refused (review round 2, D2-1): Compose puts them on each
+ * image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
+ * containers that it creates; the override configuration of a single container sets them empty
+ * (COMPOSE_CLEARED_LABELS), so that such an image does not make `docker compose -p <project> down` remove the dev
+ * container.
  */
 export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
   return Object.keys(labels)
     .map((key) => key.trim())
-    .filter((key) => key !== 'devcontainer.metadata' && RESERVED_LABEL.test(key))
+    .filter((key) => key !== 'devcontainer.metadata' && isReservedLabel(key))
     .map((key) => `label ${key} of the image ${image}`);
 }
 

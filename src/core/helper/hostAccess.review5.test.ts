@@ -42,7 +42,7 @@ describe('hotfix review 5, A5-1: a repository named *.code-workspace at `up`', (
   const repository = 'mallory/x.code-workspace';
   const folder = '/workspaces/x.code-workspace';
   const mount = 'type=volume,source=${localWorkspaceFolderBasename}-node_modules,target=/steal';
-  const victim = { 'devenv.environment-id': 'victimenv', 'devenv.owner-id': '2', 'devenv.volume': 'additional' };
+  const victim = { 'nimblescape.devenv.environment-id': 'victimenv', 'nimblescape.devenv.owner-id': '2', 'nimblescape.devenv.volume': 'additional' };
   const input = {
     ownVolume: 'devenv-x.code-workspace-11111111',
     environment: { id: 'attackerenv', ownerId: '1' },

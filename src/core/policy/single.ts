@@ -829,7 +829,10 @@ export function runArgsProblems(runArgs: readonly unknown[], ownVolume: string, 
   return uniqueItems(left.length > 0 ? left : runArgsFindings(runArgs, volumeContext({ ownVolume, foreignVolumes })));
 }
 
-/** The label devenv.config-path of the override configuration, with a configuration path (review round 4, D4-2). */
+/**
+ * The label nimblescape.devenv.config-path of the override configuration, with a configuration path (review round 4,
+ * D4-2).
+ */
 function isOwnConfigPathLabel(value: string): boolean {
   const prefix = `${LABEL_CONFIG_PATH}=`;
   return value.startsWith(prefix) && isConfigPathLabelValue(value.slice(prefix.length));
@@ -837,8 +840,9 @@ function isOwnConfigPathLabel(value: string): boolean {
 
 /**
  * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
- * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, the label devenv.config-path
- * of the override configuration (review round 4, D4-2), and (unit 15) its `--tmpfs TOKEN_TMPFS`.
+ * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, the label
+ * nimblescape.devenv.config-path of the override configuration (review round 4, D4-2), and (unit 15) its `--tmpfs
+ * TOKEN_TMPFS`.
  */
 function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
   const problems: Problem[] = [];
@@ -851,7 +855,7 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
     } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && COMPOSE_CLEARED_LABELS.includes(flag.value)) {
       continue;
     } else if (cleared && (flag.name === '--label' || flag.name === '-l') && flag.value !== undefined && isOwnConfigPathLabel(flag.value)) {
-      // Review round 4 (D4-2): the label devenv.config-path that the override configuration adds.
+      // Review round 4 (D4-2): the label nimblescape.devenv.config-path that the override configuration adds.
       continue;
     } else if (cleared && flag.name === '--tmpfs' && flag.value === TOKEN_TMPFS) {
       // Unit 15: the tmpfs of the token that the override configuration adds, exactly as written there.

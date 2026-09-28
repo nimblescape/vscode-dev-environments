@@ -557,8 +557,8 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Concept 7.5 "registry lost": entries for the volumes with the label devenv.environment-id, when registry.json is
-   * missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
+   * Concept 7.5 "registry lost": entries for the volumes with the label nimblescape.devenv.environment-id, when
+   * registry.json is missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
    */
   async reconcileIfRegistryLost(): Promise<void> {
     await this.withDockerTarget(() => this.reconcileIfRegistryLostNow());
@@ -1954,9 +1954,9 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Why the container of the environment exists but must not be used as it is (concept section 9): `version`, it was
-   * made by an older version of the extension (label devenv.container-version); `hostAccess`, it was made while the host
-   * access checks of the repository were off, and they are on now (containerIsCurrent). `undefined` otherwise, and when
-   * Docker cannot be asked. Never throws.
+   * made by an older version of the extension (label nimblescape.devenv.container-version); `hostAccess`, it was made
+   * while the host access checks of the repository were off, and they are on now (containerIsCurrent). `undefined`
+   * otherwise, and when Docker cannot be asked. Never throws.
    */
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;

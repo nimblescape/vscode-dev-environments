@@ -8,12 +8,15 @@
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
 
-/** The one Session Monitor container per Docker engine (never a container of an environment: no devenv.environment-id). */
+/**
+ * The one Session Monitor container per Docker engine (never a container of an environment: no
+ * nimblescape.devenv.environment-id).
+ */
 export const REMOTE_MONITOR_CONTAINER = 'devenv-session-monitor';
 /** The volume of its heartbeat records, mounted at REMOTE_MONITOR_STATE_DIR. */
 export const REMOTE_MONITOR_VOLUME = 'devenv-session-monitor';
 /** Label of the container: 12 hex digits of sha256 of the script and the helper tag (remoteMonitorLabelValue). */
-export const LABEL_SESSION_MONITOR = 'devenv.session-monitor';
+export const LABEL_SESSION_MONITOR = 'nimblescape.devenv.session-monitor';
 /** Where the container writes its script at each start (its own file system, so it matches the container version). */
 export const REMOTE_MONITOR_SCRIPT_PATH = '/opt/devenv/monitor.js';
 /** The mount point of REMOTE_MONITOR_VOLUME in the container. */

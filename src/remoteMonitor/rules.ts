@@ -7,7 +7,8 @@
 // without a clock of their own; main.ts reads the containers and the heartbeat records and runs the stops.
 //
 // One tick:
-//   1. `docker ps -a --filter label=devenv.environment-id` (parseContainerLines) and the records of the volume.
+//   1. `docker ps -a --filter label=nimblescape.devenv.environment-id` (parseContainerLines) and the records of the
+//      volume.
 //   2. `decision = decide({ now, containers, records, state })`. Keep `decision.state` for the next tick.
 //   3. `docker stop` of each container of `decision.stop` (the dev container first), and removal of the files of
 //      `decision.forget` (old records of removed environments).
@@ -27,14 +28,14 @@ export const RECORD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const FUTURE_RECORD_TOLERANCE_MS = 5 * 60_000;
 
-/** A container with the label devenv.environment-id, as `docker ps -a` lists it. */
+/** A container with the label nimblescape.devenv.environment-id, as `docker ps -a` lists it. */
 export interface RemoteContainer {
   id: string;
   /** `.State` of `docker ps`, for example `running` or `exited`. */
   state: string;
   name: string;
   environmentId: string;
-  /** The label devenv.compose-service; empty for the dev container. */
+  /** The label nimblescape.devenv.compose-service; empty for the dev container. */
   composeService: string;
 }
 
@@ -117,9 +118,9 @@ export function isRunningState(state: string): boolean {
  *   that still sends holds until someone makes a newer choice.
  * The gap rule: when the time since the previous tick is larger than `gapMs` (the host or the container was paused, the
  * clock was changed), and at the first tick, nothing is stopped for `graceMs`: the computers that still use their
- * environments send heartbeats again first (they retry every tick of their Session Monitor).
- * Records whose environment has no container at all (running or not) and whose `at` is older than RECORD_MAX_AGE_MS are
- * removed. The monitor never acts on containers without the label devenv.environment-id (the caller lists only those).
+ * environments send heartbeats again first (they retry every tick of their Session Monitor). Records whose environment
+ * has no container at all (running or not) and whose `at` is older than RECORD_MAX_AGE_MS are removed. The monitor
+ * never acts on containers without the label nimblescape.devenv.environment-id (the caller lists only those).
  */
 export function decide(input: RemoteDecideInput): RemoteDecision {
   const { now } = input;
@@ -178,7 +179,10 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
   return { state, stop, kept, forget, grace };
 }
 
-/** The containers of one environment in the order of the stop: the dev container (no devenv.compose-service) first. */
+/**
+ * The containers of one environment in the order of the stop: the dev container (no nimblescape.devenv.compose-service)
+ * first.
+ */
 export function devContainerFirst(containers: readonly RemoteContainer[]): RemoteContainer[] {
   return [...containers].sort((a, b) => (a.composeService === '' ? 0 : 1) - (b.composeService === '' ? 0 : 1));
 }

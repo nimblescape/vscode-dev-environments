@@ -28,6 +28,7 @@ import {
   HELPER_CACHE_FOLDER,
   HELPER_DOCKER_SOCKET,
   HOST_ACCESS_UNRESTRICTED_LABEL,
+  LABEL_PREFIX,
   TOKEN_FOLDER,
   WORKSPACES_ROOT,
 } from '../names';
@@ -179,15 +180,28 @@ export function securityOptionProblems(values: readonly unknown[]): string[] {
 // ---------------------------------------------------------------------------------------------------------------------
 // Labels
 
-/** Label keys of Dev Environments (`devenv.`) and of the Dev Container CLI and the Dev Containers extension (`devcontainer.`). */
-export const RESERVED_LABEL = /^(devenv|devcontainer)\./i;
+/** Label keys of the Dev Container CLI and the Dev Containers extension. */
+const DEVCONTAINER_LABEL = /^devcontainer\./i;
+
+/**
+ * True for a label key by which Dev Environments, the Dev Container CLI, or the Dev Containers extension find and set
+ * up containers, images, and volumes (compared without case and surrounding spaces): every key with LABEL_PREFIX (the
+ * keys of EXTENSION_LABEL_KEYS and any later one), and every `devcontainer.…` key. Other keys are not theirs, also
+ * `devenv.…` keys of other tools (for example `devenv.fingerprint`), so they cannot confuse the lookups and are
+ * allowed.
+ */
+export function isReservedLabel(key: string): boolean {
+  const trimmed = key.trim();
+  return DEVCONTAINER_LABEL.test(trimmed) || trimmed.toLowerCase().startsWith(LABEL_PREFIX);
+}
+
 /** Label keys of Docker Compose, which finds the containers, networks, and volumes of a project by them. */
 export const RESERVED_COMPOSE_LABEL = /^com\.docker\.compose\./i;
 
 /**
  * The labels that the override configuration adds to runArgs itself, with their values. The merged configuration of an
- * existing container holds them too, also `devenv.host-access=unrestricted` of a container created while the host
- * access checks were off, which must not block the open that creates it again once they are on.
+ * existing container holds them too, also `nimblescape.devenv.host-access=unrestricted` of a container created while
+ * the host access checks were off, which must not block the open that creates it again once they are on.
  */
 export const OWN_LABELS: readonly string[] = [CONTAINER_VERSION_LABEL, CONTAINER_CONFIG_UNKNOWN_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL];
 

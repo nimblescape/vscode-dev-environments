@@ -4,8 +4,16 @@
 
 // Names and labels (implementation notes 5).
 import * as crypto from 'crypto';
+import { LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
 
-export const LABEL_ENVIRONMENT_ID = 'devenv.environment-id';
+/**
+ * The prefix of every label key of the extension (EXTENSION_LABEL_KEYS), with the name of its publisher: other tools
+ * use `devenv.…` too (for example `devenv.fingerprint` of an image tool named devenv), so that prefix alone could
+ * collide with their labels.
+ */
+export const LABEL_PREFIX = 'nimblescape.devenv.';
+
+export const LABEL_ENVIRONMENT_ID = 'nimblescape.devenv.environment-id';
 
 /**
  * The `--id-label` of every run of the Dev Container CLI for the environment `environmentId` (read-configuration and
@@ -14,38 +22,39 @@ export const LABEL_ENVIRONMENT_ID = 'devenv.environment-id';
 export function environmentIdLabel(environmentId: string): string {
   return `${LABEL_ENVIRONMENT_ID}=${environmentId}`;
 }
-export const LABEL_REPOSITORY = 'devenv.repository';
+export const LABEL_REPOSITORY = 'nimblescape.devenv.repository';
 /** Volume label: the GitHub user ID of the account that created the environment (concept 7.5). */
-export const LABEL_OWNER_ID = 'devenv.owner-id';
+export const LABEL_OWNER_ID = 'nimblescape.devenv.owner-id';
 /**
  * Volume label of the additional volumes that the extension creates before `up` (the named volumes that a configuration
- * mounts), with the value VOLUME_KIND_ADDITIONAL. Such a volume also carries devenv.environment-id, devenv.owner-id,
- * and devenv.repository of its environment: only these labels make a volume the environment's own (isOwnVolume).
+ * mounts), with the value VOLUME_KIND_ADDITIONAL. Such a volume also carries nimblescape.devenv.environment-id,
+ * nimblescape.devenv.owner-id, and nimblescape.devenv.repository of its environment: only these labels make a volume
+ * the environment's own (isOwnVolume).
  */
-export const LABEL_VOLUME = 'devenv.volume';
+export const LABEL_VOLUME = 'nimblescape.devenv.volume';
 export const VOLUME_KIND_ADDITIONAL = 'additional';
 /**
- * devenv.volume of a named volume of the Compose project of an environment (`devenv-<short id>_<key>`, the data of its
- * services, for example of a database): created by the extension before `up` with the labels of the environment, never
- * shared with another environment, and removed by Delete only when the user asks for it.
+ * nimblescape.devenv.volume of a named volume of the Compose project of an environment (`devenv-<short id>_<key>`, the
+ * data of its services, for example of a database): created by the extension before `up` with the labels of the
+ * environment, never shared with another environment, and removed by Delete only when the user asks for it.
  */
 export const VOLUME_KIND_COMPOSE = 'compose';
 /**
  * Volume label (review round 2, D2-3), with the value SERVICE_DATA: a volume that the extension created before `up` for
  * a service of Docker Compose other than the dev service (it holds the data of that service, for example of a
- * database), whatever its devenv.volume. Delete lists such a volume in the question about the data of the services,
- * none ticked, also after a lost registry (reconcileFromVolumes restores Environment.serviceVolumes from it).
+ * database), whatever its nimblescape.devenv.volume. Delete lists such a volume in the question about the data of the
+ * services, none ticked, also after a lost registry (reconcileFromVolumes restores Environment.serviceVolumes from it).
  */
-export const LABEL_SERVICE_DATA = 'devenv.service-data';
+export const LABEL_SERVICE_DATA = 'nimblescape.devenv.service-data';
 export const SERVICE_DATA = 'true';
 /**
  * Container label of the containers of a Compose environment other than the dev container: the name of their service.
- * They carry devenv.environment-id too, so Stop, the Session Monitor, and Delete find them; the lookup of the dev
- * container skips them.
+ * They carry nimblescape.devenv.environment-id too, so Stop, the Session Monitor, and Delete find them; the lookup of
+ * the dev container skips them.
  */
-export const LABEL_COMPOSE_SERVICE = 'devenv.compose-service';
+export const LABEL_COMPOSE_SERVICE = 'nimblescape.devenv.compose-service';
 /** Container label: the version of the container setup (CONTAINER_VERSION). */
-export const LABEL_CONTAINER_VERSION = 'devenv.container-version';
+export const LABEL_CONTAINER_VERSION = 'nimblescape.devenv.container-version';
 /**
  * Version of the container setup. A container without the label, or with an older value, is not current
  * (containerIsCurrent): it is created again from its environment image, and the volume stays. Raise it when a change of
@@ -56,7 +65,7 @@ export const CONTAINER_VERSION = 1;
  * Container label: `unknown` when the container was created without the configuration of the repository (it could not
  * be read), so without its runArgs and appPort. Such a container is created again once the configuration can be read.
  */
-export const LABEL_CONTAINER_CONFIG = 'devenv.container-config';
+export const LABEL_CONTAINER_CONFIG = 'nimblescape.devenv.container-config';
 export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
 /**
  * Container label (review round 4, D4-2): the path of the configuration of the repository that the container was
@@ -65,7 +74,7 @@ export const CONTAINER_CONFIG_UNKNOWN = 'unknown';
  * when isConfigPathLabelValue takes the path (D5-2). reconcileFromVolumes restores the configuration path of an entry
  * from it after a lost registry; without it, the entry gets the default configuration.
  */
-export const LABEL_CONFIG_PATH = 'devenv.config-path';
+export const LABEL_CONFIG_PATH = 'nimblescape.devenv.config-path';
 /** `--label` value of the override configuration of a single container: LABEL_CONFIG_PATH with its value. */
 export function configPathLabel(configPath: string): string {
   return `${LABEL_CONFIG_PATH}=${configPath}`;
@@ -90,14 +99,14 @@ export const CONTAINER_CONFIG_UNKNOWN_LABEL = `${LABEL_CONTAINER_CONFIG}=${CONTA
  * devEnvLauncher.hostAccessChecksOff, concept section 9 "Host access"), with the value HOST_ACCESS_UNRESTRICTED. Once the
  * checks are on again, such a container is not current (containerIsCurrent): it is created again after the checks pass.
  */
-export const LABEL_HOST_ACCESS = 'devenv.host-access';
+export const LABEL_HOST_ACCESS = 'nimblescape.devenv.host-access';
 export const HOST_ACCESS_UNRESTRICTED = 'unrestricted';
 /** `--label` value of the override configuration of a container created while the host access checks were off. */
 export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCESS_UNRESTRICTED}`;
 /**
- * devenv.host-access of a container of Docker Compose that was created while the host access checks were on (review
- * round 2, D2-2): the model sets the label on every service explicitly, so that a label of the image (for example of a
- * side service that Compose builds during `up`) cannot decide it.
+ * nimblescape.devenv.host-access of a container of Docker Compose that was created while the host access checks were on
+ * (review round 2, D2-2): the model sets the label on every service explicitly, so that a label of the image (for
+ * example of a side service that Compose builds during `up`) cannot decide it.
  */
 export const HOST_ACCESS_CHECKED = 'checked';
 /**
@@ -107,8 +116,30 @@ export const HOST_ACCESS_CHECKED = 'checked';
  * dev container.
  */
 export const COMPOSE_CLEARED_LABELS: readonly string[] = ['com.docker.compose.project=', 'com.docker.compose.service='];
-export const LABEL_HELPER = 'devenv.helper';
-export const LABEL_HELPER_RUN = 'devenv.helper-run';
+export const LABEL_HELPER = 'nimblescape.devenv.helper';
+export const LABEL_HELPER_RUN = 'nimblescape.devenv.helper-run';
+/**
+ * Every label key that the extension reads or writes (on containers, images, and volumes), each with LABEL_PREFIX, in
+ * lower case. The host access policy refuses every key with LABEL_PREFIX in a configuration and on images
+ * (isReservedLabel in ./policy/rules.ts), these and any later one: such a label would hide a container or volume from
+ * the lookups of the extension, or make it look like one of another environment. A test (names.test.ts) fails for a
+ * label with LABEL_PREFIX in the code of src that is not in this set, and for a `devenv.…` label there.
+ */
+export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
+  LABEL_ENVIRONMENT_ID,
+  LABEL_REPOSITORY,
+  LABEL_OWNER_ID,
+  LABEL_VOLUME,
+  LABEL_SERVICE_DATA,
+  LABEL_COMPOSE_SERVICE,
+  LABEL_CONTAINER_VERSION,
+  LABEL_CONTAINER_CONFIG,
+  LABEL_CONFIG_PATH,
+  LABEL_HOST_ACCESS,
+  LABEL_HELPER,
+  LABEL_HELPER_RUN,
+  LABEL_SESSION_MONITOR,
+]);
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
 /** Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI). */
 export const HELPER_CACHE_FOLDER = '/devenv-cache';

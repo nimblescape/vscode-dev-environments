@@ -91,7 +91,10 @@ function repositoryInfo(nameWithOwner: string, overrides: Partial<RepositoryInfo
   };
 }
 
-/** The container of the environment as `docker.findContainer` gives it; `version` is its label devenv.container-version. */
+/**
+ * The container of the environment as `docker.findContainer` gives it; `version` is its label
+ * nimblescape.devenv.container-version.
+ */
 /** The runs of TOKEN_REMOVE_SCRIPT in the dev container (the removal of the token, concept 7.5). */
 function tokenRemovals(): number {
   const command = JSON.stringify(tokenRemoveCommand());
@@ -2837,7 +2840,7 @@ describe('the switch of the host access checks (concept section 9 "Host access",
 
   const unrestricted: ContainerInfo = {
     ...containerInfo(String(CONTAINER_VERSION)),
-    labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devenv.host-access': 'unrestricted' },
+    labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.host-access': 'unrestricted' },
   };
 
   it('role A: closes the connection to a container of the checks-off time when the checks are on and the pipeline refused', async () => {

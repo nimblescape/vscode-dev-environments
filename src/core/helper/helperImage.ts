@@ -535,13 +535,13 @@ async function removeHelperImage(m: Maintenance, image: ImageInfo, reference: st
 }
 
 /**
- * Step 5 (implementation notes 7), at most once per day: of the images with the label devenv.helper=true, except the
- * image of the current tag, it removes dangling images, and helper tags that no window of this installation used for 7
- * days. A helper tag that the state does not know is foreign (another extension version, possibly of another installation
- * of VS Code with its own helper.json, which never writes `lastUsedAt` here): it gets a grace period of 7 days, so old
- * windows during an update keep their helper. A removed tag gets a tombstone: when it comes back, another installation
- * built it again and uses it, so it stays (for HELPER_TOMBSTONE_MS), and two installations do not remove each other's
- * helper in a loop. Tags of other repositories are never removed.
+ * Step 5 (implementation notes 7), at most once per day: of the images with the label nimblescape.devenv.helper=true,
+ * except the image of the current tag, it removes dangling images, and helper tags that no window of this installation
+ * used for 7 days. A helper tag that the state does not know is foreign (another extension version, possibly of another
+ * installation of VS Code with its own helper.json, which never writes `lastUsedAt` here): it gets a grace period of 7
+ * days, so old windows during an update keep their helper. A removed tag gets a tombstone: when it comes back, another
+ * installation built it again and uses it, so it stays (for HELPER_TOMBSTONE_MS), and two installations do not remove
+ * each other's helper in a loop. Tags of other repositories are never removed.
  */
 async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   const nowMs = m.clock.now();

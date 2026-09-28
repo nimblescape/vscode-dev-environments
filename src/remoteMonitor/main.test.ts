@@ -310,7 +310,7 @@ describe('RemoteMonitorLoop', () => {
   it('lists only containers with the environment label, and stops a stale environment after the grace, dev container first', async () => {
     writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
     expect(await tickAt(T0)).toEqual([]);
-    expect(calls[0]).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=devenv.environment-id', '--format', PS_FORMAT]);
+    expect(calls[0]).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=nimblescape.devenv.environment-id', '--format', PS_FORMAT]);
     expect(lines.some((line) => line.includes('nothing is stopped until'))).toBe(true);
     for (let time = T0 + REMOTE_TICK_MS; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);

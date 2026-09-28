@@ -103,7 +103,7 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // Account separation, the GitHub token, the owner account, and items whose class is not clear.
   ['the image of another environment', input(service('db', { image: 'devenv-11111111:3' })), 'service db: image devenv-11111111:3 of another environment', 'protected'],
   ['a volume of another environment by its project name', input((m) => (m.volumes = { pgdata: { name: 'devenv-11111111_pgdata' } })), 'volume devenv-11111111_pgdata of another environment', 'protected'],
-  ['a volume of another environment by its labels', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'devenv.environment-id': 'other' } } }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
+  ['a volume of another environment by its labels', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'nimblescape.devenv.environment-id': 'other' } } }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['a volume of an environment of another account', input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`] }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['the cache volume of the workspace helper', input((m) => (m.volumes = { pgdata: { name: 'devenv-helper-cache' } })), 'volume devenv-helper-cache of the workspace helper', 'protected'],
   // Review round 1 of PR #39 (R1).
@@ -166,7 +166,7 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // Review round 8: changed expectation, a stop_grace_period over 20 s is capped; one that cannot be read is refused.
   ['stop_grace_period soon', input(service('db', { stop_grace_period: 'soon' })), 'service db: stop_grace_period soon', 'unsupported'],
   ['an unknown key', input(service('db', { future: 1 })), 'service db: future', 'unsupported'],
-  ['a reserved label', input(service('db', { labels: { 'devenv.environment-id': 'x' } })), 'service db: label devenv.environment-id', 'unsupported'],
+  ['a reserved label', input(service('db', { labels: { 'nimblescape.devenv.environment-id': 'x' } })), 'service db: label nimblescape.devenv.environment-id', 'unsupported'],
   ['a repository file with an old engine', input(service('db', { volumes: [{ type: 'bind', source: `${REPO}/i.sql`, target: '/i' }] }), { engineApiVersion: '1.44' }), `service db: bind mount ${REPO}/i.sql → /i (needs Docker Engine 26 or newer)`, 'unsupported'],
 ];
 
@@ -187,7 +187,7 @@ describe('composeAccessClassification', () => {
 
   it('keeps the refusal that the switch does not lift when two rules name the same item', () => {
     // The same volume name in two keys: one of another program (computer), the same text never gets weaker.
-    const checked = input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`], volumeLabels: { [`${PROJECT}_pgdata`]: { 'devenv.environment-id': 'x' } } });
+    const checked = input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`], volumeLabels: { [`${PROJECT}_pgdata`]: { 'nimblescape.devenv.environment-id': 'x' } } });
     expect(composeAccessReport(checked, false).hostAccess).toEqual([`volume ${PROJECT}_pgdata of another environment`]);
   });
 

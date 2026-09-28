@@ -133,7 +133,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
   function dummyHelperImage(name: string, dummyTag?: string): string {
     const args = ['build', '-q', '--label', `${LABEL_HELPER}=true`, '--label', `${TEST_RUN_LABEL}=${run.runId}`];
     if (dummyTag) args.push('-t', dummyTag);
-    return cli.ok([...args, '-'], `FROM scratch\nLABEL devenv.test-dummy=${name}\n`);
+    return cli.ok([...args, '-'], `FROM scratch\nLABEL devenv-test.dummy=${name}\n`);
   }
 
   beforeAll(() => {

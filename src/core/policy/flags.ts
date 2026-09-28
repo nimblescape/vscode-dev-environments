@@ -24,10 +24,10 @@ import {
   MAX_STOP_TIMEOUT_SECONDS,
   OWN_LABELS,
   RESERVED_COMPOSE_LABEL,
-  RESERVED_LABEL,
   RESTART_POLICY,
   capabilityProblems,
   isHelperPath,
+  isReservedLabel,
   refusedVariable,
   securityOptionProblems,
 } from './rules';
@@ -282,17 +282,18 @@ export function portProblems(spec: string): string[] {
 }
 
 /**
- * `--label`: no key of RESERVED_LABEL (compared without case and surrounding spaces), except the exact labels that the
- * override configuration adds itself (OWN_LABELS). In `docker run`, the runArgs come after the id label of the Dev
- * Container CLI (`devenv.environment-id`), and the last label of a key wins: the extension and the Session Monitor would
- * no longer find the container, or take it for another environment.
+ * `--label`: no reserved key (isReservedLabel, compared without case and surrounding spaces), except the exact labels
+ * that the override configuration adds itself (OWN_LABELS). In `docker run`, the runArgs come after the id label of the
+ * Dev Container CLI (`nimblescape.devenv.environment-id`), and the last label of a key wins: the extension and the
+ * Session Monitor would no longer find the container, or take it for another environment. Other `devenv.…` keys are
+ * allowed.
  */
 function labelProblems(value: string): Problem[] {
   if (OWN_LABELS.includes(value)) return [];
   const index = value.indexOf('=');
   const key = (index < 0 ? value : value.slice(0, index)).trim();
   // Docker Compose too: a label com.docker.compose.project would make Delete of that project remove the container.
-  return RESERVED_LABEL.test(key) || RESERVED_COMPOSE_LABEL.test(key) ? [unsupported(`label ${key}`)] : [];
+  return isReservedLabel(key) || RESERVED_COMPOSE_LABEL.test(key) ? [unsupported(`label ${key}`)] : [];
 }
 
 /**

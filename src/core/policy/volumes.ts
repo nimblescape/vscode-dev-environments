@@ -47,9 +47,10 @@ export interface VolumeInput {
    */
   volumeLabels?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /**
-   * The environment that is checked (its ID and the GitHub user ID of its owner): an existing volume whose devenv labels
-   * name it is its own (isOwnVolume) and may be mounted, and so may an additional volume of another environment of the
-   * same owner (isSameOwnerAdditionalVolume). Without it, every volume with devenv.environment-id is refused.
+   * The environment that is checked (its ID and the GitHub user ID of its owner): an existing volume whose labels of
+   * Dev Environments name it is its own (isOwnVolume) and may be mounted, and so may an additional volume of another
+   * environment of the same owner (isSameOwnerAdditionalVolume). Without it, every volume with
+   * nimblescape.devenv.environment-id is refused.
    */
   environment?: { id: string; ownerId: string };
   /**
@@ -68,7 +69,7 @@ export interface NetworkState {
   name?: string;
   /** The labels of the network (`docker network inspect`). */
   labels: Readonly<Record<string, string>>;
-  /** The label devenv.environment-id of each container attached to the network that has it. */
+  /** The label nimblescape.devenv.environment-id of each container attached to the network that has it. */
   environments: readonly string[];
   /**
    * Of `environments`, those of registry entries of the owner of the checked environment (review round 2, P2-2): the
@@ -124,10 +125,11 @@ export function foreignVolumeName(name: string): string | undefined {
 }
 
 /**
- * True when the labels of a volume make it the own volume of the environment `environmentId`: devenv.environment-id is
- * that ID, and devenv.owner-id is the owner of the environment. The only rule by which the pipeline records an
- * additional volume and Delete removes one: a volume without these labels (for example one named with
- * `${devcontainerId}`, which Docker creates at `up`, or one of another program) is never the environment's.
+ * True when the labels of a volume make it the own volume of the environment `environmentId`:
+ * nimblescape.devenv.environment-id is that ID, and nimblescape.devenv.owner-id is the owner of the environment. The
+ * only rule by which the pipeline records an additional volume and Delete removes one: a volume without these labels
+ * (for example one named with `${devcontainerId}`, which Docker creates at `up`, or one of another program) is never
+ * the environment's.
  */
 export function isOwnVolume(labels: Readonly<Record<string, string>>, environmentId: string, ownerId: string): boolean {
   return labels[LABEL_ENVIRONMENT_ID] === environmentId && labels[LABEL_OWNER_ID] === ownerId;
@@ -136,9 +138,9 @@ export function isOwnVolume(labels: Readonly<Record<string, string>>, environmen
 /**
  * The program that created an existing volume, by its labels, for a volume that a repository did not create by its
  * mounts (Docker gives such a volume no labels): Docker Compose (the volume of a project, for example the data of a
- * database), the Dev Containers extension (hasDevContainersVolumeLabel), Docker itself
- * (an anonymous volume of another container), or Dev Environments (a volume of an environment, devenv.environment-id).
- * `undefined` for a volume without such labels.
+ * database), the Dev Containers extension (hasDevContainersVolumeLabel), Docker itself (an anonymous volume of another
+ * container), or Dev Environments (a volume of an environment, nimblescape.devenv.environment-id). `undefined` for a
+ * volume without such labels.
  */
 export function volumeLabelOwner(labels: Readonly<Record<string, string>>): string | undefined {
   const keys = Object.keys(labels);
@@ -155,11 +157,12 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
 }
 
 /**
- * True when the labels of a volume make it an additional volume (devenv.volume=additional) of an environment of the
- * GitHub user `ownerId`: devenv.environment-id is set, and devenv.owner-id is set and is that user. The environments of one account share such a volume,
- * for example `${localWorkspaceFolderBasename}-node_modules` of a fork and its upstream repository, or a fixed cache
- * name: each may mount it (mayMountEnvironmentVolume) and records it, so that the Delete of one keeps it while another
- * records it. A volume without the owner label and a workspace volume (no devenv.volume) are not.
+ * True when the labels of a volume make it an additional volume (nimblescape.devenv.volume=additional) of an
+ * environment of the GitHub user `ownerId`: nimblescape.devenv.environment-id is set, and nimblescape.devenv.owner-id
+ * is set and is that user. The environments of one account share such a volume, for example
+ * `${localWorkspaceFolderBasename}-node_modules` of a fork and its upstream repository, or a fixed cache name: each may
+ * mount it (mayMountEnvironmentVolume) and records it, so that the Delete of one keeps it while another records it. A
+ * volume without the owner label and a workspace volume (no nimblescape.devenv.volume) are not.
  */
 export function isSameOwnerAdditionalVolume(labels: Readonly<Record<string, string>>, ownerId: string): boolean {
   return (
@@ -170,10 +173,10 @@ export function isSameOwnerAdditionalVolume(labels: Readonly<Record<string, stri
 }
 
 /**
- * An existing volume with devenv labels that the environment may mount: its own (isOwnVolume), or an additional volume
- * of another environment of the same owner (isSameOwnerAdditionalVolume), whether that environment still exists or its
- * Delete kept the volume. A volume of another account, a volume without an owner label, and a workspace volume are
- * refused.
+ * An existing volume with labels of Dev Environments that the environment may mount: its own (isOwnVolume), or an
+ * additional volume of another environment of the same owner (isSameOwnerAdditionalVolume), whether that environment
+ * still exists or its Delete kept the volume. A volume of another account, a volume without an owner label, and a
+ * workspace volume are refused.
  */
 function mayMountEnvironmentVolume(labels: Readonly<Record<string, string>>, volumes: VolumeContext): boolean {
   const environment = volumes.environment;
@@ -264,13 +267,13 @@ export function resolveNetworkReference<T extends { name: string; id: string }>(
 export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 
 /**
- * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass
- * `protected`): named like the Compose project of another environment (isOtherEnvironmentProjectName), labelled by
- * Docker Compose for the project of another environment (`devenv-<8 hex>`), or with a container of another environment
- * attached (label devenv.environment-id) that is not an environment of the same owner (NetworkState.sameOwnerEnvironments,
+ * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass `protected`):
+ * named like the Compose project of another environment (isOtherEnvironmentProjectName), labelled by Docker Compose for
+ * the project of another environment (`devenv-<8 hex>`), or with a container of another environment attached (label
+ * nimblescape.devenv.environment-id) that is not an environment of the same owner (NetworkState.sameOwnerEnvironments,
  * review round 2, P2-2). The name rules apply to the written reference and to the name of the network that it resolves
- * to (NetworkState.name). `environmentId`: the environment that is checked (its own project and containers); without it,
- * every such network counts as another environment's. `undefined` for any other network.
+ * to (NetworkState.name). `environmentId`: the environment that is checked (its own project and containers); without
+ * it, every such network counts as another environment's. `undefined` for any other network.
  */
 export function foreignNetworkItem(name: string, state: NetworkState | undefined, environmentId: string | undefined): string | undefined {
   const project = environmentId === undefined ? '' : composeProjectName(environmentId);

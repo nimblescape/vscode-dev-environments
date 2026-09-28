@@ -12,8 +12,8 @@
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record (Delete of an environment)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
-// (protocol.ts); it never acts on a container without the label devenv.environment-id, and it removes nothing but its own
-// record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
+// (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
+// nothing but its own record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';

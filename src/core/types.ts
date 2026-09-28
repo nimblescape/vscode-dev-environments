@@ -101,9 +101,10 @@ export interface Environment {
   /** Named volumes of the configuration (`mounts` with `type=volume`), without the workspace volume. */
   additionalVolumes?: string[];
   /**
-   * Docker Compose (review round 1, D1): the named volumes that services other than the dev service mounted, recorded at
-   * each open from the checked model (composeServiceVolumeNames) and kept once recorded. Delete lists these volumes as
-   * data of the services (none ticked), whatever their label devenv.volume, also when the configuration cannot be read.
+   * Docker Compose (review round 1, D1): the named volumes that services other than the dev service mounted, recorded
+   * at each open from the checked model (composeServiceVolumeNames) and kept once recorded. Delete lists these volumes
+   * as data of the services (none ticked), whatever their label nimblescape.devenv.volume, also when the configuration
+   * cannot be read.
    */
   serviceVolumes?: string[];
   /**

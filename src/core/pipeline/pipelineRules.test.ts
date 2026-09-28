@@ -70,40 +70,41 @@ describe('configHash', () => {
 });
 
 describe('containerIsCurrent (concept section 9: containers of an older setup are created again)', () => {
-  // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
+  // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of
+  // nimblescape.devenv.container-version below.
   it.each<[string, Record<string, string>, boolean]>([
-    ['the current version', { 'devenv.container-version': '1' }, true],
-    ['a newer version', { 'devenv.container-version': '2' }, true],
-    ['an older value (a label other than 1, below it)', { 'devenv.container-version': '0' }, false],
-    ['no label', { 'devenv.environment-id': 'x' }, false],
-    ['an invalid label', { 'devenv.container-version': 'two' }, false],
-    ['an empty label', { 'devenv.container-version': '' }, false],
+    ['the current version', { 'nimblescape.devenv.container-version': '1' }, true],
+    ['a newer version', { 'nimblescape.devenv.container-version': '2' }, true],
+    ['an older value (a label other than 1, below it)', { 'nimblescape.devenv.container-version': '0' }, false],
+    ['no label', { 'nimblescape.devenv.environment-id': 'x' }, false],
+    ['an invalid label', { 'nimblescape.devenv.container-version': 'two' }, false],
+    ['an empty label', { 'nimblescape.devenv.container-version': '' }, false],
   ])('%s', (_name, labels, expected) => {
     expect(containerIsCurrent(labels)).toBe(expected);
   });
 
   it('counts a container created without the configuration as current only while the configuration cannot be read', () => {
-    const provisional = { 'devenv.container-version': '1', 'devenv.container-config': 'unknown' };
+    const provisional = { 'nimblescape.devenv.container-version': '1', 'nimblescape.devenv.container-config': 'unknown' };
     expect(containerIsCurrent(provisional)).toBe(false);
     expect(containerIsCurrent(provisional, true)).toBe(false);
     expect(containerIsCurrent(provisional, false)).toBe(true);
-    expect(containerIsCurrent({ 'devenv.container-version': '1' }, false)).toBe(true);
-    expect(containerIsCurrent({ 'devenv.container-config': 'unknown' }, false)).toBe(false);
+    expect(containerIsCurrent({ 'nimblescape.devenv.container-version': '1' }, false)).toBe(true);
+    expect(containerIsCurrent({ 'nimblescape.devenv.container-config': 'unknown' }, false)).toBe(false);
   });
 });
 
 describe('containerIsCurrent and the switch of the host access checks (concept section 9 "Host access")', () => {
-  const unrestricted = { 'devenv.container-version': '1', 'devenv.host-access': 'unrestricted' };
+  const unrestricted = { 'nimblescape.devenv.container-version': '1', 'nimblescape.devenv.host-access': 'unrestricted' };
 
   it.each<[string, Record<string, string>, 'on' | 'off', boolean, boolean]>([
     // [name, labels, switch, current with the configuration known, current without it]
     ['a container of the checks-off time, checks on', unrestricted, 'on', false, false],
     ['a container of the checks-off time, checks off', unrestricted, 'off', true, true],
-    ['a container with the checks, checks on', { 'devenv.container-version': '1' }, 'on', true, true],
-    ['a container with the checks, checks off (it has less access)', { 'devenv.container-version': '1' }, 'off', true, true],
-    ['another value of the label, checks on', { 'devenv.container-version': '1', 'devenv.host-access': 'other' }, 'on', true, true],
-    ['an older version of the checks-off time, checks off', { 'devenv.container-version': '0', 'devenv.host-access': 'unrestricted' }, 'off', false, false],
-    ['a container of the checks-off time without the configuration, checks off', { ...unrestricted, 'devenv.container-config': 'unknown' }, 'off', false, true],
+    ['a container with the checks, checks on', { 'nimblescape.devenv.container-version': '1' }, 'on', true, true],
+    ['a container with the checks, checks off (it has less access)', { 'nimblescape.devenv.container-version': '1' }, 'off', true, true],
+    ['another value of the label, checks on', { 'nimblescape.devenv.container-version': '1', 'nimblescape.devenv.host-access': 'other' }, 'on', true, true],
+    ['an older version of the checks-off time, checks off', { 'nimblescape.devenv.container-version': '0', 'nimblescape.devenv.host-access': 'unrestricted' }, 'off', false, false],
+    ['a container of the checks-off time without the configuration, checks off', { ...unrestricted, 'nimblescape.devenv.container-config': 'unknown' }, 'off', false, true],
   ])('%s', (_name, labels, checks, current, currentWithoutConfiguration) => {
     expect(containerIsCurrent(labels, true, checks)).toBe(current);
     expect(containerIsCurrent(labels, false, checks)).toBe(currentWithoutConfiguration);
@@ -112,8 +113,8 @@ describe('containerIsCurrent and the switch of the host access checks (concept s
   it('treats the checks as on by default', () => {
     expect(containerIsCurrent(unrestricted)).toBe(false);
     expect(isUnrestrictedContainer(unrestricted)).toBe(true);
-    expect(isUnrestrictedContainer({ 'devenv.container-version': '1' })).toBe(false);
-    expect(isUnrestrictedContainer({ 'devenv.host-access': 'Unrestricted' })).toBe(false);
+    expect(isUnrestrictedContainer({ 'nimblescape.devenv.container-version': '1' })).toBe(false);
+    expect(isUnrestrictedContainer({ 'nimblescape.devenv.host-access': 'Unrestricted' })).toBe(false);
   });
 });
 
@@ -551,8 +552,8 @@ describe('Docker Compose rules (unit 6)', () => {
 
   it('composeContainerOrder: the services start first and stop last', () => {
     const dev = { id: 'dev', labels: {} };
-    const db = { id: 'db', labels: { 'devenv.compose-service': 'db' } };
-    const cache = { id: 'cache', labels: { 'devenv.compose-service': 'cache' } };
+    const db = { id: 'db', labels: { 'nimblescape.devenv.compose-service': 'db' } };
+    const cache = { id: 'cache', labels: { 'nimblescape.devenv.compose-service': 'cache' } };
     expect(composeContainerOrder([dev, db, cache], 'start').map((c) => c.id)).toEqual(['db', 'cache', 'dev']);
     expect(composeContainerOrder([db, dev, cache], 'stop').map((c) => c.id)).toEqual(['dev', 'db', 'cache']);
   });

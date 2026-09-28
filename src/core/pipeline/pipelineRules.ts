@@ -33,17 +33,16 @@ export type { RefusedUpdate };
 export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
 
 /**
- * True for a container of the current setup: its label devenv.container-version is CONTAINER_VERSION or newer. The
- * pipeline creates a container without the label, or with an older value, again from its environment image; the volume
- * stays.
- * `configKnown`: the configuration of the repository can be read now. Then a container that was created without it
- * (label devenv.container-config=unknown) is not current either: it lacks the runArgs and appPort of the configuration.
- * While the configuration cannot be read, such a container is current, so it is only started and not created again at
- * every open.
- * `hostAccessChecks`: the switch of the repository now (hostAccessChecks in ../policy/hostAccessChecks.ts). While the checks
- * are on, a container that was created while they were off (label devenv.host-access=unrestricted,
- * isUnrestrictedContainer) is not current: the pipeline creates it again once the checks pass, and never starts it as
- * it is. While they are off, the label does not matter: a container created with the checks on has less access.
+ * True for a container of the current setup: its label nimblescape.devenv.container-version is CONTAINER_VERSION or
+ * newer. The pipeline creates a container without the label, or with an older value, again from its environment image;
+ * the volume stays. `configKnown`: the configuration of the repository can be read now. Then a container that was
+ * created without it (label nimblescape.devenv.container-config=unknown) is not current either: it lacks the runArgs
+ * and appPort of the configuration. While the configuration cannot be read, such a container is current, so it is only
+ * started and not created again at every open. `hostAccessChecks`: the switch of the repository now (hostAccessChecks
+ * in ../policy/hostAccessChecks.ts). While the checks are on, a container that was created while they were off (label
+ * nimblescape.devenv.host-access=unrestricted, isUnrestrictedContainer) is not current: the pipeline creates it again
+ * once the checks pass, and never starts it as it is. While they are off, the label does not matter: a container
+ * created with the checks on has less access.
  */
 export function containerIsCurrent(
   labels: Readonly<Record<string, string>>,
@@ -57,7 +56,10 @@ export function containerIsCurrent(
   return !configKnown || labels[LABEL_CONTAINER_CONFIG] !== CONTAINER_CONFIG_UNKNOWN;
 }
 
-/** True for a container that was created while the host access checks were off (label devenv.host-access=unrestricted). */
+/**
+ * True for a container that was created while the host access checks were off (label
+ * nimblescape.devenv.host-access=unrestricted).
+ */
 export function isUnrestrictedContainer(labels: Readonly<Record<string, string>>): boolean {
   return labels[LABEL_HOST_ACCESS] === HOST_ACCESS_UNRESTRICTED;
 }
@@ -572,13 +574,13 @@ export function serviceFoldersOf(env: Pick<Environment, 'serviceFolders'>): stri
 /**
  * Review round 11 (G3, G4): the paths of the repository that the existing containers of the other services of the
  * Docker Compose environment mount (not the dev container: the container with the name of the environment, or with the
- * label of the environment and without devenv.compose-service; a container of the project without the labels of the
- * environment, for example of `docker compose run`, counts as another service), from their mounts of subpaths of the
- * workspace volume `volumeName` (ContainerInfo.volumeSubpaths): the subpath joined to WORKSPACES_ROOT, where the dev
- * container and the helper mount the volume. As composeUpModel records them: not a read-only mount, and only a path
- * below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them). Only the path as
- * Docker has it, not the real path behind a link of the repository: review round 12 (P12-2), the ownership fixes resolve
- * the paths in the volume themselves (SERVICE_OWNER_FIX).
+ * label of the environment and without nimblescape.devenv.compose-service; a container of the project without the
+ * labels of the environment, for example of `docker compose run`, counts as another service), from their mounts of
+ * subpaths of the workspace volume `volumeName` (ContainerInfo.volumeSubpaths): the subpath joined to WORKSPACES_ROOT,
+ * where the dev container and the helper mount the volume. As composeUpModel records them: not a read-only mount, and
+ * only a path below the repository folder, never the folder itself or `.git` (serviceFolderPaths filters them). Only
+ * the path as Docker has it, not the real path behind a link of the repository: review round 12 (P12-2), the ownership
+ * fixes resolve the paths in the volume themselves (SERVICE_OWNER_FIX).
  */
 export function liveServiceFolders(
   containers: ReadonlyArray<Pick<ContainerInfo, 'name' | 'labels' | 'volumeSubpaths'>>,
@@ -752,8 +754,8 @@ export const COMPOSE_ONEOFF_LABEL = 'com.docker.compose.oneoff';
 
 /**
  * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the
- * other services (label devenv.compose-service) first and the dev container last, so that a database runs before the
- * lifecycle commands of the dev container need it; `stop` the reverse (the dev container first, D-20).
+ * other services (label nimblescape.devenv.compose-service) first and the dev container last, so that a database runs
+ * before the lifecycle commands of the dev container need it; `stop` the reverse (the dev container first, D-20).
  */
 export function composeContainerOrder<T extends { labels: Readonly<Record<string, string>> }>(containers: readonly T[], order: 'start' | 'stop'): T[] {
   const services = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);

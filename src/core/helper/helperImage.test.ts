@@ -52,7 +52,7 @@ type BuildOptions = Parameters<HelperImageDocker['buildImage']>[0];
 interface FakeImage {
   id: string;
   tags: string[];
-  /** Carries the label devenv.helper=true. */
+  /** Carries the label nimblescape.devenv.helper=true. */
   helper: boolean;
 }
 
@@ -99,14 +99,14 @@ class FakeDocker implements HelperImageDocker {
     this.builds.push(options);
     // Docker moves the tag only after a successful build.
     await this.buildHandler(options);
-    this.addImage([options.tag], { helper: options.labels?.['devenv.helper'] === 'true' });
+    this.addImage([options.tag], { helper: options.labels?.['nimblescape.devenv.helper'] === 'true' });
   }
 
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {
     this.labelQueries.push(label);
     if (this.listError) throw this.listError;
     return [...this.images.values()]
-      .filter((image) => label === 'devenv.helper=true' && image.helper)
+      .filter((image) => label === 'nimblescape.devenv.helper=true' && image.helper)
       .map((image) => ({ id: image.id, tags: [...image.tags], createdAt: '2026-09-01 10:00:00 +0200 CEST' }));
   }
 
@@ -205,7 +205,7 @@ describe('ensureHelperImage', () => {
       tag,
       dockerfile: file,
       context: path.dirname(file),
-      labels: { 'devenv.helper': 'true' },
+      labels: { 'nimblescape.devenv.helper': 'true' },
       buildArgs: { DEVCONTAINER_CLI_VERSION },
     });
     expect(docker.builds[0].onOutput).toBeTypeOf('function');
@@ -228,7 +228,7 @@ describe('ensureHelperImage', () => {
     expect(content).toMatch(/^ARG BASE_IMAGE=node:24-trixie-slim$/m);
     expect(content).toMatch(/^FROM \$\{BASE_IMAGE\}$/m);
     expect(content).toMatch(/^ARG DEVCONTAINER_CLI_VERSION$/m);
-    expect(content).toMatch(/^LABEL devenv\.helper=true$/m);
+    expect(content).toMatch(/^LABEL nimblescape\.devenv\.helper=true$/m);
     // The Docker CLI with the buildx and the Compose plugins from download.docker.com (Compose configurations, spec u6).
     expect(content).toMatch(/apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin;/);
     expect(content).toMatch(/^\s*docker compose version; \\$/m);
@@ -242,7 +242,7 @@ describe('ensureHelperImage', () => {
 });
 
 const BASE = 'node:24-trixie-slim';
-const HELPER_DOCKERFILE = `ARG BASE_IMAGE=${BASE}\nFROM \${BASE_IMAGE}\nLABEL devenv.helper=true\n`;
+const HELPER_DOCKERFILE = `ARG BASE_IMAGE=${BASE}\nFROM \${BASE_IMAGE}\nLABEL nimblescape.devenv.helper=true\n`;
 const DIGEST_A = `sha256:${'a'.repeat(64)}`;
 const DIGEST_B = `sha256:${'b'.repeat(64)}`;
 const START = Date.parse('2026-09-24T12:00:00Z');
@@ -316,7 +316,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(await h.ensure()).toBe(h.tag);
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual([BASE]);
     expect(h.docker.builds).toHaveLength(1);
-    expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, labels: { 'devenv.helper': 'true' } });
+    expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, labels: { 'nimblescape.devenv.helper': 'true' } });
     expect(h.docker.builds[0].noCache).toBeUndefined();
     expect(h.state()).toEqual({
       version: 1,
@@ -648,7 +648,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(await h.ensure({ onOutput: (text) => output.push(text), onBuild: (kind) => builds.push(kind) })).toBe(h.tag);
 
     expect(h.docker.builds).toHaveLength(1);
-    expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, noCache: true, labels: { 'devenv.helper': 'true' } });
+    expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, noCache: true, labels: { 'nimblescape.devenv.helper': 'true' } });
     // The build output reaches onOutput, and onBuild tells that an existing helper is updated.
     expect(output).toEqual(['#1 building\n']);
     expect(builds).toEqual(['refresh']);
@@ -958,7 +958,7 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     });
 
     expect(await h.ensure()).toBe(h.tag);
-    expect(h.docker.labelQueries).toEqual(['devenv.helper=true']);
+    expect(h.docker.labelQueries).toEqual(['nimblescape.devenv.helper=true']);
     expect([...h.docker.removals].sort()).toEqual([OLD_TAG, danglingId].sort());
     expect(h.docker.images.has(oldId)).toBe(false);
     expect(h.docker.images.has(danglingId)).toBe(false);

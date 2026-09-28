@@ -2,14 +2,15 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Unit 7, PR 2: the Session Monitor container of a remote Docker host, against the real Docker engine of the runner (the
-// same code path as on a remote host: RemoteSessionMonitor.ensure with the workspace helper image and the socket of the
-// engine). The script is bundled from src/remoteMonitor/main.ts like dist/remoteMonitor.js. The container, its volume, and
-// the test containers have names of this run; the test containers carry the label devenv.environment-id with new ids,
-// so the monitor acts on them. The tick of the monitor is shortened with DEVENV_MONITOR_TICK_MS (read only by main.ts).
-// Checked: a labeled container with a stale record is stopped; one whose record keeps it running is not; one with a
-// fresh heartbeat is not; one without any record is never touched; ensure on a running, a stopped, and a missing container; the records and forget subcommands;
-// an invalid heartbeat writes nothing.
+// Unit 7, PR 2: the Session Monitor container of a remote Docker host, against the real Docker engine of the runner
+// (the same code path as on a remote host: RemoteSessionMonitor.ensure with the workspace helper image and the socket
+// of the engine). The script is bundled from src/remoteMonitor/main.ts like dist/remoteMonitor.js. The container, its
+// volume, and the test containers have names of this run; the test containers carry the label
+// nimblescape.devenv.environment-id with new ids, so the monitor acts on them. The tick of the monitor is shortened
+// with DEVENV_MONITOR_TICK_MS (read only by main.ts). Checked: a labeled container with a stale record is stopped; one
+// whose record keeps it running is not; one with a fresh heartbeat is not; one without any record is never touched;
+// ensure on a running, a stopped, and a missing container; the records and forget subcommands; an invalid heartbeat
+// writes nothing.
 import * as crypto from 'crypto';
 import * as path from 'path';
 import * as esbuild from 'esbuild';

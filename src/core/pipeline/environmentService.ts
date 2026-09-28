@@ -436,8 +436,9 @@ export interface EnvironmentRuntimeState {
   container: ContainerState;
   volume: boolean;
   /**
-   * Review round 7, P7-2: `true` when a container of another service of Docker Compose (label devenv.compose-service)
-   * runs; not set otherwise. Stop stays offered while it runs, also when the dev container is stopped.
+   * Review round 7, P7-2: `true` when a container of another service of Docker Compose (label
+   * nimblescape.devenv.compose-service) runs; not set otherwise. Stop stays offered while it runs, also when the dev
+   * container is stopped.
    */
   servicesRunning?: boolean;
 }
@@ -763,7 +764,7 @@ export function kindSwitchFailure(
 
 /**
  * Labels of an additional volume that the pipeline creates before `up`: those of the workspace volume, and
- * devenv.volume=additional. Only these labels make a volume the environment's own (isOwnVolume).
+ * nimblescape.devenv.volume=additional. Only these labels make a volume the environment's own (isOwnVolume).
  */
 export function additionalVolumeLabels(environment: Environment): Record<string, string> {
   return { ...volumeLabels(environment), [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL };
@@ -1273,10 +1274,11 @@ export class EnvironmentService {
 
     let outcome: ContainerOutcome | undefined;
     // Review round 3 (D3-2): an entry without a build record (restored from its volumes, with the configuration path of
-    // the label devenv.config-path of its containers, or else the default one) whose containers are of the other kind
-    // than the configuration: the environment switches only when the user says so (a rebuild), never by the build of a
-    // first open. Review round 4 (D4-2): also when the dev container of Docker Compose is gone but containers of its other
-    // services exist; (D4-3) with a question of its own that names the switch and what it removes.
+    // the label nimblescape.devenv.config-path of its containers, or else the default one) whose containers are of the
+    // other kind than the configuration: the environment switches only when the user says so (a rebuild), never by the
+    // build of a first open. Review round 4 (D4-2): also when the dev container of Docker Compose is gone but
+    // containers of its other services exist; (D4-3) with a question of its own that names the switch and what it
+    // removes.
     const containersCompose = loaded && record === undefined && !ctx.forced ? await this.containersUseCompose(ctx.env, container) : undefined;
     if (loaded && containersCompose !== undefined && containersCompose !== (loaded.compose !== undefined)) {
       this.logger.info(
@@ -1979,7 +1981,9 @@ export class EnvironmentService {
     }
     // Concept 7.7: an update whose new image the host access policy refused is not built again for the same digests and
     // configuration; the existing environment starts. A changed digest or configuration, or a rebuild, tries again.
-    // Before a refused update counts as up to date below.
+    // Before a refused update counts as up to date below. The user saw the warning at the refusal
+    // (rememberRefusedUpdate); the later opens of the same refused update only log it (user report 2026-09-27: the
+    // warning at every open).
     const newerImages = check.kind === 'checked' && !check.upToDate;
     const refused = refusedUpdateOf(ctx.env);
     const refusedAgain =
@@ -1995,7 +1999,6 @@ export class EnvironmentService {
           ? `The update of ${ctx.env.repository} is too large or too complex to check (${refused.items}). The existing environment is used.`
           : `The update of ${ctx.env.repository} was refused by the host access policy (${refused.items}). The existing environment is used.`,
       );
-      this.deps.ui.warn(refused.reason === 'size' ? Messages.updateTooLarge(refused.items) : Messages.updateRefused(refused.items));
       check = { ...check, upToDate: true, changedImages: [], changedFeatures: [] };
     }
     const build = needsBuild({ ...input, check, containerExists });
@@ -2280,9 +2283,10 @@ export class EnvironmentService {
   }
 
   /**
-   * The new environment image of an update needs access to the computer (concept 7.7, section 9 "Host access"): the user
-   * learns what it needs, the existing environment starts, and the same update is not built again (planUpdate) until a
-   * digest or the configuration changes. Only an update after an image check can be recognized again.
+   * The new environment image of an update needs access to the computer (concept 7.7, section 9 "Host access"): the
+   * user learns what it needs (only here: the later opens of the same update log it, planUpdate), the existing
+   * environment starts, and the same update is not built again (planUpdate) until a digest or the configuration
+   * changes. Only an update after an image check can be recognized again.
    */
   private async rememberRefusedUpdate(
     ctx: PipelineContext,
@@ -2386,8 +2390,8 @@ export class EnvironmentService {
     imagePresent: boolean,
     loaded: LoadedConfiguration | undefined,
   ): Promise<ContainerOutcome> {
-    // Concept section 9: a container of an older setup (label devenv.container-version) is created again from its
-    // environment image, like a missing one. The volume stays. So is a container that was created without the
+    // Concept section 9: a container of an older setup (label nimblescape.devenv.container-version) is created again
+    // from its environment image, like a missing one. The volume stays. So is a container that was created without the
     // configuration (it could not be read then), once the configuration can be read: it lacks its runArgs and appPort.
     // So is a container that was created while the host access checks were off, once they are on again: it is created
     // again when the checks pass (the image metadata before `up`), and never started as it is.
@@ -2400,7 +2404,7 @@ export class EnvironmentService {
     if (container !== undefined && !outdated && compose && ctx.hostAccessChecks === 'on') {
       // The containers of the other services follow the same rule (containerIsCurrent): one that was created while the
       // checks were off makes the environment outdated; `up` then creates the dev container again, and Compose the
-      // services whose model changed (the label devenv.host-access is gone from it).
+      // services whose model changed (the label nimblescape.devenv.host-access is gone from it).
       const unrestricted = (await this.environmentContainers(ctx.env.id)).find(
         (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
       );
@@ -2828,7 +2832,10 @@ export class EnvironmentService {
     }
   }
 
-  /** The containers with the label devenv.environment-id of `environmentId`: the dev container and the other services. */
+  /**
+   * The containers with the label nimblescape.devenv.environment-id of `environmentId`: the dev container and the other
+   * services.
+   */
   private async environmentContainers(environmentId: string): Promise<ContainerInfo[]> {
     return (await this.deps.docker.listEnvironmentContainers()).filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === environmentId);
   }
@@ -3015,9 +3022,10 @@ export class EnvironmentService {
    * (buildComposeOverrideConfig), with the project name of the environment. When `up` creates the dev container
    * (`createsContainer`, concept section 9 "Host access"): the model is checked again with the labels of its volumes
    * now, the image metadata of the environment image is checked, and the named volumes of the model and of the `mounts`
-   * are created with the labels of the environment (devenv.volume=compose for the volumes of the project, `additional`
-   * for the others). The Dev Container CLI finds the dev container by the project and the service; `up` replaces only
-   * the dev container (removeExistingContainer), and Compose recreates the other services whose model or image changed.
+   * are created with the labels of the environment (nimblescape.devenv.volume=compose for the volumes of the project,
+   * `additional` for the others). The Dev Container CLI finds the dev container by the project and the service; `up`
+   * replaces only the dev container (removeExistingContainer), and Compose recreates the other services whose model or
+   * image changed.
    */
   private async runComposeUp(
     ctx: PipelineContext,
@@ -3373,11 +3381,11 @@ export class EnvironmentService {
   /**
    * Before `up` creates the containers of a Docker Compose configuration (D-7): the named volumes of the model and the
    * volumes of the `mounts` (composeMountVolumes) that do not exist are created with the labels of the environment, so
-   * that they are its own and our model can declare them external: devenv.volume=compose for a volume of the project
-   * (`<project>_<key>` of the model, the data of the services, and `<project>_<source>` of a `mounts` entry, which the
-   * CLI puts into the project), `additional` for the other ones (a volume that the model or a mount names itself, which
-   * another environment of the same owner may share). A `compose` volume is never shared with another environment
-   * (isSameOwnerAdditionalVolume needs `additional`).
+   * that they are its own and our model can declare them external: nimblescape.devenv.volume=compose for a volume of
+   * the project (`<project>_<key>` of the model, the data of the services, and `<project>_<source>` of a `mounts`
+   * entry, which the CLI puts into the project), `additional` for the other ones (a volume that the model or a mount
+   * names itself, which another environment of the same owner may share). A `compose` volume is never shared with
+   * another environment (isSameOwnerAdditionalVolume needs `additional`).
    */
   private async createComposeVolumes(ctx: PipelineContext, compose: LoadedCompose, mounts: { names: readonly string[]; sources: readonly string[] }): Promise<void> {
     const kinds = new Map<string, string>();
@@ -3413,12 +3421,13 @@ export class EnvironmentService {
 
   /**
    * The volumes of `names` that the pipeline records as additional volumes of `env`: existing volumes, other than the
-   * workspace volume, whose labels make them its own (isOwnVolume: devenv.environment-id and devenv.owner-id), and existing additional volumes of other environments of the same owner (isSameOwnerAdditionalVolume),
-   * which the environments of one account share (for example `${localWorkspaceFolderBasename}-node_modules` of a fork
-   * and its upstream repository). Such a record only protects the shared volume: the Delete of the other environment
-   * keeps a volume that another entry records, and the Delete of this one never removes it (removableVolumes: not its
-   * own). Any other volume (an anonymous volume, a volume of another program or account, a volume that Docker created at
-   * `up`) is never recorded, so Delete never removes it.
+   * workspace volume, whose labels make them its own (isOwnVolume: nimblescape.devenv.environment-id and
+   * nimblescape.devenv.owner-id), and existing additional volumes of other environments of the same owner
+   * (isSameOwnerAdditionalVolume), which the environments of one account share (for example
+   * `${localWorkspaceFolderBasename}-node_modules` of a fork and its upstream repository). Such a record only protects
+   * the shared volume: the Delete of the other environment keeps a volume that another entry records, and the Delete of
+   * this one never removes it (removableVolumes: not its own). Any other volume (an anonymous volume, a volume of
+   * another program or account, a volume that Docker created at `up`) is never recorded, so Delete never removes it.
    */
   private async recordedVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
     const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
@@ -3605,7 +3614,8 @@ export class EnvironmentService {
     if (gone.length > 0) await this.deps.registry.forgetKeptVolumes(gone);
     const kept = (file.keptVolumes ?? []).filter((record) => otherOwner(record.owner) && record.name in volumeLabels);
     // A volume that the environment recorded itself stays its own: after a lost registry, the restored entries of two
-    // accounts can both record a volume without devenv labels that their containers mount (protectedMountedVolumes).
+    // accounts can both record a volume without labels of Dev Environments that their containers mount
+    // (protectedMountedVolumes).
     const own = new Set(env.additionalVolumes ?? []);
     const foreignVolumes = [...others.flatMap((other) => other.additionalVolumes ?? []), ...kept.map((record) => record.name)].filter(
       (name) => !own.has(name),
@@ -3621,8 +3631,9 @@ export class EnvironmentService {
   /**
    * The networks of `names` (the references that the configuration writes) that exist (`docker network inspect`), each
    * under its reference (review round 2, S2-04: a name, an ID, or a unique prefix of an ID, resolveNetworkReference),
-   * with its name, its labels, and the environments of the containers attached to it (label devenv.environment-id), of
-   * which those of entries of the owner of `env` (review round 2, P2-2), for foreignNetworkItem.
+   * with its name, its labels, and the environments of the containers attached to it (label
+   * nimblescape.devenv.environment-id), of which those of entries of the owner of `env` (review round 2, P2-2), for
+   * foreignNetworkItem.
    */
   private async networkStates(env: Environment, names: readonly string[], entries: readonly Environment[]): Promise<Record<string, NetworkState>> {
     const states: Record<string, NetworkState> = {};
@@ -4200,8 +4211,9 @@ export class EnvironmentService {
   }
 
   /**
-   * The containers of the other services of a Docker Compose environment (label devenv.compose-service) are removed,
-   * before `up` creates a single container for a configuration that no longer uses Docker Compose. Their volumes stay.
+   * The containers of the other services of a Docker Compose environment (label nimblescape.devenv.compose-service) are
+   * removed, before `up` creates a single container for a configuration that no longer uses Docker Compose. Their
+   * volumes stay.
    */
   private async removeComposeServices(ctx: PipelineContext): Promise<void> {
     const services = (await this.environmentContainers(ctx.env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
@@ -4287,12 +4299,16 @@ export class EnvironmentService {
     }
   }
 
-  /** The running containers of the other services of a Docker Compose environment are stopped (label devenv.compose-service). */
   /**
-   * Review round 7, D7-1: a running container of another service of Docker Compose (label devenv.compose-service) is
-   * stopped before `docker rm -f` removes it (review round 9, D9-3: also a dev container), so that it can shut down cleanly (for example a database whose volume is
-   * kept) instead of a SIGKILL. `docker stop` gives it its own stop time (`stop_grace_period`, which the policy caps at
-   * 20 s, else 10 s). A failed stop is logged; the removal follows anyway.
+   * The running containers of the other services of a Docker Compose environment are stopped (label
+   * nimblescape.devenv.compose-service).
+   */
+  /**
+   * Review round 7, D7-1: a running container of another service of Docker Compose (label
+   * nimblescape.devenv.compose-service) is stopped before `docker rm -f` removes it (review round 9, D9-3: also a dev
+   * container), so that it can shut down cleanly (for example a database whose volume is kept) instead of a SIGKILL.
+   * `docker stop` gives it its own stop time (`stop_grace_period`, which the policy caps at 20 s, else 10 s). A failed
+   * stop is logged; the removal follows anyway.
    */
   private async stopServiceBeforeRemoval(container: ContainerInfo, env: Environment): Promise<void> {
     if (container.state !== 'running') return;
@@ -4701,13 +4717,14 @@ export class EnvironmentService {
   }
 
   /**
-   * Registry lost (concept 7.5): adds an entry for each volume with the label devenv.environment-id that the registry
-   * lacks, with the owner of its label devenv.owner-id; a volume without a valid owner label is skipped. A volume of a
-   * repository of which the owner account has an environment already is not added: one environment per repository and
-   * account (concept D-3). The additional volumes of an entry are its own labelled volumes (devenv.volume, isOwnVolume),
-   * the additional volumes of other environments of the same owner that its surviving container mounts
-   * (isSameOwnerAdditionalVolume), and the volumes without devenv labels that it mounts (protectedMountedVolumes), which
-   * protect them from other accounts and from the Delete of the other environments; Delete removes only the own ones. The entries have no build record, so the next
+   * Registry lost (concept 7.5): adds an entry for each volume with the label nimblescape.devenv.environment-id that
+   * the registry lacks, with the owner of its label nimblescape.devenv.owner-id; a volume without a valid owner label
+   * is skipped. A volume of a repository of which the owner account has an environment already is not added: one
+   * environment per repository and account (concept D-3). The additional volumes of an entry are its own labelled
+   * volumes (nimblescape.devenv.volume, isOwnVolume), the additional volumes of other environments of the same owner
+   * that its surviving container mounts (isSameOwnerAdditionalVolume), and the volumes without labels of Dev
+   * Environments that it mounts (protectedMountedVolumes), which protect them from other accounts and from the Delete
+   * of the other environments; Delete removes only the own ones. The entries have no build record, so the next
    * connection with internet access rebuilds the container. Returns the number of added entries. Does not start Docker.
    */
   async reconcileFromVolumes(): Promise<number> {
@@ -4723,7 +4740,7 @@ export class EnvironmentService {
     const candidates: Environment[] = [];
     const additional: VolumeInfo[] = [];
     for (const volume of volumes) {
-      // An additional volume (devenv.volume) joins the entry of its environment below.
+      // An additional volume (nimblescape.devenv.volume) joins the entry of its environment below.
       if (volume.labels[LABEL_VOLUME] !== undefined) {
         additional.push(volume);
         continue;
@@ -4790,10 +4807,10 @@ export class EnvironmentService {
       ]);
       if (serviceFolders.folders.length > 0) candidate.serviceFolders = serviceFolders.folders;
       if (serviceFolders.overflow) candidate.serviceFoldersOverflow = true;
-      // Review round 4 (D4-2): the configuration path of the label devenv.config-path of its dev container, when it is a
-      // configuration path of a repository (isConfigPathLabelValue); else the default one. Review round 6 (S6-2): only the
-      // dev container (a container without devenv.compose-service) counts; the label of another service can come from its
-      // image.
+      // Review round 4 (D4-2): the configuration path of the label nimblescape.devenv.config-path of its dev container,
+      // when it is a configuration path of a repository (isConfigPathLabelValue); else the default one. Review round 6
+      // (S6-2): only the dev container (a container without nimblescape.devenv.compose-service) counts; the label of
+      // another service can come from its image.
       const labelledPath = containers.find(
         (container) =>
           container.labels[LABEL_ENVIRONMENT_ID] === candidate.id && container.labels[LABEL_COMPOSE_SERVICE] === undefined && container.labels[LABEL_CONFIG_PATH] !== undefined,
@@ -4825,14 +4842,15 @@ export class EnvironmentService {
   }
 
   /**
-   * Registry lost: the named volumes without devenv labels that the container of a restored environment mounts (the
-   * container, which a lost registry does not remove, still mounts them), for example volumes that Docker created at `up`
-   * without labels. Recorded again, they protect the data of the environment: without them, the environment of
-   * another account could mount them (the host access policy refuses the recorded volumes of other accounts). Delete
-   * never removes them (removableVolumes: they are not the environment's own). Not a volume that the policy gives to
-   * something else by its name (the workspace volume, an anonymous volume, a volume of the Dev Containers extension, of
-   * the helper, or of another environment, foreignVolumeName) or by its labels (volumeLabelOwner: Docker Compose, the
-   * Dev Containers extension, an anonymous volume, a volume of an environment), and not a volume that does not exist.
+   * Registry lost: the named volumes without labels of Dev Environments that the container of a restored environment
+   * mounts (the container, which a lost registry does not remove, still mounts them), for example volumes that Docker
+   * created at `up` without labels. Recorded again, they protect the data of the environment: without them, the
+   * environment of another account could mount them (the host access policy refuses the recorded volumes of other
+   * accounts). Delete never removes them (removableVolumes: they are not the environment's own). Not a volume that the
+   * policy gives to something else by its name (the workspace volume, an anonymous volume, a volume of the Dev
+   * Containers extension, of the helper, or of another environment, foreignVolumeName) or by its labels
+   * (volumeLabelOwner: Docker Compose, the Dev Containers extension, an anonymous volume, a volume of an environment),
+   * and not a volume that does not exist.
    */
   private async protectedMountedVolumes(names: readonly string[], workspaceVolume: string): Promise<string[]> {
     const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined);
@@ -5152,17 +5170,18 @@ export class EnvironmentService {
   /**
    * The additional volumes that Delete of `environmentId` would remove (removableVolumes), for the question of Delete:
    * it lists only these, and keeps the others. Empty when the environment or Docker does not answer. Without the
-   * volumes of a Docker Compose project (devenv.volume=compose), which removableServiceDataVolumes lists for a question
-   * of their own.
+   * volumes of a Docker Compose project (nimblescape.devenv.volume=compose), which removableServiceDataVolumes lists
+   * for a question of their own.
    */
   async removableAdditionalVolumes(environmentId: string): Promise<string[]> {
     return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.kind !== VOLUME_KIND_COMPOSE).map((volume) => volume.name);
   }
 
   /**
-   * The volumes of the Docker Compose project of `environmentId` that Delete would remove (devenv.volume=compose, D-19):
-   * the data of its services, for example of a database. The question of Delete lists them apart, none ticked: they are
-   * removed only when the user ticks them. Empty when the environment or Docker does not answer.
+   * The volumes of the Docker Compose project of `environmentId` that Delete would remove
+   * (nimblescape.devenv.volume=compose, D-19): the data of its services, for example of a database. The question of
+   * Delete lists them apart, none ticked: they are removed only when the user ticks them. Empty when the environment or
+   * Docker does not answer.
    */
   async removableServiceDataVolumes(environmentId: string): Promise<string[]> {
     return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.kind === VOLUME_KIND_COMPOSE).map((volume) => volume.name);
@@ -5180,9 +5199,9 @@ export class EnvironmentService {
   /**
    * removableVolumes of the additional volumes of `environmentId`, each with its kind: VOLUME_KIND_COMPOSE for a volume
    * that holds data of the services of Docker Compose (review round 1, D1: classified by use, whatever its label
-   * devenv.volume; a volume with `name:` in the model has the label `additional`): the label `compose`, a volume that the
-   * open recorded as mounted by another service (Environment.serviceVolumes), or a volume that a container of another
-   * service mounts now. Otherwise its label devenv.volume.
+   * nimblescape.devenv.volume; a volume with `name:` in the model has the label `additional`): the label `compose`, a
+   * volume that the open recorded as mounted by another service (Environment.serviceVolumes), or a volume that a
+   * container of another service mounts now. Otherwise its label nimblescape.devenv.volume.
    */
   private async removableVolumesByKind(environmentId: string): Promise<Array<{ name: string; kind: string | undefined; possibly?: boolean }>> {
     const env = await this.deps.registry.get(environmentId);
@@ -5195,8 +5214,9 @@ export class EnvironmentService {
         if (!isDevContainer(container, env.containerName)) for (const name of container.volumes ?? []) services.add(name);
       }
       // Review round 2 (D2-3): an entry that knows neither the volumes of its services nor its build (for example one
-      // restored from its volumes, or whose service volume Docker created at `up` without the label devenv.service-data): every
-      // volume may hold the data of a service, so each goes to that question, none ticked (the conservative side).
+      // restored from its volumes, or whose service volume Docker created at `up` without the label
+      // nimblescape.devenv.service-data): every volume may hold the data of a service, so each goes to that question,
+      // none ticked (the conservative side).
       const unknown = env.serviceVolumes === undefined && env.buildRecord === undefined;
       const known = (name: string): boolean => services.has(name) || labels.get(name)?.[LABEL_SERVICE_DATA] === SERVICE_DATA;
       return removable.map((name) =>
@@ -5304,11 +5324,11 @@ export class EnvironmentService {
 
   /**
    * Delete and a failed first open of a Docker Compose environment (implementation notes, section "Docker Compose"),
-   * after the containers with the label devenv.environment-id: the containers of the project that have no such label
-   * (for example one-off containers of `docker compose run`), the networks of the project, and the images that Compose
-   * built for it (`<project>-<service>`, found by their names: the build record may be missing, after a failed first open
-   * or a lost registry). Its volumes are the environment's own and follow the rules of Delete (removeAdditionalVolumes).
-   * `quiet`: every failure is logged, not thrown (a failed first open).
+   * after the containers with the label nimblescape.devenv.environment-id: the containers of the project that have no
+   * such label (for example one-off containers of `docker compose run`), the networks of the project, and the images
+   * that Compose built for it (`<project>-<service>`, found by their names: the build record may be missing, after a
+   * failed first open or a lost registry). Its volumes are the environment's own and follow the rules of Delete
+   * (removeAdditionalVolumes). `quiet`: every failure is logged, not thrown (a failed first open).
    */
   private async removeComposeProject(env: Environment, quiet: boolean): Promise<void> {
     const { docker } = this.deps;
