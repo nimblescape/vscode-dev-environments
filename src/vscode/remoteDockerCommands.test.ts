@@ -162,12 +162,13 @@ describe('Use a Remote Docker Host…', () => {
     expect(test?.args).toEqual(['-H', 'ssh://build-box', 'info', '--format', ENGINE_INFO_FORMAT]);
     expect(test?.options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
     // The modal.
-    // User decision 2026-09-28 ("don't show again" for all Docker warnings): the second button "…, Don't Ask Again".
+    // User decision 2026-09-28 ("don't show again" for all Docker warnings): the second button; its answer counts for
+    // every host, and it says so (review, D2).
     expect(window.showWarningMessage).toHaveBeenCalledWith(
       'All Docker tools on this computer will use build-box until you switch back.',
       expect.objectContaining({ modal: true }),
       'Use build-box',
-      "Use build-box, Don't Ask Again",
+      "Use build-box, Don't Ask Again for Any Host",
     );
     // review, C1: the context of this host (before: `devenv-remote` for every host).
     expect(cli.changes).toEqual([
@@ -401,6 +402,15 @@ describe("Don't Ask Again for the Docker host questions", () => {
     window.showWarningMessage.mockClear();
     await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX))).resolves.toBe(true);
     expect(window.showWarningMessage.mock.calls.map((call) => call[0])).not.toContain(RemoteDockerTexts.confirmLocal);
+  });
+
+  it('labels the local question without "for Any Host"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await state.setDontAsk('switchBack');
+    await commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX));
+    const call = window.showWarningMessage.mock.calls.find((entry) => entry[0] === RemoteDockerTexts.confirmLocal);
+    expect(call?.slice(2)).toEqual([RemoteDockerTexts.useLocal, "Use the Local Docker, Don't Ask Again"]);
   });
 
   it('asks again after "Ask Again Before Changing the Docker Host"', async () => {
