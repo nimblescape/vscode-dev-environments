@@ -399,7 +399,6 @@ describe("Don't Ask Again for the Docker host questions", () => {
     await commands.useRemoteHost();
     expect(cli.current).toBe(BUILD_BOX);
     expect(await state.dontAsk('switchToRemote')).toBe(true);
-    window.showWarningMessage.mockClear();
     answer('gpu');
     window.showWarningMessage.mockClear();
     window.showWarningMessage.mockResolvedValue(undefined);
@@ -419,7 +418,8 @@ describe("Don't Ask Again for the Docker host questions", () => {
     await state.setDontAsk('switchToLocal');
     window.showWarningMessage.mockClear();
     await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX))).resolves.toBe(true);
-    expect(window.showWarningMessage.mock.calls.map((call) => call[0])).not.toContain(RemoteDockerTexts.confirmLocal);
+    // Both questions of this flow were answered so (review round 2): no modal at all.
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
   });
 
   it('labels the local question without "for Any Host"', async () => {
