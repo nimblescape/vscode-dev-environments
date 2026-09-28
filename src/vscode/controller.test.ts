@@ -22,7 +22,8 @@ import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import { availableEnvironments } from '../core/ownership';
 import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
-import { runWithDockerTarget } from '../core/docker/dockerTargets';
+import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
+import { silentLogger } from '../core/ports';
 import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
@@ -3390,10 +3391,38 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       return openResult((await h.registry.get(id))!);
     });
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.otherDockerHost('acme/api', 'build-box', ''));
+    // Review round 3 (H2): the message of this path says that the container stays and how to switch back.
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.otherDockerHostAfterStart('acme/api', 'build-box', ''));
     // Review round 1 (F2): the pending connection file of the pipeline is removed.
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  // Review round 3 (H1): the check reads the current context itself, although the operation's calls are pinned to its
+  // own context (DOCKER_CONTEXT), with the real DockerTargets.
+  it('does not connect the window when the current context changed during the start (real DockerTargets)', async () => {
+    const endpoints: Record<string, string> = { 'devenv-remote-11111111': 'ssh://build-box', default: 'unix:///var/run/docker.sock' };
+    let currentContext = 'devenv-remote-11111111';
+    const cli = {
+      isInstalled: () => true,
+      // As ContainerAdapter.run: the context of the running operation (DOCKER_CONTEXT) wins over the current one.
+      run: vi.fn(async (_args: readonly string[]) => {
+        const name = operationDockerTarget()?.context ?? currentContext;
+        return { exitCode: 0, stdout: JSON.stringify({ Name: name, Endpoints: { docker: { Host: endpoints[name] } } }), stderr: '', timedOut: false };
+      }),
+    };
+    recreateHarness({ dockerTargets: new DockerTargets(cli, {}, silentLogger, 'linux'), remoteDocker: remote });
+    await h.registry.add(remoteEnvironment());
+    h.service.openEnvironment.mockImplementation(async (id: string) => {
+      await h.sessionFiles.writePending(id, WINDOW_ID);
+      currentContext = 'default';
+      return openResult((await h.registry.get(id))!);
+    });
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.otherDockerHostAfterStart('acme/api', 'build-box', ''));
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 

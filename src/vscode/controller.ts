@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
-import { operationDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
@@ -2069,6 +2069,16 @@ export class Controller implements vscode.Disposable {
     }
   }
 
+  /** The state of the container as Docker reports it, or why it could not be read. */
+  private async containerStateText(containerName: string): Promise<string> {
+    if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
+    try {
+      return String(await this.deps.docker.containerState(containerName));
+    } catch (error) {
+      return `not readable: ${errorMessage(error)}`;
+    }
+  }
+
   private async containerRuns(containerName: string): Promise<boolean> {
     if (!this.deps.docker.isInstalled()) return false;
     try {
@@ -2485,23 +2495,28 @@ export class Controller implements vscode.Disposable {
    */
   private async readyForWindow(environment: Environment, containerName: string, signal: AbortSignal): Promise<UserFacingError | undefined> {
     const repository = this.displayName({ repository: environment.repository });
-    if (this.deps.dockerTargets) {
-      const current = await this.deps.dockerTargets.resolve();
+    const targets = this.deps.dockerTargets;
+    if (targets) {
+      // Review round 3 (H1): the current context itself, not the one this operation is pinned to (DOCKER_CONTEXT).
+      const current = await outsideOperation(() => targets.resolve());
       if (!isOnDockerHost(environment, current.host)) {
         const environmentHost = dockerHostOf(environment);
         this.logger.warn(
           `${repository} is not connected: Docker is set to ${describeDockerHost(current.host)} now, the container runs on ${describeDockerHost(environmentHost)}.`,
         );
-        return new UserFacingError('otherDockerHost', Messages.otherDockerHost(repository, environmentHost, current.host));
+        return new UserFacingError('otherDockerHost', Messages.otherDockerHostAfterStart(repository, environmentHost, current.host));
       }
     }
+    // Review round 3 (H3): the last state that Docker reported goes into the log (Show details).
+    let state = 'not read';
     for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
       if (signal.aborted) return undefined;
-      if (await this.containerRuns(containerName)) return undefined;
+      state = await this.containerStateText(containerName);
+      if (state === 'running') return undefined;
       if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS, signal);
     }
     if (signal.aborted) return undefined;
-    this.logger.warn(`${repository} is not connected: the container ${containerName} does not answer as running.`);
+    this.logger.warn(`${repository} is not connected: the container ${containerName} does not run (state: ${state}).`);
     return new UserFacingError('startFailed', Messages.containerNotReady(repository, containerName));
   }
 

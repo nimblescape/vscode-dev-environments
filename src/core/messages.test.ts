@@ -94,6 +94,23 @@ describe('the messages of a remote Docker host (unit 7)', () => {
     );
   });
 
+  // Review round 3 (H2, H3): the texts before the window connects.
+  it('names both hosts and the commands to switch back when the context changed during a start', () => {
+    const text = Messages.otherDockerHostAfterStart('acme/api', 'build-box', '');
+    expect(text).toContain('runs on build-box');
+    expect(text).toContain('Docker is now set to the local Docker');
+    expect(text).toContain('Use a Remote Docker Host…');
+    expect(text).toContain('Use the Local Docker');
+    expect(text).not.toContain('Nothing was changed');
+  });
+
+  it('points to the details, not to a short wait, when the container does not run', () => {
+    const text = Messages.containerNotReady('acme/api', 'devenv-acme-api-a1b2c3d4');
+    expect(text).toContain('does not run');
+    expect(text).toContain('details');
+    expect(text).not.toContain('yet');
+  });
+
   it('names the refused endpoint and the two commands', () => {
     const text = Messages.dockerEndpointUnsupported('tcp://192.0.2.10:2376');
     expect(text).toContain('tcp://192.0.2.10:2376');
