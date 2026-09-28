@@ -66,12 +66,16 @@ describe('EXTENSION_LABEL_KEYS', () => {
 
   it('holds exactly the labels of the extension', () => {
     expect([...EXTENSION_LABEL_KEYS].map((key) => key.slice(LABEL_PREFIX.length)).sort()).toEqual([
+      // Review round 1 of the helper channel (S1): the label of the containers that a cancel of an operation removes.
+      'channel-step',
       'compose-service',
       'config-path',
       'container-config',
       'container-version',
       'environment-id',
       'helper',
+      // User request 2026-09-28 (the helper channel, step 1): the label of the container of a channel.
+      'helper-channel',
       'helper-run',
       'host-access',
       'owner-id',

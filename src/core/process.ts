@@ -2,10 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
-import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
+import { abortError, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedProcess } from './ports';
 
 /**
  * Review round 9 (S9-2): a program printed more than MAX_CAPTURED_OUTPUT_BYTES on its standard output. It was stopped,
@@ -20,6 +20,32 @@ export class OutputTooLargeError extends Error {
 }
 
 /**
+ * Review round 4 (M3): the programs of `start` that still run when this process exits (the extension host ends: VS Code
+ * does not end its children, and no timer runs anymore) are ended synchronously by one exit handler.
+ */
+const runningStarted = new Set<() => void>();
+let exitHookInstalled = false;
+function killStartedOnExit(killNow: () => void): () => void {
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    process.on('exit', () => {
+      for (const kill of [...runningStarted]) {
+        try {
+          kill();
+        } catch {
+          // The others still.
+        }
+      }
+    });
+  }
+  runningStarted.add(killNow);
+  return () => runningStarted.delete(killNow);
+}
+
+/** A program of `start` that did not end on `kill` gets SIGKILL after this time (review round 1, L2). */
+export const START_KILL_GRACE_MS = 5_000;
+
+/**
  * ProcessRunner with `child_process.spawn`, without a shell. Review round 9 (S9-2): at most `maxStdoutBytes` of
  * standard output are kept; beyond, the program is stopped and `run` rejects with OutputTooLargeError. Review round 10
  * (S10-5): of the standard error output, only the last `maxStderrCharacters` characters are kept (the program goes on;
@@ -29,13 +55,22 @@ export class OutputTooLargeError extends Error {
 export class NodeProcessRunner implements ProcessRunner {
   private readonly platform: NodeJS.Platform;
   private readonly killTree: (pid: number, fallback: () => void) => void;
+  private readonly startKillGraceMs: number;
+  private readonly killChildren: (pid: number, done: () => void) => void;
 
   constructor(
     private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
     private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
-    options: { platform?: NodeJS.Platform; killTree?: (pid: number, fallback: () => void) => void } = {},
+    options: {
+      platform?: NodeJS.Platform;
+      killTree?: (pid: number, fallback: () => void) => void;
+      startKillGraceMs?: number;
+      killChildren?: (pid: number, done: () => void) => void;
+    } = {},
   ) {
+    this.killChildren = options.killChildren ?? runPkillChildren;
     this.platform = options.platform ?? process.platform;
+    this.startKillGraceMs = options.startKillGraceMs ?? START_KILL_GRACE_MS;
     this.killTree = options.killTree ?? ((pid, fallback) => runTaskkill(pid, process.env, fallback));
   }
 
@@ -156,6 +191,129 @@ export class NodeProcessRunner implements ProcessRunner {
       else child.stdin.end();
     });
   }
+
+  /**
+   * The helper channel (user request 2026-09-28): a program whose standard input stays open. Its output goes to the
+   * listeners as it comes, without a limit (the channel checks the length of its lines). `kill` stops it as `run` does
+   * after a time limit (on Windows the process tree: docker.exe starts ssh.exe).
+   */
+  start(file: string, args: readonly string[], options: StartOptions = {}): StartedProcess {
+    const child = spawn(file, [...args], {
+      env: options.env ?? process.env,
+      cwd: options.cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stdoutDecoder = new TextDecoder('utf-8');
+    const stderrDecoder = new TextDecoder('utf-8');
+    let stdoutListener: ((text: string) => void) | undefined;
+    let stderrListener: ((text: string) => void) | undefined;
+    // Output that came before a listener was set.
+    let pendingStdout = '';
+    let pendingStderr = '';
+    const deliverStdout = (text: string) => {
+      if (text === '') return;
+      if (stdoutListener) stdoutListener(text);
+      else pendingStdout += text;
+    };
+    const deliverStderr = (text: string) => {
+      if (text === '') return;
+      if (stderrListener) stderrListener(text);
+      else pendingStderr += text;
+    };
+    child.stdout.on('data', (chunk: Buffer) => deliverStdout(stdoutDecoder.decode(chunk, { stream: true })));
+    child.stderr.on('data', (chunk: Buffer) => deliverStderr(stderrDecoder.decode(chunk, { stream: true })));
+    // EPIPE after the program ended; `exited` reports the end.
+    child.stdin.on('error', () => {});
+    let ended = false;
+    const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
+      child.on('error', (error) => {
+        if (ended) return;
+        ended = true;
+        resolve({ exitCode: null, error });
+      });
+      child.on('close', (code) => {
+        if (ended) return;
+        ended = true;
+        deliverStdout(stdoutDecoder.decode());
+        deliverStderr(stderrDecoder.decode());
+        resolve({ exitCode: code });
+      });
+    });
+    // Review round 4 (M3): synchronous, for the end of the extension host: the programs that it started first (pkill
+    // -P; Windows: taskkill /T /F of the tree), then it.
+    const killNow = () => {
+      if (ended || child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+      try {
+        if (this.platform === 'win32') {
+          const { file, args } = windowsTreeKillCommand(child.pid, process.env);
+          spawnSync(file, args, { shell: false, windowsHide: true, stdio: 'ignore', timeout: 2_000 });
+        } else {
+          spawnSync('pkill', ['-KILL', '-P', String(child.pid)], { shell: false, stdio: 'ignore', timeout: 2_000 });
+        }
+      } catch {
+        // SIGKILL below still.
+      }
+      child.kill('SIGKILL');
+    };
+    const forget = killStartedOnExit(killNow);
+    void exited.then(forget);
+    return {
+      killNow,
+      write: (text) => {
+        if (ended || child.stdin.destroyed || !child.stdin.writable) return false;
+        child.stdin.write(text);
+        return true;
+      },
+      end: () => {
+        if (!child.stdin.destroyed) child.stdin.end();
+      },
+      kill: () => {
+        if (ended) return;
+        this.stop(child);
+        // Review round 1 (L2): `docker run -i` passes SIGTERM on to its container over its connection and waits; over a
+        // hung connection it would never end. So SIGKILL after START_KILL_GRACE_MS (Windows: taskkill /F ended it).
+        const timer = setTimeout(() => {
+          // Review round 3 (K2): `exitCode`/`signalCode` are set on 'exit', which can come well before 'close' (a
+          // program that still holds its pipes); after it, the pid may belong to another program already.
+          if (ended || child.exitCode !== null || child.signalCode !== null) return;
+          // Review round 2 (A3): first the programs that it started (the Docker CLI starts `ssh` in a session of its own,
+          // which no signal to docker reaches; on Linux it would die with it, on macOS it would stay), then docker. Only
+          // after pkill ended (at most 1 s): a docker killed before would leave its children to process 1, where
+          // `pkill -P` no longer finds them.
+          const killDocker = () => {
+            if (!ended) child.kill('SIGKILL');
+          };
+          if (this.platform === 'win32' || child.pid === undefined) {
+            killDocker();
+            return;
+          }
+          const fallback = setTimeout(killDocker, 1_000);
+          fallback.unref?.();
+          this.killChildren(child.pid, () => {
+            clearTimeout(fallback);
+            killDocker();
+          });
+        }, this.startKillGraceMs);
+        timer.unref?.();
+      },
+      onStdout: (listener) => {
+        stdoutListener = listener;
+        const text = pendingStdout;
+        pendingStdout = '';
+        if (text !== '') listener(text);
+      },
+      onStderr: (listener) => {
+        stderrListener = listener;
+        const text = pendingStderr;
+        pendingStderr = '';
+        if (text !== '') listener(text);
+      },
+      exited,
+      pid: child.pid,
+    };
+  }
 }
 
 /**
@@ -167,6 +325,16 @@ export function windowsTreeKillCommand(pid: number, env: NodeJS.ProcessEnv): { f
   const root = Object.keys(env).find((key) => key.toUpperCase() === 'SYSTEMROOT');
   const systemRoot = (root !== undefined ? env[root] : undefined) || 'C:\\Windows';
   return { file: path.win32.join(systemRoot, 'System32', 'taskkill.exe'), args: ['/T', '/F', '/PID', String(Math.trunc(pid))] };
+}
+
+/**
+ * Review round 2 (A3): SIGKILL to the programs that `pid` started (`pkill -KILL -P <pid>`, macOS and Linux), never
+ * through a shell. A failure changes nothing (the program ended already, or pkill is missing).
+ */
+function runPkillChildren(pid: number, done: () => void): void {
+  const killer = spawn('pkill', ['-KILL', '-P', String(Math.trunc(pid))], { shell: false, stdio: 'ignore' });
+  killer.on('error', done);
+  killer.on('close', done);
 }
 
 function runTaskkill(pid: number, env: NodeJS.ProcessEnv, fallback: () => void): void {

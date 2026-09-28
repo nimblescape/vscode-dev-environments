@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { execFileSync } from 'child_process';
 import { Readable } from 'stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
@@ -105,5 +106,166 @@ describe('the end of a program on Windows: its whole process tree (review, C3)',
     const runner = new NodeProcessRunner(undefined, undefined, { platform: 'win32', killTree: (_pid, fallback) => fallback() });
     const result = await runner.run(node, sleeper, { timeoutMs: 200 });
     expect(result.timedOut).toBe(true);
+  });
+});
+
+describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)', () => {
+  it('keeps the input open: writes reach the program as they come, its output comes as it is written, end closes the input', async () => {
+    const echo = 'process.stdin.setEncoding("utf8"); process.stdin.on("data", (d) => process.stdout.write("got " + d)); process.stdin.on("end", () => process.exit(4));';
+    const started = new NodeProcessRunner().start(node, ['-e', echo]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    expect(started.write('one\n')).toBe(true);
+    for (let wait = 0; wait < 100 && !stdout.includes('one'); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(stdout).toBe('got one\n');
+    started.write('two ä\n');
+    started.end();
+    expect(await started.exited).toEqual({ exitCode: 4 });
+    expect(stdout).toBe('got one\ngot two ä\n');
+    expect(started.write('late')).toBe(false);
+  });
+
+  it('keeps output that came before a listener was set', async () => {
+    const started = new NodeProcessRunner().start(node, ['-e', 'process.stdout.write("early"); process.stderr.write("err")']);
+    await started.exited;
+    const out: string[] = [];
+    started.onStdout((text) => out.push(text));
+    started.onStderr((text) => out.push(text));
+    expect(out).toEqual(['early', 'err']);
+  });
+
+  it('kill stops it, on win32 with its process tree', async () => {
+    const killTree = vi.fn((pid: number) => process.kill(pid));
+    const started = new NodeProcessRunner(undefined, undefined, { platform: 'win32', killTree }).start(node, ['-e', 'setInterval(() => {}, 1000)']);
+    started.kill();
+    expect((await started.exited).exitCode).not.toBe(0);
+    expect(killTree).toHaveBeenCalledTimes(1);
+  });
+
+  it('kill sends SIGKILL after the grace time to a program that does not end on SIGTERM (review round 1, L2)', async () => {
+    if (process.platform === 'win32') return;
+    const ignoring = 'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 1000)';
+    const started = new NodeProcessRunner(undefined, undefined, { startKillGraceMs: 300 }).start(node, ['-e', ignoring]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout !== 'ready'; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const killedAt = Date.now();
+    started.kill();
+    const { exitCode } = await started.exited;
+    expect(exitCode).toBeNull();
+    expect(Date.now() - killedAt).toBeGreaterThanOrEqual(250);
+  });
+
+  it('sends no pkill for a program that exited already (review round 3, K2: its pid may be another program now)', async () => {
+    if (process.platform === 'win32') return;
+    const killed: number[] = [];
+    const runner = new NodeProcessRunner(undefined, undefined, {
+      startKillGraceMs: 200,
+      killChildren: (pid, done) => {
+        killed.push(pid);
+        done();
+      },
+    });
+    // It exits on SIGTERM, but a detached grandchild keeps its stdout open, so 'close' comes late.
+    const script = [
+      'const { spawn } = require("child_process");',
+      'spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { detached: true, stdio: ["ignore", "inherit", "inherit"] }).unref();',
+      'process.on("SIGTERM", () => process.exit(0));',
+      'process.stdout.write("ready");',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = runner.start(node, ['-e', script]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout !== 'ready'; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    started.kill();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(killed).toEqual([]);
+    await started.exited;
+  });
+
+  it('the SIGKILL goes first to the programs that it started (review round 2, A3: the ssh of the Docker CLI)', async () => {
+    if (process.platform === 'win32') return;
+    const killed: number[] = [];
+    const runner = new NodeProcessRunner(undefined, undefined, {
+      startKillGraceMs: 200,
+      killChildren: (pid, done) => {
+        killed.push(pid);
+        done();
+      },
+    });
+    const started = runner.start(node, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)']);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    started.kill();
+    await started.exited;
+    expect(killed).toEqual([started.pid]);
+  });
+
+  it('pkill ends a child in a session of its own, which no signal to its parent reaches', async () => {
+    if (process.platform === 'win32') return;
+    // A parent that ignores SIGTERM starts a detached child (setsid) that ignores SIGTERM too, and prints its pid.
+    const parent = [
+      'const { spawn } = require("child_process");',
+      'process.on("SIGTERM", () => {});',
+      'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+      'process.stdout.write(String(child.pid));',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = new NodeProcessRunner(undefined, undefined, { startKillGraceMs: 200 }).start(node, ['-e', parent]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout === ''; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const childPid = Number(stdout);
+    expect(childPid).toBeGreaterThan(0);
+    started.kill();
+    await started.exited;
+    // Ended: gone, or a zombie that nobody reaps (its parent was killed; process 1 of a container may not reap it).
+    // Review round 3 (K6): only "no such process" counts as gone; without `ps` the test fails instead of passing.
+    const alive = () => {
+      try {
+        const state = execFileSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).trim();
+        return state !== '' && !state.startsWith('Z');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
+        return false;
+      }
+    };
+    for (let wait = 0; wait < 100 && alive(); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(alive()).toBe(false);
+  });
+
+  it('killNow ends it and the programs that it started synchronously (review round 4, M3: the end of the extension host)', async () => {
+    if (process.platform === 'win32') return;
+    const parent = [
+      'const { spawn } = require("child_process");',
+      'process.on("SIGTERM", () => {});',
+      'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+      'process.stdout.write(String(child.pid));',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = new NodeProcessRunner().start(node, ['-e', parent]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout === ''; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const childPid = Number(stdout);
+    started.killNow?.();
+    expect((await started.exited).exitCode).toBeNull();
+    const state = () => {
+      try {
+        return execFileSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
+        return '';
+      }
+    };
+    for (let wait = 0; wait < 100 && state() !== '' && !state().startsWith('Z'); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(state() === '' || state().startsWith('Z')).toBe(true);
+  });
+
+  it('reports a program that cannot be started in `exited`, without throwing', async () => {
+    const started = new NodeProcessRunner().start('/nonexistent/program-of-the-test', []);
+    const { exitCode, error } = await started.exited;
+    expect(exitCode).toBeNull();
+    expect((error as NodeJS.ErrnoException).code).toBe('ENOENT');
   });
 });

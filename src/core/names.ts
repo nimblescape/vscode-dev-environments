@@ -4,6 +4,7 @@
 
 // Names and labels (implementation notes 5).
 import * as crypto from 'crypto';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from './helperChannel/protocol';
 import { LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
 
 /**
@@ -139,6 +140,8 @@ export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
   LABEL_HELPER,
   LABEL_HELPER_RUN,
   LABEL_SESSION_MONITOR,
+  LABEL_HELPER_CHANNEL,
+  LABEL_CHANNEL_STEP,
 ]);
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
 /** Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI). */
