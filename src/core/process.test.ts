@@ -141,6 +141,20 @@ describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)'
     expect(killTree).toHaveBeenCalledTimes(1);
   });
 
+  it('kill sends SIGKILL after the grace time to a program that does not end on SIGTERM (review round 1, L2)', async () => {
+    if (process.platform === 'win32') return;
+    const ignoring = 'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 1000)';
+    const started = new NodeProcessRunner(undefined, undefined, { startKillGraceMs: 300 }).start(node, ['-e', ignoring]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout !== 'ready'; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const killedAt = Date.now();
+    started.kill();
+    const { exitCode } = await started.exited;
+    expect(exitCode).toBeNull();
+    expect(Date.now() - killedAt).toBeGreaterThanOrEqual(250);
+  });
+
   it('reports a program that cannot be started in `exited`, without throwing', async () => {
     const started = new NodeProcessRunner().start('/nonexistent/program-of-the-test', []);
     const { exitCode, error } = await started.exited;

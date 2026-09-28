@@ -12,17 +12,21 @@ import { OutputTooLargeError } from '../process';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
+  CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
   CHANNEL_PING_INTERVAL_MS,
   CHANNEL_PONG_TIMEOUT_MS,
   CHANNEL_PROTOCOL_VERSION,
   LineSplitter,
   MAX_CHANNEL_SCRIPT_LENGTH,
+  MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
   MAX_SERVER_LINE,
   OP_DOCKER,
   encodeMessage,
   encodeScript,
+  isSecret,
+  parseDockerOperationParams,
   parseDockerOperationValue,
   parseServerMessage,
   type ClientMessage,
@@ -33,17 +37,23 @@ import {
 export const CHANNEL_OPEN_TIMEOUT_MS = 120_000;
 /** After `close`, `docker run` gets this long to end by itself before it is stopped. */
 export const CHANNEL_CLOSE_KILL_MS = 5_000;
-/** The extension waits this much longer than the time limit of an operation for its result before it gives up. */
-export const CHANNEL_RESULT_GRACE_MS = CHANNEL_KILL_GRACE_MS + 15_000;
+/**
+ * The extension waits this much longer than the time limit of an operation for its result before it gives up. Review
+ * round 1 (P4): longer than the worst case of the script (the kill grace, then the cleanup), so that the caller learns of
+ * the time limit only after the containers of the operation are removed.
+ */
+export const CHANNEL_RESULT_GRACE_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS + 15_000;
 
 /**
  * The channel cannot be used. `closed`: it was closed or lost before the operation was sent (the caller can take the
- * way without the channel). `lost`: the connection ended while the operation ran (its outcome is not known). `open`: it
- * could not be opened. `protocol`: the script answered with something invalid.
+ * way without the channel). `unsendable` (review round 1, P2, S6): the channel cannot carry this request (a line longer
+ * than the script reads, parameters beyond the limits of the operation, a secret that cannot be masked); it was not
+ * sent, and the caller can take the way without the channel. `lost`: the connection ended while the operation ran (its
+ * outcome is not known). `open`: it could not be opened. `protocol`: the script answered with something invalid.
  */
 export class HelperChannelError extends Error {
   constructor(
-    readonly code: 'closed' | 'lost' | 'open' | 'protocol',
+    readonly code: 'closed' | 'unsendable' | 'lost' | 'open' | 'protocol',
     message: string,
   ) {
     super(message);
@@ -75,9 +85,18 @@ export interface OperationOptions {
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
 }
 
-/** Options of HelperChannel.docker: those of a Docker call, and the containers to remove on a cancel. */
+/** Options of HelperChannel.docker: those of a Docker call, and what to remove on a cancel. */
 export interface ChannelDockerOptions extends Pick<RunOptions, 'input' | 'timeoutMs' | 'signal' | 'onStdout' | 'onStderr'> {
-  cleanup?: string[];
+  /**
+   * Review round 1 (S1): a cleanup label value (isCleanupLabel, protocol.ts). The args must put channelStepLabel(cleanup)
+   * on each container that the call starts; a cancel removes exactly the containers with that label.
+   */
+  cleanup?: string;
+  /**
+   * Review round 1 (S4): the input of the call when it is a secret (the GitHub token): it travels as the secret of the
+   * operation and is masked in everything that the helper sends back. Not together with `input`.
+   */
+  secretInput?: string;
 }
 
 export interface HelperChannelOptions {
@@ -108,7 +127,12 @@ export class HelperChannel {
   private pingNumber = 0;
   private lastHeard = Date.now();
   private readonly pending = new Map<number, Pending>();
-  /** Operations that wait for a free place (MAX_CONCURRENT_OPERATIONS). */
+  /**
+   * Review round 1 (L1, L5): the places of MAX_CONCURRENT_OPERATIONS that operations hold (sent, or about to be sent).
+   * A place that ends goes straight to the next waiting operation, so no other caller can take it in between.
+   */
+  private slots = 0;
+  /** Operations that wait for a free place; each gets the place of the operation that ended. */
   private readonly waiting: (() => void)[] = [];
   private readonly closeListeners = new Set<(reason: string) => void>();
   private pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -172,9 +196,11 @@ export class HelperChannel {
       const detail = error ? error.message : this.stderrTail.trim() || `exit code ${exitCode}`;
       this.lose(`the helper ended (${detail})`);
     });
-    if (script.length > MAX_CHANNEL_SCRIPT_LENGTH) {
+    // Review round 1 (P6): the loader limits the escaped line, so the same is checked here.
+    const scriptLine = encodeScript(script);
+    if (scriptLine.length - 1 > MAX_CHANNEL_SCRIPT_LENGTH) {
       this.lose('the script is too long');
-      throw new HelperChannelError('open', `The script of the helper channel is too long (${script.length} characters).`);
+      throw new HelperChannelError('open', `The script of the helper channel is too long (${scriptLine.length - 1} characters as JSON).`);
     }
     const openTimeoutMs = this.options.openTimeoutMs ?? CHANNEL_OPEN_TIMEOUT_MS;
     let openTimer: ReturnType<typeof setTimeout> | undefined;
@@ -184,7 +210,7 @@ export class HelperChannel {
       openTimer = setTimeout(() => reject(new Error(`no answer within ${openTimeoutMs / 1000} seconds`)), openTimeoutMs);
       removeCloseListener = this.onClose((reason) => reject(new Error(reason)));
     });
-    this.process.write(encodeScript(script));
+    this.process.write(scriptLine);
     this.send({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION });
     let answer: Extract<ServerMessage, { t: 'hello' }>;
     try {
@@ -195,6 +221,10 @@ export class HelperChannel {
     } finally {
       clearTimeout(openTimer);
       removeCloseListener?.();
+    }
+    // Review round 1 (L4): the same piece of output may have ended the channel right after the answer.
+    if (this.state === 'closed') {
+      throw new HelperChannelError('open', `The helper channel to ${name} could not be opened: ${this.closedReason ?? 'it was closed'}.`);
     }
     if (answer.protocol !== CHANNEL_PROTOCOL_VERSION) {
       this.close();
@@ -209,10 +239,15 @@ export class HelperChannel {
   }
 
   private send(message: ClientMessage): boolean {
+    return this.write(encodeMessage(message));
+  }
+
+  /** Writes a line; a failed write loses the channel. */
+  private write(line: string): boolean {
     if (this.state === 'closed') return false;
     let written = false;
     try {
-      written = this.process.write(encodeMessage(message));
+      written = this.process.write(line);
     } catch {
       written = false;
     }
@@ -222,7 +257,7 @@ export class HelperChannel {
 
   private ping(): void {
     if (this.state !== 'open') return;
-    if (Date.now() - this.lastHeard > (this.options.pongTimeoutMs ?? CHANNEL_PONG_TIMEOUT_MS)) {
+    if (Date.now() - this.lastHeard >= (this.options.pongTimeoutMs ?? CHANNEL_PONG_TIMEOUT_MS)) {
       this.lose('the helper does not answer');
       return;
     }
@@ -286,42 +321,78 @@ export class HelperChannel {
     else this.options.logger.warn(line);
   }
 
-  /** Removes an operation from the pending ones and lets the next waiting one go. */
+  /** Removes an operation from the pending ones and gives its place to the next waiting one. */
   private finish(id: number): Pending | undefined {
     const pending = this.pending.get(id);
     if (!pending) return undefined;
     this.pending.delete(id);
     if (pending.timer) clearTimeout(pending.timer);
     if (pending.onAbort) pending.options.signal?.removeEventListener('abort', pending.onAbort);
-    this.waiting.shift()?.();
+    // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
+    this.lastUsedAt = Date.now();
+    this.releaseSlot();
     return pending;
+  }
+
+  /** Gives a place to the next waiting operation, or frees it. */
+  private releaseSlot(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.slots--;
+  }
+
+  /** Waits for the place of an operation that ends (MAX_CONCURRENT_OPERATIONS are held). */
+  private waitForSlot(signal: AbortSignal | undefined): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const go = () => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        const index = this.waiting.indexOf(go);
+        if (index >= 0) this.waiting.splice(index, 1);
+        reject(abortError());
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.waiting.push(go);
+    });
   }
 
   /**
    * Runs the operation `op` in the helper. Resolves with its value; rejects with HelperOperationError (a failure or its
-   * time limit), an AbortError (the signal), or HelperChannelError (`closed`: not sent; `lost`: the channel ended while
-   * it ran).
+   * time limit), an AbortError (the signal), or HelperChannelError (`closed` or `unsendable`: not sent; `lost`: the
+   * channel ended while it ran).
    */
   async operation(op: string, params: unknown, options: OperationOptions = {}): Promise<unknown> {
     if (options.signal?.aborted) throw abortError();
     if (this.state !== 'open') throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
-    if (this.pending.size >= MAX_CONCURRENT_OPERATIONS) {
-      await new Promise<void>((resolve, reject) => {
-        const go = () => {
-          options.signal?.removeEventListener('abort', onAbort);
-          resolve();
-        };
-        const onAbort = () => {
-          const index = this.waiting.indexOf(go);
-          if (index >= 0) this.waiting.splice(index, 1);
-          reject(abortError());
-        };
-        options.signal?.addEventListener('abort', onAbort, { once: true });
-        this.waiting.push(go);
-      });
-      if (this.state !== 'open') throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
-    }
     const id = this.nextId++;
+    const message: ClientMessage = { t: 'op', id, op, params };
+    if (options.secret !== undefined) {
+      if (!isSecret(options.secret)) throw new HelperChannelError('unsendable', 'The secret cannot be sent through the helper channel.');
+      message.secret = options.secret;
+    }
+    if (options.timeoutMs !== undefined) message.timeoutMs = options.timeoutMs;
+    const line = encodeMessage(message);
+    // Review round 1 (P2): a longer line would end the whole channel in the script (and every operation on it).
+    if (line.length - 1 > MAX_CLIENT_LINE) {
+      throw new HelperChannelError('unsendable', `The request ${op} is too long for the helper channel (${line.length} characters).`);
+    }
+    // A free place is taken at once, so the operation is written in the same turn as the call.
+    if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
+    else await this.waitForSlot(options.signal);
+    // Review round 1 (L1): the signal or the channel may have ended while it waited for its place.
+    if (options.signal?.aborted || this.state !== 'open') {
+      this.releaseSlot();
+      if (options.signal?.aborted) throw abortError();
+      throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
+    }
+    // Review round 1 (L3): the operation counts as pending only once it was written, so a failed write is `closed`
+    // (not sent), never `lost`. The answers come later (stream events), never during the write.
+    if (!this.write(line)) {
+      this.releaseSlot();
+      throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
+    }
     this.lastUsedAt = Date.now();
     return new Promise<unknown>((resolve, reject) => {
       const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject };
@@ -346,13 +417,6 @@ export class HelperChannel {
         };
         options.signal.addEventListener('abort', pending.onAbort, { once: true });
       }
-      const message: ClientMessage = { t: 'op', id, op, params };
-      if (options.secret !== undefined) message.secret = options.secret;
-      if (options.timeoutMs !== undefined) message.timeoutMs = options.timeoutMs;
-      if (!this.send(message)) {
-        this.finish(id);
-        reject(new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`));
-      }
     });
   }
 
@@ -368,11 +432,18 @@ export class HelperChannel {
     let tooLarge = false;
     const tooLargeAbort = new AbortController();
     const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
+    if (options.input !== undefined && options.secretInput !== undefined) throw new Error('A Docker call has either an input or a secret input.');
     const params: Record<string, unknown> = { args: [...args] };
     if (options.input !== undefined) params.input = options.input;
-    if (options.cleanup !== undefined && options.cleanup.length > 0) params.cleanup = options.cleanup;
+    if (options.secretInput !== undefined) params.inputIsSecret = true;
+    if (options.cleanup !== undefined) params.cleanup = options.cleanup;
+    // Review round 1 (P2): a call beyond the limits of the operation is not sent; the caller takes the way without it.
+    if (parseDockerOperationParams(params) === undefined) {
+      throw new HelperChannelError('unsendable', 'The Docker call is beyond the limits of the helper channel.');
+    }
     try {
       const value = await this.operation(OP_DOCKER, params, {
+        secret: options.secretInput,
         timeoutMs: options.timeoutMs,
         signal,
         onOutput: (stream, text) => {
@@ -446,6 +517,7 @@ export class HelperChannel {
         ),
       );
     }
+    // Each waiting operation gets a place, sees the closed channel, and gives it back.
     for (const go of this.waiting.splice(0)) go();
     for (const listener of [...this.closeListeners]) {
       try {

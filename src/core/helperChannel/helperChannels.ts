@@ -173,8 +173,8 @@ export class HelperChannels {
   }
 
   /**
-   * One Docker call through the channel to the engine of `target`. Undefined when there is no channel, or it closed
-   * before the call was sent: the caller takes the way without it. Rejects as HelperChannel.docker otherwise (a lost
+   * One Docker call through the channel to the engine of `target`. Undefined when there is no channel, or the call was
+   * not sent (the channel closed before, or the call is beyond what it carries): the caller takes the way without it. Rejects as HelperChannel.docker otherwise (a lost
    * channel while the call ran: HelperChannelError('lost'), whose outcome is not known).
    */
   async docker(target: DockerTarget, args: readonly string[], options: ChannelDockerOptions = {}): Promise<RunResult | undefined> {
@@ -183,7 +183,8 @@ export class HelperChannels {
     try {
       return await channel.docker(args, options);
     } catch (error) {
-      if (error instanceof HelperChannelError && error.code === 'closed') return undefined;
+      // Not sent: closed before, or beyond what the channel carries (review round 1, P2).
+      if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;
       throw error;
     }
   }

@@ -8,8 +8,14 @@ import { OutputTooLargeError } from '../process';
 import type { Logger, StartedProcess } from '../ports';
 import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
 import {
+  CHANNEL_CLEANUP_TIMEOUT_MS,
+  CHANNEL_KILL_GRACE_MS,
   CHANNEL_PROTOCOL_VERSION,
+  MAX_CHANNEL_SCRIPT_LENGTH,
+  MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
+  MAX_DOCKER_ARGS,
+  MAX_DOCKER_INPUT_LENGTH,
   encodeMessage,
   parseClientMessage,
   type ClientMessage,
@@ -203,7 +209,8 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     const ping = fake.messages().find((message) => message.t === 'ping') as { n: number };
     fake.answer({ t: 'pong', n: ping.n });
-    await vi.advanceTimersByTimeAsync(3_000);
+    // Review round 1 (P3): lost once no answer came for pongTimeoutMs, at the next ping (here at 3 s after the answer).
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(channel.isOpen).toBe(true);
     const running = expect(channel.operation('start', {})).rejects.toMatchObject({ code: 'lost' });
     await vi.advanceTimersByTimeAsync(2_000);
@@ -245,13 +252,115 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     expect(fake.state.killed).toBe(true);
   });
 
+  describe('review round 1', () => {
+    it('L1: an operation that waits for a place and whose signal aborts meanwhile is never sent', async () => {
+      const { channel, fake } = await openChannel();
+      const controller = new AbortController();
+      const calls = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, () => channel.docker(['ps'], { signal: controller.signal }));
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort();
+      const outcomes = await Promise.allSettled(calls);
+      expect(outcomes.every((outcome) => outcome.status === 'rejected' && (outcome.reason as Error).name === 'AbortError')).toBe(true);
+      const sent = fake.messages().filter((message) => message.t === 'op');
+      expect(sent).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+      expect(fake.messages().filter((message) => message.t === 'cancel')).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+      expect(channel.busy).toBe(0);
+    });
+
+    it('L5: a caller that comes while a place goes to a waiting operation does not get past the limit', async () => {
+      const { channel, fake } = await openChannel();
+      const running = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, (_, index) => channel.operation('step', { index }));
+      await vi.advanceTimersByTimeAsync(0);
+      const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+      fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
+      // In the same turn as the result: a new caller.
+      const late = channel.operation('step', { index: 'late' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sent()).toHaveLength(MAX_CONCURRENT_OPERATIONS + 1);
+      expect(sent()[MAX_CONCURRENT_OPERATIONS].params).toEqual({ index: MAX_CONCURRENT_OPERATIONS });
+      channel.close();
+      await Promise.allSettled([...running, late]);
+    });
+
+    it('L3: an operation whose write fails is `closed` (not sent), and HelperChannels can take the way without it', async () => {
+      const { channel, fake } = await openChannel();
+      fake.state.ended = true;
+      await expect(channel.docker(['ps'])).rejects.toMatchObject({ code: 'closed' });
+      expect(channel.isOpen).toBe(false);
+    });
+
+    it('L4: a channel whose output ends it right after the answer to hello does not open', async () => {
+      const fake = fakeProcess();
+      const { logger } = recordingLogger();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.raw(`${encodeMessage(HELLO)}not a message\n`);
+      await expect(opening).rejects.toMatchObject({ code: 'open' });
+      expect(fake.state.killed).toBe(true);
+    });
+
+    it('P2: a request longer than the script reads, or a Docker call beyond the limits, is not sent (`unsendable`)', async () => {
+      const { channel, fake } = await openChannel();
+      await expect(channel.operation('step', { data: 'x'.repeat(MAX_CLIENT_LINE) })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.docker(['exec', '-i', 'c', 'cat'], { input: 'x'.repeat(MAX_DOCKER_INPUT_LENGTH + 1) })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.docker(Array.from({ length: MAX_DOCKER_ARGS + 1 }, () => 'a'))).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.docker(['run', 'img'], { cleanup: 'Not A Label' })).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+      expect(channel.isOpen).toBe(true);
+      expect(channel.busy).toBe(0);
+    });
+
+    it('P6: refuses a script whose JSON line is longer than the loader reads', async () => {
+      const fake = fakeProcess();
+      const { logger } = recordingLogger();
+      // Each line feed doubles in JSON: short enough as text, too long as its line.
+      const script = '\n'.repeat(MAX_CHANNEL_SCRIPT_LENGTH / 2 + 1);
+      await expect(HelperChannel.open(fake.process, script, { logger, name: 'build-box' })).rejects.toThrow(/too long/);
+      expect(fake.lines).toHaveLength(0);
+    });
+
+    it('P10: the idle time counts from the end of the last operation', async () => {
+      const { channel, fake } = await openChannel({ pingIntervalMs: 60 * 60_000 });
+      const result = channel.operation('start', {});
+      await vi.advanceTimersByTimeAsync(12 * 60_000);
+      const { id } = lastOp(fake);
+      fake.answer({ t: 'result', id, ok: true, value: null });
+      await result;
+      expect(Date.now() - channel.lastUsed).toBe(0);
+    });
+
+    it('S4: a secret input travels as the secret of the operation, never as a parameter', async () => {
+      const { channel, fake } = await openChannel();
+      const result = channel.docker(['exec', '-i', 'c', 'sh', '-c', 'cat > /run/secrets/token'], { secretInput: 'ghp_token_value' });
+      const op = lastOp(fake);
+      expect(op.secret).toBe('ghp_token_value');
+      expect(op.params).toEqual({ args: ['exec', '-i', 'c', 'sh', '-c', 'cat > /run/secrets/token'], inputIsSecret: true });
+      expect(JSON.stringify(op.params)).not.toContain('ghp_token_value');
+      fake.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
+      await expect(result).resolves.toMatchObject({ exitCode: 0 });
+      await expect(channel.docker(['exec'], { input: 'a', secretInput: 'ghp_token_value' })).rejects.toThrow(/either/);
+    });
+
+    it('S6: a secret too short to be masked is not sent', async () => {
+      const { channel, fake } = await openChannel();
+      await expect(channel.docker(['exec'], { secretInput: 'abc' })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.operation('start', {}, { secret: '' })).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+    });
+
+    it('P4: waits for the result of a timed-out operation longer than the kill grace and the cleanup of the script', () => {
+      expect(CHANNEL_RESULT_GRACE_MS).toBeGreaterThan(CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS);
+    });
+  });
+
   describe('docker', () => {
     it('returns the result of a Docker call: its output, its exit code, and passes its input', async () => {
       const { channel, fake, lines } = await openChannel();
       const stderrSeen: string[] = [];
-      const result = channel.docker(['exec', '-i', 'c', 'cat'], { input: 'text', timeoutMs: 5_000, cleanup: ['x'], onStderr: (text) => stderrSeen.push(text) });
+      const result = channel.docker(['exec', '-i', 'c', 'cat'], { input: 'text', timeoutMs: 5_000, cleanup: 'step-0a1b2c3d', onStderr: (text) => stderrSeen.push(text) });
       const op = lastOp(fake);
-      expect(op).toMatchObject({ op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], input: 'text', cleanup: ['x'] }, timeoutMs: 5_000 });
+      // Review round 1 (S1): the cleanup is a label value, no longer container names.
+      expect(op).toMatchObject({ op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], input: 'text', cleanup: 'step-0a1b2c3d' }, timeoutMs: 5_000 });
       fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'te' });
       fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'xt' });
       fake.answer({ t: 'out', id: op.id, stream: 'stderr', data: 'note' });

@@ -21,7 +21,8 @@
 //   3. No operation for CHANNEL_SERVER_IDLE_EXIT_MS and none runs (the extension did not close it): it exits.
 //   4. `--rm` removes the container when the script ended; tini (the entry point of the image) passes signals on.
 // Before it exits, it cancels the operations that still run: their Docker calls end (SIGTERM, then SIGKILL) and the
-// containers that they started with a known name are removed (`docker rm -f`).
+// containers that they started with their cleanup label are removed (`docker rm -f`, review round 1, S1: by the label
+// of the operation, never by a name, so no container that the operation did not start can be removed).
 import { createHash } from 'crypto';
 
 /** The version of the messages. The extension closes a channel whose script answers with another one. */
@@ -30,7 +31,7 @@ export const CHANNEL_PROTOCOL_VERSION = 1;
 export const LABEL_HELPER_CHANNEL = 'nimblescape.devenv.helper-channel';
 /** Where the loader writes the script (the file system of the container). */
 export const CHANNEL_SCRIPT_PATH = '/opt/devenv/channel.js';
-/** The longest script (its JSON line). */
+/** The longest script, as its JSON line (review round 1, P6: the loader limits the escaped line, so the extension does too). */
 export const MAX_CHANNEL_SCRIPT_LENGTH = 8 * 1024 * 1024;
 
 /**
@@ -39,7 +40,7 @@ export const MAX_CHANNEL_SCRIPT_LENGTH = 8 * 1024 * 1024;
  * the input ends before that line or the line is too long. Only Node.js built-ins.
  */
 export const CHANNEL_LOADER = [
-  `const fs=require('fs'),P=${JSON.stringify(CHANNEL_SCRIPT_PATH)},M=${MAX_CHANNEL_SCRIPT_LENGTH + 2};`,
+  `const fs=require('fs'),P=${JSON.stringify(CHANNEL_SCRIPT_PATH)},M=${MAX_CHANNEL_SCRIPT_LENGTH};`,
   `let b='';const s=process.stdin;s.setEncoding('utf8');`,
   `const t=setTimeout(()=>process.exit(3),60000);`,
   `const f=d=>{b+=d;const i=b.indexOf('\\n');if(i<0){if(b.length>M)process.exit(3);return;}`,
@@ -53,8 +54,12 @@ export const CHANNEL_LOADER = [
 export const CHANNEL_PING_INTERVAL_MS = 15_000;
 /** The script exits when no message came for this long (four pings missed). */
 export const CHANNEL_SILENCE_EXIT_MS = 60_000;
-/** The extension takes a channel as lost when no answer to a ping came for this long. */
-export const CHANNEL_PONG_TIMEOUT_MS = 45_000;
+/**
+ * The extension takes a channel as lost when no answer came for this long. Review round 1 (P3): it is checked at each
+ * ping, so the loss is noticed at most CHANNEL_PONG_TIMEOUT_MS + CHANNEL_PING_INTERVAL_MS (45 s) after the last answer,
+ * before the script's silence (60 s) ends it.
+ */
+export const CHANNEL_PONG_TIMEOUT_MS = 30_000;
 /** The extension closes a channel without an operation for this long. */
 export const CHANNEL_IDLE_CLOSE_MS = 10 * 60_000;
 /** The script exits when no operation came for this long and none runs (a backstop to CHANNEL_IDLE_CLOSE_MS). */
@@ -72,6 +77,8 @@ export const MAX_SERVER_LINE = 4 * 1024 * 1024;
 export const OUTPUT_CHUNK_CHARACTERS = 16 * 1024;
 /** The longest secret of an operation (the GitHub token). */
 export const MAX_SECRET_LENGTH = 4 * 1024;
+/** Review round 1 (S6): the shortest secret; a shorter one could not be masked, so it is refused. */
+export const MIN_SECRET_LENGTH = 4;
 /** The largest time limit of an operation (one day). */
 export const MAX_OPERATION_TIMEOUT_MS = 24 * 60 * 60_000;
 /** At most this many operations of one channel run at the same time; more wait in the extension. */
@@ -194,9 +201,26 @@ export function isOperationName(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z][a-zA-Z0-9]{0,63}$/.test(value);
 }
 
-/** A container name, as Docker allows it. */
-export function isContainerName(value: unknown): value is string {
-  return typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(value);
+/** A secret that the channel can carry: MIN_SECRET_LENGTH..MAX_SECRET_LENGTH characters. */
+export function isSecret(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= MIN_SECRET_LENGTH && value.length <= MAX_SECRET_LENGTH;
+}
+
+/**
+ * Review round 1 (S1): the label of the containers that an operation starts and that its cancel removes. The caller
+ * puts `--label nimblescape.devenv.channel-step=<value>` (channelStepLabel) on each container that it starts and names
+ * the value as the cleanup of the operation; the cleanup removes exactly the containers with that label.
+ */
+export const LABEL_CHANNEL_STEP = 'nimblescape.devenv.channel-step';
+
+/** A cleanup label value: 8 to 64 lower-case letters, digits, and `-` (for example 24 random hex digits). */
+export function isCleanupLabel(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{7,63}$/.test(value);
+}
+
+/** The `--label` value of a container of a step: `nimblescape.devenv.channel-step=<value>`. */
+export function channelStepLabel(value: string): string {
+  return `${LABEL_CHANNEL_STEP}=${value}`;
 }
 
 function parseJson(line: string): unknown {
@@ -224,7 +248,7 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
         return undefined;
       }
       const { secret, timeoutMs } = value;
-      if (secret !== undefined && (typeof secret !== 'string' || secret.length > MAX_SECRET_LENGTH)) return undefined;
+      if (secret !== undefined && !isSecret(secret)) return undefined;
       if (timeoutMs !== undefined && (!isId(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPERATION_TIMEOUT_MS)) return undefined;
       const request: OperationRequest = { t: 'op', id: value.id, op: value.op, params: value.params };
       if (secret !== undefined) request.secret = secret as string;
@@ -356,18 +380,18 @@ export const OP_PROBE = 'probe';
 export const MAX_DOCKER_ARGS = 1_000;
 export const MAX_DOCKER_ARG_LENGTH = 64 * 1024;
 export const MAX_DOCKER_INPUT_LENGTH = 1024 * 1024;
-export const MAX_CLEANUP_CONTAINERS = 16;
 
 /**
  * Parameters of `docker`: `docker <args>` without a shell. `input`: its standard input, then closed (the secret of the
- * operation instead when `inputIsSecret`). `cleanup`: containers that `docker rm -f` removes when the operation is
- * cancelled (a call that starts a container with a known name).
+ * operation instead when `inputIsSecret`). `cleanup` (review round 1, S1): a cleanup label value (isCleanupLabel); when
+ * the operation is cancelled, the containers with the label channelStepLabel(cleanup) are removed. The args must put
+ * that label on a container that the call starts.
  */
 export interface DockerOperationParams {
   args: string[];
   input?: string;
   inputIsSecret?: boolean;
-  cleanup?: string[];
+  cleanup?: string;
 }
 
 export interface DockerOperationValue {
@@ -392,13 +416,11 @@ export function parseDockerOperationParams(value: unknown): DockerOperationParam
   if (input !== undefined && (typeof input !== 'string' || input.length > MAX_DOCKER_INPUT_LENGTH)) return undefined;
   if (inputIsSecret !== undefined && typeof inputIsSecret !== 'boolean') return undefined;
   if (inputIsSecret === true && input !== undefined) return undefined;
-  if (cleanup !== undefined && (!Array.isArray(cleanup) || cleanup.length > MAX_CLEANUP_CONTAINERS || !cleanup.every(isContainerName))) {
-    return undefined;
-  }
+  if (cleanup !== undefined && !isCleanupLabel(cleanup)) return undefined;
   const params: DockerOperationParams = { args: args as string[] };
   if (input !== undefined) params.input = input as string;
   if (inputIsSecret === true) params.inputIsSecret = true;
-  if (cleanup !== undefined) params.cleanup = cleanup as string[];
+  if (cleanup !== undefined) params.cleanup = cleanup;
   return params;
 }
 

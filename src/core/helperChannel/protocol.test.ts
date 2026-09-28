@@ -15,6 +15,8 @@ import {
   MAX_CLIENT_LINE,
   MAX_SECRET_LENGTH,
   channelLabelValue,
+  channelStepLabel,
+  isCleanupLabel,
   encodeMessage,
   encodeScript,
   parseClientMessage,
@@ -29,8 +31,9 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   it('keeps the times in the order that makes the script end by itself and the extension notice a loss first', () => {
     // Several pings fit into the silence, so a lost ping or two does not end a working channel.
     expect(CHANNEL_SILENCE_EXIT_MS).toBeGreaterThanOrEqual(3 * CHANNEL_PING_INTERVAL_MS);
-    // The extension gives up on the script before the script gives up on the extension.
-    expect(CHANNEL_PONG_TIMEOUT_MS).toBeLessThan(CHANNEL_SILENCE_EXIT_MS);
+    // The extension gives up on the script before the script gives up on the extension. Review round 1 (P3): the loss is
+    // checked at each ping, so it is noticed at most one interval after the pong timeout.
+    expect(CHANNEL_PONG_TIMEOUT_MS + CHANNEL_PING_INTERVAL_MS).toBeLessThan(CHANNEL_SILENCE_EXIT_MS);
     expect(CHANNEL_PONG_TIMEOUT_MS).toBeGreaterThan(CHANNEL_PING_INTERVAL_MS);
     // The script's own idle limit is a backstop behind the extension's.
     expect(CHANNEL_SERVER_IDLE_EXIT_MS).toBeGreaterThan(CHANNEL_IDLE_CLOSE_MS);
@@ -40,12 +43,12 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(parseClientMessage('{"t":"hello","protocol":1}')).toEqual({ t: 'hello', protocol: 1 });
     expect(parseClientMessage('{"t":"ping","n":3}')).toEqual({ t: 'ping', n: 3 });
     expect(parseClientMessage('{"t":"cancel","id":2}')).toEqual({ t: 'cancel', id: 2 });
-    expect(parseClientMessage('{"t":"op","id":1,"op":"docker","params":{"args":["ps"]},"secret":"s","timeoutMs":5}')).toEqual({
+    expect(parseClientMessage('{"t":"op","id":1,"op":"docker","params":{"args":["ps"]},"secret":"s3cr","timeoutMs":5}')).toEqual({
       t: 'op',
       id: 1,
       op: 'docker',
       params: { args: ['ps'] },
-      secret: 's',
+      secret: 's3cr',
       timeoutMs: 5,
     });
     for (const line of [
@@ -58,6 +61,9 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
       '{"t":"op","id":1,"op":"docker"}',
       '{"t":"op","id":1,"op":"docker","params":null,"timeoutMs":0}',
       `{"t":"op","id":1,"op":"docker","params":null,"secret":"${'x'.repeat(MAX_SECRET_LENGTH + 1)}"}`,
+      // Review round 1 (S6): a secret too short to be masked.
+      '{"t":"op","id":1,"op":"docker","params":null,"secret":"abc"}',
+      '{"t":"op","id":1,"op":"docker","params":null,"secret":""}',
       '{"t":"quit"}',
     ]) {
       expect(parseClientMessage(line), line.slice(0, 60)).toBeUndefined();
@@ -120,13 +126,21 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(CHANNEL_LOADER).not.toContain('\n');
   });
 
+  it('the cleanup label: its values, and the label of a step container (review round 1, S1)', () => {
+    expect(isCleanupLabel('0a1b2c3d4e5f60718293a4b5')).toBe(true);
+    expect(isCleanupLabel('abc123')).toBe(false);
+    expect(isCleanupLabel('a'.repeat(65))).toBe(false);
+    expect(channelStepLabel('0a1b2c3d')).toBe('nimblescape.devenv.channel-step=0a1b2c3d');
+  });
+
   it('channelLabelValue names the protocol and the script', () => {
     expect(channelLabelValue('a')).toMatch(/^1-[0-9a-f]{12}$/);
     expect(channelLabelValue('a')).not.toBe(channelLabelValue('b'));
   });
 
   it('checks the parameters and values of docker and probe', () => {
-    expect(parseDockerOperationParams({ args: ['ps'], input: 'x', cleanup: ['a-1'] })).toEqual({ args: ['ps'], input: 'x', cleanup: ['a-1'] });
+    // Review round 1 (S1): the cleanup is a label value, no longer container names.
+    expect(parseDockerOperationParams({ args: ['ps'], input: 'x', cleanup: 'step-0a1b2c3d' })).toEqual({ args: ['ps'], input: 'x', cleanup: 'step-0a1b2c3d' });
     expect(parseDockerOperationParams({ args: ['exec'], inputIsSecret: true })).toEqual({ args: ['exec'], inputIsSecret: true });
     for (const params of [
       null,
@@ -134,8 +148,10 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
       { args: ['a\0b'] },
       { args: ['ps'], extra: 1 },
       { args: ['ps'], input: 'x', inputIsSecret: true },
-      { args: ['ps'], cleanup: ['-rf'] },
-      { args: ['ps'], cleanup: ['a b'] },
+      { args: ['ps'], cleanup: ['step-0a1b2c3d'] },
+      { args: ['ps'], cleanup: 'short' },
+      { args: ['ps'], cleanup: '-step-0a1b2c3d' },
+      { args: ['ps'], cleanup: 'Step-0A1B2C3D' },
     ]) {
       expect(parseDockerOperationParams(params), JSON.stringify(params)).toBeUndefined();
     }

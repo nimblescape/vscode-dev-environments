@@ -18,19 +18,28 @@ import { CHANNEL_LOADER, CHANNEL_SCRIPT_PATH, OP_PROBE, encodeMessage, encodeScr
 import { silentLogger, type Logger, type StartedProcess } from '../core/ports';
 import { NodeProcessRunner } from '../core/process';
 
+// Review round 1 (P9): a \`sleep\` call sets its SIGTERM handler first and only then writes its line ("ready"), so a test
+// that waits for the line knows that the handler is there. \`ps\` answers the containers of a cleanup label with one ID.
 const FAKE_DOCKER = `#!/usr/bin/env node
 const fs = require('fs');
 const args = process.argv.slice(2);
 const log = process.env.FAKE_DOCKER_LOG;
-fs.appendFileSync(log, JSON.stringify(args) + '\\n');
-if (args[0] === 'version') { process.stdout.write('27.1.0\\n'); process.exit(0); }
-if (args[0] === 'rm') process.exit(0);
-if (args[0] === 'cat') { process.stdin.pipe(process.stdout); process.stdin.on('end', () => process.exit(0)); }
-else if (args[0] === 'sleep') {
+if (args[0] === 'sleep') {
   process.on('SIGTERM', () => { fs.appendFileSync(log, JSON.stringify(['SIGTERM', ...args]) + '\\n'); process.exit(143); });
   setInterval(() => {}, 1000);
-} else { process.stderr.write('unknown\\n'); process.exit(1); }
+}
+fs.appendFileSync(log, JSON.stringify(args) + '\\n');
+if (args[0] === 'version') { process.stdout.write('27.1.0\\n'); process.exit(0); }
+else if (args[0] === 'ps') { process.stdout.write('0123456789abcdef0123456789abcdef\\n'); process.exit(0); }
+else if (args[0] === 'rm') process.exit(0);
+else if (args[0] === 'cat') { process.stdin.pipe(process.stdout); process.stdin.on('end', () => process.exit(0)); }
+else if (args[0] !== 'sleep') { process.stderr.write('unknown\\n'); process.exit(1); }
 `;
+
+const LABEL_ONE = 'step-one-0a1b2c3d';
+const LABEL_TWO = 'step-two-0a1b2c3d';
+const psOf = (label: string) => ['ps', '-aq', '--no-trunc', '--filter', `label=nimblescape.devenv.channel-step=${label}`];
+const REMOVED = ['rm', '-f', '0123456789abcdef0123456789abcdef'];
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
 
@@ -107,28 +116,30 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
   it('ends when its input ends: a running call gets SIGTERM and its container is removed', async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
-    const running = channel.docker(['sleep', 'one'], { cleanup: ['step-one'] });
+    const running = channel.docker(['sleep', 'one'], { cleanup: LABEL_ONE });
     await waitUntil(() => calls().some((call) => call[0] === 'sleep' && call[1] === 'one'), 'the start of the call');
     // As when the connection closes: the input of the script ends.
     process.end();
     await expect(running).rejects.toThrow();
     await waitUntil(ended, 'the end of the script');
     expect(calls()).toContainEqual(['SIGTERM', 'sleep', 'one']);
-    expect(calls()).toContainEqual(['rm', '-f', 'step-one']);
+    expect(calls()).toContainEqual(psOf(LABEL_ONE));
+    expect(calls()).toContainEqual(REMOVED);
   });
 
   it('ends after the silence when the connection hangs (no ping, the input stays open)', async () => {
-    const { process, ended } = start(800);
+    const { process, ended } = start(3_000);
     let stdout = '';
     process.onStdout((text) => (stdout += text));
     process.write(encodeScript(script));
     process.write(encodeMessage({ t: 'hello', protocol: 1 }));
-    process.write(encodeMessage({ t: 'op', id: 1, op: 'docker', params: { args: ['sleep', 'two'], cleanup: ['step-two'] } }));
+    process.write(encodeMessage({ t: 'op', id: 1, op: 'docker', params: { args: ['sleep', 'two'], cleanup: LABEL_TWO } }));
     await waitUntil(() => stdout.includes('"t":"hello"'), 'the answer to hello');
+    await waitUntil(() => calls().some((call) => call[0] === 'sleep' && call[1] === 'two'), 'the start of the call');
     // Nothing more is written and the input stays open.
     await waitUntil(ended, 'the end of the script after the silence');
     expect(calls()).toContainEqual(['SIGTERM', 'sleep', 'two']);
-    expect(calls()).toContainEqual(['rm', '-f', 'step-two']);
+    expect(calls()).toContainEqual(psOf(LABEL_TWO));
     process.end();
   });
 

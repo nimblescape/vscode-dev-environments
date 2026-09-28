@@ -7,7 +7,7 @@
 // startChannel with the input that it read after the script; the rest of the standard input comes as text (the loader
 // set its encoding). Only Node.js built-ins and small modules of src/core.
 import { spawn } from 'child_process';
-import { CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
+import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
 import { OPERATIONS } from './operations';
 import { ChannelServer, type ServerChild } from './server';
 
@@ -57,6 +57,22 @@ export function timesFromEnv(env: NodeJS.ProcessEnv): { silenceMs?: number; idle
   return silenceMs >= 500 && silenceMs <= CHANNEL_SILENCE_EXIT_MS ? { silenceMs, idleMs: 2 * silenceMs } : {};
 }
 
+/**
+ * The handler of an uncaught error. A defect of the script must never leave the container running. Review round 1 (P5):
+ * it still cancels what runs and removes the containers of their cleanup (the shutdown ends the process by itself, with
+ * its own deadline); a timer ends it later in any case, and when the shutdown itself fails, at once.
+ */
+export function fatalHandler(server: Pick<ChannelServer, 'shutdown'>, exit: (code: number) => void): () => void {
+  return () => {
+    setTimeout(() => exit(1), CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS + 10_000);
+    try {
+      server.shutdown();
+    } catch {
+      exit(1);
+    }
+  };
+}
+
 /** Runs the channel on the standard input and output of this process. `initial`: input that the loader read already. */
 export function startChannel(initial: string): void {
   const server = new ChannelServer({
@@ -75,9 +91,9 @@ export function startChannel(initial: string): void {
   process.on('SIGTERM', () => server.shutdown());
   process.on('SIGINT', () => server.shutdown());
   process.on('SIGHUP', () => server.shutdown());
-  // A defect of the script must never leave the container running.
-  process.on('uncaughtException', () => process.exit(1));
-  process.on('unhandledRejection', () => process.exit(1));
+  const fatal = fatalHandler(server, (code) => process.exit(code));
+  process.on('uncaughtException', fatal);
+  process.on('unhandledRejection', fatal);
   server.start();
   if (initial !== '') server.input(initial);
   process.stdin.on('data', (chunk: string | Buffer) => server.input(typeof chunk === 'string' ? chunk : chunk.toString('utf8')));

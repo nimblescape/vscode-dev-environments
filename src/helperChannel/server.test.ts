@@ -15,7 +15,17 @@ import {
   type ServerMessage,
 } from '../core/helperChannel/protocol';
 import { OPERATIONS } from './operations';
-import { ChannelServer, StreamRedactor, commandLine, redact, type OperationHandler, type ServerChild } from './server';
+import {
+  ChannelServer,
+  MAX_CONTEXT_STDERR_CHARACTERS,
+  MAX_CONTEXT_STDOUT_CHARACTERS,
+  StreamRedactor,
+  commandLine,
+  redact,
+  type ContextDockerResult,
+  type OperationHandler,
+  type ServerChild,
+} from './server';
 
 interface FakeChild extends ServerChild {
   args: string[];
@@ -27,7 +37,24 @@ interface FakeChild extends ServerChild {
 }
 
 /** A Docker CLI that records its calls; each call ends when the test says so, or on SIGKILL (and SIGTERM if `endsOnTerm`). */
-function fakeDocker(options: { endsOnTerm?: boolean; exitAt?: (args: readonly string[]) => number | undefined } = {}) {
+/** The answer of the fake to a call that ends by itself (for example the `docker ps` and `docker rm` of a cleanup). */
+type FakeAnswer = { stdout?: string; exitCode: number };
+
+/** The answers of the cleanup: `docker ps` names `ids` (one per line), `docker rm` ends with 0. */
+function cleanupAnswers(ids: string[]) {
+  return (args: readonly string[]): FakeAnswer | undefined => {
+    if (args[0] === 'ps') return { stdout: ids.map((id) => `${id}\n`).join(''), exitCode: 0 };
+    if (args[0] === 'rm') return { exitCode: 0 };
+    return undefined;
+  };
+}
+
+const LABEL = 'step-0a1b2c3d4e5f';
+const PS_OF_LABEL = ['ps', '-aq', '--no-trunc', '--filter', `label=nimblescape.devenv.channel-step=${LABEL}`];
+const ID_1 = '0123456789abcdef0123456789abcdef';
+const ID_2 = 'fedcba9876543210fedcba9876543210';
+
+function fakeDocker(options: { endsOnTerm?: boolean; respond?: (args: readonly string[]) => FakeAnswer | undefined } = {}) {
   const children: FakeChild[] = [];
   const spawn = (args: readonly string[], onStdout: (text: string) => void, onStderr: (text: string) => void): ServerChild => {
     let resolveExit!: (value: { exitCode: number | null }) => void;
@@ -39,8 +66,13 @@ function fakeDocker(options: { endsOnTerm?: boolean; exitAt?: (args: readonly st
       signals: [],
       end: (input) => {
         child.input = input;
-        const code = options.exitAt?.(args);
-        if (code !== undefined) queueMicrotask(() => child.exit(code));
+        const answer = options.respond?.(args);
+        if (answer !== undefined) {
+          queueMicrotask(() => {
+            if (answer.stdout) onStdout(answer.stdout);
+            child.exit(answer.exitCode);
+          });
+        }
       },
       kill: (signal) => {
         child.signals.push(signal);
@@ -194,39 +226,113 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(resultOf(1)).toMatchObject({ ok: false, error: { code: 'unknown' } });
   });
 
-  it('cancels an operation: SIGTERM, SIGKILL after the grace time, then docker rm -f of its cleanup, then its result', async () => {
-    const { send, docker, resultOf } = setup();
-    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'step-1', 'img'], cleanup: ['step-1'] } });
+  it('cancels an operation: SIGTERM, SIGKILL after the grace time, then the removal of the containers of its cleanup label, then its result', async () => {
+    const { send, docker, resultOf } = setup({ docker: fakeDocker({ respond: (args) => (args[0] === 'ps' ? { stdout: `${ID_1}\n`, exitCode: 0 } : undefined) }) });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--label', `nimblescape.devenv.channel-step=${LABEL}`, 'img'], cleanup: LABEL } });
     send({ t: 'cancel', id: 1 });
     const [run] = docker.children;
     expect(run.signals).toEqual(['SIGTERM']);
     await vi.advanceTimersByTimeAsync(CHANNEL_KILL_GRACE_MS);
     expect(run.signals).toEqual(['SIGTERM', 'SIGKILL']);
-    const cleanup = docker.children[1];
-    expect(cleanup.args).toEqual(['rm', '-f', 'step-1']);
+    // Review round 1 (S1): the containers of the label, then exactly those IDs; never a name.
+    expect(docker.children[1].args).toEqual(PS_OF_LABEL);
+    const remove = docker.children[2];
+    expect(remove.args).toEqual(['rm', '-f', ID_1]);
     expect(resultOf(1)).toBeUndefined();
-    cleanup.exit(0);
+    remove.exit(0);
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toEqual({ t: 'result', id: 1, ok: false, error: { code: 'cancelled', message: 'The operation was cancelled.' }, cancelled: true, timedOut: false });
   });
 
   it('ends an operation at its time limit (timedOut) and removes its containers', async () => {
-    const { send, docker, resultOf } = setup({ docker: fakeDocker({ endsOnTerm: true, exitAt: (args) => (args[0] === 'rm' ? 0 : undefined) }) });
-    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'n', 'img'], cleanup: ['n'] }, timeoutMs: 1_000 });
+    const { send, docker, resultOf } = setup({ docker: fakeDocker({ endsOnTerm: true, respond: cleanupAnswers([ID_1, ID_2]) }) });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: LABEL }, timeoutMs: 1_000 });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(docker.children[0].signals).toEqual(['SIGTERM']);
-    expect(docker.children[1].args).toEqual(['rm', '-f', 'n']);
     await vi.advanceTimersByTimeAsync(0);
+    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1, ID_2]]);
     expect(resultOf(1)).toMatchObject({ ok: false, error: { code: 'timeout' }, cancelled: false, timedOut: true });
+  });
+
+  it('removes nothing when no container carries the cleanup label, and takes only container IDs from docker ps (review round 1, S1)', async () => {
+    const { send, docker, resultOf } = setup({
+      docker: fakeDocker({ endsOnTerm: true, respond: (args) => (args[0] === 'ps' ? { stdout: 'WARNING: something\n\n', exitCode: 0 } : undefined) }),
+    });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'abc123', 'img'], cleanup: LABEL } });
+    send({ t: 'cancel', id: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL]);
+    expect(resultOf(1)).toMatchObject({ ok: false, cancelled: true });
+  });
+
+  it('refuses a cleanup that is a name instead of a label value', async () => {
+    const { send, docker, resultOf } = setup();
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: ['n'] } });
+    send({ t: 'op', id: 2, op: 'docker', params: { args: ['run', 'img'], cleanup: 'abc' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(docker.children).toHaveLength(0);
+    expect(resultOf(1)).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect(resultOf(2)).toMatchObject({ ok: false, error: { code: 'invalid' } });
   });
 
   it('removes no container when the operation ended by itself', async () => {
     const { send, docker, resultOf } = setup();
-    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'n', 'img'], cleanup: ['n'] } });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: LABEL } });
     docker.children[0].exit(0);
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toMatchObject({ ok: true });
     expect(docker.children).toHaveLength(1);
+  });
+
+  it('masks the secret before it cuts the last error line of the log (review round 1, S2)', async () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const { send, docker, of } = setup();
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, secret });
+    // The secret spans the cut at 500 characters of the last line.
+    docker.children[0].stderr(`${'x'.repeat(480)}${secret} failed\n`);
+    docker.children[0].exit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    const texts = of(1).filter((message) => message.t === 'log').map((message) => (message as { text: string }).text);
+    expect(texts.join('\n')).not.toContain(secret.slice(0, 12));
+    expect(texts[1]).toContain('***');
+  });
+
+  it('keeps at most MAX_CONTEXT_STDOUT_CHARACTERS of standard output and ends a call beyond (review round 1, S5)', async () => {
+    let result: ContextDockerResult | undefined;
+    const operations: Record<string, OperationHandler> = {
+      read: async (_params, context) => {
+        result = await context.docker(['logs', 'c']);
+        return 'done';
+      },
+    };
+    const { send, docker } = setup({ operations, docker: fakeDocker({ endsOnTerm: true }) });
+    send({ t: 'op', id: 1, op: 'read', params: null });
+    const [child] = docker.children;
+    const piece = 'y'.repeat(1024 * 1024);
+    for (let sent = 0; sent <= MAX_CONTEXT_STDOUT_CHARACTERS; sent += piece.length) child.stdout(piece);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(child.signals).toEqual(['SIGTERM']);
+    expect(result?.stdout).toBe('');
+    expect(result?.error).toMatch(/larger than 64 M characters/);
+  });
+
+  it('keeps only the end of the error output of a call (review round 1, S5)', async () => {
+    let result: ContextDockerResult | undefined;
+    const operations: Record<string, OperationHandler> = {
+      build: async (_params, context) => {
+        result = await context.docker(['build', '.']);
+        return 'done';
+      },
+    };
+    const { send, docker } = setup({ operations });
+    send({ t: 'op', id: 1, op: 'build', params: null });
+    const [child] = docker.children;
+    for (let index = 0; index < 5; index++) child.stderr('z'.repeat(MAX_CONTEXT_STDERR_CHARACTERS / 2));
+    child.stderr('the end');
+    child.exit(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(result?.stderr.length).toBe(MAX_CONTEXT_STDERR_CHARACTERS);
+    expect(result?.stderr.endsWith('the end')).toBe(true);
   });
 
   it('reports the progress and the log lines of an operation and its failure', async () => {
@@ -263,15 +369,15 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
 
   describe('ends by itself when the connection is lost (user request 2026-09-28)', () => {
     it('at the end of its input: cancels what runs, removes its containers, then exits', async () => {
-      const { server, send, docker, exits } = setup();
-      send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'a', 'img'], cleanup: ['a'] } });
+      const { server, send, docker, exits } = setup({ docker: fakeDocker({ respond: (args) => (args[0] === 'ps' ? { stdout: `${ID_1}\n`, exitCode: 0 } : undefined) }) });
+      send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: LABEL } });
       server.inputEnded();
       expect(server.active).toBe(false);
       expect(docker.children[0].signals).toEqual(['SIGTERM']);
       await vi.advanceTimersByTimeAsync(CHANNEL_KILL_GRACE_MS);
-      expect(docker.children[1].args).toEqual(['rm', '-f', 'a']);
+      expect(docker.children[2].args).toEqual(['rm', '-f', ID_1]);
       expect(exits).toEqual([]);
-      docker.children[1].exit(0);
+      docker.children[2].exit(0);
       await vi.advanceTimersByTimeAsync(0);
       expect(exits).toEqual([0]);
     });

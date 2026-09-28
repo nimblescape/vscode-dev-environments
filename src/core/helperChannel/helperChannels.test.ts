@@ -118,6 +118,9 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     expect(await channels.docker(REMOTE, ['ps'])).toEqual({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false });
     channel.docker.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
     expect(await channels.docker(REMOTE, ['ps'])).toBeUndefined();
+    // Review round 1 (P2): a call beyond what the channel carries is not sent either.
+    channel.docker.mockRejectedValueOnce(new HelperChannelError('unsendable', 'too long'));
+    expect(await channels.docker(REMOTE, ['ps'])).toBeUndefined();
     channel.docker.mockRejectedValueOnce(new HelperChannelError('lost', 'lost'));
     await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'lost' });
     channels.dispose();

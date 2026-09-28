@@ -30,7 +30,7 @@ export const dockerOperation: OperationHandler = async (params, context) => {
     onStderr: (text) => context.output('stderr', text),
     cleanup: checked.cleanup,
   });
-  if (result.error !== undefined) throw new OperationError('spawn', `docker could not be started: ${result.error}`);
+  if (result.error !== undefined) throw new OperationError('failed', result.error);
   const value: DockerOperationValue = { exitCode: result.exitCode };
   return value;
 };

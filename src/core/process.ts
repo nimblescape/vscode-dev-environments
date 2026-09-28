@@ -19,6 +19,9 @@ export class OutputTooLargeError extends Error {
   }
 }
 
+/** A program of `start` that did not end on `kill` gets SIGKILL after this time (review round 1, L2). */
+export const START_KILL_GRACE_MS = 5_000;
+
 /**
  * ProcessRunner with `child_process.spawn`, without a shell. Review round 9 (S9-2): at most `maxStdoutBytes` of
  * standard output are kept; beyond, the program is stopped and `run` rejects with OutputTooLargeError. Review round 10
@@ -29,13 +32,15 @@ export class OutputTooLargeError extends Error {
 export class NodeProcessRunner implements ProcessRunner {
   private readonly platform: NodeJS.Platform;
   private readonly killTree: (pid: number, fallback: () => void) => void;
+  private readonly startKillGraceMs: number;
 
   constructor(
     private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
     private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
-    options: { platform?: NodeJS.Platform; killTree?: (pid: number, fallback: () => void) => void } = {},
+    options: { platform?: NodeJS.Platform; killTree?: (pid: number, fallback: () => void) => void; startKillGraceMs?: number } = {},
   ) {
     this.platform = options.platform ?? process.platform;
+    this.startKillGraceMs = options.startKillGraceMs ?? START_KILL_GRACE_MS;
     this.killTree = options.killTree ?? ((pid, fallback) => runTaskkill(pid, process.env, fallback));
   }
 
@@ -216,7 +221,14 @@ export class NodeProcessRunner implements ProcessRunner {
         if (!child.stdin.destroyed) child.stdin.end();
       },
       kill: () => {
-        if (!ended) this.stop(child);
+        if (ended) return;
+        this.stop(child);
+        // Review round 1 (L2): `docker run -i` passes SIGTERM on to its container over its connection and waits; over a
+        // hung connection it would never end. So SIGKILL after START_KILL_GRACE_MS (Windows: taskkill /F ended it).
+        const timer = setTimeout(() => {
+          if (!ended) child.kill('SIGKILL');
+        }, this.startKillGraceMs);
+        timer.unref?.();
       },
       onStdout: (listener) => {
         stdoutListener = listener;

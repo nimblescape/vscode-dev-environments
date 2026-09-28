@@ -6,7 +6,7 @@
 // extension, runs each operation (operations.ts) with an OperationContext, and answers with progress, output, and one
 // result per operation. It ends by itself when the connection is lost (the four ways in protocol.ts); before it exits,
 // it cancels every operation that runs: their Docker calls end (SIGTERM, then SIGKILL) and the containers that they
-// named for a cleanup are removed. It never writes the secret or the parameters of an operation anywhere.
+// labelled for a cleanup are removed. It never writes the secret or the parameters of an operation anywhere.
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
@@ -17,7 +17,8 @@ import {
   MAX_CLIENT_LINE,
   OUTPUT_CHUNK_CHARACTERS,
   encodeMessage,
-  isContainerName,
+  channelStepLabel,
+  isCleanupLabel,
   parseClientMessage,
   refusedOperationId,
   type OperationFailure,
@@ -42,9 +43,17 @@ export interface ContextDockerResult {
   exitCode: number | null;
   stdout: string;
   stderr: string;
-  /** Set when the call could not be started. */
+  /** Set when the call could not be started, or its output was too large (it was ended then). */
   error?: string;
 }
+
+/**
+ * Review round 1 (S5): the script keeps at most this much standard output of a call (beyond, the call is ended and
+ * fails), and the last MAX_CONTEXT_STDERR_CHARACTERS of its error output, so that a long call cannot fill the memory of
+ * the host.
+ */
+export const MAX_CONTEXT_STDOUT_CHARACTERS = 64 * 1024 * 1024;
+export const MAX_CONTEXT_STDERR_CHARACTERS = 1024 * 1024;
 
 export interface ContextDockerOptions {
   input?: string;
@@ -53,8 +62,11 @@ export interface ContextDockerOptions {
   onStderr?: (text: string) => void;
   /** Keep the standard output out of the result (it only goes to onStdout). */
   discardStdout?: boolean;
-  /** Containers that the call starts with these names: removed when the operation is cancelled. */
-  cleanup?: readonly string[];
+  /**
+   * Review round 1 (S1): a cleanup label value (isCleanupLabel). The containers with the label channelStepLabel(cleanup)
+   * are removed when the operation is cancelled; the args must put that label on each container that the call starts.
+   */
+  cleanup?: string;
   /** Pipe its output to the log of the extension as it comes (the tools of a step; not data that it parses). */
   stream?: boolean;
 }
@@ -288,9 +300,10 @@ export class ChannelServer {
 
   private async docker(run: Running, args: readonly string[], options: ContextDockerOptions): Promise<ContextDockerResult> {
     if (run.controller.signal.aborted) return { exitCode: null, stdout: '', stderr: '', error: 'The operation was cancelled.' };
-    for (const name of options.cleanup ?? []) if (isContainerName(name)) run.cleanup.add(name);
+    if (options.cleanup !== undefined && isCleanupLabel(options.cleanup)) run.cleanup.add(options.cleanup);
     let stdout = '';
     let stderr = '';
+    let tooLarge = false;
     let child: ServerChild;
     const id = run.request.id;
     const log = (text: string, level: 'info' | 'warn' = 'info') => this.send({ t: 'log', id, level, text: redact(text, run.request.secret) });
@@ -301,19 +314,31 @@ export class ChannelServer {
       child = this.deps.spawnDocker(
         args,
         (text) => {
-          if (options.discardStdout !== true) stdout += text;
+          if (tooLarge) return;
+          if (options.discardStdout !== true) {
+            stdout += text;
+            if (stdout.length > MAX_CONTEXT_STDOUT_CHARACTERS) {
+              tooLarge = true;
+              stdout = '';
+              this.terminate(child);
+              return;
+            }
+          }
           if (options.stream === true) run.redactors.stdout.push(text);
           options.onStdout?.(text);
         },
         (text) => {
           stderr += text;
+          // Cut only once it is twice as long: linear time, however small the pieces are.
+          if (stderr.length > 2 * MAX_CONTEXT_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CONTEXT_STDERR_CHARACTERS);
           if (options.stream === true) run.redactors.stderr.push(text);
           options.onStderr?.(text);
         },
       );
     } catch (error) {
-      log(`docker could not be started: ${messageOf(error)}`, 'warn');
-      return { exitCode: null, stdout: '', stderr: '', error: messageOf(error) };
+      const message = `docker could not be started: ${messageOf(error)}`;
+      log(message, 'warn');
+      return { exitCode: null, stdout: '', stderr: '', error: message };
     }
     run.children.add(child);
     try {
@@ -329,10 +354,17 @@ export class ChannelServer {
       run.redactors.stdout.flush();
       run.redactors.stderr.flush();
     }
+    if (stderr.length > MAX_CONTEXT_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CONTEXT_STDERR_CHARACTERS);
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    if (tooLarge) {
+      const message = `The output of docker is larger than ${MAX_CONTEXT_STDOUT_CHARACTERS / (1024 * 1024)} M characters. It was stopped.`;
+      log(message, 'warn');
+      return { exitCode, stdout: '', stderr, error: message };
+    }
     if (error !== undefined) log(`docker could not be started: ${error}`, 'warn');
-    else log(`${exitCode === null ? 'ended by a signal' : `exit code ${exitCode}`} after ${seconds} s${exitCode === 0 ? '' : `: ${lastLine(stderr)}`}`);
-    return error === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, error };
+    // Review round 1 (S2): masked before the line is cut, so that a cut cannot leave a part of the secret.
+    else log(`${exitCode === null ? 'ended by a signal' : `exit code ${exitCode}`} after ${seconds} s${exitCode === 0 ? '' : `: ${lastLine(redact(stderr, run.request.secret))}`}`);
+    return error === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, error: `docker could not be started: ${error}` };
   }
 
   /** Cancels an operation: its signal aborts and its Docker calls end. Its result follows when its handler ended. */
@@ -371,16 +403,32 @@ export class ChannelServer {
     await Promise.all(children.map((child) => child.exited));
   }
 
-  /** `docker rm -f` of the containers that the operation named. Never rejects. */
+  /**
+   * Review round 1 (S1): removes the containers with the cleanup labels of the operation: `docker ps -aq --filter
+   * label=…` per label, then `docker rm -f` of exactly those IDs. Never by a name, so a container that the operation did
+   * not start is never removed. Both calls together within CHANNEL_CLEANUP_TIMEOUT_MS. Never rejects.
+   */
   private async cleanup(run: Running): Promise<void> {
-    const names = [...run.cleanup];
-    if (names.length === 0) return;
+    const labels = [...run.cleanup];
+    if (labels.length === 0) return;
+    const deadline = Date.now() + CHANNEL_CLEANUP_TIMEOUT_MS;
+    const ids = new Set<string>();
+    for (const label of labels) {
+      const listed = await this.quietDocker(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(label)}`], deadline);
+      for (const line of listed.split('\n')) if (/^[0-9a-f]{12,64}$/.test(line.trim())) ids.add(line.trim());
+    }
+    if (ids.size > 0) await this.quietDocker(['rm', '-f', ...ids], deadline);
+  }
+
+  /** A Docker call of the script itself (no log), ended at `deadline`; resolves with its standard output. */
+  private async quietDocker(args: readonly string[], deadline: number): Promise<string> {
+    let stdout = '';
     let child: ServerChild;
     try {
-      child = this.deps.spawnDocker(['rm', '-f', ...names], () => {}, () => {});
+      child = this.deps.spawnDocker(args, (text) => (stdout += text), () => {});
       child.end();
     } catch {
-      return;
+      return '';
     }
     const timer = setTimeout(() => {
       try {
@@ -388,9 +436,10 @@ export class ChannelServer {
       } catch {
         // It ended already.
       }
-    }, CHANNEL_CLEANUP_TIMEOUT_MS);
+    }, Math.max(0, deadline - Date.now()));
     await child.exited;
     clearTimeout(timer);
+    return stdout;
   }
 
   /**

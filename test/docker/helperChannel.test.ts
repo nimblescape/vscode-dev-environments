@@ -7,7 +7,9 @@
 // on the engine of the runner). The script is bundled from src/helperChannel/main.ts like dist/helperChannel.js.
 // Checked above all: the container ends and is removed by itself when its connection is lost (the extension closes it,
 // the `docker run` process of the computer is killed, or the connection stays silent), and a container that an
-// operation started with a cleanup name is removed with it. The global teardown fails on any container left over.
+// operation started with its cleanup label is removed with it. Review round 1 (P7): the step containers run `sleep` as
+// process 1 (no init), which ignores SIGTERM, so only the cleanup of the channel can remove them; and afterAll fails
+// when a channel container is left over.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -15,7 +17,14 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { dockerTargetOf } from '../../src/core/docker/dockerHost';
 import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, channelLabelValue, encodeMessage, encodeScript } from '../../src/core/helperChannel/protocol';
+import {
+  CHANNEL_PROTOCOL_VERSION,
+  LABEL_HELPER_CHANNEL,
+  channelLabelValue,
+  channelStepLabel,
+  encodeMessage,
+  encodeScript,
+} from '../../src/core/helperChannel/protocol';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -36,11 +45,11 @@ async function bundleScript(): Promise<string> {
   return result.outputFiles[0].text;
 }
 
-async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_000): Promise<void> {
+async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_000, pollMs = 250): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 }
 
@@ -89,9 +98,17 @@ describe('the helper channel with the real Docker engine', () => {
 
   afterAll(() => {
     timings.print('Timings of the helper channel:');
+    const leftovers = channelContainers();
     removeRunObjects(cli, run.runId);
-    for (const name of channelContainers()) cli.run(['rm', '-f', name]);
+    for (const name of leftovers) cli.run(['rm', '-f', name]);
+    // Review round 1 (P7): every channel container must have ended by itself.
+    expect(leftovers).toEqual([]);
   });
+
+  /** A step container that only the cleanup can remove: `sleep` as process 1 ignores SIGTERM (no init). */
+  function stepArgs(name: string, label: string): string[] {
+    return ['run', '--rm', '--name', name, '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', channelStepLabel(label), '--entrypoint', 'sleep', helperTag, '300'];
+  }
 
   it('opens: the container has no network, no capability, --rm, and the labels; Docker calls and their output come back', async () => {
     const { channel, name } = await timings.measure('open a channel', () => open());
@@ -127,11 +144,9 @@ describe('the helper channel with the real Docker engine', () => {
   it('cancels an operation: its Docker call ends and the container it started is removed', async () => {
     const { channel, name } = await open();
     const stepName = `devenv-test-channel-step-${run.runId}`;
+    const label = `cancel-${run.runId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const controller = new AbortController();
-    const running = channel.docker(
-      ['run', '--rm', '--init', '--name', stepName, '--label', `${TEST_RUN_LABEL}=${run.runId}`, helperTag, 'sleep', '300'],
-      { signal: controller.signal, cleanup: [stepName] },
-    );
+    const running = channel.docker(stepArgs(stepName, label), { signal: controller.signal, cleanup: label });
     await waitUntil(() => cli.container(stepName)?.State.Running === true, 'the start of the step');
     controller.abort();
     await expect(running).rejects.toMatchObject({ name: 'AbortError' });
@@ -144,8 +159,10 @@ describe('the helper channel with the real Docker engine', () => {
   it('ends after the silence while the connection stays open, with the containers of what ran', async () => {
     const containerName = `devenv-channel-test-${run.runId}`;
     const stepName = `devenv-test-channel-silent-${run.runId}`;
+    const label = `silent-${run.runId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script) });
-    args.splice(args.indexOf(helperTag), 0, '-e', 'DEVENV_CHANNEL_SILENCE_MS=3000');
+    // Review round 1 (P8): long enough for the step to start and be seen on a slow runner.
+    args.splice(args.indexOf(helperTag), 0, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');
     const process = docker.start(args)!;
     let stdout = '';
     process.onStdout((text) => (stdout += text));
@@ -156,11 +173,11 @@ describe('the helper channel with the real Docker engine', () => {
         t: 'op',
         id: 1,
         op: 'docker',
-        params: { args: ['run', '--rm', '--init', '--name', stepName, '--label', `${TEST_RUN_LABEL}=${run.runId}`, helperTag, 'sleep', '300'], cleanup: [stepName] },
+        params: { args: stepArgs(stepName, label), cleanup: label },
       }),
     );
     await waitUntil(() => stdout.includes('"t":"hello"'), 'the answer to hello');
-    await waitUntil(() => cli.container(stepName)?.State.Running === true, 'the start of the step');
+    await waitUntil(() => cli.container(stepName)?.State.Running === true, 'the start of the step', 60_000, 100);
     // Nothing more is written; the input of docker run stays open, as with a connection that hangs.
     await timings.measure('end after the silence', () => waitUntil(() => cli.container(containerName) === undefined, 'the removal of the channel container'));
     await waitUntil(() => cli.container(stepName) === undefined, 'the removal of the step container');
