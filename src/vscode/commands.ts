@@ -48,8 +48,8 @@ export const Commands = {
   // Unit 7 (user decisions 2026-09-27): Docker on another computer through the Docker context, and back.
   useRemoteDockerHost: 'devEnvironments.useRemoteDockerHost',
   useLocalDocker: 'devEnvironments.useLocalDocker',
-  // User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host (hidden in the Command
-  // Palette): another remote host, or the local Docker.
+  // User request 2026-09-28: the choice of the Docker host, the command of the first row of the view (hidden in the
+  // Command Palette): another remote host, or the local Docker.
   chooseDockerHost: 'devEnvironments.chooseDockerHost',
   // User decision 2026-09-28: forgets every "Don't Ask Again" of the Docker host questions.
   askAgainDockerHost: 'devEnvironments.askAgainDockerHost',

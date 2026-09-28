@@ -30,7 +30,6 @@ import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
 import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
-import { REMOTE_DOCKER_HOST_CONTEXT_KEY } from './dockerHostIndicator';
 import { DOUBLE_CLICK_INTERVAL_MS, type ListOpenMode } from './rowActivation';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
@@ -613,7 +612,7 @@ describe('Controller commands', () => {
     // 30 since unit 7, PR 2: Close and Keep Running.
     // 31 with the command of a repository row (hidden): a double-click runs Start (user request 2026-09-27).
     // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
-    // 33 with the choice of the Docker host, the title-bar icon of the view on a remote host (user request 2026-09-28).
+    // 33 with the choice of the Docker host, the command of the first row of the view (user requests 2026-09-28).
     // 34 with Ask Again Before Changing the Docker Host (user decision 2026-09-28: "Don't Ask Again" for all questions).
     expect(declared).toHaveLength(34);
   });
@@ -3327,9 +3326,9 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     expect(operations).toEqual([]);
   });
 
-  // User request 2026-09-28: the icon of the view's title bar, "Use a Remote Docker Host…" on the local Docker and the
-  // choice of the Docker host on a remote one.
-  it('runs the choice of the Docker host without an operation, and shows one of the two icons in the title bar', async () => {
+  // User requests 2026-09-28: the choice of the Docker host (the command of the first row of the view); since "the icon
+  // can then go away", no icon of the Docker host in the view's title bar.
+  it('runs the choice of the Docker host without an operation, and shows no icon of the Docker host in the title bar', async () => {
     await run('chooseDockerHost');
     expect(remote.chooseDockerHost).toHaveBeenCalledTimes(1);
     // User decision 2026-09-28: Ask Again Before Changing the Docker Host, also without an operation.
@@ -3343,20 +3342,12 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       };
     };
     const title = manifest.contributes.menus['view/title'];
-    // Review of the sidebar host (S1): not over the Docker setup, which shows while no local Docker CLI is found.
-    expect(title).toContainEqual({
-      command: 'devEnvironments.useRemoteDockerHost',
-      when: `view == devEnvironments.repositories && !${REMOTE_DOCKER_HOST_CONTEXT_KEY} && !${DockerContextKeys.setupRequired}`,
-      group: 'navigation@3',
-    });
-    expect(title).toContainEqual({
-      command: 'devEnvironments.chooseDockerHost',
-      when: `view == devEnvironments.repositories && ${REMOTE_DOCKER_HOST_CONTEXT_KEY}`,
-      group: 'navigation@3',
-    });
+    // User request 2026-09-28 ("the icon can then go away"): the first row of the list chooses the Docker host; the
+    // title bar has no icon of the Docker host anymore, and the commands no icon.
+    expect(title.filter((entry) => entry.command === 'devEnvironments.useRemoteDockerHost' || entry.command === 'devEnvironments.chooseDockerHost')).toEqual([]);
     const icons = Object.fromEntries(manifest.contributes.commands.map((command) => [command.command, command.icon]));
-    expect(icons['devEnvironments.useRemoteDockerHost']).toBe('$(remote)');
-    expect(icons['devEnvironments.chooseDockerHost']).toBe('$(vm-active)');
+    expect(icons['devEnvironments.useRemoteDockerHost']).toBeUndefined();
+    expect(icons['devEnvironments.chooseDockerHost']).toBeUndefined();
     expect(manifest.contributes.menus.commandPalette).toContainEqual({ command: 'devEnvironments.chooseDockerHost', when: 'false' });
   });
 

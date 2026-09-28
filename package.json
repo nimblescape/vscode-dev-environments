@@ -267,8 +267,7 @@
       {
         "command": "devEnvironments.useRemoteDockerHost",
         "title": "Use a Remote Docker Host…",
-        "category": "Dev Environments",
-        "icon": "$(remote)"
+        "category": "Dev Environments"
       },
       {
         "command": "devEnvironments.useLocalDocker",
@@ -277,9 +276,8 @@
       },
       {
         "command": "devEnvironments.chooseDockerHost",
-        "title": "Remote Docker Host…",
-        "category": "Dev Environments",
-        "icon": "$(vm-active)"
+        "title": "Choose the Docker Host…",
+        "category": "Dev Environments"
       },
       {
         "command": "devEnvironments.askAgainDockerHost",
@@ -392,16 +390,6 @@
           "command": "devEnvironments.editRepositoryGroups",
           "when": "view == devEnvironments.repositories",
           "group": "1_settings@1"
-        },
-        {
-          "command": "devEnvironments.useRemoteDockerHost",
-          "when": "view == devEnvironments.repositories && !devEnvironments.remoteDockerHost && !devEnvironments.dockerSetupRequired",
-          "group": "navigation@3"
-        },
-        {
-          "command": "devEnvironments.chooseDockerHost",
-          "when": "view == devEnvironments.repositories && devEnvironments.remoteDockerHost",
-          "group": "navigation@3"
         }
       ],
       "view/item/context": [

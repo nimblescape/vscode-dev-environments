@@ -20,22 +20,43 @@ import {
 export const REPOSITORIES_VIEW_ID = 'devEnvironments.repositories';
 
 /**
- * User report 2026-09-28 ("remote connection is not shown anymore"): the first row while Docker is set to a remote host.
- * The merged header of the single view does not reliably show the view's title or description, so the list itself
- * names the host. A click opens the choice of the Docker host.
+ * User report 2026-09-28 ("remote connection is not shown anymore"): the first row names the Docker host. The merged
+ * header of the single view does not reliably show the view's title or description, so the list itself names it. User
+ * request 2026-09-28 ("the headline shall be shown also in local mode"; "the icon can then go away"): also for the local
+ * Docker, and a click opens the choice of the Docker host, which replaces the icons of the title bar.
  */
 export interface DockerHostRow {
   kind: 'dockerHost';
   id: typeof DOCKER_HOST_ROW_ID;
+  host: ShownDockerHost;
+}
+
+/** The Docker host of the first row: the local Docker, a remote host, or an endpoint that is not supported. */
+export interface ShownDockerHost {
+  kind: 'local' | 'remote' | 'unsupported';
+  /** The remote host, or the endpoint that is not supported; empty for the local Docker. */
   host: string;
 }
 
 export const DOCKER_HOST_ROW_ID = 'dockerHost';
 
 export const DockerHostRowTexts = {
-  label: (host: string) => `Remote Docker host: ${host}`,
-  tooltip: 'Docker runs on this computer over SSH. Click to choose another host or the local Docker.',
+  label: (shown: ShownDockerHost) =>
+    shown.kind === 'local'
+      ? 'Local Docker'
+      : shown.kind === 'remote'
+        ? `Remote Docker host: ${shown.host}`
+        : `Docker endpoint not supported: ${shown.host}`,
+  tooltip: (shown: ShownDockerHost) =>
+    shown.kind === 'local'
+      ? 'Docker runs on this computer. Click to use a remote Docker host.'
+      : shown.kind === 'remote'
+        ? `Docker runs on ${shown.host} over SSH. Click to choose another host or the local Docker.`
+        : 'Docker is set to an endpoint that Dev Environments does not support (only the local Docker and SSH hosts). Click to choose the Docker host.',
 } as const;
+
+// User request 2026-09-28 ("use the remote monitor icon"): the monitor with the remote badge for a remote host.
+const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = { local: 'vm', remote: 'remote-explorer', unsupported: 'warning' };
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
 export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | DockerHostRow;
@@ -47,7 +68,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
   private groups: OwnerGroup[] = [];
   private roots: TreeNode[] = [];
-  private dockerHost: string | undefined;
+  private dockerHost: ShownDockerHost | undefined;
   private readonly parents = new Map<string, OwnerGroup | GroupNode>();
 
   readonly onDidChangeTreeData: vscode.Event<TreeNode | undefined> = this.changeEmitter.event;
@@ -74,12 +95,12 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   }
 
   /**
-   * The remote Docker host of the first row, or undefined for none (the local Docker). The row shows only above other
-   * rows: an empty view keeps its welcome content (sign-in, Docker setup).
+   * The Docker host of the first row, or undefined for none (not known yet). The row shows only above other rows: an
+   * empty view keeps its welcome content (sign-in, Docker setup).
    */
-  setDockerHost(host: string | undefined): void {
-    if (host === this.dockerHost) return;
-    this.dockerHost = host;
+  setDockerHost(host: ShownDockerHost | undefined): void {
+    if (host?.kind === this.dockerHost?.kind && host?.host === this.dockerHost?.host) return;
+    this.dockerHost = host === undefined ? undefined : { kind: host.kind, host: host.host };
     this.changeEmitter.fire(undefined);
   }
 
@@ -180,9 +201,9 @@ function signInItem(row: SignInRow): vscode.TreeItem {
 function dockerHostItem(row: DockerHostRow): vscode.TreeItem {
   const item = new vscode.TreeItem(DockerHostRowTexts.label(row.host), vscode.TreeItemCollapsibleState.None);
   item.id = row.id;
-  item.tooltip = DockerHostRowTexts.tooltip;
+  item.tooltip = DockerHostRowTexts.tooltip(row.host);
   item.contextValue = 'dockerHost';
-  item.iconPath = new vscode.ThemeIcon('remote');
+  item.iconPath = new vscode.ThemeIcon(DOCKER_HOST_ICONS[row.host.kind]);
   item.command = { command: Commands.chooseDockerHost, title: DockerHostRowTexts.label(row.host) };
   return item;
 }

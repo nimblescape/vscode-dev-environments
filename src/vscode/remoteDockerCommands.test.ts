@@ -333,8 +333,8 @@ describe('Use a Remote Docker Host…', () => {
   });
 });
 
-// User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host.
-describe('Remote Docker Host… (the choice of the title bar)', () => {
+// User request 2026-09-28: the choice of the Docker host (since "the icon can then go away": of the first row).
+describe('Choose the Docker Host… (the choice of the first row)', () => {
   // User request 2026-09-28 ("it shall show the config list again"): the hosts right away, the local Docker last.
   it('lists the hosts of the SSH config with the current one marked, "Enter an SSH address…", and the local Docker', async () => {
     cli.contexts.set(BUILD_BOX, 'ssh://build-box');
@@ -350,6 +350,30 @@ describe('Remote Docker Host… (the choice of the title bar)', () => {
       [`$(vm) ${RemoteDockerTexts.useLocal}`, undefined],
     ]);
     expect(options.title).toBe('Docker host: build-box');
+  });
+
+  // Review round 3 of the sidebar host (G2): a host entered as an SSH address is no alias of the SSH config; it is the
+  // first entry then, marked, and choosing it says that it is the current host already.
+  it('marks a current host that was entered as an SSH address', async () => {
+    const typed = remoteContextName('me@box:2222');
+    cli.contexts.set(typed, 'ssh://me@box:2222');
+    cli.current = typed;
+    await commands.chooseDockerHost();
+    const [items] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>];
+    expect(items[0]).toMatchObject({ label: '$(check) me@box:2222', description: RemoteDockerTexts.current });
+    expect(items.filter((item) => item.label.startsWith('$(check)'))).toHaveLength(1);
+    answer('$(check) me@box:2222');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('me@box:2222'));
+    expect(cli.current).toBe(typed);
+  });
+
+  // User request 2026-09-28 (the first row also for the local Docker): the same choice there, the local Docker marked.
+  it('marks the local Docker as current when Docker is local', async () => {
+    await commands.chooseDockerHost();
+    const [items] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>];
+    expect(items.at(-1)).toMatchObject({ label: `$(check) ${RemoteDockerTexts.useLocal}`, description: RemoteDockerTexts.current });
+    expect(items.some((item) => item.label.startsWith('$(check)') && item.label !== `$(check) ${RemoteDockerTexts.useLocal}`)).toBe(false);
   });
 
   it('switches to the picked host, says so for the current one, and goes local on "Use the Local Docker"', async () => {

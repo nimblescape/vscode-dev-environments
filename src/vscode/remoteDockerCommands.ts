@@ -76,7 +76,7 @@ export const RemoteDockerTexts = {
   variableSet: (name: string) =>
     `${name} is set in the environment of VS Code, so Docker ignores the Docker context. Remove ${name} and start VS Code again, then try again.`,
   switchFailed: 'The Docker context could not be changed.',
-  /** User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host. */
+  /** User request 2026-09-28: the title of the choice of the Docker host (the first row of the view). */
   chooseTitle: (host: string) => `Docker host: ${host}`,
   /** User request 2026-09-28 ("it shall show the config list again"): one list of the hosts and the local Docker. */
   choosePlaceholder: 'Choose a host of your SSH config, enter an SSH address, or use the local Docker',
@@ -117,7 +117,7 @@ export interface RemoteDockerDeps {
 
 interface HostItem extends vscode.QuickPickItem {
   host?: string;
-  /** The entry "Use the Local Docker" of the title-bar choice. */
+  /** The entry "Use the Local Docker" of the choice of the Docker host. */
   local?: boolean;
 }
 
@@ -141,8 +141,9 @@ export class RemoteDockerCommands {
   }
 
   /**
-   * The title-bar icon of the view while Docker is set to a remote host (user request 2026-09-28): another remote host
-   * ("Use a Remote Docker Host…") or the local Docker ("Use the Local Docker"). Never throws.
+   * The first row of the sidebar, which names the Docker host (user request 2026-09-28; it replaced the icons that the
+   * view had): another remote host ("Use a Remote Docker Host…") or the local Docker ("Use the Local Docker"), the
+   * current one marked. Never throws.
    */
   async chooseDockerHost(): Promise<void> {
     try {
@@ -157,6 +158,7 @@ export class RemoteDockerCommands {
         placeHolder: RemoteDockerTexts.choosePlaceholder,
         currentHost,
         offerLocal: true,
+        localIsCurrent: current.kind === 'local',
       });
       if (picked === undefined) return;
       if (picked === LOCAL_CHOICE) {
@@ -288,11 +290,12 @@ export class RemoteDockerCommands {
   }
 
   /**
-   * The host of the SSH config or a typed SSH address. With `offerLocal` (the title-bar choice), the local Docker is the
-   * last entry (LOCAL_CHOICE), and `currentHost` is marked.
+   * The host of the SSH config or a typed SSH address. With `offerLocal` (the choice of the first row of the sidebar),
+   * the local Docker is the last entry (LOCAL_CHOICE); `currentHost`, or the local Docker with `localIsCurrent`, is
+   * marked.
    */
   private async pickHost(
-    options: { title?: string; placeHolder?: string; currentHost?: string; offerLocal?: boolean } = {},
+    options: { title?: string; placeHolder?: string; currentHost?: string; offerLocal?: boolean; localIsCurrent?: boolean } = {},
   ): Promise<string | typeof LOCAL_CHOICE | undefined> {
     let hosts: SshHostEntry[] = [];
     try {
@@ -305,11 +308,21 @@ export class RemoteDockerCommands {
       if (entry.alias !== options.currentHost) return { label: entry.alias, description, host: entry.alias };
       return { label: `$(check) ${entry.alias}`, description: description ? `${description} · ${RemoteDockerTexts.current}` : RemoteDockerTexts.current, host: entry.alias };
     });
+    // Review round 3 of the sidebar host (G2): a current host that is no alias of the SSH config (an address entered
+    // with "Enter an SSH address…") is the first entry, marked, so the current choice is always marked.
+    if (options.currentHost !== undefined && !hosts.some((entry) => entry.alias === options.currentHost)) {
+      items.unshift({ label: `$(check) ${options.currentHost}`, description: RemoteDockerTexts.current, host: options.currentHost });
+    }
     if (items.length > 0) items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
     items.push({ label: RemoteDockerTexts.enterAddress, description: RemoteDockerTexts.enterAddressDetail });
     if (options.offerLocal) {
       items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
-      items.push({ label: `$(vm) ${RemoteDockerTexts.useLocal}`, local: true });
+      // User request 2026-09-28 (the first row also for the local Docker): the local Docker is marked when it is current.
+      items.push(
+        options.localIsCurrent
+          ? { label: `$(check) ${RemoteDockerTexts.useLocal}`, description: RemoteDockerTexts.current, local: true }
+          : { label: `$(vm) ${RemoteDockerTexts.useLocal}`, local: true },
+      );
     }
     const picked = await vscode.window.showQuickPick(items, {
       title: options.title ?? RemoteDockerTexts.pickTitle,
