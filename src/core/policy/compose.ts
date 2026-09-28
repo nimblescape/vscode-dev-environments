@@ -111,7 +111,9 @@ function labelProblems(labels: unknown, where: string): Problem[] {
     .map((key) => unsupported(`${where}label ${key}`));
 }
 
-/** imageReferenceFinding of ./images.ts as a problem: an image ID (an image of another account: otherAccountImageItems). */
+/**
+ * imageReferenceFinding of ./images.ts as a problem: an image ID (an image of another account: otherAccountImageItems).
+ */
 function imageProblems(reference: string, what: string): Problem[] {
   const finding = imageReferenceFinding(reference, what);
   return finding ? [finding] : [];
@@ -1125,9 +1127,10 @@ function readComposeFindings(input: ComposeAccessInput): Problem[] {
 
 /**
  * The image references of the merged model (review round 2, S2-05), for the question whether Docker takes one of them
- * for an image ID (resolvedByImageId): the `image` of each service without a build, and the images of
- * `additional_contexts`. Each named with its service, as composeAccessReport names its items. The images of the
- * Dockerfiles are not asked about (Dockerfile refusals removed, user decision 2026-09-27).
+ * for an image ID (resolvedByImageId) and, by the ID of the image that one names, whether it is an image of the
+ * environments of another account (otherAccountImageItems, user decision 2026-09-28): the `image` of each service
+ * without a build, and the images of `additional_contexts`. Each named with its service, as composeAccessReport names
+ * its items. The images of the Dockerfiles are not asked about (Dockerfile refusals removed, user decision 2026-09-27).
  */
 export function composeImageReferences(model: ComposeModel): NamedImageReference[] {
   const references: NamedImageReference[] = [];

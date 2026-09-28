@@ -36,6 +36,7 @@ import {
   imageReferenceFinding,
   otherAccountImageItems,
   unknownEnvironmentShortIds,
+  volumeOwners,
   resolveNetworkReference,
   resolvedByImageId,
   imageIdResolvedReferences,
@@ -1143,8 +1144,9 @@ describe('imageReferenceFinding and localImageRepository', () => {
   });
 
   it.each([
-    // User decision 2026-09-28: changed expectation (it was protected, `… of another environment`), a name is not refused by its
-    // form; the pipeline refuses an image of the environments of another account by its ID (otherAccountImageItems).
+    // User decision 2026-09-28: changed expectation (it was protected, `… of another environment`), a name is not
+    // refused by its form; the pipeline refuses an image of the environments of another account by its ID
+    // (otherAccountImageItems).
     ['devenv-11111111:2', undefined],
     ['Docker.io/Library/devenv-1', undefined],
     [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
@@ -1198,6 +1200,24 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     ]);
     expect(environmentImageIds(images, owners, '1001')).toEqual({ own: new Set(['sha256:b']), others: new Set(['sha256:a', 'sha256:c']) });
     expect(unknownEnvironmentShortIds(images, owners)).toEqual(['33333333']);
+    // Only of the images that the references found.
+    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:a']))).toEqual([]);
+    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:c']))).toEqual(['33333333']);
+  });
+
+  it('names the owner of each environment by the labels of its volumes, none when they differ', () => {
+    const volume = (id: string, owner?: string) => ({ labels: { 'nimblescape.devenv.environment-id': id, ...(owner ? { 'nimblescape.devenv.owner-id': owner } : {}) } });
+    expect(
+      volumeOwners([
+        volume('11111111-0000-4000-8000-000000000001', '1001'),
+        volume('11111111-0000-4000-8000-000000000001', '1001'),
+        volume('22222222-0000-4000-8000-000000000002', '1001'),
+        volume('22222222-0000-4000-8000-000000000002', '2002'),
+        volume('22222222-0000-4000-8000-000000000002', '1001'),
+        volume('33333333-0000-4000-8000-000000000003'),
+        { labels: {} },
+      ]),
+    ).toEqual(new Map([['11111111', '1001']]));
   });
 
   it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([

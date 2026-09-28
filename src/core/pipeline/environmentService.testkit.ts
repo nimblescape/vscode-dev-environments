@@ -431,11 +431,15 @@ export class FakeDocker implements EnvironmentDocker {
     this.environmentImageLists++;
     const byId = new Map<string, ImageInfo>();
     for (const reference of this.images) {
-      if (!reference.startsWith('devenv-') || reference.includes('@')) continue;
-      const tagged = reference.slice(reference.lastIndexOf('/') + 1).includes(':') ? reference : `${reference}:latest`;
+      if (reference.includes('@')) continue;
+      // Docker stores and lists a name of Docker Hub without its registry and `library/`; `*` of the filter does not
+      // match `/`.
+      const name = reference.replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '').replace(/^library\//, '');
+      if (!/^devenv-[^/]*$/.test(name)) continue;
+      const tagged = name.includes(':') ? name : `${name}:latest`;
       const id = this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
       const image = byId.get(id) ?? { id, tags: [], createdAt: '' };
-      image.tags.push(tagged);
+      if (!image.tags.includes(tagged)) image.tags.push(tagged);
       byId.set(id, image);
     }
     return [...byId.values()];

@@ -138,7 +138,8 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // Dockerfile refusals removed (user decision 2026-09-27): changed row, only the Dockerfile of the dev service must be
   // read (the build writes its text); before, any local build whose Dockerfile could not be read was refused.
   ['a dev service whose Dockerfile could not be read', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: {} }), `service app: Dockerfile ${REPO}/Dockerfile (it could not be read, and the dev service is built from the text that Dev Environments read)`, 'unsupported'],
-  // Review round 1, S4: image IDs. (User decision 2026-09-28: the rows of the images named `devenv-…` are allowed now, below.)
+  // Review round 1, S4: image IDs. (User decision 2026-09-28: the rows of the images named `devenv-…` are allowed now,
+  // below.)
   ['an image ID', input(service('db', { image: `sha256:${'b'.repeat(64)}` })), `service db: image sha256:${'b'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
   // Review round 2 (S2-05): changed row, a short prefix of an ID may be a name (the pipeline asks Docker); 64 hexadecimal
   // characters are an ID by their form.
@@ -246,9 +247,10 @@ describe('the Dockerfiles of the services are not checked', () => {
   });
 });
 
-// User decision 2026-09-28: the former rows of the images named `devenv-…` (each refused as protected `… of another environment`);
-// now allowed by the policy, with the checks on and off, and still asked about (composeImageReferences): the pipeline
-// refuses a reference whose image is an image of the environments of another account by its ID (otherAccountImageItems).
+// User decision 2026-09-28: the former rows of the images named `devenv-…` (each refused as protected `… of another
+// environment`); now allowed by the policy, with the checks on and off, and still asked about (composeImageReferences):
+// the pipeline refuses a reference whose image is an image of the environments of another account by its ID
+// (otherAccountImageItems).
 describe('images named devenv-… are not refused by their name', () => {
   const ALLOWED = { hostAccess: [], unsupported: [] };
   it.each<[string, ComposeAccessInput, string]>([

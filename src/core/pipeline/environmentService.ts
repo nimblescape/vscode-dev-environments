@@ -116,6 +116,7 @@ import {
   inspectedImageItems,
   otherAccountImageItems,
   unknownEnvironmentShortIds,
+  volumeOwners,
   isOwnVolume,
   isRefused,
   isSameOwnerAdditionalVolume,
@@ -128,6 +129,7 @@ import {
   withoutComposeIgnored,
   type CheckStage,
   type EnvironmentImageIds,
+  type InspectedImage,
   type HostAccessChecks,
   type HostAccessInput,
   type HostAccessReport,
@@ -834,14 +836,18 @@ class HostAccessError extends UserFacingError {
 }
 
 /**
+ * User decision 2026-09-28: the reasons of dockerCheckItem when the images of the environments on the Docker host, or
+ * the volumes that name the owners of some of them, could not be read.
+ */
+const ENVIRONMENT_IMAGES_UNREAD = 'the images of the environments on the Docker host could not be read';
+const ENVIRONMENT_OWNERS_UNREAD = 'the owners of the images of the environments on the Docker host could not be read';
+
+/**
  * Review round 9 (P9-1, P9-2): the analysis of the host access policy failed (AnalysisFailure): refused like a refusal
  * of the policy (fail closed), but an update is not remembered as refused (it is tried again), and an analysis that
  * could not run (`internal`) has a message of its own, does not block an existing environment whose container is only
  * started, and blames no configuration.
  */
-/** User decision 2026-09-28: the reason of dockerCheckItem when the images of the environments could not be read. */
-const ENVIRONMENT_IMAGES_UNREAD = 'the images of the environments on the Docker host could not be read';
-
 class AnalysisFailedError extends HostAccessError {
   constructor(readonly failure: AnalysisFailure) {
     const item = analysisFailureItem(failure);
@@ -1793,7 +1799,7 @@ export class EnvironmentService {
    * transient (which are logged, never turned into items); AnalysisFailedError only when there is no definitive item.
    * User decision 2026-09-28: `hostAccess` (protected), the references whose image is an image of the environments of
    * another account on the Docker host of `env` and of none of its own account (otherAccountImageItems, by the image ID;
-   * environmentImageIds); no longer a rule on the name `devenv-…`.
+   * hostEnvironmentImageIds); no longer a rule on the name `devenv-…`.
    */
   private async imageIdItems(
     env: Environment,
@@ -1830,14 +1836,15 @@ export class EnvironmentService {
     if (notChecked.length > 0) this.logger.warn(`Docker could not inspect the image references ${capped(notChecked).join(', ')}.`);
     // User decision 2026-09-28: the images of the environments of other accounts, by their IDs; only when a reference
     // found a local image (a missing one is pulled by its name, or the build fails). `undefined`: Docker could not say.
-    const ids = images.length > 0 ? await this.hostEnvironmentImageIds(env, signal) : { own: new Set<string>(), others: new Set<string>() };
+    const read = images.length > 0 ? await this.hostEnvironmentImageIds(env, images, signal) : { ids: { own: new Set<string>(), others: new Set<string>() } };
+    const ids = read.ids;
     const foreign = ids === undefined ? [] : otherAccountImageItems(named, images, ids);
     if (foreign.length > 0) this.logger.warn(`Image references of ${env.repository} name images of environments of another GitHub account: ${capped(foreign).join(', ')}.`);
     if (transient.length > 0 || ids === undefined) {
       const shown =
         transient.length > 0
           ? transient.slice(0, 5).map((reference) => truncated(reference, MAX_ITEM_LENGTH)).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '')
-          : ENVIRONMENT_IMAGES_UNREAD;
+          : (read.unread ?? ENVIRONMENT_IMAGES_UNREAD);
       // Review round 13 (P13-1): a definitive refusal is not hidden by a failure of Docker for another reference: the
       // configuration is refused for it anyway (and an update refused for it is remembered); the failure is logged. A
       // refusal as an image of another account is definitive only with the images of the environments read (`ids`).
@@ -1852,53 +1859,54 @@ export class EnvironmentService {
   }
 
   /**
-   * User decision 2026-09-28: the IDs of the images of the environments on the Docker host of `env` (EnvironmentImageIds,
-   * environmentImageIds): the images that Docker lists as `devenv-<short id>:<build>` and `devenv-<short id>-<service>`,
-   * whichever computer built them (so also an older build that is still there, a new one before its build record, and one
-   * that a Delete could not remove), split by the owner account of the short ID: the registry entries on the host (and
-   * `env` itself), else the owner label of a volume of that environment on the host (one `docker volume ls`, only for
-   * short IDs that the registry does not know); an image of no known owner counts as another account's. One `docker image
-   * ls` on each check whose references found a local image. `undefined` when Docker could not answer (the caller fails
-   * the check, as for a reference: AnalysisFailedError); a cancellation is thrown.
+   * User decision 2026-09-28: the IDs of the images of the environments on the Docker host of `env`
+   * (EnvironmentImageIds, environmentImageIds): the images that Docker lists as `devenv-<short id>:<build>` and
+   * `devenv-<short id>-<service>`, whichever computer built them (so also an older build that is still there, a new one
+   * before its build record, and one that a Delete could not remove), split by the owner account of the short ID: the
+   * registry entries on the host (and `env` itself), else the owner label of the volumes of that environment on the
+   * host (one `docker volume ls`, only when an image that a reference found, `found`, has a short ID that the registry
+   * does not know: an environment that another computer created on a shared host, or an image left behind). An image of
+   * no known owner, or of volumes with different owner labels, counts as another account's. One `docker image ls` on
+   * each check whose references found a local image. `unread`: Docker could not answer (the reason of dockerCheckItem;
+   * the caller fails the check, as for a reference: AnalysisFailedError); a cancellation is thrown.
    */
-  private async hostEnvironmentImageIds(env: Environment, signal?: AbortSignal): Promise<EnvironmentImageIds | undefined> {
-    const unread = (what: string, error: unknown): undefined => {
+  private async hostEnvironmentImageIds(
+    env: Environment,
+    found: readonly InspectedImage[],
+    signal?: AbortSignal,
+  ): Promise<{ ids?: EnvironmentImageIds; unread?: string }> {
+    const unread = (what: string, reason: string, error: unknown): { unread: string } => {
       if (this.isCancellation(error, signal)) {
         this.throwIfCancelled(signal);
         throw error;
       }
       this.logger.warn(`The ${what} on the Docker host could not be read: ${errorMessage(error)}`);
-      return undefined;
+      return { unread: reason };
     };
     this.throwIfCancelled(signal);
     let images: Awaited<ReturnType<ContainerAdapter['listEnvironmentImages']>>;
     try {
       images = await this.deps.docker.listEnvironmentImages(signal);
     } catch (error) {
-      return unread('images of the environments', error);
+      return unread('images of the environments', ENVIRONMENT_IMAGES_UNREAD, error);
     }
     this.throwIfCancelled(signal);
-    if (images.length === 0) return { own: new Set(), others: new Set() };
+    if (images.length === 0) return { ids: { own: new Set(), others: new Set() } };
     const owners = new Map<string, string>();
     for (const entry of environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env))) owners.set(shortId(entry.id).toLowerCase(), entry.owner.id);
     owners.set(shortId(env.id).toLowerCase(), env.owner.id);
-    if (unknownEnvironmentShortIds(images, owners).length > 0) {
+    const foundIds = new Set(found.map((image) => image.id.toLowerCase()));
+    if (unknownEnvironmentShortIds(images, owners, foundIds).length > 0) {
       let volumes: VolumeInfo[];
       try {
-        volumes = await this.deps.docker.listEnvironmentVolumes();
+        volumes = await this.deps.docker.listEnvironmentVolumes(signal);
       } catch (error) {
-        return unread('volumes of the environments', error);
+        return unread('volumes of the environments', ENVIRONMENT_OWNERS_UNREAD, error);
       }
       this.throwIfCancelled(signal);
-      for (const volume of volumes) {
-        const id = volume.labels[LABEL_ENVIRONMENT_ID];
-        const owner = volume.labels[LABEL_OWNER_ID];
-        if (!id || !owner) continue;
-        const short = shortId(id).toLowerCase();
-        if (!owners.has(short)) owners.set(short, owner);
-      }
+      for (const [short, owner] of volumeOwners(volumes)) if (!owners.has(short)) owners.set(short, owner);
     }
-    return environmentImageIds(images, owners, env.owner.id);
+    return { ids: environmentImageIds(images, owners, env.owner.id) };
   }
 
   /**

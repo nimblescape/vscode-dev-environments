@@ -894,11 +894,13 @@ export class ContainerAdapter {
   }
 
   /** Volumes with the label nimblescape.devenv.environment-id, with all their labels. */
-  async listEnvironmentVolumes(): Promise<VolumeInfo[]> {
+  async listEnvironmentVolumes(signal?: AbortSignal): Promise<VolumeInfo[]> {
     const listArgs = ['volume', 'ls', '--filter', `label=${LABEL_ENVIRONMENT_ID}`, '--format', '{{json .Name}}'];
-    const names = parseJsonLines(await this.runChecked(listArgs, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS })).filter(
+    const names = parseJsonLines(await this.runChecked(listArgs, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal })).filter(
       (name): name is string => typeof name === 'string' && name !== '',
     );
+    // User decision 2026-09-28: a cancellation of the check of the images of the environments ends before the inspect.
+    if (signal?.aborted) throw abortError();
     return this.inspectVolumes(names);
   }
 
@@ -1092,9 +1094,9 @@ export class ContainerAdapter {
   }
 
   /**
-   * User decision 2026-09-28: the named images of the Docker host whose repository starts with `devenv-` (`docker image ls
-   * --filter reference=devenv-*`), each image once with its full ID and its references `repository:tag`: the environment
-   * images `devenv-<short id>:<build>` and the images that Docker Compose built for an environment
+   * User decision 2026-09-28: the named images of the Docker host whose repository starts with `devenv-` (`docker image
+   * ls --filter reference=devenv-*`), each image once with its full ID and its references `repository:tag`: the
+   * environment images `devenv-<short id>:<build>` and the images that Docker Compose built for an environment
    * (`devenv-<short id>-<service>`), whichever computer built them. Throws CommandError, or an AbortError when `signal`
    * aborts.
    */

@@ -4,10 +4,11 @@
 
 // Image references of a configuration (concept D-17): an image of the environments of another account, an image ID in
 // place of a name, references that Docker's grammar does not accept, and the labels of an image by which Dev
-// Environments, the Dev Container CLI, and Docker Compose find containers. The pipeline asks Docker about the references
-// (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
+// Environments, the Dev Container CLI, and Docker Compose find containers. The pipeline asks Docker about the
+// references (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, shortId } from '../names';
 import type { HostAccessFinding } from './report';
 import { isReservedLabel } from './rules';
 
@@ -279,8 +280,8 @@ export interface EnvironmentImageIds {
 
 /**
  * The image of `images` that Docker gives for `reference` by its name (a tag, or a digest of the repository;
- * resolvedByImageId), `undefined` when none of them. A reference that Docker resolves by the ID of an image is refused as
- * an image ID (imageIdResolvedReferences).
+ * resolvedByImageId), `undefined` when none of them. A reference that Docker resolves by the ID of an image is refused
+ * as an image ID (imageIdResolvedReferences).
  */
 export function imageNamedBy(reference: string, images: readonly InspectedImage[]): InspectedImage | undefined {
   if (parseImageReference(reference) === undefined) return undefined;
@@ -318,16 +319,41 @@ export function environmentImageIds(
   return { own, others };
 }
 
-/** The short IDs of `images` (environmentImageShortId) that `owners` does not know. */
-export function unknownEnvironmentShortIds(images: ReadonlyArray<{ tags: readonly string[] }>, owners: ReadonlyMap<string, string>): string[] {
+/**
+ * The short IDs of `images` (environmentImageShortId) that `owners` does not know; with `ids`, only of the images with
+ * one of these IDs (the images that the references of a configuration found).
+ */
+export function unknownEnvironmentShortIds(
+  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
+  owners: ReadonlyMap<string, string>,
+  ids?: ReadonlySet<string>,
+): string[] {
   const unknown = new Set<string>();
   for (const image of images) {
+    if (ids !== undefined && !ids.has(image.id.toLowerCase())) continue;
     for (const tag of image.tags) {
       const short = environmentImageShortId(tag);
       if (short !== undefined && !owners.has(short)) unknown.add(short);
     }
   }
   return [...unknown];
+}
+
+/**
+ * The owner account of each environment short ID by the labels of `volumes` (nimblescape.devenv.environment-id and
+ * nimblescape.devenv.owner-id). A short ID whose volumes carry different owners is left out: its images count as
+ * another account's (environmentImageIds).
+ */
+export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): Map<string, string> {
+  const owners = new Map<string, string | undefined>();
+  for (const volume of volumes) {
+    const id = volume.labels[LABEL_ENVIRONMENT_ID];
+    const owner = volume.labels[LABEL_OWNER_ID];
+    if (!id || !owner) continue;
+    const short = shortId(id).toLowerCase();
+    owners.set(short, owners.has(short) && owners.get(short) !== owner ? undefined : owner);
+  }
+  return new Map([...owners].filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
 /** The item of an image reference that names an image of the environments of another account (protected). */

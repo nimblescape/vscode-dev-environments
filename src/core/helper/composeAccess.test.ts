@@ -109,8 +109,9 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
   it.each<[string, string, Record<string, unknown>, HostAccessReport]>([
     // image (D-17)
     ['an image', 'db', { image: 'mirror.gcr.io/library/alpine:3.22' }, NONE],
-    // User decision 2026-09-28: changed expectation (it was refused as `… of another environment`), a name like devenv-… is allowed;
-    // the pipeline refuses an image of the environments of another account by its ID (otherAccountImageItems).
+    // User decision 2026-09-28: changed expectation (it was refused as `… of another environment`), a name like
+    // devenv-… is allowed; the pipeline refuses an image of the environments of another account by its ID
+    // (otherAccountImageItems).
     ['an image named like the image of an environment', 'db', { image: 'devenv-11111111:3' }, NONE],
     ['an image named like the image of an environment on Docker Hub', 'db', { image: 'docker.io/library/devenv-11111111-app' }, NONE],
     // build

@@ -193,7 +193,8 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['a Dockerfile that is a link out of the repository', input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileUnreadable: 'Dockerfile' }), 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)', 'protected'],
   // U1: a size limit, not a check of the content.
   ['a Dockerfile longer than MAX_DOCKERFILE_LENGTH', input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileLength: MAX_DOCKERFILE_LENGTH + 1 }), `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`, 'unsupported'],
-  // Review round 1 (S4): image IDs. (User decision 2026-09-28: the rows of the images named `devenv-…` are allowed now, below.)
+  // Review round 1 (S4): image IDs. (User decision 2026-09-28: the rows of the images named `devenv-…` are allowed now,
+  // below.)
   ['an image ID', input({ image: `sha256:${'c'.repeat(64)}` }), `image sha256:${'c'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
   // Review round 1 (S3): the Compose network of another environment, by its name (also the long form) or its labels.
   ['the Compose network of another environment', input(run('--network', 'devenv-11111111_default')), 'network devenv-11111111_default of another environment', 'protected'],
@@ -276,9 +277,10 @@ describe('review round 1: what stays allowed', () => {
   });
 
   it('allows images named devenv-…, and still asks Docker about them (User decision 2026-09-28)', () => {
-    // User decision 2026-09-28: before, `image devenv-11111111:2 of another environment`, `image index.docker.io/library/devenv-11111111:2
-    // of another environment`, and `build option --build-context image docker.io/devenv-11111111:2 of another environment`
-    // (protected). The pipeline refuses an image of the environments of another account by its ID (otherAccountImageItems).
+    // User decision 2026-09-28: before, `image devenv-11111111:2 of another environment`, `image
+    // index.docker.io/library/devenv-11111111:2 of another environment`, and `build option --build-context image
+    // docker.io/devenv-11111111:2 of another environment` (protected). The pipeline refuses an image of the
+    // environments of another account by its ID (otherAccountImageItems).
     const cases: Array<[Record<string, unknown>, string]> = [
       [{ image: 'devenv-11111111:2' }, 'devenv-11111111:2'],
       [{ image: 'index.docker.io/library/devenv-11111111:2' }, 'index.docker.io/library/devenv-11111111:2'],

@@ -170,8 +170,8 @@ describe('WorkerConfigurationAnalyzer', () => {
     }
     // Not empty: the results say something.
     expect(runAnalysisJob(jobs[0])).toMatchObject({ references: { images: ['mcr.microsoft.com/devcontainers/python:3.11'], features: ['ghcr.io/devcontainers/features/node:1'] } });
-    // User decision 2026-09-28: changed expectation (it also listed `service cache: image devenv-22222222:1 of another environment`), a
-    // name like devenv-… is allowed; the pipeline refuses an image of another account by its ID.
+    // User decision 2026-09-28: changed expectation (it also listed `service cache: image devenv-22222222:1 of another
+    // environment`), a name like devenv-… is allowed; the pipeline refuses an image of another account by its ID.
     expect(runAnalysisJob(jobs[4]).report.hostAccess).toEqual(['service cache: privileged mode']);
   });
 

@@ -672,6 +672,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
   it('fails the check when Docker cannot list the volumes that name the owner of an image', async () => {
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
     h.docker.images.add(environmentImageName(gone, 2));
+    h.docker.imageIds.set(environmentImageName(gone, 2), ID);
     // Only the list right after the list of the images fails (the open lists the volumes for other reasons too).
     const listEnvironmentImages = h.docker.listEnvironmentImages.bind(h.docker);
     const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
@@ -687,7 +688,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     };
     h.helper.config = { image: THEIRS };
     const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the images of the environments on the Docker host could not be read')));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the owners of the images of the environments on the Docker host could not be read')));
   });
 
   it('keeps a definitive refusal of another kind when Docker cannot list the images of the environments', async () => {
@@ -718,8 +719,57 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.docker.environmentImageLists).toBe(0);
     h.docker.images.add(BASE_IMAGE);
     h.helper.config = { image: BASE_IMAGE };
+    const inspections = h.docker.imageInspections.length;
     await h.service.open(TARGET, options());
+    // One list for each `docker image inspect` of the references that found a local image.
+    expect(h.docker.environmentImageLists).toBe(h.docker.imageInspections.length - inspections);
     expect(h.docker.environmentImageLists).toBeGreaterThan(0);
     expect(h.docker.imageInspections.every((references) => !references.includes(THEIRS))).toBe(true);
+  });
+
+  it('lists the volumes only for an image of no owner that the registry knows, and only when a reference found it', async () => {
+    // The open lists the volumes for other reasons too: only the lists of the check of the images count.
+    let ownerLists = 0;
+    const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
+    h.docker.listEnvironmentVolumes = async () => {
+      if (new Error().stack?.includes('hostEnvironmentImageIds')) ownerLists++;
+      return listEnvironmentVolumes();
+    };
+    // The registry knows the owner of THEIRS: no volume list.
+    h.helper.config = { image: THEIRS };
+    await rejection(h.service.open(TARGET, options()));
+    expect(ownerLists).toBe(0);
+    // An image left behind by a Delete that no reference names: no volume list either.
+    const gone = '9a8b7c6d-0000-4000-8000-000000000009';
+    h.docker.images.add(environmentImageName(gone, 2));
+    h.docker.imageIds.set(environmentImageName(gone, 2), `sha256:${'9'.repeat(64)}`);
+    h.docker.images.add(BASE_IMAGE);
+    h.helper.config = { image: BASE_IMAGE };
+    await h.service.open(TARGET, options());
+    expect(ownerLists).toBe(0);
+    // A reference that names it: one list.
+    h.helper.config = { image: environmentImageName(gone, 2) };
+    await rejection(h.service.open(TARGET, options()));
+    expect(ownerLists).toBe(1);
+  });
+
+  it('does not take the owner of an environment on another Docker host for the owner of an image here', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    // An environment of this account with that ID on another host; here, its image has no known owner.
+    await seedEnvironment(h, { id: remote, repository: WEB, container: null, volume: false, image: false, extra: { dockerHost: 'ssh://build-box' } });
+    const image = environmentImageName(remote, 4);
+    h.docker.images.add(image);
+    h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
+    await refused(image);
+  });
+
+  it('counts an image as another account\'s when the volumes of its environment carry different owners', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    const image = environmentImageName(remote, 4);
+    h.docker.images.add(image);
+    h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
+    h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.docker.volumes.set('web-cache', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    await refused(image);
   });
 });
