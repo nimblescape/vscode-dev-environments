@@ -2,10 +2,12 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as http from 'http';
 import { describe, expect, it } from 'vitest';
 import {
   ImageMaintenance,
   highestMajorTag,
+  httpGetWith,
   imagePrefixesOf,
   parseBearerChallenge,
   parseImageList,
@@ -187,7 +189,9 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
 
   // Review round 1 of PR #57 (A): the image just pulled as `:2` (no version tag of its own) ranked below older `2.0.x`
   // images and was removed; an image tagged only `latest` ranked below every version.
-  it('keeps the image just pulled as its major tag, and the one of latest, above older versions', async () => {
+  // Review round 2 of PR #57 (R4): `latest` no longer ranks above every version (the monitor never pulls it): an image
+  // with only `latest` stays and takes no kept place; the two newest versions stay, the third is removed.
+  it('keeps the image just pulled as its major tag above older versions; leaves one of latest alone', async () => {
     const engine = fakeEngine({
       images: [
         image(DEV, '2', 'sha256:new', '2026-09-28'),
@@ -196,6 +200,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
         image(WEB, 'latest', 'sha256:wnew', '2026-09-28'),
         image(WEB, '1.0.1', 'sha256:w101', '2020-01-02'),
         image(WEB, '1.0.0', 'sha256:w100', '2020-01-01'),
+        image(WEB, '0.9.0', 'sha256:w090', '2019-01-01'),
       ],
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2', '2.0.15'], 'majikmate/devcontainer-classroom-web': ['1'] });
@@ -203,13 +208,65 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm')).toEqual([
       ['image', 'rm', `${DEV}:2.0.13`],
-      ['image', 'rm', `${WEB}:1.0.0`],
+      ['image', 'rm', `${WEB}:0.9.0`],
     ]);
     expect(versionsOf(parseImageList([image(DEV, '2.0', 'sha256:a', '1'), image(DEV, '2.0.14', 'sha256:b', '2'), image(DEV, '3.0.0', 'sha256:c', '0')].join('\n'))).map((version) => version.id)).toEqual([
       'sha256:c',
       'sha256:a',
       'sha256:b',
     ]);
+  });
+
+  // Review round 2 of PR #57 (R4): a `latest` that the monitor never pulls took one of the kept places for ever, and the
+  // real previous version was removed.
+  it('leaves an image with only other tags (latest) alone and does not count it', async () => {
+    const engine = fakeEngine({
+      images: [
+        image(DEV, 'latest', 'sha256:stale', '2025-01-01'),
+        image(DEV, '2', 'sha256:new', '2026-09-28'),
+        image(DEV, '<none>', 'sha256:prev', '2026-09-20'),
+        image(DEV, '<none>', 'sha256:older', '2026-09-01'),
+      ],
+    });
+    const log: string[] = [];
+    await new ImageMaintenance({
+      docker: engine.docker,
+      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      log: (message) => log.push(message),
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+    }).pass();
+    expect(engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:older']]);
+  });
+
+  // Review round 2 of PR #57 (R5): the idle time limit of the socket alone let a registry that sends a byte now and then,
+  // or a connection cut in the middle of an answer, keep a pass (and every later one) open for ever.
+  it('the registry request ends within its time limit, also when the answer trickles or is cut', async () => {
+    const server = http.createServer((request, response) => {
+      if (request.url === '/trickle') {
+        response.writeHead(200, { 'content-length': '1000' });
+        const timer = setInterval(() => response.write('x'), 50);
+        response.on('close', () => clearInterval(timer));
+      } else if (request.url === '/cut') {
+        response.writeHead(200, { 'content-length': '1000' });
+        response.write('xyz', () => setTimeout(() => request.socket.destroy(), 20));
+      } else {
+        response.end('{"tags":[]}');
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const get = http.get as unknown as Parameters<typeof httpGetWith>[0];
+    try {
+      const started = Date.now();
+      await expect(httpGetWith(get, `${base}/trickle`, {}, 400)).rejects.toThrow('did not answer in time');
+      expect(Date.now() - started).toBeLessThan(2_000);
+      await expect(httpGetWith(get, `${base}/cut`, {}, 5_000)).rejects.toThrow();
+      await expect(httpGetWith(get, `${base}/ok`, {}, 5_000)).resolves.toMatchObject({ status: 200, body: '{"tags":[]}' });
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.

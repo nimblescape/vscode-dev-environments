@@ -495,6 +495,21 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(2);
   });
 
+  // Review round 2 of PR #57 (R3): a clock that steps back ran a time that was handled already again.
+  it('does not run a time again after the clock stepped back', async () => {
+    let time = Date.parse('2026-09-29T04:06:00Z');
+    let passes = 0;
+    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T04:00:00Z');
+    await schedule.check();
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+  });
+
   it('follows new settings of another computer at the next check', async () => {
     let time = Date.parse('2026-09-29T08:58:00Z');
     const current = new CurrentImageSettings(ENV, stateDir, () => {});

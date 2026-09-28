@@ -45,24 +45,54 @@ const MAX_TAG_PAGES = 20;
 /** An HTTP GET: status, lower-case headers, body. Rejects on a network error or the time limit. */
 export type HttpGet = (url: string, headers: Record<string, string>) => Promise<{ status: number; headers: Record<string, string>; body: string }>;
 
-export const nodeHttpGet: HttpGet = (url, headers) =>
-  new Promise((resolve, reject) => {
-    const request = https.get(url, { headers, timeout: REGISTRY_TIMEOUT_MS }, (response) => {
+/**
+ * HttpGet with https. Review round 2 of PR #57 (R5): settles in every case within REGISTRY_TIMEOUT_MS: the idle time
+ * limit of the socket alone let a registry that sends a byte now and then, or a connection cut in the middle of the
+ * answer (no `end`, no error of the request), keep a pass open for ever, and with it every later pass.
+ */
+export const nodeHttpGet: HttpGet = (url, headers) => httpGetWith(https.get, url, headers, REGISTRY_TIMEOUT_MS);
+
+/** nodeHttpGet with another `get` (the tests: `http.get` of a local server) and time limit. */
+export function httpGetWith(
+  get: typeof https.get,
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): ReturnType<HttpGet> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      request.destroy();
+      reject(error);
+    };
+    const deadline = setTimeout(() => fail(new Error('The registry did not answer in time.')), timeoutMs);
+    const request = get(url, { headers, timeout: timeoutMs }, (response) => {
       let body = '';
       response.setEncoding('utf8');
       response.on('data', (chunk: string) => {
         body += chunk;
-        if (body.length > MAX_REGISTRY_BODY) request.destroy(new Error('The answer of the registry is too large.'));
+        if (body.length > MAX_REGISTRY_BODY) fail(new Error('The answer of the registry is too large.'));
+      });
+      response.on('error', (error) => fail(error));
+      response.on('close', () => {
+        if (!response.complete) fail(new Error('The connection to the registry was cut.'));
       });
       response.on('end', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
         const flat: Record<string, string> = {};
         for (const [key, value] of Object.entries(response.headers)) if (value !== undefined) flat[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
         resolve({ status: response.statusCode ?? 0, headers: flat, body });
       });
     });
-    request.on('timeout', () => request.destroy(new Error('The registry did not answer in time.')));
-    request.on('error', reject);
+    request.on('timeout', () => fail(new Error('The registry did not answer in time.')));
+    request.on('error', (error) => fail(error));
   });
+}
 
 /** One image of `docker image ls`. */
 export interface LocalImage {
@@ -104,11 +134,10 @@ export function highestMajorTag(tags: readonly string[]): string | undefined {
 }
 
 /**
- * A version tag as numbers (`2.0.14` → [2, 0, 14]); `latest` is above every version (review round 1 of PR #57, A: the
- * image that it names is the newest); undefined for any other tag (`2.0.14-amd64`).
+ * A version tag as numbers (`2.0.14` → [2, 0, 14]); undefined for any other tag (`latest`, `2.0.14-amd64`). Review round
+ * 2 of PR #57 (R4): `latest` is no version: the monitor never pulls it, so a `latest` on the engine can be of any age.
  */
 function versionOf(tag: string): number[] | undefined {
-  if (tag === 'latest') return [Number.POSITIVE_INFINITY];
   return /^[0-9]{1,6}(\.[0-9]{1,6}){0,3}$/.test(tag) ? tag.split('.').map(Number) : undefined;
 }
 
@@ -136,8 +165,8 @@ export interface ImageVersion {
 }
 
 /**
- * The versions of one repository, newest first: an ID with a version tag (or `latest`) is newer than one without (an ID
- * without a tag of the repository was replaced); between two with one, the higher version; else the later creation time.
+ * The versions of one repository, newest first: an ID with a version tag is newer than one without (an ID without a tag
+ * of the repository was replaced); between two with one, the higher version; else the later creation time.
  */
 export function versionsOf(images: readonly LocalImage[]): ImageVersion[] {
   const byId = new Map<string, ImageVersion>();
@@ -274,7 +303,9 @@ export class ImageMaintenance {
    * (its layers are the start of the layers of another image). `layers` undefined: nothing is removed.
    */
   private async clean(repository: string, images: readonly LocalImage[], layers: Map<string, string[]> | undefined): Promise<void> {
-    const versions = versionsOf(images);
+    // Review round 2 of PR #57 (R4): an ID whose tags are no versions (only `latest`, `2.0.14-amd64`) is no version of the
+    // line that the monitor pulls: it neither takes one of the kept places nor is removed.
+    const versions = versionsOf(images).filter((version) => version.version !== undefined || version.tags.length === 0);
     for (const version of versions.slice(KEPT_IMAGE_VERSIONS)) {
       const label = version.tags.length > 0 ? version.tags.join(', ') : version.id.slice(0, 19);
       const own = layers?.get(version.id);

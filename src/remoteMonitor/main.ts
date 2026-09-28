@@ -474,7 +474,8 @@ export class ImageSchedule {
     const time = this.deps.now();
     const { cron, timeZone } = this.deps.settings.value;
     const due = nextCronTime(this.checkedUntil, cron, timeZone);
-    this.checkedUntil = time;
+    // Review round 2 of PR #57 (R3): a clock that steps back does not run a time that was handled already again.
+    this.checkedUntil = Math.max(this.checkedUntil, time);
     if (due !== undefined && due <= time) await this.run();
   }
 

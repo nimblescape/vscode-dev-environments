@@ -93,6 +93,44 @@ describe('the cron schedule of the image updates', () => {
     expect(next(first, '30 2 * * *')).toBe('2026-10-26T01:30:00.000Z');
   });
 
+  // Review round 2 of PR #57 (R1): west of UTC, a skipped time mapped to an hour before the change.
+  it('a skipped time runs one hour later on the wall clock, also west of UTC', () => {
+    // 8 March 2026 in America/New_York: 02:00 EST becomes 03:00 EDT (07:00 UTC); 02:30 → 03:30 EDT.
+    expect(next('2026-03-08T05:00:00Z', '30 2 * * *', 'America/New_York')).toBe('2026-03-08T07:30:00.000Z');
+    expect(next('2026-03-28T12:00:00Z', '30 2 * * *')).toBe('2026-03-29T01:30:00.000Z');
+  });
+
+  // Review round 2 of PR #57 (R2): with every hour, both times of the repeated hour run (as cron); with a fixed hour, the
+  // first only.
+  it('in the repeated hour, a schedule of every hour runs both times; one of a fixed hour once', () => {
+    const walk = (from: string, text: string, timeZone: string, count: number) => {
+      const times: string[] = [];
+      let at = from;
+      for (let index = 0; index < count; index++) times.push((at = next(at, text, timeZone)!));
+      return times;
+    };
+    expect(walk('2026-10-24T23:30:00Z', '0 * * * *', 'Europe/Vienna', 4)).toEqual([
+      '2026-10-25T00:00:00.000Z',
+      '2026-10-25T01:00:00.000Z',
+      '2026-10-25T02:00:00.000Z',
+      '2026-10-25T03:00:00.000Z',
+    ]);
+    expect(walk('2026-11-01T04:30:00Z', '0 * * * *', 'America/New_York', 3)).toEqual([
+      '2026-11-01T05:00:00.000Z',
+      '2026-11-01T06:00:00.000Z',
+      '2026-11-01T07:00:00.000Z',
+    ]);
+    // Every half hour: in time order, not in the order of the wall clock.
+    expect(walk('2026-10-24T23:50:00Z', '0,30 * * * *', 'Europe/Vienna', 4)).toEqual([
+      '2026-10-25T00:00:00.000Z',
+      '2026-10-25T00:30:00.000Z',
+      '2026-10-25T01:00:00.000Z',
+      '2026-10-25T01:30:00.000Z',
+    ]);
+    expect(walk('2026-10-24T12:00:00Z', '30 2 * * *', 'Europe/Vienna', 2)).toEqual(['2026-10-25T00:30:00.000Z', '2026-10-26T01:30:00.000Z']);
+    expect(walk('2026-10-31T12:00:00Z', '30 1 * * *', 'America/New_York', 2)).toEqual(['2026-11-01T05:30:00.000Z', '2026-11-02T06:30:00.000Z']);
+  });
+
   // Moved from src/remoteMonitor/images.test.ts with the same expectations.
   it('reads a time zone strictly', () => {
     expect(isTimeZone('Europe/Vienna')).toBe(true);

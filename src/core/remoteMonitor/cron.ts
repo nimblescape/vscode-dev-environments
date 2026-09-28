@@ -105,11 +105,18 @@ function wallClock(time: number, timeZone: string): number {
   return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
 }
 
-/** The moment at which the wall clock of `timeZone` shows `wall` (a wall time that a change of the clock skips: later). */
-function fromWallClock(wall: number, timeZone: string): number {
-  // The offset of the zone at about that time, then once more at the result (a change of the offset in between).
-  const candidate = wall - (wallClock(wall, timeZone) - wall);
-  return wall - (wallClock(candidate, timeZone) - candidate);
+/**
+ * The moments at which the wall clock of `timeZone` shows `wall`, earliest first: one, or two in the hour that the change
+ * to winter time repeats. Review round 2 of PR #57 (R1): a wall time that the change to summer time skips maps to the
+ * moment one hour later on the wall clock (02:30 → 03:30), east and west of UTC alike; before, west of UTC it mapped to
+ * an hour before the change.
+ */
+function fromWallClock(wall: number, timeZone: string): number[] {
+  // The offsets of the zone half a day before and after (a change of the clock lies between them, if any).
+  const offset = (time: number) => wallClock(time, timeZone) - time;
+  const candidates = [...new Set([wall - offset(wall - DAY / 2), wall - offset(wall + DAY / 2)])].sort((a, b) => a - b);
+  const valid = candidates.filter((time) => wallClock(time, timeZone) === wall);
+  return valid.length > 0 ? valid : [Math.max(...candidates)];
 }
 
 const MINUTE = 60_000;
@@ -121,7 +128,9 @@ const SEARCH_DAYS = 5 * 366;
 /**
  * The next moment after `now` whose wall clock in `timeZone` matches the schedule (daylight saving time included:
  * `7 6 * * *` in Europe/Vienna is 04:07 UTC in summer and 05:07 UTC in winter). Undefined when no day within five
- * years matches.
+ * years matches. Review round 2 of PR #57 (R2), as cron: in the hour that the change to winter time repeats, a schedule
+ * with every hour (`*` in the hour field) matches both times, one with fixed hours only the first; a time that the change
+ * to summer time skips runs one hour later on the wall clock.
  */
 export function nextCronTime(now: number, schedule: CronSchedule, timeZone: string): number | undefined {
   const dayMatches = (wall: Date) => {
@@ -132,9 +141,15 @@ export function nextCronTime(now: number, schedule: CronSchedule, timeZone: stri
     if (schedule.anyWeekday) return byDay;
     return byDay || byWeekday;
   };
-  let wall = Math.floor(wallClock(now, timeZone) / MINUTE) * MINUTE + MINUTE;
+  const everyHour = schedule.hours.size === 24;
+  // An hour earlier on the wall clock: the second time of a repeated hour lies after `now` although its wall time does not.
+  let wall = Math.floor(wallClock(now, timeZone) / MINUTE) * MINUTE + MINUTE - HOUR;
   const end = wall + SEARCH_DAYS * DAY;
-  while (wall < end) {
+  // The earliest match; the walk goes on for two hours of wall time after the first, as a later wall time can be an
+  // earlier moment around a change of the clock.
+  let best: number | undefined;
+  let bestUntil = end;
+  while (wall < end && wall <= bestUntil) {
     const date = new Date(wall);
     if (!schedule.months.has(date.getUTCMonth() + 1)) {
       wall = Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
@@ -145,10 +160,14 @@ export function nextCronTime(now: number, schedule: CronSchedule, timeZone: stri
     } else if (!schedule.minutes.has(date.getUTCMinutes())) {
       wall += MINUTE;
     } else {
-      const time = fromWallClock(wall, timeZone);
-      if (time > now) return time;
+      const times = fromWallClock(wall, timeZone);
+      for (const time of everyHour ? times : times.slice(0, 1)) {
+        if (time <= now || (best !== undefined && time >= best)) continue;
+        if (best === undefined) bestUntil = wall + 2 * HOUR;
+        best = time;
+      }
       wall += MINUTE;
     }
   }
-  return undefined;
+  return best;
 }

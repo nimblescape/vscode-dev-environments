@@ -227,7 +227,9 @@ async function activateExtension(
   const sendImageList = async (host: string): Promise<void> => {
     const prefixes = imagePrefixesOf(getSettings().remoteImageUpdates ?? []);
     if (prefixes.length === 0) return;
-    await sendImageSettings(host);
+    // Review round 2 of PR #57 (R6): in the background too (a docker exec of up to 20 s that Cancel could not end); a
+    // failure is logged and the next open sends again.
+    void sendImageSettings(host);
     if (!prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
     const last = imageListSentAt.get(host);
     if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
