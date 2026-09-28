@@ -77,6 +77,9 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   it('parses the messages of the script strictly', () => {
     expect(parseServerMessage('{"t":"hello","protocol":1,"node":"v24","ops":["docker"]}')).toEqual({ t: 'hello', protocol: 1, node: 'v24', ops: ['docker'] });
     expect(parseServerMessage('{"t":"progress","id":1,"step":"Cloning"}')).toEqual({ t: 'progress', id: 1, step: 'Cloning' });
+    // Review round 4 (M2): the confirmation of a cancel.
+    expect(parseServerMessage('{"t":"cancelled","id":4}')).toEqual({ t: 'cancelled', id: 4 });
+    expect(parseServerMessage('{"t":"cancelled","id":4,"x":1}')).toBeUndefined();
     expect(parseServerMessage('{"t":"log","id":1,"level":"warn","text":"x"}')).toEqual({ t: 'log', id: 1, level: 'warn', text: 'x' });
     expect(parseServerMessage('{"t":"out","id":1,"stream":"stderr","data":"x"}')).toEqual({ t: 'out', id: 1, stream: 'stderr', data: 'x' });
     expect(parseServerMessage('{"t":"result","id":1,"ok":true,"value":{"a":1}}')).toEqual({ t: 'result', id: 1, ok: true, value: { a: 1 } });

@@ -234,6 +234,34 @@ describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)'
     expect(alive()).toBe(false);
   });
 
+  it('killNow ends it and the programs that it started synchronously (review round 4, M3: the end of the extension host)', async () => {
+    if (process.platform === 'win32') return;
+    const parent = [
+      'const { spawn } = require("child_process");',
+      'process.on("SIGTERM", () => {});',
+      'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+      'process.stdout.write(String(child.pid));',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = new NodeProcessRunner().start(node, ['-e', parent]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout === ''; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const childPid = Number(stdout);
+    started.killNow?.();
+    expect((await started.exited).exitCode).toBeNull();
+    const state = () => {
+      try {
+        return execFileSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
+        return '';
+      }
+    };
+    for (let wait = 0; wait < 100 && state() !== '' && !state().startsWith('Z'); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(state() === '' || state().startsWith('Z')).toBe(true);
+  });
+
   it('reports a program that cannot be started in `exited`, without throwing', async () => {
     const started = new NodeProcessRunner().start('/nonexistent/program-of-the-test', []);
     const { exitCode, error } = await started.exited;

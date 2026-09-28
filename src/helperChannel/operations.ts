@@ -8,7 +8,9 @@
 import {
   OP_DOCKER,
   OP_PROBE,
+  OP_SWEEP,
   parseDockerOperationParams,
+  sweepArgs,
   type DockerOperationValue,
   type ProbeValue,
 } from '../core/helperChannel/protocol';
@@ -51,7 +53,19 @@ export const probeOperation: OperationHandler = async (params, context) => {
   return value;
 };
 
+/** Review round 4 (M1): removes the channel containers that were created but never started (protocol.ts, OP_SWEEP). */
+export const sweepOperation: OperationHandler = async (params, context) => {
+  if (params !== null && params !== undefined && !(typeof params === 'object' && Object.keys(params).length === 0)) {
+    throw new OperationError('invalid', 'The sweep operation takes no parameters.');
+  }
+  const result = await context.docker(sweepArgs());
+  if (result.error !== undefined) throw new OperationError('failed', result.error);
+  if (result.exitCode !== 0) throw new OperationError('failed', result.stderr.trim() || `exit code ${result.exitCode}`);
+  return { output: result.stdout.trim().slice(-2_000) };
+};
+
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
   [OP_PROBE]: probeOperation,
+  [OP_SWEEP]: sweepOperation,
 };

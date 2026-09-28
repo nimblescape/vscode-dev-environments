@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
 import { abortError, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedProcess } from './ports';
@@ -17,6 +17,29 @@ export class OutputTooLargeError extends Error {
     super(`The output of ${file} is larger than ${Math.round(limitBytes / (1024 * 1024))} MB. It was stopped.`);
     this.name = 'OutputTooLargeError';
   }
+}
+
+/**
+ * Review round 4 (M3): the programs of `start` that still run when this process exits (the extension host ends: VS Code
+ * does not end its children, and no timer runs anymore) are ended synchronously by one exit handler.
+ */
+const runningStarted = new Set<() => void>();
+let exitHookInstalled = false;
+function killStartedOnExit(killNow: () => void): () => void {
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    process.on('exit', () => {
+      for (const kill of [...runningStarted]) {
+        try {
+          kill();
+        } catch {
+          // The others still.
+        }
+      }
+    });
+  }
+  runningStarted.add(killNow);
+  return () => runningStarted.delete(killNow);
 }
 
 /** A program of `start` that did not end on `kill` gets SIGKILL after this time (review round 1, L2). */
@@ -218,7 +241,26 @@ export class NodeProcessRunner implements ProcessRunner {
         resolve({ exitCode: code });
       });
     });
+    // Review round 4 (M3): synchronous, for the end of the extension host: the programs that it started first (pkill
+    // -P; Windows: taskkill /T /F of the tree), then it.
+    const killNow = () => {
+      if (ended || child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+      try {
+        if (this.platform === 'win32') {
+          const { file, args } = windowsTreeKillCommand(child.pid, process.env);
+          spawnSync(file, args, { shell: false, windowsHide: true, stdio: 'ignore', timeout: 2_000 });
+        } else {
+          spawnSync('pkill', ['-KILL', '-P', String(child.pid)], { shell: false, stdio: 'ignore', timeout: 2_000 });
+        }
+      } catch {
+        // SIGKILL below still.
+      }
+      child.kill('SIGKILL');
+    };
+    const forget = killStartedOnExit(killNow);
+    void exited.then(forget);
     return {
+      killNow,
       write: (text) => {
         if (ended || child.stdin.destroyed || !child.stdin.writable) return false;
         child.stdin.write(text);

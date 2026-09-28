@@ -18,6 +18,7 @@ import {
   CHANNEL_LOADER,
   LABEL_HELPER_CHANNEL,
   OP_PROBE,
+  OP_SWEEP,
   channelLabelValue,
   parseProbeValue,
 } from './protocol';
@@ -101,6 +102,13 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   } catch (error) {
     channel.close();
     throw new HelperChannelError('open', `The helper channel to ${target.host} does not reach Docker: ${(error as Error).message}`);
+  }
+  // Review round 4 (M1): channel containers that an earlier open created but never started are removed, in the
+  // background (a failure is logged; the channel is open already).
+  if (channel.operations.includes(OP_SWEEP)) {
+    void channel.operation(OP_SWEEP, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).catch((error: unknown) => {
+      deps.logger.info(`The stopped helper channel containers on ${target.host} could not be removed: ${(error as Error).message}`);
+    });
   }
   return channel;
 }
@@ -234,11 +242,14 @@ export class HelperChannels {
     }
   }
 
-  /** Closes every channel (the window closes). */
+  /**
+   * Closes every channel (the window closes). Review round 4 (M3): at once (closeNow), because the extension host may end
+   * right after, and no timer of it runs then.
+   */
   dispose(): void {
     this.disposed = true;
     clearInterval(this.sweepTimer);
-    for (const entry of this.entries.values()) entry.channel?.close();
+    for (const entry of this.entries.values()) entry.channel?.closeNow();
     this.entries.clear();
   }
 }

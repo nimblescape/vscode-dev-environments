@@ -132,7 +132,8 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     send({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION });
     send({ t: 'ping', n: 7 });
     expect(messages).toEqual([
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'probe'] },
+      // Review round 4 (M1): with the sweep of never-started channel containers.
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'probe', 'sweep'] },
       { t: 'pong', n: 7 },
     ]);
   });
@@ -277,6 +278,14 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(resultOf(1)).toMatchObject({ ok: false, cancelled: true });
   });
 
+  it('sweep prunes only stopped channel containers older than 10 minutes (review round 4, M1)', async () => {
+    const { send, docker, resultOf } = setup({ docker: fakeDocker({ respond: () => ({ stdout: 'Deleted Containers:\nabc\n', exitCode: 0 }) }) });
+    send({ t: 'op', id: 1, op: 'sweep', params: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(docker.children[0].args).toEqual(['container', 'prune', '-f', '--filter', 'label=nimblescape.devenv.helper-channel', '--filter', 'until=10m']);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { output: 'Deleted Containers:\nabc' } });
+  });
+
   it('refuses a cleanup that is a name instead of a label value', async () => {
     const { send, docker, resultOf } = setup();
     send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: ['n'] } });
@@ -297,7 +306,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
   });
 
   it('removes the containers of an operation whose cancel crossed its result, within LATE_CANCEL_WINDOW_MS (review round 2, A1)', async () => {
-    const { send, docker } = setup({ docker: fakeDocker({ respond: cleanupAnswers([ID_1]) }) });
+    const { send, docker, messages } = setup({ docker: fakeDocker({ respond: cleanupAnswers([ID_1]) }) });
     send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '-d', 'img'], cleanup: LABEL } });
     send({ t: 'op', id: 2, op: 'docker', params: { args: ['run', '-d', 'img'], cleanup: LABEL } });
     docker.children[0].exit(0);
@@ -307,6 +316,8 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     send({ t: 'cancel', id: 1 });
     await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
     expect(docker.children.slice(2).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1], PS_OF_LABEL, ['rm', '-f', ID_1]]);
+    // Review round 4 (M2): the script confirms the cancel of an operation that had ended.
+    expect(messages.filter((message) => message.t === 'cancelled')).toEqual([{ t: 'cancelled', id: 1 }]);
     // A second cancel of the same id, and a cancel of 2 after the window, remove nothing more.
     send({ t: 'cancel', id: 1 });
     await vi.advanceTimersByTimeAsync(LATE_CANCEL_WINDOW_MS);

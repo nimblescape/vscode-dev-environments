@@ -282,6 +282,8 @@ export class ChannelServer {
           this.lateCleanups.add(cleanup);
           void cleanup.then(() => this.lateCleanups.delete(cleanup));
         }
+        // Review round 4 (M2): the extension reports the cancel only when the script confirmed it.
+        this.send({ t: 'cancelled', id: message.id });
         return;
       }
       case 'op':

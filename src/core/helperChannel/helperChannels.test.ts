@@ -35,6 +35,8 @@ function fakeChannel() {
       channel.closed++;
       for (const listener of closeListeners) listener('closed');
     },
+    // Review round 4 (M3): dispose closes at once.
+    closeNow: () => channel.close(),
     lose: () => {
       channel.isOpen = false;
       for (const listener of closeListeners) listener('lost');
@@ -213,7 +215,7 @@ describe('channelRunArgs and openHelperChannel', () => {
         for (const line of text.split('\n').filter((part) => part !== '')) {
           const message = parseClientMessage(line);
           if (message?.t === 'hello') {
-            queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe'] })));
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
           }
           if (message?.t === 'op' && message.op === 'probe') {
             queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0' } })));
@@ -245,6 +247,8 @@ describe('channelRunArgs and openHelperChannel', () => {
     expect(started?.args[started.args.indexOf('--name') + 1]).toMatch(/^devenv-channel-[0-9a-f]{12}$/);
     expect(channel.isOpen).toBe(true);
     expect(written[0]).toBe(`${JSON.stringify('SCRIPT')}\n`);
+    // Review round 4 (M1): then the sweep of never-started channel containers, in the background.
+    expect(written.some((line) => line.includes('"op":"sweep"'))).toBe(true);
     channel.close();
   });
 

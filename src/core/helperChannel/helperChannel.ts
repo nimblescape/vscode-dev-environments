@@ -113,6 +113,8 @@ export interface HelperChannelOptions {
 
 interface Pending {
   op: string;
+  /** Review round 4 (M2): the cancel was sent; waiting for the script to confirm it. */
+  cancelling?: boolean;
   startedAt: number;
   options: OperationOptions;
   resolve: (value: unknown) => void;
@@ -279,16 +281,25 @@ export class HelperChannel {
         return;
       case 'pong':
         return;
+      case 'cancelled': {
+        // Review round 4 (M2): the script confirmed the cancel of an operation that had ended there already.
+        const pending = this.pending.get(message.id);
+        if (!pending?.cancelling) return;
+        this.finish(message.id);
+        this.logResult(message.id, pending, 'cancelled');
+        pending.reject(abortError());
+        return;
+      }
       case 'progress': {
         const pending = this.pending.get(message.id);
-        if (!pending) return;
+        if (!pending || pending.cancelling) return;
         this.options.logger.info(`[${this.options.name}] ${pending.op}#${message.id}: ${message.step}${message.detail ? ` – ${message.detail}` : ''}`);
         pending.options.onProgress?.(message.step, message.detail);
         return;
       }
       case 'log': {
         const pending = this.pending.get(message.id);
-        if (!pending) return;
+        if (!pending || pending.cancelling) return;
         const line = `[${this.options.name}] ${pending.op}#${message.id}: ${message.text}`;
         if (message.level === 'warn') this.options.logger.warn(line);
         else this.options.logger.info(line);
@@ -296,7 +307,7 @@ export class HelperChannel {
       }
       case 'out': {
         const pending = this.pending.get(message.id);
-        if (!pending) return;
+        if (!pending || pending.cancelling) return;
         if (pending.options.onOutput) pending.options.onOutput(message.stream, message.data);
         else this.options.logger.output(message.data);
         return;
@@ -305,6 +316,13 @@ export class HelperChannel {
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.finish(message.id);
+        // Review round 4 (M2): a result after the cancel was sent: the script ends it (or removes its containers when
+        // the cancel crossed a result), so the caller gets the cancel it asked for.
+        if (pending.cancelling) {
+          this.logResult(message.id, pending, 'cancelled');
+          pending.reject(abortError());
+          return;
+        }
         this.logResult(message.id, pending, message.ok ? undefined : message.error.message);
         if (message.ok) pending.resolve(message.value);
         else pending.reject(new HelperOperationError(message.error.code, message.error.message, message.timedOut));
@@ -415,11 +433,14 @@ export class HelperChannel {
         }, options.timeoutMs + CHANNEL_RESULT_GRACE_MS);
       }
       if (options.signal) {
+        // Review round 4 (M2): the AbortError comes when the script confirmed the cancel (its result, or `cancelled`),
+        // usually within a round trip; when the channel is lost first, the operation rejects as lost (outcome unknown).
         pending.onAbort = () => {
-          this.send({ t: 'cancel', id });
-          this.finish(id);
-          this.logResult(id, pending, 'cancelled');
-          reject(abortError());
+          pending.cancelling = true;
+          if (!this.send({ t: 'cancel', id }) && this.pending.has(id)) {
+            this.finish(id);
+            reject(new HelperChannelError('lost', `The cancel of ${op} could not be sent to ${this.options.name}.`));
+          }
         };
         options.signal.addEventListener('abort', pending.onAbort, { once: true });
       }
@@ -498,6 +519,17 @@ export class HelperChannel {
     }
     const timer = setTimeout(() => this.process.kill(), this.options.closeKillMs ?? CHANNEL_CLOSE_KILL_MS);
     void this.process.exited.then(() => clearTimeout(timer));
+  }
+
+  /**
+   * Review round 4 (M3): closes the channel at once (the window closes or the extension host ends): `docker run` and the
+   * programs that it started get SIGKILL now, not after CHANNEL_CLOSE_KILL_MS, so nothing is left on this computer.
+   * The container on the host ends by the end of its input (the connection ends) or at the latest by its silence.
+   */
+  closeNow(): void {
+    if (this.state !== 'closed') this.shutDown('closed', 'it was closed');
+    if (this.process.killNow) this.process.killNow();
+    else this.process.kill();
   }
 
   /** The channel is lost: `docker run` is stopped at once. */

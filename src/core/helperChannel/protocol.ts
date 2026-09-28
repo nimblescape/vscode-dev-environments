@@ -170,7 +170,17 @@ export type ResultAnswer =
   | { t: 'result'; id: number; ok: true; value: unknown }
   | { t: 'result'; id: number; ok: false; error: OperationFailure; cancelled: boolean; timedOut: boolean };
 
-export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswer | OutputAnswer | ResultAnswer;
+/**
+ * Review round 4 (M2): the script received the cancel of the operation `id`, which had ended already (its result may
+ * have crossed the cancel): the containers of its cleanup labels are removed (the exit waits for that). A cancel of an
+ * operation that still runs is answered by its result instead.
+ */
+export interface CancelledAnswer {
+  t: 'cancelled';
+  id: number;
+}
+
+export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswer | OutputAnswer | ResultAnswer | CancelledAnswer;
 
 /** One line of the channel (JSON and a line feed; JSON.stringify escapes every line feed in a string). */
 export function encodeMessage(message: ClientMessage | ServerMessage): string {
@@ -299,6 +309,8 @@ export function parseServerMessage(line: string): ServerMessage | undefined {
         : undefined;
     case 'pong':
       return hasOnlyKeys(value, ['t', 'n']) && isId(value.n) ? { t: 'pong', n: value.n } : undefined;
+    case 'cancelled':
+      return hasOnlyKeys(value, ['t', 'id']) && isId(value.id) ? { t: 'cancelled', id: value.id } : undefined;
     case 'progress': {
       if (!hasOnlyKeys(value, ['t', 'id', 'step'], ['detail']) || !isId(value.id) || typeof value.step !== 'string') return undefined;
       if (value.detail !== undefined && typeof value.detail !== 'string') return undefined;
@@ -387,6 +399,19 @@ export function channelLabelValue(script: string): string {
 export const OP_DOCKER = 'docker';
 /** `probe`: whether the Docker CLI of the container reaches its engine; the value is ProbeValue. */
 export const OP_PROBE = 'probe';
+/**
+ * Review round 4 (M1): `sweep` removes the channel containers of the engine that were created but never started (a
+ * connection that broke between the create and the start of `docker run -i --rm`, which then never ends and is never
+ * removed): `docker container prune` of the stopped containers with LABEL_HELPER_CHANNEL older than SWEEP_MIN_AGE (so
+ * never one of an open that runs now); running channels are never touched. The value is the prune output.
+ */
+export const OP_SWEEP = 'sweep';
+export const SWEEP_MIN_AGE = '10m';
+
+/** The arguments of the sweep (the `-f` of prune only skips its question; it removes stopped containers only). */
+export function sweepArgs(): string[] {
+  return ['container', 'prune', '-f', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `until=${SWEEP_MIN_AGE}`];
+}
 
 /** Limits of the `docker` operation. */
 export const MAX_DOCKER_ARGS = 1_000;

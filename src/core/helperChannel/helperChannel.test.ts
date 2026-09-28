@@ -170,18 +170,39 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     expect(lines[lines.length - 1]).toEqual({ level: 'warn', text: `[build-box] start#${id}: failed: git clone failed after 0.0 s.` });
   });
 
-  it('cancels an operation in the helper when its signal aborts, and ignores its late messages', async () => {
+  // Review round 4 (M2): the AbortError comes when the script confirmed the cancel (it came at once before).
+  it('cancels an operation in the helper when its signal aborts: AbortError once the script confirms it, its late messages ignored', async () => {
     const { channel, fake } = await openChannel();
     const controller = new AbortController();
     const result = channel.operation('start', {}, { signal: controller.signal, onProgress: () => expect.unreachable() });
+    let settled = false;
+    void result.catch(() => (settled = true));
     const { id } = lastOp(fake);
     controller.abort();
-    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
     expect(fake.messages()).toContainEqual({ t: 'cancel', id });
     fake.answer({ t: 'progress', id, step: 'late' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
     fake.answer({ t: 'result', id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
     expect(channel.isOpen).toBe(true);
     expect(channel.busy).toBe(0);
+  });
+
+  it('M2 (round 4): a cancel that crossed a successful result is an AbortError on its confirmation; a lost channel before it is `lost`', async () => {
+    const { channel, fake } = await openChannel();
+    const first = new AbortController();
+    const crossed = channel.operation('run', {}, { signal: first.signal });
+    const crossedId = lastOp(fake).id;
+    first.abort();
+    // The script had ended it; it confirms the cancel (and removes its containers).
+    fake.answer({ t: 'cancelled', id: crossedId });
+    await expect(crossed).rejects.toMatchObject({ name: 'AbortError' });
+    const second = new AbortController();
+    const unconfirmed = channel.operation('run', {}, { signal: second.signal });
+    second.abort();
+    fake.exit(1);
+    await expect(unconfirmed).rejects.toMatchObject({ code: 'lost' });
   });
 
   it('gives up on a helper that does not answer after the time limit and the grace time', async () => {
@@ -245,6 +266,20 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     await Promise.allSettled(results);
   });
 
+  it('closeNow (the window closes) stops docker run and what it started at once, and rejects what runs as lost (review round 4, M3)', async () => {
+    const { channel, fake } = await openChannel();
+    let killedNow = 0;
+    fake.process.killNow = () => {
+      killedNow++;
+      fake.exit(null);
+    };
+    const running = channel.operation('start', {});
+    channel.closeNow();
+    expect(killedNow).toBe(1);
+    await expect(running).rejects.toMatchObject({ code: 'lost' });
+    expect(channel.isOpen).toBe(false);
+  });
+
   it('close ends the input of docker run and stops it only when it does not end by itself', async () => {
     const { channel, fake } = await openChannel();
     channel.close();
@@ -261,6 +296,8 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const calls = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, () => channel.docker(['ps'], { signal: controller.signal }));
       await vi.advanceTimersByTimeAsync(0);
       controller.abort();
+      // Review round 4 (M2): the script confirms each cancel of the operations that were sent.
+      for (const message of fake.messages().filter((item) => item.t === 'cancel')) fake.answer({ t: 'cancelled', id: (message as { id: number }).id });
       const outcomes = await Promise.allSettled(calls);
       expect(outcomes.every((outcome) => outcome.status === 'rejected' && (outcome.reason as Error).name === 'AbortError')).toBe(true);
       const sent = fake.messages().filter((message) => message.t === 'op');
@@ -402,6 +439,8 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const { id } = lastOp(fake);
       const piece = 'x'.repeat(1024 * 1024);
       for (let sent = 0; sent <= MAX_CAPTURED_OUTPUT_BYTES; sent += piece.length) fake.answer({ t: 'out', id, stream: 'stdout', data: piece });
+      // Review round 4 (M2): the script confirms the cancel with the result of the ended call.
+      fake.answer({ t: 'result', id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
       await expect(result).rejects.toBeInstanceOf(OutputTooLargeError);
       expect(fake.messages()).toContainEqual({ t: 'cancel', id });
     });

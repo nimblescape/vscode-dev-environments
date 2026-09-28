@@ -111,6 +111,11 @@ export interface StartedProcess {
   end(): void;
   /** Stops it (on Windows with the processes that it started). */
   kill(): void;
+  /**
+   * Review round 4 (M3): stops it and the programs that it started at once, synchronously (SIGKILL; for the end of the
+   * extension host, where no timer runs anymore).
+   */
+  killNow?(): void;
   /** Its process id, when it started (for the tests that break a connection hard). */
   readonly pid?: number;
   /** Its output, decoded as UTF-8, as it comes. One listener each. */
