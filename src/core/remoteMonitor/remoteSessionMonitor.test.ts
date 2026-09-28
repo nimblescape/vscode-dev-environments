@@ -219,7 +219,7 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
       missing: false,
       detail: 'the heartbeat records stayed locked by another command for 5 s',
     });
-    // Review round 4 (H2): 137 is any SIGKILL; a command without the lock gets the bare exit code.
+    // Review round 4 (H2): 137 is any SIGKILL (a command without the lock gets the bare exit code: protocol.test.ts).
     expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({
       detail: 'the command was killed (its limit of 10 s, or a kill from outside)',
     });
@@ -245,6 +245,11 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(logger.lines).toEqual([]);
     await monitor(new FakeDocker(() => result(1, '', 'boom')), logger).forget(SOURCE, ID);
     expect(logger.lines).toEqual([`warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`]);
+    // Review round 5 of PR #58 (J2): forget runs under the lock of the records, so a kill is named in the log.
+    await monitor(new FakeDocker(() => result(137)), logger).forget(SOURCE, ID);
+    expect(logger.lines[1]).toBe(
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
+    );
   });
 
   it('isMissingContainer', () => {

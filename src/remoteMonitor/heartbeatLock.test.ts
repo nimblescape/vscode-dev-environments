@@ -100,8 +100,10 @@ function killTree(pid: number): void {
   let children: number[] = [];
   try {
     children = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' }).split(/\s+/).filter(Boolean).map(Number);
-  } catch {
-    // No children (pgrep exits 1).
+  } catch (error) {
+    // No children: pgrep exits 1. Review round 5 of PR #58 (J3): anything else (pgrep missing) fails the test loudly,
+    // as the group of `timeout` would otherwise stay with the lock.
+    if ((error as { status?: number }).status !== 1) throw error;
   }
   for (const below of children) killTree(below);
   for (const target of [-pid, pid]) {

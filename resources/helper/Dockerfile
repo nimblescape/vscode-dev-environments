@@ -14,7 +14,7 @@ ARG DEVCONTAINER_CLI_VERSION
 # Git, the Docker CLI with the buildx and the Compose plugins (from download.docker.com), and tini as init process,
 # so that a stop signal reaches the Dev Container CLI and Git. The Compose plugin runs Docker Compose configurations
 # (implementation notes, section "Docker Compose"). `flock` (util-linux) and `timeout` (coreutils) guard the heartbeats
-# of the remote Session Monitor (heartbeatCommand, review round 2 of PR #58).
+# of the remote Session Monitor (heartbeatCommand; `flock` since review round 2 of PR #58, `timeout` since round 3).
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
