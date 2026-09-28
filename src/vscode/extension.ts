@@ -14,7 +14,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { dockerHostOf, isOnDockerHost, remoteContextName } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
-import { DockerTargets } from '../core/docker/dockerTargets';
+import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
@@ -227,9 +227,13 @@ async function activateExtension(
   const sendImageList = async (host: string): Promise<void> => {
     const prefixes = imagePrefixesOf(getSettings().remoteImageUpdates ?? []);
     if (prefixes.length === 0) return;
+    // Review round 4 of PR #57 (L2): the background work keeps the Docker target of the open; after the open ended, its
+    // calls would read the current context again, and a switch to another host in the meantime sent there.
+    const target = operationDockerTarget();
+    const inTarget = (fn: () => Promise<void>) => void (target ? runWithDockerTarget(target, fn) : fn());
     // Review round 2 of PR #57 (R6): in the background too (a docker exec of up to 20 s that Cancel could not end); a
     // failure is logged and the next open sends again.
-    void sendImageSettings(host);
+    inTarget(() => sendImageSettings(host));
     if (!prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
     const last = imageListSentAt.get(host);
     if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
@@ -246,7 +250,7 @@ async function activateExtension(
       return;
     }
     imageListSentAt.set(host, Date.now());
-    void sendRepositories(host, prefixes, credentials.password);
+    inTarget(() => sendRepositories(host, prefixes, credentials.password));
   };
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);

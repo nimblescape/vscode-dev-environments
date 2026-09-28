@@ -407,6 +407,8 @@ export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { text: string; sc
 
 /** How often the monitor looks whether a time of the schedule has come (as cron: every minute). */
 export const IMAGE_CHECK_MS = 60_000;
+/** A clock that steps back by more than this starts the image schedule again from its time (review round 4, L1). */
+export const IMAGE_CLOCK_RESET_MS = 60 * 60_000;
 
 /** The settings of the image maintenance with the parsed schedule. */
 export interface ActiveImageSettings extends ImageSettings {
@@ -474,8 +476,15 @@ export class ImageSchedule {
     const time = this.deps.now();
     const { cron, timeZone } = this.deps.settings.value;
     const due = nextCronTime(this.checkedUntil, cron, timeZone);
-    // Review round 2 of PR #57 (R3): a clock that steps back does not run a time that was handled already again.
-    this.checkedUntil = Math.max(this.checkedUntil, time);
+    // Review round 2 of PR #57 (R3): a clock that steps back a little does not run a time that was handled already again.
+    // Review round 4 (L1): one that steps back by more (a clock that was far ahead, then corrected) starts the schedule
+    // again from now; otherwise no pass would come until the clock caught up.
+    if (time < this.checkedUntil - IMAGE_CLOCK_RESET_MS) {
+      this.deps.log(`The clock of the host went back by ${Math.round((this.checkedUntil - time) / 60_000)} minutes; the image schedule goes on from now.`);
+      this.checkedUntil = time;
+    } else {
+      this.checkedUntil = Math.max(this.checkedUntil, time);
+    }
     if (due !== undefined && due <= time) await this.run();
   }
 

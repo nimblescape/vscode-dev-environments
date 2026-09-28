@@ -510,6 +510,23 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(1);
   });
 
+  // Review round 4 of PR #57 (L1): after a clock that was far ahead was corrected, no pass came until it caught up.
+  it('goes on from now after the clock stepped back by more than an hour', async () => {
+    let time = Date.parse('2027-09-29T04:06:00Z');
+    let passes = 0;
+    const log: string[] = [];
+    const schedule = new ImageSchedule({ now: () => time, log: (message) => log.push(message), settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    time = Date.parse('2027-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T04:05:00Z');
+    await schedule.check();
+    expect(log[0]).toMatch(/^The clock of the host went back by \d+ minutes; the image schedule goes on from now\.$/);
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(2);
+  });
+
   it('follows new settings of another computer at the next check', async () => {
     let time = Date.parse('2026-09-29T08:58:00Z');
     const current = new CurrentImageSettings(ENV, stateDir, () => {});
