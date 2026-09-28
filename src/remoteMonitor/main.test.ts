@@ -21,6 +21,7 @@ import {
   parseContainerLines,
   readRecords,
   timingFromEnv,
+  withRecordLock,
   type DockerResult,
 } from './main';
 import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide } from './rules';
@@ -182,6 +183,37 @@ describe('monitor.js heartbeat', () => {
     await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
     expect(readRecord(SOURCE, A)).toMatchObject({ seq: 1 });
     expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  // Review of the remote monitor after PR #57: two heartbeats that both found a lock stale could both get in, and a
+  // holder removed another holder's lock in its `finally`.
+  it('lets one holder at a time take over a left-over lock, and removes only its own lock', async () => {
+    const dir = heartbeatDir(stateDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, '.record.lock');
+    fs.writeFileSync(lock, 'dead');
+    const old = new Date(Date.now() - 20_000);
+    fs.utimesSync(lock, old, old);
+    let inside = 0;
+    let most = 0;
+    await Promise.all(
+      Array.from({ length: 20 }, () =>
+        withRecordLock(dir, 'record', async () => {
+          inside++;
+          most = Math.max(most, inside);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inside--;
+        }),
+      ),
+    );
+    expect(most).toBe(1);
+    expect(fs.readdirSync(dir)).toEqual([]);
+    // A lock that another process holds now stays when a holder ends.
+    await withRecordLock(dir, 'record', async () => {
+      fs.rmSync(lock);
+      fs.writeFileSync(lock, 'other');
+    });
+    expect(fs.readFileSync(lock, 'utf8')).toBe('other');
   });
 
   it.each<[string, string[]]>([

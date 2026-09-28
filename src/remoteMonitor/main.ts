@@ -15,6 +15,7 @@
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
+import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
@@ -123,19 +124,26 @@ const RECORD_LOCK_WAIT_MS = 5_000;
 /**
  * Runs `fn` while holding the lock of one record (`.<name>.lock`, created with `wx`), so that two heartbeats of the same
  * source (two `docker exec` at the same time) read and replace the record one after the other.
+ *
+ * Review of the remote monitor after PR #57: a left-over lock was removed by path, so two heartbeats that both found it
+ * stale could both get in (the second removed the fresh lock of the first), and a holder removed the lock of another
+ * one in its `finally`. Now a lock holds a token of its holder, and a lock is only ever moved aside (`rename`, which
+ * only one process wins) before it is removed; a lock that was moved by mistake (another one than the stale or the own
+ * one) is put back (`link`, which never replaces a lock).
  */
-async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
+export async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
   const lock = path.join(dir, `.${name}.lock`);
+  const token = `${process.pid}.${randomBytes(8).toString('hex')}`;
   const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
   for (;;) {
     try {
-      await fs.promises.writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      await fs.promises.writeFile(lock, token, { flag: 'wx', mode: 0o600 });
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const stat = await fs.promises.lstat(lock).catch(() => undefined);
       if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) {
-        await fs.promises.rm(lock, { force: true });
+        await removeLock(lock, (moved) => moved.ino === stat.ino);
         continue;
       }
       if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
@@ -145,8 +153,29 @@ async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>
   try {
     return await fn();
   } finally {
-    await fs.promises.rm(lock, { force: true }).catch(() => undefined);
+    await removeLock(lock, async (_moved, aside) => (await fs.promises.readFile(aside, 'utf8').catch(() => '')) === token).catch(() => undefined);
   }
+}
+
+/**
+ * Moves the lock aside and removes it when `isIt` says it is the one meant; otherwise puts it back (unless another lock
+ * was created meanwhile). Never throws.
+ */
+async function removeLock(lock: string, isIt: (moved: fs.Stats, aside: string) => boolean | Promise<boolean>): Promise<void> {
+  const aside = `${lock}.${process.pid}.${randomBytes(6).toString('hex')}.old`;
+  try {
+    await fs.promises.rename(lock, aside);
+  } catch {
+    // Gone already, or another process moved it.
+    return;
+  }
+  try {
+    const moved = await fs.promises.lstat(aside);
+    if (!(await isIt(moved, aside))) await fs.promises.link(aside, lock).catch(() => undefined);
+  } catch {
+    // Keep going: the moved file is removed below.
+  }
+  await fs.promises.rm(aside, { force: true }).catch(() => undefined);
 }
 
 /**
