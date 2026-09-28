@@ -17,6 +17,7 @@ import {
   channelLabelValue,
   channelStepLabel,
   isCleanupLabel,
+  newCleanupLabel,
   encodeMessage,
   encodeScript,
   parseClientMessage,
@@ -129,6 +130,10 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   it('the cleanup label: its values, and the label of a step container (review round 1, S1)', () => {
     expect(isCleanupLabel('0a1b2c3d4e5f60718293a4b5')).toBe(true);
     expect(isCleanupLabel('abc123')).toBe(false);
+    // Review round 2 (B4): only values of newCleanupLabel (24 hex digits), each new.
+    expect(isCleanupLabel('cancel-0a1b2c3d')).toBe(false);
+    expect(isCleanupLabel(newCleanupLabel())).toBe(true);
+    expect(newCleanupLabel()).not.toBe(newCleanupLabel());
     expect(isCleanupLabel('a'.repeat(65))).toBe(false);
     expect(channelStepLabel('0a1b2c3d')).toBe('nimblescape.devenv.channel-step=0a1b2c3d');
   });
@@ -139,8 +144,12 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   });
 
   it('checks the parameters and values of docker and probe', () => {
-    // Review round 1 (S1): the cleanup is a label value, no longer container names.
-    expect(parseDockerOperationParams({ args: ['ps'], input: 'x', cleanup: 'step-0a1b2c3d' })).toEqual({ args: ['ps'], input: 'x', cleanup: 'step-0a1b2c3d' });
+    // Review round 1 (S1): the cleanup is a label value, no longer container names; review round 2 (B4): 24 hex digits.
+    expect(parseDockerOperationParams({ args: ['ps'], input: 'x', cleanup: '0a1b2c3d4e5f60718293a4b5' })).toEqual({
+      args: ['ps'],
+      input: 'x',
+      cleanup: '0a1b2c3d4e5f60718293a4b5',
+    });
     expect(parseDockerOperationParams({ args: ['exec'], inputIsSecret: true })).toEqual({ args: ['exec'], inputIsSecret: true });
     for (const params of [
       null,
@@ -151,6 +160,7 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
       { args: ['ps'], cleanup: ['step-0a1b2c3d'] },
       { args: ['ps'], cleanup: 'short' },
       { args: ['ps'], cleanup: '-step-0a1b2c3d' },
+      { args: ['ps'], cleanup: 'step-0a1b2c3d4e5f60718293' },
       { args: ['ps'], cleanup: 'Step-0A1B2C3D' },
     ]) {
       expect(parseDockerOperationParams(params), JSON.stringify(params)).toBeUndefined();

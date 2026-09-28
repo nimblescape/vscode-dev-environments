@@ -8,6 +8,9 @@
 // set its encoding). Only Node.js built-ins and small modules of src/core.
 import { spawn } from 'child_process';
 import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
+
+/** Review round 2 (A2): the output of the calls pauses while more than this many characters wait to be written. */
+export const CHANNEL_OUTPUT_HIGH_WATER = 1024 * 1024;
 import { OPERATIONS } from './operations';
 import { ChannelServer, type ServerChild } from './server';
 
@@ -39,6 +42,15 @@ export function spawnDockerProcess(args: readonly string[], onStdout: (text: str
   });
   return {
     end: (input) => (input === undefined ? child.stdin.end() : child.stdin.end(input)),
+    // Review round 2 (A2): with the reading paused, the pipe fills and the Docker CLI waits.
+    pause: () => {
+      child.stdout.pause();
+      child.stderr.pause();
+    },
+    resume: () => {
+      child.stdout.resume();
+      child.stderr.resume();
+    },
     kill: (signal) => {
       if (child.exitCode === null && child.signalCode === null) child.kill(signal);
     },
@@ -83,6 +95,9 @@ export function startChannel(initial: string): void {
     },
     spawnDocker: spawnDockerProcess,
     operations: OPERATIONS,
+    // Review round 2 (A2): `process.stdout.write` to a pipe does not wait; the answers that wait are bounded here.
+    congested: () => process.stdout.writableLength > CHANNEL_OUTPUT_HIGH_WATER,
+    onDrain: (listener) => process.stdout.once('drain', listener),
     exit: (code) => process.exit(code),
     ...timesFromEnv(process.env),
   });

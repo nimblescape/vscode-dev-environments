@@ -11,7 +11,7 @@ import * as crypto from 'crypto';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
-import type { Logger, RunResult, StartedProcess } from '../ports';
+import { abortError, type Logger, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError, type ChannelDockerOptions } from './helperChannel';
 import {
   CHANNEL_IDLE_CLOSE_MS,
@@ -28,6 +28,11 @@ export const CHANNEL_RETRY_AFTER_FAILURE_MS = 5 * 60_000;
 export const CHANNEL_PROBE_TIMEOUT_MS = 30_000;
 /** How often the idle channels are looked for. */
 export const CHANNEL_SWEEP_INTERVAL_MS = 60_000;
+/**
+ * Review round 2 (A4): a call waits at most this long for a channel that is still being opened; then it takes the way
+ * without it (the opening goes on for the next calls).
+ */
+export const CHANNEL_OPEN_WAIT_MS = 5_000;
 
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
@@ -50,6 +55,9 @@ export function channelRunArgs(p: { tag: string; socketPath: string; containerNa
     '--label',
     `${LABEL_HELPER_CHANNEL}=${p.label}`,
     '--network',
+    'none',
+    // Review round 2 (B3): the engine keeps no log of the channel (its commands and output), whatever its log driver.
+    '--log-driver',
     'none',
     '--cap-drop',
     'ALL',
@@ -132,7 +140,29 @@ export class HelperChannels {
    * dispose, and when it cannot be opened (logged once per attempt; the next attempt after CHANNEL_RETRY_AFTER_FAILURE_MS).
    * Never throws.
    */
-  async get(target: DockerTarget): Promise<HelperChannel | undefined> {
+  async get(target: DockerTarget, wait: { signal?: AbortSignal; waitMs?: number } = {}): Promise<HelperChannel | undefined> {
+    if (wait.signal?.aborted) throw abortError();
+    const opening = this.channelFor(target);
+    if (wait.waitMs === undefined && wait.signal === undefined) return opening;
+    // Review round 2 (A4): the caller's signal and its time for the wait end the wait, not the opening.
+    return new Promise<HelperChannel | undefined>((resolve, reject) => {
+      const timer = wait.waitMs === undefined ? undefined : setTimeout(() => done(() => resolve(undefined)), wait.waitMs);
+      const onAbort = () => done(() => reject(abortError()));
+      wait.signal?.addEventListener('abort', onAbort, { once: true });
+      let settled = false;
+      const done = (settle: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        wait.signal?.removeEventListener('abort', onAbort);
+        settle();
+      };
+      opening.then((channel) => done(() => resolve(channel)));
+    });
+  }
+
+  /** The open channel, or the shared opening of one (see get). */
+  private async channelFor(target: DockerTarget): Promise<HelperChannel | undefined> {
     if (this.disposed || target.kind !== 'remote') return undefined;
     const key = keyOf(target);
     let entry = this.entries.get(key);
@@ -178,7 +208,8 @@ export class HelperChannels {
    * channel while the call ran: HelperChannelError('lost'), whose outcome is not known).
    */
   async docker(target: DockerTarget, args: readonly string[], options: ChannelDockerOptions = {}): Promise<RunResult | undefined> {
-    const channel = await this.get(target);
+    const waitMs = Math.min(CHANNEL_OPEN_WAIT_MS, options.timeoutMs ?? CHANNEL_OPEN_WAIT_MS);
+    const channel = await this.get(target, { signal: options.signal, waitMs });
     if (channel === undefined) return undefined;
     try {
       return await channel.docker(args, options);

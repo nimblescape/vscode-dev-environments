@@ -23,7 +23,7 @@
 // Before it exits, it cancels the operations that still run: their Docker calls end (SIGTERM, then SIGKILL) and the
 // containers that they started with their cleanup label are removed (`docker rm -f`, review round 1, S1: by the label
 // of the operation, never by a name, so no container that the operation did not start can be removed).
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 /** The version of the messages. The extension closes a channel whose script answers with another one. */
 export const CHANNEL_PROTOCOL_VERSION = 1;
@@ -213,9 +213,21 @@ export function isSecret(value: unknown): value is string {
  */
 export const LABEL_CHANNEL_STEP = 'nimblescape.devenv.channel-step';
 
-/** A cleanup label value: 8 to 64 lower-case letters, digits, and `-` (for example 24 random hex digits). */
+/**
+ * A cleanup label value: 24 hex digits, as newCleanupLabel makes them (review round 2, B4: a value of its own per call,
+ * never a fixed one, so that no other call or window can have containers with it).
+ */
 export function isCleanupLabel(value: unknown): value is string {
-  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{7,63}$/.test(value);
+  return typeof value === 'string' && /^[0-9a-f]{24}$/.test(value);
+}
+
+/**
+ * A new cleanup label value (96 random bits). Use one per call and never again: the containers of a cancelled or lost
+ * operation can still be removed later (the cleanup of the script can run up to 35 s after the cancel, and after a lost
+ * connection only when the script ends by its silence).
+ */
+export function newCleanupLabel(): string {
+  return randomBytes(12).toString('hex');
 }
 
 /** The `--label` value of a container of a step: `nimblescape.devenv.channel-step=<value>`. */

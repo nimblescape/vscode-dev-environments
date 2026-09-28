@@ -23,6 +23,7 @@ import {
   channelLabelValue,
   channelStepLabel,
   encodeMessage,
+  newCleanupLabel,
   encodeScript,
 } from '../../src/core/helperChannel/protocol';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
@@ -144,7 +145,7 @@ describe('the helper channel with the real Docker engine', () => {
   it('cancels an operation: its Docker call ends and the container it started is removed', async () => {
     const { channel, name } = await open();
     const stepName = `devenv-test-channel-step-${run.runId}`;
-    const label = `cancel-${run.runId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const label = newCleanupLabel();
     const controller = new AbortController();
     const running = channel.docker(stepArgs(stepName, label), { signal: controller.signal, cleanup: label });
     await waitUntil(() => cli.container(stepName)?.State.Running === true, 'the start of the step');
@@ -159,7 +160,7 @@ describe('the helper channel with the real Docker engine', () => {
   it('ends after the silence while the connection stays open, with the containers of what ran', async () => {
     const containerName = `devenv-channel-test-${run.runId}`;
     const stepName = `devenv-test-channel-silent-${run.runId}`;
-    const label = `silent-${run.runId}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const label = newCleanupLabel();
     const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script) });
     // Review round 1 (P8): long enough for the step to start and be seen on a slow runner.
     args.splice(args.indexOf(helperTag), 0, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');

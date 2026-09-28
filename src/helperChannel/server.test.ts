@@ -9,6 +9,7 @@ import {
   CHANNEL_SERVER_IDLE_EXIT_MS,
   CHANNEL_SILENCE_EXIT_MS,
   MAX_CLIENT_LINE,
+  MAX_SERVER_LINE,
   OUTPUT_CHUNK_CHARACTERS,
   encodeMessage,
   type ClientMessage,
@@ -16,7 +17,10 @@ import {
 } from '../core/helperChannel/protocol';
 import { OPERATIONS } from './operations';
 import {
+  CLEANUP_SECOND_PASS_MS,
   ChannelServer,
+  LATE_CANCEL_WINDOW_MS,
+  MAX_LOG_TEXT,
   MAX_CONTEXT_STDERR_CHARACTERS,
   MAX_CONTEXT_STDOUT_CHARACTERS,
   StreamRedactor,
@@ -49,7 +53,8 @@ function cleanupAnswers(ids: string[]) {
   };
 }
 
-const LABEL = 'step-0a1b2c3d4e5f';
+// Review round 2 (B4): cleanup label values are 24 hex digits (newCleanupLabel).
+const LABEL = '0a1b2c3d4e5f60718293a4b5';
 const PS_OF_LABEL = ['ps', '-aq', '--no-trunc', '--filter', `label=nimblescape.devenv.channel-step=${LABEL}`];
 const ID_1 = '0123456789abcdef0123456789abcdef';
 const ID_2 = 'fedcba9876543210fedcba9876543210';
@@ -241,6 +246,12 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(resultOf(1)).toBeUndefined();
     remove.exit(0);
     await vi.advanceTimersByTimeAsync(0);
+    // Review round 2 (C3): a second look after CLEANUP_SECOND_PASS_MS, then the result.
+    expect(resultOf(1)).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    expect(docker.children[3].args).toEqual(PS_OF_LABEL);
+    docker.children[4].exit(0);
+    await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toEqual({ t: 'result', id: 1, ok: false, error: { code: 'cancelled', message: 'The operation was cancelled.' }, cancelled: true, timedOut: false });
   });
 
@@ -249,8 +260,9 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: LABEL }, timeoutMs: 1_000 });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(docker.children[0].signals).toEqual(['SIGTERM']);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1, ID_2]]);
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    // Review round 2 (C3): two passes.
+    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1, ID_2], PS_OF_LABEL, ['rm', '-f', ID_1, ID_2]]);
     expect(resultOf(1)).toMatchObject({ ok: false, error: { code: 'timeout' }, cancelled: false, timedOut: true });
   });
 
@@ -260,15 +272,15 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     });
     send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '--name', 'abc123', 'img'], cleanup: LABEL } });
     send({ t: 'cancel', id: 1 });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL]);
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    expect(docker.children.slice(1).map((child) => child.args)).toEqual([PS_OF_LABEL, PS_OF_LABEL]);
     expect(resultOf(1)).toMatchObject({ ok: false, cancelled: true });
   });
 
   it('refuses a cleanup that is a name instead of a label value', async () => {
     const { send, docker, resultOf } = setup();
     send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', 'img'], cleanup: ['n'] } });
-    send({ t: 'op', id: 2, op: 'docker', params: { args: ['run', 'img'], cleanup: 'abc' } });
+    send({ t: 'op', id: 2, op: 'docker', params: { args: ['run', 'img'], cleanup: 'step-0a1b2c3d4e5f' } });
     await vi.advanceTimersByTimeAsync(0);
     expect(docker.children).toHaveLength(0);
     expect(resultOf(1)).toMatchObject({ ok: false, error: { code: 'invalid' } });
@@ -282,6 +294,130 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toMatchObject({ ok: true });
     expect(docker.children).toHaveLength(1);
+  });
+
+  it('removes the containers of an operation whose cancel crossed its result, within LATE_CANCEL_WINDOW_MS (review round 2, A1)', async () => {
+    const { send, docker } = setup({ docker: fakeDocker({ respond: cleanupAnswers([ID_1]) }) });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['run', '-d', 'img'], cleanup: LABEL } });
+    send({ t: 'op', id: 2, op: 'docker', params: { args: ['run', '-d', 'img'], cleanup: LABEL } });
+    docker.children[0].exit(0);
+    docker.children[1].exit(0);
+    await vi.advanceTimersByTimeAsync(0);
+    // The cancel of 1 comes after its result was sent.
+    send({ t: 'cancel', id: 1 });
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    expect(docker.children.slice(2).map((child) => child.args)).toEqual([PS_OF_LABEL, ['rm', '-f', ID_1], PS_OF_LABEL, ['rm', '-f', ID_1]]);
+    // A second cancel of the same id, and a cancel of 2 after the window, remove nothing more.
+    send({ t: 'cancel', id: 1 });
+    await vi.advanceTimersByTimeAsync(LATE_CANCEL_WINDOW_MS);
+    send({ t: 'cancel', id: 2 });
+    await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+    expect(docker.children).toHaveLength(6);
+  });
+
+  it('pauses the output of the calls while the answers wait to be written, and resumes it when they are (review round 2, A2)', async () => {
+    let congested = false;
+    let drain: (() => void) | undefined;
+    const docker = fakeDocker();
+    const paused: string[] = [];
+    const messages: ServerMessage[] = [];
+    const server = new ChannelServer({
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
+        return true;
+      },
+      spawnDocker: (args, onStdout, onStderr) => {
+        const child = docker.spawn(args, onStdout, onStderr);
+        child.pause = () => paused.push(`pause ${args[0]}`);
+        child.resume = () => paused.push(`resume ${args[0]}`);
+        return child;
+      },
+      operations: OPERATIONS,
+      exit: () => {},
+      congested: () => congested,
+      onDrain: (listener) => (drain = listener),
+    });
+    server.start();
+    server.input(encodeMessage({ t: 'op', id: 1, op: 'docker', params: { args: ['logs', 'c'] } }));
+    congested = true;
+    docker.children[0].stdout('lots of output');
+    expect(paused).toEqual(['pause logs']);
+    // A call that starts meanwhile starts paused.
+    server.input(encodeMessage({ t: 'op', id: 2, op: 'docker', params: { args: ['events'] } }));
+    expect(paused).toEqual(['pause logs', 'pause events']);
+    congested = false;
+    drain?.();
+    expect(paused).toEqual(['pause logs', 'pause events', 'resume logs', 'resume events']);
+    server.shutdown();
+  });
+
+  it('cuts a log line that would be longer than the extension reads, and fails a result that is too large (review round 2, C1)', async () => {
+    const operations: Record<string, OperationHandler> = {
+      big: async () => 'x'.repeat(MAX_SERVER_LINE),
+    };
+    const { send, of, docker } = setup({ operations: { ...OPERATIONS, ...operations } });
+    const huge = Array.from({ length: 50 }, () => '\\'.repeat(40_000));
+    send({ t: 'op', id: 1, op: 'docker', params: { args: huge } });
+    docker.children[0].exit(0);
+    send({ t: 'op', id: 2, op: 'big', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    const lines = of(1).filter((message) => message.t === 'log') as { text: string }[];
+    expect(lines[0].text.length).toBeLessThanOrEqual(MAX_LOG_TEXT + 1);
+    expect(lines[0].text.endsWith('…')).toBe(true);
+    for (const message of [...of(1), ...of(2)]) expect(encodeMessage(message).length).toBeLessThanOrEqual(MAX_SERVER_LINE);
+    expect(of(2)).toEqual([
+      { t: 'result', id: 2, ok: false, error: { code: 'tooLarge', message: 'The result of the operation is too large for the helper channel.' }, cancelled: false, timedOut: false },
+    ]);
+  });
+
+  it('masks the secret per streamed call, so the end of one call does not give out a part of the secret of another (review round 2, B1)', async () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz';
+    const operations: Record<string, OperationHandler> = {
+      two: async (_params, context) => {
+        const first = context.docker(['logs', 'a'], { stream: true });
+        const second = context.docker(['logs', 'b'], { stream: true });
+        await Promise.all([first, second]);
+        return null;
+      },
+    };
+    const { send, docker, of } = setup({ operations });
+    send({ t: 'op', id: 1, op: 'two', params: null, secret });
+    await vi.advanceTimersByTimeAsync(0);
+    const [a, b] = docker.children;
+    a.stdout(`token ${secret.slice(0, 10)}`);
+    b.exit(0);
+    await vi.advanceTimersByTimeAsync(0);
+    a.stdout(`${secret.slice(10)} end\n`);
+    a.exit(0);
+    await vi.advanceTimersByTimeAsync(0);
+    const out = of(1)
+      .filter((message) => message.t === 'out')
+      .map((message) => (message as { data: string }).data)
+      .join('');
+    expect(out).toBe('token *** end\n');
+  });
+
+  it('masks the kept error output before it is cut, so a cut cannot leave a part of the secret (review round 2, B2)', async () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz';
+    let result: ContextDockerResult | undefined;
+    const operations: Record<string, OperationHandler> = {
+      build: async (_params, context) => {
+        result = await context.docker(['build', '.']);
+        return null;
+      },
+    };
+    const { send, docker, of } = setup({ operations });
+    send({ t: 'op', id: 1, op: 'build', params: null, secret });
+    await vi.advanceTimersByTimeAsync(0);
+    const [child] = docker.children;
+    // One line without a line feed; the secret lies where the kept end would begin.
+    child.stderr('y'.repeat(MAX_CONTEXT_STDERR_CHARACTERS));
+    child.stderr(secret);
+    child.stderr('z'.repeat(MAX_CONTEXT_STDERR_CHARACTERS - 10));
+    child.exit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(result?.stderr).not.toContain(secret.slice(-8));
+    expect(JSON.stringify(of(1))).not.toContain(secret.slice(-8));
   });
 
   it('masks the secret before it cuts the last error line of the log (review round 1, S2)', async () => {
@@ -378,6 +514,10 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       expect(docker.children[2].args).toEqual(['rm', '-f', ID_1]);
       expect(exits).toEqual([]);
       docker.children[2].exit(0);
+      // Review round 2 (C3): the second pass of the cleanup comes first.
+      await vi.advanceTimersByTimeAsync(CLEANUP_SECOND_PASS_MS);
+      expect(exits).toEqual([]);
+      docker.children[4].exit(0);
       await vi.advanceTimersByTimeAsync(0);
       expect(exits).toEqual([0]);
     });

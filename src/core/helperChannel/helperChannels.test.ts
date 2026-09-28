@@ -8,6 +8,7 @@ import { operationDockerTarget } from '../docker/dockerTargets';
 import { silentLogger, type Logger, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError } from './helperChannel';
 import {
+  CHANNEL_OPEN_WAIT_MS,
   CHANNEL_RETRY_AFTER_FAILURE_MS,
   HelperChannels,
   channelRunArgs,
@@ -126,6 +127,28 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     channels.dispose();
   });
 
+  it('a call waits for an opening channel at most CHANNEL_OPEN_WAIT_MS or its time limit, then takes the way without it; its signal ends the wait (review round 2, A4)', async () => {
+    const channel = fakeChannel();
+    let finishOpen!: (channel: HelperChannel) => void;
+    const open = vi.fn(() => new Promise<HelperChannel>((resolve) => (finishOpen = resolve)));
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    const first = channels.docker(REMOTE, ['ps'], { timeoutMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await first).toBeUndefined();
+    const second = channels.docker(REMOTE, ['ps']);
+    await vi.advanceTimersByTimeAsync(CHANNEL_OPEN_WAIT_MS);
+    expect(await second).toBeUndefined();
+    const controller = new AbortController();
+    const third = channels.docker(REMOTE, ['ps'], { signal: controller.signal });
+    controller.abort();
+    await expect(third).rejects.toMatchObject({ name: 'AbortError' });
+    // The opening went on: the next call uses the channel.
+    finishOpen(channel as unknown as HelperChannel);
+    expect(await channels.docker(REMOTE, ['ps'])).toMatchObject({ exitCode: 0 });
+    expect(open).toHaveBeenCalledTimes(1);
+    channels.dispose();
+  });
+
   it('closes a channel without an operation for CHANNEL_IDLE_CLOSE_MS, not one that is busy', async () => {
     const channel = fakeChannel();
     const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
@@ -169,7 +192,8 @@ describe('channelRunArgs and openHelperChannel', () => {
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
       '--label', `${LABEL_HELPER_CHANNEL}=1-x`,
-      '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      // Review round 2 (B3): no log of the channel on the host.
+      '--network', 'none', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
       'devenv-helper:abc', 'node', '-e', CHANNEL_LOADER,
     ]);

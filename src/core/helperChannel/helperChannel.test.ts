@@ -209,11 +209,13 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     const ping = fake.messages().find((message) => message.t === 'ping') as { n: number };
     fake.answer({ t: 'pong', n: ping.n });
-    // Review round 1 (P3): lost once no answer came for pongTimeoutMs, at the next ping (here at 3 s after the answer).
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(channel.isOpen).toBe(true);
+    // Review round 1 (P3), pinned in review round 2 (C4): lost at the first ping at which no answer came for exactly
+    // pongTimeoutMs (the answer at 1 s, the ping at 4 s), not one ping later.
     const running = expect(channel.operation('start', {})).rejects.toMatchObject({ code: 'lost' });
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(channel.isOpen).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(channel.isOpen).toBe(false);
     await running;
     expect(channel.isOpen).toBe(false);
     expect(fake.state.killed).toBe(true);
@@ -348,6 +350,20 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
     });
 
+    it('A5 (round 2): a time limit that the script would refuse is not sent, and a missing params travels as null', async () => {
+      const { channel, fake } = await openChannel();
+      for (const timeoutMs of [0, -5, 1.5, Number.NaN, 25 * 60 * 60_000]) {
+        await expect(channel.docker(['ps'], { timeoutMs })).rejects.toMatchObject({ code: 'unsendable' });
+      }
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+      const probe = channel.operation('probe', undefined);
+      const op = lastOp(fake);
+      expect(op.params).toBeNull();
+      expect(parseClientMessage(fake.lines[fake.lines.length - 1])).toMatchObject({ t: 'op', params: null });
+      fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
+      await probe;
+    });
+
     it('P4: waits for the result of a timed-out operation longer than the kill grace and the cleanup of the script', () => {
       expect(CHANNEL_RESULT_GRACE_MS).toBeGreaterThan(CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS);
     });
@@ -357,10 +373,10 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     it('returns the result of a Docker call: its output, its exit code, and passes its input', async () => {
       const { channel, fake, lines } = await openChannel();
       const stderrSeen: string[] = [];
-      const result = channel.docker(['exec', '-i', 'c', 'cat'], { input: 'text', timeoutMs: 5_000, cleanup: 'step-0a1b2c3d', onStderr: (text) => stderrSeen.push(text) });
+      const result = channel.docker(['exec', '-i', 'c', 'cat'], { input: 'text', timeoutMs: 5_000, cleanup: '0a1b2c3d4e5f60718293a4b5', onStderr: (text) => stderrSeen.push(text) });
       const op = lastOp(fake);
-      // Review round 1 (S1): the cleanup is a label value, no longer container names.
-      expect(op).toMatchObject({ op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], input: 'text', cleanup: 'step-0a1b2c3d' }, timeoutMs: 5_000 });
+      // Review round 1 (S1): the cleanup is a label value, no longer container names (round 2, B4: 24 hex digits).
+      expect(op).toMatchObject({ op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], input: 'text', cleanup: '0a1b2c3d4e5f60718293a4b5' }, timeoutMs: 5_000 });
       fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'te' });
       fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'xt' });
       fake.answer({ t: 'out', id: op.id, stream: 'stderr', data: 'note' });

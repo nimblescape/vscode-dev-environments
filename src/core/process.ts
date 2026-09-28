@@ -33,12 +33,19 @@ export class NodeProcessRunner implements ProcessRunner {
   private readonly platform: NodeJS.Platform;
   private readonly killTree: (pid: number, fallback: () => void) => void;
   private readonly startKillGraceMs: number;
+  private readonly killChildren: (pid: number, done: () => void) => void;
 
   constructor(
     private readonly maxStdoutBytes: number = MAX_CAPTURED_OUTPUT_BYTES,
     private readonly maxStderrCharacters: number = MAX_CAPTURED_STDERR_CHARACTERS,
-    options: { platform?: NodeJS.Platform; killTree?: (pid: number, fallback: () => void) => void; startKillGraceMs?: number } = {},
+    options: {
+      platform?: NodeJS.Platform;
+      killTree?: (pid: number, fallback: () => void) => void;
+      startKillGraceMs?: number;
+      killChildren?: (pid: number, done: () => void) => void;
+    } = {},
   ) {
+    this.killChildren = options.killChildren ?? runPkillChildren;
     this.platform = options.platform ?? process.platform;
     this.startKillGraceMs = options.startKillGraceMs ?? START_KILL_GRACE_MS;
     this.killTree = options.killTree ?? ((pid, fallback) => runTaskkill(pid, process.env, fallback));
@@ -226,7 +233,24 @@ export class NodeProcessRunner implements ProcessRunner {
         // Review round 1 (L2): `docker run -i` passes SIGTERM on to its container over its connection and waits; over a
         // hung connection it would never end. So SIGKILL after START_KILL_GRACE_MS (Windows: taskkill /F ended it).
         const timer = setTimeout(() => {
-          if (!ended) child.kill('SIGKILL');
+          if (ended) return;
+          // Review round 2 (A3): first the programs that it started (the Docker CLI starts `ssh` in a session of its own,
+          // which no signal to docker reaches; on Linux it would die with it, on macOS it would stay), then docker. Only
+          // after pkill ended (at most 1 s): a docker killed before would leave its children to process 1, where
+          // `pkill -P` no longer finds them.
+          const killDocker = () => {
+            if (!ended) child.kill('SIGKILL');
+          };
+          if (this.platform === 'win32' || child.pid === undefined) {
+            killDocker();
+            return;
+          }
+          const fallback = setTimeout(killDocker, 1_000);
+          fallback.unref?.();
+          this.killChildren(child.pid, () => {
+            clearTimeout(fallback);
+            killDocker();
+          });
         }, this.startKillGraceMs);
         timer.unref?.();
       },
@@ -257,6 +281,16 @@ export function windowsTreeKillCommand(pid: number, env: NodeJS.ProcessEnv): { f
   const root = Object.keys(env).find((key) => key.toUpperCase() === 'SYSTEMROOT');
   const systemRoot = (root !== undefined ? env[root] : undefined) || 'C:\\Windows';
   return { file: path.win32.join(systemRoot, 'System32', 'taskkill.exe'), args: ['/T', '/F', '/PID', String(Math.trunc(pid))] };
+}
+
+/**
+ * Review round 2 (A3): SIGKILL to the programs that `pid` started (`pkill -KILL -P <pid>`, macOS and Linux), never
+ * through a shell. A failure changes nothing (the program ended already, or pkill is missing).
+ */
+function runPkillChildren(pid: number, done: () => void): void {
+  const killer = spawn('pkill', ['-KILL', '-P', String(Math.trunc(pid))], { shell: false, stdio: 'ignore' });
+  killer.on('error', done);
+  killer.on('close', done);
 }
 
 function runTaskkill(pid: number, env: NodeJS.ProcessEnv, fallback: () => void): void {

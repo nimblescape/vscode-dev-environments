@@ -47,7 +47,7 @@ export const probeOperation: OperationHandler = async (params, context) => {
   const value: ProbeValue =
     result.exitCode === 0 && version !== ''
       ? { serverVersion: version, detail: `Docker ${version}` }
-      : { detail: (result.error ?? result.stderr.trim()) || `exit code ${result.exitCode}` };
+      : { detail: ((result.error ?? result.stderr.trim()) || `exit code ${result.exitCode}`).slice(-2_000) };
   return value;
 };
 

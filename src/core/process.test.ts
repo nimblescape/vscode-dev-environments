@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { execFileSync } from 'child_process';
 import { Readable } from 'stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
@@ -153,6 +154,54 @@ describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)'
     const { exitCode } = await started.exited;
     expect(exitCode).toBeNull();
     expect(Date.now() - killedAt).toBeGreaterThanOrEqual(250);
+  });
+
+  it('the SIGKILL goes first to the programs that it started (review round 2, A3: the ssh of the Docker CLI)', async () => {
+    if (process.platform === 'win32') return;
+    const killed: number[] = [];
+    const runner = new NodeProcessRunner(undefined, undefined, {
+      startKillGraceMs: 200,
+      killChildren: (pid, done) => {
+        killed.push(pid);
+        done();
+      },
+    });
+    const started = runner.start(node, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)']);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    started.kill();
+    await started.exited;
+    expect(killed).toEqual([started.pid]);
+  });
+
+  it('pkill ends a child in a session of its own, which no signal to its parent reaches', async () => {
+    if (process.platform === 'win32') return;
+    // A parent that ignores SIGTERM starts a detached child (setsid) that ignores SIGTERM too, and prints its pid.
+    const parent = [
+      'const { spawn } = require("child_process");',
+      'process.on("SIGTERM", () => {});',
+      'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+      'process.stdout.write(String(child.pid));',
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const started = new NodeProcessRunner(undefined, undefined, { startKillGraceMs: 200 }).start(node, ['-e', parent]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    for (let wait = 0; wait < 100 && stdout === ''; wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const childPid = Number(stdout);
+    expect(childPid).toBeGreaterThan(0);
+    started.kill();
+    await started.exited;
+    // Ended: gone, or a zombie that nobody reaps (its parent was killed; process 1 of a container may not reap it).
+    const alive = () => {
+      try {
+        const state = execFileSync('ps', ['-o', 'stat=', '-p', String(childPid)], { encoding: 'utf8' }).trim();
+        return state !== '' && !state.startsWith('Z');
+      } catch {
+        return false;
+      }
+    };
+    for (let wait = 0; wait < 100 && alive(); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(alive()).toBe(false);
   });
 
   it('reports a program that cannot be started in `exited`, without throwing', async () => {

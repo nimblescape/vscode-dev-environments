@@ -18,8 +18,9 @@ import { CHANNEL_LOADER, CHANNEL_SCRIPT_PATH, OP_PROBE, encodeMessage, encodeScr
 import { silentLogger, type Logger, type StartedProcess } from '../core/ports';
 import { NodeProcessRunner } from '../core/process';
 
-// Review round 1 (P9): a \`sleep\` call sets its SIGTERM handler first and only then writes its line ("ready"), so a test
-// that waits for the line knows that the handler is there. \`ps\` answers the containers of a cleanup label with one ID.
+// Review round 1 (P9): a \`sleep\` call sets its SIGTERM handler before anything else. Review round 2 (C2): that alone does
+// not order it before the SIGTERM of the script (its silence runs from the operation, not from the wait of the test);
+// the silence of the test (5 s) leaves the start of the fake time for it. \`ps\` answers a cleanup label with one ID.
 const FAKE_DOCKER = `#!/usr/bin/env node
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -36,8 +37,11 @@ else if (args[0] === 'cat') { process.stdin.pipe(process.stdout); process.stdin.
 else if (args[0] !== 'sleep') { process.stderr.write('unknown\\n'); process.exit(1); }
 `;
 
-const LABEL_ONE = 'step-one-0a1b2c3d';
-const LABEL_TWO = 'step-two-0a1b2c3d';
+// Review round 2 (B4): cleanup label values are 24 hex digits.
+const LABEL_ONE = '0000000000000000000000aa';
+const LABEL_TWO = '0000000000000000000000bb';
+/** The tests below take a few seconds (the silence, the second pass of the cleanup): review round 2, C2. */
+const SLOW_TEST_MS = 30_000;
 const psOf = (label: string) => ['ps', '-aq', '--no-trunc', '--filter', `label=nimblescape.devenv.channel-step=${label}`];
 const REMOVED = ['rm', '-f', '0123456789abcdef0123456789abcdef'];
 
@@ -113,7 +117,7 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     await waitUntil(ended, 'the end of the script');
   });
 
-  it('ends when its input ends: a running call gets SIGTERM and its container is removed', async () => {
+  it('ends when its input ends: a running call gets SIGTERM and its container is removed', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     const running = channel.docker(['sleep', 'one'], { cleanup: LABEL_ONE });
@@ -127,8 +131,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     expect(calls()).toContainEqual(REMOVED);
   });
 
-  it('ends after the silence when the connection hangs (no ping, the input stays open)', async () => {
-    const { process, ended } = start(3_000);
+  it('ends after the silence when the connection hangs (no ping, the input stays open)', { timeout: SLOW_TEST_MS }, async () => {
+    const { process, ended } = start(5_000);
     let stdout = '';
     process.onStdout((text) => (stdout += text));
     process.write(encodeScript(script));

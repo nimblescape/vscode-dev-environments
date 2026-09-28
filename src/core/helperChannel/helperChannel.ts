@@ -21,6 +21,7 @@ import {
   MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
+  MAX_OPERATION_TIMEOUT_MS,
   MAX_SERVER_LINE,
   OP_DOCKER,
   encodeMessage,
@@ -366,8 +367,13 @@ export class HelperChannel {
   async operation(op: string, params: unknown, options: OperationOptions = {}): Promise<unknown> {
     if (options.signal?.aborted) throw abortError();
     if (this.state !== 'open') throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
+    // Review round 2 (A5): what the script refuses as a whole is not sent: a time limit that is no whole number of
+    // milliseconds from 1 to MAX_OPERATION_TIMEOUT_MS; a missing `params` travels as null (JSON drops undefined).
+    if (options.timeoutMs !== undefined && !(Number.isInteger(options.timeoutMs) && options.timeoutMs >= 1 && options.timeoutMs <= MAX_OPERATION_TIMEOUT_MS)) {
+      throw new HelperChannelError('unsendable', `The time limit ${options.timeoutMs} cannot be sent through the helper channel.`);
+    }
     const id = this.nextId++;
-    const message: ClientMessage = { t: 'op', id, op, params };
+    const message: ClientMessage = { t: 'op', id, op, params: params === undefined ? null : params };
     if (options.secret !== undefined) {
       if (!isSecret(options.secret)) throw new HelperChannelError('unsendable', 'The secret cannot be sent through the helper channel.');
       message.secret = options.secret;
