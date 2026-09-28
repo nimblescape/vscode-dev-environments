@@ -390,7 +390,7 @@
         },
         {
           "command": "devEnvironments.useRemoteDockerHost",
-          "when": "view == devEnvironments.repositories && !devEnvironments.remoteDockerHost",
+          "when": "view == devEnvironments.repositories && !devEnvironments.remoteDockerHost && !devEnvironments.dockerSetupRequired",
           "group": "navigation@3"
         },
         {

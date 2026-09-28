@@ -57,6 +57,9 @@ export interface ContextReader {
 export class DockerTargets {
   private lastTarget: DockerTarget | undefined;
   private readonly listeners = new Set<(target: DockerTarget) => void>();
+  /** Review of the sidebar host (S4): the number of the newest read that started, and of the newest one applied. */
+  private readsStarted = 0;
+  private readApplied = 0;
 
   constructor(
     private readonly docker: ContextReader,
@@ -76,7 +79,11 @@ export class DockerTargets {
    * Never throws.
    */
   async resolve(): Promise<DockerTarget> {
+    const read = ++this.readsStarted;
     const target = await this.read();
+    // A read that started before a newer one finished (overlapping reads) does not overwrite what that one found.
+    if (read < this.readApplied) return target;
+    this.readApplied = read;
     this.lastTarget = target;
     for (const listener of [...this.listeners]) {
       try {
@@ -89,8 +96,8 @@ export class DockerTargets {
   }
 
   /**
-   * User request 2026-09-28 (the Docker host in the sidebar): `listener` gets every target that `resolve` reads. Returns
-   * the function that removes it.
+   * User request 2026-09-28 (the Docker host in the sidebar): `listener` gets every target that `resolve` reads, except
+   * one of a read that a newer read overtook. Returns the function that removes it.
    */
   onDidResolve(listener: (target: DockerTarget) => void): () => void {
     this.listeners.add(listener);

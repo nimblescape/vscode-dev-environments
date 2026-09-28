@@ -76,11 +76,13 @@ export const RemoteDockerTexts = {
   variableSet: (name: string) =>
     `${name} is set in the environment of VS Code, so Docker ignores the Docker context. Remove ${name} and start VS Code again, then try again.`,
   switchFailed: 'The Docker context could not be changed.',
-  /** The mismatch of an environment and the current Docker host (a restored window, for example from Open Recent). */
   /** User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host. */
   chooseTitle: (host: string) => `Docker host: ${host}`,
   choosePlaceholder: 'Use another remote host, or switch back to the local Docker',
   useAnotherHost: 'Use Another Remote Docker Host…',
+  /** Review of the sidebar host (S1): the Docker CLI of this computer talks to the remote host. */
+  cliMissing: 'A remote Docker host needs the Docker CLI on this computer. Install Docker first (Docker Desktop brings the CLI).',
+  /** The mismatch of an environment and the current Docker host (a restored window, for example from Open Recent). */
   mismatch: (environmentHost: string, currentHost: string) =>
     `This environment is on ${describeDockerHost(environmentHost)}, but Docker is set to ${describeDockerHost(currentHost)}. Use ${describeDockerHost(environmentHost)} again?`,
 } as const;
@@ -115,6 +117,11 @@ export class RemoteDockerCommands {
   async useRemoteHost(): Promise<void> {
     try {
       if (this.refuseOverride()) return;
+      if (!this.deps.docker.isInstalled()) {
+        this.deps.logger.warn('No Docker CLI on this computer; no remote Docker host is set.');
+        this.showError(RemoteDockerTexts.cliMissing);
+        return;
+      }
       const host = await this.pickHost();
       if (host === undefined) return;
       await this.switchToRemote(host);
@@ -129,6 +136,8 @@ export class RemoteDockerCommands {
    */
   async chooseDockerHost(): Promise<void> {
     try {
+      // Review of the sidebar host (S5): with DOCKER_HOST or DOCKER_CONTEXT set for VS Code, both choices are refused.
+      if (this.refuseOverride()) return;
       const current = await this.deps.targets.resolve();
       const items: Array<vscode.QuickPickItem & { choice: 'remote' | 'local' }> = [
         { label: `$(remote) ${RemoteDockerTexts.useAnotherHost}`, choice: 'remote' },

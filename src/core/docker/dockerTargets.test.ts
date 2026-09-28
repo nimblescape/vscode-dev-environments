@@ -178,3 +178,26 @@ describe('DockerTargets.onDidResolve', () => {
     expect(seen).toEqual(['local']);
   });
 });
+
+// Review of the sidebar host (S4): of overlapping reads, the one that started last wins.
+describe('DockerTargets.resolve with overlapping reads', () => {
+  it('does not let an older read that finishes later overwrite a newer one', async () => {
+    const results = [
+      { exitCode: 0, stdout: JSON.stringify({ Name: 'default', Endpoints: { docker: { Host: 'unix:///var/run/docker.sock' } } }), stderr: '', timedOut: false },
+      { exitCode: 0, stdout: JSON.stringify({ Name: 'devenv-remote', Endpoints: { docker: { Host: 'ssh://box' } } }), stderr: '', timedOut: false },
+    ];
+    const gates: Array<(value: RunResult) => void> = [];
+    const docker = { isInstalled: () => true, run: async (): Promise<RunResult> => new Promise<RunResult>((resolve) => gates.push(resolve)) };
+    const targets = new DockerTargets(docker, {}, silentLogger, 'linux');
+    const seen: string[] = [];
+    targets.onDidResolve((target) => seen.push(target.host));
+    const older = targets.resolve();
+    const newer = targets.resolve();
+    gates[1](results[1]);
+    await newer;
+    gates[0](results[0]);
+    await expect(older).resolves.toMatchObject({ kind: 'local' });
+    expect(seen).toEqual(['box']);
+    expect(targets.last?.host).toBe('box');
+  });
+});

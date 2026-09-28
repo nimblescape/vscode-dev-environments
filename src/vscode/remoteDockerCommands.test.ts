@@ -311,6 +311,15 @@ describe('Use a Remote Docker Host…', () => {
     expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote('build-box', true));
   });
 
+  // Review of the sidebar host (S1): without a Docker CLI on this computer, the missing CLI is the reason, not the host.
+  it('names the missing Docker CLI of this computer before it asks for a host', async () => {
+    cli.isInstalled = () => false;
+    await commands.useRemoteHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.cliMissing);
+    expect(cli.calls).toEqual([]);
+  });
+
   it('refuses while DOCKER_HOST is set for VS Code (the context would have no effect)', async () => {
     env.DOCKER_HOST = 'unix:///var/run/docker.sock';
     commands = create();
@@ -338,6 +347,15 @@ describe('Remote Docker Host… (the choice of the title bar)', () => {
     expect(options.title).toBe('Docker host: build-box');
     expect(useRemote).toHaveBeenCalledTimes(1);
     expect(useLocal).toHaveBeenCalledTimes(1);
+  });
+
+  // Review of the sidebar host (S5).
+  it('explains DOCKER_HOST first instead of offering choices that are refused', async () => {
+    env.DOCKER_HOST = 'ssh://build-box';
+    commands = create();
+    await commands.chooseDockerHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.variableSet('DOCKER_HOST'));
   });
 
   it('changes nothing when the choice is cancelled', async () => {

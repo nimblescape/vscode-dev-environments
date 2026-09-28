@@ -159,7 +159,7 @@ Environments of another account are not in the list, and the list does not name 
 A repository has at most one environment per GitHub account (see [D-3](#13-decisions)): a workspace volume with a clone of the repository, plus its dev container (see [section 2](#2-terms)). The first **Start** of a repository by an account creates the environment of that account. The environment stays until the user selects **Delete**.
 
 ```text
-DEV ENVIRONMENTS         [Select Organizations] [Search] [Refresh] [Collapse All]
+DEV ENVIRONMENTS  Remote: machines   [Select Organizations] [Search] [Refresh] [Docker Host] [Collapse All]
   ▾ acme-university
       ● api        main (python)   Connected                  [Stop] [Delete] [⋯]
       ▶ docs       main            Running                    [Stop] [Delete] [⋯]

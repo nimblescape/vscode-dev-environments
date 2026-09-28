@@ -3337,9 +3337,10 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       };
     };
     const title = manifest.contributes.menus['view/title'];
+    // Review of the sidebar host (S1): not over the Docker setup, which shows while no local Docker CLI is found.
     expect(title).toContainEqual({
       command: 'devEnvironments.useRemoteDockerHost',
-      when: `view == devEnvironments.repositories && !${REMOTE_DOCKER_HOST_CONTEXT_KEY}`,
+      when: `view == devEnvironments.repositories && !${REMOTE_DOCKER_HOST_CONTEXT_KEY} && !${DockerContextKeys.setupRequired}`,
       group: 'navigation@3',
     });
     expect(title).toContainEqual({
