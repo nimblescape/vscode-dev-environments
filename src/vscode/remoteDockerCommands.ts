@@ -30,7 +30,7 @@ import { errorMessage, isUserFacingError } from '../core/errors';
 import { Actions, Messages, dockerHostReason } from '../core/messages';
 import { isAbortError, type Logger, type ProcessRunner } from '../core/ports';
 import type { SshHostEntry } from '../core/sshConfig';
-import type { RemoteDockerState } from '../core/storage/remoteDockerState';
+import type { DockerHostQuestion, RemoteDockerState } from '../core/storage/remoteDockerState';
 
 /** User-visible texts of the remote Docker host (plain language). No `vscode` in them. */
 export const RemoteDockerTexts = {
@@ -84,6 +84,11 @@ export const RemoteDockerTexts = {
   alreadyHost: (host: string) => `Docker already uses ${host}.`,
   /** Review of the sidebar host (S1): the Docker CLI of this computer talks to the remote host. */
   cliMissing: 'A remote Docker host needs the Docker CLI on this computer. Install Docker first (Docker Desktop brings the CLI).',
+  /** User decision 2026-09-28: the second button of each Docker host question. */
+  dontAskAgain: (button: string) => `${button}, Don't Ask Again`,
+  dontAskSkipped: (question: string) => `Not asked (Don't Ask Again): ${question}`,
+  askAgainDone: 'Dev Environments asks again before it changes the Docker host.',
+  askAgainNothing: 'Dev Environments already asks before it changes the Docker host.',
   /** The mismatch of an environment and the current Docker host (a restored window, for example from Open Recent). */
   mismatch: (environmentHost: string, currentHost: string) =>
     `This environment is on ${describeDockerHost(environmentHost)}, but Docker is set to ${describeDockerHost(currentHost)}. Use ${describeDockerHost(environmentHost)} again?`,
@@ -190,12 +195,7 @@ export class RemoteDockerCommands {
   async offerSwitchBack(environmentHost: string, current: DockerTarget): Promise<boolean> {
     try {
       const button = RemoteDockerTexts.useHost(describeDockerHost(environmentHost));
-      const choice = await vscode.window.showWarningMessage(
-        RemoteDockerTexts.mismatch(environmentHost, current.host),
-        { modal: true },
-        button,
-      );
-      if (choice !== button) return false;
+      if (!(await this.confirm('switchBack', RemoteDockerTexts.mismatch(environmentHost, current.host), {}, button))) return false;
       if (this.refuseOverride()) return false;
       if (environmentHost === '') return await this.switchToLocal(true);
       return await this.switchToRemote(environmentHost);
@@ -242,12 +242,7 @@ export class RemoteDockerCommands {
     }
     this.deps.logger.info(`The Docker host ${host} answers: Docker engine ${check.version}${check.rootless ? ' (rootless)' : ''}.`);
     const button = RemoteDockerTexts.useHost(host);
-    const choice = await vscode.window.showWarningMessage(
-      RemoteDockerTexts.confirm(host),
-      { modal: true, detail: RemoteDockerTexts.confirmDetail },
-      button,
-    );
-    if (choice !== button) return false;
+    if (!(await this.confirm('switchToRemote', RemoteDockerTexts.confirm(host), { detail: RemoteDockerTexts.confirmDetail }, button))) return false;
     const current = await this.deps.targets.resolve();
     // The context to go back to; not one of ours (a switch from one remote host to another keeps the first one).
     if (current.context !== undefined && !isOwnRemoteContext(current.context)) {
@@ -263,10 +258,7 @@ export class RemoteDockerCommands {
 
   /** Back to the remembered context (or `default`). `confirm`: the modal first (the mismatch flow). */
   private async switchToLocal(confirm: boolean): Promise<boolean> {
-    if (confirm) {
-      const choice = await vscode.window.showWarningMessage(RemoteDockerTexts.confirmLocal, { modal: true }, RemoteDockerTexts.useLocal);
-      if (choice !== RemoteDockerTexts.useLocal) return false;
-    }
+    if (confirm && !(await this.confirm('switchToLocal', RemoteDockerTexts.confirmLocal, {}, RemoteDockerTexts.useLocal))) return false;
     // Review, C2: the remembered context only when it points to the local Docker, else `default`.
     const name = await chooseLocalContext(this.deps.docker, await this.deps.state.previousContext(), this.deps.logger);
     await useContext(this.deps.docker, name);
@@ -345,6 +337,36 @@ export class RemoteDockerCommands {
   }
 
   /** DOCKER_HOST or DOCKER_CONTEXT set for VS Code: a context switch would not reach it. True when refused. */
+  /**
+   * "Ask Again Before Changing the Docker Host" (user decision 2026-09-28): forgets every "Don't Ask Again". Never
+   * throws.
+   */
+  async askAgain(): Promise<void> {
+    try {
+      this.inform((await this.deps.state.clearDontAsk()) ? RemoteDockerTexts.askAgainDone : RemoteDockerTexts.askAgainNothing);
+    } catch (error) {
+      this.showFailure(error);
+    }
+  }
+
+  /**
+   * A Docker host question (modal): `button`, or the same with "Don't Ask Again", which is remembered (user decision
+   * 2026-09-28). A question answered so is not asked again: true at once (logged). True when the user agreed.
+   */
+  private async confirm(question: DockerHostQuestion, message: string, options: { detail?: string }, button: string): Promise<boolean> {
+    if (await this.deps.state.dontAsk(question)) {
+      this.deps.logger.info(RemoteDockerTexts.dontAskSkipped(message));
+      return true;
+    }
+    const always = RemoteDockerTexts.dontAskAgain(button);
+    const choice = await vscode.window.showWarningMessage(message, { modal: true, ...options }, button, always);
+    if (choice === always) {
+      await this.deps.state.setDontAsk(question);
+      return true;
+    }
+    return choice === button;
+  }
+
   private refuseOverride(): boolean {
     const name = dockerVariableOverride(this.deps.env, this.deps.platform);
     if (name === undefined) return false;

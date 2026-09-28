@@ -162,10 +162,12 @@ describe('Use a Remote Docker Host…', () => {
     expect(test?.args).toEqual(['-H', 'ssh://build-box', 'info', '--format', ENGINE_INFO_FORMAT]);
     expect(test?.options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
     // The modal.
+    // User decision 2026-09-28 ("don't show again" for all Docker warnings): the second button "…, Don't Ask Again".
     expect(window.showWarningMessage).toHaveBeenCalledWith(
       'All Docker tools on this computer will use build-box until you switch back.',
       expect.objectContaining({ modal: true }),
       'Use build-box',
+      "Use build-box, Don't Ask Again",
     );
     // review, C1: the context of this host (before: `devenv-remote` for every host).
     expect(cli.changes).toEqual([
@@ -383,6 +385,51 @@ describe('Remote Docker Host… (the choice of the title bar)', () => {
     expect(useRemote).not.toHaveBeenCalled();
     expect(useLocal).not.toHaveBeenCalled();
     expect(cli.changes).toEqual([]);
+  });
+});
+
+// User decision 2026-09-28: "Don't Ask Again" for every Docker host question, and a command to be asked again.
+describe("Don't Ask Again for the Docker host questions", () => {
+  it('remembers "Don\'t Ask Again" for the switch to a remote host and switches without the modal next time', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, _button: string, always: string) => always);
+    await commands.useRemoteHost();
+    expect(cli.current).toBe(BUILD_BOX);
+    expect(await state.dontAsk('switchToRemote')).toBe(true);
+    window.showWarningMessage.mockClear();
+    answer('gpu');
+    window.showWarningMessage.mockClear();
+    window.showWarningMessage.mockResolvedValue(undefined);
+    await commands.useRemoteHost();
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
+    expect(cli.current).toBe(GPU);
+  });
+
+  it('asks the questions of a restored window each on its own, and skips each one that was answered so', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    await state.setDontAsk('switchBack');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    const current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    await expect(commands.offerSwitchBack('build-box', current)).resolves.toBe(true);
+    // "Use build-box again?" was skipped; the switch itself was still asked.
+    expect(window.showWarningMessage.mock.calls.map((call) => call[0])).toEqual([RemoteDockerTexts.confirm('build-box')]);
+    await state.setDontAsk('switchToLocal');
+    window.showWarningMessage.mockClear();
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX))).resolves.toBe(true);
+    expect(window.showWarningMessage.mock.calls.map((call) => call[0])).not.toContain(RemoteDockerTexts.confirmLocal);
+  });
+
+  it('asks again after "Ask Again Before Changing the Docker Host"', async () => {
+    await commands.askAgain();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.askAgainNothing);
+    await state.setDontAsk('switchToRemote');
+    await state.setDontAsk('switchBack');
+    await commands.askAgain();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.askAgainDone);
+    expect(await state.dontAsk('switchToRemote')).toBe(false);
+    expect(await state.dontAsk('switchBack')).toBe(false);
   });
 });
 

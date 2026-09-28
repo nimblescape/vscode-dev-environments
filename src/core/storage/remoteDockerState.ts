@@ -13,10 +13,20 @@ export interface RemoteDockerHostRecord {
   rootlessSocket?: string;
 }
 
+/**
+ * User decision 2026-09-28 ("don't show again" for all Docker warnings): the questions that the user answered with
+ * "Don't Ask Again". `switchToRemote`: "All Docker tools on this computer will use <host>…"; `switchToLocal`: "… will
+ * use the local Docker again."; `switchBack`: "This environment is on <host> … Use <host> again?".
+ */
+export type DockerHostQuestion = 'switchToRemote' | 'switchToLocal' | 'switchBack';
+const DOCKER_HOST_QUESTIONS: readonly DockerHostQuestion[] = ['switchToRemote', 'switchToLocal', 'switchBack'];
+
 export interface RemoteDockerStateFile {
   /** The context that was current before the switch to a remote host. */
   previousContext?: string;
   hosts?: RemoteDockerHostRecord[];
+  /** The questions not to ask again (DockerHostQuestion). */
+  dontAsk?: DockerHostQuestion[];
 }
 
 export class RemoteDockerState {
@@ -35,6 +45,28 @@ export class RemoteDockerState {
     if (context === undefined) delete state.previousContext;
     else state.previousContext = context;
     await writeJsonAtomic(this.file, state);
+  }
+
+  /** True when the user answered `question` with "Don't Ask Again". */
+  async dontAsk(question: DockerHostQuestion): Promise<boolean> {
+    return (await this.read()).dontAsk?.includes(question) ?? false;
+  }
+
+  /** Remembers "Don't Ask Again" for `question`. */
+  async setDontAsk(question: DockerHostQuestion): Promise<void> {
+    const state = await this.read();
+    if (state.dontAsk?.includes(question)) return;
+    state.dontAsk = [...(state.dontAsk ?? []), question];
+    await writeJsonAtomic(this.file, state);
+  }
+
+  /** Asks every question again. True when there was something to forget. */
+  async clearDontAsk(): Promise<boolean> {
+    const state = await this.read();
+    if (!state.dontAsk?.length) return false;
+    delete state.dontAsk;
+    await writeJsonAtomic(this.file, state);
+    return true;
   }
 
   /** The socket of the rootless engine on `host`, or undefined for a rootful engine (the default socket). */
@@ -72,6 +104,10 @@ function normalize(value: unknown): RemoteDockerStateFile {
       if (typeof host !== 'string' || host === '') return [];
       return [typeof rootlessSocket === 'string' && rootlessSocket.startsWith('/') ? { host, rootlessSocket } : { host }];
     });
+  }
+  if (Array.isArray(record.dontAsk)) {
+    const questions = DOCKER_HOST_QUESTIONS.filter((question) => (record.dontAsk as unknown[]).includes(question));
+    if (questions.length > 0) result.dontAsk = questions;
   }
   return result;
 }
