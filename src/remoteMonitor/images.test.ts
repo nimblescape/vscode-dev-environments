@@ -269,6 +269,17 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     }
   });
 
+  // Review round 3 of PR #57 (N1): `get` throws at once for an invalid URL or header; the time limit then ended the
+  // monitor with an uncaught error.
+  it('a registry request that cannot start rejects and leaves no timer behind', async () => {
+    const throwing = (() => {
+      throw new TypeError('Invalid URL');
+    }) as unknown as Parameters<typeof httpGetWith>[0];
+    await expect(httpGetWith(throwing, 'https://[bad', {}, 50)).rejects.toThrow('Invalid URL');
+    // Past the time limit: nothing is thrown (vitest fails on an uncaught error).
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  });
+
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.
   it('leaves an older image alone that another image is built on, and removes nothing when the layers cannot be read', async () => {
     const images = [

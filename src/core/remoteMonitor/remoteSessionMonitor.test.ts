@@ -149,6 +149,13 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(docker.calls).toEqual([]);
   });
 
+  // PR #57: the whole command line counts (Windows escapes the quotes), before an old monitor is removed.
+  it('refuses a command line that is too long for Windows, also for a shorter script of quotes', async () => {
+    const docker = new FakeDocker(() => MISSING);
+    expect(await monitor(docker, new Log(), '"'.repeat(17_000)).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.calls).toEqual([]);
+  });
+
   it('fails when the script cannot be read', async () => {
     const docker = new FakeDocker(() => MISSING);
     const failing = new RemoteSessionMonitor({ docker, logger: new Log(), script: async () => Promise.reject(new Error('ENOENT')) });

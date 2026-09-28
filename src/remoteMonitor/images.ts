@@ -19,6 +19,7 @@
 //      container uses it and no other image is built on it (an environment image: its layers start with those of the
 //      older one), without force.
 // Only Node.js built-ins. Never throws; each problem is one line of the log.
+import type { IncomingMessage } from 'http';
 import * as https from 'https';
 import { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
@@ -61,15 +62,18 @@ export function httpGetWith(
 ): ReturnType<HttpGet> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    // Review round 3 of PR #57 (N1): `get` throws at once for an invalid URL (the realm of a registry's challenge) or
+    // header (its token); then there is no request, and the time limit found none to end (an uncaught error ended the
+    // monitor).
+    let request: ReturnType<typeof https.get> | undefined;
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
-      request.destroy();
+      request?.destroy();
       reject(error);
     };
-    const deadline = setTimeout(() => fail(new Error('The registry did not answer in time.')), timeoutMs);
-    const request = get(url, { headers, timeout: timeoutMs }, (response) => {
+    const onResponse = (response: IncomingMessage) => {
       let body = '';
       response.setEncoding('utf8');
       response.on('data', (chunk: string) => {
@@ -88,7 +92,14 @@ export function httpGetWith(
         for (const [key, value] of Object.entries(response.headers)) if (value !== undefined) flat[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
         resolve({ status: response.statusCode ?? 0, headers: flat, body });
       });
-    });
+    };
+    const deadline = setTimeout(() => fail(new Error('The registry did not answer in time.')), timeoutMs);
+    try {
+      request = get(url, { headers, timeout: timeoutMs }, onResponse);
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
     request.on('timeout', () => fail(new Error('The registry did not answer in time.')));
     request.on('error', (error) => fail(error));
   });

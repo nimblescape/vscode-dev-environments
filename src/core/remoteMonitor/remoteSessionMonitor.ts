@@ -12,6 +12,7 @@ import {
   IMAGE_MAINTENANCE_LABEL_PART,
   LABEL_SESSION_MONITOR,
   MAX_SCRIPT_LENGTH,
+  MAX_WINDOWS_COMMAND_LINE,
   REMOTE_MONITOR_CONTAINER,
   REMOTE_MONITOR_SCRIPT_PATH,
   REMOTE_MONITOR_STATE_DIR,
@@ -23,6 +24,7 @@ import {
   parseRecordsOutput,
   recordsCommand,
   remoteMonitorLabelValue,
+  windowsCommandLineLength,
   type HeartbeatInput,
   type ImageSettings,
   type RecordsOutput,
@@ -111,6 +113,11 @@ export class RemoteSessionMonitor {
       // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
       // time zone on the same engine do not replace it at each open.
       const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
+      // PR #57: the command line as a whole, before an old monitor is removed.
+      const runArgs = this.runArgs(helperTag, socketPath, label, script, images);
+      if (windowsCommandLineLength(['docker', ...runArgs]) > MAX_WINDOWS_COMMAND_LINE) {
+        throw new Error(`The command line of the Session Monitor is too long (${windowsCommandLineLength(['docker', ...runArgs])} characters).`);
+      }
       const current = await this.inspect(signal);
       if (current.exists && current.label === label) {
         if (current.running) return 'running';
@@ -122,7 +129,7 @@ export class RemoteSessionMonitor {
         logger.info(`The Session Monitor on the Docker host is of another version; it is replaced (${this.containerName}).`);
         await this.docker(['rm', '-f', this.containerName], signal);
       }
-      const created = await this.options.docker.run(this.runArgs(helperTag, socketPath, label, script, images), {
+      const created = await this.options.docker.run(runArgs, {
         timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS,
         signal,
       });

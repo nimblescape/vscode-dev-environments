@@ -6,8 +6,9 @@
 // to fetch in a guided cron style manner"): a cron expression of five fields, minute hour day-of-month month
 // day-of-week, in a time zone (that of the computer that created the monitor). Each field: `*`, a number, a range
 // `a-b`, a step `*/n`, `a-b/n` or `a/n`, or a list of these with commas; months and weekdays also by their English
-// three-letter names (JAN, MON); weekday 0 and 7 are Sunday. As in cron: when both the day of the month and the day of
-// the week are restricted (not `*`), a day that matches either one counts. Used by the extension (the check of the
+// three-letter names (JAN, MON); weekday 0 and 7 are Sunday. As in Vixie cron: when both the day of the month and the
+// day of the week are restricted (neither starts with `*`), a day that matches either one counts; otherwise it has to
+// match both (so `*/2` in the day of the month is every other day). Used by the extension (the check of the
 // setting) and by the monitor script (the next pass). Only Node.js built-ins; no `vscode`.
 
 /** The default schedule: every day at 06:07 (user request 2026-09-28, "at 6:07 CEST"). */
@@ -108,13 +109,14 @@ function wallClock(time: number, timeZone: string): number {
 /**
  * The moments at which the wall clock of `timeZone` shows `wall`, earliest first: one, or two in the hour that the change
  * to winter time repeats. Review round 2 of PR #57 (R1): a wall time that the change to summer time skips maps to the
- * moment one hour later on the wall clock (02:30 → 03:30), east and west of UTC alike; before, west of UTC it mapped to
- * an hour before the change.
+ * moment later by the change on the wall clock (02:30 → 03:30 for a change of one hour), east and west of UTC alike;
+ * before, west of UTC it mapped to an hour before the change.
  */
 function fromWallClock(wall: number, timeZone: string): number[] {
-  // The offsets of the zone half a day before and after (a change of the clock lies between them, if any).
+  // The offsets of the zone a day before and after (a change of the clock lies between them, if any). Review round 3 of
+  // PR #57 (N3): half a day was not enough for zones more than 12 hours ahead of UTC (Pacific/Auckland).
   const offset = (time: number) => wallClock(time, timeZone) - time;
-  const candidates = [...new Set([wall - offset(wall - DAY / 2), wall - offset(wall + DAY / 2)])].sort((a, b) => a - b);
+  const candidates = [...new Set([wall - offset(wall - DAY), wall - offset(wall + DAY)])].sort((a, b) => a - b);
   const valid = candidates.filter((time) => wallClock(time, timeZone) === wall);
   return valid.length > 0 ? valid : [Math.max(...candidates)];
 }
@@ -122,6 +124,8 @@ function fromWallClock(wall: number, timeZone: string): number[] {
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
+/** The largest change of a clock for daylight saving time, with a margin (Antarctica/Troll changes by two hours). */
+const MAX_CLOCK_CHANGE = 3 * HOUR;
 /** A schedule without a match within this many days (for example 30 2 31 2 *) has no next pass. */
 const SEARCH_DAYS = 5 * 366;
 
@@ -130,20 +134,20 @@ const SEARCH_DAYS = 5 * 366;
  * `7 6 * * *` in Europe/Vienna is 04:07 UTC in summer and 05:07 UTC in winter). Undefined when no day within five
  * years matches. Review round 2 of PR #57 (R2), as cron: in the hour that the change to winter time repeats, a schedule
  * with every hour (`*` in the hour field) matches both times, one with fixed hours only the first; a time that the change
- * to summer time skips runs one hour later on the wall clock.
+ * to summer time skips runs later by the change on the wall clock.
  */
 export function nextCronTime(now: number, schedule: CronSchedule, timeZone: string): number | undefined {
   const dayMatches = (wall: Date) => {
     const byDay = schedule.days.has(wall.getUTCDate());
     const byWeekday = schedule.weekdays.has(wall.getUTCDay());
-    if (schedule.anyDay && schedule.anyWeekday) return true;
-    if (schedule.anyDay) return byWeekday;
-    if (schedule.anyWeekday) return byDay;
-    return byDay || byWeekday;
+    // Review round 3 of PR #57 (N2), as Vixie cron: a day field that starts with `*` (also `*/2`) makes both fields count
+    // (a plain `*` is every day); only two restricted fields count either one. Before, a step there was ignored.
+    return schedule.anyDay || schedule.anyWeekday ? byDay && byWeekday : byDay || byWeekday;
   };
   const everyHour = schedule.hours.size === 24;
-  // An hour earlier on the wall clock: the second time of a repeated hour lies after `now` although its wall time does not.
-  let wall = Math.floor(wallClock(now, timeZone) / MINUTE) * MINUTE + MINUTE - HOUR;
+  // Earlier on the wall clock by the largest change of a clock (Antarctica/Troll: two hours; review round 3 of PR #57,
+  // N4): the second time of a repeated hour lies after `now` although its wall time does not.
+  let wall = Math.floor(wallClock(now, timeZone) / MINUTE) * MINUTE + MINUTE - MAX_CLOCK_CHANGE;
   const end = wall + SEARCH_DAYS * DAY;
   // The earliest match; the walk goes on for two hours of wall time after the first, as a later wall time can be an
   // earlier moment around a change of the clock.
@@ -163,7 +167,7 @@ export function nextCronTime(now: number, schedule: CronSchedule, timeZone: stri
       const times = fromWallClock(wall, timeZone);
       for (const time of everyHour ? times : times.slice(0, 1)) {
         if (time <= now || (best !== undefined && time >= best)) continue;
-        if (best === undefined) bestUntil = wall + 2 * HOUR;
+        if (best === undefined) bestUntil = wall + MAX_CLOCK_CHANGE + HOUR;
         best = time;
       }
       wall += MINUTE;

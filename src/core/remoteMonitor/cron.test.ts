@@ -131,6 +131,51 @@ describe('the cron schedule of the image updates', () => {
     expect(walk('2026-10-31T12:00:00Z', '30 1 * * *', 'America/New_York', 2)).toEqual(['2026-11-01T05:30:00.000Z', '2026-11-02T06:30:00.000Z']);
   });
 
+  // Review round 3 of PR #57 (N2), as Vixie cron: a step in a day field that starts with `*` counts.
+  it('honours a step in the day of the month or the day of the week', () => {
+    const days = (text: string, count: number) => {
+      const times: string[] = [];
+      let at = '2026-09-01T07:00:00Z';
+      for (let index = 0; index < count; index++) times.push((at = next(at, text, 'UTC')!).slice(0, 10));
+      return times;
+    };
+    expect(days('0 6 */2 * *', 3)).toEqual(['2026-09-03', '2026-09-05', '2026-09-07']);
+    // 2026-09-02 is a Wednesday: Sunday, Wednesday and Saturday.
+    expect(days('0 6 * * */3', 4)).toEqual(['2026-09-02', '2026-09-05', '2026-09-06', '2026-09-09']);
+    // Both: Mondays on odd days (2026-09-07 and 2026-09-21).
+    expect(days('0 6 */2 * 1', 2)).toEqual(['2026-09-07', '2026-09-21']);
+    // Two restricted fields: either one.
+    expect(days('0 6 15 * 1', 3)).toEqual(['2026-09-07', '2026-09-14', '2026-09-15']);
+  });
+
+  // Review round 3 of PR #57 (N3, N4): zones more than 12 hours ahead of UTC, and a change of two hours.
+  it('handles the changes of the clock of Pacific/Auckland and Antarctica/Troll', () => {
+    // 27 September 2026 in Auckland: 02:00 NZST becomes 03:00 NZDT (14:00 UTC the day before); 02:30 → 03:30 NZDT.
+    expect(next('2026-09-26T00:00:00Z', '30 2 * * *', 'Pacific/Auckland')).toBe('2026-09-26T14:30:00.000Z');
+    // 5 April 2026: 03:00 NZDT becomes 02:00 NZST (14:00 UTC the day before); a fixed hour runs at the first 02:30.
+    expect(next('2026-04-04T00:00:00Z', '30 2 * * *', 'Pacific/Auckland')).toBe('2026-04-04T13:30:00.000Z');
+    const walk = (from: string, text: string, timeZone: string, count: number) => {
+      const times: string[] = [];
+      let at = from;
+      for (let index = 0; index < count; index++) times.push((at = next(at, text, timeZone)!));
+      return times;
+    };
+    expect(walk('2026-04-04T12:00:00Z', '30 * * * *', 'Pacific/Auckland', 3)).toEqual([
+      '2026-04-04T12:30:00.000Z',
+      '2026-04-04T13:30:00.000Z',
+      '2026-04-04T14:30:00.000Z',
+    ]);
+    // 25 October 2026 in Troll: +02 becomes +00 at 01:00 UTC; wall 01:00-03:00 comes twice.
+    expect(walk('2026-10-24T23:10:00Z', '30 * * * *', 'Antarctica/Troll', 5)).toEqual([
+      '2026-10-24T23:30:00.000Z',
+      '2026-10-25T00:30:00.000Z',
+      '2026-10-25T01:30:00.000Z',
+      '2026-10-25T02:30:00.000Z',
+      '2026-10-25T03:30:00.000Z',
+    ]);
+    expect(next('2026-10-25T00:40:00Z', '30 * * * *', 'Antarctica/Troll')).toBe('2026-10-25T01:30:00.000Z');
+  });
+
   // Moved from src/remoteMonitor/images.test.ts with the same expectations.
   it('reads a time zone strictly', () => {
     expect(isTimeZone('Europe/Vienna')).toBe(true);

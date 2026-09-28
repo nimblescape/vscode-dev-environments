@@ -4,8 +4,17 @@
 
 // Names and labels (implementation notes 5).
 import * as crypto from 'crypto';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from './helperChannel/protocol';
 import { LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
+
+/**
+ * Labels of the helper channel (src/core/helperChannel/protocol.ts re-exports them). Here, not there, so that the script
+ * of the remote Session Monitor, which imports names.ts, does not bundle the protocol of the channel (PR #57: its script
+ * has to fit on the command line of `docker run`).
+ */
+/** Label of the container of a channel (its value: channelLabelValue). */
+export const LABEL_HELPER_CHANNEL = 'nimblescape.devenv.helper-channel';
+/** Label of a container that a `docker` operation of a channel starts (its value: the cleanup label). */
+export const LABEL_CHANNEL_STEP = 'nimblescape.devenv.channel-step';
 
 /**
  * The prefix of every label key of the extension (EXTENSION_LABEL_KEYS), with the name of its publisher: other tools

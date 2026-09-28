@@ -24,11 +24,12 @@
 // containers that they started with their cleanup label are removed (`docker rm -f`, review round 1, S1: by the label
 // of the operation, never by a name, so no container that the operation did not start can be removed).
 import { createHash, randomBytes } from 'crypto';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../names';
+
+export { LABEL_HELPER_CHANNEL };
 
 /** The version of the messages. The extension closes a channel whose script answers with another one. */
 export const CHANNEL_PROTOCOL_VERSION = 1;
-/** Label of the container of a channel (its value: channelLabelValue). */
-export const LABEL_HELPER_CHANNEL = 'nimblescape.devenv.helper-channel';
 /** Where the loader writes the script (the file system of the container). */
 export const CHANNEL_SCRIPT_PATH = '/opt/devenv/channel.js';
 /** The longest script, as its JSON line (review round 1, P6: the loader limits the escaped line, so the extension does too). */
@@ -232,7 +233,7 @@ export function isSecret(value: unknown): value is string {
  * puts `--label nimblescape.devenv.channel-step=<value>` (channelStepLabel) on each container that it starts and names
  * the value as the cleanup of the operation; the cleanup removes exactly the containers with that label.
  */
-export const LABEL_CHANNEL_STEP = 'nimblescape.devenv.channel-step';
+export { LABEL_CHANNEL_STEP };
 
 /**
  * A cleanup label value: 24 hex digits, as newCleanupLabel makes them (review round 2, B4: a value of its own per call,

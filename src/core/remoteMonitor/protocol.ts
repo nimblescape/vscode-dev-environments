@@ -38,10 +38,23 @@ export const MAX_HEARTBEAT_LENGTH = 32_000;
 /** A record of another computer younger than this makes an environment "in use from another computer" (shared engine). */
 export const OTHER_COMPUTER_FRESH_MS = 90_000;
 /**
- * The longest script that the container takes as an argument of `docker run` (the command line of Windows is limited to
- * 32767 characters, and the quotes of a script are escaped there).
+ * The longest script that the container takes as an argument of `docker run`. PR #57: the whole command line is checked
+ * too (windowsCommandLineLength), as the command line of Windows is limited to 32767 characters and escapes the quotes;
+ * before, 24000 characters for the script alone left room for a script of quotes only.
  */
-export const MAX_SCRIPT_LENGTH = 24_000;
+export const MAX_SCRIPT_LENGTH = 30_000;
+/** The longest command line of `docker run` of the monitor, as Windows writes it (below 32767 for the path of docker). */
+export const MAX_WINDOWS_COMMAND_LINE = 32_000;
+
+/**
+ * The length of `args` as one command line of Windows, at most (libuv quotes each argument: a quote or backslash can
+ * become two characters, plus the enclosing quotes and a space).
+ */
+export function windowsCommandLineLength(args: readonly string[]): number {
+  let length = 0;
+  for (const arg of args) length += arg.length + (arg.match(/["\\]/g)?.length ?? 0) + 3;
+  return length;
+}
 
 const SOURCE_PATTERN = /^[0-9a-f]{32}$/;
 /** The form of `newEnvironmentId` (crypto.randomUUID, lower case). */
