@@ -11,6 +11,8 @@ import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
   CHANNEL_PROTOCOL_VERSION,
+  CHANNEL_SLOT_WAIT_MS,
+  MAX_CHANNEL_REQUEST_BYTES,
   MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
@@ -266,6 +268,32 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     await Promise.allSettled(results);
   });
 
+  // Review round 5 (F2): the wait for a place was unbounded, also for a call with a short time limit.
+  it(`waits at most CHANNEL_SLOT_WAIT_MS (or its time limit) for a place; then it is not sent (unsendable)`, async () => {
+    const { channel, fake } = await openChannel();
+    const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
+    const short = channel.operation('step', { index: 'short' }, { timeoutMs: 1_000 });
+    const plain = channel.operation('step', { index: 'plain' });
+    const shortResult = expect(short).rejects.toMatchObject({ code: 'unsendable' });
+    const plainResult = expect(plain).rejects.toMatchObject({ code: 'unsendable' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await shortResult;
+    await vi.advanceTimersByTimeAsync(CHANNEL_SLOT_WAIT_MS - 1_000);
+    await plainResult;
+    expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS);
+    // A place that frees later goes to no one who left.
+    const sent = fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+    fake.answer({ t: 'result', id: sent[0].id, ok: true, value: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS - 1);
+    const next = channel.operation('step', { index: 'next' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(MAX_CONCURRENT_OPERATIONS + 1);
+    channel.close();
+    await Promise.allSettled([...held, next]);
+  });
+
   it('closeNow (the window closes) stops docker run and what it started at once, and rejects what runs as lost (review round 4, M3)', async () => {
     const { channel, fake } = await openChannel();
     let killedNow = 0;
@@ -342,6 +370,9 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const { channel, fake } = await openChannel();
       await expect(channel.operation('step', { data: 'x'.repeat(MAX_CLIENT_LINE) })).rejects.toMatchObject({ code: 'unsendable' });
       await expect(channel.docker(['exec', '-i', 'c', 'cat'], { input: 'x'.repeat(MAX_DOCKER_INPUT_LENGTH + 1) })).rejects.toMatchObject({ code: 'unsendable' });
+      // Review round 5 (F3): beyond what reaches the script in time on a slow link (bytes of UTF-8, not characters).
+      await expect(channel.docker(['exec', '-i', 'c', 'cat'], { input: 'x'.repeat(MAX_CHANNEL_REQUEST_BYTES) })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.docker(['exec', '-i', 'c', 'cat'], { input: 'ä'.repeat(MAX_CHANNEL_REQUEST_BYTES / 2) })).rejects.toMatchObject({ code: 'unsendable' });
       await expect(channel.docker(Array.from({ length: MAX_DOCKER_ARGS + 1 }, () => 'a'))).rejects.toMatchObject({ code: 'unsendable' });
       await expect(channel.docker(['run', 'img'], { cleanup: 'Not A Label' })).rejects.toMatchObject({ code: 'unsendable' });
       expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);

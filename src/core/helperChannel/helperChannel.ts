@@ -17,7 +17,9 @@ import {
   CHANNEL_PING_INTERVAL_MS,
   CHANNEL_PONG_TIMEOUT_MS,
   CHANNEL_PROTOCOL_VERSION,
+  CHANNEL_SLOT_WAIT_MS,
   LineSplitter,
+  MAX_CHANNEL_REQUEST_BYTES,
   MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
@@ -109,6 +111,7 @@ export interface HelperChannelOptions {
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   closeKillMs?: number;
+  slotWaitMs?: number;
 }
 
 interface Pending {
@@ -360,18 +363,30 @@ export class HelperChannel {
     else this.slots--;
   }
 
-  /** Waits for the place of an operation that ends (MAX_CONCURRENT_OPERATIONS are held). */
-  private waitForSlot(signal: AbortSignal | undefined): Promise<void> {
+  /**
+   * Waits for the place of an operation that ends (MAX_CONCURRENT_OPERATIONS are held). Review round 5 (F2): at most
+   * `waitMs`; then `unsendable` (not sent), so the caller takes the way without the channel.
+   */
+  private waitForSlot(signal: AbortSignal | undefined, waitMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const go = () => {
+      const leave = () => {
+        const index = this.waiting.indexOf(go);
+        if (index >= 0) this.waiting.splice(index, 1);
         signal?.removeEventListener('abort', onAbort);
+        clearTimeout(timer);
+      };
+      const go = () => {
+        leave();
         resolve();
       };
       const onAbort = () => {
-        const index = this.waiting.indexOf(go);
-        if (index >= 0) this.waiting.splice(index, 1);
+        leave();
         reject(abortError());
       };
+      const timer = setTimeout(() => {
+        leave();
+        reject(new HelperChannelError('unsendable', `The helper channel to ${this.options.name} has no free place in time.`));
+      }, waitMs);
       signal?.addEventListener('abort', onAbort, { once: true });
       this.waiting.push(go);
     });
@@ -398,13 +413,15 @@ export class HelperChannel {
     }
     if (options.timeoutMs !== undefined) message.timeoutMs = options.timeoutMs;
     const line = encodeMessage(message);
-    // Review round 1 (P2): a longer line would end the whole channel in the script (and every operation on it).
-    if (line.length - 1 > MAX_CLIENT_LINE) {
+    // Review round 1 (P2): a longer line would end the whole channel in the script (and every operation on it). Review
+    // round 5 (F3): the limit of what the channel carries is lower (MAX_CHANNEL_REQUEST_BYTES), so the pings behind a
+    // request are not late on a slow link.
+    if (line.length - 1 > MAX_CLIENT_LINE || Buffer.byteLength(line, 'utf8') - 1 > MAX_CHANNEL_REQUEST_BYTES) {
       throw new HelperChannelError('unsendable', `The request ${op} is too long for the helper channel (${line.length} characters).`);
     }
     // A free place is taken at once, so the operation is written in the same turn as the call.
     if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
-    else await this.waitForSlot(options.signal);
+    else await this.waitForSlot(options.signal, Math.min(this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY));
     // Review round 1 (L1): the signal or the channel may have ended while it waited for its place.
     if (options.signal?.aborted || this.state !== 'open') {
       this.releaseSlot();

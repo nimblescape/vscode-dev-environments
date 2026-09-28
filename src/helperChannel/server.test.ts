@@ -557,6 +557,24 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       expect(exits).toEqual([0]);
     });
 
+    // Review round 5 (F3): a long request on a slow link: its pieces arrive, the pings wait behind it.
+    it('not while the pieces of a long request arrive; after CHANNEL_SILENCE_EXIT_MS without any', async () => {
+      const { server, send, exits, resultOf } = setup();
+      const line = encodeMessage({ t: 'op', id: 1, op: 'probe', params: { pad: 'x'.repeat(4_000) } });
+      for (let start = 0; start < line.length - 1; start += 100) {
+        server.input(line.slice(start, Math.min(start + 100, line.length - 1)));
+        await vi.advanceTimersByTimeAsync(5_000);
+      }
+      expect(exits).toEqual([]);
+      server.input('\n');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(resultOf(1)).toBeDefined();
+      send({ t: 'ping', n: 1 });
+      server.input('{"t":"pi');
+      await vi.advanceTimersByTimeAsync(CHANNEL_SILENCE_EXIT_MS);
+      expect(exits).toEqual([0]);
+    });
+
     it('after CHANNEL_SERVER_IDLE_EXIT_MS without an operation, even while pings come; not while one runs', async () => {
       const { send, docker, exits } = setup();
       send({ t: 'op', id: 1, op: 'docker', params: { args: ['build', '.'] } });

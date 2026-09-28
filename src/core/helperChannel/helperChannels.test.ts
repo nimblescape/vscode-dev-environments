@@ -84,6 +84,22 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     channels.dispose();
   });
 
+  // Review round 5 (F1): a context of the user pointed to another host under the same name.
+  it('opens a channel of its own for the same context with another endpoint; the old one gets no new call', async () => {
+    const first = fakeChannel();
+    const second = fakeChannel();
+    const open = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    const before = dockerTargetOf('ssh://host-a', 'prod');
+    const after = dockerTargetOf('ssh://host-b', 'prod');
+    expect(await channels.get(before)).toBe(first);
+    expect(await channels.get(after)).toBe(second);
+    expect(open).toHaveBeenLastCalledWith(after);
+    expect(await channels.get(after)).toBe(second);
+    expect(open).toHaveBeenCalledTimes(2);
+    channels.dispose();
+  });
+
   it('opens it again after it was lost', async () => {
     const first = fakeChannel();
     const second = fakeChannel();

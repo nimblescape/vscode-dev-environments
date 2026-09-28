@@ -127,9 +127,15 @@ export interface HelperChannelsOptions {
   sweepIntervalMs?: number;
 }
 
-/** The key of the engine of a target: its Docker context, else its endpoint. */
+/**
+ * The key of the engine of a target: its Docker context and its endpoint. Review round 5 (F1): by the context alone, a
+ * context of the user that was pointed to another host under the same name (`docker context update`) kept the channel
+ * to the old engine, and the calls through it went there. The channel of the old endpoint gets no new operation and is
+ * closed by the sweep after CHANNEL_IDLE_CLOSE_MS. Not seen: an SSH alias of `~/.ssh/config` pointed to another machine
+ * (the same endpoint).
+ */
 function keyOf(target: DockerTarget): string {
-  return target.context ?? target.endpoint;
+  return JSON.stringify([target.context ?? null, target.endpoint]);
 }
 
 /** The channels of this window, one per remote host. */

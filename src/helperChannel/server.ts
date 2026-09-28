@@ -174,9 +174,14 @@ export class ChannelServer {
     this.touchIdle();
   }
 
-  /** Text of the standard input. */
+  /**
+   * Text of the standard input. Review round 5 (F3): any text that arrives shows that the connection lives, also in the
+   * middle of a long request (the pings wait behind it), so the silence counts from it; a hung connection sends none.
+   */
   input(text: string): void {
-    if (!this.stopping) this.splitter.push(text);
+    if (this.stopping) return;
+    if (text !== '') this.touchSilence();
+    this.splitter.push(text);
   }
 
   /** The standard input ended or failed: the connection is gone. */
