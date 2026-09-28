@@ -53,6 +53,7 @@ const outfiles = [
   'dist/groupsPreviewWorker.js',
   'dist/configurationAnalysisWorker.js',
   'dist/remoteMonitor.js',
+  'dist/helperChannel.js',
 ];
 
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
@@ -92,6 +93,15 @@ const contexts = await Promise.all([
     ...shared,
     entryPoints: ['src/remoteMonitor/main.ts'],
     outfile: outfiles[4],
+    minify: true,
+    sourcemap: false,
+  }),
+  // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it as the
+  // first line of the channel (src/core/helperChannel/protocol.ts), so it is always minified and has no source map.
+  esbuild.context({
+    ...shared,
+    entryPoints: ['src/helperChannel/main.ts'],
+    outfile: outfiles[5],
     minify: true,
     sourcemap: false,
   }),

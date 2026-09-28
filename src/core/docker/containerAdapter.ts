@@ -24,6 +24,7 @@ import {
   type ProcessRunner,
   type RunOptions,
   type RunResult,
+  type StartedProcess,
 } from '../ports';
 import type { ContainerState } from '../types';
 import { dockerProcessEnv, envValue } from './dockerCli';
@@ -598,6 +599,18 @@ export class ContainerAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * The helper channel (user request 2026-09-28): starts `docker <args>` with standard input open, with the environment
+   * of `run` (within an operation: its Docker context). Undefined without a Docker CLI or when the runner cannot start
+   * such a program.
+   */
+  start(args: readonly string[]): StartedProcess | undefined {
+    this.lookUpCliIfMissing();
+    const dockerPath = this.path;
+    if (dockerPath === undefined || this.runner.start === undefined) return undefined;
+    return this.runner.start(dockerPath, args, { env: this.operationEnv() });
   }
 
   /**
