@@ -10,6 +10,7 @@ import {
   MAX_SCRIPT_LENGTH,
   MAX_WINDOWS_COMMAND_LINE,
   REMOTE_MONITOR_SCRIPT_PATH,
+  heartbeatCommand,
   remoteMonitorLabelValue,
   windowsCommandLineLength,
 } from './protocol';
@@ -198,7 +199,9 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     const docker = new FakeDocker(() => result(0));
     const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 1 }] };
     expect(await monitor(docker).heartbeat(heartbeat)).toEqual({ ok: true, stdout: '' });
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
+    // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records (heartbeatCommand).
+    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...heartbeatCommand(heartbeat)]);
+    expect(heartbeatCommand(heartbeat).slice(-4)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
   });
 

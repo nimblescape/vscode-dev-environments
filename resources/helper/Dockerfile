@@ -13,11 +13,13 @@ ARG DEVCONTAINER_CLI_VERSION
 
 # Git, the Docker CLI with the buildx and the Compose plugins (from download.docker.com), and tini as init process,
 # so that a stop signal reaches the Dev Container CLI and Git. The Compose plugin runs Docker Compose configurations
-# (implementation notes, section "Docker Compose").
+# (implementation notes, section "Docker Compose"). `flock` (util-linux) and `timeout` (coreutils) guard the heartbeats
+# of the remote Session Monitor (heartbeatCommand, review round 2 of PR #58).
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl git openssh-client tini; \
+    apt-get install -y --no-install-recommends ca-certificates coreutils curl git openssh-client tini util-linux; \
+    flock --version; timeout --version; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
     chmod a+r /etc/apt/keyrings/docker.asc; \

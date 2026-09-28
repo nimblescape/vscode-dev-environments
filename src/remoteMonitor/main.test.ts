@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
@@ -21,8 +21,6 @@ import {
   parseContainerLines,
   readRecords,
   timingFromEnv,
-  withRecordLock,
-  breakStaleLock,
   type DockerResult,
 } from './main';
 import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide } from './rules';
@@ -168,118 +166,12 @@ describe('monitor.js heartbeat', () => {
     expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 600, seq: 1 });
   });
 
-  it('two heartbeats at the same time: the higher seq stays, whatever the order of the writes', async () => {
-    const entry = (seq: number, keepRunning: boolean) => JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning, seq }] });
-    await Promise.all([run(['heartbeat', entry(2, true)]), run(['heartbeat', entry(1, false)]), run(['heartbeat', entry(2, true)])]);
-    expect(readRecord(SOURCE, A)).toMatchObject({ keepRunning: true, seq: 2 });
-  });
-
-  it('a left-over lock of a killed heartbeat is taken over after 10 seconds', async () => {
-    const dir = heartbeatDir(stateDir);
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, `.${heartbeatFileName(SOURCE, A)}.lock`);
-    fs.writeFileSync(lock, '1');
-    const old = new Date(Date.now() - 20_000);
-    fs.utimesSync(lock, old, old);
+  // Review round 2 of PR #58: the lock of the records moved from files in this folder to the kernel lock `flock` around
+  // the `docker exec` (heartbeatCommand); the tests of two heartbeats at the same time, of a killed holder, and of the
+  // wait run real processes in heartbeatLock.test.ts. No lock file is written here anymore.
+  it('writes no lock file next to the records', async () => {
     await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
-    expect(readRecord(SOURCE, A)).toMatchObject({ seq: 1 });
-    expect(fs.existsSync(lock)).toBe(false);
-  });
-
-  // Review of the remote monitor after PR #57: two heartbeats that both found a lock stale could both get in, and a
-  // holder removed another holder's lock in its `finally`.
-  it('lets one holder at a time take over a left-over lock, and removes only its own lock', async () => {
-    const dir = heartbeatDir(stateDir);
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, '.record.lock');
-    fs.writeFileSync(lock, 'dead');
-    const old = new Date(Date.now() - 20_000);
-    fs.utimesSync(lock, old, old);
-    let inside = 0;
-    let most = 0;
-    await Promise.all(
-      Array.from({ length: 20 }, () =>
-        withRecordLock(dir, 'record', async () => {
-          inside++;
-          most = Math.max(most, inside);
-          await new Promise((resolve) => setTimeout(resolve, 5));
-          inside--;
-        }),
-      ),
-    );
-    expect(most).toBe(1);
-    expect(fs.readdirSync(dir)).toEqual([]);
-    // A lock that another process holds now stays when a holder ends.
-    await withRecordLock(dir, 'record', async () => {
-      fs.rmSync(lock);
-      fs.writeFileSync(lock, 'other');
-    });
-    expect(fs.readFileSync(lock, 'utf8')).toBe('other');
-  });
-
-  // Review of PR #58 (F1, F2): a breaker removes only the stale lock that it saw (token and time), never a fresh one
-  // (inode numbers are reused at once on ext4), and never moves a lock aside; one breaker at a time (the guard).
-  it('a breaker removes only the stale lock that it saw, one breaker at a time', async () => {
-    const dir = heartbeatDir(stateDir);
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, '.record.lock');
-    const old = new Date(Date.now() - 20_000);
-    fs.writeFileSync(lock, 'dead');
-    fs.utimesSync(lock, old, old);
-    const seen = { token: 'dead', mtimeMs: fs.statSync(lock).mtimeMs };
-    // Meanwhile another process took it over and holds a fresh lock.
-    fs.rmSync(lock);
-    fs.writeFileSync(lock, 'fresh');
-    await breakStaleLock(lock, seen);
-    expect(fs.readFileSync(lock, 'utf8')).toBe('fresh');
-    // Another breaker at work (a fresh guard): nothing is removed; a guard of a killed breaker is removed.
-    fs.writeFileSync(lock, 'dead');
-    fs.utimesSync(lock, old, old);
-    fs.writeFileSync(`${lock}.break`, '');
-    await breakStaleLock(lock, { token: 'dead', mtimeMs: fs.statSync(lock).mtimeMs });
-    expect(fs.existsSync(lock)).toBe(true);
-    fs.utimesSync(`${lock}.break`, old, old);
-    await breakStaleLock(lock, { token: 'dead', mtimeMs: fs.statSync(lock).mtimeMs });
-    expect(fs.existsSync(`${lock}.break`)).toBe(false);
-    await breakStaleLock(lock, { token: 'dead', mtimeMs: fs.statSync(lock).mtimeMs });
-    expect(fs.readdirSync(dir)).toEqual([]);
-  });
-
-  // Review of PR #58 (F3): a holder refreshes the time of its lock, so a long hold never looks left over.
-  it('keeps the lock fresh while its holder is inside', async () => {
-    const dir = heartbeatDir(stateDir);
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, '.record.lock');
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
-    try {
-      await withRecordLock(dir, 'record', async () => {
-        const old = new Date(Date.now() - 20_000);
-        fs.utimesSync(lock, old, old);
-        vi.advanceTimersByTime(3_000);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        expect(Date.now() - fs.statSync(lock).mtimeMs).toBeLessThan(10_000);
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  // Review of PR #58 (F4): a lock that cannot be taken over ends the wait at its limit instead of a busy loop.
-  it('gives up after the wait when a stale lock cannot be taken over', { timeout: 10_000 }, async () => {
-    const dir = heartbeatDir(stateDir);
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, '.record.lock');
-    fs.writeFileSync(lock, 'dead');
-    const old = new Date(Date.now() - 20_000);
-    fs.utimesSync(lock, old, old);
-    // A guard that stays fresh: another breaker that never ends.
-    fs.writeFileSync(`${lock}.break`, '');
-    const keepFresh = setInterval(() => fs.utimesSync(`${lock}.break`, new Date(), new Date()), 1_000);
-    try {
-      await expect(withRecordLock(dir, 'record', async () => {})).rejects.toThrow('The record record is locked.');
-    } finally {
-      clearInterval(keepFresh);
-    }
+    expect(fs.readdirSync(heartbeatDir(stateDir))).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
   it.each<[string, string[]]>([

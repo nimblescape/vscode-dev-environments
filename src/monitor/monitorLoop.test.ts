@@ -1022,13 +1022,18 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
   let heartbeatResult: () => RunResult;
   let recordsResult: () => RunResult;
 
+  /**
+   * The arguments of `monitor.js` in an exec command. Review round 2 of PR #58: a heartbeat runs under `flock` and
+   * `timeout` (heartbeatCommand), so the subcommand is no longer at a fixed place.
+   */
+  const argsOf = (command: readonly string[]): readonly string[] => command.slice(command.indexOf('/opt/devenv/monitor.js') + 1);
   type SentHeartbeat = { source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean; seq: number }> };
   const sentHeartbeats = (): SentHeartbeat[] =>
-    h.docker.execCalls.filter((call) => call.command[2] === 'heartbeat').map((call) => JSON.parse(call.command[3]) as SentHeartbeat);
+    h.docker.execCalls.filter((call) => argsOf(call.command)[0] === 'heartbeat').map((call) => JSON.parse(argsOf(call.command)[1]) as SentHeartbeat);
   /** The heartbeats without the seq of their entries (checked on its own). */
   const heartbeats = (): Array<{ source: string; limitSeconds: number; environments: Array<{ id: string; keepRunning: boolean }> }> =>
     sentHeartbeats().map((item) => ({ ...item, environments: item.environments.map(({ id, keepRunning }) => ({ id, keepRunning })) }));
-  const recordsCalls = (): ExecCall[] => h.docker.execCalls.filter((call) => call.command[2] === 'records');
+  const recordsCalls = (): ExecCall[] => h.docker.execCalls.filter((call) => argsOf(call.command)[0] === 'records');
 
   beforeEach(() => {
     h = createHarness();
@@ -1037,8 +1042,8 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     recordsResult = () => ok(JSON.stringify({ now: h.clock.time, records: [] }));
     h.docker.execResult = () => {
       const command = h.docker.execCalls[h.docker.execCalls.length - 1].command;
-      if (command[2] === 'heartbeat') return heartbeatResult();
-      if (command[2] === 'records') return recordsResult();
+      if (argsOf(command)[0] === 'heartbeat') return heartbeatResult();
+      if (argsOf(command)[0] === 'records') return recordsResult();
       return ok(GIT_OUTPUT);
     };
     (h.docker as FakeDocker & MonitorDocker).withCurrentTarget = async (fn) => {
@@ -1065,9 +1070,10 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     expect(sent[0]).toEqual({ source: SOURCE, limitSeconds: 900, environments: [{ id: ID_A, keepRunning: false }] });
     // Review round 2 of PR #39 (L1): seq is the time of the tick (the registry was read after it).
     expect(sentHeartbeats().map((item) => item.environments[0].seq)).toEqual([T0, T0 + 30_000]);
-    const call = h.docker.execCalls.find((item) => item.command[2] === 'heartbeat')!;
+    const call = h.docker.execCalls.find((item) => argsOf(item.command)[0] === 'heartbeat')!;
     expect(call.container).toBe('devenv-session-monitor');
-    expect(call.command.slice(0, 2)).toEqual(['node', '/opt/devenv/monitor.js']);
+    // Review round 2 of PR #58: under the kernel lock of the records and a time limit.
+    expect(call.command.slice(0, 10)).toEqual(['flock', '-w', '5', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10', 'node', '/opt/devenv/monitor.js']);
     expect(call.options.timeoutMs).toBe(20_000);
     expect(call.options.user).toBeUndefined();
   });

@@ -151,7 +151,21 @@ describe('records and their file names', () => {
 describe('the subcommands of the remote monitor', () => {
   it('passes the heartbeat as one JSON argument, and the ids as arguments', () => {
     const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 5 }] };
-    expect(heartbeatCommand(heartbeat)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
+    // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records and a time limit.
+    expect(heartbeatCommand(heartbeat)).toEqual([
+      'flock',
+      '-w',
+      '5',
+      '/state/.heartbeats.lock',
+      'timeout',
+      '-s',
+      'KILL',
+      '10',
+      'node',
+      REMOTE_MONITOR_SCRIPT_PATH,
+      'heartbeat',
+      JSON.stringify(heartbeat),
+    ]);
     expect(recordsCommand(ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', ID]);
     expect(forgetCommand(SOURCE, ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
   });

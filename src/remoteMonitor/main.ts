@@ -15,7 +15,6 @@
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
-import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
@@ -116,87 +115,6 @@ export async function readRecords(dir: string): Promise<RemoteRecord[]> {
   return records;
 }
 
-/** A lock of a record older than this is left over (a `docker exec` that was killed) and is removed. */
-const RECORD_LOCK_STALE_MS = 10_000;
-/** How long a heartbeat waits for the lock of a record. */
-const RECORD_LOCK_WAIT_MS = 5_000;
-
-/** A lock holder refreshes the time of its lock this often, so a long hold never looks left over. */
-const RECORD_LOCK_REFRESH_MS = 3_000;
-
-/**
- * Runs `fn` while holding the lock of one record (`.<name>.lock`, created with `wx`), so that two heartbeats of the same
- * source (two `docker exec` at the same time) read and replace the record one after the other.
- *
- * Review of PR #58 (after review round 10 of PR #57): a lock holds a token of its holder, and the holder refreshes its
- * time every RECORD_LOCK_REFRESH_MS, so only the lock of a holder that is gone (a killed `docker exec`) gets older than
- * RECORD_LOCK_STALE_MS. Such a lock is taken over under a second lock (`.<name>.lock.break`, `wx`), so one process at a
- * time: it reads the lock again and removes it only when it is still the same stale lock (its token and its time); a
- * holder removes its lock only while it still holds its token. Not atomic on plain files: a holder that stops for more
- * than 10 s (a paused container) can still lose its lock while inside.
- */
-export async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
-  const lock = path.join(dir, `.${name}.lock`);
-  const token = `${process.pid}.${randomBytes(8).toString('hex')}`;
-  const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      await fs.promises.writeFile(lock, token, { flag: 'wx', mode: 0o600 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-    const seen = await readLock(lock);
-    if (seen && Date.now() - seen.mtimeMs > RECORD_LOCK_STALE_MS) await breakStaleLock(lock, seen);
-    if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  const refresh = setInterval(() => {
-    const now = new Date();
-    void fs.promises.utimes(lock, now, now).catch(() => undefined);
-  }, RECORD_LOCK_REFRESH_MS);
-  try {
-    return await fn();
-  } finally {
-    clearInterval(refresh);
-    const current = await readLock(lock);
-    if (current?.token === token) await fs.promises.rm(lock, { force: true }).catch(() => undefined);
-  }
-}
-
-/** The token and the time of a lock, or undefined when there is none. */
-async function readLock(lock: string): Promise<{ token: string; mtimeMs: number } | undefined> {
-  try {
-    const [token, stat] = await Promise.all([fs.promises.readFile(lock, 'utf8'), fs.promises.lstat(lock)]);
-    return { token, mtimeMs: stat.mtimeMs };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Removes the lock when it is still the stale lock `seen`, under the guard `<lock>.break` (one breaker at a time; a guard
- * older than RECORD_LOCK_STALE_MS is left over by a killed breaker and removed). Never throws.
- */
-export async function breakStaleLock(lock: string, seen: { token: string; mtimeMs: number }): Promise<void> {
-  const guard = `${lock}.break`;
-  try {
-    await fs.promises.writeFile(guard, '', { flag: 'wx', mode: 0o600 });
-  } catch {
-    const stat = await fs.promises.lstat(guard).catch(() => undefined);
-    if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) await fs.promises.rm(guard, { force: true }).catch(() => undefined);
-    return;
-  }
-  try {
-    const current = await readLock(lock);
-    if (current && current.token === seen.token && current.mtimeMs === seen.mtimeMs) await fs.promises.rm(lock, { force: true });
-  } catch {
-    // The next attempt looks again.
-  } finally {
-    await fs.promises.rm(guard, { force: true }).catch(() => undefined);
-  }
-}
-
 /**
  * Writes the records of one heartbeat, each atomically (a temporary file, then a rename), with mode 0600. An entry is
  * ignored (no write, the record stays as it is):
@@ -205,7 +123,8 @@ export async function breakStaleLock(lock: string, seen: { token: string; mtimeM
  *   while an older record is replaced whatever its `seq` (a clock of the computer that was set back);
  * - when it is `clearOnly` and the existing record of the same source does not say keepRunning (review round 3, N1):
  *   it only withdraws a keep of this source, and must not create or refresh a record.
- * Returns the ids of the ignored entries.
+ * Returns the ids of the ignored entries. The caller holds the kernel lock of the records (heartbeatCommand runs
+ * `heartbeat` under `flock`), so two heartbeats read and replace the records one after the other.
  */
 export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<string[]> {
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -213,23 +132,21 @@ export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: nu
   for (const environment of input.environments) {
     const name = heartbeatFileName(input.source, environment.id);
     const file = path.join(dir, name);
-    await withRecordLock(dir, name, async () => {
-      const existing = await readRecordFile(file);
-      const olderEntry = existing !== undefined && existing.seq > environment.seq && Math.abs(now - existing.at) <= SEQ_ORDER_WINDOW_MS;
-      const nothingToClear = environment.clearOnly === true && existing?.keepRunning !== true;
-      if (olderEntry || nothingToClear) {
-        ignored.push(environment.id);
-        return;
-      }
-      const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
-      const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
-      try {
-        await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
-        await fs.promises.rename(temp, file);
-      } finally {
-        await fs.promises.rm(temp, { force: true }).catch(() => undefined);
-      }
-    });
+    const existing = await readRecordFile(file);
+    const olderEntry = existing !== undefined && existing.seq > environment.seq && Math.abs(now - existing.at) <= SEQ_ORDER_WINDOW_MS;
+    const nothingToClear = environment.clearOnly === true && existing?.keepRunning !== true;
+    if (olderEntry || nothingToClear) {
+      ignored.push(environment.id);
+      continue;
+    }
+    const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
+    const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
+    try {
+      await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
+      await fs.promises.rename(temp, file);
+    } finally {
+      await fs.promises.rm(temp, { force: true }).catch(() => undefined);
+    }
   }
   return ignored;
 }

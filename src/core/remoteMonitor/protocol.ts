@@ -24,6 +24,12 @@ export const REMOTE_MONITOR_SCRIPT_PATH = '/opt/devenv/monitor.js';
 export const REMOTE_MONITOR_STATE_DIR = '/state';
 /** The folder of the heartbeat records in the volume: `<source>.<environment id>.json`. */
 export const HEARTBEAT_FOLDER = 'heartbeats';
+/** The kernel lock (`flock`) of the heartbeat records, in the volume (heartbeatCommand). */
+export const HEARTBEAT_LOCK_PATH = `${REMOTE_MONITOR_STATE_DIR}/.heartbeats.lock`;
+/** How long a heartbeat waits for HEARTBEAT_LOCK_PATH, in seconds. */
+export const HEARTBEAT_LOCK_WAIT_SECONDS = 5;
+/** A heartbeat that holds HEARTBEAT_LOCK_PATH longer than this, in seconds, is killed (the lock with it). */
+export const HEARTBEAT_RUN_LIMIT_SECONDS = 10;
 
 /** Default of the setting devEnvLauncher.remoteStopAfterMinutes (10 minutes). */
 export const DEFAULT_REMOTE_STOP_AFTER_SECONDS = 600;
@@ -187,9 +193,31 @@ export function parseHeartbeatFileName(name: string): { source: string; environm
   return match ? { source: match[1], environmentId: match[2] } : undefined;
 }
 
-/** The command of `docker exec` that writes a heartbeat. The argument holds no secret (ids and flags only). */
+/**
+ * The command of `docker exec` that writes a heartbeat. The argument holds no secret (ids and flags only).
+ *
+ * Review round 2 of PR #58 (after review round 10 of PR #57): under the kernel lock `flock` (util-linux) of
+ * HEARTBEAT_LOCK_PATH, so that two heartbeats (two `docker exec` at the same time) read and replace the records one after
+ * the other. The kernel releases the lock when its process ends, also when it is killed, so no lock is ever left over;
+ * a heartbeat that does not get the lock within HEARTBEAT_LOCK_WAIT_SECONDS fails (exit code 1) and writes nothing, and one
+ * that holds it longer than HEARTBEAT_RUN_LIMIT_SECONDS is killed (`timeout`, coreutils), so a hanging heartbeat cannot
+ * block the others. Together at most 15 s, within the 20 s of a `docker exec` of a heartbeat.
+ */
 export function heartbeatCommand(input: HeartbeatInput): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(input)];
+  return [
+    'flock',
+    '-w',
+    String(HEARTBEAT_LOCK_WAIT_SECONDS),
+    HEARTBEAT_LOCK_PATH,
+    'timeout',
+    '-s',
+    'KILL',
+    String(HEARTBEAT_RUN_LIMIT_SECONDS),
+    'node',
+    REMOTE_MONITOR_SCRIPT_PATH,
+    'heartbeat',
+    JSON.stringify(input),
+  ];
 }
 
 /** The command of `docker exec` that prints the records of an environment (RecordsOutput). */
