@@ -136,7 +136,7 @@ export interface ControllerDeps {
    */
   dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation'>;
   /** Unit 7: "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
-  remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'offerSwitchBack'>;
+  remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
   /**
    * Unit 7, PR 2: one heartbeat with the keep-running flag for an environment to the Session Monitor on the remote
    * Docker host of the current context (Close and Keep Running). Without it, Close and Keep Running refuses a remote
@@ -321,6 +321,7 @@ export class Controller implements vscode.Disposable {
       useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
       useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
       chooseDockerHost: async () => this.deps.remoteDocker?.chooseDockerHost(),
+      askAgainDockerHost: async () => this.deps.remoteDocker?.askAgain(),
       rowActivated: (argument) => this.rowActivated(argument),
       showProgressDetails: async (argument) => {
         this.logger.show();
@@ -329,7 +330,7 @@ export class Controller implements vscode.Disposable {
     };
     // Unit 7: each command is one operation on the Docker host that is current when it starts; the two commands that
     // change the host read it themselves. A click on a row is no operation: only the Start of a double-click is one.
-    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'rowActivated', 'showProgressDetails']);
+    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'askAgainDockerHost', 'rowActivated', 'showProgressDetails']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       try {
         if (ownTarget.has(name)) await handlers[name](argument);

@@ -51,6 +51,8 @@ export const Commands = {
   // User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host (hidden in the Command
   // Palette): another remote host, or the local Docker.
   chooseDockerHost: 'devEnvironments.chooseDockerHost',
+  // User decision 2026-09-28: forgets every "Don't Ask Again" of the Docker host questions.
+  askAgainDockerHost: 'devEnvironments.askAgainDockerHost',
   // The command of a repository row (TreeItem.command, hidden in the Command Palette): a double-click runs Start (user
   // request 2026-09-27, "double-clicking a repo shall start the machine"; rowActivation.ts).
   rowActivated: 'devEnvironments.rowActivated',
