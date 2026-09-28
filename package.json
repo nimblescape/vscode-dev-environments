@@ -580,6 +580,26 @@
           "maximum": 1440,
           "description": "Stops a container on a remote Docker host after this many minutes without contact from this computer, for example when it sleeps or is offline. Not for environments that keep running when closed."
         },
+        "devEnvLauncher.remoteImageUpdates": {
+          "type": "array",
+          "scope": "application",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]*\\*?$"
+          },
+          "default": [
+            "ghcr.io/majikmate/devcontainer-classroom*",
+            "ghcr.io/majikmate/devcontainer-dev*"
+          ],
+          "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all packages of the owner, read with your GitHub sign-in), one minute after it starts and then daily at Remote Image Update Time, and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off."
+        },
+        "devEnvLauncher.remoteImageUpdateTime": {
+          "type": "string",
+          "scope": "application",
+          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+          "default": "06:07",
+          "description": "Only on a remote Docker host: the time of day (HH:MM, in the time zone of this computer) at which the Session Monitor there updates the images of Remote Image Updates each day; also one minute after it starts."
+        },
         "devEnvLauncher.updateImagesOnConnect": {
           "type": "boolean",
           "default": true,

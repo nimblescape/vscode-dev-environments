@@ -13,6 +13,9 @@ import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
 
+/** User requests 2026-09-28: the default of remoteImageUpdates. */
+export const DEFAULT_REMOTE_IMAGE_UPDATES: readonly string[] = ['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*'];
+
 /** Defaults of concept section 8. */
 export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   reopenLastOnStartup: true,
@@ -28,6 +31,8 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   repositoryGroups: [],
   openInNewWindow: false,
   remoteStopAfterMinutes: 10,
+  remoteImageUpdates: [...DEFAULT_REMOTE_IMAGE_UPDATES],
+  remoteImageUpdateTime: '06:07',
 });
 
 /**
@@ -143,5 +148,13 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
       MIN_REMOTE_STOP_AFTER_MINUTES,
       MAX_REMOTE_STOP_AFTER_MINUTES,
     ),
+    // The entries are checked where they are used (imagePrefixesOf): an invalid one is left out.
+    remoteImageUpdates: Array.isArray(get('remoteImageUpdates'))
+      ? (get('remoteImageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
+      : [...DEFAULT_REMOTE_IMAGE_UPDATES],
+    remoteImageUpdateTime:
+      typeof get('remoteImageUpdateTime') === 'string' && /^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(get('remoteImageUpdateTime') as string)
+        ? (get('remoteImageUpdateTime') as string)
+        : '06:07',
   };
 }

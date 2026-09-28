@@ -361,6 +361,13 @@ export interface ExtensionSettings {
    * contact from this computer, unless it keeps running when closed. 5 to 1440. Missing: 10.
    */
   remoteStopAfterMinutes?: number;
+  /**
+   * User requests 2026-09-28: the image repositories (a prefix with a trailing `*`) whose latest major version the Session
+   * Monitor on a remote Docker host pulls, keeping the two newest versions of each. Only on a remote host. Empty: none.
+   */
+  remoteImageUpdates?: string[];
+  /** User request 2026-09-28: the daily time (`HH:MM`, local time of this computer) of the image maintenance. */
+  remoteImageUpdateTime?: string;
 }
 
 /** State of a container as Docker reports it, simplified. */

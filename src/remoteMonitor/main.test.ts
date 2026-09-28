@@ -12,7 +12,10 @@ import {
   PS_FORMAT,
   RemoteMonitorLoop,
   heartbeatDir,
+  imageScheduleFromEnv,
+  imageTimesFromEnv,
   main,
+  readImageList,
   parseContainerLines,
   readRecords,
   timingFromEnv,
@@ -356,5 +359,49 @@ describe('RemoteMonitorLoop', () => {
     fs.writeFileSync(path.join(heartbeatDir(stateDir), 'other-file'), 'x');
     await tickAt(T0);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), 'other-file'].sort());
+  });
+});
+
+// User request 2026-09-28 ("all images"): the list of repositories that the extension read from the registry.
+describe('monitor.js images', () => {
+  async function images(input: string): Promise<Run> {
+    let out = '';
+    let err = '';
+    const code = await main(['images', '-'], {
+      env: {},
+      stateDir,
+      readStdin: async () => input,
+      out: (text) => (out += text),
+      err: (text) => (err += text),
+    });
+    return { code, out, err };
+  }
+
+  it('stores a valid list, and readImageList gives it back', async () => {
+    expect(await images(JSON.stringify({ repositories: ['ghcr.io/majikmate/devcontainer-dev', 'ghcr.io/majikmate/devcontainer-dev'] }))).toEqual({ code: 0, out: '', err: '' });
+    expect(await readImageList(stateDir)).toEqual(['ghcr.io/majikmate/devcontainer-dev']);
+  });
+
+  it('refuses anything else and keeps the stored list', async () => {
+    await images(JSON.stringify({ repositories: ['ghcr.io/a/b'] }));
+    for (const input of ['not json', '{}', JSON.stringify({ repositories: ['UPPER/case'] }), JSON.stringify({ repositories: ['ghcr.io/a/b'], extra: 1 }), JSON.stringify({ repositories: ['ubuntu'] })]) {
+      expect((await images(input)).code, input).toBe(EXIT_INVALID);
+    }
+    expect(await readImageList(stateDir)).toEqual(['ghcr.io/a/b']);
+    expect((await main(['images'], { env: {}, stateDir, readStdin: async () => '{}', err: () => {} }))).toBe(EXIT_INVALID);
+  });
+
+  it('reads no list when none was stored', async () => {
+    expect(await readImageList(stateDir)).toEqual([]);
+  });
+
+  // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
+  it('passes one minute after the start, then daily; the Docker tests can set a fixed interval', () => {
+    expect(imageTimesFromEnv({})).toEqual({ firstMs: 60_000, intervalMs: undefined });
+    expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '500', DEVENV_IMAGE_INTERVAL_MS: '2000' })).toEqual({ firstMs: 500, intervalMs: 2000 });
+    expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '5', DEVENV_IMAGE_INTERVAL_MS: 'x' })).toEqual({ firstMs: 60_000, intervalMs: undefined });
+    expect(imageScheduleFromEnv({})).toEqual({ hour: 6, minute: 7, timeZone: 'Europe/Vienna' });
+    expect(imageScheduleFromEnv({ DEVENV_IMAGE_TIME: '05:30', DEVENV_IMAGE_TZ: 'America/New_York' })).toEqual({ hour: 5, minute: 30, timeZone: 'America/New_York' });
+    expect(imageScheduleFromEnv({ DEVENV_IMAGE_TIME: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ hour: 6, minute: 7, timeZone: 'Europe/Vienna' });
   });
 });

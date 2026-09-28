@@ -29,6 +29,8 @@ import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
 import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
+import { ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
+import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
@@ -63,6 +65,13 @@ import { REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, type TreeNode } from '.
 
 /** A window that gets the focus refreshes the sidebar at most this often. */
 const FOCUS_REFRESH_INTERVAL_MS = 15_000;
+/** User requests 2026-09-28: the image list for the monitor of a host is sent at most this often. */
+export const IMAGE_LIST_INTERVAL_MS = 60 * 60_000;
+export const ImageListTexts = {
+  signInQuestion: (host: string) =>
+    `To keep all images of the setting "Remote Image Updates" on ${host} up to date, Dev Environments needs to read your GitHub packages.`,
+  signIn: 'Sign in',
+} as const;
 
 /** Kept for deactivate(), which must be synchronous. */
 let coordinator: SessionCoordinator | undefined;
@@ -165,6 +174,13 @@ async function activateExtension(
   const remoteMonitor = new RemoteSessionMonitor({
     docker,
     logger,
+    // User requests 2026-09-28: the image maintenance of the monitor (the settings remoteImageUpdates and
+    // remoteImageUpdateTime, in the time zone of this computer).
+    imageMaintenance: () => ({
+      prefixes: imagePrefixesOf(getSettings().remoteImageUpdates ?? []),
+      time: getSettings().remoteImageUpdateTime ?? '06:07',
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    }),
     script: () => {
       remoteMonitorScriptText ??= fs.promises.readFile(remoteMonitorScript, 'utf8');
       // A failed read is tried again at the next open.
@@ -172,6 +188,40 @@ async function activateExtension(
       return remoteMonitorScriptText;
     },
   });
+  // User request 2026-09-28 ("all images"): the image repositories of the prefixes, read with the GitHub session (scope
+  // read:packages) and given to the monitor of the host, at most once an hour per host. Without that scope, a question
+  // once per window; the monitor then updates only the images that are on the host.
+  const imageListSentAt = new Map<string, number>();
+  let packagesSignInOffered = false;
+  const sendImageList = async (host: string, signal?: AbortSignal): Promise<void> => {
+    const prefixes = imagePrefixesOf(getSettings().remoteImageUpdates ?? []);
+    if (prefixes.length === 0 || !prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
+    const last = imageListSentAt.get(host);
+    if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
+    const credentials = await auth.getPackagesCredentials({ interactive: false });
+    if (!credentials) {
+      logger.info(`The image list for ${host} needs the GitHub sign-in for packages; the Session Monitor there updates only the images that it has.`);
+      if (!packagesSignInOffered) {
+        packagesSignInOffered = true;
+        void vscode.window.showInformationMessage(ImageListTexts.signInQuestion(host), ImageListTexts.signIn).then(async (choice) => {
+          if (choice !== ImageListTexts.signIn) return;
+          if (await auth.getPackagesCredentials({ interactive: true })) imageListSentAt.delete(host);
+        });
+      }
+      return;
+    }
+    imageListSentAt.set(host, Date.now());
+    let repositories: string[];
+    try {
+      repositories = await ghcrRepositories(nodeHttpsTransport, credentials.password, prefixes, signal);
+    } catch (error) {
+      imageListSentAt.delete(host);
+      logger.warn(`The image repositories could not be read from GitHub: ${errorMessage(error)}`);
+      return;
+    }
+    logger.info(`The Session Monitor on ${host} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
+    await remoteMonitor.images(repositories);
+  };
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
   // One stored list per GitHub account (concept 6.2).
@@ -241,6 +291,7 @@ async function activateExtension(
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },
       forget: async (_host, environmentId) => remoteMonitor.forget(computerId(), environmentId),
+      images: sendImageList,
     },
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>

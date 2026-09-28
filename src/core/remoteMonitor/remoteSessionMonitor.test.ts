@@ -223,3 +223,47 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(isMissingContainer({ ...MISSING, timedOut: true })).toBe(false);
   });
 });
+
+// User requests 2026-09-28: the image maintenance of the monitor, only on a remote host.
+describe('RemoteSessionMonitor: images', () => {
+  const PREFIXES = ['ghcr.io/majikmate/devcontainer-classroom', 'ghcr.io/majikmate/devcontainer-dev'];
+  const IMAGES = { prefixes: PREFIXES, time: '06:07', timeZone: 'Europe/Vienna' };
+
+  it('gives the container the prefixes and outbound network; without prefixes still no network', () => {
+    const plain = monitor(new FakeDocker(() => result(0)));
+    expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT)).toEqual(expect.arrayContaining(['--network', 'none']));
+    const args = plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, IMAGES);
+    expect(args).not.toContain('--network');
+    expect(args).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(PREFIXES)}`);
+    // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
+    expect(args).toContain('DEVENV_IMAGE_TIME=06:07');
+    expect(args).toContain('DEVENV_IMAGE_TZ=Europe/Vienna');
+    expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] })).toEqual(expect.arrayContaining(['--network', 'none']));
+    // Still no capability, no published port, no new privileges.
+    expect(args).toEqual(expect.arrayContaining(['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']));
+    expect(args.some((arg) => arg === '-p' || arg === '--publish')).toBe(false);
+  });
+
+  it('replaces the container when the prefixes, the time, or the time zone change (they are part of its label)', async () => {
+    const withPrefixes = remoteMonitorLabelValue(SCRIPT, TAG, [...PREFIXES, '06:07', 'Europe/Vienna']);
+    expect(remoteMonitorLabelValue(SCRIPT, TAG, [...PREFIXES, '05:00', 'Europe/Vienna'])).not.toBe(withPrefixes);
+    expect(withPrefixes).not.toBe(LABEL);
+    expect(remoteMonitorLabelValue(SCRIPT, TAG, [])).toBe(LABEL);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL) : result(0, 'id\n')));
+    const withSetting = new RemoteSessionMonitor({ docker, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => IMAGES });
+    expect(await withSetting.ensure(TAG, SOCKET)).toBe('created');
+    const run = docker.calls.find((call) => call.args[0] === 'run');
+    expect(run?.args).toContain(`${LABEL_SESSION_MONITOR}=${withPrefixes}`);
+  });
+
+  it('gives the monitor the list of repositories on stdin (docker exec -i), and logs a failure', async () => {
+    const docker = new FakeDocker(() => result(0));
+    const log = new Log();
+    await monitor(docker, log).images(['ghcr.io/majikmate/devcontainer-dev']);
+    expect(docker.calls[0].args).toEqual(['exec', '-i', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-']);
+    expect(docker.calls[0].options?.input).toBe(JSON.stringify({ repositories: ['ghcr.io/majikmate/devcontainer-dev'] }));
+    const failing = new FakeDocker(() => result(2, '', 'Invalid image list.'));
+    await monitor(failing, log).images([]);
+    expect(log.lines).toEqual(['warn The image list could not be given to the Session Monitor: Invalid image list.']);
+  });
+});

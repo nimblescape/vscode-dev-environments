@@ -197,3 +197,46 @@ describe('Delete on a remote host', () => {
     expect(calls.filter((call) => call.startsWith('forget'))).toEqual([]);
   });
 });
+
+// User requests 2026-09-28: the image list for the image maintenance of the monitor, only on a remote host.
+describe('the image list for the Session Monitor in the open pipeline', () => {
+  function withImages(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, images: (host: string) => Promise<void>) {
+    const calls: string[] = [];
+    const remoteMonitor: EnvironmentRemoteMonitor = {
+      ensure: async (host) => {
+        calls.push(`ensure ${host}`);
+      },
+      heartbeat: async (host) => {
+        calls.push(`heartbeat ${host}`);
+        return { ok: true };
+      },
+      forget: async () => {},
+      images: async (host) => {
+        calls.push(`images ${host}`);
+        return images(host);
+      },
+    };
+    const created = createHarness({ dockerTarget: async () => target, remoteMonitor });
+    h = created;
+    return { h: created, calls };
+  }
+
+  it('sends it after the monitor is ensured and before the first heartbeat, on a remote host only', async () => {
+    const remote = withImages(REMOTE, async () => {});
+    await seedEnvironment(remote.h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await remote.h.service.openEnvironment(ENV_ID, { progress: remote.h.progress });
+    expect(remote.calls).toEqual(['ensure build-box', 'images build-box', 'heartbeat build-box']);
+    const local = withImages(LOCAL, async () => {});
+    await seedEnvironment(local.h, { container: 'stopped' });
+    await local.h.service.openEnvironment(ENV_ID, { progress: local.h.progress });
+    expect(local.calls).toEqual([]);
+  });
+
+  it('a failure is a warning, and the open goes on', async () => {
+    const { h, calls } = withImages(REMOTE, async () => Promise.reject(new Error('GitHub answered HTTP 403')));
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(calls).toContain('heartbeat build-box');
+    expect(h.logger.warnings).toContain('The image list for the Session Monitor on build-box could not be sent: GitHub answered HTTP 403');
+  });
+});

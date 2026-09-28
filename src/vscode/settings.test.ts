@@ -43,7 +43,23 @@ describe('settings (concept section 8)', () => {
       openInNewWindow: false,
       // Unit 7, PR 2 (setting remoteStopAfterMinutes): a new setting with the default of 10 minutes.
       remoteStopAfterMinutes: 10,
+      // User requests 2026-09-28 (setting remoteImageUpdates): the two image families of the user.
+      remoteImageUpdates: ['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*'],
+      // User request 2026-09-28 ("in the morning again, at 6:07 CEST"): the daily time of the image maintenance.
+      remoteImageUpdateTime: '06:07',
     });
+  });
+
+  // User requests 2026-09-28: the images that the monitor on a remote host keeps up to date.
+  it('reads remoteImageUpdates: strings only; an empty list turns it off; a wrong type gives the default', () => {
+    const read = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdates' ? value : undefined)).remoteImageUpdates;
+    expect(read(['ghcr.io/acme/base*', 3, null])).toEqual(['ghcr.io/acme/base*']);
+    expect(read([])).toEqual([]);
+    expect(read('ghcr.io/acme/base*')).toEqual(['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*']);
+    const time = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdateTime' ? value : undefined)).remoteImageUpdateTime;
+    expect(time('05:30')).toBe('05:30');
+    expect(time('5:30')).toBe('06:07');
+    expect(time(530)).toBe('06:07');
   });
 
   it('reads the section devEnvLauncher', () => {

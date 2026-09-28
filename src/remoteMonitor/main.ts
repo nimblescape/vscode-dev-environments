@@ -20,6 +20,9 @@ import * as path from 'path';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import {
   HEARTBEAT_FOLDER,
+  IMAGE_LIST_FILE,
+  MAX_IMAGE_LIST_LENGTH,
+  parseImageListInput,
   REMOTE_MONITOR_STATE_DIR,
   SEQ_ORDER_WINDOW_MS,
   heartbeatFileName,
@@ -42,6 +45,18 @@ import {
   type RemoteRecord,
   type RemoteTiming,
 } from './rules';
+import {
+  DEFAULT_IMAGE_TIME,
+  DEFAULT_IMAGE_TIME_ZONE,
+  ImageMaintenance,
+  REMOTE_IMAGE_FIRST_PASS_MS,
+  isTimeZone,
+  nextTimeOfDay,
+  nodeHttpGet,
+  parseTimeOfDay,
+  prefixesFromEnv,
+  type HttpGet,
+} from './images';
 
 /** Time limit of the container list. */
 export const LIST_TIMEOUT_MS = 30_000;
@@ -314,6 +329,9 @@ export interface MainDeps {
   env: NodeJS.ProcessEnv;
   stateDir?: string;
   docker?: DockerRunner;
+  /** The images (user requests 2026-09-28): the registry, and the standard input of `images -`. */
+  httpGet?: HttpGet;
+  readStdin?: () => Promise<string>;
   now?: () => number;
   out?: (text: string) => void;
   err?: (text: string) => void;
@@ -321,6 +339,59 @@ export interface MainDeps {
 
 function timestamped(out: (text: string) => void): (message: string) => void {
   return (message) => out(`${new Date().toISOString()} ${message}\n`);
+}
+
+/** The standard input as text, at most MAX_IMAGE_LIST_LENGTH + 1 characters (a longer one is refused). */
+export function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let text = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: string) => {
+      text += chunk;
+      if (text.length > MAX_IMAGE_LIST_LENGTH) {
+        process.stdin.destroy();
+        resolve(text);
+      }
+    });
+    process.stdin.on('end', () => resolve(text));
+    process.stdin.on('error', () => resolve(text));
+  });
+}
+
+/** Stores the list of repositories (atomically: a temporary file, then a rename). */
+export async function writeImageList(stateDir: string, repositories: readonly string[]): Promise<void> {
+  const file = path.join(stateDir, IMAGE_LIST_FILE);
+  const temporary = `${file}.${process.pid}.tmp`;
+  await fs.promises.writeFile(temporary, JSON.stringify({ repositories }), { mode: 0o600 });
+  await fs.promises.rename(temporary, file);
+}
+
+/** The stored list of repositories; none when it is missing or invalid. */
+export async function readImageList(stateDir: string): Promise<string[]> {
+  try {
+    const text = await fs.promises.readFile(path.join(stateDir, IMAGE_LIST_FILE), 'utf8');
+    return parseImageListInput(text) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The times of the Docker tests: DEVENV_IMAGE_FIRST_MS (the first pass) and DEVENV_IMAGE_INTERVAL_MS (a fixed interval
+ * instead of the daily time), 100..86400000 ms each.
+ */
+export function imageTimesFromEnv(env: NodeJS.ProcessEnv): { firstMs: number; intervalMs?: number } {
+  const read = (text: string | undefined) => (text !== undefined && /^\d{3,8}$/.test(text) && Number(text) >= 100 ? Number(text) : undefined);
+  return { firstMs: read(env.DEVENV_IMAGE_FIRST_MS) ?? REMOTE_IMAGE_FIRST_PASS_MS, intervalMs: read(env.DEVENV_IMAGE_INTERVAL_MS) };
+}
+
+/**
+ * The daily time of the passes: DEVENV_IMAGE_TIME (`HH:MM`, the setting remoteImageUpdateTime) in DEVENV_IMAGE_TZ (the
+ * time zone of the computer that created the monitor). Invalid or missing: 06:07 in Europe/Vienna.
+ */
+export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { hour: number; minute: number; timeZone: string } {
+  const time = parseTimeOfDay(env.DEVENV_IMAGE_TIME) ?? parseTimeOfDay(DEFAULT_IMAGE_TIME)!;
+  return { ...time, timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE };
 }
 
 /** Runs one subcommand of `argv` (without node and the script). Resolves with the exit code; `run` never resolves. */
@@ -356,6 +427,16 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       await removeRecord(dir, args[0], args[1]);
       return 0;
     }
+    case 'images': {
+      // User request 2026-09-28 ("all images"): the repositories that the extension read from the registry, on stdin.
+      const repositories = args.length === 1 && args[0] === '-' ? parseImageListInput(await (deps.readStdin ?? readStdin)()) : undefined;
+      if (!repositories) {
+        err('Invalid image list.\n');
+        return EXIT_INVALID;
+      }
+      await writeImageList(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, repositories);
+      return 0;
+    }
     case 'run': {
       if (args.length !== 0) {
         err('run takes no argument.\n');
@@ -363,15 +444,36 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
       const { tickMs, timing } = timingFromEnv(deps.env);
       const log = timestamped(out);
-      const loop = new RemoteMonitorLoop({ docker: deps.docker ?? nodeDocker, dir, now, log, timing });
+      const docker = deps.docker ?? nodeDocker;
+      const loop = new RemoteMonitorLoop({ docker, dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
+      // User requests 2026-09-28: the images of the prefixes, at the start and then every REMOTE_IMAGE_INTERVAL_MS.
+      const prefixes = prefixesFromEnv(deps.env);
+      if (prefixes.length > 0) {
+        const stateDir = deps.stateDir ?? REMOTE_MONITOR_STATE_DIR;
+        const images = new ImageMaintenance({
+          docker,
+          httpGet: deps.httpGet ?? nodeHttpGet,
+          log,
+          prefixes,
+          knownRepositories: () => readImageList(stateDir),
+        });
+        const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
+        const { hour, minute, timeZone } = imageScheduleFromEnv(deps.env);
+        const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+        log(`Image updates of ${prefixes.join(', ')}: in ${Math.round(firstMs / 1000)} s, then every day at ${time} (${timeZone}).`);
+        // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) instead of the daily time.
+        const delayToNext = () => (intervalMs !== undefined ? intervalMs : Math.max(1_000, nextTimeOfDay(now(), hour, minute, timeZone) - now()));
+        const next = (delay: number) => setTimeout(() => void images.pass().finally(() => next(delayToNext())), delay);
+        next(firstMs);
+      }
       for (;;) {
         await loop.tick();
         await new Promise((resolve) => setTimeout(resolve, tickMs));
       }
     }
     default:
-      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id>\n');
+      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> | images -\n');
       return EXIT_INVALID;
   }
 }

@@ -17,6 +17,7 @@ import {
   REMOTE_MONITOR_VOLUME,
   forgetCommand,
   heartbeatCommand,
+  imagesCommand,
   parseRecordsOutput,
   recordsCommand,
   remoteMonitorLabelValue,
@@ -45,11 +46,24 @@ export interface RemoteSessionMonitorOptions {
   logger: Logger;
   /** The content of dist/remoteMonitor.js. */
   script: () => Promise<string>;
+  /**
+   * User requests 2026-09-28: the image maintenance of the monitor: the prefixes of the images that it updates and cleans
+   * (the setting remoteImageUpdates, a trailing `*` dropped; none: no image maintenance), the daily time (`HH:MM`, the
+   * setting remoteImageUpdateTime), and the time zone of this computer.
+   */
+  imageMaintenance?: () => ImageMaintenanceSettings;
   /** Only for the Docker tests: another container and volume name, more labels, and variables of the container. */
   containerName?: string;
   volumeName?: string;
   labels?: Readonly<Record<string, string>>;
   containerEnv?: Readonly<Record<string, string>>;
+}
+
+/** See RemoteSessionMonitorOptions.imageMaintenance. */
+export interface ImageMaintenanceSettings {
+  prefixes: readonly string[];
+  time: string;
+  timeZone: string;
 }
 
 /** What ensure found or did. `failed`: logged as a warning; the open goes on. */
@@ -88,7 +102,8 @@ export class RemoteSessionMonitor {
     try {
       const script = await this.options.script();
       if (script.length > MAX_SCRIPT_LENGTH) throw new Error(`The script of the Session Monitor is too long (${script.length} characters).`);
-      const label = remoteMonitorLabelValue(script, helperTag);
+      const images = this.options.imageMaintenance?.();
+      const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [...images.prefixes, images.time, images.timeZone] : []);
       const current = await this.inspect(signal);
       if (current.exists && current.label === label) {
         if (current.running) return 'running';
@@ -100,7 +115,7 @@ export class RemoteSessionMonitor {
         logger.info(`The Session Monitor on the Docker host is of another version; it is replaced (${this.containerName}).`);
         await this.docker(['rm', '-f', this.containerName], signal);
       }
-      const created = await this.options.docker.run(this.runArgs(helperTag, socketPath, label, script), {
+      const created = await this.options.docker.run(this.runArgs(helperTag, socketPath, label, script, images), {
         timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS,
         signal,
       });
@@ -134,6 +149,24 @@ export class RemoteSessionMonitor {
     return result.ok ? parseRecordsOutput(result.stdout) : undefined;
   }
 
+  /**
+   * User request 2026-09-28 ("all images"): stores the repositories that the extension read from the registry, for the
+   * image maintenance of the monitor (`monitor.js images -`, the list on stdin). Best effort: a failure is logged.
+   */
+  async images(repositories: readonly string[]): Promise<void> {
+    try {
+      const result = await this.options.docker.run(['exec', '-i', this.containerName, ...imagesCommand()], {
+        timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS,
+        input: JSON.stringify({ repositories }),
+      });
+      if (result.exitCode !== 0 || result.timedOut) {
+        this.options.logger.warn(`The image list could not be given to the Session Monitor: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
+      }
+    } catch (error) {
+      this.options.logger.warn(`The image list could not be given to the Session Monitor: ${errorMessage(error)}`);
+    }
+  }
+
   /** Removes the record of `source` for an environment (Delete). Best effort: a failure is logged. */
   async forget(source: string, environmentId: string): Promise<void> {
     const result = await this.exec(forgetCommand(source, environmentId));
@@ -143,13 +176,21 @@ export class RemoteSessionMonitor {
   }
 
   /** The arguments of `docker run` for the monitor container. */
-  runArgs(helperTag: string, socketPath: string, label: string, script: string): string[] {
+  runArgs(helperTag: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings): string[] {
+    const imagePrefixes = images?.prefixes ?? [];
     const args = ['run', '-d', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
     for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
     // Our own container: it survives a restart of the daemon (the refusal of restart policies is for the containers of
-    // repositories). No network, no published port, no capability: it needs only the socket and its volume.
-    args.push('--restart', 'unless-stopped', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
+    // repositories). No published port, no capability: it needs the socket and its volume. User requests 2026-09-28:
+    // with image maintenance it reads the tags of the registry, so it has the default network then (outbound only);
+    // without it, no network.
+    args.push('--restart', 'unless-stopped');
+    if (imagePrefixes.length === 0) args.push('--network', 'none');
+    args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
     args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
+    if (images && imagePrefixes.length > 0) {
+      args.push('-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes)}`, '-e', `DEVENV_IMAGE_TIME=${images.time}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`);
+    }
     for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) args.push('-e', `${key}=${value}`);
     args.push(helperTag, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);
     return args;

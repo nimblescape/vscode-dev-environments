@@ -188,6 +188,62 @@ export function forgetCommand(source: string, environmentId: string): string[] {
   return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId];
 }
 
+// ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the
+// setting remoteImageUpdates, keep the two newest versions, only on a remote host) ----
+
+/** A prefix of image repositories: `registry/path…`, lower case, no tag, no digest (the setting drops a trailing `*`). */
+export function isImagePrefix(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) && !value.includes('..');
+}
+
+/** The prefixes of the setting remoteImageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. */
+export function imagePrefixesOf(patterns: readonly unknown[]): string[] {
+  const prefixes: string[] = [];
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string') continue;
+    const prefix = pattern.trim().replace(/\*$/, '');
+    if (isImagePrefix(prefix) && !prefixes.includes(prefix)) prefixes.push(prefix);
+  }
+  return prefixes;
+}
+
+/** The list of image repositories that the extension sends (`monitor.js images -`, JSON on stdin). */
+export const IMAGE_LIST_FILE = 'images.json';
+/** At most this many repositories in the list. */
+export const MAX_IMAGE_REPOSITORIES = 500;
+/** The longest input of `monitor.js images -`. */
+export const MAX_IMAGE_LIST_LENGTH = 128 * 1024;
+
+/** A repository of an image registry: `registry/path` in lower case, no tag, no digest (`ghcr.io/acme/base`). */
+export function isImageRepository(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= 255 &&
+    /^[a-z0-9.-]+(:[0-9]+)?(\/[a-z0-9]+([._-][a-z0-9]+)*)+$/.test(value) &&
+    /[.:]/.test(value.slice(0, value.indexOf('/')))
+  );
+}
+
+/** The input of `monitor.js images -`: `{ "repositories": [...] }`, strict. Undefined for anything else. */
+export function parseImageListInput(text: string): string[] | undefined {
+  if (text.length > MAX_IMAGE_LIST_LENGTH) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || Object.keys(value).join() !== 'repositories') return undefined;
+  const { repositories } = value;
+  if (!Array.isArray(repositories) || repositories.length > MAX_IMAGE_REPOSITORIES || !repositories.every(isImageRepository)) return undefined;
+  return [...new Set(repositories as string[])];
+}
+
+/** The command of `docker exec -i` that stores the list of repositories; the list goes on stdin. */
+export function imagesCommand(): string[] {
+  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'];
+}
+
 /** The output of `monitor.js records <id>`: the clock of the remote host and the records of that environment. */
 export interface RecordsOutput {
   now: number;
@@ -229,8 +285,12 @@ export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): 
 }
 
 /** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script and the helper tag. */
-export function remoteMonitorLabelValue(script: string, helperTag: string): string {
-  return createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8').digest('hex').slice(0, 12);
+export function remoteMonitorLabelValue(script: string, helperTag: string, imagePrefixes: readonly string[] = []): string {
+  // User request 2026-09-28: the prefixes of the image updates are part of the container (its variable), so a change of
+  // the setting replaces it at the next open.
+  const hash = createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8');
+  if (imagePrefixes.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(imagePrefixes), 'utf8');
+  return hash.digest('hex').slice(0, 12);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
