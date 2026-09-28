@@ -219,6 +219,18 @@ describe('runWithProgress', () => {
     expect(currentOperation()).toBeUndefined();
   });
 
+  it('passes on a task that throws before it returns its promise, and ends the busy state', async () => {
+    scriptWithProgress();
+    const promise = runWithProgress<number>({
+      title: 'x',
+      task: () => {
+        throw new Error('at once');
+      },
+    });
+    await expect(promise).rejects.toThrow('at once');
+    expect(currentOperation()).toBeUndefined();
+  });
+
   it('ends the busy state also when the notification cannot be shown', async () => {
     fakeVscode.window.withProgress.mockRejectedValue(new Error('no window'));
     await expect(runWithProgress({ title: 'x', task: async () => 1 })).rejects.toThrow('no window');

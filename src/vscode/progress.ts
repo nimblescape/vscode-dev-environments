@@ -102,7 +102,8 @@ export function hideProgressNotification(id: unknown): void {
 
 /**
  * Runs `task` with one progress notification. The message shows the current step (`Steps[step]`) and its detail,
- * followed by the link "Show details" (command `devEnvironments.showLog`). Cancel aborts the signal. The promise
+ * followed by the link "Show details" (command `devEnvironments.showProgressDetails` with the ID of the operation: it
+ * opens the output channel and closes the notification, while the task goes on). Cancel aborts the signal. The promise
  * settles with the result of the task.
  */
 export function runWithProgress<T>(run: ProgressRun<T>): Promise<T> {
@@ -111,6 +112,7 @@ export function runWithProgress<T>(run: ProgressRun<T>): Promise<T> {
   busyEmitter.fire(busyChange());
 
   const controller = new AbortController();
+  let started = false;
   const result = new Promise<T>((resolve, reject) => {
     // The title is part of the message (not the `title` option), so that the notification does not show "title: step".
     vscode.window
@@ -143,9 +145,11 @@ export function runWithProgress<T>(run: ProgressRun<T>): Promise<T> {
           // The callback returns; its `finally` stops the reports to the closed notification.
           operation.hide = () => hide();
           show();
-          const task = run.task(reporter, controller.signal);
-          task.then(resolve, reject);
+          started = true;
           try {
+            // Also a task that throws before it returns its promise (the rejection is passed on).
+            const task = Promise.resolve().then(() => run.task(reporter, controller.signal));
+            task.then(resolve, reject);
             await Promise.race([task.then(() => undefined, () => undefined), hidden]);
           } finally {
             finished = true;
@@ -153,7 +157,10 @@ export function runWithProgress<T>(run: ProgressRun<T>): Promise<T> {
           }
         },
       )
-      .then(undefined, reject);
+      // Only a notification that could not be shown fails the operation; once the task runs, it settles the result.
+      .then(undefined, (error: unknown) => {
+        if (!started) reject(error);
+      });
   });
 
   return result.finally(() => {
