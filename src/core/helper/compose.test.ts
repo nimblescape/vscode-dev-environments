@@ -838,13 +838,15 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
 describe('review round 9 (S9-1): the bounds of the model in the extension host', () => {
   const REPO_FOLDER = '/workspaces/api';
 
-  it('rewrites a model with 40000 folders to create in less than 1 s', () => {
-    const volumes = Array.from({ length: 40_000 }, (_, i) => ({ type: 'bind', source: `${REPO_FOLDER}/d/${i}`, target: `/m/${i}`, bind: { create_host_path: true } }));
-    const realPaths = Object.fromEntries(volumes.map((v) => [v.source, null]));
-    const mountAncestors = Object.fromEntries(volumes.map((v) => [v.source, REPO_FOLDER]));
-    const model = { name: 'devenv-3f2a9c1e', services: { app: { image: 'ubuntu', command: ['sleep'] }, db: { image: 'postgres:16', volumes } } } as unknown as ComposeModel;
-    const start = performance.now();
-    const up = composeUpModel(model, {
+  // A model with `count` bind mounts whose host folders have to be created, and the time of its rewrite (the least of
+  // `runs`, so that one pause of the runner does not count).
+  function folderModel(count: number): ComposeModel {
+    const volumes = Array.from({ length: count }, (_, i) => ({ type: 'bind', source: `${REPO_FOLDER}/d/${i}`, target: `/m/${i}`, bind: { create_host_path: true } }));
+    return { name: 'devenv-3f2a9c1e', services: { app: { image: 'ubuntu', command: ['sleep'] }, db: { image: 'postgres:16', volumes } } } as unknown as ComposeModel;
+  }
+  function rewriteFolders(model: ComposeModel): ReturnType<typeof composeUpModel> {
+    const volumes = (model.services.db as { volumes: Array<{ source: string }> }).volumes;
+    return composeUpModel(model, {
       project: 'devenv-3f2a9c1e',
       devService: 'app',
       environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d',
@@ -852,16 +854,37 @@ describe('review round 9 (S9-1): the bounds of the model in the extension host',
       volumeName: 'devenv-x',
       repositoryFolder: REPO_FOLDER,
       engineApiVersion: '1.47',
-      realPaths,
-      mountAncestors,
+      realPaths: Object.fromEntries(volumes.map((v) => [v.source, null])),
+      mountAncestors: Object.fromEntries(volumes.map((v) => [v.source, REPO_FOLDER])),
       image: 'img',
     });
-    // Before: 3 s (createFolders.includes for each mount).
-    expect(performance.now() - start).toBeLessThan(1000);
+  }
+  function rewriteTime(model: ComposeModel, runs: number): number {
+    let least = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < runs; run++) {
+      const start = performance.now();
+      rewriteFolders(model);
+      least = Math.min(least, performance.now() - start);
+    }
+    return least;
+  }
+
+  it('rewrites a model with 40000 folders to create in time that grows linearly with the folders', () => {
+    // Before: 3 s for 40000 folders (createFolders.includes for each mount: quadratic). Changed check (the absolute
+    // bound of 1 s failed on slow CI runners, 1073 ms and 1101 ms): the time for 40000 folders against the time for
+    // 4000, whatever the speed of the runner: about 10 for the linear rewrite, about 50 for the quadratic one (the linear
+    // parts of the rewrite weigh on both).
+    const small = folderModel(4_000);
+    const large = folderModel(40_000);
+    rewriteTime(small, 1);
+    const ratio = rewriteTime(large, 2) / rewriteTime(small, 3);
+    expect(ratio).toBeLessThan(20);
+    const up = rewriteFolders(large);
     expect(up.createFolders).toHaveLength(40_000);
     // The pipeline refuses such a model before (MAX_COMPOSE_MOUNTS).
-    expect(composeModelLimit(model)).toBe('40000 mounts (at most 5000)');
-  });
+    expect(composeModelLimit(large)).toBe('40000 mounts (at most 5000)');
+    // Time enough for a quadratic rewrite to fail by the ratio, not by the time limit of the test.
+  }, 30_000);
 
   it('names a model beyond the limits of services and mounts', () => {
     const services = (n: number, mounts = 0) =>
