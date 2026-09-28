@@ -45,6 +45,7 @@ import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
 import { dockerAdapterOptions } from './dockerAdapterOptions';
+import { DockerHostIndicator } from './dockerHostIndicator';
 import { DockerSetup } from './dockerSetup';
 import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
@@ -258,6 +259,9 @@ async function activateExtension(
   });
   const statusBar = new EnvironmentStatusBar();
   context.subscriptions.push(tree, view, statusBar);
+  // User request 2026-09-28: the view shows the remote Docker host, and its title-bar icon follows it.
+  const dockerHostIndicator = new DockerHostIndicator(view, logger);
+  context.subscriptions.push({ dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target)) });
   // Concept 6.1 step 2: while no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the
   // repositories. User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the
   // repositories shall not be shown, instead, the side view shall show the install docker wizard".
@@ -425,6 +429,8 @@ async function activateExtension(
 
   // The icon of Select Organizations… in the view title bar.
   updateOwnersContextKey(settings.owners, logger);
+  // The Docker host of the view title (every later read of the context updates it too).
+  background(targets.resolve(), 'read the Docker host');
   // Concept 6.1 step 3: the stored list at once, then the background refresh.
   background(sidebar.initialize(), 'show the repository list');
   if (view.visible) background(sidebar.refreshStates(), 'update the sidebar');

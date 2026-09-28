@@ -191,6 +191,9 @@ describe('the filter icon of the view title bar', () => {
       [Commands.refresh, 'navigation@2'],
       // Since unit 16 (spec: settings UI for the repository groups): Edit Repository Groups… in the "…" menu of the view.
       [Commands.editRepositoryGroups, '1_settings@1'],
+      // User request 2026-09-28: the icon of the Docker host after Refresh, one of the two at a time.
+      [Commands.useRemoteDockerHost, 'navigation@3'],
+      [Commands.chooseDockerHost, 'navigation@3'],
     ]);
     expect(title[0].when).toBe(`view == devEnvironments.repositories && !${OWNERS_FILTERED_CONTEXT_KEY}`);
     expect(title[1].when).toBe(`view == devEnvironments.repositories && ${OWNERS_FILTERED_CONTEXT_KEY}`);

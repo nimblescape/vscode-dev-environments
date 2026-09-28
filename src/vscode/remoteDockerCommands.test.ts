@@ -311,6 +311,15 @@ describe('Use a Remote Docker Host…', () => {
     expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote('build-box', true));
   });
 
+  // Review of the sidebar host (S1): without a Docker CLI on this computer, the missing CLI is the reason, not the host.
+  it('names the missing Docker CLI of this computer before it asks for a host', async () => {
+    cli.isInstalled = () => false;
+    await commands.useRemoteHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.cliMissing);
+    expect(cli.calls).toEqual([]);
+  });
+
   it('refuses while DOCKER_HOST is set for VS Code (the context would have no effect)', async () => {
     env.DOCKER_HOST = 'unix:///var/run/docker.sock';
     commands = create();
@@ -318,6 +327,62 @@ describe('Use a Remote Docker Host…', () => {
     expect(window.showQuickPick).not.toHaveBeenCalled();
     expect(window.showErrorMessage).toHaveBeenCalledWith(RemoteDockerTexts.variableSet('DOCKER_HOST'), 'Show details');
     expect(cli.calls).toEqual([]);
+  });
+});
+
+// User request 2026-09-28: the title-bar icon of the view while Docker is set to a remote host.
+describe('Remote Docker Host… (the choice of the title bar)', () => {
+  // User request 2026-09-28 ("it shall show the config list again"): the hosts right away, the local Docker last.
+  it('lists the hosts of the SSH config with the current one marked, "Enter an SSH address…", and the local Docker', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await commands.chooseDockerHost();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>, { title: string }];
+    expect(items.map((item) => [item.label, item.description])).toEqual([
+      ['$(check) build-box', 'me@build-box.example.com · current'],
+      ['gpu', 'gpu:2222'],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+      ['', undefined],
+      [`$(vm) ${RemoteDockerTexts.useLocal}`, undefined],
+    ]);
+    expect(options.title).toBe('Docker host: build-box');
+  });
+
+  it('switches to the picked host, says so for the current one, and goes local on "Use the Local Docker"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    cli.hosts.set('gpu', engineInfo());
+    const useLocal = vi.spyOn(commands, 'useLocalDocker').mockResolvedValue();
+    answer('gpu');
+    await commands.chooseDockerHost();
+    expect(cli.current).toBe(GPU);
+    cli.current = BUILD_BOX;
+    answer('$(check) build-box');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(cli.current).toBe(BUILD_BOX);
+    answer(`$(vm) ${RemoteDockerTexts.useLocal}`);
+    await commands.chooseDockerHost();
+    expect(useLocal).toHaveBeenCalledTimes(1);
+  });
+
+  // Review of the sidebar host (S5).
+  it('explains DOCKER_HOST first instead of offering choices that are refused', async () => {
+    env.DOCKER_HOST = 'ssh://build-box';
+    commands = create();
+    await commands.chooseDockerHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.variableSet('DOCKER_HOST'));
+  });
+
+  it('changes nothing when the choice is cancelled', async () => {
+    const useRemote = vi.spyOn(commands, 'useRemoteHost');
+    const useLocal = vi.spyOn(commands, 'useLocalDocker');
+    await commands.chooseDockerHost();
+    expect(useRemote).not.toHaveBeenCalled();
+    expect(useLocal).not.toHaveBeenCalled();
+    expect(cli.changes).toEqual([]);
   });
 });
 

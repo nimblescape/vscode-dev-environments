@@ -625,7 +625,10 @@ describe('open: existing environment', () => {
     h.helper.up = async (p) => {
       // For example postCreateCommand of a new container: longer than a pending file counts (concept 7.9).
       const before = writes;
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      // PR #52 CI (a busy runner delayed the 5 ms timer): the step lasts until three refreshes ran, at most 5 s, instead
+      // of a fixed 60 ms; the assertion below is unchanged.
+      const until = Date.now() + 5_000;
+      while (writes - before < 3 && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
       writesDuringUp = writes - before;
       return originalUp(p);
     };

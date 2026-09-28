@@ -152,3 +152,52 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
     expect(cli.calls.find((call) => call.args[0] === 'ps')?.options.env).not.toHaveProperty('DOCKER_CONTEXT');
   });
 });
+
+// User request 2026-09-28: the view shows the Docker host of every read.
+describe('DockerTargets.onDidResolve', () => {
+  it('gives every read target to the listener until it is removed', async () => {
+    const { targets, cli } = setup();
+    const seen: string[] = [];
+    const remove = targets.onDidResolve((target) => seen.push(`${target.kind}:${target.host}`));
+    await targets.resolve();
+    cli.context = 'devenv-remote';
+    await targets.resolve();
+    remove();
+    await targets.resolve();
+    expect(seen).toEqual(['local:', 'remote:box']);
+  });
+
+  it('keeps reading when a listener throws, and tells the others', async () => {
+    const { targets } = setup();
+    const seen: string[] = [];
+    targets.onDidResolve(() => {
+      throw new Error('broken');
+    });
+    targets.onDidResolve((target) => seen.push(target.kind));
+    await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local' });
+    expect(seen).toEqual(['local']);
+  });
+});
+
+// Review of the sidebar host (S4): of overlapping reads, the one that started last wins.
+describe('DockerTargets.resolve with overlapping reads', () => {
+  it('does not let an older read that finishes later overwrite a newer one', async () => {
+    const results = [
+      { exitCode: 0, stdout: JSON.stringify({ Name: 'default', Endpoints: { docker: { Host: 'unix:///var/run/docker.sock' } } }), stderr: '', timedOut: false },
+      { exitCode: 0, stdout: JSON.stringify({ Name: 'devenv-remote', Endpoints: { docker: { Host: 'ssh://box' } } }), stderr: '', timedOut: false },
+    ];
+    const gates: Array<(value: RunResult) => void> = [];
+    const docker = { isInstalled: () => true, run: async (): Promise<RunResult> => new Promise<RunResult>((resolve) => gates.push(resolve)) };
+    const targets = new DockerTargets(docker, {}, silentLogger, 'linux');
+    const seen: string[] = [];
+    targets.onDidResolve((target) => seen.push(target.host));
+    const older = targets.resolve();
+    const newer = targets.resolve();
+    gates[1](results[1]);
+    await newer;
+    gates[0](results[0]);
+    await expect(older).resolves.toMatchObject({ kind: 'local' });
+    expect(seen).toEqual(['box']);
+    expect(targets.last?.host).toBe('box');
+  });
+});
