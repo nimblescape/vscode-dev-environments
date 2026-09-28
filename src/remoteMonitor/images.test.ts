@@ -91,6 +91,10 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: JSON.stringify(PREFIXES) })).toEqual(PREFIXES);
     expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: 'not json' })).toEqual([]);
     expect(prefixesFromEnv({})).toEqual([]);
+    // Review round 5 of PR #57 (P1): at most 50, as the monitor takes with `settings -`.
+    const many = Array.from({ length: 60 }, (_, index) => `ghcr.io/acme/image-${index}*`);
+    expect(imagePrefixesOf(many)).toHaveLength(50);
+    expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: JSON.stringify(many) })).toHaveLength(50);
   });
 
   it('takes the highest plain major tag (the registry has latest, 2, 2.0, 2.0.14, 2.0.14-amd64)', () => {

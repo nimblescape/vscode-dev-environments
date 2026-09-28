@@ -583,6 +583,7 @@
         "devEnvLauncher.remoteImageUpdates": {
           "type": "array",
           "scope": "application",
+          "maxItems": 50,
           "items": {
             "type": "string",
             "pattern": "^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]*\\*?$"
@@ -591,7 +592,7 @@
             "ghcr.io/majikmate/devcontainer-classroom*",
             "ghcr.io/majikmate/devcontainer-dev*"
           ],
-          "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all packages of the owner, read with your GitHub sign-in), one minute after it starts and then by Remote Image Update Schedule (default every day at 06:07), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off."
+          "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all public packages of the owner, read with your GitHub sign-in), one minute after it starts and then by Remote Image Update Schedule (default every day at 06:07), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off; at most 50 patterns."
         },
         "devEnvLauncher.remoteImageUpdateSchedule": {
           "type": "string",

@@ -210,10 +210,15 @@ export function isImagePrefix(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) && !value.includes('..');
 }
 
-/** The prefixes of the setting remoteImageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. */
+/**
+ * The prefixes of the setting remoteImageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. Review
+ * round 5 of PR #57 (P1): at most MAX_IMAGE_PREFIXES, as the monitor takes (`settings -`); before, more were sent and
+ * refused at every open.
+ */
 export function imagePrefixesOf(patterns: readonly unknown[]): string[] {
   const prefixes: string[] = [];
   for (const pattern of patterns) {
+    if (prefixes.length >= MAX_IMAGE_PREFIXES) break;
     if (typeof pattern !== 'string') continue;
     const prefix = pattern.trim().replace(/\*$/, '');
     if (isImagePrefix(prefix) && !prefixes.includes(prefix)) prefixes.push(prefix);

@@ -29,7 +29,7 @@ import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
 import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
-import { DEFAULT_IMAGE_SCHEDULE } from '../core/remoteMonitor/cron';
+import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
 import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
 import { MAX_IMAGE_REPOSITORIES, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
@@ -197,7 +197,8 @@ async function activateExtension(
   const imageMaintenance = () => ({
     prefixes: imagePrefixesOf(getSettings().remoteImageUpdates ?? []),
     schedule: getSettings().remoteImageUpdateSchedule ?? DEFAULT_IMAGE_SCHEDULE,
-    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
+    timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
   });
   const sendImageSettings = async (host: string): Promise<void> => {
     const settings = imageMaintenance();

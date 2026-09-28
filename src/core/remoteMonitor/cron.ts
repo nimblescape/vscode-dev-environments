@@ -88,6 +88,14 @@ export function isTimeZone(value: string | undefined): value is string {
   }
 }
 
+/**
+ * The time zone of this computer for the monitor: `zone` when it is one that Node.js knows, else UTC. Review round 5 of
+ * PR #57 (P2): Node.js names an unknown zone (an empty TZ) `Etc/Unknown`, which the monitor refused at every open.
+ */
+export function usableTimeZone(zone: string | undefined): string {
+  return isTimeZone(zone) ? zone : 'UTC';
+}
+
 /** The wall clock of `time` in `timeZone`, as if it were UTC (ms). */
 function wallClock(time: number, timeZone: string): number {
   const parts: Record<string, number> = {};

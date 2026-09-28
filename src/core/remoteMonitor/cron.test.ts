@@ -4,7 +4,7 @@
 
 // User request 2026-09-28: "a setting that tells the monitor to fetch in a guided cron style manner".
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_IMAGE_SCHEDULE, isTimeZone, nextCronTime, parseCronSchedule, type CronSchedule } from './cron';
+import { DEFAULT_IMAGE_SCHEDULE, isTimeZone, nextCronTime, parseCronSchedule, usableTimeZone, type CronSchedule } from './cron';
 
 const at = (iso: string) => Date.parse(iso);
 const next = (iso: string, text: string, timeZone = 'Europe/Vienna') => {
@@ -174,6 +174,13 @@ describe('the cron schedule of the image updates', () => {
       '2026-10-25T03:30:00.000Z',
     ]);
     expect(next('2026-10-25T00:40:00Z', '30 * * * *', 'Antarctica/Troll')).toBe('2026-10-25T01:30:00.000Z');
+  });
+
+  // Review round 5 of PR #57 (P2): Node.js names an unknown zone (an empty TZ) `Etc/Unknown`.
+  it('takes UTC for a time zone that Node.js does not know', () => {
+    expect(usableTimeZone('Europe/Vienna')).toBe('Europe/Vienna');
+    expect(usableTimeZone('Etc/Unknown')).toBe('UTC');
+    expect(usableTimeZone(undefined)).toBe('UTC');
   });
 
   // Moved from src/remoteMonitor/images.test.ts with the same expectations.
