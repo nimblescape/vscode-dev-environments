@@ -584,7 +584,8 @@ describe('Controller commands', () => {
     // 29 since unit 7: Use a Remote Docker Host… and Use the Local Docker.
     // 30 since unit 7, PR 2: Close and Keep Running.
     // 31 with the command of a repository row (hidden): a double-click runs Start (user request 2026-09-27).
-    expect(declared).toHaveLength(31);
+    // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
+    expect(declared).toHaveLength(32);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -723,6 +724,11 @@ describe('Controller commands', () => {
 
   it('shows the log', async () => {
     await run('showLog');
+    expect(h.logger.show).toHaveBeenCalled();
+  });
+
+  it('shows the log for the link Show details of a progress notification, also with an unknown operation (user decision 2026-09-28)', async () => {
+    await run('showProgressDetails', 12345);
     expect(h.logger.show).toHaveBeenCalled();
   });
 });

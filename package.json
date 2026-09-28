@@ -278,6 +278,11 @@
         "command": "devEnvironments.rowActivated",
         "title": "Start on Double-Click",
         "category": "Dev Environments"
+      },
+      {
+        "command": "devEnvironments.showProgressDetails",
+        "title": "Show Details of the Progress",
+        "category": "Dev Environments"
       }
     ],
     "submenus": [
@@ -339,6 +344,10 @@
         },
         {
           "command": "devEnvironments.rowActivated",
+          "when": "false"
+        },
+        {
+          "command": "devEnvironments.showProgressDetails",
           "when": "false"
         }
       ],
