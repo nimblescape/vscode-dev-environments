@@ -828,6 +828,16 @@ describe('Start', () => {
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
+  // Review round 4 (test gap): a local environment never names a context, also when the other window's status has one.
+  it('shows the other window of a local environment without a context', async () => {
+    await h.registry.add(environment());
+    h.coordinator.otherActiveWindows.mockResolvedValue([
+      { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: ENV_ID, state: 'active', updatedAt: iso(NOW), dockerContext: 'devenv-remote-11111111' },
+    ]);
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.open.mock.calls).toEqual([[CONTAINER, '/workspaces/api']]);
+  });
+
   it('starts the environment when the other window has lost its connection (the row shows Stopped)', async () => {
     const env = environment();
     await h.registry.add(env);
@@ -3411,6 +3421,71 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     ]);
   });
 
+  /** DockerTargets as in the beforeEach: the operation runs on the target that is current when it starts. */
+  function pinnedTargets(): ControllerDeps['dockerTargets'] {
+    return {
+      resolve: vi.fn(async () => current),
+      current: vi.fn(async () => current),
+      withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => runWithDockerTarget(current, fn)),
+    } as unknown as ControllerDeps['dockerTargets'];
+  }
+
+  // Review round 4 (test gaps): each step of windowArgs decides on its own.
+  it('names the context of the operation, not the current one, when both are on the host', async () => {
+    current = dockerTargetOf('ssh://build-box', 'my-build-box');
+    await h.registry.add(remoteEnvironment());
+    h.service.openEnvironment.mockImplementation(async (id: string) => {
+      current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+      return openResult((await h.registry.get(id))!);
+    });
+    await run('start', row('acme/api', remoteEnvironment()));
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box');
+  });
+
+  it('the reload for the owner account keeps the context of the window (outside an operation)', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    recreateHarness({ leaveCheckMs: 100, dockerTargets: pinnedTargets(), remoteDocker: remote });
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    h.connection.currentContainerName.mockReturnValue(env.containerName);
+    h.connection.currentDockerContext.mockReturnValue('my-build-box');
+    await connectHere(env);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    h.auth.getAccount.mockResolvedValue(ACCOUNT);
+    await h.controller.onSessionChanged();
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box');
+  });
+
+  it('the reload for the owner account names the created context when the current one is on another host', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
+    recreateHarness({ leaveCheckMs: 100, dockerTargets: pinnedTargets(), remoteDocker: remote });
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    h.connection.currentContainerName.mockReturnValue(env.containerName);
+    h.connection.currentDockerContext.mockReturnValue('devenv-remote-11111111');
+    await connectHere(env);
+    h.connection.currentDockerContext.mockReturnValue(undefined);
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    h.auth.getAccount.mockResolvedValue(ACCOUNT);
+    await h.controller.onSessionChanged();
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', remoteContextName('build-box'));
+  });
+
+  it('a restored window whose pipeline failed does not move to another authority', async () => {
+    current = dockerTargetOf('ssh://build-box', 'devenv-remote');
+    const env = remoteEnvironment();
+    await h.registry.add(env);
+    h.service.openEnvironment.mockRejectedValue(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    await h.controller.openAttachedWindow(env, env.containerName, undefined);
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.connection.reopenWithDockerContext).not.toHaveBeenCalled();
+  });
+
   // Review of the attach context (A1): outside an operation, the context comes from this window's own authority, then
   // from the current context on that host, then from "Use a Remote Docker Host…".
   it('outside an operation keeps the context of the window, else the current one on the host, else the created one', async () => {
@@ -3424,7 +3499,9 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     recreateHarness({ dockerTargets: withoutOperation as unknown as ControllerDeps['dockerTargets'], remoteDocker: remote });
     await h.registry.add(env);
     const pending = { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) };
-    // 1. The window's own authority names a context that the user made: it stays.
+    // 1. The window's own authority names a context that the user made: it stays (moveToContextAuthority moves only a
+    // window without a context; the own-authority step of windowArgs is covered by the owner-account reload tests).
+    // Review round 4.
     current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
     h.connection.currentContainerName.mockReturnValue(env.containerName);
     h.connection.currentDockerContext.mockReturnValue('my-build-box');
