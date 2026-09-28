@@ -162,9 +162,15 @@ export interface ControllerDeps {
     reopenCheckDelayMs?: number;
     disconnectAnswerMs?: number;
     busyPollMs?: number;
+    /** User decision 2026-09-28: the pause between the checks of the container before the window connects. */
+    readyPollMs?: number;
   };
 }
 
+
+/** User decision 2026-09-28: the checks of the container before the window connects (requireReadyForWindow). */
+const READY_CHECKS = 5;
+const READY_POLL_MS = 1_000;
 /** What a command works on. */
 interface Target {
   /** `owner/name` as the command received it. */
@@ -1283,6 +1289,7 @@ export class Controller implements vscode.Disposable {
         : new UserFacingError('signInRequired', Messages.signInRequired);
     }
     progress.step('connecting');
+    await this.requireReadyForWindow(result.environment, result.containerName);
     await this.deps.coordinator.writePending(result.environment.id);
     if (request.newWindow) {
       await this.deps.connection.openInNewWindow(result.containerName, result.remoteWorkspaceFolder);
@@ -2432,6 +2439,34 @@ export class Controller implements vscode.Disposable {
 
   private owner(): { windowId: string; pid: number } {
     return { windowId: this.deps.coordinator.windowId, pid: process.pid };
+  }
+
+  /**
+   * User decision 2026-09-28: the window connects only to a container that the Docker of the window finds running. The
+   * Dev Containers extension of the window attaches through the current Docker context, and reports a container that it
+   * does not find as one that "no longer exists". So right before the window connects: the current Docker context is
+   * still on the host of the environment (another window or Docker Desktop may have changed it while the pipeline ran),
+   * and the container answers as running (a few checks, 1 s apart, for an engine that answers late). Otherwise the
+   * window does not connect, with a message.
+   */
+  private async requireReadyForWindow(environment: Environment, containerName: string): Promise<void> {
+    const repository = this.displayName({ repository: environment.repository });
+    if (this.deps.dockerTargets) {
+      const current = await this.deps.dockerTargets.resolve();
+      if (!isOnDockerHost(environment, current.host)) {
+        const environmentHost = dockerHostOf(environment);
+        this.logger.warn(
+          `${repository} is not connected: Docker is set to ${describeDockerHost(current.host)} now, the container runs on ${describeDockerHost(environmentHost)}.`,
+        );
+        throw new UserFacingError('otherDockerHost', Messages.otherDockerHost(repository, environmentHost, current.host));
+      }
+    }
+    for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
+      if (await this.containerRuns(containerName)) return;
+      if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS);
+    }
+    this.logger.warn(`${repository} is not connected: the container ${containerName} does not answer as running.`);
+    throw new UserFacingError('startFailed', Messages.containerNotReady(repository, containerName));
   }
 
   private delay(ms: number): Promise<void> {

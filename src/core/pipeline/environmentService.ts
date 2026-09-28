@@ -2234,6 +2234,9 @@ export class EnvironmentService {
         onOutput: this.output,
         signal: ctx.signal,
       });
+      // User decision 2026-09-28: the container is made only from an image that the engine has (a build that ended
+      // without its image, for example on a remote host whose connection broke at the end, is a failed build).
+      if (!(await this.deps.docker.imageExists(imageName))) throw new Error(`The environment image ${imageName} is missing after the build.`);
     } catch (error) {
       return this.updateFailed(ctx, error, canFallBack, plan.check);
     }
