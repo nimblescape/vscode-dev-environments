@@ -6,7 +6,8 @@
 
 User requests 2026-09-28: a monitor for the states of a window, all on the frame of the codicon `vm` at the same place:
 switched off (the silhouette) while stopped, switched on (the screen filled inside a line of 1) in another window,
-switched on with a smaller connection sign (of `vm-connect`) in this window. An icon font instead of SVG files (review
+switched on with a smaller connection sign (of `vm-connect`) in this window; the header row of the Docker host shows the
+monitor switched off, with the sign for a remote host. An icon font instead of SVG files (review
 round 2 of PR #59, K1): VS Code colors its glyphs like the codicons (theme, selected row, high contrast).
 
 Needs `pip install fonttools skia-pathops`. Run: python3 scripts/build-icon-font.py (writes the font and, for review,
@@ -58,8 +59,12 @@ GLYPHS = [
     ("monitorOff", 0xE001, "devenv-monitor-off"),
     ("monitorOn", 0xE002, "devenv-monitor-on"),
     ("monitorConnected", 0xE003, "devenv-monitor-connected"),
+    # User request 2026-09-28: the header row of a remote Docker host, the monitor switched off with the connection sign.
+    ("monitorRemote", 0xE004, "devenv-monitor-remote"),
 ]
 UNITS_PER_EM = 1000
+# Seconds since 1904-01-01 (the epoch of the head table): 2026-09-28 00:00 UTC.
+FIXED_TIMESTAMP = 3873398400
 SCALE = UNITS_PER_EM / 16
 
 
@@ -84,7 +89,9 @@ def glyphs():
     badge = path_of(BADGE, pathops.FillType.EVEN_ODD, (s, 0, 0, s, BADGE_CENTRE - 11.5 * s, BADGE_CENTRE - 11.5 * s))
     cut = pathops.op(on, path_of(circle(BADGE_CENTRE, BADGE_CENTRE, CLEARANCE)), pathops.PathOp.DIFFERENCE, fix_winding=True)
     connected = pathops.op(cut, badge, pathops.PathOp.UNION, fix_winding=True)
-    return {"monitorOff": frame, "monitorOn": on, "monitorConnected": connected}
+    frame_cut = pathops.op(frame, path_of(circle(BADGE_CENTRE, BADGE_CENTRE, CLEARANCE)), pathops.PathOp.DIFFERENCE, fix_winding=True)
+    remote = pathops.op(frame_cut, badge, pathops.PathOp.UNION, fix_winding=True)
+    return {"monitorOff": frame, "monitorOn": on, "monitorConnected": connected, "monitorRemote": remote}
 
 
 def svg_of(path):
@@ -137,6 +144,9 @@ def main():
     fb.setupNameTable({"familyName": "Dev Environments Icons", "styleName": "Regular"})
     fb.setupOS2(sTypoAscender=UNITS_PER_EM, sTypoDescender=0, usWinAscent=UNITS_PER_EM, usWinDescent=0)
     fb.setupPost()
+    # Review round 3 of PR #59 (L4): a fixed time in the head table, so a rebuild of the same glyphs gives the same file.
+    fb.font["head"].created = fb.font["head"].modified = FIXED_TIMESTAMP
+    fb.font.recalcTimestamp = False
     fb.font.flavor = "woff"
     fb.save(os.path.join(ROOT, "resources", "icons", "devenv-icons.woff"))
 

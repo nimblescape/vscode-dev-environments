@@ -417,6 +417,7 @@ flowchart LR
 | `contributes.commands`, `contributes.keybindings`, `contributes.menus` | Start, Stop, Delete, Switch branch, Select configuration, Rebuild, Switch environment, Refresh, Edit Repository Groups… | Command Palette, switcher, menus. The buttons of the Docker setup in the view (install, WSL 2) and Start Docker (after an installation, and the action of the message "Docker is not running." in a local window) are commands too, hidden in the Command Palette. |
 | `contributes.viewsWelcome` | The Docker setup while `devEnvironments.dockerSetupRequired` (intro; on Windows WSL 2 with **Install WSL 2** or "✓ WSL 2 is installed."; **Install Docker** per platform with `isMac`, `isWindows`, `isLinux`; "After the installation…"), Sign in with GitHub, then loading, empty list, and list not loaded (these three only while the setup is not required) | Welcome texts of the empty view (see [6.1](#61-first-start)) |
 | `contributes.configuration` | Settings of section [8](#8-settings) | |
+| `contributes.icons` | `devenv-monitor-off`, `devenv-monitor-on`, `devenv-monitor-connected` from `resources/icons/devenv-icons.woff` | The monitors of the states (see 6.2), in the sidebar, the switcher, and the status bar |
 
 ### 7.4 Repository discovery
 

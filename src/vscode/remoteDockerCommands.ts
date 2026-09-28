@@ -31,6 +31,7 @@ import { Actions, Messages, dockerHostReason } from '../core/messages';
 import { isAbortError, type Logger, type ProcessRunner } from '../core/ports';
 import type { SshHostEntry } from '../core/sshConfig';
 import type { DockerHostQuestion, RemoteDockerState } from '../core/storage/remoteDockerState';
+import { MonitorIcons } from './treeModel';
 
 /** User-visible texts of the remote Docker host (plain language). No `vscode` in them. */
 export const RemoteDockerTexts = {
@@ -321,7 +322,7 @@ export class RemoteDockerCommands {
       items.push(
         options.localIsCurrent
           ? { label: `$(check) ${RemoteDockerTexts.useLocal}`, description: RemoteDockerTexts.current, local: true }
-          : { label: `$(vm) ${RemoteDockerTexts.useLocal}`, local: true },
+          : { label: `$(${MonitorIcons.off}) ${RemoteDockerTexts.useLocal}`, local: true },
       );
     }
     const picked = await vscode.window.showQuickPick(items, {

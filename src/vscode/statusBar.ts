@@ -46,13 +46,13 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     this.item.show();
   }
 
-  /** `$(vm) owner/name · branch`; select → switcher. */
+  /** `$(devenv-monitor-connected) owner/name · branch`; select → switcher. */
   showConnected(repository: string, branch: string | undefined): void {
     this.base = { kind: 'connected', repository, branch: branch?.trim() || undefined };
     this.render();
   }
 
-  /** `$(vm) Open environment…`; select → switcher. */
+  /** `$(devenv-monitor-off) Open environment…`; select → switcher. */
   showNotConnected(): void {
     this.base = { kind: 'notConnected' };
     this.render();

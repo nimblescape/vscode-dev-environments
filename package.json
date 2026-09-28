@@ -47,6 +47,10 @@
       "devenv-monitor-connected": {
         "description": "Dev Environments: the environment of this window (a monitor switched on, with the connection sign).",
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E003" }
+      },
+      "devenv-monitor-remote": {
+        "description": "Dev Environments: a remote Docker host (a monitor switched off, with the connection sign).",
+        "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E004" }
       }
     },
     "viewsContainers": {

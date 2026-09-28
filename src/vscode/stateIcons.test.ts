@@ -38,7 +38,8 @@ describe('the monitor icons of the states', () => {
   it('are contributed with a character of the Private Use Area each, in the font of the package', () => {
     const icons = contributedIcons();
     expect(Object.keys(icons).sort()).toEqual(Object.values(MonitorIcons).sort());
-    expect(Object.values(icons).map((icon) => icon.default.fontCharacter)).toEqual(['\\E001', '\\E002', '\\E003']);
+    // User request 2026-09-28: a fourth monitor for the header row of a remote Docker host.
+    expect(Object.values(icons).map((icon) => icon.default.fontCharacter)).toEqual(['\\E001', '\\E002', '\\E003', '\\E004']);
     for (const icon of Object.values(icons)) expect(icon.default.fontPath).toBe(`./${FONT}`);
     const font = fs.readFileSync(path.join(ROOT, FONT));
     expect(font.subarray(0, 4).toString('latin1')).toBe('wOFF');

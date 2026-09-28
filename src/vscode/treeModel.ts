@@ -228,6 +228,8 @@ export const MonitorIcons = {
   off: 'devenv-monitor-off',
   on: 'devenv-monitor-on',
   connected: 'devenv-monitor-connected',
+  /** User request 2026-09-28: the header row of a remote Docker host. */
+  remote: 'devenv-monitor-remote',
 } as const;
 
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
@@ -254,7 +256,6 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
 }
-
 
 /** State text of concept 6.2, for example `Connected · other window`. */
 export function stateText(state: EnvironmentState): string {

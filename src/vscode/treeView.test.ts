@@ -159,7 +159,8 @@ describe('RepositoriesTreeProvider', () => {
     const item = provider.getTreeItem(host) as unknown as TreeItem;
     expect(item.label).toBe('Remote Docker host: htldvmhn');
     // User request 2026-09-28 ("use the remote monitor icon"): the monitor with the remote badge (it was `remote`).
-    expect((item.iconPath as ThemeIcon).id).toBe('remote-explorer');
+    // User request 2026-09-28 ("remote unfilled with connect icon"): the switched-off monitor with the connection sign.
+    expect((item.iconPath as ThemeIcon).id).toBe('devenv-monitor-remote');
     expect(item.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
     expect(item.contextValue).toBe('dockerHost');
     expect(provider.getParent(host)).toBeUndefined();
@@ -184,7 +185,8 @@ describe('RepositoriesTreeProvider', () => {
     const localItem = provider.getTreeItem(local) as unknown as TreeItem;
     expect(localItem.label).toBe('Local Docker');
     expect(localItem.label).toBe(DockerHostRowTexts.label({ kind: 'local', host: '' }));
-    expect((localItem.iconPath as ThemeIcon).id).toBe('vm');
+    // User request 2026-09-28 ("local unfilled"): the switched-off monitor of the sidebar.
+    expect((localItem.iconPath as ThemeIcon).id).toBe('devenv-monitor-off');
     expect(localItem.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
     expect(localItem.tooltip).toBe('Docker runs on this computer. Click to use a remote Docker host.');
     provider.setDockerHost({ kind: 'unsupported', host: 'tcp://192.0.2.10:2376' });

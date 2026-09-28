@@ -347,7 +347,8 @@ describe('Choose the Docker Host… (the choice of the first row)', () => {
       ['', undefined],
       [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
       ['', undefined],
-      [`$(vm) ${RemoteDockerTexts.useLocal}`, undefined],
+      // User request 2026-09-28: the switched-off monitor of the local Docker (header row).
+      [`$(devenv-monitor-off) ${RemoteDockerTexts.useLocal}`, undefined],
     ]);
     expect(options.title).toBe('Docker host: build-box');
   });
@@ -389,7 +390,8 @@ describe('Choose the Docker Host… (the choice of the first row)', () => {
     await commands.chooseDockerHost();
     expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('build-box'));
     expect(cli.current).toBe(BUILD_BOX);
-    answer(`$(vm) ${RemoteDockerTexts.useLocal}`);
+    // User request 2026-09-28: the switched-off monitor of the local Docker (header row).
+    answer(`$(devenv-monitor-off) ${RemoteDockerTexts.useLocal}`);
     await commands.chooseDockerHost();
     expect(useLocal).toHaveBeenCalledTimes(1);
   });
