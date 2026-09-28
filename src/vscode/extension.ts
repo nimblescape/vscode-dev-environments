@@ -261,7 +261,7 @@ async function activateExtension(
   context.subscriptions.push(tree, view, statusBar);
   // User requests 2026-09-28: the view's title and its first row name the Docker host (also the local Docker).
   const dockerHostIndicator = new DockerHostIndicator(view, logger, (host) => tree.setDockerHost(host));
-  context.subscriptions.push({ dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target)) });
+  context.subscriptions.push({ dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target, docker.isInstalled())) });
   // Concept 6.1 step 2: while no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the
   // repositories. User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the
   // repositories shall not be shown, instead, the side view shall show the install docker wizard".

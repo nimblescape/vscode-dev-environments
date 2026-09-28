@@ -22,6 +22,8 @@ export const DockerHostTexts = {
   localTitle: 'Local Docker',
   /** The view's title for an endpoint that is not supported. */
   unsupportedTitle: (endpoint: string) => `${endpoint} (not supported)`,
+  /** Review round 3 of the sidebar host (G1): the view name of package.json, while no Docker CLI is found. */
+  noDockerTitle: 'Dev Environments',
 } as const;
 
 /** The part of the TreeView that the indicator sets. */
@@ -31,20 +33,30 @@ export interface DescribedView {
 }
 
 export class DockerHostIndicator {
-  private shown: ShownDockerHost | undefined;
+  private shown: (ShownDockerHost & { installed: boolean }) | undefined;
 
   constructor(
     private readonly view: DescribedView,
     private readonly logger: Logger,
     /** User report 2026-09-28: the first row of the list names the Docker host (treeView.ts, DockerHostRow). */
-    private readonly showHostRow: (host: ShownDockerHost) => void = () => {},
+    private readonly showHostRow: (host: ShownDockerHost | undefined) => void = () => {},
   ) {}
 
-  /** Shows `target`: the local Docker, a remote host, or an endpoint that is not supported. */
-  update(target: DockerTarget): void {
+  /**
+   * Shows `target`: the local Docker, a remote host, or an endpoint that is not supported. `installed` false (no Docker
+   * CLI found; the target then reads as the local Docker): no Docker host at all (review round 3 of the sidebar host,
+   * G1: the header said "Local Docker" above the Docker setup).
+   */
+  update(target: DockerTarget, installed = true): void {
     const shown: ShownDockerHost = { kind: target.kind, host: target.kind === 'local' ? '' : target.host };
-    if (this.shown && this.shown.kind === shown.kind && this.shown.host === shown.host) return;
-    this.shown = shown;
+    if (this.shown && this.shown.kind === shown.kind && this.shown.host === shown.host && this.shown.installed === installed) return;
+    this.shown = { ...shown, installed };
+    if (!installed) {
+      this.view.description = undefined;
+      this.view.title = DockerHostTexts.noDockerTitle;
+      this.showHostRow(undefined);
+      return;
+    }
     this.view.description = shown.kind === 'remote' ? DockerHostTexts.remote(shown.host) : undefined;
     this.view.title =
       shown.kind === 'remote'

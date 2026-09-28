@@ -352,6 +352,22 @@ describe('Choose the Docker Host… (the choice of the first row)', () => {
     expect(options.title).toBe('Docker host: build-box');
   });
 
+  // Review round 3 of the sidebar host (G2): a host entered as an SSH address is no alias of the SSH config; it is the
+  // first entry then, marked, and choosing it says that it is the current host already.
+  it('marks a current host that was entered as an SSH address', async () => {
+    const typed = remoteContextName('me@box:2222');
+    cli.contexts.set(typed, 'ssh://me@box:2222');
+    cli.current = typed;
+    await commands.chooseDockerHost();
+    const [items] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>];
+    expect(items[0]).toMatchObject({ label: '$(check) me@box:2222', description: RemoteDockerTexts.current });
+    expect(items.filter((item) => item.label.startsWith('$(check)'))).toHaveLength(1);
+    answer('$(check) me@box:2222');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('me@box:2222'));
+    expect(cli.current).toBe(typed);
+  });
+
   // User request 2026-09-28 (the first row also for the local Docker): the same choice there, the local Docker marked.
   it('marks the local Docker as current when Docker is local', async () => {
     await commands.chooseDockerHost();

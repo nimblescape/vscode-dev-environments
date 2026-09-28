@@ -308,6 +308,11 @@ export class RemoteDockerCommands {
       if (entry.alias !== options.currentHost) return { label: entry.alias, description, host: entry.alias };
       return { label: `$(check) ${entry.alias}`, description: description ? `${description} · ${RemoteDockerTexts.current}` : RemoteDockerTexts.current, host: entry.alias };
     });
+    // Review round 3 of the sidebar host (G2): a current host that is no alias of the SSH config (an address entered
+    // with "Enter an SSH address…") is the first entry, marked, so the current choice is always marked.
+    if (options.currentHost !== undefined && !hosts.some((entry) => entry.alias === options.currentHost)) {
+      items.unshift({ label: `$(check) ${options.currentHost}`, description: RemoteDockerTexts.current, host: options.currentHost });
+    }
     if (items.length > 0) items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
     items.push({ label: RemoteDockerTexts.enterAddress, description: RemoteDockerTexts.enterAddressDetail });
     if (options.offerLocal) {

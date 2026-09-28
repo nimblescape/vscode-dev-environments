@@ -40,6 +40,21 @@ describe('DockerHostIndicator', () => {
     expect(view.title).toBe('tcp://192.0.2.10:2376 (not supported)');
   });
 
+  // Review round 3 of the sidebar host (G1): without a Docker CLI the target reads as the local Docker; the header then
+  // names no Docker host (it said "Local Docker" above the Docker setup), and the list has no host row.
+  it('names no Docker host while no Docker CLI is found, and names it again once one is', () => {
+    const view: { description?: string; title?: string } = {};
+    const rows: Array<ShownDockerHost | undefined> = [];
+    const indicator = new DockerHostIndicator(view, silentLogger, (host) => rows.push(host));
+    indicator.update(LOCAL_DOCKER_TARGET, false);
+    expect(view.title).toBe('Dev Environments');
+    expect(view.description).toBeUndefined();
+    indicator.update(LOCAL_DOCKER_TARGET, false);
+    indicator.update(LOCAL_DOCKER_TARGET, true);
+    expect(view.title).toBe('Local Docker');
+    expect(rows).toEqual([undefined, { kind: 'local', host: '' }]);
+  });
+
   // User request 2026-09-28 ("the icon can then go away"): no context key of a title-bar icon is set anymore.
   it('sets no context key', () => {
     new DockerHostIndicator({}, silentLogger).update(dockerTargetOf('ssh://machines', 'a'));
@@ -49,7 +64,7 @@ describe('DockerHostIndicator', () => {
   // User report 2026-09-28: the first row of the list names the Docker host (the merged header did not show it); user
   // request 2026-09-28: also the local Docker.
   it('gives the list the Docker host for its first row, and only when it changed', () => {
-    const rows: ShownDockerHost[] = [];
+    const rows: Array<ShownDockerHost | undefined> = [];
     const indicator = new DockerHostIndicator({}, silentLogger, (host) => rows.push(host));
     indicator.update(dockerTargetOf('ssh://htldvmhn', 'devenv-remote-2e9f507b'));
     indicator.update(dockerTargetOf('ssh://htldvmhn', 'devenv-remote-2e9f507b'));
