@@ -14,6 +14,8 @@ import {
   heartbeatDir,
   imageScheduleFromEnv,
   imageTimesFromEnv,
+  CurrentImageSettings,
+  ImageSchedule,
   main,
   readImageList,
   parseContainerLines,
@@ -396,12 +398,115 @@ describe('monitor.js images', () => {
   });
 
   // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
-  it('passes one minute after the start, then daily; the Docker tests can set a fixed interval', () => {
+  it('passes one minute after the start, then by the schedule; the Docker tests can set a fixed interval', () => {
     expect(imageTimesFromEnv({})).toEqual({ firstMs: 60_000, intervalMs: undefined });
     expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '500', DEVENV_IMAGE_INTERVAL_MS: '2000' })).toEqual({ firstMs: 500, intervalMs: 2000 });
     expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '5', DEVENV_IMAGE_INTERVAL_MS: 'x' })).toEqual({ firstMs: 60_000, intervalMs: undefined });
-    expect(imageScheduleFromEnv({})).toEqual({ hour: 6, minute: 7, timeZone: 'Europe/Vienna' });
-    expect(imageScheduleFromEnv({ DEVENV_IMAGE_TIME: '05:30', DEVENV_IMAGE_TZ: 'America/New_York' })).toEqual({ hour: 5, minute: 30, timeZone: 'America/New_York' });
-    expect(imageScheduleFromEnv({ DEVENV_IMAGE_TIME: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ hour: 6, minute: 7, timeZone: 'Europe/Vienna' });
+    // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule.
+    const scheduleOf = (env: NodeJS.ProcessEnv) => {
+      const { text, timeZone } = imageScheduleFromEnv(env);
+      return { text, timeZone };
+    };
+    expect(scheduleOf({})).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5', DEVENV_IMAGE_TZ: 'America/New_York' })).toEqual({ text: '30 5 * * 1-5', timeZone: 'America/New_York' });
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(imageScheduleFromEnv({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5' }).schedule.weekdays).toEqual(new Set([1, 2, 3, 4, 5]));
+  });
+});
+
+// Review round 1 of PR #57 (C): the settings of the image maintenance come with `settings -`, not with the label; the
+// schedule is a cron expression (user request 2026-09-28, "in a guided cron style manner").
+describe('the settings and the schedule of the image maintenance', () => {
+  const SETTINGS = { prefixes: ['ghcr.io/acme/base'], schedule: '0 5 * * 1-5', timeZone: 'America/New_York' };
+  const ENV = { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/majikmate/devcontainer-dev']), DEVENV_IMAGE_SCHEDULE: '7 6 * * *', DEVENV_IMAGE_TZ: 'Europe/Vienna' };
+
+  async function settings(input: string): Promise<number> {
+    return main(['settings', '-'], { env: {}, stateDir, readStdin: async () => input, err: () => {} });
+  }
+
+  it('stores valid settings; the monitor takes them instead of those of its container at the next check', async () => {
+    const log: string[] = [];
+    const current = new CurrentImageSettings(ENV, stateDir, (message) => log.push(message));
+    await current.refresh();
+    expect(current.value).toMatchObject({ prefixes: ['ghcr.io/majikmate/devcontainer-dev'], schedule: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    await current.refresh();
+    expect(current.value).toMatchObject(SETTINGS);
+    expect(current.value.cron.hours).toEqual(new Set([5]));
+    expect(log).toEqual(['Image update settings: ghcr.io/acme/base; at "0 5 * * 1-5" (cron, America/New_York).']);
+    // Unchanged: no second log line.
+    await current.refresh();
+    expect(log).toHaveLength(1);
+  });
+
+  it('refuses anything else and keeps the stored settings', async () => {
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    for (const input of [
+      'not json',
+      '{}',
+      JSON.stringify({ ...SETTINGS, schedule: '61 5 * * *' }),
+      JSON.stringify({ ...SETTINGS, schedule: '05:00' }),
+      JSON.stringify({ ...SETTINGS, timeZone: 'Mars/Base' }),
+      JSON.stringify({ ...SETTINGS, prefixes: ['ubuntu*'] }),
+      JSON.stringify({ ...SETTINGS, extra: 1 }),
+    ]) {
+      expect(await settings(input), input).toBe(EXIT_INVALID);
+    }
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    await current.refresh();
+    expect(current.value).toMatchObject(SETTINGS);
+  });
+
+  it('runs a pass when a time of the schedule came since the last check, at most one at a time', async () => {
+    let time = Date.parse('2026-09-29T04:05:00Z');
+    const log: string[] = [];
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    let passes = 0;
+    let release: (() => void) | undefined;
+    const schedule = new ImageSchedule({
+      now: () => time,
+      log: (message) => log.push(message),
+      settings: current,
+      pass: () => {
+        passes++;
+        return passes === 1 ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve();
+      },
+    });
+    // 06:07 in Vienna is 04:07 UTC in summer.
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(0);
+    time += 120_000;
+    const first = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(passes).toBe(1);
+    // A pass that is still running: the next one is left out.
+    await schedule.run();
+    expect(passes).toBe(1);
+    expect(log).toEqual(['An image update is still running; this time of the schedule is left out.']);
+    release?.();
+    await first;
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(1);
+    // The next day.
+    time = Date.parse('2026-09-30T04:07:30Z');
+    await schedule.check();
+    expect(passes).toBe(2);
+  });
+
+  it('follows new settings of another computer at the next check', async () => {
+    let time = Date.parse('2026-09-29T08:58:00Z');
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    let passes = 0;
+    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: current, pass: async () => void passes++ });
+    // 05:00 in New York (EDT) is 09:00 UTC; 2026-09-29 is a Tuesday.
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(0);
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(1);
   });
 });

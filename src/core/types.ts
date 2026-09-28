@@ -366,8 +366,11 @@ export interface ExtensionSettings {
    * Monitor on a remote Docker host pulls, keeping the two newest versions of each. Only on a remote host. Empty: none.
    */
   remoteImageUpdates?: string[];
-  /** User request 2026-09-28: the daily time (`HH:MM`, local time of this computer) of the image maintenance. */
-  remoteImageUpdateTime?: string;
+  /**
+   * User requests 2026-09-28: when the image maintenance runs after its first pass: a cron expression of five fields
+   * (minute hour day-of-month month day-of-week) in the time zone of this computer. Default `7 6 * * *`.
+   */
+  remoteImageUpdateSchedule?: string;
 }
 
 /** State of a container as Docker reports it, simplified. */

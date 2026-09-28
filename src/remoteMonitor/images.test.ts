@@ -7,9 +7,6 @@ import {
   ImageMaintenance,
   highestMajorTag,
   imagePrefixesOf,
-  isTimeZone,
-  nextTimeOfDay,
-  parseTimeOfDay,
   parseBearerChallenge,
   parseImageList,
   prefixesFromEnv,
@@ -29,11 +26,18 @@ function image(repository: string, tag: string, id: string, createdAt: string): 
 }
 
 /** A Docker CLI of the engine of the test: its images, the containers per image, and the calls. */
-function fakeEngine(options: { images: string[]; usedBy?: Record<string, string>; failRemove?: string[] }) {
+// Review round 1 of PR #57 (G): `layers` of an image ID (default: one layer of its own, no image built on another).
+function fakeEngine(options: { images: string[]; usedBy?: Record<string, string>; failRemove?: string[]; layers?: Record<string, string[]>; failInspect?: boolean }) {
   const calls: string[][] = [];
   let images = [...options.images];
+  const idOf = (line: string) => (JSON.parse(line) as { ID: string }).ID;
   const docker = async (args: readonly string[]): Promise<DockerResult> => {
     calls.push([...args]);
+    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a') return { code: 0, stdout: [...new Set(images.map(idOf)), ...Object.keys(options.layers ?? {})].join('\n'), stderr: '' };
+    if (args[0] === 'image' && args[1] === 'inspect') {
+      if (options.failInspect) return { code: 1, stdout: '', stderr: 'Error: No such image' };
+      return { code: 0, stdout: args.slice(4).map((id) => `${id} ${JSON.stringify(options.layers?.[id] ?? [`${id}/layer`])}`).join('\n'), stderr: '' };
+    }
     if (args[0] === 'image' && args[1] === 'ls') return { code: 0, stdout: images.join('\n'), stderr: '' };
     if (args[0] === 'pull') return { code: 0, stdout: '', stderr: '' };
     if (args[0] === 'ps') {
@@ -135,7 +139,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       docker: engine.docker,
       httpGet: registry.httpGet,
       log: (message) => log.push(message),
-      prefixes: PREFIXES,
+      prefixes: () => PREFIXES,
       // A repository that the host has no image of yet, and one of no prefix (left out).
       knownRepositories: async () => [WEB, 'ghcr.io/other/base'],
     }).pass();
@@ -165,7 +169,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] });
     const log: string[] = [];
-    await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     const removals = engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm');
     expect(removals).toEqual([
       ['image', 'rm', `${DEV}:2.0.11`],
@@ -181,36 +185,67 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     ]);
   });
 
+  // Review round 1 of PR #57 (A): the image just pulled as `:2` (no version tag of its own) ranked below older `2.0.x`
+  // images and was removed; an image tagged only `latest` ranked below every version.
+  it('keeps the image just pulled as its major tag, and the one of latest, above older versions', async () => {
+    const engine = fakeEngine({
+      images: [
+        image(DEV, '2', 'sha256:new', '2026-09-28'),
+        image(DEV, '2.0.14', 'sha256:v14', '2026-09-20'),
+        image(DEV, '2.0.13', 'sha256:v13', '2026-09-10'),
+        image(WEB, 'latest', 'sha256:wnew', '2026-09-28'),
+        image(WEB, '1.0.1', 'sha256:w101', '2020-01-02'),
+        image(WEB, '1.0.0', 'sha256:w100', '2020-01-01'),
+      ],
+    });
+    const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2', '2.0.15'], 'majikmate/devcontainer-classroom-web': ['1'] });
+    const log: string[] = [];
+    await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    expect(engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm')).toEqual([
+      ['image', 'rm', `${DEV}:2.0.13`],
+      ['image', 'rm', `${WEB}:1.0.0`],
+    ]);
+    expect(versionsOf(parseImageList([image(DEV, '2.0', 'sha256:a', '1'), image(DEV, '2.0.14', 'sha256:b', '2'), image(DEV, '3.0.0', 'sha256:c', '0')].join('\n'))).map((version) => version.id)).toEqual([
+      'sha256:c',
+      'sha256:a',
+      'sha256:b',
+    ]);
+  });
+
+  // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.
+  it('leaves an older image alone that another image is built on, and removes nothing when the layers cannot be read', async () => {
+    const images = [
+      image(DEV, '2.0.14', 'sha256:a', '2026-09-20'),
+      image(DEV, '2.0.13', 'sha256:b', '2026-09-10'),
+      image(DEV, '2.0.12', 'sha256:base', '2026-09-01'),
+    ];
+    const engine = fakeEngine({ images, layers: { 'sha256:base': ['l1', 'l2'], 'sha256:environment': ['l1', 'l2', 'l3'] } });
+    const log: string[] = [];
+    const run = (docker: typeof engine.docker) =>
+      new ImageMaintenance({ docker, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await run(engine.docker);
+    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+    expect(log).toContain(`The older image ${DEV} (2.0.12) stays: another image is built on it.`);
+    const failing = fakeEngine({ images, failInspect: true });
+    await run(failing.docker);
+    expect(failing.calls.some((call) => call[1] === 'rm')).toBe(false);
+    expect(log).toContain(`The older image ${DEV} (2.0.12) stays: its layers could not be read.`);
+  });
+
   it('does not update a repository whose tags cannot be read, and still cleans it', async () => {
     const engine = fakeEngine({
       images: [image(DEV, '2.0.14', 'sha256:a', '2026-09-20'), image(DEV, '2.0.13', 'sha256:b', '2026-09-10'), image(DEV, '2.0.12', 'sha256:c', '2026-09-01')],
     });
     const log: string[] = [];
     const httpGet: HttpGet = async () => ({ status: 500, headers: {}, body: '' });
-    await new ImageMaintenance({ docker: engine.docker, httpGet, log: (message) => log.push(message), prefixes: PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ docker: engine.docker, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(engine.calls.some((call) => call[0] === 'pull')).toBe(false);
     expect(log[0]).toBe(`The tags of ${DEV} could not be read; it is not updated: HTTP 500`);
     expect(engine.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', `${DEV}:2.0.12`]]);
   });
 
-  // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
-  it('finds the next 06:07 in Europe/Vienna: 04:07 UTC in summer, 05:07 UTC in winter, the next day after it', () => {
-    const at = (iso: string) => Date.parse(iso);
-    expect(new Date(nextTimeOfDay(at('2026-09-28T20:00:00Z'), 6, 7, 'Europe/Vienna')).toISOString()).toBe('2026-09-29T04:07:00.000Z');
-    expect(new Date(nextTimeOfDay(at('2026-09-29T03:00:00Z'), 6, 7, 'Europe/Vienna')).toISOString()).toBe('2026-09-29T04:07:00.000Z');
-    expect(new Date(nextTimeOfDay(at('2026-12-01T12:00:00Z'), 6, 7, 'Europe/Vienna')).toISOString()).toBe('2026-12-02T05:07:00.000Z');
-    // The night of the change to winter time (25 October 2026): 06:07 is already CET.
-    expect(new Date(nextTimeOfDay(at('2026-10-24T12:00:00Z'), 6, 7, 'Europe/Vienna')).toISOString()).toBe('2026-10-25T05:07:00.000Z');
-    expect(new Date(nextTimeOfDay(at('2026-09-28T20:00:00Z'), 6, 7, 'UTC')).toISOString()).toBe('2026-09-29T06:07:00.000Z');
-  });
-
-  it('reads a time of day and a time zone strictly', () => {
-    expect(parseTimeOfDay('06:07')).toEqual({ hour: 6, minute: 7 });
-    for (const text of ['6:07', '24:00', '06:60', '', undefined]) expect(parseTimeOfDay(text), String(text)).toBeUndefined();
-    expect(isTimeZone('Europe/Vienna')).toBe(true);
-    expect(isTimeZone('Mars/Base')).toBe(false);
-    expect(isTimeZone('Europe/Vienna; rm -rf /')).toBe(false);
-  });
+  // User request 2026-09-28 ("in a guided cron style manner"): the tests of the daily time (06:07 in Europe/Vienna,
+  // daylight saving time) and of the time zone moved, with the same expectations, to src/core/remoteMonitor/cron.test.ts.
 
   it('does nothing without prefixes, and never throws when Docker does not answer', async () => {
     const calls: string[][] = [];
@@ -219,10 +254,10 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       return { code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' };
     };
     const httpGet: HttpGet = async () => ({ status: 200, headers: {}, body: '{}' });
-    await new ImageMaintenance({ docker, httpGet, log: () => {}, prefixes: [], knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ docker, httpGet, log: () => {}, prefixes: () => [], knownRepositories: async () => [] }).pass();
     expect(calls).toEqual([]);
     const log: string[] = [];
-    await new ImageMaintenance({ docker, httpGet, log: (message) => log.push(message), prefixes: PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ docker, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(log).toEqual(['The images could not be maintained: docker image ls failed: Cannot connect to the Docker daemon']);
   });
 });

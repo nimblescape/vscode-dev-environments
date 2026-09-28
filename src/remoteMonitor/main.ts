@@ -21,8 +21,10 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import {
   HEARTBEAT_FOLDER,
   IMAGE_LIST_FILE,
+  IMAGE_SETTINGS_FILE,
   MAX_IMAGE_LIST_LENGTH,
   parseImageListInput,
+  parseImageSettingsInput,
   REMOTE_MONITOR_STATE_DIR,
   SEQ_ORDER_WINDOW_MS,
   heartbeatFileName,
@@ -33,6 +35,7 @@ import {
   parseHeartbeatRecord,
   type HeartbeatInput,
   type HeartbeatRecord,
+  type ImageSettings,
   type RecordsOutput,
 } from '../core/remoteMonitor/protocol';
 import {
@@ -46,17 +49,18 @@ import {
   type RemoteTiming,
 } from './rules';
 import {
-  DEFAULT_IMAGE_TIME,
+  DEFAULT_IMAGE_SCHEDULE,
   DEFAULT_IMAGE_TIME_ZONE,
   ImageMaintenance,
   REMOTE_IMAGE_FIRST_PASS_MS,
   isTimeZone,
-  nextTimeOfDay,
+  nextCronTime,
   nodeHttpGet,
-  parseTimeOfDay,
+  parseCronSchedule,
   prefixesFromEnv,
   type HttpGet,
 } from './images';
+import type { CronSchedule } from '../core/remoteMonitor/cron';
 
 /** Time limit of the container list. */
 export const LIST_TIMEOUT_MS = 30_000;
@@ -360,9 +364,14 @@ export function readStdin(): Promise<string> {
 
 /** Stores the list of repositories (atomically: a temporary file, then a rename). */
 export async function writeImageList(stateDir: string, repositories: readonly string[]): Promise<void> {
-  const file = path.join(stateDir, IMAGE_LIST_FILE);
+  await writeStateFile(stateDir, IMAGE_LIST_FILE, JSON.stringify({ repositories }));
+}
+
+/** Writes a file of the volume at once (a temporary file, then rename). */
+async function writeStateFile(stateDir: string, name: string, text: string): Promise<void> {
+  const file = path.join(stateDir, name);
   const temporary = `${file}.${process.pid}.tmp`;
-  await fs.promises.writeFile(temporary, JSON.stringify({ repositories }), { mode: 0o600 });
+  await fs.promises.writeFile(temporary, text, { mode: 0o600 });
   await fs.promises.rename(temporary, file);
 }
 
@@ -386,12 +395,105 @@ export function imageTimesFromEnv(env: NodeJS.ProcessEnv): { firstMs: number; in
 }
 
 /**
- * The daily time of the passes: DEVENV_IMAGE_TIME (`HH:MM`, the setting remoteImageUpdateTime) in DEVENV_IMAGE_TZ (the
- * time zone of the computer that created the monitor). Invalid or missing: 06:07 in Europe/Vienna.
+ * The schedule of the passes (user request 2026-09-28, "in a guided cron style manner"): DEVENV_IMAGE_SCHEDULE (a cron
+ * expression of five fields, the setting remoteImageUpdateSchedule) in DEVENV_IMAGE_TZ (the time zone of the computer
+ * that created the monitor). Invalid or missing: `7 6 * * *` (06:07) in Europe/Vienna.
  */
-export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { hour: number; minute: number; timeZone: string } {
-  const time = parseTimeOfDay(env.DEVENV_IMAGE_TIME) ?? parseTimeOfDay(DEFAULT_IMAGE_TIME)!;
-  return { ...time, timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE };
+export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { text: string; schedule: CronSchedule; timeZone: string } {
+  const valid = parseCronSchedule(env.DEVENV_IMAGE_SCHEDULE);
+  const text = valid ? env.DEVENV_IMAGE_SCHEDULE!.trim() : DEFAULT_IMAGE_SCHEDULE;
+  return { text, schedule: valid ?? parseCronSchedule(DEFAULT_IMAGE_SCHEDULE)!, timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE };
+}
+
+/** How often the monitor looks whether a time of the schedule has come (as cron: every minute). */
+export const IMAGE_CHECK_MS = 60_000;
+
+/** The settings of the image maintenance with the parsed schedule. */
+export interface ActiveImageSettings extends ImageSettings {
+  cron: CronSchedule;
+}
+
+/**
+ * Review round 1 of PR #57 (C): the settings of the image maintenance: those of the container (DEVENV_IMAGE_*), or the
+ * newer ones that an extension stored in the volume (`monitor.js settings -`, image-settings.json), read again before
+ * each check. So another computer (another time zone, another schedule) does not replace the container.
+ */
+export class CurrentImageSettings {
+  value: ActiveImageSettings;
+  private stored = '';
+
+  constructor(
+    env: NodeJS.ProcessEnv,
+    private readonly stateDir: string,
+    private readonly log: (message: string) => void,
+  ) {
+    const { text, schedule, timeZone } = imageScheduleFromEnv(env);
+    this.value = { prefixes: prefixesFromEnv(env), schedule: text, timeZone, cron: schedule };
+  }
+
+  /** Reads the stored settings; keeps the current ones when there are none or they are invalid. Never throws. */
+  async refresh(): Promise<void> {
+    let text: string;
+    try {
+      text = await fs.promises.readFile(path.join(this.stateDir, IMAGE_SETTINGS_FILE), 'utf8');
+    } catch {
+      return;
+    }
+    if (text === this.stored) return;
+    this.stored = text;
+    const settings = parseImageSettingsInput(text);
+    if (!settings) return;
+    this.value = { ...settings, cron: parseCronSchedule(settings.schedule)! };
+    this.log(`Image update settings: ${settings.prefixes.join(', ') || 'no prefixes'}; at "${settings.schedule}" (cron, ${settings.timeZone}).`);
+  }
+}
+
+/**
+ * The passes of the image maintenance by the cron schedule (user request 2026-09-28, "in a guided cron style manner"):
+ * every IMAGE_CHECK_MS, a pass when a time of the schedule came since the last check. At most one pass at a time: a time
+ * that comes during a pass is left out.
+ */
+export class ImageSchedule {
+  private checkedUntil: number;
+  private running = false;
+
+  constructor(
+    private readonly deps: {
+      now: () => number;
+      log: (message: string) => void;
+      settings: Pick<CurrentImageSettings, 'value' | 'refresh'>;
+      pass: () => Promise<void>;
+    },
+  ) {
+    this.checkedUntil = deps.now();
+  }
+
+  /** One check: a pass when a time of the schedule lies after the previous check and not after now. */
+  async check(): Promise<void> {
+    await this.deps.settings.refresh();
+    const time = this.deps.now();
+    const { cron, timeZone } = this.deps.settings.value;
+    const due = nextCronTime(this.checkedUntil, cron, timeZone);
+    this.checkedUntil = time;
+    if (due !== undefined && due <= time) await this.run();
+  }
+
+  /** One pass now, unless one runs. Never throws. */
+  async run(): Promise<void> {
+    if (this.running) {
+      this.deps.log('An image update is still running; this time of the schedule is left out.');
+      return;
+    }
+    this.running = true;
+    try {
+      await this.deps.settings.refresh();
+      await this.deps.pass();
+    } catch (error) {
+      this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.running = false;
+    }
+  }
 }
 
 /** Runs one subcommand of `argv` (without node and the script). Resolves with the exit code; `run` never resolves. */
@@ -437,6 +539,17 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       await writeImageList(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, repositories);
       return 0;
     }
+    case 'settings': {
+      // Review round 1 of PR #57 (C): the settings of the image maintenance of the computer that opened last, on stdin.
+      const text = args.length === 1 && args[0] === '-' ? await (deps.readStdin ?? readStdin)() : undefined;
+      const settings = text === undefined ? undefined : parseImageSettingsInput(text);
+      if (!settings) {
+        err('Invalid image settings.\n');
+        return EXIT_INVALID;
+      }
+      await writeStateFile(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, IMAGE_SETTINGS_FILE, JSON.stringify(settings));
+      return 0;
+    }
     case 'run': {
       if (args.length !== 0) {
         err('run takes no argument.\n');
@@ -447,25 +560,26 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const docker = deps.docker ?? nodeDocker;
       const loop = new RemoteMonitorLoop({ docker, dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
-      // User requests 2026-09-28: the images of the prefixes, at the start and then every REMOTE_IMAGE_INTERVAL_MS.
-      const prefixes = prefixesFromEnv(deps.env);
-      if (prefixes.length > 0) {
+      // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the schedule.
+      // Only when the container got prefixes: only then it has a network (the label says whether it has).
+      if (prefixesFromEnv(deps.env).length > 0) {
         const stateDir = deps.stateDir ?? REMOTE_MONITOR_STATE_DIR;
+        const settings = new CurrentImageSettings(deps.env, stateDir, log);
+        await settings.refresh();
         const images = new ImageMaintenance({
           docker,
           httpGet: deps.httpGet ?? nodeHttpGet,
           log,
-          prefixes,
+          prefixes: () => settings.value.prefixes,
           knownRepositories: () => readImageList(stateDir),
         });
         const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
-        const { hour, minute, timeZone } = imageScheduleFromEnv(deps.env);
-        const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-        log(`Image updates of ${prefixes.join(', ')}: in ${Math.round(firstMs / 1000)} s, then every day at ${time} (${timeZone}).`);
-        // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) instead of the daily time.
-        const delayToNext = () => (intervalMs !== undefined ? intervalMs : Math.max(1_000, nextTimeOfDay(now(), hour, minute, timeZone) - now()));
-        const next = (delay: number) => setTimeout(() => void images.pass().finally(() => next(delayToNext())), delay);
-        next(firstMs);
+        const schedule = new ImageSchedule({ now, log, settings, pass: () => images.pass() });
+        log(`Image updates of ${settings.value.prefixes.join(', ')}: in ${Math.round(firstMs / 1000)} s, then at "${settings.value.schedule}" (cron, ${settings.value.timeZone}).`);
+        setTimeout(() => void schedule.run(), firstMs);
+        // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) instead of the schedule.
+        if (intervalMs !== undefined) setInterval(() => void schedule.run(), intervalMs);
+        else setInterval(() => void schedule.check(), IMAGE_CHECK_MS);
       }
       for (;;) {
         await loop.tick();
@@ -473,7 +587,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
     }
     default:
-      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> | images -\n');
+      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> | images - | settings -\n');
       return EXIT_INVALID;
   }
 }

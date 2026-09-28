@@ -9,6 +9,7 @@
 import { errorMessage } from '../errors';
 import { isAbortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import {
+  IMAGE_MAINTENANCE_LABEL_PART,
   LABEL_SESSION_MONITOR,
   MAX_SCRIPT_LENGTH,
   REMOTE_MONITOR_CONTAINER,
@@ -17,11 +18,13 @@ import {
   REMOTE_MONITOR_VOLUME,
   forgetCommand,
   heartbeatCommand,
+  imageSettingsCommand,
   imagesCommand,
   parseRecordsOutput,
   recordsCommand,
   remoteMonitorLabelValue,
   type HeartbeatInput,
+  type ImageSettings,
   type RecordsOutput,
 } from './protocol';
 
@@ -48,8 +51,8 @@ export interface RemoteSessionMonitorOptions {
   script: () => Promise<string>;
   /**
    * User requests 2026-09-28: the image maintenance of the monitor: the prefixes of the images that it updates and cleans
-   * (the setting remoteImageUpdates, a trailing `*` dropped; none: no image maintenance), the daily time (`HH:MM`, the
-   * setting remoteImageUpdateTime), and the time zone of this computer.
+   * (the setting remoteImageUpdates, a trailing `*` dropped; none: no image maintenance), the schedule (a cron expression,
+   * the setting remoteImageUpdateSchedule), and the time zone of this computer.
    */
   imageMaintenance?: () => ImageMaintenanceSettings;
   /** Only for the Docker tests: another container and volume name, more labels, and variables of the container. */
@@ -62,7 +65,8 @@ export interface RemoteSessionMonitorOptions {
 /** See RemoteSessionMonitorOptions.imageMaintenance. */
 export interface ImageMaintenanceSettings {
   prefixes: readonly string[];
-  time: string;
+  /** A cron expression of five fields (user request 2026-09-28, "in a guided cron style manner"). */
+  schedule: string;
   timeZone: string;
 }
 
@@ -103,7 +107,10 @@ export class RemoteSessionMonitor {
       const script = await this.options.script();
       if (script.length > MAX_SCRIPT_LENGTH) throw new Error(`The script of the Session Monitor is too long (${script.length} characters).`);
       const images = this.options.imageMaintenance?.();
-      const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [...images.prefixes, images.time, images.timeZone] : []);
+      // Review round 1 of PR #57 (C): only whether it maintains images is part of the label (its network); the prefixes,
+      // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
+      // time zone on the same engine do not replace it at each open.
+      const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
       const current = await this.inspect(signal);
       if (current.exists && current.label === label) {
         if (current.running) return 'running';
@@ -153,18 +160,29 @@ export class RemoteSessionMonitor {
    * User request 2026-09-28 ("all images"): stores the repositories that the extension read from the registry, for the
    * image maintenance of the monitor (`monitor.js images -`, the list on stdin). Best effort: a failure is logged.
    */
-  async images(repositories: readonly string[]): Promise<void> {
+  async images(repositories: readonly string[]): Promise<boolean> {
+    return this.execWithInput(imagesCommand(), JSON.stringify({ repositories }), 'The image list');
+  }
+
+  /**
+   * Review round 1 of PR #57 (C): stores the settings of the image maintenance of this computer in the monitor (`monitor.js
+   * settings -`, on stdin); it uses them from its next check on. Best effort: a failure is logged. Review round 1 (D):
+   * resolves with false on a failure, so the caller tries again at the next open.
+   */
+  async imageSettings(settings: ImageMaintenanceSettings): Promise<boolean> {
+    const input: ImageSettings = { prefixes: [...settings.prefixes], schedule: settings.schedule, timeZone: settings.timeZone };
+    return this.execWithInput(imageSettingsCommand(), JSON.stringify(input), 'The image settings');
+  }
+
+  private async execWithInput(command: readonly string[], input: string, what: string): Promise<boolean> {
     try {
-      const result = await this.options.docker.run(['exec', '-i', this.containerName, ...imagesCommand()], {
-        timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS,
-        input: JSON.stringify({ repositories }),
-      });
-      if (result.exitCode !== 0 || result.timedOut) {
-        this.options.logger.warn(`The image list could not be given to the Session Monitor: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
-      }
+      const result = await this.options.docker.run(['exec', '-i', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, input });
+      if (result.exitCode === 0 && !result.timedOut) return true;
+      this.options.logger.warn(`${what} could not be given to the Session Monitor: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
     } catch (error) {
-      this.options.logger.warn(`The image list could not be given to the Session Monitor: ${errorMessage(error)}`);
+      this.options.logger.warn(`${what} could not be given to the Session Monitor: ${errorMessage(error)}`);
     }
+    return false;
   }
 
   /** Removes the record of `source` for an environment (Delete). Best effort: a failure is logged. */
@@ -189,7 +207,7 @@ export class RemoteSessionMonitor {
     args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
     args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
     if (images && imagePrefixes.length > 0) {
-      args.push('-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes)}`, '-e', `DEVENV_IMAGE_TIME=${images.time}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`);
+      args.push('-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes)}`, '-e', `DEVENV_IMAGE_SCHEDULE=${images.schedule}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`);
     }
     for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) args.push('-e', `${key}=${value}`);
     args.push(helperTag, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);

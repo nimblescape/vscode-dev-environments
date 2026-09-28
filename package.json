@@ -591,14 +591,23 @@
             "ghcr.io/majikmate/devcontainer-classroom*",
             "ghcr.io/majikmate/devcontainer-dev*"
           ],
-          "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all packages of the owner, read with your GitHub sign-in), one minute after it starts and then daily at Remote Image Update Time, and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off."
+          "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all packages of the owner, read with your GitHub sign-in), one minute after it starts and then by Remote Image Update Schedule (default every day at 06:07), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off."
         },
-        "devEnvLauncher.remoteImageUpdateTime": {
+        "devEnvLauncher.remoteImageUpdateSchedule": {
           "type": "string",
           "scope": "application",
-          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
-          "default": "06:07",
-          "description": "Only on a remote Docker host: the time of day (HH:MM, in the time zone of this computer) at which the Session Monitor there updates the images of Remote Image Updates each day; also one minute after it starts."
+          "default": "7 6 * * *",
+          "pattern": "^\\s*\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s*$",
+          "patternErrorMessage": "Five fields: minute hour day-of-month month day-of-week, for example 7 6 * * * (every day at 06:07).",
+          "examples": [
+            "7 6 * * *",
+            "7 6 * * 1-5",
+            "7 6,18 * * *",
+            "7 */6 * * *",
+            "7 6 * * 1",
+            "7 6 1 * *"
+          ],
+          "markdownDescription": "Only on a remote Docker host: when the Session Monitor there updates the images of `#devEnvLauncher.remoteImageUpdates#` after its first pass (one minute after it starts). A cron expression of five fields in the time zone of this computer:\n\n| Field | Values |\n|---|---|\n| minute | 0-59 |\n| hour | 0-23 |\n| day of the month | 1-31 |\n| month | 1-12 or JAN-DEC |\n| day of the week | 0-7 or SUN-SAT (0 and 7: Sunday) |\n\nEach field: `*` (any), a number, a range `1-5`, a list `6,18`, a step `*/6`. Examples: `7 6 * * *` every day at 06:07 (the default); `7 6 * * 1-5` Monday to Friday at 06:07; `7 6,18 * * *` at 06:07 and 18:07; `7 */6 * * *` every six hours; `7 6 * * 1` Mondays; `7 6 1 * *` on the first of each month. An invalid expression means the default."
         },
         "devEnvLauncher.updateImagesOnConnect": {
           "type": "boolean",

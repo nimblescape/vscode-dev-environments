@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
-import { LABEL_SESSION_MONITOR, MAX_SCRIPT_LENGTH, REMOTE_MONITOR_SCRIPT_PATH, remoteMonitorLabelValue } from './protocol';
+import { IMAGE_MAINTENANCE_LABEL_PART, LABEL_SESSION_MONITOR, MAX_SCRIPT_LENGTH, REMOTE_MONITOR_SCRIPT_PATH, remoteMonitorLabelValue } from './protocol';
 import { REMOTE_MONITOR_BOOTSTRAP, RemoteSessionMonitor, isMissingContainer } from './remoteSessionMonitor';
 
 const SCRIPT = 'console.log("monitor")';
@@ -227,7 +227,8 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
 // User requests 2026-09-28: the image maintenance of the monitor, only on a remote host.
 describe('RemoteSessionMonitor: images', () => {
   const PREFIXES = ['ghcr.io/majikmate/devcontainer-classroom', 'ghcr.io/majikmate/devcontainer-dev'];
-  const IMAGES = { prefixes: PREFIXES, time: '06:07', timeZone: 'Europe/Vienna' };
+  // User request 2026-09-28 ("in a guided cron style manner"): the daily time 06:07 became the cron schedule `7 6 * * *`.
+  const IMAGES = { prefixes: PREFIXES, schedule: '7 6 * * *', timeZone: 'Europe/Vienna' };
 
   it('gives the container the prefixes and outbound network; without prefixes still no network', () => {
     const plain = monitor(new FakeDocker(() => result(0)));
@@ -235,8 +236,9 @@ describe('RemoteSessionMonitor: images', () => {
     const args = plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, IMAGES);
     expect(args).not.toContain('--network');
     expect(args).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(PREFIXES)}`);
-    // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
-    expect(args).toContain('DEVENV_IMAGE_TIME=06:07');
+    // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST"; the daily time
+    // became a cron schedule ("in a guided cron style manner").
+    expect(args).toContain('DEVENV_IMAGE_SCHEDULE=7 6 * * *');
     expect(args).toContain('DEVENV_IMAGE_TZ=Europe/Vienna');
     expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] })).toEqual(expect.arrayContaining(['--network', 'none']));
     // Still no capability, no published port, no new privileges.
@@ -244,26 +246,54 @@ describe('RemoteSessionMonitor: images', () => {
     expect(args.some((arg) => arg === '-p' || arg === '--publish')).toBe(false);
   });
 
-  it('replaces the container when the prefixes, the time, or the time zone change (they are part of its label)', async () => {
-    const withPrefixes = remoteMonitorLabelValue(SCRIPT, TAG, [...PREFIXES, '06:07', 'Europe/Vienna']);
-    expect(remoteMonitorLabelValue(SCRIPT, TAG, [...PREFIXES, '05:00', 'Europe/Vienna'])).not.toBe(withPrefixes);
-    expect(withPrefixes).not.toBe(LABEL);
+  // Review round 1 of PR #57 (C; K): the prefixes, the time and the time zone were part of the label, so two computers
+  // with other settings replaced the monitor of a shared engine at each open. Now only whether it maintains images is
+  // (its network); the settings come with `settings -`.
+  it('replaces the container when the image maintenance is turned on or off, not when its settings differ', async () => {
+    const withImages = remoteMonitorLabelValue(SCRIPT, TAG, [IMAGE_MAINTENANCE_LABEL_PART]);
+    expect(withImages).not.toBe(LABEL);
     expect(remoteMonitorLabelValue(SCRIPT, TAG, [])).toBe(LABEL);
     const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL) : result(0, 'id\n')));
     const withSetting = new RemoteSessionMonitor({ docker, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => IMAGES });
     expect(await withSetting.ensure(TAG, SOCKET)).toBe('created');
     const run = docker.calls.find((call) => call.args[0] === 'run');
-    expect(run?.args).toContain(`${LABEL_SESSION_MONITOR}=${withPrefixes}`);
+    expect(run?.args).toContain(`${LABEL_SESSION_MONITOR}=${withImages}`);
+    // Another computer: other prefixes, another schedule, another time zone: the running monitor stays.
+    for (const other of [
+      { ...IMAGES, prefixes: ['ghcr.io/acme/base'] },
+      { ...IMAGES, schedule: '0 5 * * 1-5' },
+      { ...IMAGES, timeZone: 'America/New_York' },
+    ]) {
+      const running = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0)));
+      const otherComputer = new RemoteSessionMonitor({ docker: running, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => other });
+      expect(await otherComputer.ensure(TAG, SOCKET)).toBe('running');
+      expect(running.calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false);
+    }
+    // Turned off: replaced (no network again).
+    const off = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0, 'id\n')));
+    const offComputer = new RemoteSessionMonitor({ docker: off, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => ({ ...IMAGES, prefixes: [] }) });
+    expect(await offComputer.ensure(TAG, SOCKET)).toBe('created');
+  });
+
+  it('gives the monitor the settings of this computer on stdin (docker exec -i settings -); false on a failure', async () => {
+    const docker = new FakeDocker(() => result(0));
+    const log = new Log();
+    expect(await monitor(docker, log).imageSettings(IMAGES)).toBe(true);
+    expect(docker.calls[0].args).toEqual(['exec', '-i', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-']);
+    expect(docker.calls[0].options?.input).toBe(JSON.stringify(IMAGES));
+    expect(await monitor(new FakeDocker(() => result(2, '', 'Invalid image settings.')), log).imageSettings(IMAGES)).toBe(false);
+    expect(log.lines).toEqual(['warn The image settings could not be given to the Session Monitor: Invalid image settings.']);
   });
 
   it('gives the monitor the list of repositories on stdin (docker exec -i), and logs a failure', async () => {
     const docker = new FakeDocker(() => result(0));
     const log = new Log();
-    await monitor(docker, log).images(['ghcr.io/majikmate/devcontainer-dev']);
+    // Review round 1 of PR #57 (D): true on success, false on a failure (the caller tries again at the next open).
+    expect(await monitor(docker, log).images(['ghcr.io/majikmate/devcontainer-dev'])).toBe(true);
     expect(docker.calls[0].args).toEqual(['exec', '-i', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-']);
     expect(docker.calls[0].options?.input).toBe(JSON.stringify({ repositories: ['ghcr.io/majikmate/devcontainer-dev'] }));
     const failing = new FakeDocker(() => result(2, '', 'Invalid image list.'));
-    await monitor(failing, log).images([]);
+    expect(await monitor(failing, log).images([])).toBe(false);
     expect(log.lines).toEqual(['warn The image list could not be given to the Session Monitor: Invalid image list.']);
   });
 });

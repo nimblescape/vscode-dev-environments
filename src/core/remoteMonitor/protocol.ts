@@ -7,6 +7,7 @@
 // script (dist/remoteMonitor.js, src/remoteMonitor/main.ts), and the strict checks of everything that script reads.
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
+import { isTimeZone, parseCronSchedule } from './cron';
 
 /**
  * The one Session Monitor container per Docker engine (never a container of an environment: no
@@ -239,6 +240,44 @@ export function parseImageListInput(text: string): string[] | undefined {
   return [...new Set(repositories as string[])];
 }
 
+/**
+ * Review round 1 of PR #57 (C): the settings of the image maintenance are not part of the label of the monitor, so
+ * computers with other settings or another time zone on the same engine do not replace it at each open. Each open sends
+ * them (`monitor.js settings -`, JSON on stdin); the newest settings of any computer apply from its next check on.
+ */
+export const IMAGE_SETTINGS_FILE = 'image-settings.json';
+/** At most this many prefixes. */
+export const MAX_IMAGE_PREFIXES = 50;
+
+export interface ImageSettings {
+  prefixes: string[];
+  /** A cron expression of five fields. */
+  schedule: string;
+  /** An IANA time zone. */
+  timeZone: string;
+}
+
+/** The input of `monitor.js settings -`: `{ "prefixes": [...], "schedule": "…", "timeZone": "…" }`, strict. */
+export function parseImageSettingsInput(text: string): ImageSettings | undefined {
+  if (text.length > MAX_IMAGE_LIST_LENGTH) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || !hasExactKeys(value, ['prefixes', 'schedule', 'timeZone'])) return undefined;
+  const { prefixes, schedule, timeZone } = value;
+  if (!Array.isArray(prefixes) || prefixes.length > MAX_IMAGE_PREFIXES || !prefixes.every(isImagePrefix)) return undefined;
+  if (typeof schedule !== 'string' || !parseCronSchedule(schedule) || typeof timeZone !== 'string' || !isTimeZone(timeZone)) return undefined;
+  return { prefixes: [...new Set(prefixes as string[])], schedule, timeZone };
+}
+
+/** The command of `docker exec -i` that stores the settings of the image maintenance; they go on stdin. */
+export function imageSettingsCommand(): string[] {
+  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'];
+}
+
 /** The command of `docker exec -i` that stores the list of repositories; the list goes on stdin. */
 export function imagesCommand(): string[] {
   return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'];
@@ -284,12 +323,16 @@ export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): 
   );
 }
 
-/** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script and the helper tag. */
-export function remoteMonitorLabelValue(script: string, helperTag: string, imagePrefixes: readonly string[] = []): string {
-  // User request 2026-09-28: the prefixes of the image updates are part of the container (its variable), so a change of
-  // the setting replaces it at the next open.
+/**
+ * The part of the label of a monitor that maintains images (user requests 2026-09-28): it has a network then, so turning
+ * the maintenance on or off replaces it. Review round 1 of PR #57 (C): its settings are not part of the label.
+ */
+export const IMAGE_MAINTENANCE_LABEL_PART = 'image-maintenance';
+
+/** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script, the helper tag, and the `extra` parts. */
+export function remoteMonitorLabelValue(script: string, helperTag: string, extra: readonly string[] = []): string {
   const hash = createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8');
-  if (imagePrefixes.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(imagePrefixes), 'utf8');
+  if (extra.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(extra), 'utf8');
   return hash.digest('hex').slice(0, 12);
 }
 

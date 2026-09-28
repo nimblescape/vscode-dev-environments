@@ -13,7 +13,8 @@ import { isImageRepository } from './protocol';
 export const GITHUB_API = 'https://api.github.com';
 /** At most this many pages of 100 packages per owner. */
 const MAX_PACKAGE_PAGES = 10;
-export const PACKAGES_TIMEOUT_MS = 30_000;
+/** Review round 1 of PR #57 (B): the time limit of the whole listing (all owners and pages). */
+export const PACKAGES_TIMEOUT_MS = 60_000;
 
 /** The owner and the name prefix of a ghcr.io prefix (`ghcr.io/majikmate/devcontainer-dev` → majikmate, devcontainer-dev). */
 export function ghcrOwnerOf(prefix: string): { owner: string; namePrefix: string } | undefined {
@@ -68,8 +69,10 @@ async function packageNames(transport: HttpTransport, token: string, owner: stri
       const list = JSON.parse(response.body) as unknown;
       if (!Array.isArray(list)) throw new Error(`GitHub answered no list for the packages of ${owner}.`);
       for (const item of list) {
-        const name = (item as { name?: unknown }).name;
-        if (typeof name === 'string') names.push(name);
+        const { name, visibility } = item as { name?: unknown; visibility?: unknown };
+        // Review round 1 of PR #57 (J): the monitor reads the tags without a token, so a private or internal package
+        // could never be updated (a failure in each pass): only public ones.
+        if (typeof name === 'string' && (visibility === undefined || visibility === 'public')) names.push(name);
       }
       if (list.length < 100) break;
     }

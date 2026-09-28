@@ -9,6 +9,7 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../cor
 import { Messages } from '../core/messages';
 import type { Logger } from '../core/ports';
 import type { ExtensionSettings } from '../core/types';
+import { DEFAULT_IMAGE_SCHEDULE, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
@@ -32,7 +33,7 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   openInNewWindow: false,
   remoteStopAfterMinutes: 10,
   remoteImageUpdates: [...DEFAULT_REMOTE_IMAGE_UPDATES],
-  remoteImageUpdateTime: '06:07',
+  remoteImageUpdateSchedule: DEFAULT_IMAGE_SCHEDULE,
 });
 
 /**
@@ -152,9 +153,10 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     remoteImageUpdates: Array.isArray(get('remoteImageUpdates'))
       ? (get('remoteImageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
       : [...DEFAULT_REMOTE_IMAGE_UPDATES],
-    remoteImageUpdateTime:
-      typeof get('remoteImageUpdateTime') === 'string' && /^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(get('remoteImageUpdateTime') as string)
-        ? (get('remoteImageUpdateTime') as string)
-        : '06:07',
+    // User request 2026-09-28 ("in a guided cron style manner"): a cron expression of five fields; invalid: the default.
+    remoteImageUpdateSchedule:
+      typeof get('remoteImageUpdateSchedule') === 'string' && parseCronSchedule(get('remoteImageUpdateSchedule') as string)
+        ? (get('remoteImageUpdateSchedule') as string).trim().split(/\s+/).join(' ')
+        : DEFAULT_IMAGE_SCHEDULE,
   };
 }

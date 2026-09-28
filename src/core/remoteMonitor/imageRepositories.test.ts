@@ -48,6 +48,18 @@ describe('ghcrRepositories', () => {
     ]);
   });
 
+  // Review round 1 of PR #57 (J): the monitor reads the tags without a token; a private package could never be updated.
+  it('lists only public packages', async () => {
+    const { transport: http } = transport(() =>
+      ok([
+        { name: 'devcontainer-dev', visibility: 'public' },
+        { name: 'devcontainer-dev-secret', visibility: 'private' },
+        { name: 'devcontainer-dev-inside', visibility: 'internal' },
+      ]),
+    );
+    expect(await ghcrRepositories(http, 't', ['ghcr.io/majikmate/devcontainer-dev'])).toEqual(['ghcr.io/majikmate/devcontainer-dev']);
+  });
+
   it('rejects when GitHub refuses (for example a token without read:packages)', async () => {
     const { transport: http } = transport(() => ({ status: 403, headers: {}, body: '{}' }));
     await expect(ghcrRepositories(http, 't', ['ghcr.io/majikmate/devcontainer-dev'])).rejects.toThrow('GitHub answered HTTP 403 for the packages of majikmate.');

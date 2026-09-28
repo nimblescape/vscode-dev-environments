@@ -29,8 +29,9 @@ import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
 import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
-import { ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
-import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
+import { DEFAULT_IMAGE_SCHEDULE } from '../core/remoteMonitor/cron';
+import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
+import { MAX_IMAGE_REPOSITORIES, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
@@ -175,12 +176,8 @@ async function activateExtension(
     docker,
     logger,
     // User requests 2026-09-28: the image maintenance of the monitor (the settings remoteImageUpdates and
-    // remoteImageUpdateTime, in the time zone of this computer).
-    imageMaintenance: () => ({
-      prefixes: imagePrefixesOf(getSettings().remoteImageUpdates ?? []),
-      time: getSettings().remoteImageUpdateTime ?? '06:07',
-      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-    }),
+    // remoteImageUpdateSchedule, in the time zone of this computer).
+    imageMaintenance: () => imageMaintenance(),
     script: () => {
       remoteMonitorScriptText ??= fs.promises.readFile(remoteMonitorScript, 'utf8');
       // A failed read is tried again at the next open.
@@ -190,12 +187,48 @@ async function activateExtension(
   });
   // User request 2026-09-28 ("all images"): the image repositories of the prefixes, read with the GitHub session (scope
   // read:packages) and given to the monitor of the host, at most once an hour per host. Without that scope, a question
-  // once per window; the monitor then updates only the images that are on the host.
+  // once per window; the monitor then updates only the images that are on the host. Review round 1 of PR #57: first the
+  // settings of this computer (C: they are not part of the label anymore), when they changed or an hour passed; the list
+  // is read in the background with a time limit (B: it never delays Start); a failed send is tried again at the next open
+  // (D).
   const imageListSentAt = new Map<string, number>();
+  const imageSettingsSent = new Map<string, { text: string; at: number }>();
   let packagesSignInOffered = false;
-  const sendImageList = async (host: string, signal?: AbortSignal): Promise<void> => {
+  const imageMaintenance = () => ({
+    prefixes: imagePrefixesOf(getSettings().remoteImageUpdates ?? []),
+    schedule: getSettings().remoteImageUpdateSchedule ?? DEFAULT_IMAGE_SCHEDULE,
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  });
+  const sendImageSettings = async (host: string): Promise<void> => {
+    const settings = imageMaintenance();
+    if (settings.prefixes.length === 0) return;
+    const text = JSON.stringify(settings);
+    const last = imageSettingsSent.get(host);
+    if (last && last.text === text && Math.abs(Date.now() - last.at) < IMAGE_LIST_INTERVAL_MS) return;
+    if (await remoteMonitor.imageSettings(settings)) imageSettingsSent.set(host, { text, at: Date.now() });
+    else imageSettingsSent.delete(host);
+  };
+  const sendRepositories = async (host: string, prefixes: string[], token: string): Promise<void> => {
+    let repositories: string[];
+    try {
+      repositories = await ghcrRepositories(nodeHttpsTransport, token, prefixes, AbortSignal.timeout(PACKAGES_TIMEOUT_MS));
+    } catch (error) {
+      imageListSentAt.delete(host);
+      logger.warn(`The image repositories could not be read from GitHub: ${errorMessage(error)}`);
+      return;
+    }
+    if (repositories.length > MAX_IMAGE_REPOSITORIES) {
+      logger.warn(`GitHub lists ${repositories.length} image repositories for ${prefixes.join(', ')}; the Session Monitor on ${host} gets the first ${MAX_IMAGE_REPOSITORIES}.`);
+      repositories = repositories.slice(0, MAX_IMAGE_REPOSITORIES);
+    }
+    logger.info(`The Session Monitor on ${host} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
+    if (!(await remoteMonitor.images(repositories))) imageListSentAt.delete(host);
+  };
+  const sendImageList = async (host: string): Promise<void> => {
     const prefixes = imagePrefixesOf(getSettings().remoteImageUpdates ?? []);
-    if (prefixes.length === 0 || !prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
+    if (prefixes.length === 0) return;
+    await sendImageSettings(host);
+    if (!prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
     const last = imageListSentAt.get(host);
     if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
     const credentials = await auth.getPackagesCredentials({ interactive: false });
@@ -211,16 +244,7 @@ async function activateExtension(
       return;
     }
     imageListSentAt.set(host, Date.now());
-    let repositories: string[];
-    try {
-      repositories = await ghcrRepositories(nodeHttpsTransport, credentials.password, prefixes, signal);
-    } catch (error) {
-      imageListSentAt.delete(host);
-      logger.warn(`The image repositories could not be read from GitHub: ${errorMessage(error)}`);
-      return;
-    }
-    logger.info(`The Session Monitor on ${host} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
-    await remoteMonitor.images(repositories);
+    void sendRepositories(host, prefixes, credentials.password);
   };
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
