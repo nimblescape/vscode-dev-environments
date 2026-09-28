@@ -208,7 +208,16 @@ export function forgetCommand(source: string, environmentId: string): string[] {
 /** A prefix of image repositories: `registry/path…`, lower case, no tag, no digest (the setting drops a trailing `*`). */
 export function isImagePrefix(value: unknown): value is string {
   // Review round 6 of PR #57 (F2): at most MAX_IMAGE_PREFIX_LENGTH characters.
-  return typeof value === 'string' && value.length <= MAX_IMAGE_PREFIX_LENGTH && /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) && !value.includes('..');
+  // Review round 8 of PR #57 (S4): not Docker Hub, whose images `docker image ls` lists without the registry.
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_IMAGE_PREFIX_LENGTH &&
+    /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) &&
+    !value.includes('..') &&
+    !/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//.test(value) &&
+    // A registry host first (a `.` or a port, or localhost): without one, the name would never be maintained.
+    /^([^/]*[.:][^/]*|localhost)\//.test(value)
+  );
 }
 
 /**

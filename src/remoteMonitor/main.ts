@@ -468,6 +468,8 @@ export class ImageSchedule {
       log: (message: string) => void;
       settings: Pick<CurrentImageSettings, 'value' | 'refresh'>;
       pass: () => Promise<void>;
+      /** Review round 8 of PR #57 (S3): at each check while no pass runs (the IDs of the images of the repositories). */
+      observe?: () => Promise<void>;
     },
   ) {
     this.checkedUntil = deps.now();
@@ -476,6 +478,7 @@ export class ImageSchedule {
   /** One check: a pass when a time of the schedule lies after the previous check and not after now. */
   async check(): Promise<void> {
     await this.deps.settings.refresh();
+    if (!this.running) await this.deps.observe?.();
     const time = this.deps.now();
     const { cron, timeZone } = this.deps.settings.value;
     const due = nextCronTime(this.checkedUntil, cron, timeZone);
@@ -592,7 +595,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
           },
         });
         const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
-        const schedule = new ImageSchedule({ now, log, settings, pass: () => images.pass() });
+        const schedule = new ImageSchedule({ now, log, settings, pass: () => images.pass(), observe: () => images.observe() });
         log(`Image updates of ${settings.value.prefixes.join(', ')}: in ${Math.round(firstMs / 1000)} s, then at "${settings.value.schedule}" (cron, ${settings.value.timeZone}).`);
         setTimeout(() => void schedule.run(), firstMs);
         // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) instead of the schedule.

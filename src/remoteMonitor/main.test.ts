@@ -527,6 +527,26 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(2);
   });
 
+  // Review round 8 of PR #57 (S3): the IDs of the images are remembered at each check, not only at the passes.
+  it('observes the images at each check while no pass runs', async () => {
+    let observed = 0;
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: () => new Promise<void>((resolve) => (release = resolve)),
+      observe: async () => void observed++,
+    });
+    await schedule.check();
+    expect(observed).toBe(1);
+    const running = schedule.run();
+    await schedule.check();
+    expect(observed).toBe(1);
+    release();
+    await running;
+  });
+
   it('follows new settings of another computer at the next check', async () => {
     let time = Date.parse('2026-09-29T08:58:00Z');
     const current = new CurrentImageSettings(ENV, stateDir, () => {});

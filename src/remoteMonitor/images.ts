@@ -241,8 +241,21 @@ export interface ImageMaintenanceDeps {
 
 /** Image IDs that a pull replaced, by repository. */
 export type ReplacedImages = Record<string, string[]>;
-/** At most this many replaced IDs are kept per repository. */
-const MAX_REPLACED_PER_REPOSITORY = 20;
+/**
+ * At most this many IDs are kept per repository. Review round 8 of PR #57 (S2): 200 (was 20), and beyond it the IDs that
+ * are tagged now go first (the listing finds them again), then the oldest untagged ones (trimReplaced).
+ */
+const MAX_REPLACED_PER_REPOSITORY = 200;
+
+/** Trims the IDs of a repository to MAX_REPLACED_PER_REPOSITORY: tagged ones first, then the oldest. */
+function trimReplaced(ids: string[], tagged: ReadonlySet<string>): string[] {
+  const result = [...ids];
+  while (result.length > MAX_REPLACED_PER_REPOSITORY) {
+    const index = result.findIndex((id) => tagged.has(id));
+    result.splice(index >= 0 ? index : 0, 1);
+  }
+  return result;
+}
 const IMAGE_ID = /^[A-Za-z0-9:]{1,100}$/;
 
 /** The stored replaced IDs; an empty record for anything invalid. */
@@ -287,7 +300,13 @@ export class ImageMaintenance {
         if (!after.has(repository) && prefixes.some((prefix) => repository.startsWith(prefix))) after.set(repository, []);
       }
       const layers = after.size > 0 ? await this.layersById() : new Map<string, string[]>();
-      for (const [repository, images] of after) await this.clean(repository, [...images, ...(await this.replacedImages(repository, images))], layers);
+      // Review round 8 of PR #57 (S1): an ID can be a version of two repositories; one that one of them keeps is removed
+      // by none of them.
+      const all = new Map<string, LocalImage[]>();
+      for (const [repository, images] of after) all.set(repository, [...images, ...(await this.replacedImages(repository, images))]);
+      const kept = new Set<string>();
+      for (const images of all.values()) for (const version of this.versions(images).slice(0, KEPT_IMAGE_VERSIONS)) kept.add(version.id);
+      for (const [repository, images] of all) await this.clean(repository, images, layers, kept);
     } catch (error) {
       this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -299,16 +318,34 @@ export class ImageMaintenance {
    * Review round 7 of PR #57: keeps the IDs that carry a tag of a repository now, and writes the store at once (a monitor
    * that ends in the middle of a pass loses nothing).
    */
-  private async remember(images: ReadonlyMap<string, readonly LocalImage[]>): Promise<void> {
+  async remember(images: ReadonlyMap<string, readonly LocalImage[]>): Promise<void> {
     let changed = false;
     for (const [repository, list] of images) {
-      for (const image of list) {
-        if (image.tag === '<none>' || (this.replaced[repository] ?? []).includes(image.id)) continue;
-        this.replaced[repository] = [...(this.replaced[repository] ?? []), image.id].slice(-MAX_REPLACED_PER_REPOSITORY);
+      const tagged = new Set(list.filter((image) => image.tag !== '<none>').map((image) => image.id));
+      for (const id of tagged) {
+        if ((this.replaced[repository] ?? []).includes(id)) continue;
+        this.replaced[repository] = [...(this.replaced[repository] ?? []), id];
         changed = true;
       }
+      this.replaced[repository] = trimReplaced(this.replaced[repository] ?? [], tagged);
     }
     if (changed) await this.deps.replaced?.write(this.replaced).catch(() => undefined);
+  }
+
+  /**
+   * Review round 8 of PR #57 (S3): remembers the IDs that carry a tag of a repository now, between the passes too (the
+   * schedule calls it every minute; one `docker image ls -a`), so an image that the extension pulls at an open and
+   * replaces at the next one before a pass is known. Never throws.
+   */
+  async observe(): Promise<void> {
+    const prefixes = this.deps.prefixes();
+    if (prefixes.length === 0) return;
+    try {
+      if (this.deps.replaced) this.replaced = await this.deps.replaced.read();
+      await this.remember(await this.repositories(prefixes));
+    } catch {
+      // The next minute or pass tries again.
+    }
   }
 
   /** The ID of an image reference, or undefined. */
@@ -333,7 +370,8 @@ export class ImageMaintenance {
       kept.push(id);
       result.push({ repository, tag: '<none>', id, createdAt: created });
     }
-    this.replaced[repository] = [...(this.replaced[repository] ?? []).filter((id) => listed.some((image) => image.id === id)), ...kept];
+    // Review round 8 of PR #57 (S2): in the order they were seen (the oldest first), so the trim keeps the newest.
+    this.replaced[repository] = (this.replaced[repository] ?? []).filter((id) => kept.includes(id) || listed.some((image) => image.id === id));
     return result;
   }
 
@@ -374,7 +412,7 @@ export class ImageMaintenance {
     // Review round 6 of PR #57 (F1): the image that the pull replaced, also when Docker lists it without its repository.
     const now = await this.imageId(reference);
     if (before !== undefined && now !== undefined && before !== now) {
-      this.replaced[repository] = [...(this.replaced[repository] ?? []).filter((id) => id !== before), before].slice(-MAX_REPLACED_PER_REPOSITORY);
+      this.replaced[repository] = trimReplaced([...(this.replaced[repository] ?? []).filter((id) => id !== before), before], new Set([now]));
       await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
   }
@@ -411,11 +449,18 @@ export class ImageMaintenance {
    * Removes every version but the KEPT_IMAGE_VERSIONS newest that no container uses and that no other image is built on
    * (its layers are the start of the layers of another image). `layers` undefined: nothing is removed.
    */
-  private async clean(repository: string, images: readonly LocalImage[], layers: Map<string, string[]> | undefined): Promise<void> {
-    // Review round 2 of PR #57 (R4): an ID whose tags are no versions (only `latest`, `2.0.14-amd64`) is no version of the
-    // line that the monitor pulls: it neither takes one of the kept places nor is removed.
-    const versions = versionsOf(images).filter((version) => version.version !== undefined || version.tags.length === 0);
-    for (const version of versions.slice(KEPT_IMAGE_VERSIONS)) {
+  /**
+   * The versions of a repository, newest first. Review round 2 of PR #57 (R4): an ID whose tags are no versions (only
+   * `latest`, `2.0.14-amd64`) is no version of the line that the monitor pulls: it neither takes one of the kept places
+   * nor is removed.
+   */
+  private versions(images: readonly LocalImage[]): ImageVersion[] {
+    return versionsOf(images).filter((version) => version.version !== undefined || version.tags.length === 0);
+  }
+
+  private async clean(repository: string, images: readonly LocalImage[], layers: Map<string, string[]> | undefined, kept: ReadonlySet<string>): Promise<void> {
+    for (const version of this.versions(images).slice(KEPT_IMAGE_VERSIONS)) {
+      if (kept.has(version.id)) continue;
       const label = version.tags.length > 0 ? version.tags.join(', ') : version.id.slice(0, 19);
       const own = layers?.get(version.id);
       if (!layers || !own) {

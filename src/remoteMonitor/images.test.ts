@@ -132,6 +132,10 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: JSON.stringify(PREFIXES) })).toEqual(PREFIXES);
     expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: 'not json' })).toEqual([]);
     expect(prefixesFromEnv({})).toEqual([]);
+    // Review round 8 of PR #57 (S4): Docker Hub is not supported (`docker image ls` lists its images without registry).
+    expect(imagePrefixesOf(['docker.io/library/ubuntu*', 'index.docker.io/x/y*', 'registry-1.docker.io/x/y*'])).toEqual([]);
+    // Nor a name without a registry host (it would never match either).
+    expect(imagePrefixesOf(['owner/repo*', 'localhost:5000/a/b*', 'registry:5000/x*'])).toEqual(['localhost:5000/a/b', 'registry:5000/x']);
     // Review round 5 of PR #57 (P1): at most 50, as the monitor takes with `settings -`.
     const many = Array.from({ length: 60 }, (_, index) => `ghcr.io/acme/image-${index}*`);
     expect(imagePrefixesOf(many)).toHaveLength(50);
@@ -394,6 +398,43 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     dangling['sha256:v2'] = '2026-09-10T00:00:00Z';
     const engine = await pass('sha256:v3', '2026-09-20');
     expect(engine.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:v1']]);
+  });
+
+  // Review round 8 of PR #57 (S1): an ID stored for two repositories was removed by one while the other kept it.
+  it('removes no image that another repository keeps as one of its two newest versions', async () => {
+    const MINE = 'ghcr.io/majikmate/devcontainer-dev-mine';
+    const engine = fakeEngine({
+      images: [image(DEV, '2', 'sha256:y', '2026-09-28'), image(MINE, '3', 'sha256:p', '2026-09-27'), image(MINE, '2', 'sha256:q', '2026-09-26')],
+      dangling: { 'sha256:x': '2026-09-01T00:00:00Z' },
+    });
+    const stored: ReplacedImages = { [DEV]: ['sha256:x'], [MINE]: ['sha256:x'] };
+    await new ImageMaintenance({
+      docker: engine.docker,
+      httpGet: fakeRegistry({}).httpGet,
+      log: () => {},
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced: { read: async () => stored, write: async () => {} },
+    }).pass();
+    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+  });
+
+  // Review round 8 of PR #57 (S2): beyond the limit, the IDs that are tagged now go first, not the untagged ones.
+  // Review round 8 (S3): observe remembers the tagged IDs between the passes.
+  it('keeps untagged IDs beyond the limit and remembers tagged IDs between passes', async () => {
+    const tagged = Array.from({ length: 210 }, (_, index) => image(DEV, `2.0.${index}`, `sha256:t${index}`, '2026-09-01'));
+    let stored: ReplacedImages = { [DEV]: ['sha256:old1', 'sha256:old2'] };
+    const maintenance = new ImageMaintenance({
+      docker: fakeEngine({ images: tagged }).docker,
+      httpGet: fakeRegistry({}).httpGet,
+      log: () => {},
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced: { read: async () => stored, write: async (value) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) },
+    });
+    await maintenance.observe();
+    expect(stored[DEV]).toHaveLength(200);
+    expect(stored[DEV].slice(0, 2)).toEqual(['sha256:old1', 'sha256:old2']);
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.
