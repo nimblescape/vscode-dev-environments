@@ -193,6 +193,7 @@ async function activateExtension(
     logger,
     monitorScript: context.asAbsolutePath(path.join('dist', 'sessionMonitor.js')),
     settings: getSettings,
+    windowDockerContext: () => connection.currentDockerContext(),
   });
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
@@ -432,13 +433,15 @@ async function activateExtension(
 
   if (currentEnvironment && containerName && docker.isInstalled()) {
     // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window. Only for an
-    // environment of this extension (review round 1, F5). Its context: the current one when that is on the host of the
-    // environment (a context that the user made, review round 2, G5), else the one of "Use a Remote Docker Host…".
+    // environment of this extension (review round 1, F5). Its context: the one in the authority of this window, through
+    // which the Dev Containers extension attaches (review of the attach context, A4); for a window without one, the
+    // current context when that is on the host of the environment (review round 2, G5), else none for the local Docker.
     const environment = currentEnvironment;
     const logDocker = async (): Promise<void> => {
       const host = dockerHostOf(environment);
-      const current = await targets.resolve();
-      const context = isOnDockerHost(environment, current.host) ? current.context : host === '' ? undefined : remoteContextName(host);
+      const own = connection.currentDockerContext();
+      const current = own === undefined ? await targets.resolve() : undefined;
+      const context = own ?? (current && isOnDockerHost(environment, current.host) ? current.context : host === '' ? undefined : remoteContextName(host));
       const lines = await attachDiagnostics(docker, docker.processEnv(), containerName, context);
       for (const line of lines) logger.info(`While this window connects: ${line}`);
     };

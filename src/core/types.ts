@@ -274,6 +274,11 @@ export interface WindowStatus {
   environmentId: string | null;
   state: 'active' | 'closing';
   updatedAt: string;
+  /**
+   * The Docker context named in the authority of the window (review of the attach context, A2): another window that
+   * wants to show this one opens exactly its URI. Missing for a window without one (and in files of earlier versions).
+   */
+  dockerContext?: string;
 }
 
 /** Content of pending/<environment-id>.json (concept 7.9). */

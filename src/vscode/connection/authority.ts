@@ -11,6 +11,11 @@
 // encoding of the UTF-8 text of JSON.stringify({ containerName: '/<name>' }) (fields that are undefined are left out),
 // optionally followed by `@<authority of a parent remote>`. It attaches to a container of this name, and the path of the
 // URI is the folder inside the container.
+//
+// User report 2026-09-28: for a container on another Docker host, Dev Containers' own "Attach to Running Container"
+// writes `{"containerName":"/<name>","settings":{"context":"<Docker context>"}}`. Without `settings.context`, its first
+// `docker inspect` of the attach asks the local Docker (Docker Desktop), not the current Docker context, and reports the
+// container as one that "no longer exists". So the authority names the context of a remote environment.
 import { ATTACHED_CONTAINER } from '../../core/devContainers';
 
 /** URI scheme of remote folders. */
@@ -28,13 +33,15 @@ function withoutLeadingSlash(name: string): string {
 
 /**
  * Authority for the container `containerName` (with or without a leading `/`):
- * `attached-container+` + hex(JSON.stringify({ containerName: '/' + name })). Throws for an empty name.
+ * `attached-container+` + hex(JSON.stringify({ containerName: '/' + name, settings: { context } })), without `settings`
+ * when no Docker context is given (the local Docker). Throws for an empty name or context.
  */
-export function encodeAuthority(containerName: string): string {
+export function encodeAuthority(containerName: string, dockerContext?: string): string {
   const name = withoutLeadingSlash(containerName.trim());
   if (!name) throw new Error('The container name is empty.');
-  const json = JSON.stringify({ containerName: `/${name}` });
-  return `${AUTHORITY_PREFIX}${Buffer.from(json, 'utf8').toString('hex')}`;
+  if (dockerContext !== undefined && !dockerContext.trim()) throw new Error('The Docker context is empty.');
+  const value = dockerContext === undefined ? { containerName: `/${name}` } : { containerName: `/${name}`, settings: { context: dockerContext.trim() } };
+  return `${AUTHORITY_PREFIX}${Buffer.from(JSON.stringify(value), 'utf8').toString('hex')}`;
 }
 
 /**
@@ -46,6 +53,14 @@ export function encodeAuthority(containerName: string): string {
  * `code --folder-uri` examples), as long as the text is a valid container name.
  */
 export function decodeAuthority(authority: string): string | undefined {
+  return decodeAuthorityParts(authority)?.containerName;
+}
+
+/**
+ * Container name and Docker context (`settings.context`, if any) of an `attached-container+…` authority, as
+ * decodeAuthority reads it. The older plain-name form has no context.
+ */
+export function decodeAuthorityParts(authority: string): { containerName: string; dockerContext?: string } | undefined {
   let text = authority;
   if (text.includes('%')) {
     try {
@@ -65,13 +80,20 @@ export function decodeAuthority(authority: string): string | undefined {
   try {
     value = JSON.parse(decoded);
   } catch {
-    return CONTAINER_NAME_PATTERN.test(decoded) ? withoutLeadingSlash(decoded) : undefined;
+    return CONTAINER_NAME_PATTERN.test(decoded) ? { containerName: withoutLeadingSlash(decoded) } : undefined;
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-  const containerName = (value as Record<string, unknown>).containerName;
+  const record = value as Record<string, unknown>;
+  const containerName = record.containerName;
   if (typeof containerName !== 'string') return undefined;
   const name = withoutLeadingSlash(containerName);
-  return name ? name : undefined;
+  if (!name) return undefined;
+  const settings = record.settings;
+  const context =
+    typeof settings === 'object' && settings !== null && typeof (settings as Record<string, unknown>).context === 'string'
+      ? ((settings as Record<string, unknown>).context as string)
+      : undefined;
+  return context ? { containerName: name, dockerContext: context } : { containerName: name };
 }
 
 /** The folder inside the container as a URI path: POSIX, with a leading `/`. */
@@ -84,17 +106,18 @@ function normalizeFolder(remoteWorkspaceFolder: string): string {
 export function folderUriParts(
   containerName: string,
   remoteWorkspaceFolder: string,
+  dockerContext?: string,
 ): { scheme: string; authority: string; path: string } {
   return {
     scheme: REMOTE_SCHEME,
-    authority: encodeAuthority(containerName),
+    authority: encodeAuthority(containerName, dockerContext),
     path: normalizeFolder(remoteWorkspaceFolder),
   };
 }
 
 /** `vscode-remote://attached-container+<hex><folder>`. Path segments are percent-encoded where needed. */
-export function folderUriString(containerName: string, remoteWorkspaceFolder: string): string {
-  const parts = folderUriParts(containerName, remoteWorkspaceFolder);
+export function folderUriString(containerName: string, remoteWorkspaceFolder: string, dockerContext?: string): string {
+  const parts = folderUriParts(containerName, remoteWorkspaceFolder, dockerContext);
   const encodedPath = parts.path
     .split('/')
     .map((segment) => encodeURIComponent(segment))

@@ -56,8 +56,8 @@ vi.mock('vscode', () => fake.vscode);
 
 const NAME = 'devenv-acme-api-3f2a9c1e';
 
-function remoteFolder(name: string, folder = '/workspaces/api'): { uri: FakeUri } {
-  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name), path: folder }) };
+function remoteFolder(name: string, folder = '/workspaces/api', dockerContext?: string): { uri: FakeUri } {
+  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name, dockerContext), path: folder }) };
 }
 
 describe('ConnectionAdapter', () => {
@@ -91,6 +91,27 @@ describe('ConnectionAdapter', () => {
     fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/other')];
     await new ConnectionAdapter().open(NAME, '/workspaces/api');
     expect(fake.state.commands.map((call) => call[0])).toEqual([OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
+  });
+
+  // User report 2026-09-28: the Docker context of a remote environment is part of the window's authority.
+  it('opens the folder URI with the Docker context, in this window and in a new one', async () => {
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    for (const call of fake.state.commands) {
+      expect((call as [string, FakeUri])[1]).toMatchObject({ authority: encodeAuthority(NAME, 'devenv-remote-2e9f507b'), path: '/workspaces/api' });
+    }
+    expect(fake.state.commands).toHaveLength(2);
+  });
+
+  it('reloads only a window with the same context; a window without it (or with another) opens the new URI', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-2e9f507b')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devenv-remote-2e9f507b');
+    expect(fake.state.commands.map((call) => call[0])).toEqual([RELOAD_WINDOW_COMMAND, OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
   });
 
   it('opens the folder URI of the container in a new window (Start in New Window, unit 14)', async () => {
@@ -141,6 +162,50 @@ describe('ConnectionAdapter', () => {
     });
     fake.state.workspaceFolders = [remoteFolder(NAME)];
     expect(new ConnectionAdapter().currentContainerName()).toBe('devenv-acme-web-7c1d2e3f');
+  });
+
+  // Review of the attach context (A2, A3): the context in the window's own authority.
+  it('reads the Docker context of the attached window, and none without one or outside an attached window', () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBe('devenv-remote-5709ff28');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+    fake.state.remoteName = 'ssh-remote';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devenv-remote-5709ff28')];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+  });
+
+  // Review of the attach context (round 2, B3): only the authority changes; the folder or workspace file stays.
+  it('reopens the folder or the workspace file of the window with the Docker context', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api/sub')];
+    expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(true);
+    fake.state.workspaceFile = fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(NAME), path: '/workspaces/api/api.code-workspace' });
+    expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(true);
+    const uris = fake.state.commands.map((call) => (call as [string, FakeUri])[1]);
+    expect(fake.state.commands.map((call) => call[0])).toEqual([OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
+    expect(uris[0]).toMatchObject({ authority: encodeAuthority(NAME, 'devenv-remote-5709ff28'), path: '/workspaces/api/sub' });
+    expect(uris[1]).toMatchObject({ authority: encodeAuthority(NAME, 'devenv-remote-5709ff28'), path: '/workspaces/api/api.code-workspace' });
+  });
+
+  // Round 3 (C1, C2): a local workspace file of remote folders reopens its first folder; an @<parent> suffix stays.
+  it('reopens the first remote folder under a local workspace file, and keeps an @<parent> suffix', async () => {
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFile = fake.uri({ scheme: 'file', authority: '', path: '/Users/me/api.code-workspace' });
+    fake.state.workspaceFolders = [
+      { uri: fake.uri({ scheme: 'vscode-remote', authority: `${encodeAuthority(NAME)}@ssh-remote+box`, path: '/workspaces/api' }) },
+    ];
+    expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+    expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(true);
+    const uri = (fake.state.commands[0] as [string, FakeUri])[1];
+    expect(uri).toMatchObject({ authority: `${encodeAuthority(NAME, 'devenv-remote-5709ff28')}@ssh-remote+box`, path: '/workspaces/api' });
+  });
+
+  it('does not reopen a window that shows no attached container', async () => {
+    fake.state.workspaceFolders = [{ uri: fake.uri({ scheme: 'file', authority: '', path: '/home/api' }) }];
+    expect(await new ConnectionAdapter().reopenWithDockerContext('devenv-remote-5709ff28')).toBe(false);
+    expect(fake.state.commands).toEqual([]);
   });
 
   it('has no container in a local window, in a window of another remote type, and in an attached window without folder', () => {
