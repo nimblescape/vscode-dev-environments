@@ -241,9 +241,9 @@ describe('monitor protocol version and exit request', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  // Versions reset to 1 (user decision 2026-09-27).
-  it('is version 1', () => {
-    expect(MONITOR_PROTOCOL_VERSION).toBe(1);
+  // Versions reset to 1 (user decision 2026-09-27); 2 since review round 3 of PR #58 (F1: heartbeats under flock).
+  it('is version 2', () => {
+    expect(MONITOR_PROTOCOL_VERSION).toBe(2);
   });
 
   it('writes and reads the version of a process ID, atomically and next to the lock', () => {

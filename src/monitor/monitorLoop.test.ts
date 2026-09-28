@@ -1072,8 +1072,8 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     expect(sentHeartbeats().map((item) => item.environments[0].seq)).toEqual([T0, T0 + 30_000]);
     const call = h.docker.execCalls.find((item) => argsOf(item.command)[0] === 'heartbeat')!;
     expect(call.container).toBe('devenv-session-monitor');
-    // Review round 2 of PR #58: under the kernel lock of the records and a time limit.
-    expect(call.command.slice(0, 10)).toEqual(['flock', '-w', '5', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10', 'node', '/opt/devenv/monitor.js']);
+    // Review round 2 of PR #58: under the kernel lock of the records and a time limit; round 3 (F7): its own exit code.
+    expect(call.command.slice(0, 12)).toEqual(['flock', '-w', '5', '-E', '75', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10', 'node', '/opt/devenv/monitor.js']);
     expect(call.options.timeoutMs).toBe(20_000);
     expect(call.options.user).toBeUndefined();
   });
@@ -1157,6 +1157,14 @@ describe('heartbeats to the Session Monitor on a remote host', () => {
     heartbeatResult = () => ({ exitCode: 2, stdout: '', stderr: 'Invalid heartbeat.', timedOut: false });
     await runUntil(h, T0 + 3 * TICK_MS, each);
     expect(h.logger.lines.filter((line) => line.includes('A heartbeat to the Session Monitor on build-box failed'))).toHaveLength(1);
+  });
+
+  // Review round 3 of PR #58 (F7): a lock of the records that stayed busy is named, not only its exit code.
+  it('logs a busy lock of the records with its reason', async () => {
+    const each = await inUseScenario();
+    heartbeatResult = () => ({ exitCode: 75, stdout: '', stderr: '', timedOut: false });
+    await runUntil(h, T0 + TICK_MS, each);
+    expect(h.logger.lines.filter((line) => line.includes('failed; it is tried again. the heartbeat records stayed locked by another command for 5 s'))).toHaveLength(1);
   });
 
   // Review round 1 of PR #39 (R3): the first heartbeat of a series is a full sync.

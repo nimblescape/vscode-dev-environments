@@ -15,8 +15,8 @@
 // on an endpoint that is neither local nor SSH it acts on none and makes no Docker call.
 //
 // Unit 7, PR 2: on a tick whose target is an SSH host, it also sends heartbeats to the Session Monitor container on that
-// host (`docker exec devenv-session-monitor node /opt/devenv/monitor.js heartbeat <json>`, protocol.ts) for the
-// environments of that host that are in use or kept, and before it stops an environment there it asks that container
+// host (`docker exec devenv-session-monitor` of heartbeatCommand, protocol.ts: `node /opt/devenv/monitor.js heartbeat
+// <json>` under `flock` and `timeout`) for the environments of that host that are in use or kept, and before it stops an environment there it asks that container
 // whether another computer uses it (shared engine). It never sends a heartbeat through the local Docker.
 import { isBusyMarkLive } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
@@ -30,6 +30,7 @@ import {
   REMOTE_MONITOR_CONTAINER,
   clampLimitSeconds,
   heartbeatCommand,
+  monitorExecFailure,
   inUseByOtherComputer,
   isRemoteEnvironmentId,
   parseRecordsOutput,
@@ -586,7 +587,7 @@ export class MonitorLoop {
       const result = await this.deps.docker.exec(REMOTE_MONITOR_CONTAINER, heartbeatCommand(input), { timeoutMs: REMOTE_EXEC_TIMEOUT_MS });
       if (result.exitCode !== 0 || result.timedOut) {
         missing = !result.timedOut && /no such container|is not running/i.test(result.stderr);
-        failure = result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`;
+        failure = result.timedOut ? 'no answer in time' : monitorExecFailure(result.exitCode, result.stderr);
       }
     } catch (error) {
       failure = errorMessage(error);

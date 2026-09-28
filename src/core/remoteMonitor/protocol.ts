@@ -193,31 +193,52 @@ export function parseHeartbeatFileName(name: string): { source: string; environm
   return match ? { source: match[1], environmentId: match[2] } : undefined;
 }
 
+/** The exit code of a command under the lock of the records that did not get the lock in time (`flock -E`). */
+export const RECORDS_LOCK_BUSY_EXIT = 75;
+/** The exit code of a command under the lock of the records that `timeout -s KILL` ended (128 + SIGKILL). */
+export const RECORDS_RUN_LIMIT_EXIT = 137;
+
 /**
- * The command of `docker exec` that writes a heartbeat. The argument holds no secret (ids and flags only).
+ * `command` under the kernel lock `flock` (util-linux) of HEARTBEAT_LOCK_PATH.
  *
- * Review round 2 of PR #58 (after review round 10 of PR #57): under the kernel lock `flock` (util-linux) of
- * HEARTBEAT_LOCK_PATH, so that two heartbeats (two `docker exec` at the same time) read and replace the records one after
- * the other. The kernel releases the lock when its process ends, also when it is killed, so no lock is ever left over;
- * a heartbeat that does not get the lock within HEARTBEAT_LOCK_WAIT_SECONDS fails (exit code 1) and writes nothing, and one
- * that holds it longer than HEARTBEAT_RUN_LIMIT_SECONDS is killed (`timeout`, coreutils), so a hanging heartbeat cannot
+ * Review round 2 of PR #58 (after review round 10 of PR #57): two heartbeats (two `docker exec` at the same time) read and
+ * replace the records one after the other. The kernel releases the lock when its process ends, also when it is killed,
+ * so no lock is ever left over; a command that does not get the lock within HEARTBEAT_LOCK_WAIT_SECONDS fails with
+ * RECORDS_LOCK_BUSY_EXIT (review round 3, F7) and writes nothing, and one that holds it longer than
+ * HEARTBEAT_RUN_LIMIT_SECONDS is killed (`timeout`, coreutils; RECORDS_RUN_LIMIT_EXIT), so a hanging heartbeat cannot
  * block the others. Together at most 15 s, within the 20 s of a `docker exec` of a heartbeat.
  */
-export function heartbeatCommand(input: HeartbeatInput): string[] {
+function underRecordsLock(command: readonly string[]): string[] {
   return [
     'flock',
     '-w',
     String(HEARTBEAT_LOCK_WAIT_SECONDS),
+    '-E',
+    String(RECORDS_LOCK_BUSY_EXIT),
     HEARTBEAT_LOCK_PATH,
     'timeout',
     '-s',
     'KILL',
     String(HEARTBEAT_RUN_LIMIT_SECONDS),
-    'node',
-    REMOTE_MONITOR_SCRIPT_PATH,
-    'heartbeat',
-    JSON.stringify(input),
+    ...command,
   ];
+}
+
+/**
+ * The reason of a failed `docker exec` of the monitor: its stderr, else (review round 3 of PR #58, F7) the lock of the
+ * records or the time limit by their exit codes, else the exit code.
+ */
+export function monitorExecFailure(exitCode: number | null, stderr: string): string {
+  const text = stderr.trim();
+  if (text !== '') return text;
+  if (exitCode === RECORDS_LOCK_BUSY_EXIT) return `the heartbeat records stayed locked by another command for ${HEARTBEAT_LOCK_WAIT_SECONDS} s`;
+  if (exitCode === RECORDS_RUN_LIMIT_EXIT) return `the command was stopped after ${HEARTBEAT_RUN_LIMIT_SECONDS} s`;
+  return `exit code ${exitCode}`;
+}
+
+/** The command of `docker exec` that writes a heartbeat, under the lock of the records. No secret (ids and flags only). */
+export function heartbeatCommand(input: HeartbeatInput): string[] {
+  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(input)]);
 }
 
 /** The command of `docker exec` that prints the records of an environment (RecordsOutput). */
@@ -225,9 +246,12 @@ export function recordsCommand(environmentId: string): string[] {
   return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', environmentId];
 }
 
-/** The command of `docker exec` that removes the record of `source` for an environment (Delete). */
+/**
+ * The command of `docker exec` that removes the record of `source` for an environment (Delete). Review round 3 of PR #58
+ * (F6): under the lock of the records, so a heartbeat that read the record before cannot write it back after.
+ */
 export function forgetCommand(source: string, environmentId: string): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId];
+  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId]);
 }
 
 // ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the

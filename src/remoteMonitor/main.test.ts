@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
@@ -172,6 +172,18 @@ describe('monitor.js heartbeat', () => {
   it('writes no lock file next to the records', async () => {
     await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
     expect(fs.readdirSync(heartbeatDir(stateDir))).toEqual([heartbeatFileName(SOURCE, A)]);
+  });
+
+  // Review round 3 of PR #58 (F5): a heartbeat killed between its write and its rename leaves its temporary file; the
+  // next heartbeat (under the lock of the records) removes it, and nothing else.
+  it('removes the temporary files of killed heartbeats, and only those', async () => {
+    const dir = heartbeatDir(stateDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const leftover = `.${heartbeatFileName(OTHER, B)}.4242.tmp`;
+    const foreign = ['.other.4242.tmp', `${heartbeatFileName(OTHER, B)}.tmp`, 'notes.txt'];
+    for (const name of [leftover, ...foreign]) fs.writeFileSync(path.join(dir, name), '{');
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
+    expect(fs.readdirSync(dir).sort()).toEqual([...foreign, heartbeatFileName(SOURCE, A)].sort());
   });
 
   it.each<[string, string[]]>([
@@ -475,8 +487,8 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(0);
     time += 120_000;
     const first = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(passes).toBe(1);
+    // Review round 3 of PR #58: waits for the pass to start instead of 10 ms, which a loaded full run exceeded.
+    await vi.waitFor(() => expect(passes).toBe(1));
     // A pass that is still running: the next one is left out.
     await schedule.run();
     expect(passes).toBe(1);
@@ -561,14 +573,15 @@ describe('the settings and the schedule of the image maintenance', () => {
       },
     });
     const first = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(observed).toBe(1));
     await schedule.check();
     expect(observed).toBe(1);
     release();
     await first;
     const next = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(observed).toBe(2);
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(observed).toBe(2));
     release();
     await next;
   });
@@ -588,7 +601,8 @@ describe('the settings and the schedule of the image maintenance', () => {
       },
     });
     const check = schedule.check();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Review round 3 of PR #58: waits for the observe to start instead of 10 ms (a loaded full run can exceed it).
+    await vi.waitFor(() => expect(order).toEqual(['observe']));
     const run = schedule.run();
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(order).toEqual(['observe']);

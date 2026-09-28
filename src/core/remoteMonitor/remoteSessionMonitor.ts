@@ -19,6 +19,7 @@ import {
   REMOTE_MONITOR_VOLUME,
   forgetCommand,
   heartbeatCommand,
+  monitorExecFailure,
   imageSettingsCommand,
   imagesCommand,
   parseRecordsOutput,
@@ -152,7 +153,7 @@ export class RemoteSessionMonitor {
     }
   }
 
-  /** One heartbeat (`monitor.js heartbeat <json>`). */
+  /** One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). */
   async heartbeat(input: HeartbeatInput): Promise<MonitorExecResult> {
     return this.exec(heartbeatCommand(input));
   }
@@ -236,7 +237,7 @@ export class RemoteSessionMonitor {
       if (result.exitCode === 0 && !result.timedOut) return { ok: true, stdout: result.stdout };
       const detail = result.timedOut
         ? `docker exec did not end within ${REMOTE_MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`
-        : (result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`;
+        : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '');
       return { ok: false, missing: isMissingContainer(result), detail };
     } catch (error) {
       return { ok: false, missing: false, detail: errorMessage(error) };

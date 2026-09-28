@@ -10,6 +10,7 @@ import {
   MAX_SCRIPT_LENGTH,
   MAX_WINDOWS_COMMAND_LINE,
   REMOTE_MONITOR_SCRIPT_PATH,
+  forgetCommand,
   heartbeatCommand,
   remoteMonitorLabelValue,
   windowsCommandLineLength,
@@ -212,6 +213,13 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(await monitor(new FakeDocker(() => stopped)).heartbeat(heartbeat)).toMatchObject({ ok: false, missing: true });
     const invalid = result(2, '', 'Invalid heartbeat.');
     expect(await monitor(new FakeDocker(() => invalid)).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Invalid heartbeat.' });
+    // Review round 3 of PR #58 (F7): a lock that stayed busy and the time limit are named.
+    expect(await monitor(new FakeDocker(() => result(75))).heartbeat(heartbeat)).toEqual({
+      ok: false,
+      missing: false,
+      detail: 'the heartbeat records stayed locked by another command for 5 s',
+    });
+    expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({ detail: 'the command was stopped after 10 s' });
     const thrown = new FakeDocker(() => Promise.reject(new Error('Docker Desktop is not installed.')));
     expect(await monitor(thrown).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Docker Desktop is not installed.' });
   });
@@ -227,7 +235,9 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     const logger = new Log();
     const docker = new FakeDocker(() => result(0));
     await monitor(docker, logger).forget(SOURCE, ID);
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    // Review round 3 of PR #58 (F6): under the lock of the records, as a heartbeat.
+    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...forgetCommand(SOURCE, ID)]);
+    expect(forgetCommand(SOURCE, ID).slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
     await monitor(new FakeDocker(() => MISSING), logger).forget(SOURCE, ID);
     expect(logger.lines).toEqual([]);
     await monitor(new FakeDocker(() => result(1, '', 'boom')), logger).forget(SOURCE, ID);

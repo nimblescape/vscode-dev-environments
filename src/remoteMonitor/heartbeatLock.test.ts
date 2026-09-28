@@ -5,7 +5,7 @@
 // Review round 2 of PR #58: the heartbeats of the remote Session Monitor run under the kernel lock `flock` of
 // heartbeatCommand. These tests run that command line with real processes: `flock` and `timeout` as in the helper image,
 // and the monitor script built with esbuild (its state folder passed by a small entry instead of /state).
-import { spawn, type ChildProcess } from 'child_process';
+import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -13,7 +13,9 @@ import * as esbuild from 'esbuild';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   HEARTBEAT_LOCK_PATH,
+  RECORDS_LOCK_BUSY_EXIT,
   REMOTE_MONITOR_SCRIPT_PATH,
+  forgetCommand,
   heartbeatCommand,
   heartbeatFileName,
   type HeartbeatInput,
@@ -74,7 +76,7 @@ function lockPath(): string {
   return path.join(stateDir, path.basename(HEARTBEAT_LOCK_PATH));
 }
 
-/** Starts a process in its own process group, so that the group can be killed as `docker exec` leaves it. */
+/** Starts a process in its own process group, so that the test can kill it and what it started (killGroup). */
 function start(argv: string[]): ChildProcess {
   const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' });
   started.push(child);
@@ -86,11 +88,28 @@ function exited(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve) => child.once('exit', (code) => resolve(code)));
 }
 
+/**
+ * Kills the process group of `child` and, first, the groups of all processes below it. Review round 3 of PR #58 (F4):
+ * `timeout` puts itself into a process group of its own, which a kill of the group of `flock` does not reach.
+ */
 function killGroup(child: ChildProcess): void {
+  killTree(child.pid as number);
+}
+
+function killTree(pid: number): void {
+  let children: number[] = [];
   try {
-    process.kill(-(child.pid as number), 'SIGKILL');
+    children = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' }).split(/\s+/).filter(Boolean).map(Number);
   } catch {
-    // Already gone.
+    // No children (pgrep exits 1).
+  }
+  for (const below of children) killTree(below);
+  for (const target of [-pid, pid]) {
+    try {
+      process.kill(target, 'SIGKILL');
+    } catch {
+      // Already gone, or no group of its own.
+    }
   }
 }
 
@@ -110,7 +129,9 @@ function readRecord(): unknown {
   return JSON.parse(fs.readFileSync(path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A)), 'utf8'));
 }
 
-describe('the lock of the heartbeat records', () => {
+// Review round 3 of PR #58 (F3): `flock`, GNU `timeout` and process groups exist on Linux only, where the helper image and
+// CI run; as the other tests of real processes (describeUnix, it.skipIf(win32)).
+describe.skipIf(process.platform !== 'linux')('the lock of the heartbeat records', () => {
   // Moved here from main.test.ts ("two heartbeats at the same time"): now with processes, as `docker exec` runs them.
   it('two heartbeats at the same time: the higher seq stays, whatever the order of the writes', { timeout: 20_000 }, async () => {
     const children = [2, 1, 2, 1, 2, 1].map((seq) => start(command(heartbeat(seq, seq === 2))));
@@ -144,8 +165,36 @@ describe('the lock of the heartbeat records', () => {
   it('gives up after 5 seconds while the lock stays held, and writes nothing', { timeout: 20_000 }, async () => {
     await holdLock();
     const startedAt = Date.now();
-    expect(await exited(start(command(heartbeat(1, true))))).toBe(1);
+    // Review round 3 of PR #58 (F7): with the exit code of a busy lock (`flock -E`), not 1.
+    expect(await exited(start(command(heartbeat(1, true))))).toBe(RECORDS_LOCK_BUSY_EXIT);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
+    expect(fs.existsSync(path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A)))).toBe(false);
+  });
+
+  // Review round 3 of PR #58 (F4): the cleanup of the tests also ends `timeout` and its child, which hold the lock.
+  it('killGroup ends a heartbeat under timeout with the lock it holds', { timeout: 20_000 }, async () => {
+    const hanging = heartbeatCommand(heartbeat(1, true));
+    const child = start([...hanging.slice(0, hanging.indexOf('node')).map((part) => (part === HEARTBEAT_LOCK_PATH ? lockPath() : part)), 'sleep', '60']);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    killGroup(child);
+    await exited(child);
+    const startedAt = Date.now();
+    expect(await exited(start(command(heartbeat(1, true))))).toBe(0);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+  });
+
+  // Review round 3 of PR #58 (F6): `forget` waits for the lock too, so a heartbeat cannot write a forgotten record back.
+  it('forget waits while a heartbeat holds the lock', { timeout: 20_000 }, async () => {
+    expect(await exited(start(command(heartbeat(1, true))))).toBe(0);
+    const holder = await holdLock();
+    const forget = start(
+      forgetCommand(SOURCE, A).flatMap((part) => (part === HEARTBEAT_LOCK_PATH ? [lockPath()] : part === REMOTE_MONITOR_SCRIPT_PATH ? [script, stateDir] : [part])),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(forget.exitCode).toBeNull();
+    expect(readRecord()).toMatchObject({ seq: 1 });
+    killGroup(holder);
+    expect(await exited(forget)).toBe(0);
     expect(fs.existsSync(path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A)))).toBe(false);
   });
 
