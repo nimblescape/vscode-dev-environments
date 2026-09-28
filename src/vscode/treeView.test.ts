@@ -192,7 +192,8 @@ describe('RepositoriesTreeProvider', () => {
     provider.setDockerHost({ kind: 'unsupported', host: 'tcp://192.0.2.10:2376' });
     const unsupportedItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
     expect(unsupportedItem.label).toBe('Docker endpoint not supported: tcp://192.0.2.10:2376');
-    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('warning');
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the warning sign.
+    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('devenv-monitor-warning');
     provider.dispose();
   });
 

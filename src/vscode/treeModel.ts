@@ -230,6 +230,13 @@ export const MonitorIcons = {
   connected: 'devenv-monitor-connected',
   /** User request 2026-09-28: the header row of a remote Docker host. */
   remote: 'devenv-monitor-remote',
+  // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states, with the badges of
+  // the codicons vm-running (play), vm-pending (clock), vm-outline (ring), and a warning sign.
+  running: 'devenv-monitor-running',
+  updating: 'devenv-monitor-updating',
+  noContainer: 'devenv-monitor-no-container',
+  /** Files missing, and the header row of a Docker endpoint that is not supported. */
+  warning: 'devenv-monitor-warning',
 } as const;
 
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
@@ -239,19 +246,20 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   // connected in this window with a small connection sign of `vm-connect`. No codicon is a filled monitor.
   connected: { id: MonitorIcons.connected },
   connectedOtherWindow: { id: MonitorIcons.on },
-  // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
-  running: { id: 'play-circle', color: 'charts.green' },
+  // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states are the switched-off
+  // monitor (no window uses it; user, 2026-09-26: a running environment must not look like a connected one) with a sign:
+  // play while its container runs, a clock while it is updated, a ring without container, a warning without files.
+  running: { id: MonitorIcons.running },
   stopped: { id: MonitorIcons.off },
-  updating: { id: 'sync~spin' },
-  // A dashed circle (◌) is not available as a codicon.
-  noContainer: { id: 'circle-large-outline' },
-  filesMissing: { id: 'warning', color: 'list.warningForeground' },
+  updating: { id: MonitorIcons.updating },
+  noContainer: { id: MonitorIcons.noContainer },
+  filesMissing: { id: MonitorIcons.warning, color: 'list.warningForeground' },
 };
 
 /**
- * Icon of a state: a filled monitor with the connection sign connected (this window), a filled monitor connected in
- * another window, a green play icon running without a window, the silhouette of a monitor stopped, ↻ updating, ◌ no
- * container, ⚠ files missing.
+ * Icon of a state: a switched-on monitor with the connection sign connected (this window), a switched-on monitor
+ * connected in another window, and a switched-off monitor otherwise: plain when stopped, with a play sign running, a
+ * clock updating, a ring without container, a warning without files.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];

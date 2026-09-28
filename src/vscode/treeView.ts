@@ -57,8 +57,13 @@ export const DockerHostRowTexts = {
 } as const;
 
 // User requests 2026-09-28 ("use the remote monitor icon"; "align the header icon: local unfilled, remote unfilled with
-// connect icon"): the monitors of the rows, switched off, with the connection sign for a remote host.
-const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = { local: MonitorIcons.off, remote: MonitorIcons.remote, unsupported: 'warning' };
+// connect icon"; "align all the icons used with the new icon set"): the monitors of the rows, switched off, with the
+// connection sign for a remote host and the warning sign for an endpoint that is not supported.
+const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = {
+  local: MonitorIcons.off,
+  remote: MonitorIcons.remote,
+  unsupported: MonitorIcons.warning,
+};
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
 export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | DockerHostRow;

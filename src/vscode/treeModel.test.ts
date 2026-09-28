@@ -805,12 +805,14 @@ describe('state texts and icons', () => {
     expect(stateIcon('connected')).toEqual({ id: 'devenv-monitor-connected' });
     // Review round 2 of PR #59 (K3): no longer green; the filled screen tells that another window uses it.
     expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'devenv-monitor-on' });
-    // A play symbol, not the monitor of vm-running, which looked like a connected window (user, 2026-09-26).
-    expect(stateIcon('running')).toEqual({ id: 'play-circle', color: 'charts.green' });
+    // Not a switched-on monitor, which would look like a connected window (user, 2026-09-26).
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the switched-off monitor with a
+    // play sign (no window uses it), a clock, a ring, and a warning sign.
+    expect(stateIcon('running')).toEqual({ id: 'devenv-monitor-running' });
     expect(stateIcon('stopped')).toEqual({ id: 'devenv-monitor-off' });
-    expect(stateIcon('updating').id).toBe('sync~spin');
-    expect(stateIcon('noContainer').id).toBe('circle-large-outline');
-    expect(stateIcon('filesMissing').id).toBe('warning');
+    expect(stateIcon('updating').id).toBe('devenv-monitor-updating');
+    expect(stateIcon('noContainer').id).toBe('devenv-monitor-no-container');
+    expect(stateIcon('filesMissing')).toEqual({ id: 'devenv-monitor-warning', color: 'list.warningForeground' });
   });
 
   // Review round 1 of PR #59 (P1): a Quick Pick cannot color icons, so every state needs a shape of its own there. Round
@@ -1414,7 +1416,8 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(api.state).toBe('running');
     expect(api.description).toBe('main   Running · kept');
     expect(api.tooltip.split('\n')).toEqual(expect.arrayContaining(['Running · kept', TreeTexts.kept]));
-    expect(stateIcon(api.state!)).toEqual({ id: 'play-circle', color: 'charts.green' });
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the running monitor.
+    expect(stateIcon(api.state!)).toEqual({ id: 'devenv-monitor-running' });
     expect(flags(api.contextValue)).toContain('kept');
     expect(flags(api.contextValue)).not.toContain('canKeepRunning');
 

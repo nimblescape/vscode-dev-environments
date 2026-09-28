@@ -58,7 +58,7 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     this.render();
   }
 
-  /** `$(sync~spin) Updating owner/name…`; select → log with the progress details. */
+  /** `$(devenv-monitor-updating) Updating owner/name…`; select → log with the progress details. */
   showBusy(repository: string): void {
     this.busyRepository = repository;
     this.render();
@@ -84,7 +84,8 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     const item = this.item;
     item.backgroundColor = undefined;
     if (this.busyRepository !== undefined) {
-      item.text = `$(sync~spin) ${StatusBarTexts.updating(this.busyRepository)}`;
+      // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the clock.
+      item.text = `$(${MonitorIcons.updating}) ${StatusBarTexts.updating(this.busyRepository)}`;
       item.tooltip = Actions.showDetails;
       item.command = SHOW_LOG_COMMAND;
       return;

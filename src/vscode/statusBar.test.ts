@@ -43,10 +43,12 @@ describe('EnvironmentStatusBar (concept 6.3)', () => {
     const { bar, item } = create();
     bar.showConnected('acme-university/api', 'main');
     bar.showBusy('acme-university/web');
-    expect(item.text).toBe('$(sync~spin) Updating acme-university/web…');
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the clock.
+    expect(item.text).toBe('$(devenv-monitor-updating) Updating acme-university/web…');
     expect(item.command).toBe('devEnvironments.showLog');
     bar.showConnected('acme-university/api', 'dev');
-    expect(item.text).toBe('$(sync~spin) Updating acme-university/web…');
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the clock.
+    expect(item.text).toBe('$(devenv-monitor-updating) Updating acme-university/web…');
     bar.clearBusy();
     // Review round 2 of PR #59 (K2): the monitor of the sidebar with the connection sign.
     expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api · dev');

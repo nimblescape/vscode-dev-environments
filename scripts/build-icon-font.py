@@ -48,6 +48,32 @@ BADGE = (
     " 10.808 11.646 10.854L13.146 12.354C13.24 12.448 13.367 12.501 13.5 12.501C13.633 12.501 13.76 12.448 13.854 12.354"
     "C13.948 12.26 14.001 12.133 14.001 12C14.001 11.867 13.948 11.74 13.854 11.646L12.707 10.5Z"
 )
+# The badges of the codicons `vm-running` (play), `vm-pending` (clock) and `vm-outline` (ring), in the circle of `vm-connect`.
+BADGE_PLAY = (
+    "M16 11.5C16 12.39 15.736 13.26 15.242 14C14.748 14.74 14.045 15.317 13.222 15.657C12.4 15.998 11.495 16.087 10.6"
+    "22 15.913C9.749 15.739 8.947 15.311 8.318 14.681C7.689 14.052 7.26 13.25 7.086 12.377C6.912 11.504 7.001 10.599 "
+    "7.342 9.777C7.683 8.955 8.259 8.252 8.999 7.757C9.739 7.264 10.609 7 11.499 7C12.692 7 13.837 7.474 14.681 8.318"
+    "C15.525 9.162 16 10.307 16 11.5ZM13.97 11.499C13.97 11.41 13.946 11.323 13.901 11.246C13.856 11.17 13.791 11.106"
+    " 13.713 11.063L10.743 9.413C10.667 9.371 10.581 9.349 10.494 9.35C10.407 9.351 10.322 9.375 10.247 9.419C10.171 "
+    "9.463 10.109 9.526 10.066 9.602C10.023 9.677 10 9.763 10 9.85V13.15C10 13.237 10.023 13.322 10.066 13.398C10.11 "
+    "13.474 10.172 13.537 10.247 13.581C10.322 13.625 10.407 13.649 10.494 13.65C10.581 13.65 10.667 13.629 10.743 13"
+    ".587L13.713 11.937C13.791 11.892 13.856 11.829 13.901 11.752C13.946 11.676 13.97 11.588 13.97 11.499Z"
+)
+BADGE_CLOCK = (
+    "M16 11.5C16 13.985 13.985 16 11.5 16C9.015 16 7 13.985 7 11.5C7 9.015 9.015 7 11.5 7C13.985 7 16 9.015 16 11.5ZM"
+    "14 11.5C14 11.224 13.776 11 13.5 11H12V9C12 8.724 11.776 8.5 11.5 8.5C11.224 8.5 11 8.724 11 9V11.5C11 11.776 11"
+    ".224 12 11.5 12H13.5C13.776 12 14 11.776 14 11.5Z"
+)
+BADGE_RING = (
+    "M16 11.5C16 13.981 13.981 16 11.5 16C9.019 16 7 13.981 7 11.5C7 9.019 9.019 7 11.5 7C13.981 7 16 9.019 16 11.5ZM"
+    "15 11.5C15 9.57 13.43 8 11.5 8C9.57 8 8 9.57 8 11.5C8 13.43 9.57 15 11.5 15C13.43 15 15 13.43 15 11.5Z"
+)
+# A warning badge in the same circle: an exclamation mark cut out.
+BADGE_WARNING = (
+    "M16 11.5C16 13.985 13.985 16 11.5 16C9.015 16 7 13.985 7 11.5C7 9.015 9.015 7 11.5 7C13.985 7 16 9.015 16 11.5Z"
+    "M11.5 8.5C11.776 8.5 12 8.724 12 9V11.75C12 12.026 11.776 12.25 11.5 12.25C11.224 12.25 11 12.026 11 11.75V9C11 8.724 11.224 8.5 11.5 8.5Z"
+    "M12.15 13.6C12.15 13.959 11.859 14.25 11.5 14.25C11.141 14.25 10.85 13.959 10.85 13.6C10.85 13.241 11.141 12.95 11.5 12.95C11.859 12.95 12.15 13.241 12.15 13.6Z"
+)
 # User request 2026-09-28 ("a smaller diameter"): radius 3.5 instead of 4.5, in the corner (centre 12.5/12.5); the monitor
 # is cut free 1 around it.
 BADGE_RADIUS = 3.5
@@ -61,6 +87,11 @@ GLYPHS = [
     ("monitorConnected", 0xE003, "devenv-monitor-connected"),
     # User request 2026-09-28: the header row of a remote Docker host, the monitor switched off with the connection sign.
     ("monitorRemote", 0xE004, "devenv-monitor-remote"),
+    # User request 2026-09-28 ("align all the icons used with the new icon set"): the other states of an environment.
+    ("monitorRunning", 0xE005, "devenv-monitor-running"),
+    ("monitorUpdating", 0xE006, "devenv-monitor-updating"),
+    ("monitorNoContainer", 0xE007, "devenv-monitor-no-container"),
+    ("monitorWarning", 0xE008, "devenv-monitor-warning"),
 ]
 UNITS_PER_EM = 1000
 # Seconds since 1904-01-01 (the epoch of the head table): 2026-09-28 00:00 UTC.
@@ -86,12 +117,25 @@ def glyphs():
     frame = path_of(FRAME)
     on = pathops.op(frame, path_of(SCREEN), pathops.PathOp.UNION, fix_winding=True)
     s = BADGE_RADIUS / 4.5
-    badge = path_of(BADGE, pathops.FillType.EVEN_ODD, (s, 0, 0, s, BADGE_CENTRE - 11.5 * s, BADGE_CENTRE - 11.5 * s))
-    cut = pathops.op(on, path_of(circle(BADGE_CENTRE, BADGE_CENTRE, CLEARANCE)), pathops.PathOp.DIFFERENCE, fix_winding=True)
-    connected = pathops.op(cut, badge, pathops.PathOp.UNION, fix_winding=True)
-    frame_cut = pathops.op(frame, path_of(circle(BADGE_CENTRE, BADGE_CENTRE, CLEARANCE)), pathops.PathOp.DIFFERENCE, fix_winding=True)
-    remote = pathops.op(frame_cut, badge, pathops.PathOp.UNION, fix_winding=True)
-    return {"monitorOff": frame, "monitorOn": on, "monitorConnected": connected, "monitorRemote": remote}
+    clearance = path_of(circle(BADGE_CENTRE, BADGE_CENTRE, CLEARANCE))
+
+    def badged(monitor, d):
+        """The monitor cut free around the badge, with the badge (the codicon circle, smaller, in the corner)."""
+        badge = path_of(d, pathops.FillType.EVEN_ODD, (s, 0, 0, s, BADGE_CENTRE - 11.5 * s, BADGE_CENTRE - 11.5 * s))
+        cut = pathops.op(monitor, clearance, pathops.PathOp.DIFFERENCE, fix_winding=True)
+        return pathops.op(cut, badge, pathops.PathOp.UNION, fix_winding=True)
+
+    return {
+        "monitorOff": frame,
+        "monitorOn": on,
+        "monitorConnected": badged(on, BADGE),
+        "monitorRemote": badged(frame, BADGE),
+        # Switched off: no window uses it (user, 2026-09-26: a running environment must not look like a connected one).
+        "monitorRunning": badged(frame, BADGE_PLAY),
+        "monitorUpdating": badged(frame, BADGE_CLOCK),
+        "monitorNoContainer": badged(frame, BADGE_RING),
+        "monitorWarning": badged(frame, BADGE_WARNING),
+    }
 
 
 def svg_of(path):
