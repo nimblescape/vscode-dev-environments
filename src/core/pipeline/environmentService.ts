@@ -110,9 +110,11 @@ import {
   describeRefusal,
   foreignVolumeName,
   hostAccessChecks,
+  imageIdsNamedBy,
   imageLabelItems,
   imageReferencesToInspect,
   inspectedImageItems,
+  otherAccountImageItems,
   isOwnVolume,
   isRefused,
   isSameOwnerAdditionalVolume,
@@ -124,6 +126,7 @@ import {
   volumeLabelOwner,
   withoutComposeIgnored,
   type CheckStage,
+  type EnvironmentImageIds,
   type HostAccessChecks,
   type HostAccessInput,
   type HostAccessReport,
@@ -1426,7 +1429,11 @@ export class EnvironmentService {
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image. Review round 9 (S9-3): only when
     // the configuration is not refused already. `known`: the references that were asked already.
     const refuseUnlessAllowed = async (report: HostAccessReport, references: readonly NamedImageReference[]) => {
-      if (!isRefused(report)) addRefusedItems(report, 'unsupported', await this.imageIdItems(references, ctx.signal));
+      if (!isRefused(report)) {
+        const items = await this.imageIdItems(env, references, ctx.signal);
+        addRefusedItems(report, 'hostAccess', items.hostAccess);
+        addRefusedItems(report, 'unsupported', items.unsupported);
+      }
       if (isRefused(report)) {
         this.logger.warn(`The configuration ${configPath} of ${env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
         throw new HostAccessError(report);
@@ -1739,8 +1746,8 @@ export class EnvironmentService {
     });
     // Review round 2 (S2-05): a reference that Docker takes for the ID of a local image.
     // Review round 9 (S9-3): only when the configuration is not refused already.
-    const ids = isRefused(analysis.report) ? [] : await this.imageIdItems(analysis.imageReferences, ctx.signal);
-    return { report: cappedReport(analysis.report, ids), references: analysis.references };
+    const items = isRefused(analysis.report) ? { hostAccess: [], unsupported: [] } : await this.imageIdItems(env, analysis.imageReferences, ctx.signal);
+    return { report: cappedReport(analysis.report, items.unsupported, items.hostAccess), references: analysis.references };
   }
 
   /**
@@ -1779,18 +1786,25 @@ export class EnvironmentService {
    * Review round 13 (P13-1): a failure of Docker never hides a definitive refusal: grammar-invalid references are returned
    * before any inspect, and the items of `invalid` answers (and image IDs) are returned also when other references are
    * transient (which are logged, never turned into items); AnalysisFailedError only when there is no definitive item.
+   * User decision 2026-09-28: `hostAccess` (protected), the references whose image is an image of the environments of
+   * another account on the Docker host of `env` and of none of its own account (otherAccountImageItems, by the image ID;
+   * environmentImageIds); no longer a rule on the name `devenv-…`.
    */
-  private async imageIdItems(references: readonly NamedImageReference[], signal?: AbortSignal): Promise<string[]> {
+  private async imageIdItems(
+    env: Environment,
+    references: readonly NamedImageReference[],
+    signal?: AbortSignal,
+  ): Promise<{ unsupported: string[]; hostAccess: string[] }> {
     const { named, invalid } = imageReferencesToInspect(references);
     // Review round 13 (P13-1): the configuration is refused for them anyway (like the isRefused short-circuit of the
     // callers): no inspect, so that no failure of Docker for another reference hides the refusal.
     // Review round 17 (P17-3): at most MAX_LISTED_ITEMS items, each at most MAX_ITEM_LENGTH characters (capped).
     if (invalid.length > 0) {
       this.logger.warn(`Image references that are not valid: ${capped(invalid).join(', ')}.`);
-      return capped(invalid);
+      return { unsupported: capped(invalid), hostAccess: [] };
     }
     const distinct = [...new Set(named.map((entry) => entry.reference))];
-    if (distinct.length === 0) return [];
+    if (distinct.length === 0) return { unsupported: [], hostAccess: [] };
     // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
     if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
     this.throwIfCancelled(signal);
@@ -1807,20 +1821,76 @@ export class EnvironmentService {
       return { images: [], unchecked: distinct.map((reference) => ({ reference, reason: 'transient' as const })) };
     });
     this.throwIfCancelled(signal);
-    const { items, transient, notChecked } = inspectedImageItems(named, images, unchecked);
+    const { items, transient: transientReferences, notChecked } = inspectedImageItems(named, images, unchecked);
     if (notChecked.length > 0) this.logger.warn(`Docker could not inspect the image references ${capped(notChecked).join(', ')}.`);
+    // User decision 2026-09-28: the images of the environments of other accounts, by their IDs; only when a reference
+    // found a local image (a missing one is pulled by its name, or the build fails).
+    const ids = images.length > 0 ? await this.environmentImageIds(env, signal) : { own: new Set<string>(), others: new Set<string>(), transient: [] };
+    const foreign = otherAccountImageItems(named, images, ids);
+    if (foreign.length > 0) this.logger.warn(`Image references of ${env.repository} name images of environments of another GitHub account: ${capped(foreign).join(', ')}.`);
+    const transient = [...transientReferences, ...ids.transient];
     if (transient.length > 0) {
       const shown = transient.slice(0, 5).map((reference) => truncated(reference, MAX_ITEM_LENGTH)).join(', ') + (transient.length > 5 ? ` and ${transient.length - 5} more` : '');
       // Review round 13 (P13-1): a definitive refusal is not hidden by a failure of Docker for another reference: the
       // configuration is refused for it anyway (and an update refused for it is remembered); the failure is logged.
-      if (items.length > 0) {
+      if (items.length > 0 || foreign.length > 0) {
         this.logger.warn(`Docker could not check the image references ${shown}; the configuration is refused for the others.`);
-        return capped(items);
+        return { unsupported: capped(items), hostAccess: capped(foreign) };
       }
       // Review round 12 (P12-1): a text of its own (dockerCheckItem), not the one of an analysis that could not run.
       throw new AnalysisFailedError({ kind: 'internal', docker: true, reason: shown });
     }
-    return capped(items);
+    return { unsupported: capped(items), hostAccess: capped(foreign) };
+  }
+
+  /**
+   * User decision 2026-09-28: the IDs of the images of the environments on the Docker host of `env` (EnvironmentImageIds),
+   * split into those of the account of `env` and those of other accounts: every tag of the environment image repository
+   * of each environment (`devenv-<short id>:<build>`: the current build, an older one that is still there, and a new one
+   * that a build of that environment has just tagged before its build record is written), and the images of its build
+   * record (the environment image and the images that Docker Compose built; a rebuild of Compose moves their names to
+   * the new image, the old one has no name left). One `docker image ls` per environment and one `docker image inspect`
+   * of all names, only when an environment of another account is on the host. `transient`: what Docker could not answer
+   * for (a timeout, a daemon that cannot be reached); the caller treats it as a check that failed (AnalysisFailedError),
+   * as for the references of the configuration. A name of a missing image adds nothing.
+   */
+  private async environmentImageIds(env: Environment, signal?: AbortSignal): Promise<EnvironmentImageIds & { transient: string[] }> {
+    const entries = environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env));
+    if (!entries.some((entry) => entry.owner.id !== env.owner.id)) return { own: new Set(), others: new Set(), transient: [] };
+    const transient: string[] = [];
+    const imagesOf = async (entry: Environment): Promise<string[]> => {
+      const recorded = entry.buildRecord ? [entry.buildRecord.environmentImage, ...(composeRecordOf(entry.buildRecord)?.images ?? [])] : [];
+      const repository = environmentImageRepository(entry.id);
+      this.throwIfCancelled(signal);
+      const tags = await this.deps.docker.listImageTags(repository).catch((error: unknown) => {
+        this.logger.warn(`The tags of ${repository} could not be listed: ${errorMessage(error)}`);
+        transient.push(repository);
+        return [];
+      });
+      return [...recorded, ...tags];
+    };
+    const own: string[] = [];
+    const others: string[] = [];
+    for (const entry of entries) (entry.owner.id === env.owner.id ? own : others).push(...(await imagesOf(entry)));
+    const ownNames = [...new Set(own)];
+    const otherNames = [...new Set(others)].filter((name) => !ownNames.includes(name));
+    if (otherNames.length === 0) return { own: new Set(), others: new Set(), transient };
+    this.throwIfCancelled(signal);
+    const names = [...ownNames, ...otherNames];
+    const { images, unchecked } = await this.deps.docker.inspectImageNames(names, signal).catch((error: unknown) => {
+      if (this.isCancellation(error, signal)) {
+        this.throwIfCancelled(signal);
+        throw error;
+      }
+      this.logger.warn(`The images of the environments on the Docker host could not be read: ${errorMessage(error)}`);
+      return { images: [], unchecked: names.map((reference) => ({ reference, reason: 'transient' as const })) };
+    });
+    this.throwIfCancelled(signal);
+    return {
+      own: imageIdsNamedBy(ownNames, images),
+      others: imageIdsNamedBy(otherNames, images),
+      transient: [...transient, ...unchecked.filter((entry) => entry.reason === 'transient').map((entry) => entry.reference)],
+    };
   }
 
   /**

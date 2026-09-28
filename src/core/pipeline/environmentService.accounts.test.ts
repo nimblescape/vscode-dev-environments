@@ -6,9 +6,11 @@
 // the same repository, and with the names of a new environment.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
+import { dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
-import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, environmentImageRepository, resourceName } from '../names';
 import { availableEnvironments } from '../ownership';
+import { otherAccountImageItem } from '../policy';
 import type { Environment, GitHubAccount } from '../types';
 import type { EnvironmentServiceDeps, RepositoryTarget } from './environmentService';
 import {
@@ -540,5 +542,129 @@ describe('a named volume that the environments of one account share (concept sec
     expect(second.message).toBe(Messages.hostAccess(`volume ${SHARED} of another environment`));
     expect(h.helper.ups).toHaveLength(1);
     expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
+  });
+});
+
+describe('images of the environments of other accounts (user decision 2026-09-28)', () => {
+  /** The environment image of the environment of OTHER_ACCOUNT (ENV_ID, REPO), and an ID of its own. */
+  const THEIRS = environmentImageName(ENV_ID, 1);
+  const ID = `sha256:${'a'.repeat(64)}`;
+  const WEB = 'acme/web';
+
+  beforeEach(async () => {
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null });
+    h.docker.imageIds.set(THEIRS, ID);
+  });
+
+  async function refused(image: string): Promise<void> {
+    h.helper.config = { image };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(otherAccountImageItem(image)));
+    expect(h.helper.builds).toEqual([]);
+    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
+  }
+
+  it('refuses the environment image of an environment of another account, also written with the registry of Docker Hub', async () => {
+    await refused(THEIRS);
+    // Docker gives the same image for the name with docker.io/library/.
+    h.docker.images.add(`docker.io/library/${THEIRS}`);
+    h.docker.imageIds.set(`docker.io/library/${THEIRS}`, ID);
+    h.docker.imageRepoNames.set(`docker.io/library/${THEIRS}`, { repoTags: [THEIRS], repoDigests: [] });
+    await refused(`docker.io/library/${THEIRS}`);
+  });
+
+  it('refuses a copy of that image under another name (the same ID)', async () => {
+    h.docker.images.add('mine:1');
+    h.docker.imageIds.set('mine:1', ID);
+    await refused('mine:1');
+  });
+
+  it('refuses an older build of that environment that is still there, and a new one before its build record', async () => {
+    for (const [build, id] of [
+      [0, `sha256:${'b'.repeat(64)}`],
+      [2, `sha256:${'c'.repeat(64)}`],
+    ] as const) {
+      const image = environmentImageName(ENV_ID, build);
+      h.docker.images.add(image);
+      h.docker.imageIds.set(image, id);
+      await refused(image);
+    }
+  });
+
+  it('refuses an image that Docker Compose built for that environment (its build record)', async () => {
+    h.cleanup();
+    h = createHarness();
+    const built = `${environmentImageRepository(ENV_ID)}-db`;
+    await seedEnvironment(h, {
+      owner: OTHER_ACCOUNT,
+      container: null,
+      record: { compose: { service: 'app', images: [built], serviceImages: [], version: '2.40.0', inputsHash: 'sha256:x' } },
+    });
+    h.docker.images.add(built);
+    h.docker.imageIds.set(built, `sha256:${'d'.repeat(64)}`);
+    await refused(built);
+  });
+
+  it('allows the image of an environment of the same account', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
+    const ours = environmentImageName(OTHER_ID, 1);
+    h.helper.config = { image: ours };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows an image with the ID of an image of the same account: the same configuration builds the same image', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
+    h.docker.imageIds.set(environmentImageName(OTHER_ID, 1), ID);
+    h.helper.config = { image: THEIRS };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows a name like devenv-… that is no image of an environment of another account', async () => {
+    h.docker.images.add('devenv-tools:1');
+    h.helper.config = { image: 'devenv-tools:1' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('allows the image of another account on another Docker host', async () => {
+    h.cleanup();
+    h = createHarness();
+    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { dockerHost: 'ssh://build-box' } });
+    h.docker.imageIds.set(THEIRS, ID);
+    h.helper.config = { image: THEIRS };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('fails the check when Docker cannot list the images of the environments', async () => {
+    const listImageTags = h.docker.listImageTags.bind(h.docker);
+    h.docker.listImageTags = async (repository: string) => {
+      if (repository === environmentImageRepository(ENV_ID)) throw new Error('Cannot connect to the Docker daemon');
+      return listImageTags(repository);
+    };
+    h.helper.config = { image: BASE_IMAGE };
+    h.docker.images.add(BASE_IMAGE);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem(environmentImageRepository(ENV_ID))));
+    expect(h.helper.builds).toEqual([]);
+  });
+
+  it('asks Docker about the images of the environments only when a reference names a local image and another account has an environment', async () => {
+    h.helper.config = { image: 'missing:1' };
+    await h.service.open(TARGET, options()).catch(() => undefined);
+    expect(h.docker.imageInspections).toEqual([['missing:1']]);
+  });
+});
+
+describe('images of the environments without another account (user decision 2026-09-28)', () => {
+  it('asks Docker about the references only', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, volume: false });
+    h.docker.images.add(BASE_IMAGE);
+    h.helper.config = { image: BASE_IMAGE };
+    await h.service.open(TARGET, options());
+    expect(h.docker.imageInspections).toEqual([[BASE_IMAGE]]);
   });
 });

@@ -111,7 +111,7 @@ function labelProblems(labels: unknown, where: string): Problem[] {
     .map((key) => unsupported(`${where}label ${key}`));
 }
 
-/** imageReferenceFinding of ./images.ts as a problem: the image of another environment (D-17), or an image ID. */
+/** imageReferenceFinding of ./images.ts as a problem: an image ID (an image of another account: otherAccountImageItems). */
 function imageProblems(reference: string, what: string): Problem[] {
   const finding = imageReferenceFinding(reference, what);
   return finding ? [finding] : [];
@@ -181,8 +181,8 @@ function listOf(value: unknown): unknown[] {
 }
 
 const SERVICE_RULES: Readonly<Record<string, KeyRule>> = {
-  // The image of another environment is refused (D-17): account separation. The images of built services are renamed
-  // (rewrite).
+  // An image ID is refused; an image of the environments of another account by its ID in the pipeline
+  // (otherAccountImageItems): account separation. The images of built services are renamed (rewrite).
   image: (value) => (typeof value === 'string' ? imageProblems(value, 'image') : []),
   build: buildProblems,
   // Rewritten: the dev container gets the name of the environment, the others none (D-12).

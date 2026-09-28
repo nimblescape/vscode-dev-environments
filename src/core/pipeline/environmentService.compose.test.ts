@@ -55,6 +55,7 @@ import {
   ENV_ID,
   FEATURE,
   FEATURE_DIGEST,
+  OTHER_ACCOUNT,
   OTHER_ID,
   REPO,
   TOKEN,
@@ -388,6 +389,21 @@ describe('first open of a Docker Compose configuration', () => {
     expect(error.message).toContain('local Feature ./local in a Docker Compose configuration');
     expect(error.message).toContain('service web (not in the Docker Compose configuration)');
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('refuses a service image that is an image of an environment of another account, whatever the switch says (user decision 2026-09-28)', async () => {
+    const theirs = environmentImageName(OTHER_ID, 1);
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false });
+    h.docker.images.add(BASE_IMAGE);
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageIds.set(DB_IMAGE, `sha256:image-of-${theirs}`);
+    for (const checksOff of [false, true]) {
+      if (checksOff) h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('hostAccess');
+      expect(error.message).toContain(`service db: image ${DB_IMAGE} (an image of an environment of another GitHub account)`);
+      expect(h.helper.builds).toEqual([]);
+    }
   });
 
   it('refuses a project volume of another environment', async () => {

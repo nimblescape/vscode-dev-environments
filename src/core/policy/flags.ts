@@ -368,8 +368,9 @@ function storageOptionProblems(value: string): Problem[] {
 // Values of options of `docker build`
 
 /**
- * `--build-context name=value`: an image or a URL is allowed, a folder of the computer is not; the image of another
- * environment or an image ID stays refused (imageReferenceFinding). The build client reads a folder (also of
+ * `--build-context name=value`: an image or a URL is allowed, a folder of the computer is not; an image ID stays refused
+ * (imageReferenceFinding), and the pipeline refuses an image of the environments of another account by its ID
+ * (otherAccountImageItems). The build client reads a folder (also of
  * `oci-layout://`) in the workspace helper (review round 2, S2-03): a path of the workspace helper (isHelperPath; the
  * workspace volume holds only the repository besides the folder with the token) or a relative path (resolved against
  * the working folder of the build in the helper, which the check does not know) stays refused whatever the switch says.

@@ -30,7 +30,10 @@ import {
   hostAccessProblems,
   hostAccessReport,
   imageLabelItems,
+  imageIdsNamedBy,
+  imageNamedBy,
   imageReferenceFinding,
+  otherAccountImageItems,
   resolveNetworkReference,
   resolvedByImageId,
   imageIdResolvedReferences,
@@ -1138,8 +1141,10 @@ describe('imageReferenceFinding and localImageRepository', () => {
   });
 
   it.each([
-    ['devenv-11111111:2', { item: 'image devenv-11111111:2 of another environment', class: 'protected' }],
-    ['Docker.io/Library/devenv-1', { item: 'image Docker.io/Library/devenv-1 of another environment', class: 'protected' }],
+    // User decision 2026-09-28: changed expectation (it was protected, `… of another environment`), a name is not refused by its
+    // form; the pipeline refuses an image of the environments of another account by its ID (otherAccountImageItems).
+    ['devenv-11111111:2', undefined],
+    ['Docker.io/Library/devenv-1', undefined],
     [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
     ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
     // Review round 2 (S2-05): changed expectation, 12 hexadecimal characters may be a name; the pipeline asks Docker
@@ -1149,6 +1154,40 @@ describe('imageReferenceFinding and localImageRepository', () => {
     ['postgres:16', undefined],
   ])('%s', (reference, expected) => {
     expect(imageReferenceFinding(reference)).toEqual(expected);
+  });
+});
+
+describe('otherAccountImageItems (user decision 2026-09-28)', () => {
+  const THEIRS = { id: `sha256:${'a'.repeat(64)}`, repoTags: ['devenv-11111111:2'], repoDigests: [] };
+  const COPY = { id: THEIRS.id, repoTags: ['mine:1'], repoDigests: [] };
+  const OURS = { id: `sha256:${'b'.repeat(64)}`, repoTags: ['devenv-22222222:1'], repoDigests: [] };
+  const named = (reference: string, what = 'image') => [{ reference, what }];
+
+  it('gives the image of a reference by its name, also written with the registry of Docker Hub, never by an ID prefix', () => {
+    expect(imageNamedBy('devenv-11111111:2', [OURS, THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy('docker.io/library/devenv-11111111:2', [THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy('aaaaaaaa', [THEIRS])).toBeUndefined();
+    expect(imageNamedBy('Not A Reference', [THEIRS])).toBeUndefined();
+  });
+
+  it('collects the IDs that names give, and nothing for a missing image', () => {
+    expect(imageIdsNamedBy(['devenv-11111111:2', 'devenv-33333333:1'], [THEIRS])).toEqual(new Set([THEIRS.id]));
+  });
+
+  it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
+    ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
+    ['an image of another account that is also the account\'s own (the same build)', [THEIRS], { own: [THEIRS.id], others: [THEIRS.id] }, []],
+    ['an image of the account', [OURS], { own: [OURS.id], others: [THEIRS.id] }, []],
+    ['no image of an environment', [{ id: 'sha256:c', repoTags: ['devenv-11111111:2'], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
+    ['a missing image', [], { own: [], others: [THEIRS.id] }, []],
+  ])('%s', (_name, images, ids, expected) => {
+    expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) })).toEqual(expected);
+  });
+
+  it('refuses a copy under another name by its ID, with the name of the setting', () => {
+    expect(otherAccountImageItems(named('mine:1', 'service db: image'), [COPY], { own: new Set(), others: new Set([THEIRS.id]) })).toEqual([
+      'service db: image mine:1 (an image of an environment of another GitHub account)',
+    ]);
   });
 });
 

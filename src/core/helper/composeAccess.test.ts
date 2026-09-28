@@ -109,8 +109,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
   it.each<[string, string, Record<string, unknown>, HostAccessReport]>([
     // image (D-17)
     ['an image', 'db', { image: 'mirror.gcr.io/library/alpine:3.22' }, NONE],
-    ['the image of another environment', 'db', { image: 'devenv-11111111:3' }, A('service db: image devenv-11111111:3 of another environment')],
-    ['the image of another environment on Docker Hub', 'db', { image: 'docker.io/library/devenv-11111111-app' }, A('service db: image docker.io/library/devenv-11111111-app of another environment')],
+    // User decision 2026-09-28: changed expectation (it was refused as `… of another environment`), a name like devenv-… is allowed;
+    // the pipeline refuses an image of the environments of another account by its ID (otherAccountImageItems).
+    ['an image named like the image of an environment', 'db', { image: 'devenv-11111111:3' }, NONE],
+    ['an image named like the image of an environment on Docker Hub', 'db', { image: 'docker.io/library/devenv-11111111-app' }, NONE],
     // build
     ['a build context in the repository', 'db', { build: { context: REPO, dockerfile: 'docker/Dockerfile', args: { A: '1' }, target: 'dev', network: 'host', pull: true, no_cache: true, shm_size: '1g', extra_hosts: ['a:1.2.3.4'], platforms: ['linux/amd64'], ulimits: {}, isolation: 'default' } }, NONE],
     // Review round 5, S5-4: changed expectation, a remote build context is not supported yet.

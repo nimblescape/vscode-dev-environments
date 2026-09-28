@@ -114,13 +114,14 @@ export function addRefusedItems(report: HostAccessReport, list: keyof HostAccess
 
 /**
  * The report of a Docker Compose configuration (checkContainer `composeModel`) with the items of its image references
- * that Docker resolves by the ID of an image (`imageIds`, not supported). Review round 17 (P17-3): each list at most
+ * that Docker resolves by the ID of an image (`imageIds`, not supported) and of those that name an image of the
+ * environments of another account (`protectedImages`, otherAccountImageItems; refused whatever the switch says). Review round 17 (P17-3): each list at most
  * MAX_LISTED_ITEMS, each item at most MAX_ITEM_LENGTH characters, after the merge and without duplicates (a model with
  * hundreds of services would otherwise make a message of megabytes).
  */
-export function cappedReport(report: HostAccessReport, imageIds: readonly string[] = []): HostAccessReport {
+export function cappedReport(report: HostAccessReport, imageIds: readonly string[] = [], protectedImages: readonly string[] = []): HostAccessReport {
   return {
-    hostAccess: capped([...new Set(report.hostAccess)]),
+    hostAccess: capped([...new Set([...report.hostAccess, ...protectedImages])]),
     unsupported: capped([...new Set([...report.unsupported, ...imageIds])]),
   };
 }
