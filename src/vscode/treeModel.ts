@@ -235,11 +235,20 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
 
 /**
  * Icon of a state: green monitor with the remote sign connected (this window), green monitor connected in another
- * window, green running machine without a window, grey monitor stopped, ↻ updating, ◌ no container, ⚠ files missing. Green always means that the container
- * runs.
+ * window, green play icon running without a window, grey monitor stopped, ↻ updating, ◌ no container, ⚠ files missing.
+ * Green always means that the container runs.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
+}
+
+/**
+ * The codicon of a state in a Quick Pick label (the switcher, the environment pickers). Review round 1 of PR #59 (P1): a
+ * Quick Pick cannot color an icon, so the grey monitor of Stopped would look like the green monitor of Connected · other
+ * window; Stopped keeps the ring there. Every other state has the codicon of the sidebar.
+ */
+export function pickerIconId(state: EnvironmentState): string {
+  return state === 'stopped' ? 'circle-outline' : STATE_ICONS[state].id;
 }
 
 /** State text of concept 6.2, for example `Connected · other window`. */

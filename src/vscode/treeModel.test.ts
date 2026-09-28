@@ -19,6 +19,7 @@ import {
   rootNodes,
   rowActions,
   rowStateText,
+  pickerIconId,
   stateIcon,
   stateText,
   TreeTexts,
@@ -811,6 +812,14 @@ describe('state texts and icons', () => {
     expect(stateIcon('updating').id).toBe('sync~spin');
     expect(stateIcon('noContainer').id).toBe('circle-large-outline');
     expect(stateIcon('filesMissing').id).toBe('warning');
+  });
+
+  // Review round 1 of PR #59 (P1): a Quick Pick cannot color icons, so Stopped keeps a shape of its own there.
+  it('gives every state a Quick Pick icon that tells Stopped from Connected · other window', () => {
+    expect(pickerIconId('stopped')).toBe('circle-outline');
+    expect(pickerIconId('connectedOtherWindow')).toBe('vm');
+    expect(pickerIconId('connected')).toBe('vm-connect');
+    for (const state of ['running', 'updating', 'noContainer', 'filesMissing'] as const) expect(pickerIconId(state)).toBe(stateIcon(state).id);
   });
 });
 

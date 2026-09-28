@@ -71,7 +71,7 @@ import {
   repositoryTarget,
   type CommandArgument,
 } from './targets';
-import { TreeTexts, recentEnvironments, stateIcon } from './treeModel';
+import { TreeTexts, pickerIconId, recentEnvironments } from './treeModel';
 import { opensNewWindow, type WindowRequest } from './windowChoice';
 
 /**
@@ -2334,7 +2334,7 @@ export class Controller implements vscode.Disposable {
     }
     await this.renderQuietly();
     const items = recentEnvironments(sidebar.model(), environments).map((entry) => ({
-      label: entry.state ? `$(${stateIcon(entry.state).id}) ${entry.repository}` : entry.repository,
+      label: entry.state ? `$(${pickerIconId(entry.state)}) ${entry.repository}` : entry.repository,
       description: entry.description,
       environmentId: entry.environmentId,
     }));

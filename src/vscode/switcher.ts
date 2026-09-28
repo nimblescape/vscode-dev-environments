@@ -5,7 +5,7 @@
 // Switcher (concept 6.4): Quick Pick with the recent environments and the entry "Open repository…".
 import * as vscode from 'vscode';
 import type { Environment, RepositoryInfo } from '../core/types';
-import { recentEnvironments, repositoriesForPicker, stateIcon, type OwnerGroup } from './treeModel';
+import { pickerIconId, recentEnvironments, repositoriesForPicker, type OwnerGroup } from './treeModel';
 
 // User-visible texts that messages.ts lacks; to be moved there.
 export const SwitcherTexts = {
@@ -50,7 +50,7 @@ export async function showSwitcher(input: {
   const items: ChoiceItem[] = [
     { label: SwitcherTexts.recentEnvironments, kind: vscode.QuickPickItemKind.Separator },
     ...recent.map((entry): ChoiceItem => ({
-      label: entry.state ? `$(${stateIcon(entry.state).id}) ${entry.repository}` : entry.repository,
+      label: entry.state ? `$(${pickerIconId(entry.state)}) ${entry.repository}` : entry.repository,
       description: entry.description,
       choice: { kind: 'environment', environmentId: entry.environmentId },
     })),
