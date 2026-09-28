@@ -4,7 +4,8 @@
 
 // The Docker host in the sidebar (user request 2026-09-28: "it shall be indicated that we are on a remote host in the
 // sidebar"; later: "the headline shall be shown also in local mode"). The view's title names the Docker host: "<host>
-// (remote)", "Local Docker", or "<endpoint> (not supported)"; the sidebar has one view, so VS Code merges its header with
+// (remote)", "Local Docker", or "<endpoint> (not supported)" ("Dev Environments", and no host row, while no Docker CLI is
+// found); the sidebar has one view, so VS Code merges its header with
 // the sidebar title and shows "Dev Environments: <title>" (user screenshot 2026-09-28: the description of a merged view
 // is not shown; it is set too, for a layout with more views). The merged header does not show it in every window, so the
 // first row of the list names the host too (treeView.ts, DockerHostRow); a click on it chooses the Docker host (user
