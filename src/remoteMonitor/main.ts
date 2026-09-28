@@ -121,15 +121,19 @@ const RECORD_LOCK_STALE_MS = 10_000;
 /** How long a heartbeat waits for the lock of a record. */
 const RECORD_LOCK_WAIT_MS = 5_000;
 
+/** A lock holder refreshes the time of its lock this often, so a long hold never looks left over. */
+const RECORD_LOCK_REFRESH_MS = 3_000;
+
 /**
  * Runs `fn` while holding the lock of one record (`.<name>.lock`, created with `wx`), so that two heartbeats of the same
  * source (two `docker exec` at the same time) read and replace the record one after the other.
  *
- * Review of the remote monitor after PR #57: a left-over lock was removed by path, so two heartbeats that both found it
- * stale could both get in (the second removed the fresh lock of the first), and a holder removed the lock of another
- * one in its `finally`. Now a lock holds a token of its holder, and a lock is only ever moved aside (`rename`, which
- * only one process wins) before it is removed; a lock that was moved by mistake (another one than the stale or the own
- * one) is put back (`link`, which never replaces a lock).
+ * Review of PR #58 (after review round 10 of PR #57): a lock holds a token of its holder, and the holder refreshes its
+ * time every RECORD_LOCK_REFRESH_MS, so only the lock of a holder that is gone (a killed `docker exec`) gets older than
+ * RECORD_LOCK_STALE_MS. Such a lock is taken over under a second lock (`.<name>.lock.break`, `wx`), so one process at a
+ * time: it reads the lock again and removes it only when it is still the same stale lock (its token and its time); a
+ * holder removes its lock only while it still holds its token. Not atomic on plain files: a holder that stops for more
+ * than 10 s (a paused container) can still lose its lock while inside.
  */
 export async function withRecordLock<T>(dir: string, name: string, fn: () => Promise<T>): Promise<T> {
   const lock = path.join(dir, `.${name}.lock`);
@@ -141,41 +145,56 @@ export async function withRecordLock<T>(dir: string, name: string, fn: () => Pro
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const stat = await fs.promises.lstat(lock).catch(() => undefined);
-      if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) {
-        await removeLock(lock, (moved) => moved.ino === stat.ino);
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
-      await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    const seen = await readLock(lock);
+    if (seen && Date.now() - seen.mtimeMs > RECORD_LOCK_STALE_MS) await breakStaleLock(lock, seen);
+    if (Date.now() > deadline) throw new Error(`The record ${name} is locked.`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  const refresh = setInterval(() => {
+    const now = new Date();
+    void fs.promises.utimes(lock, now, now).catch(() => undefined);
+  }, RECORD_LOCK_REFRESH_MS);
   try {
     return await fn();
   } finally {
-    await removeLock(lock, async (_moved, aside) => (await fs.promises.readFile(aside, 'utf8').catch(() => '')) === token).catch(() => undefined);
+    clearInterval(refresh);
+    const current = await readLock(lock);
+    if (current?.token === token) await fs.promises.rm(lock, { force: true }).catch(() => undefined);
+  }
+}
+
+/** The token and the time of a lock, or undefined when there is none. */
+async function readLock(lock: string): Promise<{ token: string; mtimeMs: number } | undefined> {
+  try {
+    const [token, stat] = await Promise.all([fs.promises.readFile(lock, 'utf8'), fs.promises.lstat(lock)]);
+    return { token, mtimeMs: stat.mtimeMs };
+  } catch {
+    return undefined;
   }
 }
 
 /**
- * Moves the lock aside and removes it when `isIt` says it is the one meant; otherwise puts it back (unless another lock
- * was created meanwhile). Never throws.
+ * Removes the lock when it is still the stale lock `seen`, under the guard `<lock>.break` (one breaker at a time; a guard
+ * older than RECORD_LOCK_STALE_MS is left over by a killed breaker and removed). Never throws.
  */
-async function removeLock(lock: string, isIt: (moved: fs.Stats, aside: string) => boolean | Promise<boolean>): Promise<void> {
-  const aside = `${lock}.${process.pid}.${randomBytes(6).toString('hex')}.old`;
+export async function breakStaleLock(lock: string, seen: { token: string; mtimeMs: number }): Promise<void> {
+  const guard = `${lock}.break`;
   try {
-    await fs.promises.rename(lock, aside);
+    await fs.promises.writeFile(guard, '', { flag: 'wx', mode: 0o600 });
   } catch {
-    // Gone already, or another process moved it.
+    const stat = await fs.promises.lstat(guard).catch(() => undefined);
+    if (stat && Date.now() - stat.mtimeMs > RECORD_LOCK_STALE_MS) await fs.promises.rm(guard, { force: true }).catch(() => undefined);
     return;
   }
   try {
-    const moved = await fs.promises.lstat(aside);
-    if (!(await isIt(moved, aside))) await fs.promises.link(aside, lock).catch(() => undefined);
+    const current = await readLock(lock);
+    if (current && current.token === seen.token && current.mtimeMs === seen.mtimeMs) await fs.promises.rm(lock, { force: true });
   } catch {
-    // Keep going: the moved file is removed below.
+    // The next attempt looks again.
+  } finally {
+    await fs.promises.rm(guard, { force: true }).catch(() => undefined);
   }
-  await fs.promises.rm(aside, { force: true }).catch(() => undefined);
 }
 
 /**
