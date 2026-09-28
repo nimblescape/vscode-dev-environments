@@ -739,6 +739,18 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     await refused(environmentImageName('9a8b7c6d-0000-4000-8000-000000000009', 1));
   });
 
+  it('fails the check, not refuses by the name, when Docker could not inspect a reference (review round 4, T1, T2)', async () => {
+    // By its ID the image would be allowed: an environment of the account has the same image.
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
+    h.docker.imageIds.set(environmentImageName(OTHER_ID, 1), ID);
+    h.docker.transientImages = new Set([THEIRS]);
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem(THEIRS)));
+    // Docker, which could not answer, is not asked for the images of the environments either.
+    expect(h.docker.environmentImageLists).toBe(0);
+  });
+
   it('does not refuse the name of an image of an environment of the same account that is not there', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false, image: false });
     h.helper.config = { image: environmentImageName(OTHER_ID, 5) };

@@ -1838,15 +1838,19 @@ export class EnvironmentService {
     if (notChecked.length > 0) this.logger.warn(`Docker could not inspect the image references ${capped(notChecked).join(', ')}.`);
     // User decision 2026-09-28: the images of the environments of other accounts, by their IDs; only when a reference
     // found a local image (another one is pulled by its name, or the build fails), or (review round 3, S1) names no
-    // local image under the name of an environment image. `undefined`: Docker could not say.
-    const missing = named.filter((entry) => imageNamedBy(entry.reference, images) === undefined).map((entry) => environmentImageShortId(entry.reference));
-    const missingShortIds = missing.filter((short): short is string => short !== undefined);
+    // local image under the name of an environment image. `undefined`: Docker could not say. Review round 4 (T1, T2):
+    // missing only by a definitive answer of Docker; a reference that it could not inspect is not decided by its name.
+    const unanswered = new Set(unchecked.map((entry) => entry.reference));
+    const missing = new Set(
+      named.filter((entry) => !unanswered.has(entry.reference) && imageNamedBy(entry.reference, images) === undefined).map((entry) => entry.reference),
+    );
+    const missingShortIds = [...missing].map(environmentImageShortId).filter((short): short is string => short !== undefined);
     const read =
       images.length > 0 || missingShortIds.length > 0
         ? await this.hostEnvironmentImageIds(env, images, missingShortIds, signal)
         : { ids: { own: new Set<string>(), others: new Set<string>() } };
     const ids = read.ids;
-    const foreign = ids === undefined ? [] : otherAccountImageItems(named, images, ids);
+    const foreign = ids === undefined ? [] : otherAccountImageItems(named, images, ids, missing);
     if (foreign.length > 0) this.logger.warn(`Image references of ${env.repository} name images of environments of another GitHub account: ${capped(foreign).join(', ')}.`);
     if (transient.length > 0 || ids === undefined) {
       const shown =
@@ -1872,10 +1876,11 @@ export class EnvironmentService {
    * `devenv-<short id>-<service>`, whichever computer built them (so also an older build that is still there, a new one
    * before its build record, and one that a Delete could not remove), split by the owner account of the short ID: the
    * registry entries on the host (and `env` itself), else the owner label of the volumes of that environment on the
-   * host (one `docker volume ls`, only when an image that a reference found, `found`, has a short ID that the registry
-   * does not know: an environment that another computer created on a shared host, or an image left behind). An image of
-   * no known owner, or of volumes with different owner labels, counts as another account's. One `docker image ls` on
-   * each check whose references found a local image. `unread`: Docker could not answer (the reason of dockerCheckItem;
+   * host (one `docker volume ls`, only when an image that a reference found, `found`, or a reference without a local
+   * image, `missingShortIds`, has a short ID that the registry does not know: an environment that another computer
+   * created on a shared host, or an image left behind). An image of no known owner, or of volumes with different owner
+   * labels, counts as another account's. One `docker image ls` on each check whose references found a local image or
+   * name an environment image that Docker found missing. `unread`: Docker could not answer (the reason of dockerCheckItem;
    * the caller fails the check, as for a reference: AnalysisFailedError); a cancellation is thrown.
    */
   private async hostEnvironmentImageIds(
