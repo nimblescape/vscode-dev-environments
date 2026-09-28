@@ -86,6 +86,8 @@ export const RemoteDockerTexts = {
   cliMissing: 'A remote Docker host needs the Docker CLI on this computer. Install Docker first (Docker Desktop brings the CLI).',
   /** User decision 2026-09-28: the second button of each Docker host question. */
   dontAskAgain: (button: string) => `${button}, Don't Ask Again`,
+  /** Review (D2): the answer of a question about a remote host counts for every host. */
+  dontAskAgainAnyHost: (button: string) => `${button}, Don't Ask Again for Any Host`,
   dontAskSkipped: (question: string) => `Not asked (Don't Ask Again): ${question}`,
   askAgainDone: 'Dev Environments asks again before it changes the Docker host.',
   askAgainNothing: 'Dev Environments already asks before it changes the Docker host.',
@@ -336,7 +338,6 @@ export class RemoteDockerCommands {
     return parsed.address;
   }
 
-  /** DOCKER_HOST or DOCKER_CONTEXT set for VS Code: a context switch would not reach it. True when refused. */
   /**
    * "Ask Again Before Changing the Docker Host" (user decision 2026-09-28): forgets every "Don't Ask Again". Never
    * throws.
@@ -358,7 +359,8 @@ export class RemoteDockerCommands {
       this.deps.logger.info(RemoteDockerTexts.dontAskSkipped(message));
       return true;
     }
-    const always = RemoteDockerTexts.dontAskAgain(button);
+    // The answer is kept per question, not per host (review, D2): the button of a remote host says so.
+    const always = question === 'switchToLocal' ? RemoteDockerTexts.dontAskAgain(button) : RemoteDockerTexts.dontAskAgainAnyHost(button);
     const choice = await vscode.window.showWarningMessage(message, { modal: true, ...options }, button, always);
     if (choice === always) {
       await this.deps.state.setDontAsk(question);
@@ -367,6 +369,7 @@ export class RemoteDockerCommands {
     return choice === button;
   }
 
+  /** DOCKER_HOST or DOCKER_CONTEXT set for VS Code: a context switch would not reach it. True when refused. */
   private refuseOverride(): boolean {
     const name = dockerVariableOverride(this.deps.env, this.deps.platform);
     if (name === undefined) return false;
