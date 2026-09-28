@@ -9,9 +9,13 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../cor
 import { Messages } from '../core/messages';
 import type { Logger } from '../core/ports';
 import type { ExtensionSettings } from '../core/types';
+import { DEFAULT_IMAGE_SCHEDULE, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
+
+/** User requests 2026-09-28: the default of remoteImageUpdates. */
+export const DEFAULT_REMOTE_IMAGE_UPDATES: readonly string[] = ['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*'];
 
 /** Defaults of concept section 8. */
 export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
@@ -28,6 +32,8 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   repositoryGroups: [],
   openInNewWindow: false,
   remoteStopAfterMinutes: 10,
+  remoteImageUpdates: [...DEFAULT_REMOTE_IMAGE_UPDATES],
+  remoteImageUpdateSchedule: DEFAULT_IMAGE_SCHEDULE,
 });
 
 /**
@@ -143,5 +149,14 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
       MIN_REMOTE_STOP_AFTER_MINUTES,
       MAX_REMOTE_STOP_AFTER_MINUTES,
     ),
+    // The entries are checked where they are used (imagePrefixesOf): an invalid one is left out.
+    remoteImageUpdates: Array.isArray(get('remoteImageUpdates'))
+      ? (get('remoteImageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
+      : [...DEFAULT_REMOTE_IMAGE_UPDATES],
+    // User request 2026-09-28 ("in a guided cron style manner"): a cron expression of five fields; invalid: the default.
+    remoteImageUpdateSchedule:
+      typeof get('remoteImageUpdateSchedule') === 'string' && parseCronSchedule(get('remoteImageUpdateSchedule') as string)
+        ? (get('remoteImageUpdateSchedule') as string).trim().split(/\s+/).join(' ')
+        : DEFAULT_IMAGE_SCHEDULE,
   };
 }

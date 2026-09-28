@@ -12,7 +12,12 @@ import {
   PS_FORMAT,
   RemoteMonitorLoop,
   heartbeatDir,
+  imageScheduleFromEnv,
+  imageTimesFromEnv,
+  CurrentImageSettings,
+  ImageSchedule,
   main,
+  readImageList,
   parseContainerLines,
   readRecords,
   timingFromEnv,
@@ -356,5 +361,292 @@ describe('RemoteMonitorLoop', () => {
     fs.writeFileSync(path.join(heartbeatDir(stateDir), 'other-file'), 'x');
     await tickAt(T0);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), 'other-file'].sort());
+  });
+});
+
+// User request 2026-09-28 ("all images"): the list of repositories that the extension read from the registry.
+describe('monitor.js images', () => {
+  async function images(input: string): Promise<Run> {
+    let out = '';
+    let err = '';
+    const code = await main(['images', '-'], {
+      env: {},
+      stateDir,
+      readStdin: async () => input,
+      out: (text) => (out += text),
+      err: (text) => (err += text),
+    });
+    return { code, out, err };
+  }
+
+  it('stores a valid list, and readImageList gives it back', async () => {
+    expect(await images(JSON.stringify({ repositories: ['ghcr.io/majikmate/devcontainer-dev', 'ghcr.io/majikmate/devcontainer-dev'] }))).toEqual({ code: 0, out: '', err: '' });
+    expect(await readImageList(stateDir)).toEqual(['ghcr.io/majikmate/devcontainer-dev']);
+  });
+
+  it('refuses anything else and keeps the stored list', async () => {
+    await images(JSON.stringify({ repositories: ['ghcr.io/a/b'] }));
+    for (const input of ['not json', '{}', JSON.stringify({ repositories: ['UPPER/case'] }), JSON.stringify({ repositories: ['ghcr.io/a/b'], extra: 1 }), JSON.stringify({ repositories: ['ubuntu'] })]) {
+      expect((await images(input)).code, input).toBe(EXIT_INVALID);
+    }
+    expect(await readImageList(stateDir)).toEqual(['ghcr.io/a/b']);
+    expect((await main(['images'], { env: {}, stateDir, readStdin: async () => '{}', err: () => {} }))).toBe(EXIT_INVALID);
+  });
+
+  it('reads no list when none was stored', async () => {
+    expect(await readImageList(stateDir)).toEqual([]);
+  });
+
+  // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST".
+  it('passes one minute after the start, then by the schedule; the Docker tests can set a fixed interval', () => {
+    expect(imageTimesFromEnv({})).toEqual({ firstMs: 60_000, intervalMs: undefined });
+    expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '500', DEVENV_IMAGE_INTERVAL_MS: '2000' })).toEqual({ firstMs: 500, intervalMs: 2000 });
+    expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '5', DEVENV_IMAGE_INTERVAL_MS: 'x' })).toEqual({ firstMs: 60_000, intervalMs: undefined });
+    // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule.
+    const scheduleOf = (env: NodeJS.ProcessEnv) => {
+      const { text, timeZone } = imageScheduleFromEnv(env);
+      return { text, timeZone };
+    };
+    expect(scheduleOf({})).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5', DEVENV_IMAGE_TZ: 'America/New_York' })).toEqual({ text: '30 5 * * 1-5', timeZone: 'America/New_York' });
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(imageScheduleFromEnv({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5' }).schedule.weekdays).toEqual(new Set([1, 2, 3, 4, 5]));
+  });
+});
+
+// Review round 1 of PR #57 (C): the settings of the image maintenance come with `settings -`, not with the label; the
+// schedule is a cron expression (user request 2026-09-28, "in a guided cron style manner").
+describe('the settings and the schedule of the image maintenance', () => {
+  const SETTINGS = { prefixes: ['ghcr.io/acme/base'], schedule: '0 5 * * 1-5', timeZone: 'America/New_York' };
+  const ENV = { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/majikmate/devcontainer-dev']), DEVENV_IMAGE_SCHEDULE: '7 6 * * *', DEVENV_IMAGE_TZ: 'Europe/Vienna' };
+
+  async function settings(input: string): Promise<number> {
+    return main(['settings', '-'], { env: {}, stateDir, readStdin: async () => input, err: () => {} });
+  }
+
+  it('stores valid settings; the monitor takes them instead of those of its container at the next check', async () => {
+    const log: string[] = [];
+    const current = new CurrentImageSettings(ENV, stateDir, (message) => log.push(message));
+    await current.refresh();
+    expect(current.value).toMatchObject({ prefixes: ['ghcr.io/majikmate/devcontainer-dev'], schedule: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    await current.refresh();
+    expect(current.value).toMatchObject(SETTINGS);
+    expect(current.value.cron.hours).toEqual(new Set([5]));
+    expect(log).toEqual(['Image update settings: ghcr.io/acme/base; at "0 5 * * 1-5" (cron, America/New_York).']);
+    // Unchanged: no second log line.
+    await current.refresh();
+    expect(log).toHaveLength(1);
+  });
+
+  // Review round 10 of PR #57 (U2): a failed write leaves no temporary file in the volume.
+  it('leaves no temporary file behind when a write fails', async () => {
+    fs.mkdirSync(path.join(stateDir, 'image-settings.json'));
+    await expect(settings(JSON.stringify(SETTINGS))).rejects.toThrow();
+    expect(fs.readdirSync(stateDir).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('refuses anything else and keeps the stored settings', async () => {
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    for (const input of [
+      'not json',
+      '{}',
+      JSON.stringify({ ...SETTINGS, schedule: '61 5 * * *' }),
+      JSON.stringify({ ...SETTINGS, schedule: '05:00' }),
+      JSON.stringify({ ...SETTINGS, timeZone: 'Mars/Base' }),
+      JSON.stringify({ ...SETTINGS, prefixes: ['ubuntu*'] }),
+      JSON.stringify({ ...SETTINGS, extra: 1 }),
+    ]) {
+      expect(await settings(input), input).toBe(EXIT_INVALID);
+    }
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    await current.refresh();
+    expect(current.value).toMatchObject(SETTINGS);
+  });
+
+  it('runs a pass when a time of the schedule came since the last check, at most one at a time', async () => {
+    let time = Date.parse('2026-09-29T04:05:00Z');
+    const log: string[] = [];
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    let passes = 0;
+    let release: (() => void) | undefined;
+    const schedule = new ImageSchedule({
+      now: () => time,
+      log: (message) => log.push(message),
+      settings: current,
+      pass: () => {
+        passes++;
+        return passes === 1 ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve();
+      },
+    });
+    // 06:07 in Vienna is 04:07 UTC in summer.
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(0);
+    time += 120_000;
+    const first = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(passes).toBe(1);
+    // A pass that is still running: the next one is left out.
+    await schedule.run();
+    expect(passes).toBe(1);
+    expect(log).toEqual(['An image update is still running; this time of the schedule is left out.']);
+    release?.();
+    await first;
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(1);
+    // The next day.
+    time = Date.parse('2026-09-30T04:07:30Z');
+    await schedule.check();
+    expect(passes).toBe(2);
+  });
+
+  // Review round 2 of PR #57 (R3): a clock that steps back ran a time that was handled already again.
+  it('does not run a time again after the clock stepped back', async () => {
+    let time = Date.parse('2026-09-29T04:06:00Z');
+    let passes = 0;
+    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T04:00:00Z');
+    await schedule.check();
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+  });
+
+  // Review round 4 of PR #57 (L1): after a clock that was far ahead was corrected, no pass came until it caught up.
+  it('goes on from now after the clock stepped back by more than an hour', async () => {
+    let time = Date.parse('2027-09-29T04:06:00Z');
+    let passes = 0;
+    const log: string[] = [];
+    const schedule = new ImageSchedule({ now: () => time, log: (message) => log.push(message), settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    time = Date.parse('2027-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T04:05:00Z');
+    await schedule.check();
+    expect(log[0]).toMatch(/^The clock of the host went back by \d+ minutes; the image schedule goes on from now\.$/);
+    time = Date.parse('2026-09-29T04:08:00Z');
+    await schedule.check();
+    expect(passes).toBe(2);
+  });
+
+  // Review round 8 of PR #57 (S3): the IDs of the images are remembered at each check, not only at the passes.
+  it('observes the images at each check while no pass runs', async () => {
+    let observed = 0;
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: () => new Promise<void>((resolve) => (release = resolve)),
+      observe: async () => void observed++,
+    });
+    await schedule.check();
+    expect(observed).toBe(1);
+    const running = schedule.run();
+    await schedule.check();
+    expect(observed).toBe(1);
+    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release();
+    await running;
+  });
+
+  // Review round 9 of PR #57 (T1): a check that takes longer than the next one's start is not joined.
+  it('runs no second check while one is still running', async () => {
+    let observed = 0;
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: async () => {},
+      observe: () => {
+        observed++;
+        return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+    const first = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await schedule.check();
+    expect(observed).toBe(1);
+    release();
+    await first;
+    const next = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(observed).toBe(2);
+    release();
+    await next;
+  });
+
+  // Review round 9 of PR #57 (T1): a pass (the first one, one minute after the start) waits for a check's observe.
+  it('starts a pass only after the observe of a running check', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: async () => void order.push('pass'),
+      observe: () => {
+        order.push('observe');
+        return new Promise<void>((resolve) => (release = () => (order.push('observed'), resolve())));
+      },
+    });
+    const check = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const run = schedule.run();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(order).toEqual(['observe']);
+    release();
+    await Promise.all([check, run]);
+    expect(order).toEqual(['observe', 'observed', 'pass']);
+  });
+
+  // Review round 10 of PR #57 (U1): the times during a pass that a check started are left out, not caught up at once.
+  it('leaves out the times of the schedule during a pass that a check started, and logs it', async () => {
+    let time = Date.parse('2026-09-29T06:04:30Z');
+    const log: string[] = [];
+    let passes = 0;
+    const settings = new CurrentImageSettings({ ...ENV, DEVENV_IMAGE_SCHEDULE: '*/5 * * * *', DEVENV_IMAGE_TZ: 'UTC' }, stateDir, () => {});
+    const schedule = new ImageSchedule({
+      now: () => time,
+      log: (message) => log.push(message),
+      settings,
+      pass: async () => {
+        passes++;
+        // The pass takes until 06:17.
+        time = Date.parse('2026-09-29T06:17:00Z');
+      },
+    });
+    time = Date.parse('2026-09-29T06:05:10Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    expect(log).toEqual(['An image update was still running; the times of the schedule during it are left out.']);
+    time = Date.parse('2026-09-29T06:18:00Z');
+    await schedule.check();
+    expect(passes).toBe(1);
+    time = Date.parse('2026-09-29T06:20:10Z');
+    await schedule.check();
+    expect(passes).toBe(2);
+  });
+
+  it('follows new settings of another computer at the next check', async () => {
+    let time = Date.parse('2026-09-29T08:58:00Z');
+    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    let passes = 0;
+    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: current, pass: async () => void passes++ });
+    // 05:00 in New York (EDT) is 09:00 UTC; 2026-09-29 is a Tuesday.
+    expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(0);
+    time += 60_000;
+    await schedule.check();
+    expect(passes).toBe(1);
   });
 });

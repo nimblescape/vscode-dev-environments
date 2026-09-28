@@ -7,6 +7,7 @@
 // script (dist/remoteMonitor.js, src/remoteMonitor/main.ts), and the strict checks of everything that script reads.
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
+import { isTimeZone, parseCronSchedule } from './cron';
 
 /**
  * The one Session Monitor container per Docker engine (never a container of an environment: no
@@ -37,10 +38,23 @@ export const MAX_HEARTBEAT_LENGTH = 32_000;
 /** A record of another computer younger than this makes an environment "in use from another computer" (shared engine). */
 export const OTHER_COMPUTER_FRESH_MS = 90_000;
 /**
- * The longest script that the container takes as an argument of `docker run` (the command line of Windows is limited to
- * 32767 characters, and the quotes of a script are escaped there).
+ * The longest script that the container takes as an argument of `docker run`. PR #57: the whole command line is checked
+ * too (windowsCommandLineLength), as the command line of Windows is limited to 32767 characters and escapes the quotes;
+ * before, 24000 characters for the script alone left room for a script of quotes only.
  */
-export const MAX_SCRIPT_LENGTH = 24_000;
+export const MAX_SCRIPT_LENGTH = 30_000;
+/** The longest command line of `docker run` of the monitor, as Windows writes it (below 32767 for the path of docker). */
+export const MAX_WINDOWS_COMMAND_LINE = 32_000;
+
+/**
+ * The length of `args` as one command line of Windows, at most (libuv quotes each argument: a quote or backslash can
+ * become two characters, plus the enclosing quotes and a space).
+ */
+export function windowsCommandLineLength(args: readonly string[]): number {
+  let length = 0;
+  for (const arg of args) length += arg.length + (arg.match(/["\\]/g)?.length ?? 0) + 3;
+  return length;
+}
 
 const SOURCE_PATTERN = /^[0-9a-f]{32}$/;
 /** The form of `newEnvironmentId` (crypto.randomUUID, lower case). */
@@ -188,6 +202,121 @@ export function forgetCommand(source: string, environmentId: string): string[] {
   return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId];
 }
 
+// ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the
+// setting remoteImageUpdates, keep the two newest versions, only on a remote host) ----
+
+/** A prefix of image repositories: `registry/path…`, lower case, no tag, no digest (the setting drops a trailing `*`). */
+export function isImagePrefix(value: unknown): value is string {
+  // Review round 6 of PR #57 (F2): at most MAX_IMAGE_PREFIX_LENGTH characters.
+  // Review round 8 of PR #57 (S4): not Docker Hub, whose images `docker image ls` lists without the registry.
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_IMAGE_PREFIX_LENGTH &&
+    /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) &&
+    !value.includes('..') &&
+    !/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//.test(value) &&
+    // A registry host first (a `.` or a port, or localhost): without one, the name would never be maintained.
+    /^([^/]*[.:][^/]*|localhost)\//.test(value)
+  );
+}
+
+/**
+ * The prefixes of the setting remoteImageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. Review
+ * round 5 of PR #57 (P1): at most MAX_IMAGE_PREFIXES, as the monitor takes (`settings -`); before, more were sent and
+ * refused at every open.
+ */
+export function imagePrefixesOf(patterns: readonly unknown[]): string[] {
+  const prefixes: string[] = [];
+  for (const pattern of patterns) {
+    if (prefixes.length >= MAX_IMAGE_PREFIXES) break;
+    if (typeof pattern !== 'string') continue;
+    const prefix = pattern.trim().replace(/\*$/, '');
+    // Review round 6 of PR #57 (F2): all together at most MAX_IMAGE_PREFIXES_JSON_LENGTH characters as JSON, as they go on
+    // the command line of `docker run` of the monitor (DEVENV_IMAGE_PREFIXES), whose length is limited.
+    if (isImagePrefix(prefix) && !prefixes.includes(prefix) && JSON.stringify([...prefixes, prefix]).length <= MAX_IMAGE_PREFIXES_JSON_LENGTH) prefixes.push(prefix);
+  }
+  return prefixes;
+}
+
+/** The list of image repositories that the extension sends (`monitor.js images -`, JSON on stdin). */
+export const IMAGE_LIST_FILE = 'images.json';
+/** At most this many repositories in the list. */
+export const MAX_IMAGE_REPOSITORIES = 500;
+/** The longest input of `monitor.js images -`. */
+export const MAX_IMAGE_LIST_LENGTH = 128 * 1024;
+
+/** A repository of an image registry: `registry/path` in lower case, no tag, no digest (`ghcr.io/acme/base`). */
+export function isImageRepository(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= 255 &&
+    /^[a-z0-9.-]+(:[0-9]+)?(\/[a-z0-9]+([._-][a-z0-9]+)*)+$/.test(value) &&
+    /[.:]/.test(value.slice(0, value.indexOf('/')))
+  );
+}
+
+/** The input of `monitor.js images -`: `{ "repositories": [...] }`, strict. Undefined for anything else. */
+export function parseImageListInput(text: string): string[] | undefined {
+  if (text.length > MAX_IMAGE_LIST_LENGTH) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || Object.keys(value).join() !== 'repositories') return undefined;
+  const { repositories } = value;
+  if (!Array.isArray(repositories) || repositories.length > MAX_IMAGE_REPOSITORIES || !repositories.every(isImageRepository)) return undefined;
+  return [...new Set(repositories as string[])];
+}
+
+/**
+ * Review round 1 of PR #57 (C): the settings of the image maintenance are not part of the label of the monitor, so
+ * computers with other settings or another time zone on the same engine do not replace it at each open. Each open sends
+ * them (`monitor.js settings -`, JSON on stdin); the newest settings of any computer apply from its next check on.
+ */
+export const IMAGE_SETTINGS_FILE = 'image-settings.json';
+/** At most this many prefixes. */
+export const MAX_IMAGE_PREFIXES = 50;
+/** The longest prefix (review round 6 of PR #57, F2). */
+export const MAX_IMAGE_PREFIX_LENGTH = 128;
+/** The longest list of prefixes as JSON (review round 6 of PR #57, F2: the command line of `docker run`). */
+export const MAX_IMAGE_PREFIXES_JSON_LENGTH = 4096;
+
+export interface ImageSettings {
+  prefixes: string[];
+  /** A cron expression of five fields. */
+  schedule: string;
+  /** An IANA time zone. */
+  timeZone: string;
+}
+
+/** The input of `monitor.js settings -`: `{ "prefixes": [...], "schedule": "…", "timeZone": "…" }`, strict. */
+export function parseImageSettingsInput(text: string): ImageSettings | undefined {
+  if (text.length > MAX_IMAGE_LIST_LENGTH) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || !hasExactKeys(value, ['prefixes', 'schedule', 'timeZone'])) return undefined;
+  const { prefixes, schedule, timeZone } = value;
+  if (!Array.isArray(prefixes) || prefixes.length > MAX_IMAGE_PREFIXES || !prefixes.every(isImagePrefix)) return undefined;
+  if (typeof schedule !== 'string' || !parseCronSchedule(schedule) || typeof timeZone !== 'string' || !isTimeZone(timeZone)) return undefined;
+  return { prefixes: [...new Set(prefixes as string[])], schedule, timeZone };
+}
+
+/** The command of `docker exec -i` that stores the settings of the image maintenance; they go on stdin. */
+export function imageSettingsCommand(): string[] {
+  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'];
+}
+
+/** The command of `docker exec -i` that stores the list of repositories; the list goes on stdin. */
+export function imagesCommand(): string[] {
+  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'];
+}
+
 /** The output of `monitor.js records <id>`: the clock of the remote host and the records of that environment. */
 export interface RecordsOutput {
   now: number;
@@ -228,9 +357,17 @@ export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): 
   );
 }
 
-/** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script and the helper tag. */
-export function remoteMonitorLabelValue(script: string, helperTag: string): string {
-  return createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8').digest('hex').slice(0, 12);
+/**
+ * The part of the label of a monitor that maintains images (user requests 2026-09-28): it has a network then, so turning
+ * the maintenance on or off replaces it. Review round 1 of PR #57 (C): its settings are not part of the label.
+ */
+export const IMAGE_MAINTENANCE_LABEL_PART = 'image-maintenance';
+
+/** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script, the helper tag, and the `extra` parts. */
+export function remoteMonitorLabelValue(script: string, helperTag: string, extra: readonly string[] = []): string {
+  const hash = createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8');
+  if (extra.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(extra), 'utf8');
+  return hash.digest('hex').slice(0, 12);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

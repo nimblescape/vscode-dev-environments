@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { ContainerAdapter } from './containerAdapter';
-import { DockerTargets, operationDockerTarget } from './dockerTargets';
+import { DockerTargets, operationDockerTarget, runWithDockerTarget } from './dockerTargets';
 
 const DOCKER = '/usr/local/bin/docker';
 
@@ -86,6 +86,32 @@ describe('DockerTargets.resolve (remote mode detection from the current context)
 });
 
 describe('DockerTargets.withOperation (an operation keeps the host it started with)', () => {
+  // Review round 4 of PR #57 (L2): background work of an operation (the image list of the remote monitor) that it pins
+  // with runWithDockerTarget keeps the target after the operation ended, also when the context was switched meanwhile.
+  it('background work pinned to the target of an operation keeps it after the operation ended', async () => {
+    const { targets, cli } = setup();
+    cli.context = 'devenv-remote';
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let later: Promise<string | undefined> | undefined;
+    let unpinned: Promise<string | undefined> | undefined;
+    await targets.withOperation(async () => {
+      const target = operationDockerTarget()!;
+      later = runWithDockerTarget(target, async () => {
+        await gate;
+        return operationDockerTarget()?.host;
+      });
+      unpinned = (async () => {
+        await gate;
+        return operationDockerTarget()?.host;
+      })();
+    });
+    cli.context = 'default';
+    release();
+    expect(await later).toBe('box');
+    expect(await unpinned).toBeUndefined();
+  });
+
   it('reads the target once; a switch in the middle does not move the operation', async () => {
     const { targets, cli, docker } = setup();
     cli.context = 'devenv-remote';

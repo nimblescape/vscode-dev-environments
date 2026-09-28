@@ -318,6 +318,11 @@ export interface EnvironmentRemoteMonitor {
   heartbeat(host: string, environmentId: string, keepRunning: boolean, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
   /** Removes the heartbeat record of this computer for a deleted environment (best effort). */
   forget(host: string, environmentId: string): Promise<void>;
+  /**
+   * User requests 2026-09-28: gives the monitor on `host` the image repositories to update and clean (read from the
+   * registry; at most once an hour per host). Best effort: never throws, except an AbortError.
+   */
+  images?(host: string, signal?: AbortSignal): Promise<void>;
 }
 
 /** Starts Docker when it does not run and waits until it is ready (concept 7.6 "Docker start"). */
@@ -5115,6 +5120,14 @@ export class EnvironmentService {
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);
+    }
+    this.throwIfCancelled(ctx.signal);
+    // User requests 2026-09-28: the list of image repositories for the image maintenance of the monitor.
+    try {
+      await remoteMonitor.images?.(target.host, ctx.signal);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The image list for the Session Monitor on ${target.host} could not be sent: ${errorMessage(error)}`);
     }
     this.throwIfCancelled(ctx.signal);
     // Review round 2 of PR #39 (L1): `seq` is the time at which the flags are read; the entry is read again for them.
