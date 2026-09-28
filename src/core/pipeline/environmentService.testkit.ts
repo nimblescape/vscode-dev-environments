@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
-import { isDevContainer, type ContainerInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -418,6 +418,27 @@ export class FakeDocker implements EnvironmentDocker {
   async removeImage(reference: string): Promise<boolean> {
     this.log.push(`rmi ${reference}`);
     return this.images.delete(reference);
+  }
+
+  /** User decision 2026-09-28: the number of listEnvironmentImages calls. */
+  environmentImageLists = 0;
+
+  /**
+   * User decision 2026-09-28: as `docker image ls --filter reference=devenv-*`: the images whose repository starts with
+   * `devenv-`, each ID once with its references (the ID as inspectImageNames gives it).
+   */
+  async listEnvironmentImages(): Promise<ImageInfo[]> {
+    this.environmentImageLists++;
+    const byId = new Map<string, ImageInfo>();
+    for (const reference of this.images) {
+      if (!reference.startsWith('devenv-') || reference.includes('@')) continue;
+      const tagged = reference.slice(reference.lastIndexOf('/') + 1).includes(':') ? reference : `${reference}:latest`;
+      const id = this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
+      const image = byId.get(id) ?? { id, tags: [], createdAt: '' };
+      image.tags.push(tagged);
+      byId.set(id, image);
+    }
+    return [...byId.values()];
   }
 
   async listImageTags(repository: string): Promise<string[]> {

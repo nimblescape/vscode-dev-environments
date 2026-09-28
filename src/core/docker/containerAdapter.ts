@@ -1091,6 +1091,33 @@ export class ContainerAdapter {
     throw this.commandError(args, result);
   }
 
+  /**
+   * User decision 2026-09-28: the named images of the Docker host whose repository starts with `devenv-` (`docker image ls
+   * --filter reference=devenv-*`), each image once with its full ID and its references `repository:tag`: the environment
+   * images `devenv-<short id>:<build>` and the images that Docker Compose built for an environment
+   * (`devenv-<short id>-<service>`), whichever computer built them. Throws CommandError, or an AbortError when `signal`
+   * aborts.
+   */
+  async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {
+    const args = ['image', 'ls', '--filter', 'reference=devenv-*', '--no-trunc', '--format', '{{json .}}'];
+    const stdout = await this.runChecked(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+    if (signal?.aborted) throw abortError();
+    const images = new Map<string, ImageInfo>();
+    for (const item of parseJsonLines(stdout)) {
+      if (!isRecord(item) || typeof item.ID !== 'string' || item.ID === '') continue;
+      const { Repository: repository, Tag: tag } = item;
+      if (typeof repository !== 'string' || typeof tag !== 'string' || !repository || !tag || repository === '<none>' || tag === '<none>') continue;
+      let image = images.get(item.ID);
+      if (!image) {
+        image = { id: item.ID, tags: [], createdAt: typeof item.CreatedAt === 'string' ? item.CreatedAt : '' };
+        images.set(item.ID, image);
+      }
+      const reference = `${repository}:${tag}`;
+      if (!image.tags.includes(reference)) image.tags.push(reference);
+    }
+    return [...images.values()];
+  }
+
   /** Tags of a repository, e.g. listImageTags('devenv-3f2a9c1e') → ['devenv-3f2a9c1e:1', 'devenv-3f2a9c1e:2']. Sorted by tag (numbers numerically). */
   async listImageTags(repository: string): Promise<string[]> {
     const stdout = await this.runChecked(['image', 'ls', '--format', '{{json .}}', repository], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });

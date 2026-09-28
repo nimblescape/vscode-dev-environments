@@ -266,9 +266,11 @@ export interface InspectedImage {
 }
 
 /**
- * The IDs of the images that the build records of the environments on one Docker host name (the environment image and
- * the images that Docker Compose built for the project), split by owner: `own`, of the environments of the account of
- * the checked environment (also of the checked environment itself); `others`, of the environments of other accounts.
+ * The IDs of the images of the environments on one Docker host (the environment images and the images that Docker
+ * Compose built for them, environmentImageShortId), split by owner: `own`, of the environments of the account of the
+ * checked environment (also of the checked environment itself); `others`, of the environments of other accounts and of
+ * environments whose owner is not known (built from another computer and without a volume here, or left behind by a
+ * Delete).
  */
 export interface EnvironmentImageIds {
   own: ReadonlySet<string>;
@@ -286,16 +288,46 @@ export function imageNamedBy(reference: string, images: readonly InspectedImage[
 }
 
 /**
- * The IDs of the images that `names` (image names of build records) name, of the images that one `docker image inspect`
- * of them found. A name whose image does not exist (removed, or never built) adds nothing.
+ * The short ID of the environment whose image `reference` names: `devenv-<short id>:<build>` (environmentImageName) or
+ * `devenv-<short id>-<service>` (composeServiceImage), also written with Docker Hub's registry or `library/`
+ * (localImageRepository). `undefined` for any other name.
  */
-export function imageIdsNamedBy(names: readonly string[], images: readonly InspectedImage[]): Set<string> {
-  const ids = new Set<string>();
-  for (const name of names) {
-    const image = imageNamedBy(name, images);
-    if (image) ids.add(image.id.toLowerCase());
+export function environmentImageShortId(reference: string): string | undefined {
+  return /^devenv-([0-9a-f]{8})(?:-[^/]+)?$/.exec(localImageRepository(reference))?.[1];
+}
+
+/**
+ * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag`), by the
+ * owner account of each short ID (`owners`: of the registry entries, and of the labels of the volumes of the host) and
+ * the account `accountId`. An image with a short ID of no known owner counts as another account's.
+ */
+export function environmentImageIds(
+  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
+  owners: ReadonlyMap<string, string>,
+  accountId: string,
+): EnvironmentImageIds {
+  const own = new Set<string>();
+  const others = new Set<string>();
+  for (const image of images) {
+    for (const tag of image.tags) {
+      const short = environmentImageShortId(tag);
+      if (short === undefined) continue;
+      (owners.get(short) === accountId ? own : others).add(image.id.toLowerCase());
+    }
   }
-  return ids;
+  return { own, others };
+}
+
+/** The short IDs of `images` (environmentImageShortId) that `owners` does not know. */
+export function unknownEnvironmentShortIds(images: ReadonlyArray<{ tags: readonly string[] }>, owners: ReadonlyMap<string, string>): string[] {
+  const unknown = new Set<string>();
+  for (const image of images) {
+    for (const tag of image.tags) {
+      const short = environmentImageShortId(tag);
+      if (short !== undefined && !owners.has(short)) unknown.add(short);
+    }
+  }
+  return [...unknown];
 }
 
 /** The item of an image reference that names an image of the environments of another account (protected). */
@@ -306,12 +338,12 @@ export function otherAccountImageItem(reference: string, what = 'image'): string
 /**
  * The items (otherAccountImageItem) of the references `named` whose image, as Docker gives it by the name
  * (imageNamedBy, of the images that one `docker image inspect` found), is an image of an environment of another account
- * (`ids.others`) and of none of the account of the checked environment (`ids.own`), user decision 2026-09-28. The image
- * ID says what the image holds, not whose it is: two environments with the same configuration can build the same image
- * (the same ID), and an image with the ID of an image of the account's own environments holds nothing that the account
- * could not build itself. Not recognized: a copy of such an image with other labels or layers (another ID), and the
- * images of environments that the registry does not know (a registry that was lost). Refused whatever the switch says
- * (HostAccessClass `protected`): account separation.
+ * or of no known owner (`ids.others`) and of none of the account of the checked environment (`ids.own`), user decision
+ * 2026-09-28. The image ID says what the image holds, not whose it is: two environments with the same configuration can
+ * build the same image (the same ID), and an image with the ID of an image of the account's own environments holds
+ * nothing that the account could not build itself. Not recognized: a copy of such an image with other labels or layers
+ * (another ID) and without a name of an environment. Refused whatever the switch says (HostAccessClass `protected`):
+ * account separation.
  */
 export function otherAccountImageItems(named: readonly NamedImageReference[], images: readonly InspectedImage[], ids: EnvironmentImageIds): string[] {
   const items: string[] = [];

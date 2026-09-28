@@ -2800,7 +2800,7 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('refuses the image of another environment, also with the registry of Docker Hub, and allows FROM it (S4)', async () => {
+  it('refuses the image of an environment of another account, also with the registry of Docker Hub, and allows FROM it (S4)', async () => {
     // User decision 2026-09-28: changed setup and item (it was refused by the name devenv-…, as `image
     // docker.io/library/devenv-7c1d2e3f:2 of another environment`): the image of an environment of another account, by
     // its ID.

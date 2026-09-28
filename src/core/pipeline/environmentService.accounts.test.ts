@@ -556,22 +556,28 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     h.docker.imageIds.set(THEIRS, ID);
   });
 
-  async function refused(image: string): Promise<void> {
-    h.helper.config = { image };
+  async function refused(image: string, config: Record<string, unknown> = { image }, item = otherAccountImageItem(image)): Promise<void> {
+    h.helper.config = config;
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('hostAccess');
-    expect(error.message).toBe(Messages.hostAccess(otherAccountImageItem(image)));
+    expect(error.message).toBe(Messages.hostAccess(item));
     expect(h.helper.builds).toEqual([]);
-    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
   }
 
   it('refuses the environment image of an environment of another account, also written with the registry of Docker Hub', async () => {
     await refused(THEIRS);
+    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
     // Docker gives the same image for the name with docker.io/library/.
     h.docker.images.add(`docker.io/library/${THEIRS}`);
     h.docker.imageIds.set(`docker.io/library/${THEIRS}`, ID);
     h.docker.imageRepoNames.set(`docker.io/library/${THEIRS}`, { repoTags: [THEIRS], repoDigests: [] });
     await refused(`docker.io/library/${THEIRS}`);
+  });
+
+  it('refuses it whatever the switch says, also as a build context', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await refused(THEIRS);
+    await refused(THEIRS, { build: { dockerfile: 'Dockerfile', options: ['--build-context', `base=docker-image://${THEIRS}`] } }, otherAccountImageItem(THEIRS, 'build option --build-context image'));
   });
 
   it('refuses a copy of that image under another name (the same ID)', async () => {
@@ -592,24 +598,48 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     }
   });
 
-  it('refuses an image that Docker Compose built for that environment (its build record)', async () => {
-    h.cleanup();
-    h = createHarness();
+  it('refuses an image that Docker Compose built for that environment, also before its build record', async () => {
     const built = `${environmentImageRepository(ENV_ID)}-db`;
-    await seedEnvironment(h, {
-      owner: OTHER_ACCOUNT,
-      container: null,
-      record: { compose: { service: 'app', images: [built], serviceImages: [], version: '2.40.0', inputsHash: 'sha256:x' } },
-    });
     h.docker.images.add(built);
     h.docker.imageIds.set(built, `sha256:${'d'.repeat(64)}`);
     await refused(built);
   });
 
+  it('refuses the images of an environment that another computer created on the host, by the owner label of its volume', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    const image = environmentImageName(remote, 4);
+    h.docker.images.add(image);
+    h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
+    // An additional volume of that environment (no repository label): the open does not restore an entry from it, so
+    // only the owner label of the volume names the owner.
+    h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    await refused(image);
+  });
+
+  it('allows the images of an environment of the same account that another computer created on the host', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    const image = environmentImageName(remote, 4);
+    h.docker.images.add(image);
+    h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
+    // An additional volume of that environment (no repository label): the open does not restore an entry from it, so
+    // only the owner label of the volume names the owner.
+    h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: ACCOUNT.id });
+    h.helper.config = { image };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses an image of an environment of no known owner (left behind by a Delete, or of another computer without a volume)', async () => {
+    const gone = '9a8b7c6d-0000-4000-8000-000000000009';
+    const image = environmentImageName(gone, 2);
+    h.docker.images.add(image);
+    h.docker.imageIds.set(image, `sha256:${'9'.repeat(64)}`);
+    await refused(image);
+  });
+
   it('allows the image of an environment of the same account', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
-    const ours = environmentImageName(OTHER_ID, 1);
-    h.helper.config = { image: ours };
+    h.helper.config = { image: environmentImageName(OTHER_ID, 1) };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
   });
@@ -622,49 +652,74 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('allows a name like devenv-… that is no image of an environment of another account', async () => {
+  it('allows a name like devenv-… that is no image of an environment', async () => {
     h.docker.images.add('devenv-tools:1');
     h.helper.config = { image: 'devenv-tools:1' };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('allows the image of another account on another Docker host', async () => {
-    h.cleanup();
-    h = createHarness();
-    await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: null, extra: { dockerHost: 'ssh://build-box' } });
-    h.docker.imageIds.set(THEIRS, ID);
-    h.helper.config = { image: THEIRS };
-    await h.service.open(TARGET, options());
-    expect(h.helper.builds).toHaveLength(1);
-  });
-
-  it('fails the check when Docker cannot list the images of the environments', async () => {
-    const listImageTags = h.docker.listImageTags.bind(h.docker);
-    h.docker.listImageTags = async (repository: string) => {
-      if (repository === environmentImageRepository(ENV_ID)) throw new Error('Cannot connect to the Docker daemon');
-      return listImageTags(repository);
+  it('fails the check, and refuses nothing as another account\'s, when Docker cannot list the images of the environments', async () => {
+    h.docker.listEnvironmentImages = async () => {
+      throw new Error('Cannot connect to the Docker daemon');
     };
-    h.helper.config = { image: BASE_IMAGE };
-    h.docker.images.add(BASE_IMAGE);
+    h.helper.config = { image: THEIRS };
     const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem(environmentImageRepository(ENV_ID))));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the images of the environments on the Docker host could not be read')));
     expect(h.helper.builds).toEqual([]);
   });
 
-  it('asks Docker about the images of the environments only when a reference names a local image and another account has an environment', async () => {
+  it('fails the check when Docker cannot list the volumes that name the owner of an image', async () => {
+    const gone = '9a8b7c6d-0000-4000-8000-000000000009';
+    h.docker.images.add(environmentImageName(gone, 2));
+    // Only the list right after the list of the images fails (the open lists the volumes for other reasons too).
+    const listEnvironmentImages = h.docker.listEnvironmentImages.bind(h.docker);
+    const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
+    let failVolumes = false;
+    h.docker.listEnvironmentImages = async () => {
+      failVolumes = true;
+      return listEnvironmentImages();
+    };
+    h.docker.listEnvironmentVolumes = async () => {
+      if (!failVolumes) return listEnvironmentVolumes();
+      failVolumes = false;
+      throw new Error('Cannot connect to the Docker daemon');
+    };
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the images of the environments on the Docker host could not be read')));
+  });
+
+  it('keeps a definitive refusal of another kind when Docker cannot list the images of the environments', async () => {
+    h.docker.listEnvironmentImages = async () => {
+      throw new Error('Cannot connect to the Docker daemon');
+    };
+    h.docker.images.add('cafe');
+    h.docker.imageRepoNames.set('cafe', { repoTags: [], repoDigests: [] });
+    h.helper.config = { image: 'cafe' };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.unsupportedOptions('image cafe (an image ID; name the image)'));
+  });
+
+  it('passes a cancellation during the list of the images of the environments on as a cancellation', async () => {
+    const controller = new AbortController();
+    h.docker.listEnvironmentImages = async () => {
+      controller.abort();
+      throw new Error('aborted');
+    };
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, { ...options(), signal: controller.signal }));
+    expect(error.code).toBe('cancelled');
+  });
+
+  it('lists the images of the environments only when a reference names a local image, once per check', async () => {
     h.helper.config = { image: 'missing:1' };
     await h.service.open(TARGET, options()).catch(() => undefined);
-    expect(h.docker.imageInspections).toEqual([['missing:1']]);
-  });
-});
-
-describe('images of the environments without another account (user decision 2026-09-28)', () => {
-  it('asks Docker about the references only', async () => {
-    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, volume: false });
+    expect(h.docker.environmentImageLists).toBe(0);
     h.docker.images.add(BASE_IMAGE);
     h.helper.config = { image: BASE_IMAGE };
     await h.service.open(TARGET, options());
-    expect(h.docker.imageInspections).toEqual([[BASE_IMAGE]]);
+    expect(h.docker.environmentImageLists).toBeGreaterThan(0);
+    expect(h.docker.imageInspections.every((references) => !references.includes(THEIRS))).toBe(true);
   });
 });

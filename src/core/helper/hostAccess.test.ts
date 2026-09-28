@@ -30,10 +30,12 @@ import {
   hostAccessProblems,
   hostAccessReport,
   imageLabelItems,
-  imageIdsNamedBy,
+  environmentImageIds,
+  environmentImageShortId,
   imageNamedBy,
   imageReferenceFinding,
   otherAccountImageItems,
+  unknownEnvironmentShortIds,
   resolveNetworkReference,
   resolvedByImageId,
   imageIdResolvedReferences,
@@ -1170,8 +1172,32 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     expect(imageNamedBy('Not A Reference', [THEIRS])).toBeUndefined();
   });
 
-  it('collects the IDs that names give, and nothing for a missing image', () => {
-    expect(imageIdsNamedBy(['devenv-11111111:2', 'devenv-33333333:1'], [THEIRS])).toEqual(new Set([THEIRS.id]));
+  it.each([
+    ['devenv-1a2b3c4d:2', '1a2b3c4d'],
+    ['devenv-1a2b3c4d-db:latest', '1a2b3c4d'],
+    ['docker.io/library/devenv-1a2b3c4d:2', '1a2b3c4d'],
+    ['index.docker.io/devenv-1a2b3c4d-app', '1a2b3c4d'],
+    ['devenv-tools:1', undefined],
+    ['devenv-1a2b3c4:1', undefined],
+    ['ghcr.io/acme/devenv-1a2b3c4d:1', undefined],
+    ['postgres:16', undefined],
+  ])('gives the short ID of the environment of %s: %s', (reference, expected) => {
+    expect(environmentImageShortId(reference)).toBe(expected);
+  });
+
+  it('splits the images of the environments by the owner of their short ID; an unknown owner counts as another account', () => {
+    const images = [
+      { id: 'sha256:A', tags: ['devenv-11111111:2', 'devenv-11111111:3'] },
+      { id: 'sha256:B', tags: ['devenv-22222222-db:latest'] },
+      { id: 'sha256:C', tags: ['devenv-33333333:1'] },
+      { id: 'sha256:D', tags: ['devenv-tools:1'] },
+    ];
+    const owners = new Map([
+      ['11111111', '2002'],
+      ['22222222', '1001'],
+    ]);
+    expect(environmentImageIds(images, owners, '1001')).toEqual({ own: new Set(['sha256:b']), others: new Set(['sha256:a', 'sha256:c']) });
+    expect(unknownEnvironmentShortIds(images, owners)).toEqual(['33333333']);
   });
 
   it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([

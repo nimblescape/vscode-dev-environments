@@ -254,8 +254,8 @@ function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Probl
   // of the owner account: stays refused with the checks off.
   for (const source of [input.config, ...(input.metadata ?? [])]) if (isRecord(source)) add(environmentProblems(source));
   // The build of a single container: no folder of the workspace helper as its context or Dockerfile, and no image ID
-  // (as image, or additional context; an image of another account is refused by its ID in the pipeline). Not the merged configuration: it holds the
-  // values of the configuration, and the image of an existing container.
+  // (as image, or additional context; an image of another account is refused by its ID in the pipeline). Not the merged
+  // configuration: it holds the values of the configuration, and the image of an existing container.
   if (input.config) add(singleBuildProblems(input.config, input));
   return [...problems.values()];
 }
@@ -284,11 +284,12 @@ function secondPassProblems(what: string, entries: readonly unknown[]): Problem[
  * (isHelperPath) stays refused whatever the switch says; the CLI builds in the helper, where the cache volume, the
  * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
  * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
- * of the computer), and the check does not resolve its links. `image`: no image ID (imageReferenceFinding); an image of the
- * environments of another account is refused by its ID in the pipeline (otherAccountImageItems). The content of the Dockerfile is not checked (Dockerfile refusals removed, user decision
- * 2026-09-27): it runs as trusted code. The Dockerfile itself is: a Dockerfile that is a link out of the repository or
- * could not be read is refused whatever the switch says (dockerfileUnreadable, U2), and one longer than
- * MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength, U1).
+ * of the computer), and the check does not resolve its links. `image`: no image ID (imageReferenceFinding); an image of
+ * the environments of another account is refused by its ID in the pipeline (otherAccountImageItems). The content of the
+ * Dockerfile is not checked (Dockerfile refusals removed, user decision 2026-09-27): it runs as trusted code. The
+ * Dockerfile itself is: a Dockerfile that is a link out of the repository or could not be read is refused whatever the
+ * switch says (dockerfileUnreadable, U2), and one longer than MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength,
+ * U1).
  */
 function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
   const problems: Problem[] = [];
