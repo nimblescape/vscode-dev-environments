@@ -260,7 +260,7 @@ async function activateExtension(
   const statusBar = new EnvironmentStatusBar();
   context.subscriptions.push(tree, view, statusBar);
   // User request 2026-09-28: the view shows the remote Docker host, and its title-bar icon follows it.
-  const dockerHostIndicator = new DockerHostIndicator(view, logger);
+  const dockerHostIndicator = new DockerHostIndicator(view, logger, (host) => tree.setDockerHost(host));
   context.subscriptions.push({ dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target)) });
   // Concept 6.1 step 2: while no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the
   // repositories. User decision 2026-09-26: "when no remote docker is configured and local docker is not available, the

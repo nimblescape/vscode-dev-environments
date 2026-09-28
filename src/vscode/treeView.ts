@@ -19,8 +19,26 @@ import {
 
 export const REPOSITORIES_VIEW_ID = 'devEnvironments.repositories';
 
+/**
+ * User report 2026-09-28 ("remote connection is not shown anymore"): the first row while Docker is set to a remote host.
+ * The merged header of the single view does not reliably show the view's title or description, so the list itself
+ * names the host. A click opens the choice of the Docker host.
+ */
+export interface DockerHostRow {
+  kind: 'dockerHost';
+  id: typeof DOCKER_HOST_ROW_ID;
+  host: string;
+}
+
+export const DOCKER_HOST_ROW_ID = 'dockerHost';
+
+export const DockerHostRowTexts = {
+  label: (host: string) => `Remote Docker host: ${host}`,
+  tooltip: 'Docker runs on this computer over SSH. Click to choose another host or the local Docker.',
+} as const;
+
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
-export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow;
+export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | DockerHostRow;
 
 /** Command of the sign-in row (package.json). */
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
@@ -29,6 +47,7 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
   private groups: OwnerGroup[] = [];
   private roots: TreeNode[] = [];
+  private dockerHost: string | undefined;
   private readonly parents = new Map<string, OwnerGroup | GroupNode>();
 
   readonly onDidChangeTreeData: vscode.Event<TreeNode | undefined> = this.changeEmitter.event;
@@ -54,6 +73,16 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
     this.changeEmitter.fire(undefined);
   }
 
+  /**
+   * The remote Docker host of the first row, or undefined for none (the local Docker). The row shows only above other
+   * rows: an empty view keeps its welcome content (sign-in, Docker setup).
+   */
+  setDockerHost(host: string | undefined): void {
+    if (host === this.dockerHost) return;
+    this.dockerHost = host;
+    this.changeEmitter.fire(undefined);
+  }
+
   /** The current model. */
   getModel(): readonly OwnerGroup[] {
     return this.groups;
@@ -72,6 +101,8 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
           return hintItem(node);
         case 'signIn':
           return signInItem(node);
+        case 'dockerHost':
+          return dockerHostItem(node);
       }
     } catch (error) {
       this.logger.error('Could not show a row of the sidebar.', error);
@@ -80,12 +111,16 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
   }
 
   getChildren(node?: TreeNode): TreeNode[] {
-    if (!node) return this.roots;
+    if (!node) {
+      if (this.dockerHost === undefined || this.roots.length === 0) return this.roots;
+      const row: DockerHostRow = { kind: 'dockerHost', id: DOCKER_HOST_ROW_ID, host: this.dockerHost };
+      return [row, ...this.roots];
+    }
     return node.kind === 'owner' || node.kind === 'group' ? node.children : [];
   }
 
   getParent(node: TreeNode): TreeNode | undefined {
-    return node.kind === 'owner' || node.kind === 'signIn' ? undefined : this.parents.get(node.id);
+    return node.kind === 'owner' || node.kind === 'signIn' || node.kind === 'dockerHost' ? undefined : this.parents.get(node.id);
   }
 
   dispose(): void {
@@ -139,6 +174,16 @@ function signInItem(row: SignInRow): vscode.TreeItem {
   item.contextValue = 'signIn';
   item.iconPath = new vscode.ThemeIcon('account');
   item.command = { command: SIGN_IN_COMMAND, title: row.label };
+  return item;
+}
+
+function dockerHostItem(row: DockerHostRow): vscode.TreeItem {
+  const item = new vscode.TreeItem(DockerHostRowTexts.label(row.host), vscode.TreeItemCollapsibleState.None);
+  item.id = row.id;
+  item.tooltip = DockerHostRowTexts.tooltip;
+  item.contextValue = 'dockerHost';
+  item.iconPath = new vscode.ThemeIcon('remote');
+  item.command = { command: Commands.chooseDockerHost, title: DockerHostRowTexts.label(row.host) };
   return item;
 }
 
