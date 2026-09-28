@@ -224,10 +224,17 @@ export class HelperChannels {
    */
   async docker(target: DockerTarget, args: readonly string[], options: ChannelDockerOptions = {}): Promise<RunResult | undefined> {
     const waitMs = Math.min(CHANNEL_OPEN_WAIT_MS, options.timeoutMs ?? CHANNEL_OPEN_WAIT_MS);
+    const startedAt = Date.now();
     const channel = await this.get(target, { signal: options.signal, waitMs });
     if (channel === undefined) return undefined;
+    // Review round 6 (R6-2): the wait for the channel and the wait for a free place share one wait of at most waitMs, and
+    // the time limit counts from this call. So a call ends within its limit (plus the waits of at most 5 s when it
+    // is not sent and the caller takes the way without the channel).
+    const waited = Date.now() - startedAt;
+    const timeoutMs = options.timeoutMs === undefined ? undefined : options.timeoutMs - waited;
+    if (timeoutMs !== undefined && timeoutMs < 1) return undefined;
     try {
-      return await channel.docker(args, options);
+      return await channel.docker(args, { ...options, timeoutMs, slotWaitMs: Math.max(0, waitMs - waited) });
     } catch (error) {
       // Not sent: closed before, or beyond what the channel carries (review round 1, P2).
       if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;

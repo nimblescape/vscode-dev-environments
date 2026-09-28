@@ -167,6 +167,19 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     channels.dispose();
   });
 
+  // Review round 6 (R6-2): the wait for the channel, the wait for a place and the time limit added up.
+  it('takes the wait for the channel from the time limit and gives the rest of the wait to the wait for a place', async () => {
+    const channel = fakeChannel();
+    let finishOpen!: (channel: HelperChannel) => void;
+    const channels = new HelperChannels({ open: () => new Promise<HelperChannel>((resolve) => (finishOpen = resolve)), logger: silentLogger });
+    const call = channels.docker(REMOTE, ['ps'], { timeoutMs: 10_000 });
+    await vi.advanceTimersByTimeAsync(3_000);
+    finishOpen(channel as unknown as HelperChannel);
+    expect(await call).toMatchObject({ exitCode: 0 });
+    expect(channel.docker).toHaveBeenCalledWith(['ps'], expect.objectContaining({ timeoutMs: 7_000, slotWaitMs: 2_000 }));
+    channels.dispose();
+  });
+
   it('closes a channel without an operation for CHANNEL_IDLE_CLOSE_MS, not one that is busy', async () => {
     const channel = fakeChannel();
     const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });

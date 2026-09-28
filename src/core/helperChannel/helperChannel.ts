@@ -86,10 +86,15 @@ export interface OperationOptions {
   onProgress?: (step: string, detail?: string) => void;
   /** Output of the operation. Without it, the output goes to the log. */
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
+  /**
+   * Review round 6 (R6-2): the longest wait of this call for a free place (default CHANNEL_SLOT_WAIT_MS); HelperChannels
+   * gives what is left of its wait for the channel, so the two waits together stay within one.
+   */
+  slotWaitMs?: number;
 }
 
 /** Options of HelperChannel.docker: those of a Docker call, and what to remove on a cancel. */
-export interface ChannelDockerOptions extends Pick<RunOptions, 'input' | 'timeoutMs' | 'signal' | 'onStdout' | 'onStderr'> {
+export interface ChannelDockerOptions extends Pick<RunOptions, 'input' | 'timeoutMs' | 'signal' | 'onStdout' | 'onStderr'>, Pick<OperationOptions, 'slotWaitMs'> {
   /**
    * Review round 1 (S1): a cleanup label value (isCleanupLabel, protocol.ts). The args must put channelStepLabel(cleanup)
    * on each container that the call starts; a cancel removes exactly the containers with that label.
@@ -412,7 +417,7 @@ export class HelperChannel {
       message.secret = options.secret;
     }
     if (options.timeoutMs !== undefined) message.timeoutMs = options.timeoutMs;
-    const line = encodeMessage(message);
+    let line = encodeMessage(message);
     // Review round 1 (P2): a longer line would end the whole channel in the script (and every operation on it). Review
     // round 5 (F3): the limit of what the channel carries is lower (MAX_CHANNEL_REQUEST_BYTES), so the pings behind a
     // request are not late on a slow link.
@@ -420,8 +425,20 @@ export class HelperChannel {
       throw new HelperChannelError('unsendable', `The request ${op} is too long for the helper channel (${line.length} characters).`);
     }
     // A free place is taken at once, so the operation is written in the same turn as the call.
+    const queuedAt = Date.now();
     if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
-    else await this.waitForSlot(options.signal, Math.min(this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY));
+    else {
+      const waitMs = Math.min(options.slotWaitMs ?? this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY);
+      await this.waitForSlot(options.signal, Math.max(0, waitMs));
+    }
+    // Review round 6 (R6-2): the time limit counts from the call, so the wait for a place is taken from it (the line only
+    // gets shorter, so its limits still hold).
+    let timeoutMs = options.timeoutMs;
+    if (timeoutMs !== undefined && Date.now() > queuedAt) {
+      timeoutMs = Math.max(1, timeoutMs - (Date.now() - queuedAt));
+      message.timeoutMs = timeoutMs;
+      line = encodeMessage(message);
+    }
     // Review round 1 (L1): the signal or the channel may have ended while it waited for its place.
     if (options.signal?.aborted || this.state !== 'open') {
       this.releaseSlot();
@@ -440,14 +457,14 @@ export class HelperChannel {
       // The `docker` operation logs its one call itself; an operation of steps gets a line at its start and its end.
       if (op !== OP_DOCKER) this.options.logger.info(`[${this.options.name}] ${op}#${id}: started.`);
       this.pending.set(id, pending);
-      if (options.timeoutMs !== undefined) {
+      if (timeoutMs !== undefined) {
         // The helper ends the operation at its time limit and answers; this is for a helper that does not answer.
         pending.timer = setTimeout(() => {
           this.send({ t: 'cancel', id });
           this.finish(id);
           this.logResult(id, pending, 'the helper did not answer in time');
           reject(new HelperOperationError('timeout', `The operation ${op} did not end in time.`, true));
-        }, options.timeoutMs + CHANNEL_RESULT_GRACE_MS);
+        }, timeoutMs + CHANNEL_RESULT_GRACE_MS);
       }
       if (options.signal) {
         // Review round 4 (M2): the AbortError comes when the script confirmed the cancel (its result, or `cancelled`),
@@ -489,6 +506,7 @@ export class HelperChannel {
       const value = await this.operation(OP_DOCKER, params, {
         secret: options.secretInput,
         timeoutMs: options.timeoutMs,
+        slotWaitMs: options.slotWaitMs,
         signal,
         onOutput: (stream, text) => {
           if (stream === 'stdout') {

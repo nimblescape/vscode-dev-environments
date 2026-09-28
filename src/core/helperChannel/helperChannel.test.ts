@@ -269,6 +269,25 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
   });
 
   // Review round 5 (F2): the wait for a place was unbounded, also for a call with a short time limit.
+  // Review round 6 (R6-2): the time limit counts from the call, so the wait for a place is taken from it; a call can
+  // wait less (slotWaitMs).
+  it('takes the wait for a place from the time limit that it sends, and waits no longer than its slotWaitMs', async () => {
+    const { channel, fake } = await openChannel();
+    const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
+    const waiting = channel.operation('step', { index: 'waiting' }, { timeoutMs: 10_000 });
+    const short = channel.operation('step', { index: 'short' }, { slotWaitMs: 500 });
+    const shortResult = expect(short).rejects.toMatchObject({ code: 'unsendable' });
+    await vi.advanceTimersByTimeAsync(500);
+    await shortResult;
+    await vi.advanceTimersByTimeAsync(1_500);
+    const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+    fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent()[MAX_CONCURRENT_OPERATIONS]).toMatchObject({ params: { index: 'waiting' }, timeoutMs: 8_000 });
+    channel.close();
+    await Promise.allSettled([...held, waiting]);
+  });
+
   it(`waits at most CHANNEL_SLOT_WAIT_MS (or its time limit) for a place; then it is not sent (unsendable)`, async () => {
     const { channel, fake } = await openChannel();
     const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
