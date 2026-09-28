@@ -212,8 +212,8 @@ export interface HelperRunSpec {
 
 /**
  * `docker run` arguments of one helper run: `--rm -i`, never a pull (the image exists only locally), the label
- * devenv.helper-run=true, the workspace volume at /workspaces, [the Docker socket and the cache volume], [`--network
- * none`], and for runs with the token a tmpfs mount (in memory, mode 0700).
+ * nimblescape.devenv.helper-run=true, the workspace volume at /workspaces, [the Docker socket and the cache volume],
+ * [`--network none`], and for runs with the token a tmpfs mount (in memory, mode 0700).
  */
 export function helperRunArgs(spec: HelperRunSpec): string[] {
   const args = [
@@ -478,10 +478,10 @@ export class WorkspaceHelper {
   }
 
   /**
-   * docker run --rm -i --label devenv.helper-run=true, the volume at /workspaces, [the Docker socket and the cache
-   * volume devenv-helper-cache, unless `docker: false`], [--network none for `network: false`], [a tmpfs for the token],
-   * [-e NAME=value…], then the command. Resolves also for a non-zero exit code. On an abort, the helper container is
-   * removed.
+   * docker run --rm -i --label nimblescape.devenv.helper-run=true, the volume at /workspaces, [the Docker socket and
+   * the cache volume devenv-helper-cache, unless `docker: false`], [--network none for `network: false`], [a tmpfs for
+   * the token], [-e NAME=value…], then the command. Resolves also for a non-zero exit code. On an abort, the helper
+   * container is removed.
    */
   run(
     volumeName: string,

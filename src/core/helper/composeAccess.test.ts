@@ -125,7 +125,9 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['an absolute Dockerfile outside the repository', 'db', { build: { context: REPO, dockerfile: '/root/Dockerfile' } }, A('service db: Dockerfile /root/Dockerfile')],
     ['a dockerfile_inline', 'db', { build: { context: REPO, dockerfile_inline: 'FROM alpine' } }, NONE],
     ['a build label', 'db', { build: { context: REPO, labels: { team: 'a' } } }, NONE],
-    ['a reserved build label', 'db', { build: { context: REPO, labels: { 'devenv.environment-id': 'x' } } }, U('service db: build label devenv.environment-id')],
+    ['a reserved build label', 'db', { build: { context: REPO, labels: { 'nimblescape.devenv.environment-id': 'x' } } }, U('service db: build label nimblescape.devenv.environment-id')],
+    // User report 2026-09-27: labels of another tool with the prefix devenv. are not the extension's.
+    ['a build label of another tool with the prefix devenv.', 'db', { build: { context: REPO, labels: { 'devenv.fingerprint': 'x', 'devenv.inputs': 'y' } } }, NONE],
     ['build ssh', 'db', { build: { context: REPO, ssh: ['default'] } }, A('service db: build ssh')],
     ['build secrets', 'db', { build: { context: REPO, secrets: ['npmrc'] } }, A('service db: build secrets')],
     ['build entitlements', 'db', { build: { context: REPO, entitlements: ['network.host'] } }, A('service db: build entitlements')],
@@ -142,7 +144,10 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['a container_name', 'db', { container_name: 'db1' }, NONE],
     // labels
     ['labels', 'db', { labels: { team: 'a' } }, NONE],
-    ['a devenv. label', 'db', { labels: { 'devenv.environment-id': 'x' } }, U('service db: label devenv.environment-id')],
+    ['a devenv. label', 'db', { labels: { 'nimblescape.devenv.environment-id': 'x' } }, U('service db: label nimblescape.devenv.environment-id')],
+    ['a label of the extension (list, another case)', 'db', { labels: [' Nimblescape.DevEnv.Compose-Service=x'] }, U('service db: label Nimblescape.DevEnv.Compose-Service')],
+    ['labels of another tool with the prefix devenv.', 'db', { labels: { 'devenv.fingerprint': 'x', 'devenv.inputs': 'y' } }, NONE],
+    ['a later label with the prefix of the extension', 'db', { labels: { 'nimblescape.devenv.future': 'x' } }, U('service db: label nimblescape.devenv.future')],
     ['a devcontainer. label (list)', 'db', { labels: ['devcontainer.metadata=[]'] }, U('service db: label devcontainer.metadata')],
     ['a com.docker.compose. label', 'db', { labels: { 'com.docker.compose.project': 'other' } }, U('service db: label com.docker.compose.project')],
     ['a label_file', 'db', { label_file: ['./labels'] }, U('service db: label_file')],
@@ -325,7 +330,8 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
     // review round 22, H22-5: changed expectation, not supported (the pipeline creates the volumes without them).
     ['a volume with another driver', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } }), U('volume pgdata: driver nfs (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)')],
     ['a volume with driver options', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver_opts: { type: 'none', device: '/Users/x', o: 'bind' } } }), U('volume pgdata: driver options (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)')],
-    ['a volume with a reserved label', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, labels: { 'devenv.volume': 'additional' } } }), U('volume pgdata: label devenv.volume')],
+    ['a volume with a reserved label', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, labels: { 'nimblescape.devenv.volume': 'additional' } } }), U('volume pgdata: label nimblescape.devenv.volume')],
+    ['a volume with a label of another tool with the prefix devenv.', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, labels: { 'devenv.fingerprint': 'x' } } }), NONE],
     ['a volume with an unknown option', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, future: 1 } }), U('volume pgdata: future')],
     ['the key of the workspace volume', (m) => (m.volumes = { ...m.volumes, 'devenv-workspace': { name: `${PROJECT}_devenv-workspace` } }), U('volume key devenv-workspace (Dev Environments uses it)')],
     ['a volume of the project of another environment', (m) => (m.volumes = { ...m.volumes, data: { name: 'devenv-11111111_pgdata', external: true } }), A('volume devenv-11111111_pgdata of another environment')],
@@ -339,15 +345,17 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
     ['network driver options', (m) => (m.networks = { lan: { driver_opts: { parent: 'eth0' } } }), A('network lan: driver options')],
     ['a network of another environment', (m) => (m.networks = { other: { name: 'devenv-11111111_default', external: true } }), A('network devenv-11111111_default of another environment')],
     ['a network with a reserved label', (m) => (m.networks = { front: { labels: { 'com.docker.compose.network': 'x' } } }), U('network front: label com.docker.compose.network')],
+    ['a network with a label of the extension', (m) => (m.networks = { front: { labels: { 'nimblescape.devenv.environment-id': 'x' } } }), U('network front: label nimblescape.devenv.environment-id')],
+    ['a network with a label of another tool with the prefix devenv.', (m) => (m.networks = { front: { labels: { 'devenv.inputs': 'x' } } }), NONE],
     ['a network with an unknown option', (m) => (m.networks = { front: { future: 1 } }), U('network front: future')],
   ])('%s', (_name, change, expected) => {
     expect(topReport(change)).toEqual(expected);
   });
 
   it('allows the own project volume when it exists with the labels of the environment, and refuses one of another account', () => {
-    const own = { 'devenv.environment-id': ID, 'devenv.owner-id': '42', 'devenv.volume': 'compose' };
+    const own = { 'nimblescape.devenv.environment-id': ID, 'nimblescape.devenv.owner-id': '42', 'nimblescape.devenv.volume': 'compose' };
     expect(composeAccessReport(input({ volumeLabels: { [`${PROJECT}_pgdata`]: own } }))).toEqual(NONE);
-    const other = { ...own, 'devenv.environment-id': '11111111-0000-4000-8000-000000000000' };
+    const other = { ...own, 'nimblescape.devenv.environment-id': '11111111-0000-4000-8000-000000000000' };
     expect(composeAccessReport(input({ volumeLabels: { [`${PROJECT}_pgdata`]: other } }))).toEqual(A(`volume ${PROJECT}_pgdata of another environment`));
     expect(composeAccessReport(input({ foreignVolumes: [`${PROJECT}_pgdata`] }))).toEqual(A(`volume ${PROJECT}_pgdata of another environment`));
     expect(composeAccessReport(input({ volumeLabels: { [`${PROJECT}_pgdata`]: { 'com.docker.compose.project': 'shop' } } }))).toEqual(

@@ -157,13 +157,14 @@ describe('open: first open', () => {
       workspaceFolder: '/workspaces/api',
       shutdownAction: 'none',
     });
-    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, the tmpfs of the token.
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty. Review round 4, D4-2:
+    // changed expectation, with the label nimblescape.devenv.config-path. unit 15: changed expectation, the tmpfs of
+    // the token.
     expect(h.helper.ups[0].override.runArgs).toEqual([
       '--label',
-      // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
-      'devenv.container-version=1',
+      // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of
+      // nimblescape.devenv.container-version below.
+      'nimblescape.devenv.container-version=1',
       ...CONFIG_PATH_LABEL,
       ...CLEARED_COMPOSE_LABELS,
       '--name',
@@ -1562,7 +1563,7 @@ describe('open: registry lost', () => {
     expect([...h.ui.infos, ...h.ui.warnings]).toEqual([]);
   });
 
-  it('restores no volume without a valid label devenv.owner-id, and creates an environment of the account', async () => {
+  it('restores no volume without a valid label nimblescape.devenv.owner-id, and creates an environment of the account', async () => {
     h.docker.volumes.set(OLD_NAME, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).not.toBe(OTHER_ID);
@@ -2518,8 +2519,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
   it.each<[string, 'stopped' | 'running', Record<string, string>]>([
     ['a stopped container without the label', 'stopped', {}],
     ['a running container without the label', 'running', {}],
-    ['a container of an older version', 'stopped', { 'devenv.container-version': '0' }],
-    ['a running container with an invalid label', 'running', { 'devenv.container-version': 'x' }],
+    ['a container of an older version', 'stopped', { 'nimblescape.devenv.container-version': '0' }],
+    ['a running container with an invalid label', 'running', { 'nimblescape.devenv.container-version': 'x' }],
   ])('creates %s again from the environment image, without a build; the volume stays', async (_name, state, labels) => {
     await seedEnvironment(h, { container: state, containerLabels: labels });
     const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -2529,7 +2530,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     const containers = h.docker.containersOf(ENV_ID);
     expect(containers).toHaveLength(1);
     expect(containers[0].id).not.toBe(before);
-    expect(containers[0].labels['devenv.container-version']).toBe('1');
+    expect(containers[0].labels['nimblescape.devenv.container-version']).toBe('1');
     expect(h.docker.volumes.has(NAME)).toBe(true);
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
     expect(result.containerName).toBe(NAME);
@@ -2548,10 +2549,10 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     for (const env of [override.containerEnv, override.remoteEnv]) {
       for (const name of ['SSH_AUTH_SOCK', 'REMOTE_CONTAINERS_IPC', 'BROWSER', 'GNUPGHOME']) expect(env).not.toHaveProperty(name);
     }
-    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect((override.runArgs as string[]).slice(-14)).toEqual(['--label', 'devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty. Review round 4, D4-2:
+    // changed expectation, with the label nimblescape.devenv.config-path. unit 15: changed expectation, the tmpfs of
+    // the token at the end.
+    expect((override.runArgs as string[]).slice(-14)).toEqual(['--label', 'nimblescape.devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('starts a current container as it is', async () => {
@@ -2615,7 +2616,7 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
       const provisional = h.docker.containersOf(ENV_ID)[0];
       expect(provisional.id).not.toBe(original);
-      expect(provisional.labels).toMatchObject({ 'devenv.container-version': '1', 'devenv.container-config': 'unknown' });
+      expect(provisional.labels).toMatchObject({ 'nimblescape.devenv.container-version': '1', 'nimblescape.devenv.container-config': 'unknown' });
       expect(h.progress.details).toContain(Messages.containerRecreated);
 
       // While the configuration stays broken, the provisional container is only started.
@@ -2635,12 +2636,12 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
       const last = h.helper.ups[h.helper.ups.length - 1];
       expect(last.override.runArgs).toEqual(expect.arrayContaining(['--network=host', '--cap-add=SYS_PTRACE']));
-      expect(last.override.runArgs).not.toContain('devenv.container-config=unknown');
+      expect(last.override.runArgs).not.toContain('nimblescape.devenv.container-config=unknown');
       expect(last.override.appPort).toEqual(['127.0.0.1:3000:3000']);
       const final = h.docker.containersOf(ENV_ID);
       expect(final).toHaveLength(1);
       expect(final[0].id).not.toBe(provisional.id);
-      expect(final[0].labels['devenv.container-config']).toBeUndefined();
+      expect(final[0].labels['nimblescape.devenv.container-config']).toBeUndefined();
       expect(h.progress.details).toEqual([Messages.containerConfigApplied]);
       expect(h.helper.builds).toEqual([]);
 
@@ -2951,10 +2952,32 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
 
   it('refuses an environment image with a label of the extension before the container is created (D2)', async () => {
     await seedEnvironment(h, { container: null });
-    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'devenv.compose-service': 'x', 'devcontainer.metadata': '[]' } });
+    h.docker.imageConfigs.set(IMAGE_1, { User: '', Labels: { 'nimblescape.devenv.compose-service': 'x', 'devcontainer.metadata': '[]' } });
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-    expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${IMAGE_1}`));
+    expect(error.message).toBe(Messages.hostAccess(`label nimblescape.devenv.compose-service of the image ${IMAGE_1}`));
     expect(h.helper.ups).toEqual([]);
+  });
+
+  it('uses an update whose new image carries labels of another tool with the prefix devenv. (user report 2026-09-27)', async () => {
+    // The images of the user are built by another tool that also uses the prefix devenv.: before, the update was
+    // refused ("label devenv.fingerprint of the image devenv-af605cdd:2, label devenv.inputs of the image
+    // devenv-af605cdd:2").
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    h.helper.buildLabels = { 'devenv.fingerprint': 'f', 'devenv.inputs': 'i' };
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((b) => b.imageName)).toEqual([IMAGE_2]);
+    expect(h.helper.ups.map((u) => u.image)).toEqual([IMAGE_2]);
+    expect(h.ui.warnings).toEqual([]);
+    expect((await entry())?.refusedUpdate).toBeUndefined();
+    expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_2);
+  });
+
+  it('refuses an update whose new image carries a label of the extension, and starts the old container', async () => {
+    await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+    h.helper.buildLabels = { 'devenv.fingerprint': 'f', 'nimblescape.devenv.environment-id': 'x' };
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups.map((u) => u.image)).toEqual([IMAGE_1]);
+    expect(h.ui.warnings).toEqual([Messages.updateRefused(`label nimblescape.devenv.environment-id of the image ${IMAGE_2}`)]);
   });
 
   it('opens an environment image with the labels of another Compose project, and sets them empty on the container (review round 2, D2-1)', async () => {
@@ -2978,7 +3001,7 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
   it('finds a container whose image gave it the label of a Compose service, and creates it again once the checks are on (D2)', async () => {
     await seedEnvironment(h, {
       container: 'running',
-      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED, 'devenv.compose-service': 'x' },
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED, 'nimblescape.devenv.compose-service': 'x' },
     });
     const old = h.docker.containersOf(ENV_ID)[0].id;
     await h.service.openEnvironment(ENV_ID, options());
@@ -3063,20 +3086,20 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       return;
     }
     await h.service.openEnvironment(ENV_ID, options());
-    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty. Review round 4, D4-2:
+    // changed expectation, with the label nimblescape.devenv.config-path. unit 15: changed expectation, the tmpfs of
+    // the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual([...passed, '--label', 'nimblescape.devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
   });
 
   it('removes --rm, -i, -t, -d, and --name before up, and names them in the log', async () => {
     await seedEnvironment(h, { container: null });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--rm', '-it', '--cap-drop', 'ALL', '-d', '--name', 'mine', '--label', '--rm'] };
     await h.service.openEnvironment(ENV_ID, options());
-    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty.
-    // Review round 4, D4-2: changed expectation, with the label devenv.config-path.
-    // unit 15: changed expectation, the tmpfs of the token at the end.
-    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
+    // Review round 2 (D2-1): changed expectation, with the labels of Docker Compose set empty. Review round 4, D4-2:
+    // changed expectation, with the label nimblescape.devenv.config-path. unit 15: changed expectation, the tmpfs of
+    // the token at the end.
+    expect(h.helper.ups[0].override.runArgs).toEqual(['--cap-drop', 'ALL', '--label', '--rm', '--label', 'nimblescape.devenv.container-version=1', ...CONFIG_PATH_LABEL, ...CLEARED_COMPOSE_LABELS, '--name', NAME, '--hostname', 'api', ...TOKEN_TMPFS_ARGS]);
     const lines = h.logger.infos.filter((line) => line.startsWith(`Removed from the runArgs of ${REPO}: `));
     expect(lines).toHaveLength(1);
     for (const removed of ['--rm (Dev Environments stops, starts, and recreates the container', '-it (the container runs without a terminal', '-d (the Dev Container CLI stays attached', '--name mine (the container gets the name of the environment)']) {
@@ -3173,8 +3196,10 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       await h.service.openEnvironment(ENV_ID, options());
       h.docker.containersOf(ENV_ID)[0].state = 'stopped';
 
-      // The same update: no pull, no build; the old container starts, and the user learns why again.
+      // The same update: no pull, no build; the old container starts. User report 2026-09-27: changed expectation, the
+      // user saw the warning at the refusal, and the later opens only log it (before: the warning at every open).
       h.ui.warnings.length = 0;
+      h.logger.infos.length = 0;
       h.docker.log.length = 0;
       h.progress.steps.length = 0;
       await h.service.openEnvironment(ENV_ID, options());
@@ -3185,13 +3210,15 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
         [IMAGE_1, false],
       ]);
       expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
-      expect(h.ui.warnings).toEqual([REFUSED]);
+      expect(h.ui.warnings).toEqual([]);
+      expect(h.logger.infos).toContain(`The update of ${REPO} was refused by the host access policy (bind mount /var/run/docker.sock). The existing environment is used.`);
       expect(h.progress.steps).not.toContain('preparing');
 
-      // A newer Feature: the update is tried again (and refused again).
+      // A newer Feature: the update is tried again (and refused again), a new refusal with its warning.
       h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW }, { [FEATURE]: NEWER_FEATURE });
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.builds).toHaveLength(2);
+      expect(h.ui.warnings).toEqual([REFUSED]);
       expect(((await refusedUpdate()) as { features: unknown }).features).toEqual({ [FEATURE]: NEWER_FEATURE });
 
       // The Feature does not need the computer anymore: the update is used, and the refusal is forgotten.
@@ -3272,7 +3299,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       expect(h.ui.warnings).toEqual([Messages.updateRefused(items)]);
     });
 
-    it('bounds a stored refusal with long items when it is read, logged, and shown (hotfix review 4, Q3)', async () => {
+    it('bounds a stored refusal with long items when it is read and logged (hotfix review 4, Q3)', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
       await h.service.openEnvironment(ENV_ID, options());
       // 100 KB of items, as a registry changed by hand could hold them.
@@ -3284,9 +3311,9 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       h.ui.warnings.length = 0;
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.builds).toHaveLength(1);
-      expect(h.ui.warnings).toHaveLength(1);
-      expect(h.ui.warnings[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
-      expect(h.ui.warnings[0]).toContain('…');
+      // User report 2026-09-27: changed expectation, the same refused update is logged, not shown again (the warning at
+      // the refusal bounds its items with truncated, rememberRefusedUpdate).
+      expect(h.ui.warnings).toEqual([]);
       const logged = h.logger.infos.filter((line) => line.includes('was refused by the host access policy'));
       expect(logged).toHaveLength(1);
       expect(logged[0].length).toBeLessThan(MAX_REFUSED_ITEMS_LENGTH + 500);
@@ -3303,13 +3330,13 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
   it('refuses labels of Dev Environments and variables of container-only Git before any build (findings 5 and 6)', async () => {
     h.helper.config = {
       image: BASE_IMAGE,
-      runArgs: ['--label', 'devenv.environment-id=someone-else', '-e', 'GIT_CONFIG_GLOBAL=/tmp/gitconfig'],
+      runArgs: ['--label', 'nimblescape.devenv.environment-id=someone-else', '-e', 'GIT_CONFIG_GLOBAL=/tmp/gitconfig'],
       remoteEnv: { GIT_CONFIG_PARAMETERS: "'credential.helper=store'" },
     };
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('hostAccess');
     expect(error.message).toBe(
-      Messages.hostAccessAndUnsupported('variable GIT_CONFIG_GLOBAL in runArgs, variable GIT_CONFIG_PARAMETERS in remoteEnv', 'label devenv.environment-id'),
+      Messages.hostAccessAndUnsupported('variable GIT_CONFIG_GLOBAL in runArgs, variable GIT_CONFIG_PARAMETERS in remoteEnv', 'label nimblescape.devenv.environment-id'),
     );
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
@@ -3626,12 +3653,14 @@ describe('review round 9 (P9-1, P9-2): a failed analysis of the host access poli
     expect(Messages.updateTooLarge('x')).toBe('The newer image of the environment is too large or too complex to check (x). The environment is started without the update.');
     expect(h.helper.builds).toHaveLength(1);
     expect(h.docker.containersOf(ENV_ID)[0].image).toBe(IMAGE_1);
-    // The next open does not build the same update again, and says why.
+    // The next open does not build the same update again, and logs why. User report 2026-09-27: changed expectation,
+    // the warning is not shown again (before: at every open).
     h.docker.containersOf(ENV_ID)[0].state = 'stopped';
     h.ui.warnings.length = 0;
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
     expect(h.helper.builds).toHaveLength(1);
-    expect(h.ui.warnings).toEqual([Messages.updateTooLarge(ANALYSIS_FAILED_ITEM)]);
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.logger.infos.some((line) => line.includes(`is too large or too complex to check (${ANALYSIS_FAILED_ITEM})`))).toBe(true);
     // A rebuild tries again.
     failing.enabled.on = false;
     h.docker.containersOf(ENV_ID)[0].state = 'stopped';

@@ -28,7 +28,7 @@ describe('argument builders', () => {
       readConfigurationArgs({
         workspaceFolder: '/workspaces/api',
         configPath: '/workspaces/api/.devcontainer/python/devcontainer.json',
-        idLabel: 'devenv.environment-id=3f2a',
+        idLabel: 'nimblescape.devenv.environment-id=3f2a',
       }),
     ).toEqual([
       'read-configuration',
@@ -37,11 +37,11 @@ describe('argument builders', () => {
       '--config',
       '/workspaces/api/.devcontainer/python/devcontainer.json',
       '--id-label',
-      'devenv.environment-id=3f2a',
+      'nimblescape.devenv.environment-id=3f2a',
       '--include-merged-configuration',
     ]);
     expect(
-      readConfigurationArgs({ workspaceFolder: '/workspaces/api', configPath: '/c', idLabel: 'devenv.environment-id=3f2a', merged: false }),
+      readConfigurationArgs({ workspaceFolder: '/workspaces/api', configPath: '/c', idLabel: 'nimblescape.devenv.environment-id=3f2a', merged: false }),
     ).not.toContain('--include-merged-configuration');
   });
 
@@ -69,7 +69,7 @@ describe('argument builders', () => {
     const base = {
       workspaceFolder: '/workspaces/api',
       overrideConfigPath: '/tmp/devenv-override/devcontainer.json',
-      idLabel: 'devenv.environment-id=3f2a',
+      idLabel: 'nimblescape.devenv.environment-id=3f2a',
     };
     const args = upArgs({ ...base, removeExistingContainer: false });
     expect(args).toEqual([
@@ -79,7 +79,7 @@ describe('argument builders', () => {
       '--override-config',
       '/tmp/devenv-override/devcontainer.json',
       '--id-label',
-      'devenv.environment-id=3f2a',
+      'nimblescape.devenv.environment-id=3f2a',
       '--user-data-folder',
       HELPER_CACHE_FOLDER,
       '--update-remote-user-uid-default',
@@ -96,7 +96,7 @@ describe('argument builders', () => {
       runUserCommandsArgs({
         workspaceFolder: '/workspaces/api',
         overrideConfigPath: '/tmp/devenv-override/devcontainer.json',
-        idLabel: 'devenv.environment-id=3f2a',
+        idLabel: 'nimblescape.devenv.environment-id=3f2a',
         containerId: 'c0ffee',
       }),
     ).toEqual([
@@ -106,7 +106,7 @@ describe('argument builders', () => {
       '--override-config',
       '/tmp/devenv-override/devcontainer.json',
       '--id-label',
-      'devenv.environment-id=3f2a',
+      'nimblescape.devenv.environment-id=3f2a',
       '--container-id',
       'c0ffee',
       '--user-data-folder',
@@ -227,8 +227,9 @@ describe('buildOverrideConfig', () => {
       // unit 15: changed expectation, the tmpfs of the token at the end.
       runArgs: [
         '--label',
-        // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
-        'devenv.container-version=1',
+        // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of
+        // nimblescape.devenv.container-version below.
+        'nimblescape.devenv.container-version=1',
         '--label',
         'com.docker.compose.project=',
         '--label',
@@ -309,7 +310,7 @@ describe('buildOverrideConfig', () => {
       '127.0.0.1:8080:80',
       '--label',
       // unit 15: changed expectation, the tmpfs of the token at the end.
-      'devenv.container-version=1',
+      'nimblescape.devenv.container-version=1',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',
@@ -346,7 +347,7 @@ describe('buildOverrideConfig', () => {
       ...shifting,
       '--label',
       // unit 15: changed expectation, the tmpfs of the token at the end.
-      'devenv.container-version=1',
+      'nimblescape.devenv.container-version=1',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       '--label',
       'com.docker.compose.project=',
@@ -368,7 +369,7 @@ describe('Docker Compose configurations', () => {
       readConfigurationArgs({
         workspaceFolder: '/workspaces/api',
         configPath: '/workspaces/api/.devcontainer/devcontainer.json',
-        idLabel: 'devenv.environment-id=3f2a',
+        idLabel: 'nimblescape.devenv.environment-id=3f2a',
         overrideConfigPath: '/tmp/devenv-override/devcontainer.json',
       }),
     ).toEqual([
@@ -378,7 +379,7 @@ describe('Docker Compose configurations', () => {
       '--config',
       '/workspaces/api/.devcontainer/devcontainer.json',
       '--id-label',
-      'devenv.environment-id=3f2a',
+      'nimblescape.devenv.environment-id=3f2a',
       '--override-config',
       '/tmp/devenv-override/devcontainer.json',
       '--include-merged-configuration',

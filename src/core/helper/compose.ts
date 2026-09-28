@@ -480,16 +480,16 @@ export interface ComposeRewriteParams {
    */
   mountVolumeSources?: readonly string[];
   /**
-   * The switch of the host access checks of the repository (../policy/hostAccessChecks.ts), as the check used it. `off`: the
-   * published ports keep the address that the model gives them, the mounts that only the class `computer` refuses stay
-   * as they are, and every container gets the label devenv.host-access=unrestricted (containerIsCurrent); with the checks
-   * on, `checked`. Default `on`.
+   * The switch of the host access checks of the repository (../policy/hostAccessChecks.ts), as the check used it.
+   * `off`: the published ports keep the address that the model gives them, the mounts that only the class `computer`
+   * refuses stay as they are, and every container gets the label nimblescape.devenv.host-access=unrestricted
+   * (containerIsCurrent); with the checks on, `checked`. Default `on`.
    */
   hostAccessChecks?: HostAccessChecks;
   /**
-   * Review round 4 (D4-2): the configuration path of the environment, as the label devenv.config-path (LABEL_CONFIG_PATH)
-   * of the dev service (review round 5, D5-1: not of the other services), when isConfigPathLabelValue takes it (D5-2).
-   * Only the up model gets it.
+   * Review round 4 (D4-2): the configuration path of the environment, as the label nimblescape.devenv.config-path
+   * (LABEL_CONFIG_PATH) of the dev service (review round 5, D5-1: not of the other services), when
+   * isConfigPathLabelValue takes it (D5-2). Only the up model gets it.
    */
   configPath?: string;
 }
@@ -770,19 +770,19 @@ function finish(model: ComposeModel): ComposeModel {
  * The model of `devcontainer up` (the only compose file of the override configuration, COMPOSE_MODEL_PATH), from the
  * checked merged model:
  * - `name`: the project of the environment;
- * - every service: the label devenv.environment-id, published ports on 127.0.0.1 only (decideServicePort), mounts of
- *   repository files from the workspace volume (decideServiceMount), `pull_policy: missing`;
- * - the other services: the label devenv.compose-service, no `container_name` (D-12), `image: <project>-<service>` when
- *   Compose builds them;
+ * - every service: the label nimblescape.devenv.environment-id, published ports on 127.0.0.1 only (decideServicePort),
+ *   mounts of repository files from the workspace volume (decideServiceMount), `pull_policy: missing`;
+ * - the other services: the label nimblescape.devenv.compose-service, no `container_name` (D-12), `image:
+ *   <project>-<service>` when Compose builds them;
  * - the dev service: the environment image (`image`, no `build`, `pull_policy: never`), the name of the environment
- *   (`container_name`), the label devenv.container-version, the workspace volume at WORKSPACES_ROOT (the templates'
- *   bind mount there is dropped), the host name of the repository (containerHostname) unless the service decides
- *   it (serviceDecidesHostname), and (unit 15) the tmpfs of the token, TOKEN_TMPFS, added to its `tmpfs`;
+ *   (`container_name`), the label nimblescape.devenv.container-version, the workspace volume at WORKSPACES_ROOT (the
+ *   templates' bind mount there is dropped), the host name of the repository (containerHostname) unless the service
+ *   decides it (serviceDecidesHostname), and (unit 15) the tmpfs of the token, TOKEN_TMPFS, added to its `tmpfs`;
  * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY) and the
  *   volumes of `mountVolumeSources`;
- * - the label devenv.host-access on every service: `checked`, or with the host access checks off (`hostAccessChecks`)
- *   `unrestricted` (review round 2, D2-2); with the checks off also the published ports as the model has them, and the
- *   mounts that only the class `computer` refuses unchanged;
+ * - the label nimblescape.devenv.host-access on every service: `checked`, or with the host access checks off
+ *   (`hostAccessChecks`) `unrestricted` (review round 2, D2-2); with the checks off also the published ports as the
+ *   model has them, and the mounts that only the class `computer` refuses unchanged;
  * - each text escaped (`$$`), whatever the Compose version (review round 19, S19-1: the model holds the unescaped texts).
  * `network_mode: service:<name>` stays as it is: the check allows only a service of the same model, which Compose
  * finds by its service name, not by the removed `container_name`. Throws when the model has a setting that the check

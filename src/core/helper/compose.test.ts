@@ -405,8 +405,8 @@ describe('composeUpModel', () => {
           command: ['sleep', 'infinity'],
           networks: { default: null },
           environment: { POSTGRES_HOST: 'db' },
-          // Review round 2 (D2-2): changed expectation, devenv.host-access set on every service.
-          labels: { 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION), 'devenv.host-access': 'checked' },
+          // Review round 2 (D2-2): changed expectation, nimblescape.devenv.host-access set on every service.
+          labels: { 'nimblescape.devenv.environment-id': ID, 'nimblescape.devenv.container-version': String(CONTAINER_VERSION), 'nimblescape.devenv.host-access': 'checked' },
           volumes: [{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' }],
           // Package C of unit 6: the dev container is named after the repository, as a single container (containerHostname).
           hostname: 'api',
@@ -418,7 +418,7 @@ describe('composeUpModel', () => {
           pull_policy: 'missing',
           // Review round 7, P7-1: changed expectation, `restart: unless-stopped` is rewritten to `no`.
           restart: 'no',
-          labels: { 'devenv.environment-id': ID, 'devenv.compose-service': 'db', 'devenv.host-access': 'checked' },
+          labels: { 'nimblescape.devenv.environment-id': ID, 'nimblescape.devenv.compose-service': 'db', 'nimblescape.devenv.host-access': 'checked' },
           ports: [{ mode: 'ingress', target: 5432, published: '5432', protocol: 'tcp', host_ip: '127.0.0.1' }],
           volumes: [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data', volume: {} }],
           networks: { default: null },
@@ -496,12 +496,12 @@ describe('composeUpModel', () => {
 
   it('keeps the labels of the repository, and replaces the values of the own labels', () => {
     const model = templateModel();
-    model.services.app.labels = { team: 'a', 'devenv.environment-id': 'forged' };
-    model.services.db.labels = ['tier=data', 'devenv.compose-service=app'];
+    model.services.app.labels = { team: 'a', 'nimblescape.devenv.environment-id': 'forged' };
+    model.services.db.labels = ['tier=data', 'nimblescape.devenv.compose-service=app'];
     const result = up(model).model;
-    // Review round 2 (D2-2): changed expectation, devenv.host-access set on every service.
-    expect(result.services.app.labels).toEqual({ team: 'a', 'devenv.environment-id': ID, 'devenv.container-version': String(CONTAINER_VERSION), 'devenv.host-access': 'checked' });
-    expect(result.services.db.labels).toEqual({ tier: 'data', 'devenv.environment-id': ID, 'devenv.compose-service': 'db', 'devenv.host-access': 'checked' });
+    // Review round 2 (D2-2): changed expectation, nimblescape.devenv.host-access set on every service.
+    expect(result.services.app.labels).toEqual({ team: 'a', 'nimblescape.devenv.environment-id': ID, 'nimblescape.devenv.container-version': String(CONTAINER_VERSION), 'nimblescape.devenv.host-access': 'checked' });
+    expect(result.services.db.labels).toEqual({ tier: 'data', 'nimblescape.devenv.environment-id': ID, 'nimblescape.devenv.compose-service': 'db', 'nimblescape.devenv.host-access': 'checked' });
   });
 
   it('gives the dev container the name of the environment, and logs a different name of the repository', () => {
@@ -688,25 +688,25 @@ describe('review round 5 of unit 6 (D5-1, D5-2)', () => {
   it('labels only the dev service with the configuration path, so the other services stay the same for another configuration (D5-1)', () => {
     const first = up('.devcontainer/devcontainer.json');
     const second = up('.devcontainer/other/devcontainer.json');
-    expect(first.services.app.labels).toMatchObject({ 'devenv.config-path': '.devcontainer/devcontainer.json' });
-    expect(second.services.app.labels).toMatchObject({ 'devenv.config-path': '.devcontainer/other/devcontainer.json' });
+    expect(first.services.app.labels).toMatchObject({ 'nimblescape.devenv.config-path': '.devcontainer/devcontainer.json' });
+    expect(second.services.app.labels).toMatchObject({ 'nimblescape.devenv.config-path': '.devcontainer/other/devcontainer.json' });
     const others = Object.keys(first.services).filter((name) => name !== 'app');
     expect(others.length).toBeGreaterThan(0);
     for (const name of others) {
-      expect(first.services[name].labels).not.toHaveProperty(['devenv.config-path']);
+      expect(first.services[name].labels).not.toHaveProperty(['nimblescape.devenv.config-path']);
       expect(second.services[name]).toEqual(first.services[name]);
     }
   });
 
   it('labels the dev service with a folder that has a backslash or a space (D5-2)', () => {
     for (const configPath of ['.devcontainer/a\\b/devcontainer.json', '.devcontainer/ /devcontainer.json']) {
-      expect(up(configPath).services.app.labels).toMatchObject({ 'devenv.config-path': configPath });
+      expect(up(configPath).services.app.labels).toMatchObject({ 'nimblescape.devenv.config-path': configPath });
     }
   });
 
   it('adds no label for a path that is no configuration path of the discovery (D5-2)', () => {
     for (const configPath of ['.devcontainer/a/b/devcontainer.json', '../x/devcontainer.json', '.devcontainer/../devcontainer.json']) {
-      expect(up(configPath).services.app.labels).not.toHaveProperty(['devenv.config-path']);
+      expect(up(configPath).services.app.labels).not.toHaveProperty(['nimblescape.devenv.config-path']);
     }
   });
 });

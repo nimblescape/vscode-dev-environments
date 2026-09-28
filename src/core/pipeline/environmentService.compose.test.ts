@@ -304,7 +304,7 @@ describe('first open of a Docker Compose configuration', () => {
     // The volumes are created before `up` with the labels of the environment: the project volume as service data.
     const labels = { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id };
     // Review round 2 (D2-3): changed expectation, the volume of the service db is labelled as its data.
-    expect(h.docker.volumes.get(`${PROJECT}_pgdata`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE, 'devenv.service-data': 'true' });
+    expect(h.docker.volumes.get(`${PROJECT}_pgdata`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE, 'nimblescape.devenv.service-data': 'true' });
     // D-7 (package C of unit 6): the volume of a `mounts` entry is a volume of the project too (`<project>_cache`), so it
     // is `compose` (never shared with another environment), not `additional`.
     expect(h.docker.volumes.get(`${PROJECT}_cache`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
@@ -501,9 +501,9 @@ describe('first open of a Docker Compose configuration', () => {
 
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
     h.docker.images.add(DB_IMAGE);
-    h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'devenv.compose-service': 'x' } });
+    h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'nimblescape.devenv.compose-service': 'x' } });
     const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.message).toBe(Messages.hostAccess(`label devenv.compose-service of the image ${DB_IMAGE}`));
+    expect(error.message).toBe(Messages.hostAccess(`label nimblescape.devenv.compose-service of the image ${DB_IMAGE}`));
     expect(h.helper.ups).toEqual([]);
   });
 
@@ -877,7 +877,7 @@ describe('Docker Compose with the host access checks off for the repository', ()
   it('does not take a side service for unrestricted when the image that Compose built has the label (review round 2, D2-2)', async () => {
     useCompose(h, {
       ...output((m) => (m.services.tool = { build: { context: FOLDER, dockerfile: 'tool.Dockerfile' } })),
-      dockerfiles: { tool: 'FROM alpine:3.22\nLABEL devenv.host-access=unrestricted\n' },
+      dockerfiles: { tool: 'FROM alpine:3.22\nLABEL nimblescape.devenv.host-access=unrestricted\n' },
       realPaths: { '/workspaces': '/workspaces', [`${FOLDER}/init.sql`]: `${FOLDER}/init.sql`, [FOLDER]: FOLDER, [`${FOLDER}/tool.Dockerfile`]: `${FOLDER}/tool.Dockerfile` },
     });
     // The image that Compose builds during `up` (not checked before it): its label would reach the container.
@@ -956,7 +956,7 @@ describe('Delete of a Docker Compose environment', () => {
     await h.service.open(TARGET, options());
     expect(h.docker.volumes.get('myapp-db')?.[LABEL_VOLUME]).toBe(VOLUME_KIND_ADDITIONAL);
     // Review round 2 (D2-3): and the label of the data of a service.
-    expect(h.docker.volumes.get('myapp-db')?.['devenv.service-data']).toBe('true');
+    expect(h.docker.volumes.get('myapp-db')?.['nimblescape.devenv.service-data']).toBe('true');
     expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
@@ -1121,7 +1121,7 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
   it('restores the volumes of the services from their label, and asks about them at Delete (review round 2, D2-3)', async () => {
     // A volume with `name:` of the model (label `additional`) that the database used; no container mounts it now.
     seedVolumes({
-      'myapp-db': { ...volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'devenv.service-data': 'true' },
+      'myapp-db': { ...volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'nimblescape.devenv.service-data': 'true' },
       'shared-tools': volumeLabelsOf(VOLUME_KIND_ADDITIONAL),
     });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
@@ -1533,7 +1533,7 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
   });
 
   it.each(['.devcontainer/a\\b/devcontainer.json', '.devcontainer/my config/devcontainer.json'])(
-    'starts a single container of the configuration %j, with the label devenv.config-path (D5-2)',
+    'starts a single container of the configuration %j, with the label nimblescape.devenv.config-path (D5-2)',
     async (configPath) => {
       const other = createHarness({ newEnvironmentId: () => ENV_ID });
       try {

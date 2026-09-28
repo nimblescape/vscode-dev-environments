@@ -30,11 +30,11 @@ import {
   LOG_DRIVERS,
   LOG_OPTIONS,
   RESERVED_COMPOSE_LABEL,
-  RESERVED_LABEL,
   capabilityProblems,
   configFolderMountItem,
   configFolderTarget,
   isHelperPath,
+  isReservedLabel,
   refusedVariable,
   securityOptionProblems,
 } from './rules';
@@ -107,7 +107,7 @@ function labelKeys(labels: unknown): string[] {
 function labelProblems(labels: unknown, where: string): Problem[] {
   return labelKeys(labels)
     .map((key) => key.trim())
-    .filter((key) => RESERVED_LABEL.test(key) || RESERVED_COMPOSE_LABEL.test(key))
+    .filter((key) => isReservedLabel(key) || RESERVED_COMPOSE_LABEL.test(key))
     .map((key) => unsupported(`${where}label ${key}`));
 }
 

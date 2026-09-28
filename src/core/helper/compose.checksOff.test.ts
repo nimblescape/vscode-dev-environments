@@ -5,7 +5,7 @@
 // Package C of unit 6: the model that `up` runs (compose.ts) with the switch of the host access checks of the
 // repository (../hostAccessChecks.ts), and the host name of the dev container. With the checks off, the rewrite keeps
 // what only the class `computer` refuses (published ports on other addresses, bind mounts of the computer) and labels
-// every container devenv.host-access=unrestricted, as buildOverrideConfig does for a single container.
+// every container nimblescape.devenv.host-access=unrestricted, as buildOverrideConfig does for a single container.
 import { describe, expect, it } from 'vitest';
 import { HOST_ACCESS_UNRESTRICTED, LABEL_HOST_ACCESS } from '../names';
 import { composeBuildModel, composeUpModel, serviceDecidesHostname, type ComposeModel, type ComposeRewriteParams, type ComposeService } from './compose';
@@ -77,14 +77,14 @@ describe('the host name of the dev container', () => {
 });
 
 describe('composeUpModel with the host access checks off', () => {
-  it('labels every container devenv.host-access=unrestricted only while the checks are off', () => {
+  it('labels every container nimblescape.devenv.host-access=unrestricted only while the checks are off', () => {
     const off = composeUpModel(model(), params({ hostAccessChecks: 'off' })).model;
     expect(off.services.app.labels).toMatchObject({ [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
     expect(off.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
     const built = composeBuildModel(model(), params({ hostAccessChecks: 'off' })).model;
     expect(built.services.db.labels).toMatchObject({ [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
-    // Review round 2 (D2-2): changed expectation, with the checks on every service gets devenv.host-access=checked (before:
-    // no label), so that a label of an image cannot decide it.
+    // Review round 2 (D2-2): changed expectation, with the checks on every service gets
+    // nimblescape.devenv.host-access=checked (before: no label), so that a label of an image cannot decide it.
     for (const checks of [undefined, 'on'] as const) {
       const on = composeUpModel(model(), params({ hostAccessChecks: checks })).model;
       expect(on.services.app.labels).toMatchObject({ [LABEL_HOST_ACCESS]: 'checked' });

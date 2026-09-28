@@ -2,15 +2,16 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The open pipeline for a Docker Compose configuration (implementation notes, section "Docker Compose") against the real
-// Docker engine: an app service built from a one-line Dockerfile and a db service from an image, both from the test base
-// image with `sleep infinity`. Open: both containers with the labels of the environment, the dev container with the name
-// of the environment and the workspace volume, the published port of db on 127.0.0.1 only, the repository files that db
-// mounts (a folder and a single file) from the workspace volume (volume.subpath), the volumes of the project and of
-// `mounts` with our labels; the refusal of a privileged service before any build; Stop of both; open again without a
-// build. Package C of unit 6: the host name of the dev container; Delete (all containers, the network, and the images of
-// the project; the data volumes of the services only when the user ticks them); the label devenv.host-access=unrestricted
-// on every container, and ports as the model writes them, while the host access checks are off for the repository.
+// The open pipeline for a Docker Compose configuration (implementation notes, section "Docker Compose") against the
+// real Docker engine: an app service built from a one-line Dockerfile and a db service from an image, both from the
+// test base image with `sleep infinity`. Open: both containers with the labels of the environment, the dev container
+// with the name of the environment and the workspace volume, the published port of db on 127.0.0.1 only, the repository
+// files that db mounts (a folder and a single file) from the workspace volume (volume.subpath), the volumes of the
+// project and of `mounts` with our labels; the refusal of a privileged service before any build; Stop of both; open
+// again without a build. Package C of unit 6: the host name of the dev container; Delete (all containers, the network,
+// and the images of the project; the data volumes of the services only when the user ticks them); the label
+// nimblescape.devenv.host-access=unrestricted on every container, and ports as the model writes them, while the host
+// access checks are off for the repository.
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -296,7 +297,7 @@ ${extra}volumes:
     expect(dev?.Config.Image).toBe(`${environmentImageRepository(app.id)}:1`);
     expect(dev?.Config.Labels).toMatchObject({
       [LABEL_ENVIRONMENT_ID]: app.id,
-      'devenv.container-version': String(CONTAINER_VERSION),
+      'nimblescape.devenv.container-version': String(CONTAINER_VERSION),
       'com.docker.compose.project': app.project,
       'com.docker.compose.service': 'app',
     });
@@ -342,16 +343,17 @@ ${extra}volumes:
     expect(cli.volume(`${app.project}_dbdata`)?.Labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
     // Review round 2 (D2-3): the data volume of db carries the label of the data of a service; the cache of the dev
     // service does not.
-    expect(cli.volume(`${app.project}_dbdata`)?.Labels?.['devenv.service-data']).toBe('true');
-    expect(cli.volume(`${app.project}_cache`)?.Labels?.['devenv.service-data']).toBeUndefined();
-    // Review round 2 (D2-2): every container gets devenv.host-access=checked from the model, whatever its image says.
+    expect(cli.volume(`${app.project}_dbdata`)?.Labels?.['nimblescape.devenv.service-data']).toBe('true');
+    expect(cli.volume(`${app.project}_cache`)?.Labels?.['nimblescape.devenv.service-data']).toBeUndefined();
+    // Review round 2 (D2-2): every container gets nimblescape.devenv.host-access=checked from the model, whatever its
+    // image says.
     expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
     expect(details?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
     // Review round 4 (D4-2): the dev container carries the configuration path, for the restore after a lost registry.
     // Review round 5 (D5-1): only the dev service gets it; on the other services a changed selection would change their
     // Compose config hash and recreate them (their container file system would be lost).
-    expect(dev?.Config.Labels?.['devenv.config-path']).toBe(CONFIG_PATH);
-    expect(details?.Config.Labels?.['devenv.config-path']).toBeUndefined();
+    expect(dev?.Config.Labels?.['nimblescape.devenv.config-path']).toBe(CONFIG_PATH);
+    expect(details?.Config.Labels?.['nimblescape.devenv.config-path']).toBeUndefined();
     // Review round 2 (D2-4): Compose puts labels on its containers that images never have (isComposeContainer).
     expect(dev?.Config.Labels?.['com.docker.compose.container-number']).toBeDefined();
 
@@ -451,7 +453,7 @@ ${extra}volumes:
     expect(await registry.get(app.id)).toBeUndefined();
   });
 
-  it('labels every container devenv.host-access=unrestricted and keeps the ports while the checks are off', async () => {
+  it('labels every container nimblescape.devenv.host-access=unrestricted and keeps the ports while the checks are off', async () => {
     if (!supportsVolumeSubpath(apiVersion)) return;
     settings = { ...settings, hostAccessChecksOff: [unrestricted.repository] };
     try {
@@ -468,9 +470,9 @@ ${extra}volumes:
     expect(ports.length).toBeGreaterThan(0);
     expect(ports.some((binding) => !binding.startsWith('127.0.0.1:'))).toBe(true);
 
-    // With the checks on again, the next open creates the containers again with devenv.host-access=checked (review
-    // round 2, D2-2: the model sets the label on every service, so an image label cannot claim "unrestricted"), the
-    // port on 127.0.0.1.
+    // With the checks on again, the next open creates the containers again with nimblescape.devenv.host-access=checked
+    // (review round 2, D2-2: the model sets the label on every service, so an image label cannot claim "unrestricted"),
+    // the port on 127.0.0.1.
     await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
     expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
     const again = dbContainer(unrestricted);

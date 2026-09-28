@@ -76,8 +76,11 @@ export const T0 = Date.parse('2026-09-24T15:40:00.000Z');
  * own labels (review round 2, D2-1): the expectations of the runArgs name them.
  */
 export const CLEARED_COMPOSE_LABELS: readonly string[] = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
-/** Review round 4 (D4-2): the label devenv.config-path of the override configuration, for the default configuration. */
-export const CONFIG_PATH_LABEL: readonly string[] = ['--label', 'devenv.config-path=.devcontainer/devcontainer.json'];
+/**
+ * Review round 4 (D4-2): the label nimblescape.devenv.config-path of the override configuration, for the default
+ * configuration.
+ */
+export const CONFIG_PATH_LABEL: readonly string[] = ['--label', 'nimblescape.devenv.config-path=.devcontainer/devcontainer.json'];
 /** Unit 15: the tmpfs of the token at the end of the runArgs of the override configuration. */
 export const TOKEN_TMPFS_ARGS: readonly string[] = ['--tmpfs', TOKEN_TMPFS];
 
@@ -432,7 +435,7 @@ export class FakeDocker implements EnvironmentDocker {
     this.images.add(reference);
   }
 
-  /** `labels` default: the label devenv.container-version of the current setup. */
+  /** `labels` default: the label nimblescape.devenv.container-version of the current setup. */
   addContainer(p: {
     environmentId: string;
     name: string;
@@ -467,7 +470,8 @@ export class FakeDocker implements EnvironmentDocker {
 
 /**
  * Labels of an additional volume that the pipeline created for the environment `id` (additionalVolumeLabels): only
- * these make a volume the environment's own. `owner` null: a volume without the label devenv.owner-id (made by hand).
+ * these make a volume the environment's own. `owner` null: a volume without the label nimblescape.devenv.owner-id (made
+ * by hand).
  */
 export function additionalVolumeLabels(
   id: string = ENV_ID,
@@ -558,6 +562,8 @@ export class FakeHelper implements EnvironmentHelper {
   prepareGitError: Maybe<Error>;
   /** More entries of the label devcontainer.metadata of a built image (for example of a Feature). */
   buildMetadata: Array<Record<string, unknown>> = [];
+  /** More labels of a built image (for example of its base image). */
+  buildLabels: Record<string, string> = {};
   /** Hook while a build runs (to look at the registry or to abort). */
   onBuild: (imageName: string) => void | Promise<void> = () => undefined;
   onClone: () => void | Promise<void> = () => undefined;
@@ -767,7 +773,8 @@ export class FakeHelper implements EnvironmentHelper {
     if (error) throw error;
     this.docker.images.add(p.imageName);
     // Like `devcontainer build`: the configuration (with the remote user) is the last entry of the metadata label.
-    this.docker.imageConfigs.set(p.imageName, imageConfigWithUser(this.remoteUser, this.buildMetadata));
+    const config = imageConfigWithUser(this.remoteUser, this.buildMetadata);
+    this.docker.imageConfigs.set(p.imageName, { ...config, Labels: { ...this.buildLabels, ...config.Labels } });
     return { outcome: 'success', imageName: p.imageName };
   }
 
@@ -1268,7 +1275,7 @@ export interface SeedOptions {
   image?: boolean;
   /** The workspace volume exists. Default true. */
   volume?: boolean;
-  /** Labels of the container. Default: the label devenv.container-version of the current setup. */
+  /** Labels of the container. Default: the label nimblescape.devenv.container-version of the current setup. */
   containerLabels?: Record<string, string>;
   /** Default: ACCOUNT. */
   owner?: GitHubAccount;

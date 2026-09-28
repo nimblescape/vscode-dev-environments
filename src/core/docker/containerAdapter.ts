@@ -423,8 +423,8 @@ function toNetworkInfo(value: unknown): NetworkInfo | undefined {
 }
 
 /**
- * Whether a container of an environment is its dev container (findContainer): without the label devenv.compose-service
- * of the other services of Docker Compose, or with the name of the environment.
+ * Whether a container of an environment is its dev container (findContainer): without the label
+ * nimblescape.devenv.compose-service of the other services of Docker Compose, or with the name of the environment.
  */
 export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>, containerName: string): boolean {
   return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
@@ -706,14 +706,15 @@ export class ContainerAdapter {
   }
 
   /**
-   * The container with the label devenv.environment-id=<id>. If there are several, a running one, then the newest. The
-   * other services of a Docker Compose environment carry the label too, with devenv.compose-service: they are skipped,
-   * so this is always the dev container. A container with the name of the environment (`containerName`, the name of
-   * the dev container) is never skipped, whatever labels its image gave it (review round 1, D2: an image with the label
-   * devenv.compose-service would hide a single container, which then kept running after the checks were turned on).
-   * That container comes first (final review, FC-1: the previous dev container of a Select configuration…, renamed and
-   * without devenv.compose-service, or a stray container of the environment never wins over it); without it (an older
-   * container, a failed switch), a running one, then the newest.
+   * The container with the label nimblescape.devenv.environment-id=<id>. If there are several, a running one, then the
+   * newest. The other services of a Docker Compose environment carry the label too, with
+   * nimblescape.devenv.compose-service: they are skipped, so this is always the dev container. A container with the
+   * name of the environment (`containerName`, the name of the dev container) is never skipped, whatever labels its
+   * image gave it (review round 1, D2: an image with the label nimblescape.devenv.compose-service would hide a single
+   * container, which then kept running after the checks were turned on). That container comes first (final review,
+   * FC-1: the previous dev container of a Select configuration…, renamed and without
+   * nimblescape.devenv.compose-service, or a stray container of the environment never wins over it); without it (an
+   * older container, a failed switch), a running one, then the newest.
    */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const all = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}=${environmentId}`));
@@ -746,7 +747,7 @@ export class ContainerAdapter {
     return undefined;
   }
 
-  /** All containers with the label devenv.environment-id, running or not. */
+  /** All containers with the label nimblescape.devenv.environment-id, running or not. */
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${LABEL_ENVIRONMENT_ID}`));
     return containers.map(publicInfo);
@@ -754,7 +755,7 @@ export class ContainerAdapter {
 
   /**
    * All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not, also
-   * those without the label devenv.environment-id (for example one-off containers of `docker compose run`).
+   * those without the label nimblescape.devenv.environment-id (for example one-off containers of `docker compose run`).
    */
   async listProjectContainers(project: string): Promise<ContainerInfo[]> {
     const containers = await this.inspectContainers(await this.containerIds(`label=${COMPOSE_PROJECT_LABEL}=${project}`));
@@ -780,7 +781,7 @@ export class ContainerAdapter {
   /**
    * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
    * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
-   * devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
+   * nimblescape.devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
    */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
@@ -892,7 +893,7 @@ export class ContainerAdapter {
     throw this.commandError(args, result);
   }
 
-  /** Volumes with the label devenv.environment-id, with all their labels. */
+  /** Volumes with the label nimblescape.devenv.environment-id, with all their labels. */
   async listEnvironmentVolumes(): Promise<VolumeInfo[]> {
     const listArgs = ['volume', 'ls', '--filter', `label=${LABEL_ENVIRONMENT_ID}`, '--format', '{{json .Name}}'];
     const names = parseJsonLines(await this.runChecked(listArgs, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS })).filter(
@@ -1044,9 +1045,9 @@ export class ContainerAdapter {
   }
 
   /**
-   * Local images with a label (`docker image ls --filter label=<label> --no-trunc`, then the same with
-   * `--filter dangling=true`), for example `devenv.helper=true`. Dangling images are included, with no tags. One entry
-   * per image ID, with all its tags. Throws CommandError.
+   * Local images with a label (`docker image ls --filter label=<label> --no-trunc`, then the same with `--filter
+   * dangling=true`), for example `nimblescape.devenv.helper=true`. Dangling images are included, with no tags. One
+   * entry per image ID, with all its tags. Throws CommandError.
    */
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {
     const images = new Map<string, ImageInfo>();

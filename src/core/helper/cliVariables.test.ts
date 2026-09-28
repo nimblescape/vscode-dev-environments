@@ -79,7 +79,7 @@ function loadCli(): CliSubstitution {
 
 const cli = loadCli();
 const REPOSITORY_FOLDER = '/workspaces/api';
-const ID_LABELS = { 'devenv.environment-id': '3f2a9c1e-0000-4000-8000-000000000001' };
+const ID_LABELS = { 'nimblescape.devenv.environment-id': '3f2a9c1e-0000-4000-8000-000000000001' };
 const ENV = { HOME: '/root', FOO: 'bar', EMPTY: '' };
 
 /** What `devcontainer up` does with an entry of the image metadata: Fo (local variables), then tg (${devcontainerId}). */
@@ -429,7 +429,7 @@ describe('devcontainerIdOf: `${devcontainerId}` as Dev Container CLI 0.89.0 comp
   it('environmentDevcontainerId: the ID for the single id label that the pipeline passes', () => {
     const id = '3f2a9c1e-0000-4000-8000-000000000001';
     expect(environmentDevcontainerId(id)).toBe(cli.Q_(ID_LABELS));
-    expect(environmentDevcontainerId(id)).toBe(cliId([`devenv.environment-id=${id}`]));
+    expect(environmentDevcontainerId(id)).toBe(cliId([`nimblescape.devenv.environment-id=${id}`]));
     expect(environmentDevcontainerId(id)).not.toBe(DEVCONTAINER_ID_PLACEHOLDER);
     expect(environmentDevcontainerId(id)).not.toBe(environmentDevcontainerId('7c1d2e3f-1111-4222-8333-444444444444'));
   });

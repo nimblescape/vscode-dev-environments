@@ -189,7 +189,7 @@ describe('model run of a Docker Compose configuration', () => {
   it('reads the labels and the containers of a network, and leaves out a missing one (review round 1, S2)', async () => {
     const network = `devenv-test-backend-${run.runId}`;
     cli.ok(['network', 'create', '--label', 'com.docker.compose.project=devenv-11111111', '--label', `${TEST_RUN_LABEL}=${run.runId}`, network]);
-    const container = cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', 'devenv.environment-id=other', '--network', network, TEST_BASE_IMAGE, 'true']);
+    const container = cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', 'nimblescape.devenv.environment-id=other', '--network', network, TEST_BASE_IMAGE, 'true']);
     try {
       const networks = await docker.inspectNetworks([network, `devenv-test-missing-${run.runId}`]);
       expect(networks).toHaveLength(1);

@@ -3,12 +3,12 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Recreate offer, review round 2 (E1–E3): the premise of the direct check before the Compose `up` of a recreation. The
-// hash that COMPOSE_HASH_SCRIPT prints for a service (docker compose config --hash, without the engine) equals the label
-// com.docker.compose.config-hash of the container that `up` created from the same model, also for a model file in
-// another folder; a changed label of the service (for example devenv.host-access after the checks were turned off)
-// changes it; and with equal hashes and image IDs, an `up` after the removal of the dev container creates only the dev
-// container and keeps the container of the other service. Runs the Compose of this computer (the pipeline runs the same
-// script in the workspace helper, whose Compose also runs `up`).
+// hash that COMPOSE_HASH_SCRIPT prints for a service (docker compose config --hash, without the engine) equals the
+// label com.docker.compose.config-hash of the container that `up` created from the same model, also for a model file in
+// another folder; a changed label of the service (for example nimblescape.devenv.host-access after the checks were
+// turned off) changes it; and with equal hashes and image IDs, an `up` after the removal of the dev container creates
+// only the dev container and keeps the container of the other service. Runs the Compose of this computer (the pipeline
+// runs the same script in the workspace helper, whose Compose also runs `up`).
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -34,7 +34,7 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
         db: {
           image: TEST_BASE_IMAGE,
           command: ['sleep', '601'],
-          labels: { ...labels, 'devenv.host-access': hostAccess },
+          labels: { ...labels, 'nimblescape.devenv.host-access': hostAccess },
           volumes: [{ type: 'volume', source: 'data', target: '/data' }],
         },
         // Review round 3 (G1): a service of a profile (started through runServices).
@@ -86,7 +86,8 @@ describe('the configuration hash of Docker Compose (recreate offer, review round
     expect(computed.get('tools')).toBe(container('tools')?.Config.Labels?.['com.docker.compose.config-hash']);
     expect(computed.get('tools')).toMatch(/^[0-9a-f]{64}$/);
     expect(db?.Config.Labels?.['com.docker.compose.image']).toBe(cli.image(TEST_BASE_IMAGE)?.Id);
-    // E1: another value of devenv.host-access gives another hash, so Compose would create the container again.
+    // E1: another value of nimblescape.devenv.host-access gives another hash, so Compose would create the container
+    // again.
     expect(hashes(model('unrestricted')).get('db')).not.toBe(computed.get('db'));
 
     // The recreation of the dev container: removed without its volumes, then `up` without --no-recreate.

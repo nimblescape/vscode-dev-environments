@@ -259,7 +259,7 @@ describe('containers', () => {
             id: 'c1',
             name: 'devenv-acme-api-3f2a9c1e',
             status: 'exited',
-            labels: { 'devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
+            labels: { 'nimblescape.devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
           }),
         ]),
       );
@@ -270,7 +270,7 @@ describe('containers', () => {
       '-a',
       '--no-trunc',
       '--filter',
-      'label=devenv.environment-id=env-1',
+      'label=nimblescape.devenv.environment-id=env-1',
       '--format',
       '{{json .ID}}',
     ]);
@@ -280,7 +280,7 @@ describe('containers', () => {
       name: 'devenv-acme-api-3f2a9c1e',
       state: 'stopped',
       rawState: 'exited',
-      labels: { 'devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
+      labels: { 'nimblescape.devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
       image: 'devenv-3f2a9c1e:1',
     });
   });
@@ -311,8 +311,8 @@ describe('containers', () => {
       return ok(
         inspectOutput([
           // The running side service would win without the rule (a running container comes first).
-          containerJson({ id: 'db', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } }),
-          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', labels: { 'devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'db', name: 'devenv-3f2a9c1e-db-1', status: 'running', labels: { 'nimblescape.devenv.environment-id': 'env-1', 'nimblescape.devenv.compose-service': 'db' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', labels: { 'nimblescape.devenv.environment-id': 'env-1' } }),
         ]),
       );
     });
@@ -324,7 +324,7 @@ describe('containers', () => {
       if (call.args[0] === 'ps') return ok(idLines(['dev']));
       return ok(
         inspectOutput([
-          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'x' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'running', labels: { 'nimblescape.devenv.environment-id': 'env-1', 'nimblescape.devenv.compose-service': 'x' } }),
         ]),
       );
     });
@@ -336,10 +336,11 @@ describe('containers', () => {
       if (call.args[0] === 'ps') return ok(idLines(['old', 'dev', 'stray']));
       return ok(
         inspectOutput([
-          // The previous dev container of a Select configuration… (renamed, without devenv.compose-service), running.
-          containerJson({ id: 'old', name: 'devenv-3f2a9c1e-app-1', status: 'running', created: '2026-01-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
-          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', created: '2026-02-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
-          containerJson({ id: 'stray', name: 'stray', status: 'running', created: '2026-03-01T00:00:00Z', labels: { 'devenv.environment-id': 'env-1' } }),
+          // The previous dev container of a Select configuration… (renamed, without
+          // nimblescape.devenv.compose-service), running.
+          containerJson({ id: 'old', name: 'devenv-3f2a9c1e-app-1', status: 'running', created: '2026-01-01T00:00:00Z', labels: { 'nimblescape.devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'dev', name: 'devenv-acme-api-3f2a9c1e', status: 'exited', created: '2026-02-01T00:00:00Z', labels: { 'nimblescape.devenv.environment-id': 'env-1' } }),
+          containerJson({ id: 'stray', name: 'stray', status: 'running', created: '2026-03-01T00:00:00Z', labels: { 'nimblescape.devenv.environment-id': 'env-1' } }),
         ]),
       );
     });
@@ -351,7 +352,7 @@ describe('containers', () => {
   it('finds no container when only other services of a Docker Compose environment exist', async () => {
     const { docker } = adapter((call) => {
       if (call.args[0] === 'ps') return ok(idLines(['db']));
-      return ok(inspectOutput([containerJson({ id: 'db', name: 'db', status: 'running', labels: { 'devenv.environment-id': 'env-1', 'devenv.compose-service': 'db' } })]));
+      return ok(inspectOutput([containerJson({ id: 'db', name: 'db', status: 'running', labels: { 'nimblescape.devenv.environment-id': 'env-1', 'nimblescape.devenv.compose-service': 'db' } })]));
     });
     expect(await docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')).toBeUndefined();
   });
@@ -407,7 +408,7 @@ describe('containers', () => {
       return ok(inspectOutput([...batch.map((id) => containerJson({ id, name: id, status: 'running' })), { Id: 'broken' }]));
     });
     const list = await docker.listEnvironmentContainers();
-    expect(runner.calls[0].args).toContain('label=devenv.environment-id');
+    expect(runner.calls[0].args).toContain('label=nimblescape.devenv.environment-id');
     expect(list).toHaveLength(120);
     expect(runner.calls.slice(1).map((call) => call.args.length - 2)).toEqual([50, 50, 20]);
   });
@@ -500,14 +501,14 @@ describe('volumes', () => {
 
   it('createVolume passes the labels as separate arguments', async () => {
     const { docker, runner } = adapter(() => ok('v\n'));
-    await docker.createVolume('v', { 'devenv.environment-id': 'env-1', 'devenv.repository': 'acme/a,b' });
+    await docker.createVolume('v', { 'nimblescape.devenv.environment-id': 'env-1', 'nimblescape.devenv.repository': 'acme/a,b' });
     expect(runner.calls[0].args).toEqual([
       'volume',
       'create',
       '--label',
-      'devenv.environment-id=env-1',
+      'nimblescape.devenv.environment-id=env-1',
       '--label',
-      'devenv.repository=acme/a,b',
+      'nimblescape.devenv.repository=acme/a,b',
       'v',
     ]);
   });
@@ -536,17 +537,17 @@ describe('volumes', () => {
         'Error response from daemon: get v3: no such volume',
         1,
         inspectOutput([
-          { Name: 'v1', Driver: 'local', Labels: { 'devenv.environment-id': 'e1', 'devenv.repository': 'acme/api' } },
+          { Name: 'v1', Driver: 'local', Labels: { 'nimblescape.devenv.environment-id': 'e1', 'nimblescape.devenv.repository': 'acme/api' } },
           { Name: 'v2', Driver: 'local', Labels: null },
           { Driver: 'broken' },
         ]),
       );
     });
     expect(await docker.listEnvironmentVolumes()).toEqual([
-      { name: 'v1', labels: { 'devenv.environment-id': 'e1', 'devenv.repository': 'acme/api' } },
+      { name: 'v1', labels: { 'nimblescape.devenv.environment-id': 'e1', 'nimblescape.devenv.repository': 'acme/api' } },
       { name: 'v2', labels: {} },
     ]);
-    expect(runner.calls[0].args).toEqual(['volume', 'ls', '--filter', 'label=devenv.environment-id', '--format', '{{json .Name}}']);
+    expect(runner.calls[0].args).toEqual(['volume', 'ls', '--filter', 'label=nimblescape.devenv.environment-id', '--format', '{{json .Name}}']);
     expect(runner.calls[1].args).toEqual(['volume', 'inspect', 'v1', 'v2', 'v3']);
   });
 
@@ -683,7 +684,7 @@ describe('images', () => {
       tag: 'devenv-helper:abc',
       dockerfile: '/ext/resources/helper/Dockerfile',
       context: '/ext/resources/helper',
-      labels: { 'devenv.helper': 'true' },
+      labels: { 'nimblescape.devenv.helper': 'true' },
       buildArgs: { DEVCONTAINER_CLI_VERSION: '0.89.0' },
       onOutput: (text) => output.push(text),
     });
@@ -694,7 +695,7 @@ describe('images', () => {
       '-f',
       '/ext/resources/helper/Dockerfile',
       '--label',
-      'devenv.helper=true',
+      'nimblescape.devenv.helper=true',
       '--build-arg',
       'DEVCONTAINER_CLI_VERSION=0.89.0',
       '/ext/resources/helper',
@@ -968,14 +969,14 @@ describe('images', () => {
     const all = `${lines.map((line) => JSON.stringify(line)).join('\n')}\nWARNING: not JSON\n`;
     // The classic image store lists a dangling image in both listings.
     const { docker, runner } = adapter((call) => ok(call.args.includes('dangling=true') ? `${JSON.stringify(lines[3])}\n` : all));
-    expect(await docker.listImagesByLabel('devenv.helper=true')).toEqual([
+    expect(await docker.listImagesByLabel('nimblescape.devenv.helper=true')).toEqual([
       { id: id1, tags: ['devenv-helper:76fa66d93464', 'mine:backup'], createdAt: '2026-09-25 02:31:55 +0200 CEST' },
       { id: id2, tags: [], createdAt: '2026-09-24 22:37:12 +0200 CEST' },
       { id: id3, tags: [], createdAt: '' },
     ]);
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['image', 'ls', '--filter', 'label=devenv.helper=true', '--no-trunc', '--format', '{{json .}}'],
-      ['image', 'ls', '--filter', 'label=devenv.helper=true', '--filter', 'dangling=true', '--no-trunc', '--format', '{{json .}}'],
+      ['image', 'ls', '--filter', 'label=nimblescape.devenv.helper=true', '--no-trunc', '--format', '{{json .}}'],
+      ['image', 'ls', '--filter', 'label=nimblescape.devenv.helper=true', '--filter', 'dangling=true', '--no-trunc', '--format', '{{json .}}'],
     ]);
   });
 
@@ -990,7 +991,7 @@ describe('images', () => {
           : `${JSON.stringify({ ID: tagged, Repository: 'devenv-helper', Tag: '0123456789ab', CreatedAt: 'a' })}\n`,
       ),
     );
-    expect(await docker.listImagesByLabel('devenv.helper=true')).toEqual([
+    expect(await docker.listImagesByLabel('nimblescape.devenv.helper=true')).toEqual([
       { id: tagged, tags: ['devenv-helper:0123456789ab'], createdAt: 'a' },
       { id: dangling, tags: [], createdAt: 'b' },
     ]);
@@ -998,7 +999,7 @@ describe('images', () => {
 
   it('listImagesByLabel throws CommandError', async () => {
     const { docker } = adapter(() => fail('Cannot connect to the Docker daemon'));
-    await expect(docker.listImagesByLabel('devenv.helper=true')).rejects.toBeInstanceOf(CommandError);
+    await expect(docker.listImagesByLabel('nimblescape.devenv.helper=true')).rejects.toBeInstanceOf(CommandError);
   });
 
   it('buildImage throws CommandError', async () => {
@@ -1467,8 +1468,8 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
       if (call.args[0] === 'image' && call.args[1] === 'ls') return ok(`${lines.join('\n')}\n`);
       return ok(
         inspectOutput([
-          { RepoTags: ['devenv-3f2a9c1e-app:latest'], Config: { Labels: { 'devenv.environment-id': 'env-1' } } },
-          { RepoTags: ['devenv-3f2a9c1e-db:latest'], Config: { Labels: { 'devenv.environment-id': 'env-2' } } },
+          { RepoTags: ['devenv-3f2a9c1e-app:latest'], Config: { Labels: { 'nimblescape.devenv.environment-id': 'env-1' } } },
+          { RepoTags: ['devenv-3f2a9c1e-db:latest'], Config: { Labels: { 'nimblescape.devenv.environment-id': 'env-2' } } },
           { RepoTags: ['devenv-3f2a9c1e-tool:latest'], Config: { Labels: null } },
         ]),
       );

@@ -6,9 +6,9 @@
 // files, applies the rules of rules.ts, stops the containers that no window uses anymore, and ends itself when it has no
 // work. All I/O goes through the dependencies, so that tests can drive single ticks with fakes.
 //
-// It never starts Docker: the only Docker calls are the container list, `docker exec` for the Git summary, and
-// `docker stop` (concept 7.6: "The Session Monitor never starts Docker. When Docker does not run, no container runs.").
-// It only acts on containers whose label devenv.environment-id names an environment of the registry.
+// It never starts Docker: the only Docker calls are the container list, `docker exec` for the Git summary, and `docker
+// stop` (concept 7.6: "The Session Monitor never starts Docker. When Docker does not run, no container runs."). It only
+// acts on containers whose label nimblescape.devenv.environment-id names an environment of the registry.
 //
 // Unit 7, review D2: each tick reads the current Docker target once (MonitorDocker.withCurrentTarget) and pins its Docker
 // calls to it (DOCKER_CONTEXT). It acts only on the environments of that host (their dockerHost; the local Docker: none);
@@ -87,7 +87,7 @@ export function environmentLabel(
 
 /**
  * The containers of one environment in the order of the stop (D-20): the dev container (the name of the environment, or
- * without the label devenv.compose-service) first, then the other services of a Docker Compose environment.
+ * without the label nimblescape.devenv.compose-service) first, then the other services of a Docker Compose environment.
  */
 export function devContainerFirst(containers: readonly ContainerInfo[], containerName: string): ContainerInfo[] {
   const rank = (container: ContainerInfo): number =>
@@ -108,7 +108,7 @@ export function defaultMonitorSettings(): MonitorSettings {
 
 /** The Docker calls of the monitor. `ContainerAdapter` has this shape. Implementations must put time limits on each call. */
 export interface MonitorDocker {
-  /** All containers with the label devenv.environment-id. Throws when Docker does not answer. */
+  /** All containers with the label nimblescape.devenv.environment-id. Throws when Docker does not answer. */
   listEnvironmentContainers(): Promise<ContainerInfo[]>;
   /** `docker exec` in a running container. Resolves also for a non-zero exit code. */
   exec(container: string, command: readonly string[], options: { user?: string; timeoutMs?: number }): Promise<RunResult>;
@@ -403,11 +403,11 @@ export class MonitorLoop {
   }
 
   /**
-   * Stops the running containers of one environment: check again that it is not in use, record the Git summary
-   * (docker exec in the dev container, then a registry update under the lock), check again, then `docker stop` of each
-   * container. A Docker Compose environment has several (the other services carry the label devenv.compose-service,
-   * D-20): the dev container goes first, and the lock is refreshed before each further one, because each stop can take
-   * up to the time limit of a Docker call.
+   * Stops the running containers of one environment: check again that it is not in use, record the Git summary (docker
+   * exec in the dev container, then a registry update under the lock), check again, then `docker stop` of each
+   * container. A Docker Compose environment has several (the other services carry the label
+   * nimblescape.devenv.compose-service, D-20): the dev container goes first, and the lock is refreshed before each
+   * further one, because each stop can take up to the time limit of a Docker call.
    */
   private async stopEnvironment(id: string, running: ContainerInfo[]): Promise<StopOutcome> {
     const { logger } = this.deps;

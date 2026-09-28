@@ -430,12 +430,12 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('container-only Git: the variables, the label, the token file, and the Git configuration of the container (concept section 9)', () => {
-    expect(cli.container(containerName)?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
+    expect(cli.container(containerName)?.Config.Labels?.['nimblescape.devenv.container-version']).toBe(String(CONTAINER_VERSION));
     // Review round 2 (D2-1): Docker accepts the labels of Docker Compose with empty values, so an image cannot give the
     // container the project of another Compose configuration.
     expect(cli.container(containerName)?.Config.Labels).toMatchObject({ 'com.docker.compose.project': '', 'com.docker.compose.service': '' });
     // Review round 4 (D4-2): the configuration path, for the restore after a lost registry.
-    expect(cli.container(containerName)?.Config.Labels?.['devenv.config-path']).toBe(CONFIG_PATH);
+    expect(cli.container(containerName)?.Config.Labels?.['nimblescape.devenv.config-path']).toBe(CONFIG_PATH);
     const env = containerEnv();
     expect(env).toMatchObject({
       GIT_CONFIG_GLOBAL: '/workspaces/.devenv+/gitconfig',
@@ -643,7 +643,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
   });
 
-  it('a container without the label devenv.container-version is not current and is created again, without a build', async () => {
+  it('a container without the label nimblescape.devenv.container-version is not current and is created again, without a build', async () => {
     // A container of an older setup: the ID label, the workspace volume, no version label.
     cli.ok(['rm', '-f', containerName]);
     const oldId = cli.ok([
@@ -671,7 +671,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(container?.Id).not.toBe(oldId);
     expect(container?.State.Running).toBe(true);
     expect(container?.Config.Image).toBe(`${imageRepository}:1`);
-    expect(container?.Config.Labels?.['devenv.container-version']).toBe(String(CONTAINER_VERSION));
+    expect(container?.Config.Labels?.['nimblescape.devenv.container-version']).toBe(String(CONTAINER_VERSION));
     expect(containerEnv().GIT_CONFIG_GLOBAL).toBe('/workspaces/.devenv+/gitconfig');
     // unit 15: the token is in the tmpfs of the new container.
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
@@ -1097,7 +1097,7 @@ describe('open pipeline on a seeded environment', () => {
       const container = cli.container(name);
       expect(container?.State.Running).toBe(true);
       expect(container?.HostConfig.Privileged).toBe(true);
-      expect(container?.Config.Labels?.['devenv.host-access']).toBe('unrestricted');
+      expect(container?.Config.Labels?.['nimblescape.devenv.host-access']).toBe('unrestricted');
       expect(fs.readFileSync(log.file, 'utf8')).toContain(`The host access checks are off for ${repository}`);
 
       // Checks on again: the open stops with the normal refusal, and the container is not started.

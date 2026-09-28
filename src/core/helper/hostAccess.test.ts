@@ -9,7 +9,9 @@ import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
   ENVIRONMENT_VOLUME_PATTERN,
+  EXTENSION_LABEL_KEYS,
   HELPER_CACHE_VOLUME,
+  LABEL_PREFIX,
   TOKEN_TMPFS,
   newEnvironmentId,
   resourceName,
@@ -100,10 +102,10 @@ describe('host access policy: mounts (concept section 9 "Host access")', () => {
     ['a volume with driver options (a folder of the computer)', 'type=volume,source=v,target=/x,volume-opt=type=none,volume-opt=device=/Users/x', ['volume options of the mount v']],
     ['a volume with a driver', 'type=volume,source=v,target=/x,volume-driver=local', ['volume options of the mount v']],
     // Labels on a volume that the mount creates: the labels by which the extension restores environments after a lost registry.
-    ['a volume with labels', 'type=volume,source=myvol,target=/x,volume-label=devenv.environment-id=x,volume-label=devenv.owner-id=2', ['volume options of the mount myvol']],
+    ['a volume with labels', 'type=volume,source=myvol,target=/x,volume-label=nimblescape.devenv.environment-id=x,volume-label=nimblescape.devenv.owner-id=2', ['volume options of the mount myvol']],
     ['a volume with a label in upper case', 'type=volume,source=v,target=/x,Volume-Label=a=b', ['volume options of the mount v']],
     ['the documented volume options without access to the computer', 'type=volume,source=v,target=/x,volume-nocopy,volume-subpath=sub', []],
-    ['an object whose target adds a volume label', { type: 'volume', source: 'v', target: '/x,volume-label=devenv.environment-id=x' }, ['volume options of the mount v']],
+    ['an object whose target adds a volume label', { type: 'volume', source: 'v', target: '/x,volume-label=nimblescape.devenv.environment-id=x' }, ['volume options of the mount v']],
     ['an object with volume labels', { source: 'v', target: '/x', type: 'volume', volumeLabels: { a: 'b' } }, ['volume options of the mount v']],
     ['a named pipe', 'type=npipe,source=\\\\.\\pipe\\docker_engine,target=/p', ['mount of the type npipe']],
     ['an object bind mount (a Feature: docker-outside-of-docker)', { source: '/var/run/docker.sock', target: '/var/run/docker-host.sock', type: 'bind' }, ['bind mount /var/run/docker.sock']],
@@ -181,7 +183,7 @@ describe('host access policy: runArgs', () => {
     ['a port in the long syntax with --publish=', ['--publish=published=9090,target=90'], ['published port published=9090,target=90']],
     ['a port in the long syntax attached to -p', ['-ppublished=8080,target=80'], ['published port published=8080,target=80']],
     ['-v with a volume named like an anonymous volume', ['-v', `${'cd'.repeat(32)}:/x`], [`volume ${'cd'.repeat(32)} of another container`]],
-    ['--mount with volume labels', ['--mount', 'type=volume,source=myvol,target=/x,volume-label=devenv.repository=acme/api'], ['volume options of the mount myvol']],
+    ['--mount with volume labels', ['--mount', 'type=volume,source=myvol,target=/x,volume-label=nimblescape.devenv.repository=acme/api'], ['volume options of the mount myvol']],
     ['a port in the long syntax behind 127.0.0.1', ['-p', '127.0.0.1::published=8080,target=80'], ['published port 127.0.0.1::published=8080,target=80']],
     ['all ports', ['-P'], ['publishing all ports (-P)']],
     ['all ports, long form', ['--publish-all'], ['publishing all ports (--publish-all)']],
@@ -262,11 +264,14 @@ describe('host access policy: runArgs', () => {
     ['the cache volume of the Dev Containers extension', ['-v', 'vscode:/vscode', '--mount=type=volume,src=vscode,dst=/v'], ['volume vscode of the Dev Containers extension']],
     [
       'labels of Dev Environments and of the Dev Container CLI',
-      ['--label', 'devenv.environment-id=x', '-l', 'devenv.owner-id=1', '--label=devcontainer.metadata=[]', '-ldevcontainer.local_folder=/Users/x', '--label', ' DEVENV.container-config=unknown', '--label', 'devenv.container-version=2', '-l', 'devenv.helper-run'],
-      ['label devenv.environment-id', 'label devenv.owner-id', 'label devcontainer.metadata', 'label devcontainer.local_folder', 'label DEVENV.container-config', 'label devenv.container-version', 'label devenv.helper-run'],
+      ['--label', 'nimblescape.devenv.environment-id=x', '-l', 'nimblescape.devenv.owner-id=1', '--label=devcontainer.metadata=[]', '-ldevcontainer.local_folder=/Users/x', '--label', ' NIMBLESCAPE.DEVENV.container-config=unknown', '--label', 'nimblescape.devenv.container-version=2', '-l', 'nimblescape.devenv.helper-run'],
+      ['label nimblescape.devenv.environment-id', 'label nimblescape.devenv.owner-id', 'label devcontainer.metadata', 'label devcontainer.local_folder', 'label NIMBLESCAPE.DEVENV.container-config', 'label nimblescape.devenv.container-version', 'label nimblescape.devenv.helper-run'],
     ],
     ['the labels that the override configuration adds itself', ['--label', CONTAINER_VERSION_LABEL, '-l', CONTAINER_CONFIG_UNKNOWN_LABEL], []],
     ['other labels', ['--label', 'devenvx=1', '-l', 'devcontainer=1', '--label', 'com.example.devenv.x=1', '--label', 'devenv', '--label', 'devenv-test.run=1'], []],
+    // User report 2026-09-27: labels of another tool with the prefix devenv. are not the extension's.
+    // The former labels of the extension too (it now uses the prefix nimblescape.devenv.).
+    ['labels of another tool with the prefix devenv.', ['--label', 'devenv.fingerprint=x', '-l', 'devenv.inputs', '--label=devenv.environment-id=x', '-ldevenv.compose-service=db'], []],
     [
       'variables of container-only Git (the value of runArgs would win)',
       ['-e', 'GIT_CONFIG_GLOBAL=/tmp/x', '--env', 'GIT_CONFIG_COUNT=0', '-eGIT_CONFIG_PARAMETERS=', '-e=DOCKER_CONFIG=/tmp/docker', '--env=GIT_CONFIG_KEY_0=x', '--env', 'GIT_SSH_COMMAND=ssh', '-e', 'GIT_CONFIG_SYSTEM=/x'],
@@ -299,6 +304,11 @@ describe('host access policy: runArgs', () => {
   ])('%s', (_name, runArgs, expected) => {
     expect(runArgsProblems(runArgs, OWN)).toEqual(expected);
     expect(configProblems({ runArgs })).toEqual(expected);
+  });
+
+  // Each label of the extension, and any later one with its prefix.
+  it.each([...EXTENSION_LABEL_KEYS, `${LABEL_PREFIX}future`])('refuses the label %s of the extension in runArgs, with or without a value', (key) => {
+    expect(runArgsProblems(['--label', `${key}=x`, '-l', key, '--label', 'devenv.fingerprint=f'], OWN)).toEqual([`label ${key}`]);
   });
 
   it('never takes the value of a flag for a flag', () => {
@@ -342,7 +352,7 @@ describe('host access policy: settings that need access to the computer, and set
 
   it('reports labels of Dev Environments as not supported, and variables, volumes, and the port host as access to the computer', () => {
     const config = {
-      runArgs: ['--label', 'devenv.environment-id=x', '-e', 'GIT_CONFIG_GLOBAL=/x', '-v', 'vscode:/v'],
+      runArgs: ['--label', 'nimblescape.devenv.environment-id=x', '-e', 'GIT_CONFIG_GLOBAL=/x', '-v', 'vscode:/v'],
       containerEnv: { DOCKER_CONFIG: '/a' },
       customizations: { vscode: { settings: { 'remote.localPortHost': 'allInterfaces' } } },
     };
@@ -353,7 +363,7 @@ describe('host access policy: settings that need access to the computer, and set
         'volume vscode of the Dev Containers extension',
         'variable DOCKER_CONFIG in containerEnv',
       ],
-      unsupported: ['label devenv.environment-id'],
+      unsupported: ['label nimblescape.devenv.environment-id'],
     });
   });
 
@@ -401,8 +411,9 @@ describe('host access policy: the runArgs that Docker gets', () => {
     // Review round 2 (D2-1): changed expectation, the override configuration also sets the labels of Docker Compose empty.
     const tail = [
       '--label',
-      // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of devenv.container-version below.
-      'devenv.container-version=1',
+      // Versions reset to 1 (user decision 2026-09-27), here and in the expectations of
+      // nimblescape.devenv.container-version below.
+      'nimblescape.devenv.container-version=1',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -498,7 +509,7 @@ describe('host access policy: flags that are removed before up (--rm, -i, -t, -d
       '--rm',
       '--label',
       // unit 15: changed expectation, the tmpfs of the token, which the check accepts.
-      'devenv.container-version=1',
+      'nimblescape.devenv.container-version=1',
       '--label',
       'com.docker.compose.project=',
       '--label',
@@ -764,7 +775,7 @@ describe('volumes named like a clone volume of the Dev Containers extension (a n
   const SHA = `api-${'5e'.repeat(32)}`;
   const MD5 = `vsc-api-${'0f'.repeat(16)}`;
   const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
-  const OWN_LABELS = { 'devenv.environment-id': ENVIRONMENT.id, 'devenv.owner-id': '1001', 'devenv.repository': 'acme/api', 'devenv.volume': 'additional' };
+  const OWN_LABELS = { 'nimblescape.devenv.environment-id': ENVIRONMENT.id, 'nimblescape.devenv.owner-id': '1001', 'nimblescape.devenv.repository': 'acme/api', 'nimblescape.devenv.volume': 'additional' };
 
   it.each<[string, Record<string, Record<string, string>>, string[]]>([
     ['they do not exist yet (the pipeline creates them with its labels)', {}, []],
@@ -782,10 +793,10 @@ describe('volumes with the labels of Dev Environments', () => {
   const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
   const FORMER = 'e0000009-0000-4000-8000-000000000009';
   const labels = (id: string, owner?: string, kind: string | null = 'additional'): Record<string, string> => ({
-    'devenv.environment-id': id,
-    'devenv.repository': 'acme/api',
-    ...(owner === undefined ? {} : { 'devenv.owner-id': owner }),
-    ...(kind === null ? {} : { 'devenv.volume': kind }),
+    'nimblescape.devenv.environment-id': id,
+    'nimblescape.devenv.repository': 'acme/api',
+    ...(owner === undefined ? {} : { 'nimblescape.devenv.owner-id': owner }),
+    ...(kind === null ? {} : { 'nimblescape.devenv.volume': kind }),
   });
 
   it.each<[string, Record<string, string>, { id: string; ownerId: string }, string[]]>([
@@ -798,7 +809,7 @@ describe('volumes with the labels of Dev Environments', () => {
     ['a volume that the Delete of an environment of the same owner kept', labels(FORMER, '1001'), ENVIRONMENT, []],
     ['a volume of another environment of another owner', labels(FORMER, '2002'), ENVIRONMENT, ['volume data of another environment']],
     ['a volume of another environment without an owner label', labels(FORMER), ENVIRONMENT, ['volume data of another environment']],
-    ['a volume of another environment of the same owner without devenv.volume (a workspace volume)', labels(FORMER, '1001', null), ENVIRONMENT, ['volume data of another environment']],
+    ['a volume of another environment of the same owner without nimblescape.devenv.volume (a workspace volume)', labels(FORMER, '1001', null), ENVIRONMENT, ['volume data of another environment']],
     ['a volume of another environment of the same owner of another kind', labels(FORMER, '1001', 'workspace'), ENVIRONMENT, ['volume data of another environment']],
   ])('%s', (_name, volumeLabels, environment, expected) => {
     const config = { mounts: ['source=data,target=/data,type=volume'] };
@@ -812,16 +823,16 @@ describe('volumes with the labels of Dev Environments', () => {
     ).toEqual(['volume data of another environment']);
   });
 
-  it('refuses every volume with devenv.environment-id when the environment is not known', () => {
+  it('refuses every volume with nimblescape.devenv.environment-id when the environment is not known', () => {
     const config = { mounts: ['source=data,target=/data,type=volume'] };
     expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: labels(ENVIRONMENT.id, '1001') } })).toEqual(['volume data of another environment']);
   });
 
   it.each<[string, Record<string, string>, string, boolean]>([
-    ['the ID and the owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '1' }, '1', true],
-    ['the ID without an owner label', { 'devenv.environment-id': 'a' }, '1', false],
-    ['another owner', { 'devenv.environment-id': 'a', 'devenv.owner-id': '2' }, '1', false],
-    ['another ID', { 'devenv.environment-id': 'b', 'devenv.owner-id': '1' }, '1', false],
+    ['the ID and the owner', { 'nimblescape.devenv.environment-id': 'a', 'nimblescape.devenv.owner-id': '1' }, '1', true],
+    ['the ID without an owner label', { 'nimblescape.devenv.environment-id': 'a' }, '1', false],
+    ['another owner', { 'nimblescape.devenv.environment-id': 'a', 'nimblescape.devenv.owner-id': '2' }, '1', false],
+    ['another ID', { 'nimblescape.devenv.environment-id': 'b', 'nimblescape.devenv.owner-id': '1' }, '1', false],
     ['no labels', {}, '1', false],
     ['labels of another program', { 'com.docker.compose.project': 'a' }, '1', false],
   ])('isOwnVolume: %s', (_name, volumeLabels, ownerId, expected) => {
@@ -832,9 +843,9 @@ describe('volumes with the labels of Dev Environments', () => {
     ['an additional volume of the owner', labels(FORMER, '1001'), '1001', true],
     ['an additional volume of another owner', labels(FORMER, '2002'), '1001', false],
     ['an additional volume without an owner label', labels(FORMER), '1001', false],
-    ['a workspace volume of the owner (no devenv.volume)', labels(FORMER, '1001', null), '1001', false],
+    ['a workspace volume of the owner (no nimblescape.devenv.volume)', labels(FORMER, '1001', null), '1001', false],
     ['a volume of the owner of another kind', labels(FORMER, '1001', 'workspace'), '1001', false],
-    ['the owner and kind labels without an environment ID', { 'devenv.owner-id': '1001', 'devenv.volume': 'additional' }, '1001', false],
+    ['the owner and kind labels without an environment ID', { 'nimblescape.devenv.owner-id': '1001', 'nimblescape.devenv.volume': 'additional' }, '1001', false],
     ['no labels', {}, '1001', false],
   ])('isSameOwnerAdditionalVolume: %s', (_name, volumeLabels, ownerId, expected) => {
     expect(isSameOwnerAdditionalVolume(volumeLabels, ownerId)).toBe(expected);
@@ -848,7 +859,7 @@ describe('volumes of other programs, by their labels (restrictions summary, find
     ['a clone of the Dev Containers extension', { 'vsch.local.repository': 'https://github.com/a/b.git', 'vsch.local.repository.unique': 'false' }, ['volume data of the Dev Containers extension']],
     ['a volume of a template of the Dev Containers extension', { 'dev.container.volume': 'true' }, ['volume data of the Dev Containers extension']],
     ['an anonymous volume of another container', { 'com.docker.volume.anonymous': '' }, ['volume data of another container']],
-    ['the workspace volume of another environment', { 'devenv.environment-id': 'x', 'devenv.owner-id': '1' }, ['volume data of another environment']],
+    ['the workspace volume of another environment', { 'nimblescape.devenv.environment-id': 'x', 'nimblescape.devenv.owner-id': '1' }, ['volume data of another environment']],
     ['a volume without labels (as the mounts of a configuration create it)', {}, []],
     ['a volume with other labels', { 'com.example.purpose': 'cache' }, []],
   ])('%s', (_name, labels, expected) => {
@@ -915,8 +926,8 @@ describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, c
   it.each<[string, Record<string, string>, string | undefined]>([
     ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop' }, 'the Docker Compose project shop'],
     // The volumes of the Compose project of an environment carry both: the environment label decides (spec u6).
-    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': 'devenv-11111111', 'devenv.environment-id': 'x' }, 'another environment'],
-    ['a volume of an environment', { 'devenv.environment-id': 'x' }, 'another environment'],
+    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': 'devenv-11111111', 'nimblescape.devenv.environment-id': 'x' }, 'another environment'],
+    ['a volume of an environment', { 'nimblescape.devenv.environment-id': 'x' }, 'another environment'],
     ['no labels', {}, undefined],
   ])('volumeLabelOwner: %s', (_name, labels, expected) => {
     expect(volumeLabelOwner(labels)).toBe(expected);
@@ -928,9 +939,9 @@ describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, c
     expect(volumeNameItems('cache', { ownVolume: OWN })).toEqual([]);
     expect(volumeNameItems('devenv-helper-cache', { ownVolume: OWN })).toEqual(['volume devenv-helper-cache of the workspace helper']);
     expect(volumeNameItems('cache', { ownVolume: OWN, foreignVolumes: ['cache'] })).toEqual(['volume cache of another environment']);
-    const own = { 'devenv.environment-id': 'e1', 'devenv.owner-id': '1', 'devenv.volume': 'compose' };
+    const own = { 'nimblescape.devenv.environment-id': 'e1', 'nimblescape.devenv.owner-id': '1', 'nimblescape.devenv.volume': 'compose' };
     expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: own } })).toEqual([]);
-    const other = { ...own, 'devenv.environment-id': 'e2' };
+    const other = { ...own, 'nimblescape.devenv.environment-id': 'e2' };
     expect(volumeNameItems('data', { ownVolume: OWN, environment, volumeLabels: { data: other } })).toEqual(['volume data of another environment']);
   });
 });
@@ -1290,17 +1301,29 @@ describe('foreignNetworkItem (review round 2, S2-04 and P2-2)', () => {
 });
 
 describe('imageLabelItems', () => {
+  it('allows the labels of another tool with the prefix devenv. (user report 2026-09-27)', () => {
+    // Before: "label devenv.fingerprint of the image devenv-af605cdd:2, label devenv.inputs of the image
+    // devenv-af605cdd:2".
+    expect(imageLabelItems('devenv-af605cdd:2', { 'devenv.fingerprint': 'f', 'devenv.inputs': 'i', 'devcontainer.metadata': '[]' })).toEqual([]);
+    expect(imageLabelItems('x', { 'devenv.environment-id': 'e', 'devenv.compose-service': 'db' })).toEqual([]);
+  });
+
+  it.each([...EXTENSION_LABEL_KEYS, `${LABEL_PREFIX}future`])('names the label %s of the extension, in any case', (key) => {
+    expect(imageLabelItems('x', { [key]: 'v', 'devenv.fingerprint': 'f' })).toEqual([`label ${key} of the image x`]);
+    expect(imageLabelItems('x', { [` ${key.toUpperCase()}`]: 'v' })).toEqual([`label ${key.toUpperCase()} of the image x`]);
+  });
+
   it('names the labels by which the extension and the CLI find containers, except devcontainer.metadata', () => {
     // Review round 2 (D2-1): changed expectation, the label com.docker.compose.project of an image is no longer refused.
     expect(
       imageLabelItems('devenv-e0000001:2', {
         'devcontainer.metadata': '[]',
         'org.opencontainers.image.title': 'x',
-        'devenv.compose-service': 'x',
+        'nimblescape.devenv.compose-service': 'x',
         'devcontainer.local_folder': '/x',
         'com.docker.compose.project': 'devenv-11111111',
       }),
-    ).toEqual(['label devenv.compose-service of the image devenv-e0000001:2', 'label devcontainer.local_folder of the image devenv-e0000001:2']);
+    ).toEqual(['label nimblescape.devenv.compose-service of the image devenv-e0000001:2', 'label devcontainer.local_folder of the image devenv-e0000001:2']);
   });
 
   it('allows the labels of Docker Compose of any project (review round 2, D2-1)', () => {
@@ -1309,8 +1332,8 @@ describe('imageLabelItems', () => {
     const built = { 'com.docker.compose.project': 'devenv-e0000001', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
     expect(imageLabelItems('devenv-e0000001-app', built)).toEqual([]);
     expect(imageLabelItems('x', { 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'shop' })).toEqual([]);
-    expect(imageLabelItems('x', { 'devenv.host-access': 'unrestricted', 'com.docker.compose.project': 'shop' })).toEqual([
-      'label devenv.host-access of the image x',
+    expect(imageLabelItems('x', { 'nimblescape.devenv.host-access': 'unrestricted', 'com.docker.compose.project': 'shop' })).toEqual([
+      'label nimblescape.devenv.host-access of the image x',
     ]);
   });
 });
@@ -1739,7 +1762,7 @@ describe('host access policy: what the Dev Container CLI substitutes again at up
       ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
       ['the joined -e form', ['-e$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
       ['--env=', ['--env=$${env:NOPE:{}env:TERM:GITHUB_TOKEN}=attacker']],
-      ['--label of Dev Environments', ['--label', '$${env:NOPE:{}env:TERM:devenv.container-version}=999']],
+      ['--label of Dev Environments', ['--label', '$${env:NOPE:{}env:TERM:nimblescape.devenv.container-version}=999']],
     ])('refuses %s, with the checks on and off', (_name, raw) => {
       const runArgs = readConfiguration(raw);
       const entry = runArgs[runArgs.length - 1];
@@ -1787,7 +1810,7 @@ describe('host access policy: what the Dev Container CLI substitutes again at up
       ['-v of another environment', ['-v', `$\${env:NOPE:{}env:NOPE2:${FOREIGN_NAME}}:/y`]],
       ['-v of the helper cache', ['-v', `$\${env:NOPE:{}env:NOPE2:${HELPER_CACHE_VOLUME}}:/y`]],
       ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:NOPE2:GH_TOKEN}=x']],
-      ['--label', ['--label', '$${env:NOPE:{}env:NOPE2:devenv.environment-id}=x']],
+      ['--label', ['--label', '$${env:NOPE:{}env:NOPE2:nimblescape.devenv.environment-id}=x']],
     ])('refuses %s, with the checks on and off', (_name, raw) => {
       const runArgs = readConfiguration(raw);
       const entry = runArgs[runArgs.length - 1];

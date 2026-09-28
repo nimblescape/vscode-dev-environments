@@ -142,14 +142,14 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   // Account separation.
   ['the workspace volume of another environment', input(mount('source=devenv-acme-web-11111111,target=/w,type=volume')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
   ['a volume of an environment of another account (registry)', input(mount('source=data,target=/d'), { foreignVolumes: ['data'] }), 'volume data of another environment', 'protected'],
-  ['a volume with the labels of another environment', input(mount('source=data,target=/d'), { volumeLabels: { data: { 'devenv.environment-id': 'other', 'devenv.owner-id': '2002' } } }), 'volume data of another environment', 'protected'],
+  ['a volume with the labels of another environment', input(mount('source=data,target=/d'), { volumeLabels: { data: { 'nimblescape.devenv.environment-id': 'other', 'nimblescape.devenv.owner-id': '2002' } } }), 'volume data of another environment', 'protected'],
   ['-v with the volume of another environment', input(run('-v', 'devenv-acme-web-11111111:/w')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
   ['the cache volume of the workspace helper', input(mount('source=devenv-helper-cache,target=/c,type=volume')), 'volume devenv-helper-cache of the workspace helper', 'protected'],
   // Review round 1 of PR #39 (R1): the heartbeat records of the Session Monitor on a remote Docker host.
   ['the volume of the remote Session Monitor', input(mount('source=devenv-session-monitor,target=/s,type=volume')), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
   ['-v with the volume of the remote Session Monitor', input(run('-v', 'devenv-session-monitor:/s')), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
   ['--env-file outside the workspace volume (a file of the workspace helper)', input(run('--env-file', '/devenv-cache/x')), '--env-file=/devenv-cache/x', 'protected'],
-  ['volume-label (the labels that tell the volumes of the environments apart)', input(mount('type=volume,source=v,target=/x,volume-label=devenv.environment-id=x')), 'volume options of the mount v', 'protected'],
+  ['volume-label (the labels that tell the volumes of the environments apart)', input(mount('type=volume,source=v,target=/x,volume-label=nimblescape.devenv.environment-id=x')), 'volume options of the mount v', 'protected'],
   ['volumeLabels in the object form', input(mount({ type: 'volume', source: 'v', target: '/x', volumeLabels: {} })), 'volume options of the mount v', 'protected'],
   ['volume-driver together with volume-label', input(mount('type=volume,source=v,target=/x,volume-driver=local,volume-label=a=b')), 'volume options of the mount v', 'protected'],
   // The identity of the owner account.
@@ -171,8 +171,8 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['a log driver that writes to the computer', input(run('--log-driver', 'syslog')), '--log-driver=syslog', 'protected'],
 
   // Options that the policy does not support.
-  ['a label of Dev Environments', input(run('--label', 'devenv.environment-id=x')), 'label devenv.environment-id', 'unsupported'],
-  ['another value of the label devenv.host-access', input(run('--label', 'devenv.host-access=none')), 'label devenv.host-access', 'unsupported'],
+  ['a label of Dev Environments', input(run('--label', 'nimblescape.devenv.environment-id=x')), 'label nimblescape.devenv.environment-id', 'unsupported'],
+  ['another value of the label nimblescape.devenv.host-access', input(run('--label', 'nimblescape.devenv.host-access=none')), 'label nimblescape.devenv.host-access', 'unsupported'],
   ['an unknown flag', input(run('--pull=always')), '--pull', 'unsupported'],
   ['a stray argument', input(run('stray')), 'argument stray', 'unsupported'],
   ['a flag without its value at the end', input(run('--init', '-e')), '-e without a value', 'unsupported'],
@@ -294,7 +294,7 @@ describe('the override configuration with the checks off', () => {
     expect(overrideRunArgs(runArgs, false)).toEqual(['-p', '8080:80', '--publish=9000']);
   });
 
-  it('adds the label devenv.host-access=unrestricted and keeps appPort as the configuration writes it', () => {
+  it('adds the label nimblescape.devenv.host-access=unrestricted and keeps appPort as the configuration writes it', () => {
     const common = { environmentImage: 'devenv-3f2a9c1e:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['-p', '80'] };
     const on = buildOverrideConfig({ ...common, appPort: [3000, '0.0.0.0:5000:5000'] as Array<number | string> });
     // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
@@ -595,19 +595,19 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   });
 });
 
-describe('the label devenv.config-path (review round 4, D4-2)', () => {
+describe('the label nimblescape.devenv.config-path (review round 4, D4-2)', () => {
   it('allows the label of the override configuration with a configuration path', () => {
     for (const configPath of ['.devcontainer/devcontainer.json', '.devcontainer.json', '.devcontainer/python/devcontainer.json']) {
       const runArgs = buildOverrideConfig({ environmentImage: 'img', volumeName: OWN, repositoryName: 'api', containerName: OWN, configPath }).runArgs as string[];
-      expect(runArgs).toEqual(expect.arrayContaining(['--label', `devenv.config-path=${configPath}`]));
+      expect(runArgs).toEqual(expect.arrayContaining(['--label', `nimblescape.devenv.config-path=${configPath}`]));
       expect(hostAccessProblems({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
     }
   });
 
   it('refuses the label in the runArgs of the repository, and another value in the override configuration', () => {
-    expect(hostAccessProblems(input(run('--label', 'devenv.config-path=.devcontainer/devcontainer.json')))).toEqual(['label devenv.config-path']);
-    expect(hostAccessProblems({ config: { runArgs: ['--label', 'devenv.config-path=../x/devcontainer.json'] }, ownVolume: OWN, overrideConfiguration: true })).toEqual([
-      'label devenv.config-path',
+    expect(hostAccessProblems(input(run('--label', 'nimblescape.devenv.config-path=.devcontainer/devcontainer.json')))).toEqual(['label nimblescape.devenv.config-path']);
+    expect(hostAccessProblems({ config: { runArgs: ['--label', 'nimblescape.devenv.config-path=../x/devcontainer.json'] }, ownVolume: OWN, overrideConfiguration: true })).toEqual([
+      'label nimblescape.devenv.config-path',
     ]);
   });
 });
@@ -710,18 +710,18 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
     expectAllowed('FROM alpine\n', { args: { BUILDKIT_SYNTAX: 'evil/frontend:1 docker/dockerfile:1' } });
   });
 
-  it('allows the label devenv.config-path of the override configuration for a folder that the discovery finds (D5-2)', () => {
+  it('allows the label nimblescape.devenv.config-path of the override configuration for a folder that the discovery finds (D5-2)', () => {
     for (const configPath of ['.devcontainer/a\\b/devcontainer.json', '.devcontainer/ /devcontainer.json', '.devcontainer/my config/devcontainer.json']) {
       const runArgs = buildOverrideConfig({ environmentImage: 'img', volumeName: OWN, repositoryName: 'api', containerName: OWN, configPath }).runArgs as string[];
-      expect(runArgs).toEqual(expect.arrayContaining(['--label', `devenv.config-path=${configPath}`]));
+      expect(runArgs).toEqual(expect.arrayContaining(['--label', `nimblescape.devenv.config-path=${configPath}`]));
       expect(hostAccessProblems({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
     }
   });
 
-  it('adds no label devenv.config-path for a path that is no configuration path of the discovery (D5-2)', () => {
+  it('adds no label nimblescape.devenv.config-path for a path that is no configuration path of the discovery (D5-2)', () => {
     for (const configPath of ['.devcontainer/a/b/devcontainer.json', '.devcontainer/../devcontainer.json', '.devcontainer//devcontainer.json', '../x/devcontainer.json']) {
       const runArgs = buildOverrideConfig({ environmentImage: 'img', volumeName: OWN, repositoryName: 'api', containerName: OWN, configPath }).runArgs as string[];
-      expect(runArgs.some((arg) => arg.startsWith('devenv.config-path'))).toBe(false);
+      expect(runArgs.some((arg) => arg.startsWith('nimblescape.devenv.config-path'))).toBe(false);
       expect(hostAccessProblems({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
     }
   });

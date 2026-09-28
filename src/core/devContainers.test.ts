@@ -131,7 +131,7 @@ describe('other internal details of the Dev Containers extension', () => {
     expect(DEV_CONTAINERS_VOLUMES).toEqual(['vscode', 'vsc-remote-containers']);
     expect(hasDevContainersVolumeLabel({ 'vsch.local.repository': 'x' })).toBe(true);
     expect(hasDevContainersVolumeLabel({ 'dev.container.volume': 'true' })).toBe(true);
-    expect(hasDevContainersVolumeLabel({ 'devenv.environment-id': 'x', 'com.docker.compose.project': 'p' })).toBe(false);
+    expect(hasDevContainersVolumeLabel({ 'nimblescape.devenv.environment-id': 'x', 'com.docker.compose.project': 'p' })).toBe(false);
   });
 
   it.each<[number, number, boolean]>([
