@@ -207,7 +207,8 @@ export function forgetCommand(source: string, environmentId: string): string[] {
 
 /** A prefix of image repositories: `registry/path…`, lower case, no tag, no digest (the setting drops a trailing `*`). */
 export function isImagePrefix(value: unknown): value is string {
-  return typeof value === 'string' && /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) && !value.includes('..');
+  // Review round 6 of PR #57 (F2): at most MAX_IMAGE_PREFIX_LENGTH characters.
+  return typeof value === 'string' && value.length <= MAX_IMAGE_PREFIX_LENGTH && /^[a-z0-9.-]+(:[0-9]+)?\/[a-z0-9._/-]*$/.test(value) && !value.includes('..');
 }
 
 /**
@@ -221,7 +222,9 @@ export function imagePrefixesOf(patterns: readonly unknown[]): string[] {
     if (prefixes.length >= MAX_IMAGE_PREFIXES) break;
     if (typeof pattern !== 'string') continue;
     const prefix = pattern.trim().replace(/\*$/, '');
-    if (isImagePrefix(prefix) && !prefixes.includes(prefix)) prefixes.push(prefix);
+    // Review round 6 of PR #57 (F2): all together at most MAX_IMAGE_PREFIXES_JSON_LENGTH characters as JSON, as they go on
+    // the command line of `docker run` of the monitor (DEVENV_IMAGE_PREFIXES), whose length is limited.
+    if (isImagePrefix(prefix) && !prefixes.includes(prefix) && JSON.stringify([...prefixes, prefix]).length <= MAX_IMAGE_PREFIXES_JSON_LENGTH) prefixes.push(prefix);
   }
   return prefixes;
 }
@@ -266,6 +269,10 @@ export function parseImageListInput(text: string): string[] | undefined {
 export const IMAGE_SETTINGS_FILE = 'image-settings.json';
 /** At most this many prefixes. */
 export const MAX_IMAGE_PREFIXES = 50;
+/** The longest prefix (review round 6 of PR #57, F2). */
+export const MAX_IMAGE_PREFIX_LENGTH = 128;
+/** The longest list of prefixes as JSON (review round 6 of PR #57, F2: the command line of `docker run`). */
+export const MAX_IMAGE_PREFIXES_JSON_LENGTH = 4096;
 
 export interface ImageSettings {
   prefixes: string[];

@@ -57,6 +57,7 @@ import {
   nextCronTime,
   nodeHttpGet,
   parseCronSchedule,
+  parseReplacedImages,
   prefixesFromEnv,
   type HttpGet,
 } from './images';
@@ -405,6 +406,8 @@ export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { text: string; sc
   return { text, schedule: valid ?? parseCronSchedule(DEFAULT_IMAGE_SCHEDULE)!, timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE };
 }
 
+/** The IDs of images that pulls replaced (review round 6 of PR #57, F1), in the volume. */
+export const REPLACED_IMAGES_FILE = 'replaced-images.json';
 /** How often the monitor looks whether a time of the schedule has come (as cron: every minute). */
 export const IMAGE_CHECK_MS = 60_000;
 /** A clock that steps back by more than this starts the image schedule again from its time (review round 4, L1). */
@@ -582,6 +585,11 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
           log,
           prefixes: () => settings.value.prefixes,
           knownRepositories: () => readImageList(stateDir),
+          // Review round 6 of PR #57 (F1): the IDs that pulls replaced, in the volume.
+          replaced: {
+            read: async () => parseReplacedImages(await fs.promises.readFile(path.join(stateDir, REPLACED_IMAGES_FILE), 'utf8').catch(() => '{}')),
+            write: (value) => writeStateFile(stateDir, REPLACED_IMAGES_FILE, JSON.stringify(value)),
+          },
         });
         const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
         const schedule = new ImageSchedule({ now, log, settings, pass: () => images.pass() });

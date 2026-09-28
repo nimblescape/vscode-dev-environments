@@ -195,7 +195,8 @@ export function versionsOf(images: readonly LocalImage[]): ImageVersion[] {
     } else if (a.version || b.version) {
       return a.version ? -1 : 1;
     }
-    return b.createdAt.localeCompare(a.createdAt);
+    // Review round 6 of PR #57 (F1): as times, as `docker image ls` and `docker image inspect` write them differently.
+    return createdTime(b.createdAt) - createdTime(a.createdAt);
   });
 }
 
@@ -228,10 +229,44 @@ export interface ImageMaintenanceDeps {
   prefixes: () => readonly string[];
   /** The repositories of the list that the extension sent (none when it sent none). */
   knownRepositories: () => Promise<string[]>;
+  /**
+   * Review round 6 of PR #57 (F1): the IDs that a pull replaced, by repository, kept in the volume. With the containerd
+   * image store of Docker, the image that a pull replaces is listed without its repository (`<none>`), so without these
+   * IDs no older version would ever be removed. Without it: kept for the pass only.
+   */
+  replaced?: { read(): Promise<ReplacedImages>; write(value: ReplacedImages): Promise<void> };
+}
+
+/** Image IDs that a pull replaced, by repository. */
+export type ReplacedImages = Record<string, string[]>;
+/** At most this many replaced IDs are kept per repository. */
+const MAX_REPLACED_PER_REPOSITORY = 20;
+const IMAGE_ID = /^[A-Za-z0-9:]{1,100}$/;
+
+/** The stored replaced IDs; an empty record for anything invalid. */
+export function parseReplacedImages(text: string): ReplacedImages {
+  try {
+    const value = JSON.parse(text) as unknown;
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return {};
+    const result: ReplacedImages = {};
+    for (const [repository, ids] of Object.entries(value)) {
+      if (splitRepository(repository) && Array.isArray(ids)) result[repository] = ids.filter((id): id is string => typeof id === 'string' && IMAGE_ID.test(id)).slice(-MAX_REPLACED_PER_REPOSITORY);
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+/** The time of `CreatedAt` of `docker image ls` or `Created` of `docker image inspect` (ms; 0 when unknown). */
+function createdTime(text: string): number {
+  return Date.parse(text.replace(/ ([+-]\d{4}) [A-Z]+$/, ' $1')) || 0;
 }
 
 /** The passes of the image maintenance. */
 export class ImageMaintenance {
+  private replaced: ReplacedImages = {};
+
   constructor(private readonly deps: ImageMaintenanceDeps) {}
 
   /** One pass: the pulls, then the removal of the older versions. Never throws. */
@@ -239,15 +274,47 @@ export class ImageMaintenance {
     const prefixes = this.deps.prefixes();
     if (prefixes.length === 0) return;
     try {
+      if (this.deps.replaced) this.replaced = await this.deps.replaced.read();
       const local = await this.repositories(prefixes);
       const known = (await this.deps.knownRepositories()).filter((repository) => prefixes.some((prefix) => repository.startsWith(prefix)));
       for (const repository of new Set([...local.keys(), ...known])) await this.update(repository);
       const after = await this.repositories(prefixes);
+      for (const repository of Object.keys(this.replaced)) {
+        if (!after.has(repository) && prefixes.some((prefix) => repository.startsWith(prefix))) after.set(repository, []);
+      }
       const layers = after.size > 0 ? await this.layersById() : new Map<string, string[]>();
-      for (const [repository, images] of after) await this.clean(repository, images, layers);
+      for (const [repository, images] of after) await this.clean(repository, [...images, ...(await this.replacedImages(repository, images))], layers);
     } catch (error) {
       this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
+  }
+
+  /** The ID of an image reference, or undefined. */
+  private async imageId(reference: string): Promise<string | undefined> {
+    const inspected = await this.deps.docker(['image', 'inspect', '--format', '{{.Id}}', reference], IMAGE_LIST_TIMEOUT_MS);
+    const id = inspected.stdout.trim();
+    return inspected.code === 0 && IMAGE_ID.test(id) ? id : undefined;
+  }
+
+  /**
+   * Review round 6 of PR #57 (F1): the stored replaced IDs of `repository` that still exist without any tag, as
+   * untagged images of it; the others are forgotten (removed, or tagged again).
+   */
+  private async replacedImages(repository: string, listed: readonly LocalImage[]): Promise<LocalImage[]> {
+    const ids = (this.replaced[repository] ?? []).filter((id) => !listed.some((image) => image.id === id));
+    const result: LocalImage[] = [];
+    const kept: string[] = [];
+    for (const id of ids) {
+      const inspected = await this.deps.docker(['image', 'inspect', '--format', '{{json .RepoTags}}\t{{.Created}}', id], IMAGE_LIST_TIMEOUT_MS);
+      const [tags, created] = inspected.stdout.trim().split('\t');
+      if (inspected.code !== 0 || created === undefined || (tags !== '[]' && tags !== 'null')) continue;
+      kept.push(id);
+      result.push({ repository, tag: '<none>', id, createdAt: created });
+    }
+    this.replaced[repository] = [...(this.replaced[repository] ?? []).filter((id) => listed.some((image) => image.id === id)), ...kept];
+    return result;
   }
 
   /** The images of the repositories with one of the prefixes, by repository. */
@@ -277,8 +344,17 @@ export class ImageMaintenance {
     const major = highestMajorTag(tags);
     if (major === undefined) return;
     const reference = `${repository}:${major}`;
+    const before = await this.imageId(reference);
     const pulled = await this.deps.docker(['pull', '--quiet', reference], IMAGE_PULL_TIMEOUT_MS);
-    if (pulled.code !== 0) this.deps.log(`${reference} could not be pulled: ${pulled.stderr.trim() || `exit code ${pulled.code}`}`);
+    if (pulled.code !== 0) {
+      this.deps.log(`${reference} could not be pulled: ${pulled.stderr.trim() || `exit code ${pulled.code}`}`);
+      return;
+    }
+    // Review round 6 of PR #57 (F1): the image that the pull replaced, also when Docker lists it without its repository.
+    const now = await this.imageId(reference);
+    if (before !== undefined && now !== undefined && before !== now) {
+      this.replaced[repository] = [...(this.replaced[repository] ?? []).filter((id) => id !== before), before].slice(-MAX_REPLACED_PER_REPOSITORY);
+    }
   }
 
   /**

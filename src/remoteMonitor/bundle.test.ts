@@ -9,7 +9,7 @@
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { describe, expect, it } from 'vitest';
-import { MAX_SCRIPT_LENGTH, MAX_WINDOWS_COMMAND_LINE, windowsCommandLineLength } from '../core/remoteMonitor/protocol';
+import { MAX_SCRIPT_LENGTH, MAX_WINDOWS_COMMAND_LINE, imagePrefixesOf, windowsCommandLineLength } from '../core/remoteMonitor/protocol';
 import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { silentLogger } from '../core/ports';
 
@@ -35,5 +35,9 @@ describe('the script of the remote Session Monitor', () => {
       timeZone: 'America/Argentina/Buenos_Aires',
     });
     expect(windowsCommandLineLength(['docker', ...args])).toBeLessThanOrEqual(MAX_WINDOWS_COMMAND_LINE);
+    // Review round 6 of PR #57 (F2): the most that the settings allow (50 patterns of 128 characters) still fits.
+    const most = imagePrefixesOf(Array.from({ length: 50 }, (_, index) => `ghcr.io/${String(index).padStart(2, '0')}${'a'.repeat(118)}*`));
+    const longest = monitor.runArgs('devenv-helper:0123456789ab', '/run/user/1000/docker.sock', '0123456789ab', script, { prefixes: most, schedule: '7 6 * * *', timeZone: 'America/Argentina/Buenos_Aires' });
+    expect(windowsCommandLineLength(['docker', ...longest])).toBeLessThanOrEqual(MAX_WINDOWS_COMMAND_LINE);
   });
 });

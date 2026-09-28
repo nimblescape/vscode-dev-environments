@@ -11,11 +11,13 @@ import {
   imagePrefixesOf,
   parseBearerChallenge,
   parseImageList,
+  parseReplacedImages,
   prefixesFromEnv,
   splitRepository,
   versionsOf,
   type HttpGet,
   type LocalImage,
+  type ReplacedImages,
 } from './images';
 import type { DockerResult } from './main';
 
@@ -29,19 +31,58 @@ function image(repository: string, tag: string, id: string, createdAt: string): 
 
 /** A Docker CLI of the engine of the test: its images, the containers per image, and the calls. */
 // Review round 1 of PR #57 (G): `layers` of an image ID (default: one layer of its own, no image built on another).
-function fakeEngine(options: { images: string[]; usedBy?: Record<string, string>; failRemove?: string[]; layers?: Record<string, string[]>; failInspect?: boolean }) {
+function fakeEngine(options: {
+  images: string[];
+  usedBy?: Record<string, string>;
+  failRemove?: string[];
+  layers?: Record<string, string[]>;
+  failInspect?: boolean;
+  pulled?: Record<string, string>;
+  dangling?: Record<string, string>;
+}) {
   const calls: string[][] = [];
   let images = [...options.images];
   const idOf = (line: string) => (JSON.parse(line) as { ID: string }).ID;
   const docker = async (args: readonly string[]): Promise<DockerResult> => {
     calls.push([...args]);
-    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a') return { code: 0, stdout: [...new Set(images.map(idOf)), ...Object.keys(options.layers ?? {})].join('\n'), stderr: '' };
+    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a') {
+      return { code: 0, stdout: [...new Set([...images.map(idOf), ...Object.keys(options.layers ?? {}), ...Object.keys(options.dangling ?? {})])].join('\n'), stderr: '' };
+    }
+    // Review round 6 of PR #57 (F1): the ID of a reference, and the tags and time of an ID (`pulled`: what a pull of a
+    // reference makes it point to; `dangling`: images that Docker lists without their repository, as the containerd
+    // image store does after a pull replaced them).
+    if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
+      const line = images.find((entry) => {
+        const item = JSON.parse(entry) as { Repository: string; Tag: string };
+        return `${item.Repository}:${item.Tag}` === args[4];
+      });
+      return line ? { code: 0, stdout: `${idOf(line)}\n`, stderr: '' } : { code: 1, stdout: '', stderr: 'Error: No such image' };
+    }
+    if (args[0] === 'image' && args[1] === 'inspect' && args[3].startsWith('{{json .RepoTags}}')) {
+      const id = args[4];
+      const tags = images.filter((entry) => idOf(entry) === id).map((entry) => JSON.parse(entry) as { Repository: string; Tag: string }).filter((item) => item.Tag !== '<none>');
+      const dangling = options.dangling?.[id];
+      if (tags.length === 0 && dangling === undefined) return { code: 1, stdout: '', stderr: 'Error: No such image' };
+      return { code: 0, stdout: `${JSON.stringify(tags.map((item) => `${item.Repository}:${item.Tag}`))}\t${dangling ?? '2026-01-01T00:00:00Z'}\n`, stderr: '' };
+    }
     if (args[0] === 'image' && args[1] === 'inspect') {
       if (options.failInspect) return { code: 1, stdout: '', stderr: 'Error: No such image' };
       return { code: 0, stdout: args.slice(4).map((id) => `${id} ${JSON.stringify(options.layers?.[id] ?? [`${id}/layer`])}`).join('\n'), stderr: '' };
     }
     if (args[0] === 'image' && args[1] === 'ls') return { code: 0, stdout: images.join('\n'), stderr: '' };
-    if (args[0] === 'pull') return { code: 0, stdout: '', stderr: '' };
+    if (args[0] === 'pull') {
+      // A pull that moves the reference to a new image: the old one loses it (containerd: listed without repository).
+      const target = options.pulled?.[args[2]];
+      if (target !== undefined) {
+        const [repository, tag] = [args[2].slice(0, args[2].lastIndexOf(':')), args[2].slice(args[2].lastIndexOf(':') + 1)];
+        images = images.filter((entry) => {
+          const item = JSON.parse(entry) as { Repository: string; Tag: string };
+          return !(item.Repository === repository && item.Tag === tag);
+        });
+        images.push(image(repository, tag, target, '2026-09-28'));
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    }
     if (args[0] === 'ps') {
       const id = /ancestor=(.*)$/.exec(args[args.length - 1])?.[1] ?? '';
       return { code: 0, stdout: options.usedBy?.[id] ?? '', stderr: '' };
@@ -95,6 +136,10 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const many = Array.from({ length: 60 }, (_, index) => `ghcr.io/acme/image-${index}*`);
     expect(imagePrefixesOf(many)).toHaveLength(50);
     expect(prefixesFromEnv({ DEVENV_IMAGE_PREFIXES: JSON.stringify(many) })).toHaveLength(50);
+    // Review round 6 of PR #57 (F2): at most 128 characters each, 4096 as JSON together (the command line of the monitor).
+    expect(imagePrefixesOf([`ghcr.io/${'a'.repeat(121)}*`, `ghcr.io/${'a'.repeat(120)}*`])).toEqual([`ghcr.io/${'a'.repeat(120)}`]);
+    const long = Array.from({ length: 50 }, (_, index) => `ghcr.io/${String(index).padStart(2, '0')}${'a'.repeat(118)}*`);
+    expect(JSON.stringify(imagePrefixesOf(long)).length).toBeLessThanOrEqual(4096);
   });
 
   it('takes the highest plain major tag (the registry has latest, 2, 2.0, 2.0.14, 2.0.14-amd64)', () => {
@@ -282,6 +327,44 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     await expect(httpGetWith(throwing, 'https://[bad', {}, 50)).rejects.toThrow('Invalid URL');
     // Past the time limit: nothing is thrown (vitest fails on an uncaught error).
     await new Promise((resolve) => setTimeout(resolve, 120));
+  });
+
+  // Review round 6 of PR #57 (F1): with the containerd image store, the image that a pull replaced is listed without its
+  // repository; the monitor keeps its ID in the volume and removes it once it is older than the two newest.
+  it('removes the images that pulls replaced also when Docker lists them without their repository', async () => {
+    const dangling: Record<string, string> = {};
+    const engine = fakeEngine({ images: [image(DEV, '2', 'sha256:v1', '2026-09-01')], pulled: { [`${DEV}:2`]: 'sha256:v2' }, dangling });
+    let stored: ReplacedImages = {};
+    const replaced = { read: async () => stored, write: async (value: ReplacedImages) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) };
+    const run = () =>
+      new ImageMaintenance({
+        docker: engine.docker,
+        httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+        log: () => {},
+        prefixes: () => PREFIXES,
+        knownRepositories: async () => [],
+        replaced,
+      }).pass();
+    // v1 is replaced by v2 and listed as <none> <none> (not in `docker image ls` of the repository): two versions stay.
+    dangling['sha256:v1'] = '2026-09-01T00:00:00Z';
+    await run();
+    expect(stored).toEqual({ [DEV]: ['sha256:v1'] });
+    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+    // The next update: v1 is now the third version and is removed by its ID.
+    const second = fakeEngine({ images: [image(DEV, '2', 'sha256:v2', '2026-09-28')], pulled: { [`${DEV}:2`]: 'sha256:v3' }, dangling });
+    dangling['sha256:v2'] = '2026-09-28T00:00:00Z';
+    await new ImageMaintenance({
+      docker: second.docker,
+      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      log: () => {},
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced,
+    }).pass();
+    expect(second.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:v1']]);
+    expect(stored[DEV]).toContain('sha256:v2');
+    expect(parseReplacedImages('{"ghcr.io/a/b":["sha256:x",3],"ubuntu":["sha256:y"]}')).toEqual({ 'ghcr.io/a/b': ['sha256:x'] });
+    expect(parseReplacedImages('not json')).toEqual({});
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.
