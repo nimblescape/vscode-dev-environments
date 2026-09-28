@@ -1270,7 +1270,8 @@ export class Controller implements vscode.Disposable {
     const diagnostics = this.logAttachDiagnostics(result.containerName);
     const notReady = await this.readyForWindow(result.environment, result.containerName, signal);
     const waited = new AbortController();
-    await Promise.race([diagnostics, this.delay(ATTACH_DIAGNOSTICS_WAIT_MS, waited.signal)]);
+    // Review round 2 (G2): Cancel also ends this wait.
+    await Promise.race([diagnostics, this.delay(ATTACH_DIAGNOSTICS_WAIT_MS, AbortSignal.any([waited.signal, signal]))]);
     waited.abort();
     if (!request.newWindow && [...this.activeConnectRequests].some((other) => other > request.number)) {
       this.logger.info(`${result.environment.repository} is not connected: another environment is opening in this window.`);
@@ -2504,8 +2505,9 @@ export class Controller implements vscode.Disposable {
     return new UserFacingError('startFailed', Messages.containerNotReady(repository, containerName));
   }
 
-  /** Waits `ms`; ends early when `signal` aborts. */
+  /** Waits `ms`; ends early when `signal` aborts, at once when it has aborted already (review round 2, G1). */
   private delay(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve();
     return new Promise((resolve) => {
       const done = (): void => {
         clearTimeout(timer);

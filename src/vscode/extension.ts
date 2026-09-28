@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { dockerHostOf, remoteContextName } from '../core/docker/dockerHost';
+import { dockerHostOf, isOnDockerHost, remoteContextName } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets } from '../core/docker/dockerTargets';
 import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
@@ -432,15 +432,17 @@ async function activateExtension(
 
   if (currentEnvironment && containerName && docker.isInstalled()) {
     // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window. Only for an
-    // environment of this extension (review round 1, F5); its context is the one of its host.
-    const host = dockerHostOf(currentEnvironment);
-    const context = host === '' ? undefined : remoteContextName(host);
-    background(
-      attachDiagnostics(docker, docker.processEnv(), containerName, context).then((lines) => {
-        for (const line of lines) logger.info(`While this window connects: ${line}`);
-      }),
-      'log the Docker of this window',
-    );
+    // environment of this extension (review round 1, F5). Its context: the current one when that is on the host of the
+    // environment (a context that the user made, review round 2, G5), else the one of "Use a Remote Docker Host…".
+    const environment = currentEnvironment;
+    const logDocker = async (): Promise<void> => {
+      const host = dockerHostOf(environment);
+      const current = await targets.resolve();
+      const context = isOnDockerHost(environment, current.host) ? current.context : host === '' ? undefined : remoteContextName(host);
+      const lines = await attachDiagnostics(docker, docker.processEnv(), containerName, context);
+      for (const line of lines) logger.info(`While this window connects: ${line}`);
+    };
+    background(logDocker(), 'log the Docker of this window');
   }
 
   if (currentEnvironment && containerName) {

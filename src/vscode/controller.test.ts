@@ -279,6 +279,8 @@ function createHarness(
     remoteDocker?: ControllerDeps['remoteDocker'];
     /** Unit 7, PR 2: the heartbeat of Close and Keep Running. */
     remoteMonitor?: ControllerDeps['remoteMonitor'];
+    /** User decision 2026-09-28: the pause between the checks of the container (default 0). */
+    readyPollMs?: number;
   } = {},
 ): Harness {
   const listOpenMode: Harness['listOpenMode'] = { value: 'singleClick' };
@@ -409,7 +411,7 @@ function createHarness(
       reopenCheckDelayMs: 0,
       disconnectAnswerMs: options.disconnectAnswerMs ?? 60_000,
       busyPollMs: 5,
-      readyPollMs: 0,
+      readyPollMs: options.readyPollMs ?? 0,
     },
   } as unknown as ControllerDeps;
   const controller = new Controller(deps);
@@ -803,7 +805,7 @@ describe('Start', () => {
     await h.registry.add(env);
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
-    pipelineStartsContainer();
+    pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', { environmentId: ENV_ID });
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
@@ -826,7 +828,7 @@ describe('Start', () => {
     await h.registry.add(env);
     otherWindowConnected();
     h.docker.containerState.mockResolvedValue('stopped');
-    pipelineStartsContainer();
+    pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', row('acme/api', env));
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
@@ -839,7 +841,7 @@ describe('Start', () => {
     await h.registry.add(env);
     otherWindowConnected();
     h.docker.containerState.mockRejectedValue(new Error('Cannot connect to the Docker daemon'));
-    pipelineStartsContainer();
+    pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', row('acme/api', env));
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
@@ -883,6 +885,75 @@ describe('Start', () => {
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
     expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // Review round 2 (G3): Cancel ends a pause between the checks of the container (not only the checks themselves).
+  it('stays in this window when the user cancels during a pause between the checks of the container', async () => {
+    recreateHarness({ readyPollMs: 60_000 });
+    const env = environment();
+    await h.registry.add(env);
+    const progress = cancellableProgress();
+    h.docker.containerState.mockImplementation(async () => {
+      setTimeout(() => progress.cancel(), 10);
+      return 'stopped';
+    });
+    await run('start', row('acme/api', env));
+    expect(h.docker.containerState).toHaveBeenCalledTimes(1);
+    expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
+  });
+
+  // Review round 2 (G1): a Cancel during the check itself skips the following pause.
+  it('does not wait for the next pause when the user cancels during a check of the container', async () => {
+    recreateHarness({ readyPollMs: 60_000 });
+    const env = environment();
+    await h.registry.add(env);
+    const progress = cancellableProgress();
+    h.docker.containerState.mockImplementation(async () => {
+      progress.cancel();
+      return 'stopped';
+    });
+    await run('start', row('acme/api', env));
+    expect(h.docker.containerState).toHaveBeenCalledTimes(1);
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  // Review round 2 (G3): the newest request wins also when it arrives while the container of the older one is checked.
+  it('does not connect an older request whose container check ends after a newer request started', async () => {
+    const web = environment({ id: 'b1c2d3e4-0000-4000-8000-000000000002', repository: 'acme/web', containerName: 'web', volumeName: 'web', remoteWorkspaceFolder: '/workspaces/web' });
+    await h.registry.add(environment());
+    await h.registry.add(web);
+    const webPipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockImplementation(async (id: string) => (id === ENV_ID ? openResult(environment()) : webPipeline.promise));
+    const apiState = deferred<string>();
+    h.docker.containerState.mockImplementation(async (name: string) => (name === CONTAINER ? apiState.promise : 'running'));
+    const first = run('start', row('acme/api', environment()));
+    await settle(() => h.docker.containerState.mock.calls.some(([name]) => name === CONTAINER), 'the check of the first container');
+    const second = run('start', row('acme/web', web));
+    await settle(() => h.service.openEnvironment.mock.calls.length === 2, 'the second pipeline');
+    apiState.resolve('running');
+    await first;
+    expect(h.connection.open).not.toHaveBeenCalled();
+    webPipeline.resolve(openResult(web));
+    await second;
+    expect(h.connection.open).toHaveBeenCalledTimes(1);
+    expect(h.connection.open).toHaveBeenCalledWith('web', '/workspaces/web');
+  });
+
+  // Review round 2 (G3): the lines about the Docker of the attach are in the log before the window switches.
+  it('logs the Docker of the attach before the window connects', async () => {
+    await h.registry.add(environment());
+    h.docker.run.mockImplementation(async () => {
+      await pause(20);
+      return { exitCode: 0, stdout: 'x', stderr: '', timedOut: false };
+    });
+    let loggedAtOpen: string[] = [];
+    h.connection.open.mockImplementation(async () => {
+      loggedAtOpen = h.logger.info.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('Before the window connects:'));
+    });
+    await run('start', row('acme/api', environment()));
+    expect(h.connection.open).toHaveBeenCalledTimes(1);
+    expect(loggedAtOpen.length).toBeGreaterThanOrEqual(4);
   });
 
   it('runs one operation per environment at a time; a second Start is ignored', async () => {
@@ -3054,7 +3125,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
-    pipelineStartsContainer();
+    pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('startInNewWindow', { environmentId: ENV_ID });
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
