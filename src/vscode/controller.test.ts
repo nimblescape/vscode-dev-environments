@@ -30,7 +30,6 @@ import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
 import { ControllerTexts } from './controllerTexts';
 import { DisconnectRequests } from './disconnectRequests';
-import { REMOTE_DOCKER_HOST_CONTEXT_KEY } from './dockerHostIndicator';
 import { DOUBLE_CLICK_INTERVAL_MS, type ListOpenMode } from './rowActivation';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
@@ -3343,20 +3342,12 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       };
     };
     const title = manifest.contributes.menus['view/title'];
-    // Review of the sidebar host (S1): not over the Docker setup, which shows while no local Docker CLI is found.
-    expect(title).toContainEqual({
-      command: 'devEnvironments.useRemoteDockerHost',
-      when: `view == devEnvironments.repositories && !${REMOTE_DOCKER_HOST_CONTEXT_KEY} && !${DockerContextKeys.setupRequired}`,
-      group: 'navigation@3',
-    });
-    expect(title).toContainEqual({
-      command: 'devEnvironments.chooseDockerHost',
-      when: `view == devEnvironments.repositories && ${REMOTE_DOCKER_HOST_CONTEXT_KEY}`,
-      group: 'navigation@3',
-    });
+    // User request 2026-09-28 ("the icon can then go away"): the first row of the list chooses the Docker host; the
+    // title bar has no icon of the Docker host anymore, and the commands no icon.
+    expect(title.filter((entry) => entry.command === 'devEnvironments.useRemoteDockerHost' || entry.command === 'devEnvironments.chooseDockerHost')).toEqual([]);
     const icons = Object.fromEntries(manifest.contributes.commands.map((command) => [command.command, command.icon]));
-    expect(icons['devEnvironments.useRemoteDockerHost']).toBe('$(remote)');
-    expect(icons['devEnvironments.chooseDockerHost']).toBe('$(vm-active)');
+    expect(icons['devEnvironments.useRemoteDockerHost']).toBeUndefined();
+    expect(icons['devEnvironments.chooseDockerHost']).toBeUndefined();
     expect(manifest.contributes.menus.commandPalette).toContainEqual({ command: 'devEnvironments.chooseDockerHost', when: 'false' });
   });
 

@@ -142,33 +142,54 @@ describe('RepositoriesTreeProvider', () => {
   });
 
   // User report 2026-09-28 ("remote connection is not shown anymore"): the list names the remote Docker host.
-  it('shows the remote Docker host as the first row above a list, never in an empty view, and not for the local Docker', () => {
+  it('shows the remote Docker host as the first row above a list, never in an empty view', () => {
     const provider = new RepositoriesTreeProvider(silentLogger);
     let changes = 0;
     provider.onDidChangeTreeData(() => changes++);
-    provider.setDockerHost('htldvmhn');
+    provider.setDockerHost({ kind: 'remote', host: 'htldvmhn' });
     provider.setModel([], { signedIn: true });
     expect(provider.getChildren()).toEqual([]);
     const groups = model();
     provider.setModel(groups, { signedIn: false });
     const [host, signIn, ...rest] = provider.getChildren();
-    expect(host).toEqual({ kind: 'dockerHost', id: DOCKER_HOST_ROW_ID, host: 'htldvmhn' });
+    expect(host).toEqual({ kind: 'dockerHost', id: DOCKER_HOST_ROW_ID, host: { kind: 'remote', host: 'htldvmhn' } });
     expect(signIn).toMatchObject({ kind: 'signIn' });
     expect(rest).toEqual(groups);
     const item = provider.getTreeItem(host) as unknown as TreeItem;
-    expect(item.label).toBe(DockerHostRowTexts.label('htldvmhn'));
     expect(item.label).toBe('Remote Docker host: htldvmhn');
-    expect((item.iconPath as ThemeIcon).id).toBe('remote');
+    // User request 2026-09-28 ("use the remote monitor icon"): the monitor with the remote badge (it was `remote`).
+    expect((item.iconPath as ThemeIcon).id).toBe('remote-explorer');
     expect(item.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
     expect(item.contextValue).toBe('dockerHost');
     expect(provider.getParent(host)).toBeUndefined();
     expect(provider.getChildren(host)).toEqual([]);
     const before = changes;
-    provider.setDockerHost('htldvmhn');
+    provider.setDockerHost({ kind: 'remote', host: 'htldvmhn' });
     expect(changes).toBe(before);
+    // Not known (yet): no row.
     provider.setDockerHost(undefined);
     expect(changes).toBe(before + 1);
     expect(provider.getChildren()[0]).toMatchObject({ kind: 'signIn' });
+    provider.dispose();
+  });
+
+  // User request 2026-09-28 ("the headline shall be shown also in local mode"; "the icon can then go away"): the first
+  // row names the local Docker too (it used to show nothing there), and opens the same choice of the Docker host.
+  it('shows the local Docker and an endpoint that is not supported as the first row too', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(model(), { signedIn: true });
+    provider.setDockerHost({ kind: 'local', host: '' });
+    const [local] = provider.getChildren();
+    const localItem = provider.getTreeItem(local) as unknown as TreeItem;
+    expect(localItem.label).toBe('Local Docker');
+    expect(localItem.label).toBe(DockerHostRowTexts.label({ kind: 'local', host: '' }));
+    expect((localItem.iconPath as ThemeIcon).id).toBe('vm');
+    expect(localItem.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
+    expect(localItem.tooltip).toBe('Docker runs on this computer. Click to use a remote Docker host.');
+    provider.setDockerHost({ kind: 'unsupported', host: 'tcp://192.0.2.10:2376' });
+    const unsupportedItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(unsupportedItem.label).toBe('Docker endpoint not supported: tcp://192.0.2.10:2376');
+    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('warning');
     provider.dispose();
   });
 
