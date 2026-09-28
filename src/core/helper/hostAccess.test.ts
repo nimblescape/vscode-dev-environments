@@ -33,6 +33,7 @@ import {
   environmentImageIds,
   environmentImageShortId,
   imageNamedBy,
+  isOtherEnvironmentImageName,
   imageReferenceFinding,
   otherAccountImageItems,
   unknownEnvironmentShortIds,
@@ -1198,11 +1199,26 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
       ['11111111', '2002'],
       ['22222222', '1001'],
     ]);
-    expect(environmentImageIds(images, owners, '1001')).toEqual({ own: new Set(['sha256:b']), others: new Set(['sha256:a', 'sha256:c']) });
+    expect(environmentImageIds(images, owners, '1001')).toEqual({
+      own: new Set(['sha256:b']),
+      others: new Set(['sha256:a', 'sha256:c']),
+      ownShortIds: new Set(['22222222']),
+    });
     expect(unknownEnvironmentShortIds(images, owners)).toEqual(['33333333']);
     // Only of the images that the references found.
     expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:a']))).toEqual([]);
     expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:c']))).toEqual(['33333333']);
+  });
+
+  it('refuses a name of an environment image without a local image unless the environment is the account\'s (review round 3, S1)', () => {
+    const ids = { own: new Set<string>(), others: new Set<string>(), ownShortIds: new Set(['22222222']) };
+    expect(isOtherEnvironmentImageName('devenv-11111111:4', ids)).toBe(true);
+    expect(isOtherEnvironmentImageName('docker.io/library/devenv-11111111-db', ids)).toBe(true);
+    expect(isOtherEnvironmentImageName('devenv-22222222:4', ids)).toBe(false);
+    expect(isOtherEnvironmentImageName('devenv-tools:1', ids)).toBe(false);
+    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids)).toEqual(['image devenv-11111111:4 (an image of an environment of another GitHub account)']);
+    expect(otherAccountImageItems(named('devenv-22222222:4'), [], ids)).toEqual([]);
+    expect(environmentImageIds([], new Map([['22222222', '1001'], ['11111111', '2002']]), '1001').ownShortIds).toEqual(new Set(['22222222']));
   });
 
   it('names the owner of each environment by the labels of its volumes, none when they differ', () => {
@@ -1223,9 +1239,13 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
   it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
     ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
     ['an image of another account that is also the account\'s own (the same build)', [THEIRS], { own: [THEIRS.id], others: [THEIRS.id] }, []],
-    ['an image of the account', [OURS], { own: [OURS.id], others: [THEIRS.id] }, []],
+    // Review round 3 (S1): changed data (the image of the account is named by the reference; before, the reference named
+    // no image of the list, so the row did not test the image of the account).
+    ['an image of the account', [{ ...OURS, repoTags: ['devenv-11111111:2'] }], { own: [OURS.id], others: [THEIRS.id] }, []],
     ['no image of an environment', [{ id: 'sha256:c', repoTags: ['devenv-11111111:2'], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
-    ['a missing image', [], { own: [], others: [THEIRS.id] }, []],
+    // Review round 3 (S1): changed expectation (it was allowed), the name of an image of an environment of no known
+    // owner that is not there is refused by its name (isOtherEnvironmentImageName).
+    ['a missing image', [], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
   ])('%s', (_name, images, ids, expected) => {
     expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) })).toEqual(expected);
   });

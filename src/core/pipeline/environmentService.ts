@@ -111,6 +111,8 @@ import {
   foreignVolumeName,
   hostAccessChecks,
   environmentImageIds,
+  environmentImageShortId,
+  imageNamedBy,
   imageLabelItems,
   imageReferencesToInspect,
   inspectedImageItems,
@@ -1835,8 +1837,14 @@ export class EnvironmentService {
     const { items, transient, notChecked } = inspectedImageItems(named, images, unchecked);
     if (notChecked.length > 0) this.logger.warn(`Docker could not inspect the image references ${capped(notChecked).join(', ')}.`);
     // User decision 2026-09-28: the images of the environments of other accounts, by their IDs; only when a reference
-    // found a local image (a missing one is pulled by its name, or the build fails). `undefined`: Docker could not say.
-    const read = images.length > 0 ? await this.hostEnvironmentImageIds(env, images, signal) : { ids: { own: new Set<string>(), others: new Set<string>() } };
+    // found a local image (another one is pulled by its name, or the build fails), or (review round 3, S1) names no
+    // local image under the name of an environment image. `undefined`: Docker could not say.
+    const missing = named.filter((entry) => imageNamedBy(entry.reference, images) === undefined).map((entry) => environmentImageShortId(entry.reference));
+    const missingShortIds = missing.filter((short): short is string => short !== undefined);
+    const read =
+      images.length > 0 || missingShortIds.length > 0
+        ? await this.hostEnvironmentImageIds(env, images, missingShortIds, signal)
+        : { ids: { own: new Set<string>(), others: new Set<string>() } };
     const ids = read.ids;
     const foreign = ids === undefined ? [] : otherAccountImageItems(named, images, ids);
     if (foreign.length > 0) this.logger.warn(`Image references of ${env.repository} name images of environments of another GitHub account: ${capped(foreign).join(', ')}.`);
@@ -1873,6 +1881,7 @@ export class EnvironmentService {
   private async hostEnvironmentImageIds(
     env: Environment,
     found: readonly InspectedImage[],
+    missingShortIds: readonly string[],
     signal?: AbortSignal,
   ): Promise<{ ids?: EnvironmentImageIds; unread?: string }> {
     const unread = (what: string, reason: string, error: unknown): { unread: string } => {
@@ -1891,12 +1900,11 @@ export class EnvironmentService {
       return unread('images of the environments', ENVIRONMENT_IMAGES_UNREAD, error);
     }
     this.throwIfCancelled(signal);
-    if (images.length === 0) return { ids: { own: new Set(), others: new Set() } };
     const owners = new Map<string, string>();
     for (const entry of environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env))) owners.set(shortId(entry.id).toLowerCase(), entry.owner.id);
     owners.set(shortId(env.id).toLowerCase(), env.owner.id);
     const foundIds = new Set(found.map((image) => image.id.toLowerCase()));
-    if (unknownEnvironmentShortIds(images, owners, foundIds).length > 0) {
+    if (unknownEnvironmentShortIds(images, owners, foundIds).length > 0 || missingShortIds.some((short) => !owners.has(short))) {
       let volumes: VolumeInfo[];
       try {
         volumes = await this.deps.docker.listEnvironmentVolumes(signal);

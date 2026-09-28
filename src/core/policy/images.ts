@@ -276,6 +276,8 @@ export interface InspectedImage {
 export interface EnvironmentImageIds {
   own: ReadonlySet<string>;
   others: ReadonlySet<string>;
+  /** The short IDs of the environments of the account of the checked environment (for a name without a local image). */
+  ownShortIds?: ReadonlySet<string>;
 }
 
 /**
@@ -316,7 +318,8 @@ export function environmentImageIds(
       (owners.get(short) === accountId ? own : others).add(image.id.toLowerCase());
     }
   }
-  return { own, others };
+  const ownShortIds = new Set([...owners].filter(([, owner]) => owner === accountId).map(([short]) => short));
+  return { own, others, ownShortIds };
 }
 
 /**
@@ -365,7 +368,8 @@ export function otherAccountImageItem(reference: string, what = 'image'): string
  * The items (otherAccountImageItem) of the references `named` whose image, as Docker gives it by the name
  * (imageNamedBy, of the images that one `docker image inspect` found), is an image of an environment of another account
  * or of no known owner (`ids.others`) and of none of the account of the checked environment (`ids.own`), user decision
- * 2026-09-28. The image ID says what the image holds, not whose it is: two environments with the same configuration can
+ * 2026-09-28; a reference that names no local image, by its name (isOtherEnvironmentImageName). The image ID says
+ * what the image holds, not whose it is: two environments with the same configuration can
  * build the same image (the same ID), and an image with the ID of an image of the account's own environments holds
  * nothing that the account could not build itself. Not recognized: a copy of such an image with other labels or layers
  * (another ID) and without a name of an environment. Refused whatever the switch says (HostAccessClass `protected`):
@@ -375,7 +379,19 @@ export function otherAccountImageItems(named: readonly NamedImageReference[], im
   const items: string[] = [];
   for (const entry of named) {
     const id = imageNamedBy(entry.reference, images)?.id.toLowerCase();
-    if (id !== undefined && ids.others.has(id) && !ids.own.has(id)) items.push(otherAccountImageItem(entry.reference, entry.what));
+    if (id !== undefined ? ids.others.has(id) && !ids.own.has(id) : isOtherEnvironmentImageName(entry.reference, ids)) {
+      items.push(otherAccountImageItem(entry.reference, entry.what));
+    }
   }
   return items;
+}
+
+/**
+ * Review round 3 (S1): whether `reference`, which names no local image, is the name of an image of an environment of
+ * another account or of no known owner (environmentImageShortId; `ids.ownShortIds`). No registry has such a name, so it
+ * has no use but to catch that environment's next build between the check and the start.
+ */
+export function isOtherEnvironmentImageName(reference: string, ids: EnvironmentImageIds): boolean {
+  const short = environmentImageShortId(reference);
+  return short !== undefined && !(ids.ownShortIds?.has(short) ?? false);
 }

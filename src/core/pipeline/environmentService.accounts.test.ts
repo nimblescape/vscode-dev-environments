@@ -711,6 +711,42 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     h.helper.config = { image: THEIRS };
     const error = await rejection(h.service.open(TARGET, { ...options(), signal: controller.signal }));
     expect(error.code).toBe('cancelled');
+    // Review round 3 (S2): passed on as a cancellation, not read as a failure of Docker.
+    expect(h.logger.warnings.filter((line) => line.includes('could not be read'))).toEqual([]);
+  });
+
+  it('passes a cancellation during the list of the volumes that name the owners on as a cancellation (review round 3, S2)', async () => {
+    const gone = '9a8b7c6d-0000-4000-8000-000000000009';
+    h.docker.images.add(environmentImageName(gone, 2));
+    h.docker.imageIds.set(environmentImageName(gone, 2), ID);
+    const controller = new AbortController();
+    const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
+    h.docker.listEnvironmentVolumes = async () => {
+      if (!new Error().stack?.includes('hostEnvironmentImageIds')) return listEnvironmentVolumes();
+      controller.abort();
+      throw new Error('aborted');
+    };
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, { ...options(), signal: controller.signal }));
+    expect(error.code).toBe('cancelled');
+    expect(h.logger.warnings.filter((line) => line.includes('could not be read'))).toEqual([]);
+  });
+
+  it('refuses the name of an image of an environment of another account or of no known owner that is not there yet (review round 3, S1)', async () => {
+    // The next build of the environment of the other account: no registry has the name; only that build could make it.
+    await refused(environmentImageName(ENV_ID, 2));
+    await refused(`${environmentImageRepository(ENV_ID)}-db`);
+    await refused(environmentImageName('9a8b7c6d-0000-4000-8000-000000000009', 1));
+  });
+
+  it('does not refuse the name of an image of an environment of the same account that is not there', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false, image: false });
+    h.helper.config = { image: environmentImageName(OTHER_ID, 5) };
+    const error = await h.service.open(TARGET, options()).then(
+      () => undefined,
+      (caught: unknown) => caught as UserFacingError,
+    );
+    expect(error?.code).not.toBe('hostAccess');
   });
 
   it('lists the images of the environments only when a reference names a local image, once per check', async () => {
