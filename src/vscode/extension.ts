@@ -194,8 +194,20 @@ async function activateExtension(
   const imageListSentAt = new Map<string, number>();
   const imageSettingsSent = new Map<string, { text: string; at: number }>();
   let packagesSignInOffered = false;
+  // Review round 9 of PR #57 (T2): patterns that are left out (invalid, or beyond the limits) are logged once.
+  let warnedPatterns = '';
+  const usedImagePrefixes = (): string[] => {
+    const patterns = getSettings().remoteImageUpdates ?? [];
+    const prefixes = imagePrefixesOf(patterns);
+    const left = patterns.filter((pattern) => !prefixes.includes(pattern.trim().replace(/\*$/, '')));
+    if (left.length > 0 && JSON.stringify(left) !== warnedPatterns) {
+      warnedPatterns = JSON.stringify(left);
+      logger.warn(`These image patterns of devEnvLauncher.remoteImageUpdates are not used (invalid, Docker Hub, duplicate, or beyond 50 patterns or 4096 characters): ${left.join(', ')}`);
+    }
+    return prefixes;
+  };
   const imageMaintenance = () => ({
-    prefixes: imagePrefixesOf(getSettings().remoteImageUpdates ?? []),
+    prefixes: usedImagePrefixes(),
     schedule: getSettings().remoteImageUpdateSchedule ?? DEFAULT_IMAGE_SCHEDULE,
     // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
     timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
@@ -226,7 +238,7 @@ async function activateExtension(
     if (!(await remoteMonitor.images(repositories))) imageListSentAt.delete(host);
   };
   const sendImageList = async (host: string): Promise<void> => {
-    const prefixes = imagePrefixesOf(getSettings().remoteImageUpdates ?? []);
+    const prefixes = usedImagePrefixes();
     if (prefixes.length === 0) return;
     // Review round 4 of PR #57 (L2): the background work keeps the Docker target of the open; after the open ended, its
     // calls would read the current context again, and a switch to another host in the meantime sent there.

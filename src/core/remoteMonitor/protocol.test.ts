@@ -2,8 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
+  isImagePrefix,
   DEFAULT_REMOTE_STOP_AFTER_SECONDS,
   MAX_HEARTBEAT_ENVIRONMENTS,
   REMOTE_MONITOR_SCRIPT_PATH,
@@ -197,5 +200,31 @@ describe('limits and the label', () => {
     expect(remoteMonitorLabelValue('script', 'devenv-helper:1')).toBe(label);
     expect(remoteMonitorLabelValue('script2', 'devenv-helper:1')).not.toBe(label);
     expect(remoteMonitorLabelValue('script', 'devenv-helper:2')).not.toBe(label);
+  });
+});
+
+// Review round 9 of PR #57 (T2): the pattern of the setting and isImagePrefix agree, so no pattern that the settings UI
+// accepts is left out without a word.
+describe('the pattern of devEnvLauncher.remoteImageUpdates', () => {
+  it('accepts exactly what the code takes', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../package.json'), 'utf8')) as {
+      contributes: { configuration: Array<{ properties?: Record<string, { items?: { pattern?: string } }> }> | { properties?: Record<string, { items?: { pattern?: string } }> } };
+    };
+    const sections = ([] as Array<{ properties?: Record<string, { items?: { pattern?: string } }> }>).concat(manifest.contributes.configuration);
+    const pattern = new RegExp(sections.find((section) => section.properties?.['devEnvLauncher.remoteImageUpdates'])!.properties!['devEnvLauncher.remoteImageUpdates'].items!.pattern!);
+    for (const value of [
+      'ghcr.io/majikmate/devcontainer-dev*',
+      'ghcr.io/majikmate/devcontainer-dev',
+      `ghcr.io/${'a'.repeat(120)}*`,
+      `ghcr.io/${'a'.repeat(121)}`,
+      'ghcr.io/a..b*',
+      'docker.io/library/ubuntu*',
+      'owner/repo*',
+      'localhost:5000/a/b*',
+      'registry:5000/x*',
+      'GHCR.io/x*',
+    ]) {
+      expect(pattern.test(value), value).toBe(isImagePrefix(value.replace(/\*$/, '')));
+    }
   });
 });

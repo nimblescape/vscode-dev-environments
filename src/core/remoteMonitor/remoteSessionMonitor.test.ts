@@ -4,7 +4,15 @@
 
 import { describe, expect, it } from 'vitest';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
-import { IMAGE_MAINTENANCE_LABEL_PART, LABEL_SESSION_MONITOR, MAX_SCRIPT_LENGTH, REMOTE_MONITOR_SCRIPT_PATH, remoteMonitorLabelValue } from './protocol';
+import {
+  IMAGE_MAINTENANCE_LABEL_PART,
+  LABEL_SESSION_MONITOR,
+  MAX_SCRIPT_LENGTH,
+  MAX_WINDOWS_COMMAND_LINE,
+  REMOTE_MONITOR_SCRIPT_PATH,
+  remoteMonitorLabelValue,
+  windowsCommandLineLength,
+} from './protocol';
 import { REMOTE_MONITOR_BOOTSTRAP, RemoteSessionMonitor, isMissingContainer } from './remoteSessionMonitor';
 
 const SCRIPT = 'console.log("monitor")';
@@ -280,6 +288,22 @@ describe('RemoteSessionMonitor: images', () => {
     const off = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0, 'id\n')));
     const offComputer = new RemoteSessionMonitor({ docker: off, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => ({ ...IMAGES, prefixes: [] }) });
     expect(await offComputer.ensure(TAG, SOCKET)).toBe('created');
+  });
+
+  // Review round 9 of PR #57: the prefixes on the command line are cut to what Windows takes; `settings -` brings all.
+  it('puts only as many prefixes on the command line as fit', () => {
+    const many = Array.from({ length: 50 }, (_, index) => `ghcr.io/${String(index).padStart(2, '0')}${'a'.repeat(76)}`);
+    const plain = monitor(new FakeDocker(() => result(0)));
+    const script = 'x'.repeat(28_000);
+    const args = plain.runArgs(TAG, SOCKET, LABEL, script, { ...IMAGES, prefixes: many });
+    expect(windowsCommandLineLength(['docker', ...args])).toBeLessThanOrEqual(MAX_WINDOWS_COMMAND_LINE);
+    const env = args.find((arg) => arg.startsWith('DEVENV_IMAGE_PREFIXES='))!;
+    const sent = JSON.parse(env.slice('DEVENV_IMAGE_PREFIXES='.length)) as string[];
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sent.length).toBeLessThan(50);
+    expect(sent).toEqual(many.slice(0, sent.length));
+    // All of them when they fit.
+    expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: many })).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(many)}`);
   });
 
   it('gives the monitor the settings of this computer on stdin (docker exec -i settings -); false on a failure', async () => {

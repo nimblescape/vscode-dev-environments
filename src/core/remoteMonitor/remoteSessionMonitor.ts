@@ -213,11 +213,20 @@ export class RemoteSessionMonitor {
     if (imagePrefixes.length === 0) args.push('--network', 'none');
     args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
     args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
+    const tail: string[] = [];
+    for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) tail.push('-e', `${key}=${value}`);
+    tail.push(helperTag, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);
     if (images && imagePrefixes.length > 0) {
-      args.push('-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes)}`, '-e', `DEVENV_IMAGE_SCHEDULE=${images.schedule}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`);
+      const settings = ['-e', `DEVENV_IMAGE_SCHEDULE=${images.schedule}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`];
+      // Review round 9 of PR #57: as many prefixes as the command line of Windows still takes (at least one); the whole
+      // list comes with `settings -` at each open anyway.
+      const fits = (list: readonly string[]) =>
+        windowsCommandLineLength(['docker', ...args, '-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(list)}`, ...settings, ...tail]) <= MAX_WINDOWS_COMMAND_LINE;
+      let count = imagePrefixes.length;
+      while (count > 1 && !fits(imagePrefixes.slice(0, count))) count--;
+      args.push('-e', `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes.slice(0, count))}`, ...settings);
     }
-    for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) args.push('-e', `${key}=${value}`);
-    args.push(helperTag, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);
+    args.push(...tail);
     return args;
   }
 

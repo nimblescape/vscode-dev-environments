@@ -369,9 +369,12 @@ export async function writeImageList(stateDir: string, repositories: readonly st
 }
 
 /** Writes a file of the volume at once (a temporary file, then rename). */
+let temporaryFiles = 0;
+
 async function writeStateFile(stateDir: string, name: string, text: string): Promise<void> {
   const file = path.join(stateDir, name);
-  const temporary = `${file}.${process.pid}.tmp`;
+  // Review round 9 of PR #57 (T1): a name of its own for each write, so two writes at the same time never mix.
+  const temporary = `${file}.${process.pid}.${++temporaryFiles}.tmp`;
   await fs.promises.writeFile(temporary, text, { mode: 0o600 });
   await fs.promises.rename(temporary, file);
 }
@@ -461,6 +464,10 @@ export class CurrentImageSettings {
 export class ImageSchedule {
   private checkedUntil: number;
   private running = false;
+  /** Review round 9 of PR #57 (T1): a check that takes longer than a minute (a slow `docker image ls`) is not joined. */
+  private checking = false;
+  /** The observe of a check that runs now; a pass waits for it (review round 9, T1). */
+  private observing: Promise<void> | undefined;
 
   constructor(
     private readonly deps: {
@@ -477,8 +484,21 @@ export class ImageSchedule {
 
   /** One check: a pass when a time of the schedule lies after the previous check and not after now. */
   async check(): Promise<void> {
+    if (this.checking) return;
+    this.checking = true;
+    try {
+      await this.checkOnce();
+    } finally {
+      this.checking = false;
+    }
+  }
+
+  private async checkOnce(): Promise<void> {
     await this.deps.settings.refresh();
-    if (!this.running) await this.deps.observe?.();
+    if (!this.running && this.deps.observe) {
+      this.observing = this.deps.observe().finally(() => (this.observing = undefined));
+      await this.observing;
+    }
     const time = this.deps.now();
     const { cron, timeZone } = this.deps.settings.value;
     const due = nextCronTime(this.checkedUntil, cron, timeZone);
@@ -502,6 +522,8 @@ export class ImageSchedule {
     }
     this.running = true;
     try {
+      // Review round 9 of PR #57 (T1): not together with the observe of a check (both keep the store of IDs).
+      await this.observing?.catch(() => undefined);
       await this.deps.settings.refresh();
       await this.deps.pass();
     } catch (error) {

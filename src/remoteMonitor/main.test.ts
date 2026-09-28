@@ -543,8 +543,61 @@ describe('the settings and the schedule of the image maintenance', () => {
     const running = schedule.run();
     await schedule.check();
     expect(observed).toBe(1);
+    // Review round 9 of PR #57 (T1): the pass starts after a turn (it first waits for an observe of a check).
+    await new Promise((resolve) => setTimeout(resolve, 10));
     release();
     await running;
+  });
+
+  // Review round 9 of PR #57 (T1): a check that takes longer than the next one's start is not joined.
+  it('runs no second check while one is still running', async () => {
+    let observed = 0;
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: async () => {},
+      observe: () => {
+        observed++;
+        return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+    const first = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await schedule.check();
+    expect(observed).toBe(1);
+    release();
+    await first;
+    const next = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(observed).toBe(2);
+    release();
+    await next;
+  });
+
+  // Review round 9 of PR #57 (T1): a pass (the first one, one minute after the start) waits for a check's observe.
+  it('starts a pass only after the observe of a running check', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const schedule = new ImageSchedule({
+      now: () => Date.parse('2026-09-29T12:00:00Z'),
+      log: () => {},
+      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      pass: async () => void order.push('pass'),
+      observe: () => {
+        order.push('observe');
+        return new Promise<void>((resolve) => (release = () => (order.push('observed'), resolve())));
+      },
+    });
+    const check = schedule.check();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const run = schedule.run();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(order).toEqual(['observe']);
+    release();
+    await Promise.all([check, run]);
+    expect(order).toEqual(['observe', 'observed', 'pass']);
   });
 
   it('follows new settings of another computer at the next check', async () => {
