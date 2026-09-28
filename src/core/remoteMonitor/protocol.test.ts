@@ -13,6 +13,8 @@ import {
   clampLimitSeconds,
   forgetCommand,
   heartbeatCommand,
+  isUnderRecordsLock,
+  monitorExecFailure,
   heartbeatFileName,
   inUseByOtherComputer,
   isRemoteEnvironmentId,
@@ -151,9 +153,26 @@ describe('records and their file names', () => {
 describe('the subcommands of the remote monitor', () => {
   it('passes the heartbeat as one JSON argument, and the ids as arguments', () => {
     const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 5 }] };
-    expect(heartbeatCommand(heartbeat)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
+    // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records and a time limit; review round 3
+    // (F7): a lock that stays busy has its own exit code, and (F6) `forget` runs under the same lock.
+    const locked = ['flock', '-w', '5', '-E', '75', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10'];
+    expect(heartbeatCommand(heartbeat)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(recordsCommand(ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', ID]);
-    expect(forgetCommand(SOURCE, ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    expect(forgetCommand(SOURCE, ID)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+  });
+
+  // Review round 3 of PR #58 (F7): a busy lock and the time limit are named in the log, not only their exit codes.
+  // Review round 4 (H2): 137 is any SIGKILL, and only commands under the lock get these texts.
+  it('names the reason of a failed command under the lock of the records', () => {
+    expect(monitorExecFailure(75, '', true)).toBe('the heartbeat records stayed locked by another command for 5 s');
+    expect(monitorExecFailure(137, '', true)).toBe('the command was killed (its limit of 10 s, or a kill from outside)');
+    expect(monitorExecFailure(2, 'Invalid heartbeat.\n', true)).toBe('Invalid heartbeat.');
+    expect(monitorExecFailure(1, ' ', true)).toBe('exit code 1');
+    expect(monitorExecFailure(137, '', false)).toBe('exit code 137');
+    expect(monitorExecFailure(75, '', false)).toBe('exit code 75');
+    expect(isUnderRecordsLock(heartbeatCommand({ source: SOURCE, limitSeconds: 600, environments: [] }))).toBe(true);
+    expect(isUnderRecordsLock(forgetCommand(SOURCE, ID))).toBe(true);
+    expect(isUnderRecordsLock(recordsCommand(ID))).toBe(false);
   });
 
   it('parses the output of records, and refuses anything else', () => {

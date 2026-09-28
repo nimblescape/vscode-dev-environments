@@ -24,7 +24,9 @@ export const MONITOR_LOCK_STALE_MS = 120_000;
  * alone. Raise the version whenever a monitor of the previous version would decide wrongly with the files that a window
  * of this version writes.
  */
-export const MONITOR_PROTOCOL_VERSION = 1;
+// Review round 3 of PR #58 (F1): 2, because a monitor of version 1 sends heartbeats without the kernel lock of the
+// records (heartbeatCommand), which races the heartbeats of the windows of this version.
+export const MONITOR_PROTOCOL_VERSION = 2;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */
 const INCOMPLETE_LOCK_MS = 5_000;
