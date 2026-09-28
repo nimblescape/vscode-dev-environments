@@ -43,7 +43,7 @@ When Docker is not installed, the view shows no repositories, but the steps to s
 
 1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards). Once WSL 2 is ready, the view shows "✓ WSL 2 is installed." instead of the button.
 2. **Install Docker**:
-   - macOS: with Homebrew, `brew install --cask docker-desktop`; without Homebrew, the installer `Docker.dmg` is downloaded from Docker and opens (drag Docker to Applications).
+   - macOS: with Homebrew, `brew install --cask docker-desktop` (if the terminal shows "Operation not permitted" from `xattr`, allow VS Code in System Settings › Privacy & Security › App Management and install again); without Homebrew, the installer `Docker.dmg` is downloaded from Docker and opens (drag Docker to Applications).
    - Windows: with winget, `winget install --exact --id Docker.DockerDesktop …`; without winget, `Docker Desktop Installer.exe` is downloaded from Docker and starts.
    - Linux (Ubuntu, Debian, Fedora, RHEL, CentOS): Docker Engine from the package repository of Docker, and your user joins the group `docker` (sign in again afterwards). Other distributions: the installation guide of Docker opens.
 3. Docker starts by itself when an environment needs it. Right after the installation, a notification also offers **Start Docker**. At its first start, Docker Desktop shows its own dialogs once. On Linux, **Start Docker** runs `sudo systemctl enable --now docker` in a terminal to start the Docker service.

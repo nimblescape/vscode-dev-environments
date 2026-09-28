@@ -70,14 +70,16 @@ describe('installPlan on macOS and Windows', () => {
       'darwin',
       'arm64',
       ['brew'],
-      { kind: 'terminal', commands: [BREW_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionBrew },
+      // User decision 2026-09-28: changed expectation, the Homebrew plan names App Management (note).
+      { kind: 'terminal', commands: [BREW_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionBrew, note: DockerSetupTexts.brewAppManagementNote },
     ],
     [
       'macOS with Homebrew (Intel)',
       'darwin',
       'x64',
       ['brew'],
-      { kind: 'terminal', commands: [BREW_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionBrew },
+      // User decision 2026-09-28: changed expectation, the Homebrew plan names App Management (note).
+      { kind: 'terminal', commands: [BREW_INSTALL_COMMAND], needsAdmin: true, description: DockerSetupTexts.descriptionBrew, note: DockerSetupTexts.brewAppManagementNote },
     ],
     [
       'macOS without Homebrew (Apple silicon)',
@@ -341,6 +343,8 @@ describe('installPlan on macOS: Homebrew still records docker-desktop', () => {
       commands: ['/opt/homebrew/bin/brew uninstall --cask --force docker-desktop', '/opt/homebrew/bin/brew install --cask docker-desktop'],
       needsAdmin: true,
       description: `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}`,
+      // User decision 2026-09-28: changed expectation, the Homebrew plan names App Management.
+      note: DockerSetupTexts.brewAppManagementNote,
     });
     // The install runs only when the uninstall succeeded.
     expect(plan.kind === 'terminal' && terminalLines(plan.commands, 'darwin')).toEqual([
@@ -374,6 +378,8 @@ describe('installPlan on macOS: Homebrew still records docker-desktop', () => {
       commands: ['/opt/homebrew/bin/brew install --cask docker-desktop'],
       needsAdmin: true,
       description: DockerSetupTexts.descriptionBrew,
+      // User decision 2026-09-28: changed expectation, the Homebrew plan names App Management.
+      note: DockerSetupTexts.brewAppManagementNote,
     });
   });
 
@@ -387,7 +393,8 @@ describe('installPlan on macOS: Homebrew still records docker-desktop', () => {
     const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew'), brewCaskRecorded: true, dockerAppPresent: false });
     expect(installConfirmation(plan)?.detail).toBe(
       `${DockerSetupTexts.descriptionBrew} ${DockerSetupTexts.brewStaleCask}\n\n${DockerSetupTexts.confirmCommands}\n\n` +
-        `brew uninstall --cask --force docker-desktop\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}`,
+        // User decision 2026-09-28: changed expectation, the note on App Management at the end.
+        `brew uninstall --cask --force docker-desktop\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}\n\n${DockerSetupTexts.brewAppManagementNote}`,
     );
   });
 
@@ -509,8 +516,12 @@ describe('confirmation', () => {
   it('lists the Homebrew command', () => {
     const plan = installPlan({ platform: 'darwin', arch: 'arm64', has: tools('brew') });
     expect(installConfirmation(plan)?.detail).toBe(
-      `${DockerSetupTexts.descriptionBrew}\n\n${DockerSetupTexts.confirmCommands}\n\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}`,
+      // User decision 2026-09-28: changed expectation, the note on App Management at the end.
+      `${DockerSetupTexts.descriptionBrew}\n\n${DockerSetupTexts.confirmCommands}\n\nbrew install --cask docker-desktop\n\n${DockerSetupTexts.adminPassword}\n\n${DockerSetupTexts.brewAppManagementNote}`,
     );
+    // The note names the error of the terminal and where to allow it.
+    expect(DockerSetupTexts.brewAppManagementNote).toContain('Operation not permitted');
+    expect(DockerSetupTexts.brewAppManagementNote).toContain('Privacy & Security › App Management');
   });
 
   it('names the download URL and the target file of a download', () => {
