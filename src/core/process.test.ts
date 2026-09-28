@@ -107,3 +107,44 @@ describe('the end of a program on Windows: its whole process tree (review, C3)',
     expect(result.timedOut).toBe(true);
   });
 });
+
+describe('NodeProcessRunner.start (user request 2026-09-28: the helper channel)', () => {
+  it('keeps the input open: writes reach the program as they come, its output comes as it is written, end closes the input', async () => {
+    const echo = 'process.stdin.setEncoding("utf8"); process.stdin.on("data", (d) => process.stdout.write("got " + d)); process.stdin.on("end", () => process.exit(4));';
+    const started = new NodeProcessRunner().start(node, ['-e', echo]);
+    let stdout = '';
+    started.onStdout((text) => (stdout += text));
+    expect(started.write('one\n')).toBe(true);
+    for (let wait = 0; wait < 100 && !stdout.includes('one'); wait++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(stdout).toBe('got one\n');
+    started.write('two ä\n');
+    started.end();
+    expect(await started.exited).toEqual({ exitCode: 4 });
+    expect(stdout).toBe('got one\ngot two ä\n');
+    expect(started.write('late')).toBe(false);
+  });
+
+  it('keeps output that came before a listener was set', async () => {
+    const started = new NodeProcessRunner().start(node, ['-e', 'process.stdout.write("early"); process.stderr.write("err")']);
+    await started.exited;
+    const out: string[] = [];
+    started.onStdout((text) => out.push(text));
+    started.onStderr((text) => out.push(text));
+    expect(out).toEqual(['early', 'err']);
+  });
+
+  it('kill stops it, on win32 with its process tree', async () => {
+    const killTree = vi.fn((pid: number) => process.kill(pid));
+    const started = new NodeProcessRunner(undefined, undefined, { platform: 'win32', killTree }).start(node, ['-e', 'setInterval(() => {}, 1000)']);
+    started.kill();
+    expect((await started.exited).exitCode).not.toBe(0);
+    expect(killTree).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a program that cannot be started in `exited`, without throwing', async () => {
+    const started = new NodeProcessRunner().start('/nonexistent/program-of-the-test', []);
+    const { exitCode, error } = await started.exited;
+    expect(exitCode).toBeNull();
+    expect((error as NodeJS.ErrnoException).code).toBe('ENOENT');
+  });
+});

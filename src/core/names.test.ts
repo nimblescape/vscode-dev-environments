@@ -72,6 +72,8 @@ describe('EXTENSION_LABEL_KEYS', () => {
       'container-version',
       'environment-id',
       'helper',
+      // User request 2026-09-28 (the helper channel, step 1): the label of the container of a channel.
+      'helper-channel',
       'helper-run',
       'host-access',
       'owner-id',

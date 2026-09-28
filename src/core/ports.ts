@@ -90,6 +90,34 @@ export interface RunResult {
  */
 export interface ProcessRunner {
   run(file: string, args: readonly string[], options?: RunOptions): Promise<RunResult>;
+  /**
+   * The helper channel (user request 2026-09-28): starts a program whose standard input stays open until `end`. Never
+   * throws; a program that cannot be started resolves `exited` with `error`.
+   */
+  start?(file: string, args: readonly string[], options?: StartOptions): StartedProcess;
+}
+
+export interface StartOptions {
+  /** Complete environment of the process. Default: the environment of this process. */
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+/** A program started with ProcessRunner.start. */
+export interface StartedProcess {
+  /** Writes to its standard input. False when that is closed. */
+  write(text: string): boolean;
+  /** Closes its standard input. */
+  end(): void;
+  /** Stops it (on Windows with the processes that it started). */
+  kill(): void;
+  /** Its process id, when it started (for the tests that break a connection hard). */
+  readonly pid?: number;
+  /** Its output, decoded as UTF-8, as it comes. One listener each. */
+  onStdout(listener: (text: string) => void): void;
+  onStderr(listener: (text: string) => void): void;
+  /** Resolves when it ended: its exit code (null after a signal), or the error of its start. */
+  readonly exited: Promise<{ exitCode: number | null; error?: Error }>;
 }
 
 /** Progress of one operation, shown in one notification (concept 6.5). */

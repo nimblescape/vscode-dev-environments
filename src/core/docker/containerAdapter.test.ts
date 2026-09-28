@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
+import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   ContainerAdapter,
   DOCKER_CLI_LOOKUP_RETRY_MS,
@@ -21,6 +21,8 @@ import {
   type ImageInspection,
 } from './containerAdapter';
 import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
+import { dockerTargetOf, remoteContextName } from './dockerHost';
+import { runWithDockerTarget } from './dockerTargets';
 
 interface Call {
   file: string;
@@ -1652,5 +1654,29 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
     expect(sshDroppedReadCall(['info'], ok())).toBe(false);
     // The same words from somewhere else (for example the output of a container) are not a drop.
     expect(sshDroppedReadCall(['info'], fail('Connection closed by 127.0.0.1 port 32771'))).toBe(false);
+  });
+});
+
+describe('ContainerAdapter.start (user request 2026-09-28: the helper channel)', () => {
+  it('starts docker with the Docker context of the operation, and nothing without a runner that can start', async () => {
+    const starts: { file: string; args: readonly string[]; env: NodeJS.ProcessEnv | undefined }[] = [];
+    const fakeStarted = {} as StartedProcess;
+    const runner: ProcessRunner = {
+      run: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+      start: (file, args, options) => {
+        starts.push({ file, args, env: options?.env });
+        return fakeStarted;
+      },
+    };
+    const docker = new ContainerAdapter(runner, '/usr/bin/docker', { PATH: '/usr/bin', DOCKER_CONTEXT: 'desktop-linux' }, silentLogger, 'linux');
+    const target = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+    expect(await runWithDockerTarget(target, async () => docker.start(['run', '-i', 'img']))).toBe(fakeStarted);
+    expect(starts[0]).toMatchObject({ file: '/usr/bin/docker', args: ['run', '-i', 'img'] });
+    expect(starts[0].env?.DOCKER_CONTEXT).toBe(remoteContextName('build-box'));
+    expect(starts[0].env?.DOCKER_HOST).toBeUndefined();
+    const withoutStart = new ContainerAdapter({ run: runner.run }, '/usr/bin/docker', {}, silentLogger, 'linux');
+    expect(withoutStart.start(['ps'])).toBeUndefined();
+    const withoutCli = new ContainerAdapter(runner, undefined, {}, silentLogger, 'linux');
+    expect(withoutCli.start(['ps'])).toBeUndefined();
   });
 });

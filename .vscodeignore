@@ -4,6 +4,7 @@
 !dist/groupsPreviewWorker.js
 !dist/configurationAnalysisWorker.js
 !dist/remoteMonitor.js
+!dist/helperChannel.js
 !resources/**
 !package.json
 !README.md

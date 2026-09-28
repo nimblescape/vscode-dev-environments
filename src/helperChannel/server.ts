@@ -1,0 +1,473 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The logic of the script of the helper channel (src/core/helperChannel/protocol.ts): it reads the messages of the
+// extension, runs each operation (operations.ts) with an OperationContext, and answers with progress, output, and one
+// result per operation. It ends by itself when the connection is lost (the four ways in protocol.ts); before it exits,
+// it cancels every operation that runs: their Docker calls end (SIGTERM, then SIGKILL) and the containers that they
+// named for a cleanup are removed. It never writes the secret or the parameters of an operation anywhere.
+import {
+  CHANNEL_CLEANUP_TIMEOUT_MS,
+  CHANNEL_KILL_GRACE_MS,
+  CHANNEL_PROTOCOL_VERSION,
+  CHANNEL_SERVER_IDLE_EXIT_MS,
+  CHANNEL_SILENCE_EXIT_MS,
+  LineSplitter,
+  MAX_CLIENT_LINE,
+  OUTPUT_CHUNK_CHARACTERS,
+  encodeMessage,
+  isContainerName,
+  parseClientMessage,
+  refusedOperationId,
+  type OperationFailure,
+  type OperationRequest,
+  type ServerMessage,
+} from '../core/helperChannel/protocol';
+
+/** A started Docker call of the script. */
+export interface ServerChild {
+  /** Writes the input (if any) and closes the standard input. */
+  end(input?: string): void;
+  kill(signal: 'SIGTERM' | 'SIGKILL'): void;
+  /** Resolves when the process ended: its exit code, or null after a signal; `error` when it could not be started. */
+  readonly exited: Promise<{ exitCode: number | null; error?: string }>;
+}
+
+/** Starts `docker <args>` without a shell; its output goes to the two callbacks. */
+export type SpawnDocker = (args: readonly string[], onStdout: (text: string) => void, onStderr: (text: string) => void) => ServerChild;
+
+/** The result of OperationContext.docker. */
+export interface ContextDockerResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /** Set when the call could not be started. */
+  error?: string;
+}
+
+export interface ContextDockerOptions {
+  input?: string;
+  /** Output as it comes (in addition to the result). */
+  onStdout?: (text: string) => void;
+  onStderr?: (text: string) => void;
+  /** Keep the standard output out of the result (it only goes to onStdout). */
+  discardStdout?: boolean;
+  /** Containers that the call starts with these names: removed when the operation is cancelled. */
+  cleanup?: readonly string[];
+  /** Pipe its output to the log of the extension as it comes (the tools of a step; not data that it parses). */
+  stream?: boolean;
+}
+
+/** What an operation can do. Every Docker call ends when the operation is cancelled. */
+export interface OperationContext {
+  readonly signal: AbortSignal;
+  /** The secret of the request (the GitHub token), if any. Only ever input of a process. */
+  readonly secret: string | undefined;
+  progress(step: string, detail?: string): void;
+  /** A line of the log of the extension. */
+  log(text: string, level?: 'info' | 'warn'): void;
+  output(stream: 'stdout' | 'stderr', text: string): void;
+  docker(args: readonly string[], options?: ContextDockerOptions): Promise<ContextDockerResult>;
+}
+
+/** A failure with a code for the extension (for example `invalid` for parameters that the check refused). */
+export class OperationError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'OperationError';
+  }
+}
+
+/** An operation: checks its parameters itself; resolves with its value (JSON). */
+export type OperationHandler = (params: unknown, context: OperationContext) => Promise<unknown>;
+
+export interface ServerDeps {
+  /** Writes a line to the standard output. False when it cannot be written anymore (the connection is gone). */
+  write(text: string): boolean;
+  spawnDocker: SpawnDocker;
+  operations: Readonly<Record<string, OperationHandler>>;
+  /** Ends the process. Called once. */
+  exit(code: number): void;
+  /** Only for the tests: shorter times (main.ts: DEVENV_CHANNEL_SILENCE_MS). */
+  silenceMs?: number;
+  idleMs?: number;
+  killGraceMs?: number;
+}
+
+interface Running {
+  request: OperationRequest;
+  controller: AbortController;
+  children: Set<ServerChild>;
+  cleanup: Set<string>;
+  cancelled: boolean;
+  timedOut: boolean;
+  timeoutTimer?: ReturnType<typeof setTimeout>;
+  /** Resolves when the result was sent. */
+  finished: Promise<void>;
+  /** The output of the operation, with its secret masked (also when a chunk splits it). */
+  redactors: Record<'stdout' | 'stderr', StreamRedactor>;
+}
+
+/** The logic of the script: one instance per process. */
+export class ChannelServer {
+  private readonly running = new Map<number, Running>();
+  private readonly splitter: LineSplitter;
+  private silenceTimer: ReturnType<typeof setTimeout> | undefined;
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopping = false;
+  private readonly silenceMs: number;
+  private readonly idleMs: number;
+  private readonly killGraceMs: number;
+
+  constructor(private readonly deps: ServerDeps) {
+    this.silenceMs = deps.silenceMs ?? CHANNEL_SILENCE_EXIT_MS;
+    this.idleMs = deps.idleMs ?? CHANNEL_SERVER_IDLE_EXIT_MS;
+    this.killGraceMs = deps.killGraceMs ?? CHANNEL_KILL_GRACE_MS;
+    this.splitter = new LineSplitter(MAX_CLIENT_LINE, (line) => this.onLine(line), () => this.shutdown());
+  }
+
+  /** Starts the timers; call once before the first input. */
+  start(): void {
+    this.touchSilence();
+    this.touchIdle();
+  }
+
+  /** Text of the standard input. */
+  input(text: string): void {
+    if (!this.stopping) this.splitter.push(text);
+  }
+
+  /** The standard input ended or failed: the connection is gone. */
+  inputEnded(): void {
+    this.shutdown();
+  }
+
+  /** True until it begins to exit. */
+  get active(): boolean {
+    return !this.stopping;
+  }
+
+  private send(message: ServerMessage): void {
+    // While it exits, only the results of the cancelled operations still go out (if anyone reads them).
+    if (this.stopping && message.t !== 'result') return;
+    let written = false;
+    try {
+      written = this.deps.write(encodeMessage(message));
+    } catch {
+      written = false;
+    }
+    // The standard output cannot be written: nobody reads the answers anymore.
+    if (!written) this.shutdown();
+  }
+
+  private touchSilence(): void {
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    this.silenceTimer = setTimeout(() => this.shutdown(), this.silenceMs);
+  }
+
+  private touchIdle(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (this.running.size === 0) this.shutdown();
+      else this.touchIdle();
+    }, this.idleMs);
+  }
+
+  private onLine(line: string): void {
+    const message = parseClientMessage(line);
+    if (message === undefined) {
+      const id = refusedOperationId(line);
+      if (id !== undefined && !this.running.has(id)) this.fail(id, { code: 'invalid', message: 'The request is invalid.' }, false, false);
+      return;
+    }
+    this.touchSilence();
+    switch (message.t) {
+      case 'hello':
+        this.send({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: Object.keys(this.deps.operations).sort() });
+        return;
+      case 'ping':
+        this.send({ t: 'pong', n: message.n });
+        return;
+      case 'cancel': {
+        const run = this.running.get(message.id);
+        if (run) this.cancel(run, false);
+        return;
+      }
+      case 'op':
+        this.touchIdle();
+        this.startOperation(message);
+        return;
+    }
+  }
+
+  private fail(id: number, error: OperationFailure, cancelled: boolean, timedOut: boolean): void {
+    this.send({ t: 'result', id, ok: false, error, cancelled, timedOut });
+  }
+
+  private startOperation(request: OperationRequest): void {
+    if (this.running.has(request.id)) {
+      this.fail(request.id, { code: 'invalid', message: 'An operation with this id runs already.' }, false, false);
+      return;
+    }
+    const handler = Object.prototype.hasOwnProperty.call(this.deps.operations, request.op) ? this.deps.operations[request.op] : undefined;
+    if (handler === undefined) {
+      this.fail(request.id, { code: 'unknown', message: `The helper does not know the operation ${request.op}.` }, false, false);
+      return;
+    }
+    let resolveFinished!: () => void;
+    const id = request.id;
+    const secret = request.secret;
+    const sendOutput = (stream: 'stdout' | 'stderr') => (text: string) => {
+      for (let start = 0; start < text.length; start += OUTPUT_CHUNK_CHARACTERS) {
+        this.send({ t: 'out', id, stream, data: text.slice(start, start + OUTPUT_CHUNK_CHARACTERS) });
+      }
+    };
+    const run: Running = {
+      request,
+      controller: new AbortController(),
+      children: new Set(),
+      cleanup: new Set(),
+      cancelled: false,
+      timedOut: false,
+      finished: new Promise<void>((resolve) => (resolveFinished = resolve)),
+      redactors: { stdout: new StreamRedactor(secret, sendOutput('stdout')), stderr: new StreamRedactor(secret, sendOutput('stderr')) },
+    };
+    this.running.set(request.id, run);
+    if (request.timeoutMs !== undefined) run.timeoutTimer = setTimeout(() => this.cancel(run, true), request.timeoutMs);
+    const context = this.contextOf(run);
+    let outcome: { ok: true; value: unknown } | { ok: false; error: OperationFailure };
+    void (async () => {
+      try {
+        const value = await handler(request.params, context);
+        outcome = { ok: true, value };
+      } catch (error) {
+        outcome = {
+          ok: false,
+          error:
+            error instanceof OperationError ? { code: error.code, message: error.message } : { code: 'failed', message: messageOf(error) },
+        };
+      }
+      if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+      // Its Docker calls may still run when the handler did not wait for them: end them.
+      await this.endChildren(run);
+      run.redactors.stdout.flush();
+      run.redactors.stderr.flush();
+      const aborted = run.cancelled || run.timedOut;
+      if (aborted) await this.cleanup(run);
+      this.running.delete(request.id);
+      this.touchIdle();
+      if (aborted) {
+        const message = run.timedOut ? 'The operation did not end in time.' : 'The operation was cancelled.';
+        this.fail(request.id, { code: run.timedOut ? 'timeout' : 'cancelled', message }, run.cancelled, run.timedOut);
+      } else if (outcome.ok) {
+        this.send({ t: 'result', id: request.id, ok: true, value: outcome.value });
+      } else {
+        this.fail(request.id, outcome.error, false, false);
+      }
+      resolveFinished();
+    })();
+  }
+
+  private contextOf(run: Running): OperationContext {
+    const id = run.request.id;
+    const mask = (text: string) => redact(text, run.request.secret);
+    return {
+      signal: run.controller.signal,
+      secret: run.request.secret,
+      progress: (step, detail) =>
+        this.send(detail === undefined ? { t: 'progress', id, step: mask(step) } : { t: 'progress', id, step: mask(step), detail: mask(detail) }),
+      log: (text, level = 'info') => this.send({ t: 'log', id, level, text: mask(text) }),
+      output: (stream, text) => run.redactors[stream].push(text),
+      docker: (args, options = {}) => this.docker(run, args, options),
+    };
+  }
+
+  private async docker(run: Running, args: readonly string[], options: ContextDockerOptions): Promise<ContextDockerResult> {
+    if (run.controller.signal.aborted) return { exitCode: null, stdout: '', stderr: '', error: 'The operation was cancelled.' };
+    for (const name of options.cleanup ?? []) if (isContainerName(name)) run.cleanup.add(name);
+    let stdout = '';
+    let stderr = '';
+    let child: ServerChild;
+    const id = run.request.id;
+    const log = (text: string, level: 'info' | 'warn' = 'info') => this.send({ t: 'log', id, level, text: redact(text, run.request.secret) });
+    const command = commandLine(args);
+    const startedAt = Date.now();
+    log(`$ ${command}`);
+    try {
+      child = this.deps.spawnDocker(
+        args,
+        (text) => {
+          if (options.discardStdout !== true) stdout += text;
+          if (options.stream === true) run.redactors.stdout.push(text);
+          options.onStdout?.(text);
+        },
+        (text) => {
+          stderr += text;
+          if (options.stream === true) run.redactors.stderr.push(text);
+          options.onStderr?.(text);
+        },
+      );
+    } catch (error) {
+      log(`docker could not be started: ${messageOf(error)}`, 'warn');
+      return { exitCode: null, stdout: '', stderr: '', error: messageOf(error) };
+    }
+    run.children.add(child);
+    try {
+      child.end(options.input);
+    } catch {
+      // The process ended before it read its input; its exit is reported below.
+    }
+    // Cancelled while the call started.
+    if (run.controller.signal.aborted) this.terminate(child);
+    const { exitCode, error } = await child.exited;
+    run.children.delete(child);
+    if (options.stream === true) {
+      run.redactors.stdout.flush();
+      run.redactors.stderr.flush();
+    }
+    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    if (error !== undefined) log(`docker could not be started: ${error}`, 'warn');
+    else log(`${exitCode === null ? 'ended by a signal' : `exit code ${exitCode}`} after ${seconds} s${exitCode === 0 ? '' : `: ${lastLine(stderr)}`}`);
+    return error === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, error };
+  }
+
+  /** Cancels an operation: its signal aborts and its Docker calls end. Its result follows when its handler ended. */
+  private cancel(run: Running, timedOut: boolean): void {
+    if (run.cancelled || run.timedOut) return;
+    if (timedOut) run.timedOut = true;
+    else run.cancelled = true;
+    if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+    run.controller.abort();
+    for (const child of run.children) this.terminate(child);
+  }
+
+  /** SIGTERM, then SIGKILL after the grace time (only while it still runs). */
+  private terminate(child: ServerChild): void {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // It ended already.
+    }
+    let ended = false;
+    void child.exited.then(() => (ended = true));
+    const timer = setTimeout(() => {
+      if (ended) return;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // It ended already.
+      }
+    }, this.killGraceMs);
+    void child.exited.then(() => clearTimeout(timer));
+  }
+
+  private async endChildren(run: Running): Promise<void> {
+    const children = [...run.children];
+    for (const child of children) this.terminate(child);
+    await Promise.all(children.map((child) => child.exited));
+  }
+
+  /** `docker rm -f` of the containers that the operation named. Never rejects. */
+  private async cleanup(run: Running): Promise<void> {
+    const names = [...run.cleanup];
+    if (names.length === 0) return;
+    let child: ServerChild;
+    try {
+      child = this.deps.spawnDocker(['rm', '-f', ...names], () => {}, () => {});
+      child.end();
+    } catch {
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // It ended already.
+      }
+    }, CHANNEL_CLEANUP_TIMEOUT_MS);
+    await child.exited;
+    clearTimeout(timer);
+  }
+
+  /**
+   * Ends the script: no more messages are read; every operation is cancelled (its Docker calls end, its cleanup runs);
+   * then exit. A hard deadline makes sure that it exits even when a call or a handler does not end.
+   */
+  shutdown(): void {
+    if (this.stopping) return;
+    this.stopping = true;
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    const deadline = setTimeout(() => this.deps.exit(0), this.killGraceMs + CHANNEL_CLEANUP_TIMEOUT_MS + 5_000);
+    const runs = [...this.running.values()];
+    for (const run of runs) this.cancel(run, false);
+    void Promise.all(runs.map((run) => run.finished)).then(() => {
+      clearTimeout(deadline);
+      this.deps.exit(0);
+    });
+  }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The secret (at least 4 characters) replaced by `***`. */
+export function redact(text: string, secret: string | undefined): string {
+  return secret !== undefined && secret.length >= 4 ? text.split(secret).join('***') : text;
+}
+
+/** A command for the log: `docker` and its arguments, an argument with a space or a quote as JSON. */
+export function commandLine(args: readonly string[]): string {
+  return ['docker', ...args.map((arg) => (arg === '' || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(' ');
+}
+
+/** The last non-empty line of an output, at most 500 characters. */
+function lastLine(text: string): string {
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  const last = lines[lines.length - 1] ?? '';
+  return last.length > 500 ? `${last.slice(0, 500)}…` : last;
+}
+
+/**
+ * Passes a stream on with the secret masked, also when a chunk splits it: the last characters (shorter than the secret)
+ * wait for the next chunk; flush passes them on.
+ */
+export class StreamRedactor {
+  private buffer = '';
+
+  constructor(
+    private readonly secret: string | undefined,
+    private readonly forward: (text: string) => void,
+  ) {}
+
+  push(text: string): void {
+    if (text === '') return;
+    if (this.secret === undefined || this.secret.length < 4) {
+      this.forward(text);
+      return;
+    }
+    const masked = redact(this.buffer + text, this.secret);
+    const keep = this.secret.length - 1;
+    // Keep a tail that could be the start of the secret.
+    let cut = masked.length;
+    for (let length = Math.min(keep, masked.length); length > 0; length--) {
+      if (this.secret.startsWith(masked.slice(masked.length - length))) {
+        cut = masked.length - length;
+        break;
+      }
+    }
+    this.buffer = masked.slice(cut);
+    if (cut > 0) this.forward(masked.slice(0, cut));
+  }
+
+  flush(): void {
+    const rest = this.buffer;
+    this.buffer = '';
+    if (rest !== '') this.forward(rest);
+  }
+}

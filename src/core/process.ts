@@ -5,7 +5,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
-import { abortError, type ProcessRunner, type RunOptions, type RunResult } from './ports';
+import { abortError, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedProcess } from './ports';
 
 /**
  * Review round 9 (S9-2): a program printed more than MAX_CAPTURED_OUTPUT_BYTES on its standard output. It was stopped,
@@ -155,6 +155,84 @@ export class NodeProcessRunner implements ProcessRunner {
       if (options.input !== undefined) child.stdin.end(options.input);
       else child.stdin.end();
     });
+  }
+
+  /**
+   * The helper channel (user request 2026-09-28): a program whose standard input stays open. Its output goes to the
+   * listeners as it comes, without a limit (the channel checks the length of its lines). `kill` stops it as `run` does
+   * after a time limit (on Windows the process tree: docker.exe starts ssh.exe).
+   */
+  start(file: string, args: readonly string[], options: StartOptions = {}): StartedProcess {
+    const child = spawn(file, [...args], {
+      env: options.env ?? process.env,
+      cwd: options.cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stdoutDecoder = new TextDecoder('utf-8');
+    const stderrDecoder = new TextDecoder('utf-8');
+    let stdoutListener: ((text: string) => void) | undefined;
+    let stderrListener: ((text: string) => void) | undefined;
+    // Output that came before a listener was set.
+    let pendingStdout = '';
+    let pendingStderr = '';
+    const deliverStdout = (text: string) => {
+      if (text === '') return;
+      if (stdoutListener) stdoutListener(text);
+      else pendingStdout += text;
+    };
+    const deliverStderr = (text: string) => {
+      if (text === '') return;
+      if (stderrListener) stderrListener(text);
+      else pendingStderr += text;
+    };
+    child.stdout.on('data', (chunk: Buffer) => deliverStdout(stdoutDecoder.decode(chunk, { stream: true })));
+    child.stderr.on('data', (chunk: Buffer) => deliverStderr(stderrDecoder.decode(chunk, { stream: true })));
+    // EPIPE after the program ended; `exited` reports the end.
+    child.stdin.on('error', () => {});
+    let ended = false;
+    const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
+      child.on('error', (error) => {
+        if (ended) return;
+        ended = true;
+        resolve({ exitCode: null, error });
+      });
+      child.on('close', (code) => {
+        if (ended) return;
+        ended = true;
+        deliverStdout(stdoutDecoder.decode());
+        deliverStderr(stderrDecoder.decode());
+        resolve({ exitCode: code });
+      });
+    });
+    return {
+      write: (text) => {
+        if (ended || child.stdin.destroyed || !child.stdin.writable) return false;
+        child.stdin.write(text);
+        return true;
+      },
+      end: () => {
+        if (!child.stdin.destroyed) child.stdin.end();
+      },
+      kill: () => {
+        if (!ended) this.stop(child);
+      },
+      onStdout: (listener) => {
+        stdoutListener = listener;
+        const text = pendingStdout;
+        pendingStdout = '';
+        if (text !== '') listener(text);
+      },
+      onStderr: (listener) => {
+        stderrListener = listener;
+        const text = pendingStderr;
+        pendingStderr = '';
+        if (text !== '') listener(text);
+      },
+      exited,
+      pid: child.pid,
+    };
   }
 }
 
