@@ -764,7 +764,49 @@ describe('existing Docker Compose environment', () => {
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.warnings).toEqual([Messages.helperFailed]);
-    expect(h.logger.errors).toEqual([`The configuration of ${REPO} could not be used. The running environment is opened as it is. ${Messages.helperFailed}`]);
+    // Changed expectation (review round 2 of PR #64, B2): the log line names the helper, not the configuration.
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('opens running containers of the checks-off time as they are without the workspace helper while the checks are off (review round 2 of PR #64, B-M3)', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await seedCompose({
+      dev: 'running',
+      db: 'running',
+      devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED },
+      dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED },
+    });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+  });
+
+  it('keeps helperFailed when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    h.docker.listEnvironmentContainers = async () => {
+      throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.startsWith(`The containers of ${REPO} could not be listed:`))).toBe(true);
+  });
+
+  it('keeps the host access refusal when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
+    // Before, the Step 5 handling asked whether the running dev container opens as it is (a listing of the containers)
+    // for every error, and the error of that listing replaced the refusal.
+    await seedCompose({ dev: 'running', db: 'running' });
+    useCompose(h, output((m) => (m.services.db.privileged = true)));
+    h.docker.listEnvironmentContainers = async () => {
+      throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.message).toBe(Messages.hostAccess('service db: privileged mode'));
     expect(h.helper.ups).toEqual([]);
   });
 
@@ -837,6 +879,15 @@ describe('existing Docker Compose environment', () => {
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
     expect(devContainer()?.state).toBe('running');
+  });
+
+  it('passes the previous helper image of the open to every helper run of a Docker Compose open (review round 2 of PR #64, A-N1)', async () => {
+    await seedCompose();
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    await h.service.openEnvironment(ENV_ID, options());
+    const previous = { tag: 'devenv-helper:0123456789ab', previousId: h.helper.previousHelperImageId };
+    expect(h.helper.helperImages.map((entry) => entry.call)).toEqual(expect.arrayContaining(['readConfiguration', 'composeModel', 'up']));
+    expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
   });
 
   it('replaces a single container of the environment when the configuration became a Compose configuration', async () => {

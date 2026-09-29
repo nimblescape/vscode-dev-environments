@@ -1394,9 +1394,19 @@ describe('open: existing environment', () => {
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
     await h.service.open(TARGET, options());
-    expect(h.logger.errors).toEqual([
-      `The configuration of ${REPO} could not be used. The running environment is opened as it is. ${Messages.helperFailed}`,
-    ]);
+    // Changed expectation (review round 2 of PR #64, B2): the log line names the helper, not the configuration.
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+  });
+
+  it('uses no helper for the rest of the open when a helper run of the open fails with helperFailed (review round 2 of PR #64, A-N1)', async () => {
+    // The previous helper image of the open was removed at a helper run: the run fails with helperFailed instead of
+    // switching the helper image; a running container that is current opens as it is, without further helper runs.
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.readConfigurationError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'5'.repeat(64)}`);
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).not.toContain('prepareGit');
+    expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([]);
   });
 
   it('logs that a stopped container is started without the configuration that cannot be read (review round 1 of PR #64, L2)', async () => {
@@ -1428,6 +1438,24 @@ describe('open: existing environment', () => {
     await h.service.open(TARGET, options());
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
     expect(h.helper.calls.filter((c) => c.startsWith('up'))).toHaveLength(1);
+  });
+
+  it('passes the helper image of the open to every helper run of the open (review round 2 of PR #64, A-N1)', async () => {
+    // A first open (clone, configuration, build, up, lifecycle commands) with a previous helper, and a reconnect with the
+    // current tag: every helper run of an open gets the image that the open resolved once.
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    await h.service.open(TARGET, options());
+    const previous = { tag: 'devenv-helper:0123456789ab', previousId: h.helper.previousHelperImageId };
+    const calls = h.helper.helperImages.map((entry) => entry.call);
+    expect(calls).toEqual(expect.arrayContaining(['clone', 'readConfigFiles', 'readConfiguration', 'build', 'up', 'runUserCommands', 'prepareGit']));
+    expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
+
+    await h.service.stop(ENV_ID);
+    h.helper.helperImages.length = 0;
+    h.helper.previousHelperTag = undefined;
+    await h.service.open(TARGET, options());
+    expect(h.helper.helperImages.length).toBeGreaterThan(0);
+    expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify({ tag: 'devenv-helper:test' }))).toEqual([]);
   });
 
   it('fails with helperFailed when neither the helper nor a container is available', async () => {

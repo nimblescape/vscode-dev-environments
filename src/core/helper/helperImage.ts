@@ -30,6 +30,20 @@ export const DEVCONTAINER_CLI_VERSION: string = __DEVCONTAINER_CLI_VERSION__;
 /** Repository part of the helper image tag. */
 export const HELPER_IMAGE_REPOSITORY = 'devenv-helper';
 
+/**
+ * Review round 2 of PR #64 (A-N2): the helper generation of this extension version, recorded per tag in helper.json
+ * (`generation`) at each build and rebuild. It rises with HELPER_MIN_PREVIOUS_GENERATION.
+ */
+export const HELPER_GENERATION = 1;
+
+/**
+ * Review round 2 of PR #64 (A-N2): the lowest helper generation that is used as a previous helper when the current tag
+ * cannot be built. A release that fixes a security problem in the helper image raises HELPER_GENERATION and this value
+ * to it, so the fallback never brings back a helper image with that problem. Records without a generation (built before
+ * it existed) are never used.
+ */
+export const HELPER_MIN_PREVIOUS_GENERATION = 1;
+
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -180,7 +194,8 @@ interface Maintenance {
  *   registry digest of the base image with the recorded one; a change asks the next ensure for a rebuild.
  * - `lastUsedAt` of the tag is written (at most once per hour); with `maintain`, the cleanup runs (at most once per day).
  * - Previous helper (user decision 2026-09-29): when the missing tag cannot be built, the newest previous helper tag
- *   that this installation built and whose image is still the one it built (usePreviousHelper) is returned instead, and
+ *   that this installation built, whose image is still the one it built, and whose helper generation is at least
+ *   HELPER_MIN_PREVIOUS_GENERATION (usePreviousHelper) is returned instead, and
  *   `onPreviousHelper` is called with it and the ID of its image; without one, the error of the build is thrown.
  * Problems of the check, the state file, and the cleanup are logged and never make this function fail.
  */
@@ -300,11 +315,9 @@ async function ensureWithState(m: Maintenance): Promise<string> {
     change = rebuilt.change;
     currentId = rebuilt.currentId;
   }
-  if (change === undefined && currentId !== undefined && needsImageId(recorded)) {
-    // A tag that this installation built before `imageId` existed: its image now is taken as the one it built.
-    const id = currentId;
-    change = (record) => ({ ...(record ?? {}), imageId: id });
-  }
+  // Review round 2 of PR #64 (A-N3): `imageId` comes only from a build or rebuild of this installation. A tag that it
+  // built before the field existed gets none (another installation may have built the image that the tag has now), and
+  // without an ID and a generation it is never a previous helper.
 
   // The check starts now, so its request runs while the open pipeline goes on; its result is written after the writes
   // of this function.
@@ -348,7 +361,8 @@ async function create(m: Maintenance, checkBaseImage: boolean): Promise<RecordCh
   const digest = lookedUp ? await lookUpBaseDigest(m, m.options.signal) : undefined;
   const pulled = await buildMissing(m, digest !== 'unreachable');
   const now = isoTime(m.clock);
-  const record: HelperImageRecord = { builtAt: now };
+  // Review round 2 of PR #64 (A-N2): the helper generation of this build.
+  const record: HelperImageRecord = { builtAt: now, generation: HELPER_GENERATION };
   if (m.baseImage !== undefined) record.baseImage = m.baseImage;
   if (!pulled) {
     // Maybe built from an old local base image: the next check that gets a digest asks for a rebuild.
@@ -424,7 +438,16 @@ async function rebuild(
   return {
     change: (record) => {
       const { latestBaseDigest: _latest, builtWithoutPull: _unpulled, attemptedAt: _attempted, imageId: _id, ...rest } = record ?? {};
-      return { ...rest, baseImage, baseDigest: digest, builtAt, checkedAt: builtAt, ...(newId !== undefined ? { imageId: newId } : {}) };
+      // Review round 2 of PR #64 (A-N2): the helper generation of this rebuild.
+      return {
+        ...rest,
+        baseImage,
+        baseDigest: digest,
+        builtAt,
+        checkedAt: builtAt,
+        generation: HELPER_GENERATION,
+        ...(newId !== undefined ? { imageId: newId } : {}),
+      };
     },
     currentId: newId,
   };
@@ -520,24 +543,36 @@ async function imageIdQuietly(m: Maintenance): Promise<string | undefined> {
   }
 }
 
-/** A record of a tag that this installation built (`builtAt`, not foreign or removed) without the ID of its image. */
-function needsImageId(record: HelperImageRecord | undefined): boolean {
-  return record !== undefined && record.imageId === undefined && record.builtAt !== undefined && !isForeign(record);
+/**
+ * Review round 2 of PR #64 (A-N2): the record has a helper generation of at least `minimum` (HELPER_MIN_PREVIOUS_GENERATION),
+ * so its tag may be used as a previous helper. A record without one (built before the generation existed) never qualifies.
+ */
+export function hasPreviousGeneration(record: HelperImageRecord, minimum: number = HELPER_MIN_PREVIOUS_GENERATION): boolean {
+  return record.generation !== undefined && record.generation >= minimum;
 }
 
 /**
  * Previous helper (user decision 2026-09-29): the current tag is missing and could not be built (`error`). The newest
  * (by `builtAt`) other helper tag that this installation built is used, if the engine still has it: an image with the
  * label nimblescape.devenv.helper=true, the tag, and exactly the image ID that `helper.json` recorded for the build
- * (`imageId`). An image of the helper repository that someone else made, a foreign or removed tag, and a tag whose image
- * changed are never used. Records the use (`lastUsedAt`, which keeps the image for 7 days) and the tag as `previousTag`.
+ * (`imageId`), and with a helper generation of at least HELPER_MIN_PREVIOUS_GENERATION (review round 2 of PR #64, A-N2).
+ * An image of the helper repository that someone else made, a foreign or removed tag, a tag of an older generation or
+ * without one, and a tag whose image changed are never used. Records the use (`lastUsedAt`, which keeps the image for 7 days) and the tag as `previousTag`.
  * Returns the tag, or `undefined` when there is none; `onPreviousHelper` gets the tag and the checked image ID, which the
  * helper runs use (review round 1 of PR #64, S1). Never throws, except for an abort.
  */
 async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string | undefined> {
   const state = await readHelperState(m.statePath);
   const candidates = Object.entries(state.images)
-    .filter(([tag, record]) => tag !== m.tag && isHelperImageTag(tag) && record.imageId !== undefined && record.builtAt !== undefined && !isForeign(record))
+    .filter(
+      ([tag, record]) =>
+        tag !== m.tag &&
+        isHelperImageTag(tag) &&
+        record.imageId !== undefined &&
+        record.builtAt !== undefined &&
+        !isForeign(record) &&
+        hasPreviousGeneration(record),
+    )
     .sort(([, a], [, b]) => (Date.parse(b.builtAt ?? '') || 0) - (Date.parse(a.builtAt ?? '') || 0));
   const images = candidates.length > 0 ? await listHelperImages(m) : undefined;
   if (m.options.signal?.aborted) throw abortError();

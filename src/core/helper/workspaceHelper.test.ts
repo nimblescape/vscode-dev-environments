@@ -14,7 +14,7 @@ import { abortError, type Logger, type RunOptions, type RunResult } from '../por
 import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
-import { HELPER_CHECK_INTERVAL_MS, helperImageTag, type BaseDigestLookup } from './helperImage';
+import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
@@ -524,6 +524,8 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
       lastUsedAt: iso(),
       // Changed expectation (review round 1 of PR #64, S5): the fake gives full sha256: IDs, the only form helper.json keeps.
       imageId: fakeImageId(TAG),
+      // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
+      generation: HELPER_GENERATION,
     });
   });
 
@@ -576,9 +578,13 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     let now = START;
     const statePath = path.join(dir, 'storage', 'helper.json');
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    // A helper image that this installation built for the previous extension version.
+    // A helper image that this installation built for the previous extension version (review round 2 of PR #64, A-N2:
+    // with its helper generation, which a previous helper needs).
     docker.images.add(PREVIOUS);
-    fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(PREVIOUS) } } }));
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(PREVIOUS), generation: HELPER_GENERATION } } }),
+    );
     docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
     };
@@ -653,13 +659,14 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     expect(commandOfImage(args, fakeImageId(PREVIOUS))).toEqual(['true']);
   });
 
-  it('asks for the image again when the previous helper image is gone at its run, and uses another previous helper (review round 1 of PR #64, S1)', async () => {
+  it('asks for the image again when the previous helper image is gone at a run outside an open, and uses another previous helper (review round 1 of PR #64, S1)', async () => {
     const { helper, state } = setup();
     // An older helper image that this installation built, too.
     const OLDER = 'devenv-helper:00000000000a';
     docker.images.add(OLDER);
     const saved = state();
-    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER) };
+    // Review round 2 of PR #64 (A-N2): with its helper generation.
+    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION };
     fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
     expect(await helper.ensureImage()).toBe(PREVIOUS);
     // The image is removed before the run (for example by a prune): docker run answers "No such image" for the ID.
@@ -676,9 +683,96 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
       fakeImageId(PREVIOUS),
       fakeImageId(OLDER),
     ]);
-    expect(logger.lines).toContain(`warn The workspace helper image ${PREVIOUS} is missing. It is built again.`);
+    // Changed expectation (review round 2 of PR #64, B3): the log line says that the helper image is prepared again (the
+    // current tag, or else another previous helper), not that the previous helper image is built again.
+    expect(logger.lines).toContain(
+      `warn The previous helper image ${PREVIOUS} (${fakeImageId(PREVIOUS).slice(0, 19)}) is missing. The workspace helper image is prepared again.`,
+    );
     // The current tag was tried once more (offline), then the older previous helper was used.
     expect(docker.builds.filter((build) => build.tag === TAG).length).toBeGreaterThan(2);
+  });
+
+  it('keeps the runs of an open on its previous helper when another open builds the current tag (review round 2 of PR #64, A-N1)', async () => {
+    const { helper, advance } = setup();
+    // Open A (offline): the previous helper.
+    let previousId: string | undefined;
+    const tagA = await helper.ensureImage({ onPreviousHelper: (_tag, imageId) => (previousId = imageId) });
+    expect(tagA).toBe(PREVIOUS);
+    const openA = { tag: tagA, previousId };
+    await helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'a', merged: false, image: openA }).catch(() => undefined);
+    // Open B of another repository (online again) builds the current tag; the cache of the window now has it.
+    docker.buildHandler = async () => undefined;
+    advance(60_000);
+    expect(await helper.ensureImage()).toBe(TAG);
+    // The later runs of open A stay on the image ID of the previous helper that read its configuration.
+    const before = docker.runs.length;
+    await helper.run('vol', ['true'], { image: openA });
+    await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image: openA });
+    const images = docker.runs.slice(before).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
+    expect(images).toEqual([fakeImageId(PREVIOUS), fakeImageId(PREVIOUS)]);
+    // A run outside an open uses the image of the window: the current tag.
+    await helper.run('vol', ['true']);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
+  });
+
+  it('fails with helperFailed and does not switch when the previous helper image of an open is gone at its run (review round 2 of PR #64, A-N1)', async () => {
+    const { helper, state } = setup();
+    // An older previous helper exists, which a run outside an open would switch to.
+    const OLDER = 'devenv-helper:00000000000a';
+    docker.images.add(OLDER);
+    const saved = state();
+    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION };
+    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
+    let previousId: string | undefined;
+    const tag = await helper.ensureImage({ onPreviousHelper: (_tag, imageId) => (previousId = imageId) });
+    const image = { tag, previousId };
+    const builds = docker.builds.length;
+    docker.handler = (args) => {
+      if (args.includes(fakeImageId(PREVIOUS))) return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(PREVIOUS)}.\n` };
+      return {};
+    };
+    await expect(helper.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
+    // One run, no build of the current tag, and no run with another helper image.
+    expect(docker.runs).toHaveLength(1);
+    expect(docker.builds).toHaveLength(builds);
+    expect(logger.lines.join('\n')).toContain(`The previous helper image ${PREVIOUS} (${fakeImageId(PREVIOUS).slice(0, 19)}) that this open uses was removed.`);
+  });
+
+  it('builds the current tag of an open again when its image is gone at a run, and fails instead of switching to a previous helper (review round 2 of PR #64, A-N1)', async () => {
+    const { helper } = setup();
+    docker.buildHandler = async () => undefined;
+    expect(await helper.ensureImage()).toBe(TAG);
+    const image = { tag: TAG };
+    // The image is removed before the run; the same tag is built again (the same CLI), and the run goes on with it.
+    let missing = true;
+    docker.handler = (args) => {
+      if (args.includes(TAG) && missing) {
+        missing = false;
+        docker.images.delete(TAG);
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}.\n` };
+      }
+      return {};
+    };
+    const builds = docker.builds.length;
+    expect((await helper.run('vol', ['true'], { image })).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(builds + 1);
+    expect(docker.runs.slice(-2).map((run) => run.args.includes(TAG))).toEqual([true, true]);
+
+    // Removed again, and offline now: ensureHelperImage would give the previous helper, which has another CLI.
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+    };
+    docker.handler = (args) => {
+      if (args.includes(TAG)) {
+        docker.images.delete(TAG);
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}.\n` };
+      }
+      return {};
+    };
+    const runs = docker.runs.length;
+    await expect(helper.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(docker.runs).toHaveLength(runs + 1);
+    expect(docker.runs.some((run) => run.args.includes(fakeImageId(PREVIOUS)))).toBe(false);
   });
 
   it('fails with helperFailed when the current tag cannot be built and no previous helper of this installation exists', async () => {

@@ -67,6 +67,15 @@ describe('parseHelperState', () => {
     }
   });
 
+  it('keeps a helper generation that is a positive safe integer (review round 2 of PR #64, A-N2)', () => {
+    for (const generation of [1, 2, Number.MAX_SAFE_INTEGER]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } });
+    }
+    for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY, '1', null, true]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME } } });
+    }
+  });
+
   it('keeps valid records', () => {
     const state = {
       version: 1,

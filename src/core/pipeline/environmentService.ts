@@ -61,7 +61,7 @@ import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, 
 import { writeContainerToken } from '../helper/containerToken';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
-import type { HelperFiles, WorkspaceHelper } from '../helper/workspaceHelper';
+import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   compareWithBuildRecord,
   type CheckedOutcome,
@@ -310,9 +310,10 @@ export interface EnvironmentRemoteMonitor {
   /**
    * Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context).
    * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of a previous
-   * helper (review round 1 of PR #64, S1); the label and the log lines keep the tag.
+   * helper (review round 1 of PR #64, S1); the label and the log lines keep the tag. Review round 2 of PR #64 (B-M9): the
+   * parameters are required, so an implementation states what it does with them.
    */
-  ensure(host: string, helperTag: string, signal?: AbortSignal, helperImage?: string): Promise<unknown>;
+  ensure(host: string, helperTag: string, signal: AbortSignal | undefined, helperImage: string | undefined): Promise<unknown>;
   /**
    * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
    * only on environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
@@ -574,10 +575,13 @@ interface PipelineContext {
    */
   helperUnavailable: boolean;
   /**
-   * Previous helper (user decision 2026-09-29): this run uses a previous helper image, because the current one could not
-   * be built. Further prepareHelper calls of the run do not try the build again.
+   * Review round 2 of PR #64 (A-N1): the helper image of this run (the current tag, or a previous helper image with its
+   * checked ID, user decision 2026-09-29), resolved once by the first prepareHelper of the run and passed to every helper
+   * run of it: the configuration that the Dev Container CLI of this image read and checked is built and started with the
+   * same CLI, whatever another open of the window resolves meanwhile. Further prepareHelper calls of the run do not
+   * resolve it again (with a previous helper, they do not try the build of the current tag again).
    */
-  previousHelper?: boolean;
+  helperImage?: HelperImageUse;
   /**
    * Review round 1 of PR #64 (L2): the configuration was read, but its check could not run (AnalysisFailure `internal`,
    * for example Docker did not answer for its images): the reason of a Docker Compose start that fails says so.
@@ -1304,13 +1308,17 @@ export class EnvironmentService {
     } catch (error) {
       const usable = container !== undefined || imagePresent;
       const cancelled = this.isCancellation(error, ctx.signal);
-      // Review round 1 of PR #64 (L2): whether Step 9 opens the container as it is (it runs and is current).
-      const asItIs = !cancelled && (await this.opensAsItIs(ctx, container, record));
+      const helperFailed = isUserFacingError(error) && error.code === 'helperFailed';
+      // Review round 2 of PR #64 (A-N1): also when a helper run of this open failed (its helper image was removed), not
+      // only prepareHelper: the rest of the open uses no helper.
+      if (helperFailed) ctx.helperUnavailable = true;
       // No docker start fallback (user decision 2026-09-29): without the workspace helper only a running container
       // opens; otherwise the open fails with helperFailed at once, without a warning that the environment is started.
-      // Review round 1 of PR #64 (L2): only a running container that is current opens as it is; a running one that is
-      // outdated would be created again, which needs the helper, too.
-      if (isUserFacingError(error) && error.code === 'helperFailed' && !asItIs) throw error;
+      // Review round 1 of PR #64 (L2): only a running container that is current opens as it is (Step 9); a running one
+      // that is outdated would be created again, which needs the helper, too. Review round 2 of PR #64 (A-N4): whether
+      // it opens as it is (a Docker listing) is asked only when the answer is needed, and a failure of the listing counts
+      // as `false`, so the error of the configuration is never lost.
+      if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
       if (!usable || cancelled || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
@@ -1319,12 +1327,17 @@ export class EnvironmentService {
       // Review round 1 of PR #64 (L2): the log line says what happens next. A Docker Compose environment that is not
       // opened as it is starts nothing (startContainer: startFailed); a single container starts through `up`.
       if (isInternalAnalysisFailure(error)) ctx.configurationUnchecked = true;
-      const next = asItIs
-        ? 'The running environment is opened as it is.'
-        : this.isComposeEnvironment(ctx.env, record, container)
-          ? 'Its containers are not started.'
-          : 'The existing environment is started without it.';
-      this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
+      if (helperFailed) {
+        // Review round 2 of PR #64 (B2): the configuration was not the problem.
+        this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
+      } else {
+        const next = (await this.opensAsItIsOrFalse(ctx, container, record))
+          ? 'The running environment is opened as it is.'
+          : this.isComposeEnvironment(ctx.env, record, container)
+            ? 'Its containers are not started.'
+            : 'The existing environment is started without it.';
+        this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
+      }
       this.deps.ui.warn(isUserFacingError(error) ? error.message : Messages.buildFailed);
     }
 
@@ -1430,7 +1443,7 @@ export class EnvironmentService {
     }
     await this.prepareHelper(ctx);
 
-    const resolved = await this.resolveConfigFiles(env, ctx.configPath, ctx.signal);
+    const resolved = await this.resolveConfigFiles(env, ctx.configPath, ctx.signal, ctx.helperImage);
     if (!resolved) throw new UserFacingError('noConfiguration', Messages.noConfiguration(env.repository));
     const { configPath, files, fallback } = resolved;
     if (fallback) {
@@ -1453,6 +1466,7 @@ export class EnvironmentService {
       environmentId: env.id,
       merged: false,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
@@ -1462,7 +1476,7 @@ export class EnvironmentService {
     // configuration hash. The Dockerfile itself is: one that is a link out of the repository or could not be read is
     // refused whatever the switch says (U2), and one too large for the hash is not supported (U1).
     const repository = repositoryFolder(env.repository);
-    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
+    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal, ctx.helperImage);
     const input: Omit<HostAccessInput, 'ownVolume'> = {
       config,
       configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
@@ -1505,6 +1519,7 @@ export class EnvironmentService {
       configPath,
       environmentId: env.id,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     let merged = read.merged;
@@ -1577,6 +1592,7 @@ export class EnvironmentService {
     config: DevcontainerConfig,
     files: ConfigFiles,
     signal: AbortSignal | undefined,
+    image?: HelperImageUse,
   ): Promise<{ text?: string; unreadable?: string; missing?: string }> {
     const build: Record<string, unknown> = isRecord(config.build) ? config.build : {};
     const raw: Record<string, unknown> = config as Record<string, unknown>;
@@ -1594,6 +1610,7 @@ export class EnvironmentService {
       repository: env.repository,
       configPath,
       dockerfile: named,
+      image,
       signal,
     });
     if (read?.dockerfileText !== undefined) return { text: read.dockerfileText };
@@ -1648,6 +1665,7 @@ export class EnvironmentService {
       merged: false,
       env: { COMPOSE_PROJECT_NAME: project },
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const service = nonEmptyString(config.service);
@@ -1667,6 +1685,7 @@ export class EnvironmentService {
       repository: env.repository,
       files: composeFiles.files,
       project,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     if ('error' in output) {
@@ -1731,6 +1750,7 @@ export class EnvironmentService {
       files: composeBuildFiles(composeBuildModel(output.model, this.composeParams(env, compose, []))),
       env: { COMPOSE_PROJECT_NAME: project },
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const merged = read.merged;
@@ -2012,17 +2032,18 @@ export class EnvironmentService {
     env: Environment,
     configPath: string,
     signal: AbortSignal | undefined,
+    image?: HelperImageUse,
   ): Promise<{ configPath: string; files: ConfigFiles; fallback: boolean } | undefined> {
     const { helper } = this.deps;
     await this.requireVolume(env);
-    const files = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath, signal });
+    const files = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath, image, signal });
     if (files) return { configPath, files: this.limitedConfigFiles(env, configPath, files), fallback: false };
     await this.requireVolume(env);
-    const available = await helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal });
+    const available = await helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, image, signal });
     if (available.length === 0) return undefined;
     const fallback = available[0];
     await this.requireVolume(env);
-    const fallbackFiles = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath: fallback, signal });
+    const fallbackFiles = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath: fallback, image, signal });
     return fallbackFiles ? { configPath: fallback, files: this.limitedConfigFiles(env, fallback, fallbackFiles), fallback: true } : undefined;
   }
 
@@ -2273,6 +2294,7 @@ export class EnvironmentService {
         imageName,
         ...(loaded.compose ? this.composeBuildOptions(env, loaded.compose) : {}),
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       // User decision 2026-09-28: the container is made only from an image that the engine has (a build that ended
@@ -2772,6 +2794,7 @@ export class EnvironmentService {
         repository: env.repository,
         model: JSON.stringify(model, null, 2),
         project: compose.project,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
     } catch (error) {
@@ -2952,10 +2975,6 @@ export class EnvironmentService {
   }
 
   /**
-   * A Docker Compose environment (D-15): its build record says so, or its container belongs to the project of the
-   * environment.
-   */
-  /**
    * Review round 1 of PR #64 (L2): whether startContainer opens `container` as it is when the configuration could not be
    * used: it runs and is current (containerIsCurrent without the configuration, and for Docker Compose with the host
    * access checks on, no container of another service that was created while they were off).
@@ -2973,6 +2992,24 @@ export class EnvironmentService {
     );
   }
 
+  /**
+   * Review round 2 of PR #64 (A-N4): opensAsItIs for the handling of an error at Step 5: a failure of its Docker listing
+   * is logged and counts as `false`, so the caller goes on with its own error; a cancellation passes through.
+   */
+  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined): Promise<boolean> {
+    try {
+      return await this.opensAsItIs(ctx, container, record);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The containers of ${ctx.env.repository} could not be listed: ${errorDetail(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * A Docker Compose environment (D-15): its build record says so, or its container belongs to the project of the
+   * environment.
+   */
   private isComposeEnvironment(env: Environment, record: BuildRecord | undefined, container: ContainerInfo | undefined): boolean {
     if (composeRecordOf(record) !== undefined) return true;
     return container !== undefined && isComposeContainer(container.labels, composeProjectName(env.id));
@@ -3124,6 +3161,7 @@ export class EnvironmentService {
         removeExistingContainer,
         token: ctx.session.token,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
@@ -3220,7 +3258,13 @@ export class EnvironmentService {
     // a data folder in .gitignore): Docker would create them; the subpath of the workspace volume must exist.
     if (createFolders !== undefined && createFolders.length > 0) {
       await this.requireVolume(env);
-      await this.deps.helper.createRepositoryFolders({ volumeName: env.volumeName, repository: env.repository, folders: createFolders, signal: ctx.signal });
+      await this.deps.helper.createRepositoryFolders({
+        volumeName: env.volumeName,
+        repository: env.repository,
+        folders: createFolders,
+        image: ctx.helperImage,
+        signal: ctx.signal,
+      });
     }
     // The user of the dev service decides the owner of the files (imageRemoteUser reads `--user`).
     const userArgs = composeUserArgs(compose.output.model.services[compose.service]);
@@ -3279,6 +3323,7 @@ export class EnvironmentService {
         ...inputs,
         token: ctx.session.token,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
@@ -3646,6 +3691,7 @@ export class EnvironmentService {
       // Review PL-1: the commands can read the token; the helper removes it from their output and from its errors.
       token: ctx.session.token,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const failure = nonEmptyString(commands.lifecycleCommandFailure);
@@ -3882,6 +3928,7 @@ export class EnvironmentService {
         repository: env.repository,
         identity,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
     } catch (error) {
@@ -4237,6 +4284,7 @@ export class EnvironmentService {
         uid,
         gid,
         timeoutMs: OWNERSHIP_TIMEOUT_MS,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       if (result.exitCode !== 0) {
@@ -5091,11 +5139,12 @@ export class EnvironmentService {
   /**
    * Builds the helper image if needed. The build is shown as a detail of the current step: the steps of concept 6.5
    * keep their order ("Preparing environment" is the build of the environment image). The check of the base image of
-   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7).
+   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7). Review round 2 of PR #64
+   * (A-N1): the first call of a run resolves the helper image of the run (ctx.helperImage); later calls do nothing.
    */
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
-    // Previous helper (user decision 2026-09-29): the build of the current helper failed in this run already.
-    if (ctx.previousHelper) return;
+    // Review round 2 of PR #64 (A-N1): the helper image is resolved once per run.
+    if (ctx.helperImage !== undefined) return;
     let announced = false;
     const announce = (text: string): void => {
       if (announced) return;
@@ -5114,7 +5163,6 @@ export class EnvironmentService {
         onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
         checkBaseImage: this.deps.settings().updateImagesOnConnect,
         onPreviousHelper: (_tag, imageId) => {
-          ctx.previousHelper = true;
           previousId = imageId;
         },
         signal: ctx.signal,
@@ -5125,6 +5173,7 @@ export class EnvironmentService {
     } finally {
       if (announced) ctx.steps.clearDetail();
     }
+    ctx.helperImage = previousId !== undefined ? { tag, previousId } : { tag };
     await this.ensureRemoteMonitor(ctx, tag, previousId);
   }
 
@@ -5185,6 +5234,7 @@ export class EnvironmentService {
         repository: env.repository,
         branch,
         token,
+        image: ctx.helperImage,
         onOutput: this.output,
         signal: ctx.signal,
       });

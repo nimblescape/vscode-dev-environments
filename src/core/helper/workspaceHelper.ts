@@ -138,8 +138,13 @@ export interface EnsureImageOptions {
   onPreviousHelper?: (tag: string, imageId: string) => void;
 }
 
-/** The result of ensureHelperImage that WorkspaceHelper caches. */
-interface HelperImageUse {
+/**
+ * The result of ensureHelperImage that WorkspaceHelper caches, and the helper image of an open. Review round 2 of PR #64
+ * (A-N1): the open pipeline resolves it once per open and passes it to every helper run of that open (`image`), so the
+ * configuration that the CLI of one helper image read and checked is run with the same CLI, whatever another open in
+ * this window resolves meanwhile.
+ */
+export interface HelperImageUse {
   /** The helper tag: the key of helper.json, and the name in log lines. */
   tag: string;
   /**
@@ -366,6 +371,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** `sha256:` and the first 12 hex characters of an image ID, for log lines. */
+function shortImageId(id: string): string {
+  return id.slice(0, 'sha256:'.length + 12);
+}
+
 function describeCommand(command: readonly string[]): string {
   if (command[0] === 'sh' && command[1] === '-c') return ['sh', '<script>', ...command.slice(4)].join(' ');
   if (command[0] === 'node' && command[1] === '-e') return ['node', '<script>', ...command.slice(3)].join(' ');
@@ -412,6 +422,8 @@ interface StreamOptions {
   network?: boolean;
   /** See HelperRunSpec.hideConfigFolder. */
   hideConfigFolder?: boolean;
+  /** The helper image of the open (see HelperImageUse); without it, the image of this instance (WorkspaceHelper.image). */
+  image?: HelperImageUse;
   signal?: AbortSignal;
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
@@ -496,7 +508,8 @@ export class WorkspaceHelper {
    * image (in the background), the cleanup of old helper images. The open pipeline calls it before the helper runs; a
    * result older than HELPER_IMAGE_RECHECK_MS, or one of a helper run (without the maintenance), is not reused. A failed
    * build throws UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors
-   * pass through.
+   * pass through. Review round 2 of PR #64 (A-N1): the open pipeline passes the result (the tag, and the image ID of
+   * onPreviousHelper) as `image` to every helper run of the open, because this cache is shared by all opens of the window.
    */
   async ensureImage(options: EnsureImageOptions = {}): Promise<string> {
     return (await this.image(options, true)).tag;
@@ -517,11 +530,14 @@ export class WorkspaceHelper {
       secrets?: boolean;
       docker?: boolean;
       network?: boolean;
+      /** The helper image of the open (HelperImageUse). */
+      image?: HelperImageUse;
       onOutput?: (text: string) => void;
       signal?: AbortSignal;
     } = {},
   ): Promise<RunResult> {
     return this.runStreams(volumeName, command, {
+      image: options.image,
       env: options.env,
       input: options.input,
       secrets: options.secrets,
@@ -542,6 +558,8 @@ export class WorkspaceHelper {
     repository: string;
     branch?: string;
     token: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -550,6 +568,7 @@ export class WorkspaceHelper {
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, cloneCommand(p.repository, name, p.branch || undefined), {
+      image: p.image,
       input: p.token,
       secrets: true,
       docker: false,
@@ -573,10 +592,13 @@ export class WorkspaceHelper {
     repository: string;
     configPath: string;
     dockerfile?: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } | undefined> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -597,9 +619,10 @@ export class WorkspaceHelper {
   }
 
   /** Configuration paths in the volume, in the order of precedence (concept 7.4). */
-  async listConfigurations(p: { volumeName: string; repository: string; signal?: AbortSignal }): Promise<string[]> {
+  async listConfigurations(p: { volumeName: string; repository: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<string[]> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, listConfigsCommand(folder), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -638,6 +661,8 @@ export class WorkspaceHelper {
     override?: Record<string, unknown>;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
@@ -664,6 +689,7 @@ export class WorkspaceHelper {
       override?: Record<string, unknown>;
       files?: HelperFiles;
       env?: Record<string, string>;
+      image?: HelperImageUse;
       onOutput?: (text: string) => void;
       signal?: AbortSignal;
     },
@@ -682,6 +708,7 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, withFiles ? writeAndRunCommand({}, args) : ['devcontainer', ...args], {
       input: withFiles ? writeAndRunInput(p.files, p.override) : undefined,
       env: p.env,
+      image: p.image,
       timeoutMs,
       signal: p.signal,
       onStderr: p.onOutput ?? this.logOutput,
@@ -721,6 +748,8 @@ export class WorkspaceHelper {
     override?: Record<string, unknown>;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
@@ -731,6 +760,7 @@ export class WorkspaceHelper {
       const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
       return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
         env: p.env,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -741,6 +771,7 @@ export class WorkspaceHelper {
     return this.runDevcontainer('devcontainer build', p.volumeName, command, {
       input: writeAndRunInput(p.files, p.override),
       env: p.env,
+      image: p.image,
       onOutput: p.onOutput,
       signal: p.signal,
     });
@@ -759,6 +790,8 @@ export class WorkspaceHelper {
     files: readonly string[];
     project: string;
     timeoutMs?: number;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<ComposeModelOutput | { error: string }> {
     const folder = this.repositoryFolder(p.repository);
@@ -767,6 +800,7 @@ export class WorkspaceHelper {
     }
     this.deps.logger.info(`Reading the Docker Compose configuration of ${p.repository} (${p.files.join(', ')}).`);
     const result = await this.runStreams(p.volumeName, composeModelCommand(folder, p.files), {
+      image: p.image,
       env: { COMPOSE_PROJECT_NAME: p.project },
       docker: false,
       network: false,
@@ -785,9 +819,18 @@ export class WorkspaceHelper {
    * one that runs `up` (COMPOSE_HASH_SCRIPT). Without the Docker socket, the cache volume, and network, and with the
    * configuration folder of the volume hidden. Throws CommandError when Compose fails.
    */
-  async composeServiceHashes(p: { volumeName: string; repository: string; model: string; project: string; signal?: AbortSignal }): Promise<Map<string, string>> {
+  async composeServiceHashes(p: {
+    volumeName: string;
+    repository: string;
+    model: string;
+    project: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<Map<string, string>> {
     this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
     const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
+      image: p.image,
       input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },
       docker: false,
@@ -808,7 +851,14 @@ export class WorkspaceHelper {
    * Without the Docker socket, the cache volume, and network, and with the configuration folder of the volume hidden.
    * Throws CommandError when a folder cannot be created.
    */
-  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[]; signal?: AbortSignal }): Promise<void> {
+  async createRepositoryFolders(p: {
+    volumeName: string;
+    repository: string;
+    folders: readonly string[];
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<void> {
     const folder = this.repositoryFolder(p.repository);
     if (p.folders.some((entry) => !entry.startsWith(`${folder}/`) || entry.slice(folder.length + 1).split('/').some((part) => part === '..' || part === '.' || part === ''))) {
       throw new Error(`Invalid folders: ${p.folders.join(', ')}`);
@@ -816,6 +866,7 @@ export class WorkspaceHelper {
     if (p.folders.length === 0) return;
     this.deps.logger.info(`Creating the folders ${p.folders.join(', ')} of ${p.repository} for the bind mounts of Docker Compose.`);
     const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
+      image: p.image,
       docker: false,
       network: false,
       hideConfigFolder: true,
@@ -845,6 +896,8 @@ export class WorkspaceHelper {
     env?: Record<string, string>;
     /** Review PL-1: removed from the output and from the error (none of the commands of `up` reads it). */
     token?: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -863,6 +916,7 @@ export class WorkspaceHelper {
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -892,6 +946,8 @@ export class WorkspaceHelper {
      * the error (the command output of DevcontainerCommandError), also when it is split across chunks.
      */
     token: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -907,6 +963,7 @@ export class WorkspaceHelper {
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -942,6 +999,8 @@ export class WorkspaceHelper {
     volumeName: string;
     repository: string;
     identity: GitIdentity;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -949,6 +1008,7 @@ export class WorkspaceHelper {
     const output = p.onOutput ?? this.logOutput;
     this.deps.logger.info(`Writing the Git configuration of ${p.repository} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -966,8 +1026,18 @@ export class WorkspaceHelper {
    * `volumes_from`, or a tmpfs) is there: the fix walks only the folder of the volume. Throws for IDs that are not numbers
    * (configOwnershipFixCommand); returns the result also for a non-zero exit code.
    */
-  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string; timeoutMs?: number; signal?: AbortSignal }): Promise<RunResult> {
+  async fixConfigOwnership(p: {
+    volumeName: string;
+    folder: string;
+    uid: string;
+    gid: string;
+    timeoutMs?: number;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<RunResult> {
     return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
+      image: p.image,
       docker: false,
       network: false,
       timeoutMs: p.timeoutMs,
@@ -1040,7 +1110,8 @@ export class WorkspaceHelper {
    * HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
    * and only record the use (at most once per hour); without a result (a new window), they run ensureHelperImage without
    * the maintenance, which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays
-   * a stop, a delete, or a branch switch.
+   * a stop, a delete, or a branch switch. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
+   * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
   private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
@@ -1152,7 +1223,14 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { input?: string; env?: Record<string, string>; secret?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: {
+      input?: string;
+      env?: Record<string, string>;
+      secret?: string;
+      image?: HelperImageUse;
+      onOutput?: (text: string) => void;
+      signal?: AbortSignal;
+    },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
     const secret = options.secret;
@@ -1164,6 +1242,7 @@ export class WorkspaceHelper {
       result = await this.runStreams(volumeName, helperCommand, {
         input: options.input,
         env: options.env,
+        image: options.image,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
         onStderr: stderr === undefined ? output : (text) => stderr.write(text),
@@ -1185,16 +1264,38 @@ export class WorkspaceHelper {
 
   private async runStreams(volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
     const env = this.helperEnv(options.env ?? {}, options.secrets === true);
-    let use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
+    // Review round 2 of PR #64 (A-N1): a run of an open uses the helper image of that open, never the image that this
+    // instance resolved for another open meanwhile.
+    const pinned = options.image;
+    let use = pinned ?? (await this.image({ onOutput: options.onStderr, signal: options.signal }, false));
     // Review round 1 of PR #64 (S1): a previous helper runs by the ID of its image that was checked, not by its tag.
     let result = await this.runContainer(use.previousId ?? use.tag, volumeName, command, env, options);
     if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
-      // The image was removed after this instance checked it (for example by `docker image prune -a`, or the cleanup of
-      // another installation for a previous helper): ensureHelperImage builds the current tag again, or else picks
-      // another previous helper.
-      this.deps.logger.warn(`The workspace helper image ${use.tag} is missing. It is built again.`);
+      // The image was removed after it was checked (for example by `docker image prune -a`, or the cleanup of another
+      // installation for a previous helper).
+      if (pinned?.previousId !== undefined) {
+        // Review round 2 of PR #64 (A-N1, B3): the open ends. Another helper image has another Dev Container CLI than the
+        // one that read and checked the configuration of this open; the next open chooses the helper image again.
+        this.deps.logger.warn(
+          `The previous helper image ${pinned.tag} (${shortImageId(pinned.previousId)}) that this open uses was removed. The open cannot go on with another helper image.`,
+        );
+        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${pinned.previousId}`);
+      }
+      // The current tag is built again (the same tag, the same CLI). A run outside an open takes what ensureHelperImage
+      // returns: the current tag, or else a previous helper.
+      this.deps.logger.warn(
+        use.previousId !== undefined
+          ? `The previous helper image ${use.tag} (${shortImageId(use.previousId)}) is missing. The workspace helper image is prepared again.`
+          : `The workspace helper image ${use.tag} is missing. It is built again.`,
+      );
       this.resetImage();
       use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
+      if (pinned !== undefined && (use.tag !== pinned.tag || use.previousId !== undefined)) {
+        // Review round 2 of PR #64 (A-N1): the current tag of the open could not be built again; a previous helper has
+        // another CLI.
+        this.deps.logger.warn(`The workspace helper image ${pinned.tag} of this open could not be built again. The open cannot go on with another helper image.`);
+        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${pinned.tag}`);
+      }
       result = await this.runContainer(use.previousId ?? use.tag, volumeName, command, env, options);
     }
     return result;

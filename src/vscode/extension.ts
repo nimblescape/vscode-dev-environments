@@ -56,6 +56,7 @@ import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
+import { remoteMonitorEnsure } from './remoteMonitorEnsure';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
@@ -323,8 +324,7 @@ async function activateExtension(
     dockerTarget: () => targets.current(),
     // Unit 7, PR 2: the Session Monitor on a remote host, with the socket that the workspace helper mounts there.
     remoteMonitor: {
-      ensure: async (host, helperTag, signal, helperImage) =>
-        remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal, helperImage),
+      ensure: remoteMonitorEnsure(remoteMonitor, (host) => remoteState.rootlessSocket(host)),
       heartbeat: async (_host, environmentId, keepRunning, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),

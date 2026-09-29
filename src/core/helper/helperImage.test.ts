@@ -18,11 +18,14 @@ import {
   DEVCONTAINER_CLI_VERSION,
   HELPER_CHECK_INTERVAL_MS,
   HELPER_CLEANUP_INTERVAL_MS,
+  HELPER_GENERATION,
   HELPER_LAST_USED_INTERVAL_MS,
+  HELPER_MIN_PREVIOUS_GENERATION,
   HELPER_RETRY_INTERVAL_MS,
   HELPER_TOMBSTONE_MS,
   HELPER_UNUSED_LIMIT_MS,
   ensureHelperImage,
+  hasPreviousGeneration,
   helperImageTag,
   recordHelperImageUse,
   registryBaseDigest,
@@ -319,9 +322,20 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, labels: { 'nimblescape.devenv.helper': 'true' } });
     expect(h.docker.builds[0].noCache).toBeUndefined();
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state()).toEqual({
       version: 1,
-      images: { [h.tag]: { baseImage: BASE, baseDigest: DIGEST_A, builtAt: h.iso(), checkedAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) } },
+      images: {
+        [h.tag]: {
+          baseImage: BASE,
+          baseDigest: DIGEST_A,
+          builtAt: h.iso(),
+          checkedAt: h.iso(),
+          lastUsedAt: h.iso(),
+          imageId: h.docker.idOf(h.tag),
+          generation: HELPER_GENERATION,
+        },
+      },
       lastCleanupAt: h.iso(),
     });
   });
@@ -333,6 +347,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds[0].pull).toBe(false);
     // No digest and no checkedAt, but the mark: the image may come from an old local base image.
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       builtAt: h.iso(),
@@ -340,6 +355,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
       attemptedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
     const firstId = h.docker.idOf(h.tag);
 
@@ -364,6 +380,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.idOf(h.tag)).not.toBe(firstId);
     expect(h.logger.lines.join('\n')).toContain('was built from the local base image. It is built again from the current base image');
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
@@ -371,6 +388,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
     await h.ensure();
     await h.settled();
@@ -421,7 +439,8 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure({ baseDigest: undefined });
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) });
+    // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag), generation: HELPER_GENERATION });
   });
 
   it('replaces the record of a tag whose image was removed', async () => {
@@ -433,6 +452,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure();
     expect(h.docker.builds).toHaveLength(1);
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
@@ -440,6 +460,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
   });
 
@@ -465,6 +486,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.warnings().join('\n')).toMatch(/could not be built with a fresh base image\. It is built from the local base image: .*toomanyrequests/);
     // The digest of the registry is not the digest of the image, so it is not recorded; the mark asks for a rebuild.
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       builtAt: h.iso(),
@@ -472,6 +494,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
       attemptedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
 
     // The next check (a day later) asks for a build with a fresh base image, and the next ensure runs it.
@@ -483,6 +506,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds).toHaveLength(3);
     expect(h.docker.builds[2]).toMatchObject({ pull: true, noCache: true });
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
@@ -490,6 +514,7 @@ describe('ensureHelperImage with a state file: new helper image', () => {
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
   });
 
@@ -544,7 +569,8 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.lookups).toHaveLength(0);
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) });
+    // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag), generation: HELPER_GENERATION });
   });
 
   it('checks the base image of the real Dockerfile of the extension', async () => {
@@ -570,6 +596,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
           builtAt: h.iso(-30 * DAY),
           checkedAt: h.iso(-checkedAgoMs),
           lastUsedAt: h.iso(-2 * HOUR),
+          // Review round 2 of PR #64 (A-N3): the ID that the build of this installation recorded. Before, the ensure
+          // filled it in for a record without one; it no longer does.
+          imageId: oldId,
         },
       },
       // The cleanup ran today: these tests see the refresh alone.
@@ -673,6 +702,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.docker.removals).toEqual([oldId]);
     expect(h.docker.images.has(oldId)).toBe(false);
     // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation (review round 2 of PR #64, A-N2): the rebuild records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_B,
@@ -680,6 +710,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
       imageId: h.docker.idOf(h.tag),
+      generation: HELPER_GENERATION,
     });
     await h.settled();
     expect(h.lookups).toHaveLength(1);
@@ -695,7 +726,15 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(await h.ensure()).toBe(h.tag);
     expect(h.docker.builds).toHaveLength(1);
     // The old ID is not the image of the tag any more: no ID is better than a wrong one.
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, baseDigest: DIGEST_B, builtAt: h.iso(), checkedAt: h.iso(), lastUsedAt: h.iso() });
+    // Changed expectation (review round 2 of PR #64, A-N2): the rebuild records the helper generation.
+    expect(h.state().images[h.tag]).toEqual({
+      baseImage: BASE,
+      baseDigest: DIGEST_B,
+      builtAt: h.iso(),
+      checkedAt: h.iso(),
+      lastUsedAt: h.iso(),
+      generation: HELPER_GENERATION,
+    });
   });
 
   it('keeps the previous image when it still has another tag', async () => {
@@ -1246,11 +1285,14 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
   };
 
-  /** A helper image that this installation built for `tag` `builtAgoMs` ago, as recorded in the state. Returns its ID. */
+  /**
+   * A helper image that this installation built for `tag` `builtAgoMs` ago, as recorded in the state. Returns its ID.
+   * Review round 2 of PR #64 (A-N2): with the helper generation of this version, which a previous helper needs.
+   */
   function ownPrevious(h: Harness, tag: string, builtAgoMs: number, extra: Partial<HelperImageRecord> = {}): string {
     const id = h.docker.addImage([tag]);
     const state: HelperState = fs.existsSync(h.statePath) ? h.state() : { version: 1, images: {} };
-    state.images[tag] = { builtAt: h.iso(-builtAgoMs), imageId: id, lastUsedAt: h.iso(-builtAgoMs), ...extra };
+    state.images[tag] = { builtAt: h.iso(-builtAgoMs), imageId: id, lastUsedAt: h.iso(-builtAgoMs), generation: HELPER_GENERATION, ...extra };
     h.writeState(state);
     return id;
   }
@@ -1271,7 +1313,8 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     expect(h.warnings().join('\n')).toContain(`The previous helper image ${OLD_TAG} is used for now; ${h.tag} is built again at the next open.`);
     const state = h.state();
     expect(state.previousTag).toBe(OLD_TAG);
-    expect(state.images[OLD_TAG]).toEqual({ builtAt: h.iso(-10 * DAY), imageId: oldId, lastUsedAt: h.iso() });
+    // Changed expectation (review round 2 of PR #64, A-N2): the record keeps its helper generation.
+    expect(state.images[OLD_TAG]).toEqual({ builtAt: h.iso(-10 * DAY), imageId: oldId, lastUsedAt: h.iso(), generation: HELPER_GENERATION });
     expect(state.images[h.tag]).toBeUndefined();
     expect(state.lastCleanupAt).toBeUndefined();
     expect(h.docker.removals).toEqual([]);
@@ -1316,14 +1359,17 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     const unbuilt = h.docker.addImage(['devenv-helper:555555555555']);
     // The name of the helper repository with another tag form.
     h.docker.addImage(['devenv-helper:latest']);
+    // Review round 2 of PR #64 (A-N2): each record has the helper generation of this version, so only the reason that
+    // the test names keeps it out.
+    const generation = HELPER_GENERATION;
     h.writeState({
       version: 1,
       images: {
-        'devenv-helper:222222222222': { builtAt: h.iso(-DAY), imageId: built },
-        'devenv-helper:333333333333': { builtAt: h.iso(-DAY), imageId: foreignId, foreignSince: h.iso(-DAY) },
-        'devenv-helper:666666666666': { builtAt: h.iso(-DAY), imageId: removedId, removedAt: h.iso(-DAY) },
-        'devenv-helper:444444444444': { builtAt: h.iso(-DAY), imageId: unlabeled },
-        'devenv-helper:555555555555': { lastUsedAt: h.iso(-DAY), imageId: unbuilt },
+        'devenv-helper:222222222222': { builtAt: h.iso(-DAY), imageId: built, generation },
+        'devenv-helper:333333333333': { builtAt: h.iso(-DAY), imageId: foreignId, foreignSince: h.iso(-DAY), generation },
+        'devenv-helper:666666666666': { builtAt: h.iso(-DAY), imageId: removedId, removedAt: h.iso(-DAY), generation },
+        'devenv-helper:444444444444': { builtAt: h.iso(-DAY), imageId: unlabeled, generation },
+        'devenv-helper:555555555555': { lastUsedAt: h.iso(-DAY), imageId: unbuilt, generation },
       },
     });
     h.docker.buildHandler = offline;
@@ -1374,7 +1420,8 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     expect(h.docker.removals).toEqual([]);
     expect(h.state().previousTag).toBeUndefined();
     expect(h.state().lastCleanupAt).toBe(h.iso());
-    expect(h.state().images[OLD_TAG]).toEqual({ builtAt: h.iso(-40 * DAY), imageId: oldId, lastUsedAt: h.iso(-HOUR) });
+    // Changed expectation (review round 2 of PR #64, A-N2): the record keeps its helper generation.
+    expect(h.state().images[OLD_TAG]).toEqual({ builtAt: h.iso(-40 * DAY), imageId: oldId, lastUsedAt: h.iso(-HOUR), generation: HELPER_GENERATION });
 
     // Unused for 7 days: the next cleanup removes it, although the current tag still is not an image that this
     // installation built.
@@ -1404,7 +1451,8 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
   it('skips a candidate without an image ID without a warning (review round 1 of PR #64, L3)', async () => {
     const h = new Harness();
     h.docker.addImage([OLD_TAG]);
-    h.writeState({ version: 1, images: { [OLD_TAG]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-DAY) } } });
+    // Review round 2 of PR #64 (A-N2): with the helper generation, so only the missing ID keeps it out.
+    h.writeState({ version: 1, images: { [OLD_TAG]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-DAY), generation: HELPER_GENERATION } } });
     h.docker.buildHandler = offline;
     await expect(h.ensure()).rejects.toBeInstanceOf(CommandError);
     expect(h.warnings().join('\n')).not.toContain('is not the image that this installation');
@@ -1446,12 +1494,53 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     expect(h.state().images[h.tag]).toEqual({ builtAt: h.iso(-DAY), lastUsedAt: h.iso() });
   });
 
-  it('records the image ID of a tag that this installation built before the ID was recorded, but not of one it did not build', async () => {
+  it('never uses a previous helper without a helper generation, and uses an older one with it (review round 2 of PR #64, A-N2)', async () => {
     const h = new Harness();
-    const id = h.docker.addImage([h.tag]);
+    const olderId = ownPrevious(h, OTHER_TAG, 30 * DAY);
+    // The newer tag was built before the helper generation existed.
+    ownPrevious(h, OLD_TAG, DAY, { generation: undefined });
+    h.docker.buildHandler = offline;
+    const previous: Array<[string, string]> = [];
+    expect(await h.ensure({ onPreviousHelper: (tag, imageId) => previous.push([tag, imageId]) })).toBe(OTHER_TAG);
+    expect(previous).toEqual([[OTHER_TAG, olderId]]);
+    expect(h.state().previousTag).toBe(OTHER_TAG);
+  });
+
+  it('throws the error of the build when every previous helper lacks a helper generation (review round 2 of PR #64, A-N2)', async () => {
+    const h = new Harness();
+    ownPrevious(h, OLD_TAG, DAY, { generation: undefined });
+    h.docker.buildHandler = offline;
+    await expect(h.ensure()).rejects.toBeInstanceOf(CommandError);
+    expect(h.warnings().join('\n')).toContain('there is no previous helper image of Dev Environments.');
+    expect(h.docker.labelQueries).toEqual([]);
+    expect(h.state().previousTag).toBeUndefined();
+  });
+
+  it('accepts a helper generation from the minimum on, and never a record without one (review round 2 of PR #64, A-N2)', () => {
+    expect(HELPER_GENERATION).toBeGreaterThanOrEqual(HELPER_MIN_PREVIOUS_GENERATION);
+    expect(hasPreviousGeneration({ generation: HELPER_GENERATION })).toBe(true);
+    expect(hasPreviousGeneration({})).toBe(false);
+    // A security release raises the minimum: older generations no longer qualify.
+    expect(hasPreviousGeneration({ generation: 1 }, 2)).toBe(false);
+    expect(hasPreviousGeneration({ generation: 2 }, 2)).toBe(true);
+    expect(hasPreviousGeneration({ generation: 3 }, 2)).toBe(true);
+  });
+
+  it('gives an older record without an image ID none, and never uses it as a previous helper (review round 2 of PR #64, A-N3)', async () => {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
     h.writeState({ version: 1, images: { [h.tag]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-10 * HOUR) } }, lastCleanupAt: h.iso() });
     await h.ensure({ baseDigest: undefined });
-    expect(h.state().images[h.tag]).toEqual({ builtAt: h.iso(-DAY), imageId: id, lastUsedAt: h.iso() });
+    // Changed expectation (review round 2 of PR #64, A-N3): before, the ensure took the image of the tag as the one that
+    // this installation built and recorded its ID; another installation may have built it, so the record gets none.
+    expect(h.state().images[h.tag]).toEqual({ builtAt: h.iso(-DAY), lastUsedAt: h.iso() });
+    // After an extension update, the tag is not a previous helper: it has neither an image ID nor a helper generation.
+    const updated = new Harness();
+    updated.docker.addImage([OLD_TAG]);
+    updated.writeState({ version: 1, images: { [OLD_TAG]: h.state().images[h.tag] } });
+    updated.docker.buildHandler = offline;
+    await expect(updated.ensure()).rejects.toBeInstanceOf(CommandError);
+    expect(updated.state().previousTag).toBeUndefined();
 
     const other = new Harness();
     other.docker.addImage([other.tag]);

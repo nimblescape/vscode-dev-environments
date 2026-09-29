@@ -15,6 +15,7 @@ import { CommandError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
+import type { HelperImageUse } from '../helper/workspaceHelper';
 import type { CheckOutcome, ConfigReferences } from '../imageCheck/imageCheck';
 import { parseJsonc } from '../jsonc';
 import type { ProgressStep } from '../messages';
@@ -658,6 +659,16 @@ export class FakeHelper implements EnvironmentHelper {
     repository: string;
     identity: { name: string; email: string };
   }> = [];
+  /**
+   * Review round 2 of PR #64 (A-N1): the helper image (`image`) that each helper run of the pipeline got, by the name of
+   * the call.
+   */
+  readonly helperImages: Array<{ call: string; image?: HelperImageUse }> = [];
+
+  private usedImage(call: string, image: HelperImageUse | undefined): void {
+    this.helperImages.push(image === undefined ? { call } : { call, image: { ...image } });
+  }
+
   /** Volumes that a helper run created silently (the real helper does this for a missing volume). Must stay empty. */
   readonly silentlyCreatedVolumes: string[] = [];
 
@@ -680,7 +691,8 @@ export class FakeHelper implements EnvironmentHelper {
     return 'devenv-helper:test';
   }
 
-  async clone(p: { volumeName: string; repository: string; branch?: string; token: string; signal?: AbortSignal }): Promise<void> {
+  async clone(p: { volumeName: string; repository: string; branch?: string; token: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<void> {
+    this.usedImage('clone', p.image);
     this.mount(p.volumeName);
     this.calls.push(`clone ${p.branch ?? ''}`.trim());
     this.clones.push({ volumeName: p.volumeName, repository: p.repository, branch: p.branch, token: p.token });
@@ -702,7 +714,8 @@ export class FakeHelper implements EnvironmentHelper {
    */
   unreadableDockerfiles: string[] = [];
 
-  async readConfigFiles(p: { volumeName: string; configPath: string; dockerfile?: string }): Promise<FakeFiles | undefined> {
+  async readConfigFiles(p: { volumeName: string; configPath: string; dockerfile?: string; image?: HelperImageUse }): Promise<FakeFiles | undefined> {
+    this.usedImage('readConfigFiles', p.image);
     this.mount(p.volumeName);
     this.calls.push(`readConfigFiles ${p.configPath}`);
     if (!Object.prototype.hasOwnProperty.call(this.files, p.configPath)) return undefined;
@@ -727,7 +740,8 @@ export class FakeHelper implements EnvironmentHelper {
     return result;
   }
 
-  async listConfigurations(p: { volumeName: string }): Promise<string[]> {
+  async listConfigurations(p: { volumeName: string; image?: HelperImageUse }): Promise<string[]> {
+    this.usedImage('listConfigurations', p.image);
     this.mount(p.volumeName);
     this.calls.push('listConfigurations');
     return this.configurations ?? Object.keys(this.files);
@@ -740,7 +754,9 @@ export class FakeHelper implements EnvironmentHelper {
     override?: Record<string, unknown>;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    image?: HelperImageUse;
   }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
+    this.usedImage('readConfiguration', p.image);
     this.mount(p.volumeName);
     this.calls.push(`readConfiguration ${p.configPath}`);
     this.readConfigurations.push({
@@ -759,7 +775,8 @@ export class FakeHelper implements EnvironmentHelper {
     return this.merged === undefined ? { config } : { config, merged: { ...config, ...this.merged } };
   }
 
-  async composeModel(p: { volumeName: string; files: readonly string[]; project: string }): Promise<ComposeModelOutput | { error: string }> {
+  async composeModel(p: { volumeName: string; files: readonly string[]; project: string; image?: HelperImageUse }): Promise<ComposeModelOutput | { error: string }> {
+    this.usedImage('composeModel', p.image);
     this.mount(p.volumeName);
     this.calls.push(`composeModel ${p.project}`);
     this.composeModels.push({ files: [...p.files], project: p.project });
@@ -771,14 +788,16 @@ export class FakeHelper implements EnvironmentHelper {
   readonly createdFolders: string[][] = [];
   createFoldersError: Maybe<Error>;
 
-  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[] }): Promise<void> {
+  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[]; image?: HelperImageUse }): Promise<void> {
+    this.usedImage('createRepositoryFolders', p.image);
     this.mount(p.volumeName);
     this.calls.push(`createRepositoryFolders ${p.folders.join(' ')}`);
     this.createdFolders.push([...p.folders]);
     if (this.createFoldersError) throw this.createFoldersError;
   }
 
-  async prepareGit(p: { volumeName: string; repository: string; identity: { name: string; email: string } }): Promise<void> {
+  async prepareGit(p: { volumeName: string; repository: string; identity: { name: string; email: string }; image?: HelperImageUse }): Promise<void> {
+    this.usedImage('prepareGit', p.image);
     this.mount(p.volumeName);
     this.calls.push('prepareGit');
     this.gitPreparations.push({ volumeName: p.volumeName, repository: p.repository, identity: { ...p.identity } });
@@ -792,8 +811,10 @@ export class FakeHelper implements EnvironmentHelper {
     override?: Record<string, unknown>;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
+    this.usedImage('build', p.image);
     this.mount(p.volumeName);
     this.calls.push(`build ${p.imageName}`);
     this.builds.push({
@@ -822,7 +843,9 @@ export class FakeHelper implements EnvironmentHelper {
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
     token?: string;
+    image?: HelperImageUse;
   }): Promise<DevcontainerResult> {
+    this.usedImage('up', p.image);
     this.mount(p.volumeName);
     this.upTokens.push(p.token);
     if (p.override.dockerComposeFile !== undefined) return this.composeUp(p);
@@ -877,7 +900,8 @@ export class FakeHelper implements EnvironmentHelper {
   serviceHashes: Record<string, string> | Error | undefined;
   readonly hashModels: string[] = [];
 
-  async composeServiceHashes(p: { model: string; project: string }): Promise<Map<string, string>> {
+  async composeServiceHashes(p: { model: string; project: string; image?: HelperImageUse }): Promise<Map<string, string>> {
+    this.usedImage('composeServiceHashes', p.image);
     this.calls.push(`composeServiceHashes ${p.project}`);
     this.hashModels.push(p.model);
     if (this.serviceHashes instanceof Error) throw this.serviceHashes;
@@ -894,7 +918,9 @@ export class FakeHelper implements EnvironmentHelper {
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
     token?: string;
+    image?: HelperImageUse;
   }): Promise<DevcontainerResult> {
+    this.usedImage('runUserCommands', p.image);
     this.mount(p.volumeName);
     this.userCommandContext.push({ execsBefore: this.docker.execs.length, token: p.token });
     this.userCommandRuns.push({
@@ -1062,7 +1088,8 @@ export class FakeHelper implements EnvironmentHelper {
   /** Result of fixConfigOwnership (an Error is thrown). */
   configOwnershipResult: Partial<RunResult> | Error = {};
 
-  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string }): Promise<RunResult> {
+  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string; image?: HelperImageUse }): Promise<RunResult> {
+    this.usedImage('fixConfigOwnership', p.image);
     this.mount(p.volumeName);
     this.configOwnershipFixes.push({ volumeName: p.volumeName, folder: p.folder, uid: p.uid, gid: p.gid });
     if (this.configOwnershipResult instanceof Error) throw this.configOwnershipResult;
