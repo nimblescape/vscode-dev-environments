@@ -627,10 +627,7 @@
             "pattern": "^(?=.{1,128}\\*?$)(?!.*\\.\\.)(?!(docker\\.io|index\\.docker\\.io|registry-1\\.docker\\.io)/)([a-z0-9-]+(\\.[a-z0-9-]+)+(:[0-9]+)?|[a-z0-9.-]+:[0-9]+|localhost)/[a-z0-9._/-]*\\*?$",
             "patternErrorMessage": "A repository prefix with its registry, for example ghcr.io/owner/name*. Docker Hub (docker.io) is not supported."
           },
-          "default": [
-            "ghcr.io/majikmate/devcontainer-classroom*",
-            "ghcr.io/majikmate/devcontainer-dev*"
-          ],
+          "default": [],
           "description": "Only on a remote Docker host: the Session Monitor there pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all public packages of the owner, read with your GitHub sign-in), one minute after it starts and then by Remote Image Update Schedule (default every day at 06:07), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off; at most 50 patterns."
         },
         "devEnvLauncher.remoteImageUpdateSchedule": {

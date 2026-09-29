@@ -14,8 +14,11 @@ import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
 
-/** User requests 2026-09-28: the default of remoteImageUpdates. */
-export const DEFAULT_REMOTE_IMAGE_UPDATES: readonly string[] = ['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*'];
+/**
+ * The default of remoteImageUpdates: none, so the image maintenance is off until the user names image repositories
+ * (user decision 2026-09-29: the extension knows no image repositories of its own).
+ */
+export const DEFAULT_REMOTE_IMAGE_UPDATES: readonly string[] = [];
 
 /** Defaults of concept section 8. */
 export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({

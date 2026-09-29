@@ -43,8 +43,9 @@ describe('settings (concept section 8)', () => {
       openInNewWindow: false,
       // Unit 7, PR 2 (setting remoteStopAfterMinutes): a new setting with the default of 10 minutes.
       remoteStopAfterMinutes: 10,
-      // User requests 2026-09-28 (setting remoteImageUpdates): the two image families of the user.
-      remoteImageUpdates: ['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*'],
+      // User requests 2026-09-28 (setting remoteImageUpdates); user decision 2026-09-29: empty by default (no image
+      // repositories known to the extension; the image maintenance is off until the user names some).
+      remoteImageUpdates: [],
       // User request 2026-09-28 ("in the morning again, at 6:07 CEST"; "in a guided cron style manner"): the schedule of
       // the image maintenance, a cron expression (the daily time 06:07 before).
       remoteImageUpdateSchedule: '7 6 * * *',
@@ -56,7 +57,8 @@ describe('settings (concept section 8)', () => {
     const read = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdates' ? value : undefined)).remoteImageUpdates;
     expect(read(['ghcr.io/acme/base*', 3, null])).toEqual(['ghcr.io/acme/base*']);
     expect(read([])).toEqual([]);
-    expect(read('ghcr.io/acme/base*')).toEqual(['ghcr.io/majikmate/devcontainer-classroom*', 'ghcr.io/majikmate/devcontainer-dev*']);
+    // User decision 2026-09-29: the default is empty.
+    expect(read('ghcr.io/acme/base*')).toEqual([]);
     // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule; an
     // invalid one (also a time HH:MM) gives the default.
     const schedule = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdateSchedule' ? value : undefined)).remoteImageUpdateSchedule;
