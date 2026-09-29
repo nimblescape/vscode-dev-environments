@@ -1549,7 +1549,9 @@ describe('open: existing environment', () => {
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('helperFailed');
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
-      expect(h.ui.warnings).not.toContain(Messages.helperFailedOpenedAsItIs('update'));
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): the 'update' variant of helperFailedOpenedAsItIs no longer exists (before: not.toContain that warning); no
+      // "opened as it is" warning at all.
+      expect(h.ui.warnings.filter((line) => line.includes('opened as it is'))).toEqual([]);
       expect(h.logger.errors.filter((line) => line.includes('opened as it is'))).toEqual([]);
       expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
     });
@@ -1591,7 +1593,9 @@ describe('open: existing environment', () => {
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('startFailed');
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
-      expect(h.ui.warnings).not.toContain(Messages.helperFailedOpenedAsItIs('update'));
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): the 'update' variant of helperFailedOpenedAsItIs no longer exists (before: not.toContain that warning); no
+      // "opened as it is" warning at all.
+      expect(h.ui.warnings.filter((line) => line.includes('opened as it is'))).toEqual([]);
     });
 
     it('(c) a build that fails with another UserFacingError is a failed build: the running container starts with the buildFailed warning and the Git setup (review round 20 of PR #64, B-R20-3)', async () => {
@@ -1603,46 +1607,50 @@ describe('open: existing environment', () => {
       expect(h.helper.calls).toContain('prepareGit');
     });
 
-    it('(c) a running current container opens as it is when the build fails with helperFailed: no buildFailed and no gitSetupFailed warning, no Git setup', async () => {
+    it('(c) a build that fails with helperFailed ends the open with helperFailed although the container still runs: no buildFailed and no gitSetupFailed warning, no Git setup', async () => {
       // Reproduced: the running container opened, with the warnings buildFailed and gitSetupFailed (prepareGit ran).
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       h.helper.buildError = gone;
-      const result = await h.service.open(TARGET, options());
-      expect(result.containerName).toBe(NAME);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('update')).
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
       expect(h.helper.builds).toHaveLength(1);
-      // Changed expectation (review round 4 of PR #64, R4-4): no buildFailed and no gitSetupFailed warning, but the user
-      // learns that the update was not applied.
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+      expect(h.ui.warnings).toEqual([]);
       expect(h.helper.calls).not.toContain('prepareGit');
       expect(h.helper.ups).toEqual([]);
-      expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+      expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The update could not be completed. ${Messages.helperFailed}`]);
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+      expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
     });
 
-    it('(c) a running current container opens as it is when the `up` of the new image fails with helperFailed before the container was removed', async () => {
+    it('(c) an `up` of the new image that fails with helperFailed before the container was removed ends the open with helperFailed although the container still runs', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const before = h.docker.containersOf(ENV_ID)[0].id;
       h.helper.upFailsBeforeRemoval = true;
       h.helper.upError = (image) => (image === IMAGE_2 ? gone() : undefined);
-      const result = await h.service.open(TARGET, options());
-      expect(result.containerName).toBe(NAME);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('update')).
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
-      // Changed expectation (review round 4 of PR #64, R4-4): the user learns that the update was not applied.
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+      expect(h.ui.warnings).toEqual([]);
       expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
     });
 
-    it('(c) a running current container opens as it is when the Git setup before the `up` of the new image fails with helperFailed: no gitSetupFailed warning, no `up` (review round 11 of PR #64, R11-2)', async () => {
+    it('(c) a Git setup before the `up` of the new image that fails with helperFailed ends the open with helperFailed although the container still runs: no gitSetupFailed warning, no `up` (review round 11 of PR #64, R11-2)', async () => {
       // Reproduced: prepareGit turned the helperFailed into the gitSetupFailed warning, and `up` then failed the same way:
       // the warnings were [gitSetupFailed, helperFailedOpenedAsItIs('update')].
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const before = h.docker.containersOf(ENV_ID)[0].id;
       h.helper.prepareGitError = gone();
       h.helper.upError = (image) => (image === IMAGE_2 ? gone() : undefined);
-      const result = await h.service.open(TARGET, options());
-      expect(result.containerName).toBe(NAME);
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('update')).
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.ui.warnings).toEqual([]);
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([]);
       expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
@@ -1663,35 +1671,44 @@ describe('open: existing environment', () => {
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
     });
 
-    it('(c) a rebuild that fails with helperFailed opens the running current container as it is and says that it was not rebuilt (review round 4 of PR #64, R4-4)', async () => {
+    it('(c) a rebuild whose build fails with helperFailed ends the open with helperFailed although the container still runs (review round 4 of PR #64, R4-4)', async () => {
       await seedEnvironment(h, { container: 'running' });
       h.helper.buildError = gone;
-      const result = await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
-      expect(result.containerName).toBe(NAME);
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('rebuild')).
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options({ forceRebuild: true })));
+      expect(error.code).toBe('helperFailed');
+      expect(h.ui.warnings).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
     });
 
-    it('(c) "Rebuild now" after a configuration change that fails with helperFailed says that it was not rebuilt (review round 4 of PR #64, R4-4)', async () => {
+    it('(c) "Rebuild now" after a configuration change whose build fails with helperFailed ends the open with helperFailed (review round 4 of PR #64, R4-4)', async () => {
       await seedEnvironment(h, { container: 'running' });
       h.helper.files['.devcontainer/devcontainer.json'] = { configText: '{ "image": "node:22", "remoteUser": "node" }' };
       h.ui.configurationChangedAnswer = 'rebuildNow';
       h.helper.buildError = gone;
-      await h.service.open(TARGET, options());
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('rebuild')).
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
       expect(h.ui.prompts).toContain(`configurationChanged ${REPO}`);
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+      expect(h.ui.warnings).toEqual([]);
     });
 
-    it('(c) a selected configuration whose build fails with helperFailed is not applied: the previous one stays selected, and the user learns it (review round 4 of PR #64, R4-4)', async () => {
+    it('(c) a selected configuration whose build fails with helperFailed ends the open with helperFailed and is not applied: the previous one stays selected (review round 4 of PR #64, R4-4)', async () => {
       const env = await seedEnvironment(h, { container: 'running' });
       const python = '.devcontainer/python/devcontainer.json';
       h.helper.files[python] = { configText: '{ "image": "python:3.12" }' };
       h.helper.config = { image: 'python:3.12' };
       h.checker.outcome = checked({ 'python:3.12': DIGEST_NEW });
       h.helper.buildError = gone;
-      const result = await h.service.openEnvironment(ENV_ID, options({ configPath: python }));
-      expect(result.containerName).toBe(NAME);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): changed expectation (before: the running container opened as it is
+      // with helperFailedOpenedAsItIs('configuration', <previous configuration>)).
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options({ configPath: python })));
+      expect(error.code).toBe('helperFailed');
       expect((await entry())?.configPath).toBe(env.configPath);
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(env.configPath))]);
+      expect(h.ui.warnings).toEqual([]);
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
     });
 
@@ -1772,7 +1789,7 @@ describe('open: existing environment', () => {
       expect(h.ui.warnings).toEqual([]);
     });
 
-    it('ends with helperFailed when the container cannot be looked up again after the failing build (review round 4 of PR #64, R4-7 M3)', async () => {
+    it('ends with helperFailed after the failing build, also when the container could not be looked up again (review round 4 of PR #64, R4-7 M3)', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const find = h.docker.findContainer.bind(h.docker);
       let failLookup = false;
@@ -1786,7 +1803,8 @@ describe('open: existing environment', () => {
       h.helper.buildError = gone;
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('helperFailed');
-      expect(h.logger.warnings.join('\n')).toContain(`The container of ${REPO} could not be found`);
+      // User decision 2026-09-29 (a helperFailed during an update fails the open): the container is no longer looked up again after
+      // the failing build, so there is no warning that it could not be found (before: that warning was logged).
       expect(h.ui.warnings).toEqual([]);
     });
 
@@ -1805,17 +1823,18 @@ describe('open: existing environment', () => {
     });
 
     // Changed expectation, review round 14 of PR #64 (R14-4): a helperFailed of `up` itself means that its helper container
-    // never started, so `up` removed nothing (R13-2); the fake no longer removes the container before such an error. The
-    // running container therefore opens as it is, and the open fails only when the container is gone (see R4-7 M1 above).
-    it('a running container that `up` could not reach opens as it is: helperFailed of `up` removed nothing', async () => {
+    // never started, so `up` removed nothing (R13-2); the fake no longer removes the container before such an error.
+    // User decision 2026-09-29 (a helperFailed during an update fails the open): the open ends with helperFailed although the
+    // container still runs (before: the running container opened as it is with helperFailedOpenedAsItIs('update')).
+    it('a running container that `up` could not reach is kept, and the open ends with helperFailed: helperFailed of `up` removed nothing', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const before = h.docker.containersOf(ENV_ID)[0].id;
       h.helper.upError = (image) => (image === IMAGE_2 ? gone() : undefined);
-      const result = await h.service.open(TARGET, options());
-      expect(result.containerName).toBe(NAME);
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
       expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
-      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+      expect(h.ui.warnings).toEqual([]);
     });
   });
 

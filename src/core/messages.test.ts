@@ -153,14 +153,16 @@ describe('the recreate offer, review round 2 (V1): volumes without a name', () =
 
 describe('helperFailedOpenedAsItIs (review round 4 of PR #64, R4-4)', () => {
   it('says that the helper failed, that the running environment opens as it is, and what was not applied', () => {
-    expect(Messages.helperFailedOpenedAsItIs('update')).toBe(
-      'The workspace helper could not be prepared. The running environment is opened as it is: the update was not applied. Open it again to try again.',
+    // User decision 2026-09-29 (a helperFailed during an update fails the open): the 'update' variant no longer exists
+    // (before: helperFailedOpenedAsItIs('update') said "the update was not applied"); the full text is checked for 'rebuild'.
+    expect(Messages.helperFailedOpenedAsItIs('rebuild')).toBe(
+      'The workspace helper could not be prepared. The running environment is opened as it is: it was not rebuilt. Open it again to try again.',
     );
-    expect(Messages.helperFailedOpenedAsItIs('rebuild')).toContain('it was not rebuilt');
     expect(Messages.helperFailedOpenedAsItIs('configuration', 'devcontainer.json')).toContain(
       'the selected configuration was not applied, and devcontainer.json stays selected',
     );
-    for (const change of ['update', 'rebuild', 'configuration'] as const) {
+    // User decision 2026-09-29 (a helperFailed during an update fails the open): 'update' dropped (before: also checked).
+    for (const change of ['rebuild', 'configuration'] as const) {
       expect(Messages.helperFailedOpenedAsItIs(change).startsWith(Messages.helperFailed)).toBe(true);
     }
   });

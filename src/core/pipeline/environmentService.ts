@@ -634,6 +634,12 @@ interface PipelineContext {
    */
   kindSwitchRemoved?: string[];
   /**
+   * Review round 12 of PR #64 (R12-2): `devcontainer up` ran in this run (it may have removed or replaced the dev container
+   * with --remove-existing-container), so a later helperFailed of a switch gets the detail of the switch. Set once `up`
+   * returned (review round 13, R13-2): a helperFailed of `up` itself means that its helper container never started.
+   */
+  upStarted?: boolean;
+  /**
    * Review round 4 (D4-1): runComposeUp removed the single container of the environment in this run (a switch to Docker
    * Compose), and the IDs of the containers of Docker Compose of the project that existed before its `up`. After a failed
    * `up`, removeFailedComposeContainers removes only the others (those that the failed `up` created).
@@ -2382,9 +2388,10 @@ export class EnvironmentService {
       // previous kind is not started from here: its image is not an image of the new kind, and the configuration is of
       // the new kind. The next build tries again.
       const previousCompose = record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
-      // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container ends the open
-      // without the detail of a switch (helperFailedInUpdate; user decision 2026-09-29: never opened as it is).
-      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true) {
+      // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container (and before `up`
+      // ran, R12-2) ends the open without the detail of a switch (helperFailedInUpdate; user decision 2026-09-29: never
+      // opened as it is).
+      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true && ctx.upStarted !== true) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         return this.helperFailedInUpdate(ctx, error);
       }
@@ -3241,6 +3248,7 @@ export class EnvironmentService {
         image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
       result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
@@ -3405,6 +3413,7 @@ export class EnvironmentService {
         image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
       result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {
