@@ -286,13 +286,11 @@ export const Messages = {
    * switch to a newly selected configuration, and the running container opened as it is. `change` names what was not
    * applied; with a selected configuration, `previous` names the configuration that stays selected.
    */
-  helperFailedOpenedAsItIs: (change: 'update' | 'rebuild' | 'configuration', previous?: string) =>
+  helperFailedOpenedAsItIs: (change: 'rebuild' | 'configuration', previous?: string) =>
     `The workspace helper could not be prepared. The running environment is opened as it is: ${
       change === 'configuration'
         ? `the selected configuration was not applied${previous !== undefined ? `, and ${previous} stays selected` : ''}`
-        : change === 'rebuild'
-          ? 'it was not rebuilt'
-          : 'the update was not applied'
+        : 'it was not rebuilt'
     }. Open it again to try again.`,
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
