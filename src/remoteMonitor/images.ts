@@ -159,8 +159,8 @@ function versionOf(tag: string): number[] | undefined {
  */
 function compareVersions(a: number[], b: number[]): number {
   for (let index = 0; index < Math.max(a.length, b.length); index++) {
-    const x = a[index] ?? Number.POSITIVE_INFINITY;
-    const y = b[index] ?? Number.POSITIVE_INFINITY;
+    const x = a[index] ?? Infinity;
+    const y = b[index] ?? Infinity;
     if (x !== y) return x < y ? -1 : 1;
   }
   return 0;

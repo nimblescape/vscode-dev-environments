@@ -45,6 +45,7 @@ import {
 } from '../core/remoteMonitor/protocol';
 import {
   DEFAULT_REMOTE_TIMING,
+  RECORD_MAX_AGE_MS,
   REMOTE_TICK_MS,
   decide,
   initialRemoteState,
@@ -99,9 +100,10 @@ export function parseContainerLines(stdout: string): RemoteContainer[] {
 
 /**
  * The valid records of the folder: files named `<source>.<environment id>.json` (regular files, at most 4 KB) with a
- * valid record. Everything else is ignored. A missing folder has none.
+ * valid record. Everything else is ignored. A missing folder has none. Review round 3 of PR #63 (R3-9): a regular file
+ * with such a name but no valid record goes to `invalid`, with its modification time as `at`.
  */
-export async function readRecords(dir: string): Promise<RemoteRecord[]> {
+export async function readRecords(dir: string, invalid?: RemoteRecord[]): Promise<RemoteRecord[]> {
   let names: string[];
   try {
     names = await fs.promises.readdir(dir);
@@ -114,8 +116,10 @@ export async function readRecords(dir: string): Promise<RemoteRecord[]> {
     const parts = parseHeartbeatFileName(name);
     if (!parts) continue;
     // Removed meanwhile, or not readable: ignored.
-    const record = await readRecordFile(path.join(dir, name));
+    const file = path.join(dir, name);
+    const record = await readRecordFile(file);
     if (record) records.push({ ...parts, ...record });
+    else if (invalid) await fs.promises.lstat(file).then((stat) => stat.isFile() && invalid.push({ ...parts, at: stat.mtimeMs, keepRunning: false, limitSeconds: 0 }), () => 0);
   }
   return records;
 }
@@ -189,11 +193,12 @@ export async function recordsOf(dir: string, environmentId: string, now: number)
 
 /**
  * Removes one record; a missing one is no error. Review round 1 of PR #63 (F2): with `at`, only while the file holds a
- * record with that `at` (the caller holds the lock of the records). True when it removed it.
+ * record with that `at` (the caller holds the lock of the records). True when it removed it. Review round 3 (R3-9): `at`
+ * 0 also removes a file without a valid record (heartbeats write whole records, so it is no live one).
  */
 export async function removeRecord(dir: string, source: string, environmentId: string, at?: number): Promise<boolean> {
   const file = path.join(dir, heartbeatFileName(source, environmentId));
-  if (at !== undefined && (await readRecordFile(file))?.at !== at) return false;
+  if (at !== undefined && ((await readRecordFile(file))?.at ?? 0) !== at) return false;
   await fs.promises.rm(file, { force: true });
   return true;
 }
@@ -230,12 +235,14 @@ export type ExecFile = (
   file: string,
   args: string[],
   options: { timeout: number; windowsHide: boolean },
-  callback: (error: { code?: string | number | null; killed?: boolean; message: string } | null, stdout: string, stderr: string) => void,
+  callback: (error: { code?: string | number | null; killed?: boolean; signal?: string | null; message: string } | null, stdout: string, stderr: string) => void,
 ) => unknown;
 
 /**
  * Runs `forget <source> <env id> <at>` of this script under the lock of the records (forgetIfUnchangedCommand). Review
  * round 2 of PR #63 (R2-2): a timeout and a failed start (a string code such as ENOENT) say so, not "exit code null".
+ * Review round 3 (R3-2): the timeout kills only `flock`, whose child may still remove the record, so the text says so;
+ * another signal is named.
  */
 export const recordRemover =
   (exec: ExecFile = execFile): RecordRemover =>
@@ -244,7 +251,8 @@ export const recordRemover =
       const [file, ...args] = forgetIfUnchangedCommand(record.source, record.environmentId, record.at);
       exec(file, args, { timeout: FORGET_TIMEOUT_MS, windowsHide: true }, (error, stdout, stderr) => {
         if (!error) resolve(String(stdout).trim() === 'removed');
-        else if (error.killed) reject(new Error(`no answer within ${FORGET_TIMEOUT_MS / 1000} s`));
+        else if (error.killed) reject(new Error(`no answer within ${FORGET_TIMEOUT_MS / 1000} s (it may still end)`));
+        else if (error.signal) reject(new Error(`killed by ${error.signal}`));
         else reject(new Error(typeof error.code === 'string' ? error.message : monitorExecFailure(error.code ?? null, String(stderr), true)));
       });
     });
@@ -267,7 +275,10 @@ export class RemoteMonitorLoop {
   /** Env ids whose "keeps running" was logged; env ids whose failed stop was logged. */
   private readonly keptLogged = new Set<string>();
   private readonly stopFailedLogged = new Set<string>();
-  /** Review round 2 of PR #63 (R2-3): the records (`<source>.<env id>.<at>`) whose failed removal was logged. */
+  /**
+   * Review round 2 of PR #63 (R2-3): the records (`<source>.<env id>.<at>`) whose failed removal was logged. Like
+   * stopFailedLogged, it is kept across a tick that ends early (review round 3, R3-8).
+   */
   private removeFailedLogged = new Set<string>();
   private graceLogged = false;
 
@@ -289,14 +300,16 @@ export class RemoteMonitorLoop {
     if (this.listFailing) log('Docker answers again.');
     this.listFailing = false;
     let records: RemoteRecord[];
+    const invalid: RemoteRecord[] = [];
     try {
-      records = await readRecords(this.deps.dir);
+      records = await readRecords(this.deps.dir, invalid);
     } catch (error) {
       log(`The heartbeat records could not be read; nothing is stopped. ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
+    const now = this.deps.now();
     const decision = decide({
-      now: this.deps.now(),
+      now,
       containers: parseContainerLines(listed.stdout),
       records,
       state: this.state,
@@ -336,18 +349,28 @@ export class RemoteMonitorLoop {
     // (F2): each under the lock of the records and only while the file still holds the record that `decide` saw, so a
     // heartbeat written since stays. Review round 2 (R2-1): after the stops, which a removal (up to FORGET_TIMEOUT_MS each)
     // would otherwise delay; the `at` check makes a late removal safe. A failed one is logged once per series (R2-3).
+    // Review round 3 (R3-9): also a file without a valid record whose modification time is more than RECORD_MAX_AGE_MS
+    // from now. Review round 3 (R3-1): none starts after REMOTE_TICK_MS since `now`, so that slow ones do not make a gap
+    // (the gap rule would hold every stop); the rest follow at the next ticks, the ones that failed last.
+    const key = (record: RemoteRecord) => `${record.source}.${record.environmentId}.${record.at}`;
+    const logged = this.removeFailedLogged;
     const removals = [
       ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
       ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
-    ];
+      ...invalid.filter((record) => Math.abs(now - record.at) > RECORD_MAX_AGE_MS).map((record) => ({ record: { ...record, at: 0 }, reason: 'it is not valid' })),
+    ].sort((a, b) => +logged.has(key(a.record)) - +logged.has(key(b.record)));
     const failing = new Set<string>();
     for (const { record, reason } of removals) {
-      const key = `${record.source}.${record.environmentId}.${record.at}`;
+      const id = key(record);
+      if (this.deps.now() - now > REMOTE_TICK_MS) {
+        if (logged.has(id)) failing.add(id);
+        continue;
+      }
       try {
         if (await this.deps.removeRecord(record)) log(`Removed the old record of ${record.environmentId} (${reason}).`);
       } catch (error) {
-        if (!this.removeFailedLogged.has(key)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
-        failing.add(key);
+        if (!logged.has(id)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+        failing.add(id);
       }
     }
     this.removeFailedLogged = failing;
@@ -429,12 +452,13 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
  * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
  */
 export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
-/** Such a file older than this (by its modification time) is removed at the start of `run`. */
+/** Such a file whose modification time is more than this from now is removed at the start of `run`. */
 export const STATE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
 
 /**
- * Monitor cleanup, user decision 2026-09-29 (R4): removes the leftover temporary files of writeStateFile in the volume that
- * are older than STATE_TEMPORARY_MAX_AGE_MS (a younger one may belong to a write that runs now). Only regular files with
+ * Monitor cleanup, user decision 2026-09-29 (R4): removes the leftover temporary files of writeStateFile in the volume whose
+ * modification time is more than STATE_TEMPORARY_MAX_AGE_MS from now, in either direction (review round 3 of PR #63,
+ * R3-7; a younger one may belong to a write that runs now). Only regular files with
  * such a name, never a link; every error is ignored. Returns the names it removed.
  */
 export async function removeStaleStateTemporaryFiles(stateDir: string, now: number): Promise<string[]> {

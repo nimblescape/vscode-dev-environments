@@ -325,12 +325,26 @@ describe('decide of the remote Session Monitor', () => {
       });
 
       // Review round 2 of PR #63 (R2-6): a keep of another computer with the same time as the record holds it back too.
+      // Review round 3 (R3-4): only as a precaution; on a tie the local check counts that keep whether the record stays or
+      // not.
       it('keeps an old record while a keepRunning record of another computer has the same time', () => {
         const DAY = 24 * 60 * MINUTE;
         const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
         const own = record(A, T0 - 9 * DAY);
         const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
         expect(decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() }).superseded).toEqual([]);
+      });
+
+      // Review round 3 of PR #63 (R3-3): only a keep of the same environment holds a record back, not one of another.
+      it('removes an old record although an old keepRunning record of another environment is not newer than it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const otherKeep = record(B, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
+        const sameTime = record(B, own.at, { source: OTHER, keepRunning: true });
+        for (const keep of [otherKeep, sameTime]) {
+          expect(decide({ now: T0, containers: [container(A), container(B)], records: [keep, own, newest], state: running() }).superseded).toEqual([own]);
+        }
       });
 
       // Review round 2 of PR #63 (R2-6): the local check compares the written times (`records` prints them), so the keep

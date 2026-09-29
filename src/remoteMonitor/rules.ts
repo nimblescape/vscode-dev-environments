@@ -137,14 +137,16 @@ export function isRunningState(state: string): boolean {
  * environments send heartbeats again first (they retry every tick of their Session Monitor). Records whose environment
  * has no container at all (running or not) and whose `at` is more than RECORD_MAX_AGE_MS before or after now are removed
  * (`forget`); so are records without keepRunning older than RECORD_MAX_AGE_MS for which a strictly newer record of the
- * same environment exists (`superseded`; monitor cleanup, user decision 2026-09-29). The monitor
- * never acts on containers without the label nimblescape.devenv.environment-id (the caller lists only those).
+ * same environment exists (`superseded`; monitor cleanup, user decision 2026-09-29), except while a keepRunning record of
+ * another source of the same environment has an `at` not later than its own (review round 1 of PR #63, F1; review round
+ * 3, R3-7). The monitor never acts on containers without the label nimblescape.devenv.environment-id (the caller lists
+ * only those).
  */
 export function decide(input: RemoteDecideInput): RemoteDecision {
   const { now } = input;
   const timing = input.timing ?? DEFAULT_REMOTE_TIMING;
   const previous = input.state;
-  const gap = previous.lastTickAt === undefined ? Number.POSITIVE_INFINITY : now - previous.lastTickAt;
+  const gap = previous.lastTickAt === undefined ? Infinity : now - previous.lastTickAt;
   let graceUntil = previous.graceUntil;
   if (!(Math.abs(gap) <= timing.gapMs)) graceUntil = now + timing.graceMs;
   else if (graceUntil !== undefined) graceUntil = Math.min(graceUntil, now + timing.graceMs);

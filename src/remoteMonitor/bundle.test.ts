@@ -4,7 +4,8 @@
 
 // The Session Monitor on a remote Docker host gets its script as an argument of `docker run`, and `ensure` refuses one
 // longer than MAX_SCRIPT_LENGTH or a command line longer than MAX_WINDOWS_COMMAND_LINE: then no monitor starts at all. The image maintenance of
-// PR #57 made the script about 24 K characters, so the build as esbuild.mjs makes it, and the whole command line of
+// PR #57 and the monitor cleanup of PR #63 made the script about 29 K of the 30 K characters (review round 3 of PR #63,
+// R3-5), so the build as esbuild.mjs makes it, and the whole command line of
 // `docker run` (windowsCommandLineLength), are checked here.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
