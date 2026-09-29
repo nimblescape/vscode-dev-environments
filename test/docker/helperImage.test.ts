@@ -264,11 +264,18 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     const currentId = cli.image(tag)?.Id;
     expect((await readHelperState(statePath)).images[tag]?.imageId).toBe(currentId);
     const previous: string[] = [];
+    // Review round 1 of PR #64 (S1): the checked image ID, by which the helper runs start the previous helper.
+    const previousIds: string[] = [];
     const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
 
-    expect(await timings.measure('failed build, previous helper', () => helper.ensureImage({ onPreviousHelper: (used) => previous.push(used) }))).toBe(tag);
+    const onPreviousHelper = (used: string, id: string): void => {
+      previous.push(used);
+      previousIds.push(id);
+    };
+    expect(await timings.measure('failed build, previous helper', () => helper.ensureImage({ onPreviousHelper }))).toBe(tag);
     await settled();
     expect(previous).toEqual([tag]);
+    expect(previousIds).toEqual([currentId]);
     expect(cli.image(updatedTag)).toBeUndefined();
     expect(docker.builds.slice(-2).map((build) => build.tag)).toEqual([updatedTag, updatedTag]);
     const state = await readHelperState(statePath);

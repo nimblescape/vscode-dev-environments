@@ -307,8 +307,12 @@ export type EnvironmentSessionFiles = Pick<
  * host and the id of this computer). Both never throw, except an AbortError.
  */
 export interface EnvironmentRemoteMonitor {
-  /** Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context). */
-  ensure(host: string, helperTag: string, signal?: AbortSignal): Promise<unknown>;
+  /**
+   * Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context).
+   * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of a previous
+   * helper (review round 1 of PR #64, S1); the label and the log lines keep the tag.
+   */
+  ensure(host: string, helperTag: string, signal?: AbortSignal, helperImage?: string): Promise<unknown>;
   /**
    * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
    * only on environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
@@ -565,8 +569,8 @@ interface PipelineContext {
   busy: boolean;
   /**
    * The workspace helper image could not be prepared (for example offline after an extension update, without a previous
-   * helper image). A running container still opens; nothing is started (no docker start fallback, previous helper, user
-   * decision 2026-09-29).
+   * helper image). A running container that is current still opens (review round 1 of PR #64, L2); nothing is started (no
+   * docker start fallback, previous helper, user decision 2026-09-29).
    */
   helperUnavailable: boolean;
   /**
@@ -574,6 +578,11 @@ interface PipelineContext {
    * be built. Further prepareHelper calls of the run do not try the build again.
    */
   previousHelper?: boolean;
+  /**
+   * Review round 1 of PR #64 (L2): the configuration was read, but its check could not run (AnalysisFailure `internal`,
+   * for example Docker did not answer for its images): the reason of a Docker Compose start that fails says so.
+   */
+  configurationUnchecked?: boolean;
   /** Unit 7, PR 2: the Session Monitor on the remote Docker host was ensured in this run (once per run). */
   remoteMonitorEnsured?: boolean;
   /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
@@ -1294,15 +1303,28 @@ export class EnvironmentService {
       loaded = await this.loadConfiguration(ctx, imagePresent, container);
     } catch (error) {
       const usable = container !== undefined || imagePresent;
+      const cancelled = this.isCancellation(error, ctx.signal);
+      // Review round 1 of PR #64 (L2): whether Step 9 opens the container as it is (it runs and is current).
+      const asItIs = !cancelled && (await this.opensAsItIs(ctx, container, record));
       // No docker start fallback (user decision 2026-09-29): without the workspace helper only a running container
       // opens; otherwise the open fails with helperFailed at once, without a warning that the environment is started.
-      if (isUserFacingError(error) && error.code === 'helperFailed' && container?.state !== 'running') throw error;
+      // Review round 1 of PR #64 (L2): only a running container that is current opens as it is; a running one that is
+      // outdated would be created again, which needs the helper, too.
+      if (isUserFacingError(error) && error.code === 'helperFailed' && !asItIs) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
-      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
+      if (!usable || cancelled || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
         throw configurationError(error);
       }
-      this.logger.error(`The configuration of ${ctx.env.repository} could not be used. The existing environment is started.`, error);
+      // Review round 1 of PR #64 (L2): the log line says what happens next. A Docker Compose environment that is not
+      // opened as it is starts nothing (startContainer: startFailed); a single container starts through `up`.
+      if (isInternalAnalysisFailure(error)) ctx.configurationUnchecked = true;
+      const next = asItIs
+        ? 'The running environment is opened as it is.'
+        : this.isComposeEnvironment(ctx.env, record, container)
+          ? 'Its containers are not started.'
+          : 'The existing environment is started without it.';
+      this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
       this.deps.ui.warn(isUserFacingError(error) ? error.message : Messages.buildFailed);
     }
 
@@ -2531,9 +2553,7 @@ export class EnvironmentService {
       // The containers of the other services follow the same rule (containerIsCurrent): one that was created while the
       // checks were off makes the environment outdated; `up` then creates the dev container again, and Compose the
       // services whose model changed (the label nimblescape.devenv.host-access is gone from it).
-      const unrestricted = (await this.environmentContainers(ctx.env.id)).find(
-        (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
-      );
+      const unrestricted = await this.unrestrictedServiceContainer(ctx);
       if (unrestricted) {
         outdated = true;
         recreation = {
@@ -2567,8 +2587,11 @@ export class EnvironmentService {
     if (compose && loaded === undefined) {
       // D-15: without the configuration there is no model, so no `up`, and the containers are not started (user decision
       // 2026-09-29: no start of the containers as they are).
-      const reason = ctx.kindKept ? 'The configuration no longer uses Docker Compose, which applies with a rebuild' : 'The Docker Compose configuration cannot be read';
-      if (!ctx.kindKept) this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} cannot be read. Its containers are not started.`);
+      // Review round 1 of PR #64 (L2): a configuration that was read, but that could not be checked (for example Docker did
+      // not answer for its images, review round 11, G1), is not called unreadable.
+      const failure = ctx.configurationUnchecked ? 'could not be checked' : 'cannot be read';
+      const reason = ctx.kindKept ? 'The configuration no longer uses Docker Compose, which applies with a rebuild' : `The Docker Compose configuration ${failure}`;
+      if (!ctx.kindKept) this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} ${failure}. Its containers are not started.`);
       throw new UserFacingError(
         'startFailed',
         PipelineTexts.startFailed,
@@ -2932,6 +2955,24 @@ export class EnvironmentService {
    * A Docker Compose environment (D-15): its build record says so, or its container belongs to the project of the
    * environment.
    */
+  /**
+   * Review round 1 of PR #64 (L2): whether startContainer opens `container` as it is when the configuration could not be
+   * used: it runs and is current (containerIsCurrent without the configuration, and for Docker Compose with the host
+   * access checks on, no container of another service that was created while they were off).
+   */
+  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined): Promise<boolean> {
+    if (container?.state !== 'running' || !containerIsCurrent(container.labels, false, ctx.hostAccessChecks)) return false;
+    if (ctx.hostAccessChecks !== 'on' || !this.isComposeEnvironment(ctx.env, record, container)) return true;
+    return (await this.unrestrictedServiceContainer(ctx)) === undefined;
+  }
+
+  /** A container of another Docker Compose service of the environment that was created while the host access checks were off. */
+  private async unrestrictedServiceContainer(ctx: PipelineContext): Promise<ContainerInfo | undefined> {
+    return (await this.environmentContainers(ctx.env.id)).find(
+      (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
+    );
+  }
+
   private isComposeEnvironment(env: Environment, record: BuildRecord | undefined, container: ContainerInfo | undefined): boolean {
     if (composeRecordOf(record) !== undefined) return true;
     return container !== undefined && isComposeContainer(container.labels, composeProjectName(env.id));
@@ -5062,6 +5103,7 @@ export class EnvironmentService {
       ctx.steps.detail(text);
     };
     let tag: string;
+    let previousId: string | undefined;
     try {
       tag = await this.deps.helper.ensureImage({
         onOutput: (text) => {
@@ -5071,8 +5113,9 @@ export class EnvironmentService {
         // A new helper after an extension update, or the rebuild of an existing one from a new base image.
         onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
         checkBaseImage: this.deps.settings().updateImagesOnConnect,
-        onPreviousHelper: () => {
+        onPreviousHelper: (_tag, imageId) => {
           ctx.previousHelper = true;
+          previousId = imageId;
         },
         signal: ctx.signal,
       });
@@ -5082,7 +5125,7 @@ export class EnvironmentService {
     } finally {
       if (announced) ctx.steps.clearDetail();
     }
-    await this.ensureRemoteMonitor(ctx, tag);
+    await this.ensureRemoteMonitor(ctx, tag, previousId);
   }
 
   /**
@@ -5093,14 +5136,15 @@ export class EnvironmentService {
    * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
    * its ticks).
    */
-  private async ensureRemoteMonitor(ctx: PipelineContext, helperTag: string): Promise<void> {
+  private async ensureRemoteMonitor(ctx: PipelineContext, helperTag: string, previousId: string | undefined): Promise<void> {
     const remoteMonitor = this.deps.remoteMonitor;
     if (!remoteMonitor || ctx.remoteMonitorEnsured) return;
     const target = await this.dockerTarget();
     if (target.kind !== 'remote') return;
     ctx.remoteMonitorEnsured = true;
     try {
-      await remoteMonitor.ensure(target.host, helperTag, ctx.signal);
+      // Review round 1 of PR #64 (S1): a previous helper runs by the ID of its image that was checked, not by its tag.
+      await remoteMonitor.ensure(target.host, helperTag, ctx.signal, previousId);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);

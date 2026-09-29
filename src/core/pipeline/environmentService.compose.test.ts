@@ -732,6 +732,81 @@ describe('existing Docker Compose environment', () => {
     expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
   });
 
+  it.each<[string, () => Promise<void>, string]>([
+    [
+      'there',
+      () => seedCompose(),
+      'The Docker Compose configuration cannot be read. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.',
+    ],
+    [
+      'outdated',
+      () => seedCompose({ devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }),
+      `The Docker Compose configuration cannot be read, and the container ${NAME} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`,
+    ],
+    ['missing', () => seedCompose({ dev: null }), 'The Docker Compose configuration cannot be read, and the environment has no container.'],
+  ])('names in the start failure whether the dev container is %s (review round 1 of PR #64, L3)', async (_name, seed, detail) => {
+    await seed();
+    h.helper.composeOutput = { error: 'yaml: invalid' };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.message).toBe(PipelineTexts.startFailed);
+    expect(error.detail).toBe(detail);
+    expect(h.helper.ups).toEqual([]);
+    // Review round 1 of PR #64 (L2): the log line does not claim that the environment is started.
+    expect(h.logger.errors.filter((line) => line.startsWith('The configuration of'))).toEqual([
+      expect.stringContaining(`The configuration of ${REPO} could not be used. Its containers are not started.`),
+    ]);
+    expect(h.logger.warnings).toContain(`The Docker Compose configuration of ${REPO} cannot be read. Its containers are not started.`);
+  });
+
+  it('opens a running dev container that is current as it is without the workspace helper (review round 1 of PR #64, L2)', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    expect(h.logger.errors).toEqual([`The configuration of ${REPO} could not be used. The running environment is opened as it is. ${Messages.helperFailed}`]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('fails with helperFailed at once, without a warning, for a running dev container that is outdated (review round 1 of PR #64, L2)', async () => {
+    await seedCompose({ dev: 'running', devLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
+  it('fails with helperFailed at once for a running dev container next to a service of the checks-off time (review round 1 of PR #64, L2)', async () => {
+    // The dev container is current, but a container of another service was created while the host access checks were
+    // off: the environment is created again (startContainer), which needs the helper.
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('does not start the environment without the helper when a service of the checks-off time appears after the first look (review round 1 of PR #64, L3)', async () => {
+    // Step 5 saw a running dev container that is current, so the open went on without the helper; startContainer looks
+    // at the containers again and finds one of the checks-off time: the environment would be created again, which needs
+    // the helper, so it fails with helperFailed (never a start without the helper).
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    let calls = 0;
+    h.docker.listEnvironmentContainers = async () => {
+      if (++calls === 2) dbContainer()!.labels[LABEL_HOST_ACCESS] = HOST_ACCESS_UNRESTRICTED;
+      return list();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
   it('fails with helperFailed when up fails because the workspace helper failed (review round 1, P-3)', async () => {
     await seedCompose();
     h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
@@ -2213,6 +2288,17 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     expect(devContainer()?.state).toBe('stopped');
     expect(dbContainer()?.state).toBe('stopped');
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('says in the start failure that the configuration could not be checked when the daemon failed at the load (review round 1 of PR #64, L2)', async () => {
+    await seedCompose();
+    h.docker.transientImages = 'all';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(
+      'The Docker Compose configuration could not be checked. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.',
+    );
+    expect(h.logger.warnings).toContain(`The Docker Compose configuration of ${REPO} could not be checked. Its containers are not started.`);
   });
 
   it('does not use a new configuration whose images Docker could not inspect (G1)', async () => {

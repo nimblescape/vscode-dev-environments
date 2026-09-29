@@ -557,6 +557,8 @@ export class FakeHelper implements EnvironmentHelper {
    * current helper image could not be built.
    */
   previousHelperTag: string | undefined;
+  /** The checked image ID of the previous helper (review round 1 of PR #64, S1). */
+  previousHelperImageId = `sha256:${'5'.repeat(64)}`;
   cloneError: Maybe<Error>;
   readConfigurationError: Maybe<Error>;
   buildError: (imageName: string) => Maybe<Error> = () => undefined;
@@ -668,11 +670,11 @@ export class FakeHelper implements EnvironmentHelper {
     }
   }
 
-  async ensureImage(options: { onOutput?: (text: string) => void; onPreviousHelper?: (tag: string) => void } = {}): Promise<string> {
+  async ensureImage(options: { onOutput?: (text: string) => void; onPreviousHelper?: (tag: string, imageId: string) => void } = {}): Promise<string> {
     this.calls.push('ensureImage');
     if (this.ensureImageError) throw this.ensureImageError;
     if (this.previousHelperTag !== undefined) {
-      options.onPreviousHelper?.(this.previousHelperTag);
+      options.onPreviousHelper?.(this.previousHelperTag, this.previousHelperImageId);
       return this.previousHelperTag;
     }
     return 'devenv-helper:test';

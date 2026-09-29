@@ -132,9 +132,11 @@ export interface EnsureHelperImageOptions {
   onBuild?: (kind: HelperBuildKind) => void;
   /**
    * Previous helper (user decision 2026-09-29): called when the current tag could not be built and the previous helper
-   * tag `tag` is returned in its place. The next ensure tries to build the current tag again.
+   * tag `tag` is returned in its place. `imageId` is the ID of its image that was checked against helper.json: the helper
+   * runs use it, not the tag, so a tag that moves after the check is never run (review round 1 of PR #64, S1). The next
+   * ensure tries to build the current tag again.
    */
-  onPreviousHelper?: (tag: string) => void;
+  onPreviousHelper?: (tag: string, imageId: string) => void;
   /**
    * Called with the check of the base image when it starts. It runs in the background, after this function returned; the
    * promise never rejects (for tests, and for callers that want to wait for it).
@@ -179,7 +181,7 @@ interface Maintenance {
  * - `lastUsedAt` of the tag is written (at most once per hour); with `maintain`, the cleanup runs (at most once per day).
  * - Previous helper (user decision 2026-09-29): when the missing tag cannot be built, the newest previous helper tag
  *   that this installation built and whose image is still the one it built (usePreviousHelper) is returned instead, and
- *   `onPreviousHelper` is called; without one, the error of the build is thrown.
+ *   `onPreviousHelper` is called with it and the ID of its image; without one, the error of the build is thrown.
  * Problems of the check, the state file, and the cleanup are logged and never make this function fail.
  */
 export async function ensureHelperImage(
@@ -528,8 +530,9 @@ function needsImageId(record: HelperImageRecord | undefined): boolean {
  * (by `builtAt`) other helper tag that this installation built is used, if the engine still has it: an image with the
  * label nimblescape.devenv.helper=true, the tag, and exactly the image ID that `helper.json` recorded for the build
  * (`imageId`). An image of the helper repository that someone else made, a foreign or removed tag, and a tag whose image
- * changed are never used. Records the use (`lastUsedAt`) and the tag as `previousTag`, so the cleanup keeps it. Returns
- * the tag, or `undefined` when there is none. Never throws, except for an abort.
+ * changed are never used. Records the use (`lastUsedAt`, which keeps the image for 7 days) and the tag as `previousTag`.
+ * Returns the tag, or `undefined` when there is none; `onPreviousHelper` gets the tag and the checked image ID, which the
+ * helper runs use (review round 1 of PR #64, S1). Never throws, except for an abort.
  */
 async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string | undefined> {
   const state = await readHelperState(m.statePath);
@@ -538,22 +541,22 @@ async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string
     .sort(([, a], [, b]) => (Date.parse(b.builtAt ?? '') || 0) - (Date.parse(a.builtAt ?? '') || 0));
   const images = candidates.length > 0 ? await listHelperImages(m) : undefined;
   if (m.options.signal?.aborted) throw abortError();
-  let previous: string | undefined;
+  let previous: { tag: string; imageId: string } | undefined;
   for (const [tag, record] of candidates) {
     const image = images?.find((item) => item.tags.includes(tag));
     if (image === undefined) continue;
-    if (image.id !== record.imageId) {
+    if (record.imageId === undefined || image.id !== record.imageId) {
       m.logger.warn(`The helper image ${tag} is not the image that this installation of Dev Environments built for it. It is not used as the previous helper.`);
       continue;
     }
-    previous = tag;
+    previous = { tag, imageId: record.imageId };
     break;
   }
   if (previous === undefined) {
     m.logger.warn(`The workspace helper image ${m.tag} could not be built, and there is no previous helper image of Dev Environments.`);
     return undefined;
   }
-  const tag = previous;
+  const { tag, imageId } = previous;
   m.logger.warn(
     `The workspace helper image ${m.tag} could not be built: ${errorMessage(error)}. The previous helper image ${tag} is used for now; ${m.tag} is built again at the next open.`,
   );
@@ -561,7 +564,7 @@ async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string
     fresh.images[tag] = { ...owned(fresh.images[tag]), lastUsedAt: isoTime(m.clock) };
     fresh.previousTag = tag;
   });
-  m.options.onPreviousHelper?.(tag);
+  m.options.onPreviousHelper?.(tag, imageId);
   return tag;
 }
 
@@ -614,8 +617,10 @@ async function removeHelperImage(m: Maintenance, image: ImageInfo, reference: st
  * days, so old windows during an update keep their helper. A removed tag gets a tombstone: when it comes back, another
  * installation built it again and uses it, so it stays (for HELPER_TOMBSTONE_MS), and two installations do not remove
  * each other's helper in a loop. Tags of other repositories are never removed. Previous helper (user decision
- * 2026-09-29): the `previousTag` of the state is kept until the current tag is an image that this installation built
- * (its recorded `imageId` is `currentId`); then it is forgotten, and the rules above apply to it.
+ * 2026-09-29): the cleanup runs only when the current tag exists, so it forgets the `previousTag` of the state; the rules
+ * above apply to its image (its `lastUsedAt` of the fallback keeps it for 7 days). Review round 1 of PR #64 (S4): before,
+ * it was kept until the current tag was an image that this installation built, which may never happen when another
+ * installation built it.
  */
 async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   const nowMs = m.clock.now();
@@ -625,8 +630,6 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   if (!images) return;
 
   const now = isoTime(m.clock);
-  const currentBuilt = state.images[m.tag]?.imageId === currentId;
-  const keptPrevious = currentBuilt ? undefined : state.previousTag;
   const listed = new Set<string>();
   const graced: string[] = [];
   const removed: string[] = [];
@@ -639,10 +642,6 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
     }
     for (const tag of image.tags.filter(isHelperImageTag)) {
       if (tag === m.tag) continue;
-      if (tag === keptPrevious) {
-        m.logger.info(`The previous workspace helper image ${tag} is kept until ${m.tag} is built.`);
-        continue;
-      }
       const record = state.images[tag];
       if (hasTombstone(record, nowMs)) {
         m.logger.info(`The workspace helper image ${tag} was built again after its removal: another installation uses it. It is kept.`);
@@ -660,7 +659,7 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
 
   await writeState(m, (fresh) => {
     fresh.lastCleanupAt = now;
-    if (currentBuilt || (fresh.previousTag !== undefined && !listed.has(fresh.previousTag))) delete fresh.previousTag;
+    delete fresh.previousTag;
     for (const tag of graced) {
       const record = fresh.images[tag];
       if (hasTombstone(record, nowMs)) continue;

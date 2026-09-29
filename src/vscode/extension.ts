@@ -323,8 +323,8 @@ async function activateExtension(
     dockerTarget: () => targets.current(),
     // Unit 7, PR 2: the Session Monitor on a remote host, with the socket that the workspace helper mounts there.
     remoteMonitor: {
-      ensure: async (host, helperTag, signal) =>
-        remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal),
+      ensure: async (host, helperTag, signal, helperImage) =>
+        remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal, helperImage),
       heartbeat: async (_host, environmentId, keepRunning, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),

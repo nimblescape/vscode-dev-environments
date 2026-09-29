@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -57,8 +58,18 @@ interface Call {
   options: RunOptions;
 }
 
+/**
+ * The image ID of the fake for a tag: a full `sha256:` ID, which helper.json keeps (review round 1 of PR #64, S5: an ID
+ * of another form, like the former `id:<tag>`, is dropped).
+ */
+function fakeImageId(tag: string): string {
+  return `sha256:${crypto.createHash('sha256').update(tag).digest('hex')}`;
+}
+
 class FakeDocker implements HelperDocker {
   readonly images = new Set<string>();
+  /** Image IDs that differ from fakeImageId(tag): a tag that points to another image now. */
+  readonly ids = new Map<string, string>();
   readonly builds: BuildOptions[] = [];
   readonly calls: Call[] = [];
   buildHandler: (options: BuildOptions) => Promise<void> = async () => undefined;
@@ -78,7 +89,11 @@ class FakeDocker implements HelperDocker {
 
   async imageId(reference: string): Promise<string | undefined> {
     this.imageIdCalls++;
-    return this.images.has(reference) ? `id:${reference}` : undefined;
+    return this.images.has(reference) ? this.idOf(reference) : undefined;
+  }
+
+  idOf(tag: string): string {
+    return this.ids.get(tag) ?? fakeImageId(tag);
   }
 
   async buildImage(options: BuildOptions): Promise<void> {
@@ -89,7 +104,7 @@ class FakeDocker implements HelperDocker {
 
   async listImagesByLabel(): Promise<ImageInfo[]> {
     this.listCalls++;
-    return [...this.images].map((tag) => ({ id: `id:${tag}`, tags: [tag], createdAt: '' }));
+    return [...this.images].map((tag) => ({ id: this.idOf(tag), tags: [tag], createdAt: '' }));
   }
 
   async removeImage(reference: string): Promise<boolean> {
@@ -120,6 +135,13 @@ function hasDockerAccess(args: string[]): boolean {
 function hasNoNetwork(args: string[]): boolean {
   const index = args.indexOf('--network');
   return index >= 0 && args[index + 1] === 'none';
+}
+
+/** The command after the image reference `image` in docker run arguments. */
+function commandOfImage(args: string[], image: string): string[] {
+  const index = args.indexOf(image);
+  expect(index).toBeGreaterThan(0);
+  return args.slice(index + 1);
 }
 
 /** The command after the image tag in docker run arguments. */
@@ -500,7 +522,8 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
       builtAt: iso(),
       checkedAt: iso(),
       lastUsedAt: iso(),
-      imageId: `id:${TAG}`,
+      // Changed expectation (review round 1 of PR #64, S5): the fake gives full sha256: IDs, the only form helper.json keeps.
+      imageId: fakeImageId(TAG),
     });
   });
 
@@ -555,7 +578,7 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     // A helper image that this installation built for the previous extension version.
     docker.images.add(PREVIOUS);
-    fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: `id:${PREVIOUS}` } } }));
+    fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(PREVIOUS) } } }));
     docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
     };
@@ -591,10 +614,13 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     expect(await helper.ensureImage({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(PREVIOUS);
     expect(previous).toEqual([PREVIOUS]);
     expect(state().previousTag).toBe(PREVIOUS);
+    // Changed expectation (review round 1 of PR #64, S1): the previous helper runs by the checked ID of its image, not by
+    // its tag; the arguments are those of the current helper except the image reference.
     await helper.run('vol', ['true']);
-    const withSocket = lastRunArgs(PREVIOUS);
+    expect(docker.runs[docker.runs.length - 1].args).not.toContain(PREVIOUS);
+    const withSocket = lastRunArgs(fakeImageId(PREVIOUS));
     await helper.run('vol', ['true'], { docker: false, network: false, secrets: true });
-    const withoutSocket = lastRunArgs(PREVIOUS);
+    const withoutSocket = lastRunArgs(fakeImageId(PREVIOUS));
     // The helper runs reuse the previous helper; they do not build.
     expect(docker.builds).toHaveLength(2);
 
@@ -610,6 +636,49 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     expect(lastRunArgs(TAG)).toEqual(withoutSocket);
     expect(withSocket.some((arg) => arg.includes('docker.sock'))).toBe(true);
     expect(withoutSocket.some((arg) => arg.includes('docker.sock'))).toBe(false);
+  });
+
+  it('runs the previous helper by the image ID it checked, also when its tag points to another image afterwards (review round 1 of PR #64, S1)', async () => {
+    const { helper } = setup();
+    const previous: Array<[string, string]> = [];
+    expect(await helper.ensureImage({ onPreviousHelper: (tag, imageId) => previous.push([tag, imageId]) })).toBe(PREVIOUS);
+    expect(previous).toEqual([[PREVIOUS, fakeImageId(PREVIOUS)]]);
+    // The tag moves to another image after the check (for example someone builds or pulls devenv-helper:<hash>).
+    docker.ids.set(PREVIOUS, `sha256:${'9'.repeat(64)}`);
+    await helper.run('vol', ['true']);
+    const args = docker.runs[docker.runs.length - 1].args;
+    expect(args).toContain(fakeImageId(PREVIOUS));
+    expect(args).not.toContain(PREVIOUS);
+    expect(args).not.toContain(`sha256:${'9'.repeat(64)}`);
+    expect(commandOfImage(args, fakeImageId(PREVIOUS))).toEqual(['true']);
+  });
+
+  it('asks for the image again when the previous helper image is gone at its run, and uses another previous helper (review round 1 of PR #64, S1)', async () => {
+    const { helper, state } = setup();
+    // An older helper image that this installation built, too.
+    const OLDER = 'devenv-helper:00000000000a';
+    docker.images.add(OLDER);
+    const saved = state();
+    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER) };
+    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
+    expect(await helper.ensureImage()).toBe(PREVIOUS);
+    // The image is removed before the run (for example by a prune): docker run answers "No such image" for the ID.
+    docker.handler = (args) => {
+      if (args.includes(fakeImageId(PREVIOUS))) {
+        docker.images.delete(PREVIOUS);
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(PREVIOUS)}.\n` };
+      }
+      return {};
+    };
+    const result = await helper.run('vol', ['true']);
+    expect(result.exitCode).toBe(0);
+    expect(docker.runs.map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')))).toEqual([
+      fakeImageId(PREVIOUS),
+      fakeImageId(OLDER),
+    ]);
+    expect(logger.lines).toContain(`warn The workspace helper image ${PREVIOUS} is missing. It is built again.`);
+    // The current tag was tried once more (offline), then the older previous helper was used.
+    expect(docker.builds.filter((build) => build.tag === TAG).length).toBeGreaterThan(2);
   });
 
   it('fails with helperFailed when the current tag cannot be built and no previous helper of this installation exists', async () => {

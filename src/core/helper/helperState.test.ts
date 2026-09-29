@@ -48,6 +48,25 @@ describe('parseHelperState', () => {
     expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: 7 } } })).toEqual({ version: 1, images: { [TAG]: {} } });
   });
 
+  it('keeps only a full sha256: image ID (review round 1 of PR #64, S5)', () => {
+    const id = `sha256:${'0123456789abcdef'.repeat(4)}`;
+    expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: id } } })).toEqual({ version: 1, images: { [TAG]: { imageId: id } } });
+    for (const imageId of [
+      'id:devenv-helper:0123456789ab',
+      'sha256:0123',
+      `sha256:${'A'.repeat(64)}`,
+      `sha256:${'0'.repeat(65)}`,
+      `${'0'.repeat(64)}`,
+      `sha512:${'0'.repeat(64)}`,
+      ` sha256:${'0'.repeat(64)}`,
+      `sha256:${'0'.repeat(64)}\n`,
+      'devenv-helper:0123456789ab',
+      '--privileged',
+    ]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, imageId } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME } } });
+    }
+  });
+
   it('keeps valid records', () => {
     const state = {
       version: 1,

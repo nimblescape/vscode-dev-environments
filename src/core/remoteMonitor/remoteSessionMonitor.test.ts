@@ -82,6 +82,21 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(docker.calls[1].args).toEqual(['rm', '-f', 'devenv-session-monitor']);
   });
 
+  it('runs a previous helper by its checked image ID, with the label and the log line of its tag (review round 1 of PR #64, S1)', async () => {
+    const imageId = `sha256:${'7'.repeat(64)}`;
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
+    const logger = new Log();
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET, undefined, imageId)).toBe('created');
+    const byId = docker.calls[1].args;
+    const byTag = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
+    await monitor(byTag).ensure(TAG, SOCKET);
+    // The same arguments as with the tag, the label included; only the image reference differs.
+    expect(byId).toEqual(byTag.calls[1].args.map((arg) => (arg === TAG ? imageId : arg)));
+    expect(byId).toContain(`${LABEL_SESSION_MONITOR}=${LABEL}`);
+    expect(byId).not.toContain(TAG);
+    expect(logger.lines).toContain(`info The Session Monitor on the Docker host was created (devenv-session-monitor, image ${TAG}).`);
+  });
+
   it('replaces a container of the name without the label', async () => {
     const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, undefined) : result(0)));
     expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('created');

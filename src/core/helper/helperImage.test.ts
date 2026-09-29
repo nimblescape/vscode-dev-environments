@@ -685,6 +685,19 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.lookups).toHaveLength(1);
   });
 
+  it('drops the recorded image ID when the ID of the rebuilt image cannot be read (review round 1 of PR #64, L3)', async () => {
+    const { h, oldId } = await changed();
+    expect(h.state().images[h.tag]?.imageId).toBe(oldId);
+    // The build succeeds, but Docker does not answer for the ID of the new image.
+    h.docker.buildHandler = async () => {
+      h.docker.imageIdError = new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    expect(await h.ensure()).toBe(h.tag);
+    expect(h.docker.builds).toHaveLength(1);
+    // The old ID is not the image of the tag any more: no ID is better than a wrong one.
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, baseDigest: DIGEST_B, builtAt: h.iso(), checkedAt: h.iso(), lastUsedAt: h.iso() });
+  });
+
   it('keeps the previous image when it still has another tag', async () => {
     const { h, oldId } = await changed();
     h.docker.images.get(oldId)!.tags.push('mine:backup');
@@ -1347,28 +1360,90 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     expect(h.state().previousTag).toBeUndefined();
   });
 
-  it('the daily cleanup keeps the previous tag until the current tag is an image that this installation built', async () => {
+  it('the daily cleanup forgets the previous tag once the current tag exists, and its image follows the usual rules', async () => {
+    // Changed expectation (review round 1 of PR #64, S4): before, the cleanup kept the previous tag until the current tag
+    // was an image that this installation built, which never happens while another installation built it; now it forgets
+    // the previous tag, and the lastUsedAt of the fallback keeps its image for 7 days.
     const h = new Harness();
-    const oldId = ownPrevious(h, OLD_TAG, 40 * DAY);
+    const oldId = ownPrevious(h, OLD_TAG, 40 * DAY, { lastUsedAt: h.iso(-HOUR) });
     // The current tag exists, but this installation did not build it (for example another installation of VS Code did).
-    const currentId = h.docker.addImage([h.tag]);
+    h.docker.addImage([h.tag]);
     h.writeState({ ...h.state(), previousTag: OLD_TAG, lastCleanupAt: h.iso(-2 * DAY) });
     expect(await h.ensure({ baseDigest: undefined })).toBe(h.tag);
     expect(h.docker.idOf(OLD_TAG)).toBe(oldId);
     expect(h.docker.removals).toEqual([]);
-    expect(h.state().previousTag).toBe(OLD_TAG);
+    expect(h.state().previousTag).toBeUndefined();
     expect(h.state().lastCleanupAt).toBe(h.iso());
-    expect(h.logger.lines.join('\n')).toContain(`The previous workspace helper image ${OLD_TAG} is kept until ${h.tag} is built.`);
+    expect(h.state().images[OLD_TAG]).toEqual({ builtAt: h.iso(-40 * DAY), imageId: oldId, lastUsedAt: h.iso(-HOUR) });
 
-    // Once the current tag is the image that this installation built, the next cleanup applies the usual rules to it.
-    const state = h.state();
-    state.images[h.tag] = { ...state.images[h.tag], builtAt: h.iso(-HOUR), imageId: currentId };
-    h.writeState(state);
-    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    // Unused for 7 days: the next cleanup removes it, although the current tag still is not an image that this
+    // installation built.
+    h.advance(HELPER_UNUSED_LIMIT_MS);
     await h.ensure({ baseDigest: undefined });
     expect(h.docker.idOf(OLD_TAG)).toBeUndefined();
-    expect(h.state().previousTag).toBeUndefined();
     expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h.iso() });
+  });
+
+  it('the daily cleanup forgets a previous tag whose image is gone (review round 1 of PR #64, L3)', async () => {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
+    h.writeState({ version: 1, images: { [OLD_TAG]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-HOUR) } }, previousTag: OLD_TAG, lastCleanupAt: h.iso(-2 * DAY) });
+    await h.ensure({ baseDigest: undefined });
+    expect(h.state().previousTag).toBeUndefined();
+    expect(h.state().lastCleanupAt).toBe(h.iso());
+  });
+
+  it('keeps the previous tag while the daily cleanup is not due (review round 1 of PR #64, S4)', async () => {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
+    h.writeState({ version: 1, images: {}, previousTag: OLD_TAG, lastCleanupAt: h.iso(-HOUR) });
+    await h.ensure({ baseDigest: undefined });
+    expect(h.state().previousTag).toBe(OLD_TAG);
+  });
+
+  it('skips a candidate without an image ID without a warning (review round 1 of PR #64, L3)', async () => {
+    const h = new Harness();
+    h.docker.addImage([OLD_TAG]);
+    h.writeState({ version: 1, images: { [OLD_TAG]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-DAY) } } });
+    h.docker.buildHandler = offline;
+    await expect(h.ensure()).rejects.toBeInstanceOf(CommandError);
+    expect(h.warnings().join('\n')).not.toContain('is not the image that this installation');
+    expect(h.warnings().join('\n')).toContain('there is no previous helper image of Dev Environments.');
+    expect(h.docker.labelQueries).toEqual([]);
+    expect(h.state().previousTag).toBeUndefined();
+  });
+
+  it('throws an abort that comes while it lists the previous helper images (review round 1 of PR #64, L3)', async () => {
+    const h = new Harness();
+    ownPrevious(h, OLD_TAG, DAY);
+    h.docker.buildHandler = offline;
+    const controller = new AbortController();
+    const list = h.docker.listImagesByLabel.bind(h.docker);
+    h.docker.listImagesByLabel = async (label) => {
+      controller.abort();
+      return list(label);
+    };
+    const previous: string[] = [];
+    await expect(h.ensure({ signal: controller.signal, onPreviousHelper: (tag) => previous.push(tag) })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(previous).toEqual([]);
+    expect(h.state().previousTag).toBeUndefined();
+  });
+
+  it('passes the checked image ID of the previous helper to onPreviousHelper (review round 1 of PR #64, S1)', async () => {
+    const h = new Harness();
+    const oldId = ownPrevious(h, OLD_TAG, DAY);
+    h.docker.buildHandler = offline;
+    const previous: Array<[string, string]> = [];
+    expect(await h.ensure({ onPreviousHelper: (tag, imageId) => previous.push([tag, imageId]) })).toBe(OLD_TAG);
+    expect(previous).toEqual([[OLD_TAG, oldId]]);
+  });
+
+  it('records no image ID for a current tag whose record is of another installation (review round 1 of PR #64, L3)', async () => {
+    const h = new Harness();
+    h.docker.addImage([h.tag]);
+    h.writeState({ version: 1, images: { [h.tag]: { builtAt: h.iso(-DAY), foreignSince: h.iso(-DAY), lastUsedAt: h.iso(-DAY) } }, lastCleanupAt: h.iso() });
+    await h.ensure({ baseDigest: undefined });
+    expect(h.state().images[h.tag]).toEqual({ builtAt: h.iso(-DAY), lastUsedAt: h.iso() });
   });
 
   it('records the image ID of a tag that this installation built before the ID was recorded, but not of one it did not build', async () => {

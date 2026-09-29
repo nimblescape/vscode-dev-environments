@@ -103,9 +103,11 @@ export class RemoteSessionMonitor {
    * matching label that runs → nothing; that is stopped → `docker start`; missing or with another label → `docker rm -f`,
    * then `docker run`. When another window created it meanwhile (a name conflict), it looks once more and accepts a
    * matching one that runs. `socketPath`: the source of the socket mount on the host of the engine (as for the workspace
-   * helper, rootless aware). Never throws, except an AbortError; a failure is logged as a warning.
+   * helper, rootless aware). `helperImage`: the image reference of `docker run` when it is not `helperTag`: the checked
+   * image ID of a previous helper (review round 1 of PR #64, S1); the label and the log lines keep the tag. Never throws,
+   * except an AbortError; a failure is logged as a warning.
    */
-  async ensure(helperTag: string, socketPath: string, signal?: AbortSignal): Promise<EnsureOutcome> {
+  async ensure(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<EnsureOutcome> {
     const { logger } = this.options;
     try {
       const script = await this.options.script();
@@ -116,7 +118,7 @@ export class RemoteSessionMonitor {
       // time zone on the same engine do not replace it at each open.
       const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
       // PR #57: the command line as a whole, before an old monitor is removed.
-      const runArgs = this.runArgs(helperTag, socketPath, label, script, images);
+      const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images);
       if (windowsCommandLineLength(['docker', ...runArgs]) > MAX_WINDOWS_COMMAND_LINE) {
         throw new Error(`The command line of the Session Monitor is too long (${windowsCommandLineLength(['docker', ...runArgs])} characters).`);
       }
@@ -202,8 +204,8 @@ export class RemoteSessionMonitor {
     }
   }
 
-  /** The arguments of `docker run` for the monitor container. */
-  runArgs(helperTag: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings): string[] {
+  /** The arguments of `docker run` for the monitor container. `helperImage`: the helper tag, or an image ID (S1). */
+  runArgs(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings): string[] {
     const imagePrefixes = images?.prefixes ?? [];
     const args = ['run', '-d', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
     for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
@@ -217,7 +219,7 @@ export class RemoteSessionMonitor {
     args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
     const tail: string[] = [];
     for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) tail.push('-e', `${key}=${value}`);
-    tail.push(helperTag, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);
+    tail.push(helperImage, 'sh', '-c', REMOTE_MONITOR_BOOTSTRAP, 'sh', script);
     if (images && imagePrefixes.length > 0) {
       const settings = ['-e', `DEVENV_IMAGE_SCHEDULE=${images.schedule}`, '-e', `DEVENV_IMAGE_TZ=${images.timeZone}`];
       // Review round 9 of PR #57: as many prefixes as the command line of Windows still takes (at least one); the whole

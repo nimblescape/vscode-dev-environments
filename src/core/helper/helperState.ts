@@ -23,7 +23,8 @@ export interface HelperImageRecord {
    * ID of the image that this installation built for the tag (`sha256:…`, written after each build, or once for a tag
    * that it built before this field existed). Previous helper (user decision 2026-09-29): only a tag whose image still
    * has this ID is ever used in place of a current tag that cannot be built, never an image of the helper repository
-   * that someone else made.
+   * that someone else made, and it runs by this ID, not by its tag (review round 1 of PR #64, S1). Only a full
+   * `sha256:<64 hex characters>` ID is kept (S5).
    */
   imageId?: string;
   /**
@@ -55,12 +56,14 @@ export interface HelperState {
   lastCleanupAt?: string;
   /**
    * Previous helper (user decision 2026-09-29): the helper tag that an open used because the current tag could not be
-   * built. The daily cleanup keeps it until the current tag is an image that this installation built.
+   * built. The daily cleanup, which runs only when the current tag exists, forgets it (review round 1 of PR #64, S4).
    */
   previousTag?: string;
 }
 
 const HELPER_TAG = /^devenv-helper:[0-9a-f]{12}$/;
+/** A full image ID (review round 1 of PR #64, S5). */
+const IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
 
 /**
  * True for a tag that `helperImageTag` returns: `devenv-helper:<12 hex characters>`. The state keeps only such keys (so a
@@ -107,8 +110,8 @@ function isTime(value: unknown): value is string {
 
 /**
  * The valid part of the file content: another version, or a value that is not an object, gives an empty state; entries
- * with an invalid tag, and fields with an invalid value (a time that does not parse, a value that is not a string), are
- * dropped.
+ * with an invalid tag, and fields with an invalid value (a time that does not parse, a value that is not a string, an
+ * `imageId` that is not a full `sha256:` ID), are dropped.
  */
 export function parseHelperState(value: unknown): HelperState {
   const state = emptyHelperState();
@@ -123,6 +126,8 @@ export function parseHelperState(value: unknown): HelperState {
       const fieldValue = entry[field];
       if (typeof fieldValue !== 'string' || fieldValue === '') continue;
       if (TIME_FIELDS.has(field) && !isTime(fieldValue)) continue;
+      // Review round 1 of PR #64 (S5): the helper runs of a previous helper use this ID as the image reference.
+      if (field === 'imageId' && !IMAGE_ID.test(fieldValue)) continue;
       record[field] = fieldValue;
     }
     state.images[tag] = record;

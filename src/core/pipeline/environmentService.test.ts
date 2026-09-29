@@ -1376,6 +1376,39 @@ describe('open: existing environment', () => {
     expect(h.helper.ups).toEqual([]);
   });
 
+  it('fails with helperFailed at once, without a warning, for a running container that is outdated (review round 1 of PR #64, L2)', async () => {
+    // Before: the open warned with helperFailed, logged that the environment is started, and then failed with the same
+    // text; the outdated container would be created again, which needs the helper.
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.logger.errors.join('\n')).not.toContain('The existing environment is started');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+  });
+
+  it('logs that a running current container is opened as it is when the helper is not available (review round 1 of PR #64, L2)', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    await h.service.open(TARGET, options());
+    expect(h.logger.errors).toEqual([
+      `The configuration of ${REPO} could not be used. The running environment is opened as it is. ${Messages.helperFailed}`,
+    ]);
+  });
+
+  it('logs that a stopped container is started without the configuration that cannot be read (review round 1 of PR #64, L2)', async () => {
+    await seedEnvironment(h);
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    await h.service.open(TARGET, options());
+    expect(h.logger.errors.filter((line) => line.startsWith('The configuration of'))).toEqual([
+      expect.stringMatching(new RegExp(`^The configuration of ${REPO} could not be used\\. The existing environment is started without it\\. `)),
+    ]);
+    expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
+  });
+
   it('starts through the Dev Container CLI with a previous helper image when the current one cannot be built', async () => {
     // No docker start fallback, previous helper, user decision 2026-09-29.
     await seedEnvironment(h);

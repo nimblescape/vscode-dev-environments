@@ -39,8 +39,9 @@ function setup(
   const calls: string[] = [];
   seqs = [];
   const remoteMonitor: EnvironmentRemoteMonitor = {
-    ensure: async (host, helperTag) => {
-      calls.push(`ensure ${host} ${helperTag}`);
+    ensure: async (host, helperTag, _signal, helperImage) => {
+      // Review round 1 of PR #64 (S1): the image reference of a previous helper, when it is not the tag.
+      calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
       // In the order of the helper calls.
       created.helper.calls.push('remote monitor');
       return behavior.ensure?.();
@@ -75,6 +76,14 @@ describe('the Session Monitor on a remote host in the open pipeline', () => {
     expect(order.indexOf('remote monitor')).toBeLessThan(order.indexOf('first heartbeat'));
     const up = order.findIndex((call) => call.startsWith('up '));
     expect(up).toBeGreaterThan(order.indexOf('first heartbeat'));
+  });
+
+  it('runs the monitor with the checked image ID of a previous helper, and labels it with its tag (review round 1 of PR #64, S1)', async () => {
+    const { h, calls } = setup(REMOTE);
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(calls[0]).toBe(`ensure build-box devenv-helper:0123456789ab image ${h.helper.previousHelperImageId}`);
   });
 
   it('an open of a stopped environment on a remote host ensures it before the container starts', async () => {
