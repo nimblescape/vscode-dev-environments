@@ -82,6 +82,17 @@ export class SessionFiles {
     await retryTransient(() => removeFile(file));
   }
 
+  // --- Disconnect requests (disconnect/<environment-id>.json, src/vscode/disconnectRequests.ts) ---------------------
+
+  /**
+   * Removes the disconnect request of the environment (Delete; monitor cleanup, user decision 2026-09-29). A missing one
+   * is not an error.
+   */
+  async removeDisconnectRequest(environmentId: string): Promise<void> {
+    const file = this.paths.disconnectFile(environmentId);
+    await retryTransient(() => removeFile(file));
+  }
+
   // --- Pending operations (operations/<environment-id>.json) -------------------------------------------------------
 
   async writeOperation(operation: PendingOperation): Promise<void> {

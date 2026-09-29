@@ -15,7 +15,7 @@ import {
   remoteMonitorLabelValue,
   windowsCommandLineLength,
 } from './protocol';
-import { REMOTE_MONITOR_BOOTSTRAP, RemoteSessionMonitor, isMissingContainer } from './remoteSessionMonitor';
+import { REMOTE_MONITOR_BOOTSTRAP, REMOTE_MONITOR_LOG_OPTIONS, RemoteSessionMonitor, isMissingContainer } from './remoteSessionMonitor';
 
 const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';
@@ -126,6 +126,13 @@ describe('RemoteSessionMonitor.ensure', () => {
       'ALL',
       '--security-opt',
       'no-new-privileges',
+      // Monitor cleanup, user decision 2026-09-29 (R5): the log of the monitor is capped, with the driver named.
+      '--log-driver',
+      'json-file',
+      '--log-opt',
+      'max-size=1m',
+      '--log-opt',
+      'max-file=2',
       '-v',
       '/run/user/1000/docker.sock:/var/run/docker.sock',
       '-v',
@@ -298,6 +305,21 @@ describe('RemoteSessionMonitor: images', () => {
     // Still no capability, no published port, no new privileges.
     expect(args).toEqual(expect.arrayContaining(['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']));
     expect(args.some((arg) => arg === '-p' || arg === '--publish')).toBe(false);
+  });
+
+  // Monitor cleanup, user decision 2026-09-29 (R5): the log of the monitor is capped with and without image maintenance,
+  // with the json-file driver named (max-size alone fails where journald or syslog is the default driver).
+  it('caps the Docker log of the container in every variant', () => {
+    const plain = monitor(new FakeDocker(() => result(0)));
+    const capped = ['--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=2'];
+    expect(REMOTE_MONITOR_LOG_OPTIONS).toEqual(capped);
+    for (const args of [plain.runArgs(TAG, SOCKET, LABEL, SCRIPT), plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, IMAGES)]) {
+      const at = args.indexOf('--log-driver');
+      expect(at).toBeGreaterThan(0);
+      expect(args.slice(at, at + capped.length)).toEqual(capped);
+      // Options of `docker run`, before the image.
+      expect(at).toBeLessThan(args.indexOf(TAG));
+    }
   });
 
   // Review round 1 of PR #57 (C; K): the prefixes, the time and the time zone were part of the label, so two computers

@@ -64,6 +64,9 @@ describe('StoragePaths', () => {
     expect(paths.sessionFile(WINDOW_ID)).toBe(path.join(root, 'sessions', `${WINDOW_ID}.json`));
     expect(paths.pendingFile(ENV_ID)).toBe(path.join(root, 'pending', `${ENV_ID}.json`));
     expect(paths.operationFile(ENV_ID)).toBe(path.join(root, 'operations', `${ENV_ID}.json`));
+    // Monitor cleanup, user decision 2026-09-29: the disconnect requests (their layout moved here from disconnectRequests.ts).
+    expect(paths.disconnectDir).toBe(path.join(root, 'disconnect'));
+    expect(paths.disconnectFile(ENV_ID)).toBe(path.join(root, 'disconnect', `${ENV_ID}.json`));
   });
 
   it('names claimed operation files so that they do not end in .json and can be parsed back', () => {
@@ -90,6 +93,7 @@ describe('StoragePaths', () => {
       expect(() => paths.sessionFile(id)).toThrow(/Invalid window ID/);
       expect(() => paths.pendingFile(id)).toThrow(/Invalid environment ID/);
       expect(() => paths.operationFile(id)).toThrow(/Invalid environment ID/);
+      expect(() => paths.disconnectFile(id)).toThrow(/Invalid environment ID/);
       expect(() => paths.claimedOperationFile(ENV_ID, id, 0)).toThrow(/Invalid window ID/);
     },
   );

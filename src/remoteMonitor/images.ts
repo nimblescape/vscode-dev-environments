@@ -159,8 +159,8 @@ function versionOf(tag: string): number[] | undefined {
  */
 function compareVersions(a: number[], b: number[]): number {
   for (let index = 0; index < Math.max(a.length, b.length); index++) {
-    const x = a[index] ?? Number.POSITIVE_INFINITY;
-    const y = b[index] ?? Number.POSITIVE_INFINITY;
+    const x = a[index] ?? Infinity;
+    const y = b[index] ?? Infinity;
     if (x !== y) return x < y ? -1 : 1;
   }
   return 0;
@@ -273,6 +273,20 @@ export function parseReplacedImages(text: string): ReplacedImages {
   }
 }
 
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R3): the stored IDs without the repositories that keep none. A new record; the
+ * given one is not changed. Review round 1 of PR #63 (B1): the repositories of no current prefix stay: the prefixes are
+ * those of the computer that opened last, so on a shared engine they change between computers, and the replaced images
+ * of the others would be left on the disk for ever.
+ */
+export function pruneReplacedImages(replaced: ReplacedImages): ReplacedImages {
+  const result: ReplacedImages = {};
+  for (const [repository, ids] of Object.entries(replaced)) {
+    if (ids.length > 0) result[repository] = ids;
+  }
+  return result;
+}
+
 /** The time of `CreatedAt` of `docker image ls` or `Created` of `docker image inspect` (ms; 0 when unknown). */
 function createdTime(text: string): number {
   return Date.parse(text.replace(/ ([+-]\d{4}) [A-Z]+$/, ' $1')) || 0;
@@ -310,6 +324,9 @@ export class ImageMaintenance {
     } catch (error) {
       this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
+      // Monitor cleanup, user decision 2026-09-29 (R3): no empty lists (review round 1 of PR #63, B1: the repositories of
+      // other prefixes stay).
+      this.replaced = pruneReplacedImages(this.replaced);
       await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
   }

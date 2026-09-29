@@ -224,7 +224,7 @@ function underRecordsLock(command: readonly string[]): string[] {
   ];
 }
 
-/** Whether `command` runs under the lock of the records (heartbeatCommand, forgetCommand). */
+/** Whether `command` runs under the lock of the records (heartbeatCommand, forgetCommand, forgetIfUnchangedCommand). */
 export function isUnderRecordsLock(command: readonly string[]): boolean {
   return command[0] === 'flock';
 }
@@ -263,6 +263,15 @@ export function recordsCommand(environmentId: string): string[] {
  */
 export function forgetCommand(source: string, environmentId: string): string[] {
   return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId]);
+}
+
+/**
+ * Review round 1 of PR #63 (F2): the command with which the monitor itself removes an old record (`forget` with the `at`
+ * of the record as it read it), under the lock of the records: it removes the record only when its `at` is still that
+ * one, so a heartbeat written after the read stays. It prints `removed` when it removed it.
+ */
+export function forgetIfUnchangedCommand(source: string, environmentId: string, at: number): string[] {
+  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId, String(at)]);
 }
 
 // ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the

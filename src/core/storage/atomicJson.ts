@@ -8,7 +8,13 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
-function tempPath(file: string): string {
+/**
+ * The temporary file of an atomic write of `file`: `.<name>.<pid>.<8 hex>.tmp` in the same folder. Every atomic writer
+ * of the global storage folder names its temporary file with it (writeJsonAtomic, FileLogger in monitorLog.ts, the
+ * heartbeat of SessionCoordinator, computerId.ts), so that the sweep of the storage folder (storageSweep.ts, R8,
+ * ATOMIC_TEMPORARY_FILE) removes one that a killed write left behind (review round 9 of PR #63, A4/B6).
+ */
+export function atomicTemporaryPath(file: string): string {
   return path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
 }
 
@@ -43,7 +49,7 @@ export function readJsonSync<T>(file: string): T | undefined {
 
 export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  const temp = tempPath(file);
+  const temp = atomicTemporaryPath(file);
   try {
     await fs.promises.writeFile(temp, JSON.stringify(value, null, 2), 'utf8');
     await fs.promises.rename(temp, file);
@@ -56,7 +62,7 @@ export async function writeJsonAtomic(file: string, value: unknown): Promise<voi
 /** Synchronous variant for `deactivate()` (implementation notes 4). */
 export function writeJsonAtomicSync(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const temp = tempPath(file);
+  const temp = atomicTemporaryPath(file);
   try {
     fs.writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8');
     fs.renameSync(temp, file);

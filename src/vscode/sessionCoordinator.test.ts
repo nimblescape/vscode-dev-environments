@@ -4,12 +4,14 @@
 
 import type { SpawnOptions } from 'child_process';
 import * as fs from 'fs';
+import { createRequire, syncBuiltinESMExports } from 'module';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
+import { ATOMIC_TEMPORARY_FILE } from '../core/storage/storageSweep';
 import type { ExtensionSettings, WindowStatus } from '../core/types';
 import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
@@ -167,6 +169,29 @@ describe('SessionCoordinator', () => {
     expect(first.windowId).not.toBe(second.windowId);
     first.dispose();
     second.dispose();
+  });
+
+  // Review round 10 of PR #63 (B-R10-1): the status file is written under the name form of atomicTemporaryPath, in the
+  // sessions folder, so that the sweep of the storage folder (storageSweep.ts, R8) removes a leftover.
+  it('writes the status file through a temporary file that the sweep of the storage folder recognises', async () => {
+    // The namespace of the ES module `fs` cannot be spied on; its CommonJS exports can, and syncBuiltinESMExports
+    // passes the spy on to the namespace that sessionCoordinator.ts reads.
+    const spy = vi.spyOn(createRequire(import.meta.url)('fs') as typeof fs, 'renameSync');
+    syncBuiltinESMExports();
+    try {
+      await h.coordinator.start(ID_A);
+      const file = h.paths.sessionFile('window-1');
+      const writes = spy.mock.calls.filter(([, target]) => target === file);
+      expect(writes.length).toBeGreaterThan(0);
+      for (const [temporary] of writes) {
+        expect(path.dirname(String(temporary))).toBe(h.paths.sessionsDir);
+        expect(path.basename(String(temporary))).toMatch(ATOMIC_TEMPORARY_FILE);
+        expect(path.basename(String(temporary)).startsWith(`.window-1.json.${process.pid}.`)).toBe(true);
+      }
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 
   it('start writes the active status file, removes the pending file, writes monitor.json, and starts the monitor', async () => {

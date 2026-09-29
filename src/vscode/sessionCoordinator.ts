@@ -15,6 +15,7 @@ import * as path from 'path';
 import type * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
 import { isoTime, systemClock, type Clock, type Logger } from '../core/ports';
+import { atomicTemporaryPath } from '../core/storage/atomicJson';
 import { retryTransient, retryTransientSync, type StoragePaths } from '../core/storage/paths';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
@@ -342,10 +343,8 @@ export class SessionCoordinator implements vscode.Disposable {
       ...(dockerContext ? { dockerContext } : {}),
     };
     const file = this.paths.sessionFile(this.windowId);
-    const temp = path.join(
-      path.dirname(file),
-      `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`,
-    );
+    // The name form of writeJsonAtomic, so that the sweep of the storage folder removes a leftover (storageSweep.ts, R8).
+    const temp = atomicTemporaryPath(file);
     try {
       await fs.promises.mkdir(path.dirname(file), { recursive: true });
       await retryTransient(() => fs.promises.writeFile(temp, JSON.stringify(status, null, 2), 'utf8'));

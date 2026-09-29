@@ -24,6 +24,9 @@ function checkedId(kind: string, id: string): string {
   return id;
 }
 
+/** Folder of the disconnect requests (`disconnect/<environment-id>.json`, src/vscode/disconnectRequests.ts). */
+export const DISCONNECT_DIR_NAME = 'disconnect';
+
 /** Marker in the name of a claimed operation file. The name does not end in `.json`, so `listJsonFiles` skips it. */
 export const CLAIM_MARKER = '.claimed.';
 
@@ -50,6 +53,8 @@ export class StoragePaths {
   readonly pendingDir: string;
   /** Pending operations, `<environment-id>.json`, and claimed operations. */
   readonly operationsDir: string;
+  /** Disconnect requests, `<environment-id>.json` (src/vscode/disconnectRequests.ts). */
+  readonly disconnectDir: string;
   /** Reopen record. */
   readonly reopen: string;
   /** Settings for the Session Monitor. */
@@ -75,6 +80,7 @@ export class StoragePaths {
     this.sessionsDir = path.join(root, 'sessions');
     this.pendingDir = path.join(root, 'pending');
     this.operationsDir = path.join(root, 'operations');
+    this.disconnectDir = path.join(root, DISCONNECT_DIR_NAME);
     this.reopen = path.join(root, 'reopen.json');
     this.monitorSettings = path.join(root, 'monitor.json');
     this.monitorLock = path.join(root, 'monitor.lock');
@@ -107,6 +113,11 @@ export class StoragePaths {
   /** `operations/<environment-id>.json`. Throws for an invalid ID. */
   operationFile(environmentId: string): string {
     return path.join(this.operationsDir, `${checkedId('environment ID', environmentId)}.json`);
+  }
+
+  /** `disconnect/<environment-id>.json`. Throws for an invalid ID. */
+  disconnectFile(environmentId: string): string {
+    return path.join(this.disconnectDir, `${checkedId('environment ID', environmentId)}.json`);
   }
 
   /** `operations/<environment-id>.claimed.<time in ms>.<window-id>`. Throws for an invalid ID. */

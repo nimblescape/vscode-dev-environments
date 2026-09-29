@@ -43,6 +43,13 @@ export const REMOTE_MONITOR_EXEC_TIMEOUT_MS = 20_000;
  */
 export const REMOTE_MONITOR_BOOTSTRAP = `mkdir -p /opt/devenv && printf %s "$1" > ${REMOTE_MONITOR_SCRIPT_PATH} && exec node ${REMOTE_MONITOR_SCRIPT_PATH} run`;
 
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R5): the log options of the monitor container, `docker logs` of at most
+ * about 2 MB. Not part of the label (remoteMonitorLabelValue covers the script, the helper tag and whether it maintains
+ * images): a running monitor keeps its log settings until it is replaced for another reason.
+ */
+export const REMOTE_MONITOR_LOG_OPTIONS: readonly string[] = ['--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=2'];
+
 /** The part of ContainerAdapter that is used here. */
 export interface RemoteMonitorDocker {
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
@@ -219,6 +226,9 @@ export class RemoteSessionMonitor {
     args.push('--restart', 'unless-stopped');
     if (imagePrefixes.length === 0) args.push('--network', 'none');
     args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
+    // Monitor cleanup, user decision 2026-09-29 (R5): its own Docker log is capped (two files of at most 1 MB). The driver
+    // is named, as max-size fails on a host whose default driver is journald or syslog.
+    args.push(...REMOTE_MONITOR_LOG_OPTIONS);
     args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
     const tail: string[] = [];
     for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) tail.push('-e', `${key}=${value}`);

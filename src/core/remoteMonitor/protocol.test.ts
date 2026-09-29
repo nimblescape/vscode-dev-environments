@@ -12,6 +12,7 @@ import {
   REMOTE_MONITOR_SCRIPT_PATH,
   clampLimitSeconds,
   forgetCommand,
+  forgetIfUnchangedCommand,
   heartbeatCommand,
   isUnderRecordsLock,
   monitorExecFailure,
@@ -159,6 +160,8 @@ describe('the subcommands of the remote monitor', () => {
     expect(heartbeatCommand(heartbeat)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
     expect(recordsCommand(ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', ID]);
     expect(forgetCommand(SOURCE, ID)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    // Review round 1 of PR #63 (F2): the removal of an old record by the monitor itself, under the same lock.
+    expect(forgetIfUnchangedCommand(SOURCE, ID, 1234)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID, '1234']);
   });
 
   // Review round 3 of PR #58 (F7): a busy lock and the time limit are named in the log, not only their exit codes.
@@ -172,6 +175,7 @@ describe('the subcommands of the remote monitor', () => {
     expect(monitorExecFailure(75, '', false)).toBe('exit code 75');
     expect(isUnderRecordsLock(heartbeatCommand({ source: SOURCE, limitSeconds: 600, environments: [] }))).toBe(true);
     expect(isUnderRecordsLock(forgetCommand(SOURCE, ID))).toBe(true);
+    expect(isUnderRecordsLock(forgetIfUnchangedCommand(SOURCE, ID, 1234))).toBe(true);
     expect(isUnderRecordsLock(recordsCommand(ID))).toBe(false);
   });
 

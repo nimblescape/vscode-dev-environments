@@ -14,6 +14,7 @@ import { readOrCreateComputerId } from '../core/storage/computerId';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
+import { sweepStorage } from '../core/storage/storageSweep';
 import {
   acquireMonitorLock,
   isMonitorExitRequested,
@@ -106,6 +107,16 @@ export async function main(argv: readonly string[] = process.argv): Promise<numb
     refreshLock: () => {
       checkExitRequest();
       return refreshMonitorLock(paths.monitorLock);
+    },
+    // Monitor cleanup, user decision 2026-09-29 (R6–R8): the outdated files of the windows, at most once per hour.
+    sweep: async () => {
+      const removed = await sweepStorage(paths, Date.now());
+      const count = removed.pending.length + removed.disconnect.length + removed.temporary.length;
+      if (count > 0) {
+        logger.info(
+          `Removed outdated files of the storage folder: ${removed.pending.length} pending connection(s), ${removed.disconnect.length} disconnect request(s), ${removed.temporary.length} temporary file(s).`,
+        );
+      }
     },
   });
 
