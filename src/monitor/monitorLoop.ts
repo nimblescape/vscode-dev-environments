@@ -575,7 +575,7 @@ export class MonitorLoop {
 
     const input: HeartbeatInput = {
       source,
-      limitSeconds: clampLimitSeconds(settings.remoteStopAfterSeconds ?? remoteStopAfterSeconds(undefined)),
+      limitSeconds: clampLimitSeconds(settings.remoteStopAfterSeconds),
       // Review round 2 of PR #39 (L1): `seq` is the time of this tick, taken before the registry was read.
       environments: [...entries].map(([id, keepRunning]) =>
         clearOnly.has(id) ? { id, keepRunning, seq: now, clearOnly: true as const } : { id, keepRunning, seq: now },

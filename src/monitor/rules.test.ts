@@ -38,6 +38,7 @@ function settings(overrides: Partial<MonitorSettings> = {}): MonitorSettings {
     waitingTimeSeconds: 30,
     stopOnClose: true,
     respectShutdownActionNone: false,
+    remoteStopAfterSeconds: 600,
     updatedAt: iso(T0),
     ...overrides,
   };

@@ -276,7 +276,7 @@ export interface WindowStatus {
   updatedAt: string;
   /**
    * The Docker context named in the authority of the window (review of the attach context, A2): another window that
-   * wants to show this one opens exactly its URI. Missing for a window without one (and in files of earlier versions).
+   * wants to show this one opens exactly its URI. Missing for a window without one.
    */
   dockerContext?: string;
 }
@@ -324,9 +324,9 @@ export interface MonitorSettings {
   respectShutdownActionNone: boolean;
   /**
    * Unit 7, PR 2: the time limit that the heartbeats give the Session Monitor on a remote Docker host (the setting
-   * remoteStopAfterMinutes in seconds). Missing (a file of an older window): DEFAULT_REMOTE_STOP_AFTER_SECONDS.
+   * remoteStopAfterMinutes in seconds).
    */
-  remoteStopAfterSeconds?: number;
+  remoteStopAfterSeconds: number;
   updatedAt: string;
 }
 

@@ -211,7 +211,7 @@ describe('Use a Remote Docker Host…', () => {
   });
 
   it('takes a typed SSH address after validation, and never changes an existing context (review, C1)', async () => {
-    cli.contexts.set('devenv-remote', 'ssh://old');
+    cli.contexts.set(remoteContextName('old-box'), 'ssh://old');
     cli.hosts.set('me@192.0.2.10:2222', engineInfo());
     answer(RemoteDockerTexts.enterAddress);
     window.showInputBox.mockImplementation(async (options: { validateInput: (value: string) => string | undefined }) => {
@@ -221,7 +221,7 @@ describe('Use a Remote Docker Host…', () => {
       return ' me@192.0.2.10:2222 ';
     });
     await commands.useRemoteHost();
-    // review, C1: the context of this host is created; `devenv-remote` of an earlier build stays as it is (before: updated).
+    // review, C1: the context of this host is created; the context of another host stays as it is (before: updated).
     const name = remoteContextName('me@192.0.2.10:2222');
     expect(cli.changes[0]).toEqual([
       'context',
@@ -232,7 +232,7 @@ describe('Use a Remote Docker Host…', () => {
       '--docker',
       'host=ssh://me@192.0.2.10:2222',
     ]);
-    expect(cli.contexts.get('devenv-remote')).toBe('ssh://old');
+    expect(cli.contexts.get(remoteContextName('old-box'))).toBe('ssh://old');
     expect(cli.current).toBe(name);
   });
 
@@ -503,8 +503,8 @@ describe('Use the Local Docker', () => {
   });
 
   it('uses the context default when none is remembered (or it is gone)', async () => {
-    cli.contexts.set('devenv-remote', 'ssh://box');
-    cli.current = 'devenv-remote';
+    cli.contexts.set(remoteContextName('box'), 'ssh://box');
+    cli.current = remoteContextName('box');
     await state.setPreviousContext('removed-context');
     await commands.useLocalDocker();
     expect(cli.current).toBe('default');
@@ -532,11 +532,11 @@ describe('the mismatch of a restored window (offerSwitchBack)', () => {
   });
 
   it('switches back to the local Docker for a local environment', async () => {
-    cli.contexts.set('devenv-remote', 'ssh://box');
-    cli.current = 'devenv-remote';
+    cli.contexts.set(remoteContextName('box'), 'ssh://box');
+    cli.current = remoteContextName('box');
     await state.setPreviousContext('desktop-linux');
     window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
-    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', 'devenv-remote'))).resolves.toBe(true);
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', remoteContextName('box')))).resolves.toBe(true);
     expect(window.showWarningMessage.mock.calls[0][0]).toBe(
       'This environment is on the local Docker, but Docker is set to box. Use the local Docker again?',
     );

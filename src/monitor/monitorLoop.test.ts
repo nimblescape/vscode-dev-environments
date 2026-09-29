@@ -239,6 +239,7 @@ async function writeSettings(h: Harness, overrides: Partial<MonitorSettings> = {
     waitingTimeSeconds: WAITING_MS / 1000,
     stopOnClose: true,
     respectShutdownActionNone: false,
+    remoteStopAfterSeconds: 600,
     updatedAt: iso(T0),
     ...overrides,
   });
@@ -1004,7 +1005,7 @@ describe('the Docker host of a tick (review, D2)', () => {
 
   it('makes no Docker call at all on an endpoint that is neither local nor SSH, and says so once', async () => {
     target = dockerTargetOf('tcp://10.0.0.5:2375', 'tcpbox');
-    // As an earlier build recorded it after a restore there.
+    // A recorded endpoint that is neither local nor SSH (the registry is a file that anything can change).
     await closedWindowScenario(h, { dockerHost: 'tcp://10.0.0.5:2375' });
     await runUntil(h, T0 + WAITING_MS + 4 * TICK_MS);
     expect(h.docker.calls).toEqual([]);

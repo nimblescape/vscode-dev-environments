@@ -13,10 +13,12 @@ import {
   dockerTargetOf,
   environmentsOfHost,
   isOnDockerHost,
+  isOwnRemoteContext,
   isRootlessEngine,
   isUsableSshAlias,
   parseContextInspect,
   parseSshAddress,
+  remoteContextName,
   rootlessSocketPath,
   sameDockerHost,
   sshCommandArgs,
@@ -58,7 +60,7 @@ describe('classifyDockerEndpoint (unit 7: SSH only for another computer)', () =>
   );
 
   it('keeps the context name only when a context decides the endpoint', () => {
-    expect(dockerTargetOf('ssh://box', 'devenv-remote')).toEqual({ kind: 'remote', host: 'box', endpoint: 'ssh://box', context: 'devenv-remote' });
+    expect(dockerTargetOf('ssh://box', 'devenv-remote-26f8567f')).toEqual({ kind: 'remote', host: 'box', endpoint: 'ssh://box', context: 'devenv-remote-26f8567f' });
     expect(dockerTargetOf('ssh://box', undefined)).toEqual({ kind: 'remote', host: 'box', endpoint: 'ssh://box' });
   });
 });
@@ -66,11 +68,11 @@ describe('classifyDockerEndpoint (unit 7: SSH only for another computer)', () =>
 describe('parseContextInspect', () => {
   it('reads the name and the Docker endpoint of `docker context inspect --format {{json .}}`', () => {
     const stdout = JSON.stringify({
-      Name: 'devenv-remote',
+      Name: 'devenv-remote-26f8567f',
       Metadata: { Description: 'x' },
       Endpoints: { docker: { Host: 'ssh://build-box', SkipTLSVerify: false } },
     });
-    expect(parseContextInspect(`${stdout}\n`)).toEqual({ name: 'devenv-remote', endpoint: 'ssh://build-box' });
+    expect(parseContextInspect(`${stdout}\n`)).toEqual({ name: 'devenv-remote-26f8567f', endpoint: 'ssh://build-box' });
   });
 
   it('reads the first entry of a list, and gives an empty endpoint when none is set', () => {
@@ -79,6 +81,21 @@ describe('parseContextInspect', () => {
 
   it.each(['', 'not json', '{}', '[]', 'null', '{"Name": 3}'])('refuses %j', (stdout) => {
     expect(parseContextInspect(stdout)).toBeUndefined();
+  });
+});
+
+describe('isOwnRemoteContext (the contexts of "Use a Remote Docker Host…")', () => {
+  it('is true only for the context of a host', () => {
+    expect(isOwnRemoteContext(remoteContextName('box'))).toBe(true);
+    expect(isOwnRemoteContext('devenv-remote-26f8567f')).toBe(true);
+    expect(isOwnRemoteContext(undefined)).toBe(false);
+    expect(isOwnRemoteContext('default')).toBe(false);
+    expect(isOwnRemoteContext('desktop-linux')).toBe(false);
+    expect(isOwnRemoteContext('devenv-remote-26F8567F')).toBe(false);
+    expect(isOwnRemoteContext('devenv-remote-26f8567')).toBe(false);
+    expect(isOwnRemoteContext('my-devenv-remote-26f8567f')).toBe(false);
+    // Greenfield, drop migration logic, user decision 2026-09-28: the bare prefix of earlier builds is not ours.
+    expect(isOwnRemoteContext('devenv-remote')).toBe(false);
   });
 });
 

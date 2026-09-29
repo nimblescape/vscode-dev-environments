@@ -114,7 +114,7 @@ export class EnvironmentRegistry {
 
   /**
    * Concept 7.5 "registry lost": true when registry.json lost content that the volume labels can restore. That is, the
-   * file is missing, is not valid (not JSON, an unknown format version, `environments` is not a list), or has entries
+   * file is missing, is not valid (not JSON, no or an unknown format version, `environments` is not a list), or has entries
    * that the registry leaves out as invalid (the next write drops them). False for a valid file, and for a file of a
    * newer format version, which this version must not change. Throws only if the file exists but cannot be read.
    */
@@ -387,7 +387,7 @@ async function removeFolder(dir: string): Promise<void> {
 // Normalization
 
 interface ParsedRegistry {
-  /** `invalid`: not JSON, not an object, an unknown version, or `environments` is not a list. */
+  /** `invalid`: not JSON, not an object, no or an unknown version, or `environments` is not a list. */
   state: 'missing' | 'ok' | 'invalid' | 'newer';
   file: RegistryFile;
   /** Version of a newer file. */
@@ -407,9 +407,9 @@ function parseRegistry(text: string | undefined): ParsedRegistry {
   const value = parseJson(text);
   if (!isRecord(value)) return { state: 'invalid', file: emptyRegistry(), dropped: 0, droppedRecords: 0 };
 
-  // A file without a version is taken as version 1: only this extension writes the file.
+  // Every file that this extension writes has a version: a file without one is invalid.
   const version = value.version;
-  if (version !== undefined && version !== REGISTRY_VERSION) {
+  if (version !== REGISTRY_VERSION) {
     if (typeof version === 'number' && Number.isFinite(version) && version > REGISTRY_VERSION) {
       return { state: 'newer', file: emptyRegistry(), version, dropped: 0, droppedRecords: 0 };
     }

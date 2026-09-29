@@ -308,6 +308,7 @@ describe('monitor settings', () => {
     waitingTimeSeconds: 30,
     stopOnClose: true,
     respectShutdownActionNone: false,
+    remoteStopAfterSeconds: 600,
     updatedAt: '2026-09-24T17:40:15.000Z',
   };
 
@@ -349,10 +350,13 @@ describe('validators', () => {
     expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db'] })).toBe(true);
     expect(isReopenRecord({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isReopenRecord(null)).toBe(false);
-    expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
-    expect(isMonitorSettings({ waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true, updatedAt: '2026-09-24T18:02:11Z' })).toBe(false);
-    // Unit 7, PR 2: remoteStopAfterSeconds is optional (a file of an older window), and a positive number when present.
+    // Greenfield, drop migration logic, user decision 2026-09-28: with remoteStopAfterSeconds, which every window writes.
+    expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, remoteStopAfterSeconds: 600, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
+    expect(isMonitorSettings({ waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true, remoteStopAfterSeconds: 600, updatedAt: '2026-09-24T18:02:11Z' })).toBe(false);
+    // Unit 7, PR 2: remoteStopAfterSeconds is a positive number. Greenfield, drop migration logic, user decision
+    // 2026-09-28: it is required (before: optional for a file of an older window, so `base` without it was valid).
     const base = { waitingTimeSeconds: 30, stopOnClose: true, respectShutdownActionNone: false, updatedAt: '2026-09-24T18:02:11Z' };
+    expect(isMonitorSettings(base)).toBe(false);
     expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: 600 })).toBe(true);
     expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: 0 })).toBe(false);
     expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: '600' })).toBe(false);

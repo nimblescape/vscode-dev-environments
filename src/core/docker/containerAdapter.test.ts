@@ -1627,7 +1627,7 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
       ['context', 'inspect'],
       ['system', 'df'],
       ['-H', 'ssh://build-box', 'info'],
-      ['--context', 'devenv-remote', 'image', 'inspect', 'img'],
+      ['--context', 'devenv-remote-26f8567f', 'image', 'inspect', 'img'],
     ]) {
       expect(isReadOnlyDockerCall(args), args.join(' ')).toBe(true);
     }
@@ -1640,7 +1640,7 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
       ['image', 'prune', '-f'],
       ['volume', 'create', 'ls'],
       ['network', 'rm', 'inspect'],
-      ['context', 'use', 'devenv-remote'],
+      ['context', 'use', 'devenv-remote-26f8567f'],
       ['compose', 'ps'],
       ['buildx', 'build', '.'],
       ['logs', 'x'],
