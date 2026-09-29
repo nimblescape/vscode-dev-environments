@@ -20,7 +20,7 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-09-29 | Inside a helper, Git runs as a user without access to the Docker socket; the token is sent only with the request that needs it and stays in memory. |
 | 2026-09-29 | **Concurrency**: an environment lock on the Docker host (a `flock` per environment in the monitor's state volume) for the whole operation, released when the process ends; the local busy mark stays as the first stage. Operations that change the working copy check for Git lock files and uncommitted changes and refuse instead of forcing; read-only Git steps use `--no-optional-locks`. |
 | 2026-09-28 | The **remote Session Monitor** stays one container per engine and never accepts connections. Heartbeats, the "in use elsewhere" check and `forget` become operations of the local Session Monitor's own worker, which runs `docker exec` on the monitor container locally. After a restart the monitor resumes from its stored script. |
-| 2026-09-29 | **Previous helper image** (PR #64): used only when the current helper tag is missing on that engine and cannot be built; retried at every open. Proposed, open: a visible warning when it is used, no maximum age. |
+| 2026-09-29 | **No previous helper image.** There shall be no case in which an open needs an older helper image: the previous-helper fallback of PR #64 is removed again. The current helper image is built ahead of time (in the background after an extension update, before an open needs it); an open that still finds no helper image fails with "The workspace helper could not be prepared." Pinning the image of an open by its ID stays. |
 | 2026-09-28 | **Names**: container named by its 8-hex short ID; the Docker context named after the SSH profile or host; image `devenv-<owner>-<repo>-<adjective>-<scientist>:<n>`. No compatibility for old names. |
 | 2026-09-29 | **Versions**: no migration code for files, windows, names or data until release; all container upgrade mechanisms stay and are exercised now (container version label and recreate, monitor label, local monitor protocol version, registry version). |
 | 2026-09-28 | Not planned: a Go agent on the host, Remote Tunnels, credential helpers that read the token through the worker, SSH ControlMaster settings. |
@@ -32,7 +32,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | # | Step | Content | Status |
 |---|---|---|---|
 | 1 | Cleanup of old monitor data | old records, leftover files, capped monitor log | PR #63 in review |
-| 2 | No `docker start` fallback; previous helper image | pinned helper image per open, build label | PR #64 in review |
+| 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | PR #64 in review |
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | next |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | queued |
 | 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | queued |
