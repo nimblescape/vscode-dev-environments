@@ -4,6 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES } from '../helper/analysisLimits';
+import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { OutputTooLargeError } from '../process';
 import type { Logger, StartedProcess } from '../ports';
 import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
@@ -13,7 +14,6 @@ import {
   CHANNEL_PROTOCOL_VERSION,
   CHANNEL_SLOT_WAIT_MS,
   MAX_CHANNEL_REQUEST_BYTES,
-  MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
   MAX_DOCKER_ARGS,
@@ -403,7 +403,9 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const fake = fakeProcess();
       const { logger } = recordingLogger();
       // Each line feed doubles in JSON: short enough as text, too long as its line.
-      const script = '\n'.repeat(MAX_CHANNEL_SCRIPT_LENGTH / 2 + 1);
+      // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: MAX_CHANNEL_SCRIPT_LENGTH of the
+      // channel; now MAX_BUNDLE_LINE_LENGTH of the pipe loader, the same 8 MiB).
+      const script = '\n'.repeat(MAX_BUNDLE_LINE_LENGTH / 2 + 1);
       await expect(HelperChannel.open(fake.process, script, { logger, name: 'build-box' })).rejects.toThrow(/too long/);
       expect(fake.lines).toHaveLength(0);
     });

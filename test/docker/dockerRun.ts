@@ -142,8 +142,8 @@ export interface ContainerDetails {
   Id: string;
   /** With a leading `/`. */
   Name: string;
-  State: { Status: string; Running: boolean };
-  Config: { Image: string; Hostname?: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean };
+  State: { Status: string; Running: boolean; ExitCode?: number; Restarting?: boolean };
+  Config: { Image: string; Hostname?: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean; Cmd?: string[] | null };
   HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null; Privileged?: boolean; RestartPolicy?: { Name?: string; MaximumRetryCount?: number }; Tmpfs?: Record<string, string> | null };
   Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
 }

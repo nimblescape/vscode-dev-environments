@@ -10,6 +10,7 @@
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
+import { MAX_BUNDLE_LINE_LENGTH, encodeBundle } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
@@ -20,14 +21,12 @@ import {
   CHANNEL_SLOT_WAIT_MS,
   LineSplitter,
   MAX_CHANNEL_REQUEST_BYTES,
-  MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
   MAX_OPERATION_TIMEOUT_MS,
   MAX_SERVER_LINE,
   OP_DOCKER,
   encodeMessage,
-  encodeScript,
   isSecret,
   parseDockerOperationParams,
   parseDockerOperationValue,
@@ -162,7 +161,8 @@ export class HelperChannel {
   ) {}
 
   /**
-   * Starts the channel on `process` (`docker run -i … node -e CHANNEL_LOADER`): writes the script, sends `hello`, and
+   * Starts the channel on `process` (`docker run -i … node -e PIPE_LOADER …`, channelRunArgs): writes the script as the
+   * first line (encodeBundle; the loader checks it against the hash of its command line), sends `hello`, and
    * waits for its answer. Throws HelperChannelError('open') and stops the process when that fails.
    */
   static async open(process: StartedProcess, script: string, options: HelperChannelOptions): Promise<HelperChannel> {
@@ -207,9 +207,10 @@ export class HelperChannel {
       const detail = error ? error.message : this.stderrTail.trim() || `exit code ${exitCode}`;
       this.lose(`the helper ended (${detail})`);
     });
-    // Review round 1 (P6): the loader limits the escaped line, so the same is checked here.
-    const scriptLine = encodeScript(script);
-    if (scriptLine.length - 1 > MAX_CHANNEL_SCRIPT_LENGTH) {
+    // Review round 1 (P6): the loader limits the escaped line, so the same is checked here (plan step 3: the memory guard
+    // of the pipe loader, MAX_BUNDLE_LINE_LENGTH).
+    const scriptLine = encodeBundle(script);
+    if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
       this.lose('the script is too long');
       throw new HelperChannelError('open', `The script of the helper channel is too long (${scriptLine.length - 1} characters as JSON).`);
     }

@@ -2,9 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { createHash } from 'crypto';
 import { describe, expect, it } from 'vitest';
+import { PIPE_LOADER, encodeBundle } from '../loader/pipeLoader';
 import {
-  CHANNEL_LOADER,
+  CHANNEL_ENTRY,
   CHANNEL_SCRIPT_PATH,
   CHANNEL_SILENCE_EXIT_MS,
   CHANNEL_PING_INTERVAL_MS,
@@ -19,7 +21,6 @@ import {
   isCleanupLabel,
   newCleanupLabel,
   encodeMessage,
-  encodeScript,
   parseClientMessage,
   parseDockerOperationParams,
   parseDockerOperationValue,
@@ -105,7 +106,8 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
 
   it('encodes a message and the script as one line each', () => {
     expect(encodeMessage({ t: 'log', id: 1, level: 'info', text: 'a\nb' })).toBe('{"t":"log","id":1,"level":"info","text":"a\\nb"}\n');
-    expect(encodeScript('line 1\nline 2')).toBe('"line 1\\nline 2"\n');
+    // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: encodeScript of the channel; now encodeBundle of the pipe loader, the same line).
+    expect(encodeBundle('line 1\nline 2')).toBe('"line 1\\nline 2"\n');
   });
 
   it('LineSplitter passes whole lines on and fails once on a line that is too long', () => {
@@ -121,13 +123,14 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(lines).toEqual(['abc', 'de']);
   });
 
-  it('the loader writes the script to CHANNEL_SCRIPT_PATH and gives up on an input without it', () => {
-    expect(CHANNEL_LOADER).toContain(JSON.stringify(CHANNEL_SCRIPT_PATH));
-    expect(CHANNEL_LOADER).toContain('startChannel');
-    expect(CHANNEL_LOADER).toContain('process.exit(3)');
-    // It is one argument of `docker run`: short, one line.
-    expect(CHANNEL_LOADER.length).toBeLessThan(1_000);
-    expect(CHANNEL_LOADER).not.toContain('\n');
+  // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: CHANNEL_LOADER held the path and
+  // `startChannel`; now the shared pipe loader gets them as arguments, channelRunArgs, and pipeLoader.test.ts checks it).
+  it('the loader stores the script at CHANNEL_SCRIPT_PATH and starts CHANNEL_ENTRY', () => {
+    expect(CHANNEL_SCRIPT_PATH).toBe('/opt/devenv/channel.js');
+    expect(CHANNEL_ENTRY).toBe('startChannel');
+    expect(PIPE_LOADER).not.toContain(CHANNEL_SCRIPT_PATH);
+    // It is one argument of `docker run`: one line.
+    expect(PIPE_LOADER).not.toContain('\n');
   });
 
   it('the cleanup label: its values, and the label of a step container (review round 1, S1)', () => {
@@ -141,9 +144,13 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(channelStepLabel('0a1b2c3d')).toBe('nimblescape.devenv.channel-step=0a1b2c3d');
   });
 
-  it('channelLabelValue names the protocol and the script', () => {
+  it('channelLabelValue names the protocol, the script and the loader', () => {
     expect(channelLabelValue('a')).toMatch(/^1-[0-9a-f]{12}$/);
     expect(channelLabelValue('a')).not.toBe(channelLabelValue('b'));
+    // Plan step 3 (pipe loading, user decision 2026-09-29): the loader is part of the label (a new loader, a new version).
+    const hash = createHash('sha256').update('a', 'utf8').update('\n', 'utf8').update(PIPE_LOADER, 'utf8').digest('hex');
+    expect(channelLabelValue('a')).toBe(`1-${hash.slice(0, 12)}`);
+    expect(channelLabelValue('a')).not.toBe(`1-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
   });
 
   it('checks the parameters and values of docker and probe', () => {

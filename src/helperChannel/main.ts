@@ -3,9 +3,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Entry point of the script of the helper channel (src/core/helperChannel/protocol.ts), bundled to
-// dist/helperChannel.js. The loader of the container (CHANNEL_LOADER) writes it to CHANNEL_SCRIPT_PATH and calls
-// startChannel with the input that it read after the script; the rest of the standard input comes as text (the loader
-// set its encoding). Only Node.js built-ins and small modules of src/core.
+// dist/helperChannel.js. The pipe loader of the container (src/core/loader/pipeLoader.ts, plan step 3) checks its hash,
+// stores it at CHANNEL_SCRIPT_PATH, and calls startChannel (CHANNEL_ENTRY) with the input that it read after the script;
+// the rest of the standard input comes as text (the loader set its encoding and paused it). Only Node.js built-ins and small modules of src/core.
 import { spawn } from 'child_process';
 import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
 
