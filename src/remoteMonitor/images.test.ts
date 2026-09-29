@@ -13,6 +13,7 @@ import {
   parseImageList,
   parseReplacedImages,
   prefixesFromEnv,
+  pruneReplacedImages,
   splitRepository,
   versionsOf,
   type HttpGet,
@@ -435,6 +436,31 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     await maintenance.observe();
     expect(stored[DEV]).toHaveLength(200);
     expect(stored[DEV].slice(0, 2)).toEqual(['sha256:old1', 'sha256:old2']);
+  });
+
+  // Monitor cleanup, user decision 2026-09-29 (R3): the store drops empty lists and repositories of former prefixes.
+  it('prunes the stored IDs: no empty lists, no repositories that match no current prefix', () => {
+    const OLD = 'ghcr.io/someone/else';
+    const given: ReplacedImages = { [DEV]: ['sha256:a'], [WEB]: [], [OLD]: ['sha256:b'] };
+    expect(pruneReplacedImages(given, PREFIXES)).toEqual({ [DEV]: ['sha256:a'] });
+    // The given record is not changed; with the other prefix, that repository is kept.
+    expect(given[OLD]).toEqual(['sha256:b']);
+    expect(pruneReplacedImages(given, ['ghcr.io/someone/'])).toEqual({ [OLD]: ['sha256:b'] });
+    expect(pruneReplacedImages(given, [])).toEqual({});
+  });
+
+  it('writes the pruned store at the end of a pass', async () => {
+    const OLD = 'ghcr.io/someone/else';
+    let stored: ReplacedImages = { [DEV]: ['sha256:v1'], [WEB]: [], [OLD]: ['sha256:gone'] };
+    await new ImageMaintenance({
+      docker: fakeEngine({ images: [image(DEV, '2', 'sha256:v1', '2026-09-01')] }).docker,
+      httpGet: fakeRegistry({}).httpGet,
+      log: () => {},
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced: { read: async () => stored, write: async (value) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) },
+    }).pass();
+    expect(stored).toEqual({ [DEV]: ['sha256:v1'] });
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.

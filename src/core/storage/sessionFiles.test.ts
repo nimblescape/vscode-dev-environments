@@ -139,6 +139,18 @@ describe('pending connection files', () => {
   });
 });
 
+// Monitor cleanup, user decision 2026-09-29 (R7): Delete removes the disconnect request of the environment.
+describe('disconnect requests', () => {
+  it('removes the request of one environment; a missing one is no error', async () => {
+    fs.mkdirSync(paths.disconnectDir, { recursive: true });
+    fs.writeFileSync(paths.disconnectFile(ENV_A), JSON.stringify(operation(ENV_A)));
+    fs.writeFileSync(paths.disconnectFile(ENV_B), JSON.stringify(operation(ENV_B)));
+    await files.removeDisconnectRequest(ENV_A);
+    await files.removeDisconnectRequest(ENV_A);
+    expect(fs.readdirSync(paths.disconnectDir)).toEqual([`${ENV_B}.json`]);
+  });
+});
+
 describe('pending operations', () => {
   it('writes and reads operations', async () => {
     await files.writeOperation(operation(ENV_A));

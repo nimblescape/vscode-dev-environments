@@ -20,6 +20,7 @@ import {
   readImageList,
   parseContainerLines,
   readRecords,
+  removeStaleStateTemporaryFiles,
   timingFromEnv,
   type DockerResult,
 } from './main';
@@ -363,6 +364,54 @@ describe('RemoteMonitorLoop', () => {
     fs.writeFileSync(path.join(heartbeatDir(stateDir), 'other-file'), 'x');
     await tickAt(T0);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), 'other-file'].sort());
+    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names the reason.
+    expect(lines).toContain(`Removed the old record of ${B} (no container of it exists).`);
+  });
+
+  // Monitor cleanup, user decision 2026-09-29 (R1): an old record that a newer one of the same environment replaced.
+  it('removes an old record that a newer one of the same environment replaced, and names the reason', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, A, { at: T0 - MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tickAt(T0);
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A)]);
+    expect(lines).toContain(`Removed the old record of ${A} (a newer record of it exists).`);
+  });
+});
+
+// Monitor cleanup, user decision 2026-09-29 (R4): the leftover temporary files of the state files, at the start of `run`.
+describe('removeStaleStateTemporaryFiles', () => {
+  const HOUR = 60 * MINUTE;
+  function file(name: string, ageMs: number): void {
+    const full = path.join(stateDir, name);
+    fs.writeFileSync(full, 'x');
+    const time = (T0 - ageMs) / 1000;
+    fs.utimesSync(full, time, time);
+  }
+
+  it('removes the temporary files of images.json, image-settings.json and replaced-images.json older than an hour', async () => {
+    file('images.json.12.1.tmp', HOUR + MINUTE);
+    file('image-settings.json.7.3.tmp', 2 * HOUR);
+    file('replaced-images.json.99.12.tmp', 24 * HOUR);
+    file('images.json.12.2.tmp', HOUR - MINUTE);
+    file('images.json', 48 * HOUR);
+    file('other.json.12.1.tmp', 48 * HOUR);
+    file('images.json.x.1.tmp', 48 * HOUR);
+    const removed = await removeStaleStateTemporaryFiles(stateDir, T0);
+    expect(removed.sort()).toEqual(['image-settings.json.7.3.tmp', 'images.json.12.1.tmp', 'replaced-images.json.99.12.tmp']);
+    expect(fs.readdirSync(stateDir).sort()).toEqual(['images.json', 'images.json.12.2.tmp', 'images.json.x.1.tmp', 'other.json.12.1.tmp']);
+  });
+
+  it('never removes a folder or a link with such a name, nor what a link points to', async () => {
+    const target = path.join(stateDir, 'target');
+    fs.writeFileSync(target, 'x');
+    fs.symlinkSync(target, path.join(stateDir, 'images.json.1.1.tmp'));
+    fs.mkdirSync(path.join(stateDir, 'images.json.2.1.tmp'));
+    expect(await removeStaleStateTemporaryFiles(stateDir, T0 + 48 * HOUR)).toEqual([]);
+    expect(fs.readdirSync(stateDir).sort()).toEqual(['images.json.1.1.tmp', 'images.json.2.1.tmp', 'target']);
+  });
+
+  it('ignores a missing folder', async () => {
+    expect(await removeStaleStateTemporaryFiles(path.join(stateDir, 'missing'), T0)).toEqual([]);
   });
 });
 

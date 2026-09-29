@@ -13,7 +13,8 @@
 //   forget <source> <env id>     removes that record (Delete of an environment)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
-// nothing but its own record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
+// nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
+// and, with image maintenance, older images of the prefixes. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -284,10 +285,15 @@ export class RemoteMonitorLoop {
       }
     }
 
-    for (const record of decision.forget) {
+    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names why a record is removed.
+    const removals = [
+      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
+      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
+    ];
+    for (const { record, reason } of removals) {
       try {
         await removeRecord(this.deps.dir, record.source, record.environmentId);
-        log(`Removed the old record of ${record.environmentId} (no container of it exists).`);
+        log(`Removed the old record of ${record.environmentId} (${reason}).`);
       } catch (error) {
         log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -361,6 +367,37 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
     // Review round 10 of PR #57 (U2): a failed write (a full volume) leaves no temporary file behind.
     await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R4): the temporary files of writeStateFile
+ * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
+ */
+export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
+/** Such a file older than this (by its modification time) is removed at the start of `run`. */
+export const STATE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R4): removes the leftover temporary files of writeStateFile in the volume that
+ * are older than STATE_TEMPORARY_MAX_AGE_MS (a younger one may belong to a write that runs now). Only regular files with
+ * such a name, never a link; every error is ignored. Returns the names it removed.
+ */
+export async function removeStaleStateTemporaryFiles(stateDir: string, now: number): Promise<string[]> {
+  const removed: string[] = [];
+  const names = await fs.promises.readdir(stateDir).catch(() => [] as string[]);
+  for (const name of names) {
+    if (!STATE_TEMPORARY_FILE.test(name)) continue;
+    const file = path.join(stateDir, name);
+    try {
+      const stat = await fs.promises.lstat(file);
+      if (!stat.isFile() || Math.abs(now - stat.mtimeMs) <= STATE_TEMPORARY_MAX_AGE_MS) continue;
+      await fs.promises.unlink(file);
+      removed.push(name);
+    } catch {
+      // Removed meanwhile, or not removable: left alone.
+    }
+  }
+  return removed;
 }
 
 /** The stored list of repositories; none when it is missing or invalid. */
@@ -589,6 +626,9 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const docker = deps.docker ?? nodeDocker;
       const loop = new RemoteMonitorLoop({ docker, dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
+      // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
+      const leftovers = await removeStaleStateTemporaryFiles(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, now());
+      if (leftovers.length > 0) log(`Removed ${leftovers.length} leftover temporary file(s) of the volume.`);
       // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the schedule.
       // Only when the container got prefixes: only then it has a network (the label says whether it has).
       if (prefixesFromEnv(deps.env).length > 0) {

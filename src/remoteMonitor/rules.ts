@@ -11,14 +11,18 @@
 //      volume.
 //   2. `decision = decide({ now, containers, records, state })`. Keep `decision.state` for the next tick.
 //   3. `docker stop` of each container of `decision.stop` (the dev container first), and removal of the files of
-//      `decision.forget` (old records of removed environments).
+//      `decision.forget` (old records of removed environments) and `decision.superseded` (old records that a newer one of
+//      the same environment replaced).
 /** Interval between two ticks. */
 export const REMOTE_TICK_MS = 15_000;
 /** A time since the previous tick larger than this means that the host or the container was paused, or the clock changed. */
 export const REMOTE_GAP_MS = 60_000;
 /** After such a gap (and after the start), nothing is stopped for this time: the computers send heartbeats again first. */
 export const REMOTE_GRACE_MS = 120_000;
-/** A record of an environment that has no container at all any more is removed after this time. */
+/**
+ * A record of an environment that has no container at all any more is removed after this time; so is an old record that a
+ * newer one of the same environment replaced (monitor cleanup, user decision 2026-09-29, R1).
+ */
 export const RECORD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /**
  * A record whose `at` is later than now plus this counts as written when the monitor first saw it (review round 1 of
@@ -95,8 +99,18 @@ export interface RemoteDecision {
   stop: RemoteStop[];
   /** Env ids with a running container that a record keeps running (Keep Running When Closed, Close and Keep Running). */
   kept: string[];
-  /** Records to remove: their environment has no container at all, and they are older than RECORD_MAX_AGE_MS. */
+  /**
+   * Records to remove: their environment has no container at all, and their `at` is more than RECORD_MAX_AGE_MS from now
+   * (in either direction; monitor cleanup, user decision 2026-09-29, R2).
+   */
   forget: RemoteRecord[];
+  /**
+   * Monitor cleanup, user decision 2026-09-29 (R1): records to remove that are not in `forget`: they do not say
+   * keepRunning, their `at` (as the rules see it, a time in the future counts from when it was first seen) is older than
+   * RECORD_MAX_AGE_MS, and another record of the same environment has a strictly later `at`. So the newest record of an
+   * environment, a keepRunning record, and a record with the same `at` as the newest are never removed by it.
+   */
+  superseded: RemoteRecord[];
   /** The gap rule holds every stop in this tick. */
   grace: boolean;
 }
@@ -119,7 +133,9 @@ export function isRunningState(state: string): boolean {
  * The gap rule: when the time since the previous tick is larger than `gapMs` (the host or the container was paused, the
  * clock was changed), and at the first tick, nothing is stopped for `graceMs`: the computers that still use their
  * environments send heartbeats again first (they retry every tick of their Session Monitor). Records whose environment
- * has no container at all (running or not) and whose `at` is older than RECORD_MAX_AGE_MS are removed. The monitor
+ * has no container at all (running or not) and whose `at` is more than RECORD_MAX_AGE_MS before or after now are removed
+ * (`forget`); so are records without keepRunning older than RECORD_MAX_AGE_MS for which a strictly newer record of the
+ * same environment exists (`superseded`; monitor cleanup, user decision 2026-09-29). The monitor
  * never acts on containers without the label nimblescape.devenv.environment-id (the caller lists only those).
  */
 export function decide(input: RemoteDecideInput): RemoteDecision {
@@ -171,12 +187,22 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     stop.push({ environmentId, containers: devContainerFirst(containers), reason });
   }
 
-  const forget = input.records.filter((record) => !present.has(record.environmentId) && now - record.at > RECORD_MAX_AGE_MS);
-  // (A record with a time in the future is kept by this rule until its time has passed by 7 days.)
+  // Monitor cleanup, user decision 2026-09-29 (R2): the absolute age, so a record far in the future (a skewed clock of a
+  // computer) whose environment is gone is removed too; before, it was kept until its time had passed by 7 days.
+  const forget = input.records.filter((record) => !present.has(record.environmentId) && Math.abs(now - record.at) > RECORD_MAX_AGE_MS);
+  // Monitor cleanup, user decision 2026-09-29 (R1): an old record that a strictly newer one of the same environment
+  // replaced, with the times as the rules see them. Never one that says keepRunning, never the newest, never on a tie.
+  const forgotten = new Set(forget);
+  const superseded = input.records.filter((record, index) => {
+    if (forgotten.has(record) || record.keepRunning) return false;
+    const at = clamped[index].at;
+    if (now - at <= RECORD_MAX_AGE_MS) return false;
+    return (recordsOf.get(record.environmentId) ?? []).some((other) => other.at > at);
+  });
   const state: RemoteMonitorState = { lastTickAt: now };
   if (Object.keys(futureSeen).length > 0) state.futureSeen = futureSeen;
   if (graceUntil !== undefined && now < graceUntil) state.graceUntil = graceUntil;
-  return { state, stop, kept, forget, grace };
+  return { state, stop, kept, forget, superseded, grace };
 }
 
 /**

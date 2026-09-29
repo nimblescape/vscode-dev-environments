@@ -273,6 +273,19 @@ export function parseReplacedImages(text: string): ReplacedImages {
   }
 }
 
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R3): the stored IDs without the repositories that keep none, and without the
+ * repositories that match none of the current prefixes (their images are not maintained any more). A new record; the
+ * given one is not changed.
+ */
+export function pruneReplacedImages(replaced: ReplacedImages, prefixes: readonly string[]): ReplacedImages {
+  const result: ReplacedImages = {};
+  for (const [repository, ids] of Object.entries(replaced)) {
+    if (ids.length > 0 && prefixes.some((prefix) => repository.startsWith(prefix))) result[repository] = ids;
+  }
+  return result;
+}
+
 /** The time of `CreatedAt` of `docker image ls` or `Created` of `docker image inspect` (ms; 0 when unknown). */
 function createdTime(text: string): number {
   return Date.parse(text.replace(/ ([+-]\d{4}) [A-Z]+$/, ' $1')) || 0;
@@ -310,6 +323,8 @@ export class ImageMaintenance {
     } catch (error) {
       this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
+      // Monitor cleanup, user decision 2026-09-29 (R3): no empty lists, no repositories of former prefixes.
+      this.replaced = pruneReplacedImages(this.replaced, prefixes);
       await this.deps.replaced?.write(this.replaced).catch(() => undefined);
     }
   }

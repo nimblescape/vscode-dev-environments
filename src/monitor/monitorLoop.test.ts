@@ -16,6 +16,7 @@ import type { Logger, RunResult } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
+import { STORAGE_SWEEP_INTERVAL_MS } from '../core/storage/storageSweep';
 import type { Environment, GitSummary, MonitorSettings, WindowStatus } from '../core/types';
 import {
   BUSY_MARK_MAX_AGE_MS,
@@ -855,6 +856,44 @@ describe('MonitorLoop.tick', () => {
     expect(h.loop.state.idleSince[ID_A]).toBe(T0);
     await step(h);
     expect(h.loop.state.idleSince[ID_A]).toBe(T0);
+  });
+});
+
+// Monitor cleanup, user decision 2026-09-29 (R6–R8): the sweep of the storage folder, not at every tick.
+describe('MonitorLoop: the sweep of the storage folder', () => {
+  it('sweeps at the first tick, then at most once per hour of run time', async () => {
+    const h = createHarness();
+    let uptime = 0;
+    let sweeps = 0;
+    const loop = h.newLoop({ sweep: async () => void sweeps++, uptime: () => uptime });
+    await loop.tick();
+    expect(sweeps).toBe(1);
+    for (uptime = TICK_MS; uptime < STORAGE_SWEEP_INTERVAL_MS; uptime += TICK_MS) await loop.tick();
+    expect(sweeps).toBe(1);
+    uptime = STORAGE_SWEEP_INTERVAL_MS;
+    await loop.tick();
+    expect(sweeps).toBe(2);
+    await loop.tick();
+    expect(sweeps).toBe(2);
+  });
+
+  it('logs a failed sweep and goes on with the tick; no sweep after a lost lock', async () => {
+    const h = createHarness();
+    let sweeps = 0;
+    const loop = h.newLoop({
+      sweep: async () => {
+        sweeps++;
+        throw new Error('boom');
+      },
+      uptime: () => 0,
+    });
+    const result = await loop.tick();
+    expect(result.decision).toBeDefined();
+    expect(h.logger.lines).toContain('warn The outdated files of the storage folder could not be removed: boom');
+    h.lock.held = false;
+    const other = h.newLoop({ sweep: async () => void sweeps++, uptime: () => 0 });
+    expect((await other.tick()).end).toBe('lockLost');
+    expect(sweeps).toBe(1);
   });
 });
 

@@ -12,12 +12,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { removeFile, writeJsonAtomic } from '../core/storage/atomicJson';
-import { errorCode, isStorageId, readJsonTolerant, retryTransient } from '../core/storage/paths';
+import { DISCONNECT_DIR_NAME, errorCode, isStorageId, readJsonTolerant, retryTransient } from '../core/storage/paths';
 import { isPendingOperation } from '../core/storage/sessionFiles';
 import type { PendingOperation } from '../core/types';
 
-/** Folder of the requests in the global storage folder. */
-export const DISCONNECT_DIR_NAME = 'disconnect';
+/** Folder of the requests in the global storage folder (defined in paths.ts, where the storage layout lives). */
+export { DISCONNECT_DIR_NAME };
 /**
  * A request older than this is dropped without running: the connected window checks every 15 seconds (heartbeat) and
  * on each change of the folder, so a request that is still there after this time found no window that answers.
