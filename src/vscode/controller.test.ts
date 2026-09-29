@@ -1669,6 +1669,10 @@ describe('Switch branch…', () => {
       } else {
         expect(await h.sessionFiles.readOperations()).toEqual([]);
         expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+        // Review round 20 of PR #64 (R20-2): Later in the connected window starts nothing, as its question
+        // (Messages.configurationKindChangedConnected) says.
+        expect(h.service.openEnvironment).not.toHaveBeenCalled();
+        expect(h.service.open).not.toHaveBeenCalled();
       }
     },
   );

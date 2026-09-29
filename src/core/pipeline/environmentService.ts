@@ -421,8 +421,9 @@ export interface RepositoryTarget {
 
 /**
  * Review round 5 (D5-3): configurationChanged of an environment without a build record whose containers are of another
- * kind than the configuration that the pipeline would use: `question` asks about the switch as the pipeline asks
- * (Messages.configurationKindChanged, or configurationKindChangedDevContainerMissing).
+ * kind than the configuration that the pipeline would use: `question` asks about the switch (Messages.configurationKindChanged
+ * of a single container, configurationKindChangedConnected of Docker Compose, where Later only keeps the connected window,
+ * review round 20 of PR #64, R20-2, or configurationKindChangedDevContainerMissing).
  */
 export interface ConfigurationKindChange {
   question: string;
@@ -1447,7 +1448,7 @@ export class EnvironmentService {
     const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
     this.logger.info(
       existingCompose
-        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, a stopped dev container of Docker Compose cannot be started (a dev container that runs already opens as it is).`
+        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, a dev container of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and is current opens as it is).`
         : `The configuration ${loaded.configPath} of ${ctx.env.repository} now uses Docker Compose. It applies with the next rebuild; until then, the existing container is started as it is.`,
     );
     ctx.kindKept = true;
@@ -4885,7 +4886,10 @@ export class EnvironmentService {
         question:
           container === undefined
             ? Messages.configurationKindChangedDevContainerMissing(resolved.configPath)
-            : Messages.configurationKindChanged(containersCompose, resolved.configPath),
+            : // Review round 20 of PR #64 (R20-2): the only caller is the connected window, where Later starts nothing.
+              containersCompose
+              ? Messages.configurationKindChangedConnected(resolved.configPath)
+              : Messages.configurationKindChanged(false, resolved.configPath),
       };
     } catch (error) {
       throw this.toUserError(error, options.signal);

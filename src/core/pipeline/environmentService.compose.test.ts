@@ -1479,7 +1479,9 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
     expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
     // The log line names the exception for a running dev container (before: "the containers of Docker Compose cannot be started").
-    expect(h.logger.infos.some((line) => line.includes('a stopped dev container of Docker Compose cannot be started (a dev container that runs already opens as it is)'))).toBe(true);
+    // Review round 20 of PR #64 (R20-1): changed expectation, only a current dev container opens (before: "a stopped dev
+    // container of Docker Compose cannot be started (a dev container that runs already opens as it is)").
+    expect(h.logger.infos.some((line) => line.includes('a dev container of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and is current opens as it is)'))).toBe(true);
   });
 
   it('refuses to start on "Rebuild later" when the Docker Compose environment has no dev container (review round 1, P-1)', async () => {
@@ -1692,13 +1694,42 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
     // The question says what Later does with a running dev container (before: "Later keeps Docker Compose and starts nothing").
-    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('a dev container that runs already opens as it is, and the stopped containers of the other services are started');
+    // Review round 20 of PR #64 (R20-1): changed expectation, "and is current" (before: "a dev container that runs already
+    // opens as it is").
+    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('a dev container that runs already and is current opens as it is, and the stopped containers of the other services are started');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db?.id}`]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
     expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
     expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+  });
+
+  it.each([
+    ['created by an older version', { devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }],
+    ['created while the host access checks were off', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+    ['next to a service container created while the host access checks were off', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+  ])('does not start a running dev container %s of a restored Docker Compose environment on Later, as the question says (review round 20 of PR #64, R20-1)', async (_case, labels) => {
+    await seedCompose({ dev: 'running', db: 'stopped', ...labels });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('must be created again');
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    expect(h.ui.kindQuestions[0]).toContain('a dev container that runs already and is current opens as it is');
+    expect(h.ui.kindQuestions[0]).toContain('one that must be created again');
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'stopped' });
+    expect(h.logger.infos.some((line) => line.includes('that is stopped or must be created again cannot be started'))).toBe(true);
   });
 
   it('does not start the existing Docker Compose environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
@@ -2038,13 +2069,30 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await withoutRecord();
     useSingle();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH) });
-    // The pipeline asks the same question.
+    // Review round 20 of PR #64 (R20-2): changed expectation, the connected window gets its own question, as Later there
+    // only keeps the window connected (before: Messages.configurationKindChanged(true, …), the question of the pipeline).
+    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
+    // The pipeline asks its own question, which says what Later does in an open.
     // Changed expectation (no docker start fallback, user decision 2026-09-29): Later then fails to start (no
     // Docker Compose configuration, no `up`); before, docker start started the containers.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+  });
+
+  it('asks the connected window about a switch from Docker Compose without promising a start on Later, and starts nothing (review round 20 of PR #64, R20-2)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    await withoutRecord();
+    useSingle();
+    const db = dbContainer();
+    const changed = await h.service.configurationChanged(ENV_ID, options());
+    expect(changed).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
+    const question = typeof changed === 'object' ? changed.question : '';
+    expect(question).toContain('this window stays connected, and nothing is started or removed');
+    expect(question).not.toContain('are started');
+    expect(question).not.toContain('opens as it is');
+    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'stopped' });
   });
 
   it('reports a switch from a single container to Docker Compose in configurationChanged (D5-3)', async () => {

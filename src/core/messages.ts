@@ -45,8 +45,15 @@ export const Messages = {
    */
   configurationKindChanged: (containersUseCompose: boolean, configPath: string) =>
     containersUseCompose
-      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: a dev container that runs already opens as it is, and the stopped containers of the other services are started; a stopped dev container does not start, because it starts only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
+      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: a dev container that runs already and is current opens as it is, and the stopped containers of the other services are started; any other dev container (a stopped one, or one that must be created again, for example because an older version created it) does not start, because it starts only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
       : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
+  /**
+   * Review round 20 of PR #64 (R20-2): configurationKindChanged(true, …) in the window that is connected to the
+   * environment (Switch branch…, configurationChanged). Later there only keeps the window connected: nothing is started
+   * or removed (the next open starts the stopped services, D-22).
+   */
+  configurationKindChangedConnected: (configPath: string) =>
+    `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: this window stays connected, and nothing is started or removed. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`,
   /**
    * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts
    * nothing then (composeDevContainerMissing).
