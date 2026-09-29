@@ -13,10 +13,17 @@
 // `docker restart`, a restart policy), the loader starts it without reading the standard input at all. A stored file
 // with another hash is replaced by the bundle from the input.
 //
-// Every failure (invalid arguments, the input ended before the bundle, no bundle within LOADER_BUNDLE_TIMEOUT_MS, a line
-// longer than MAX_BUNDLE_LINE_LENGTH, not a JSON string, another hash, the file cannot be stored or loaded, no such
-// function) writes one line `devenv loader: …` to stderr and exits with LOADER_EXIT_CODE; nothing of a refused bundle
-// is stored. The hash protects against a broken or mixed-up transfer and a changed stored file; it is no defence
+// Review round 1 of PR #69 (A-R1-1): before it reads the input, the loader creates the marker `<path>.started` (and
+// the folder). A loader that finds the marker but no stored file with the hash was started before and never got its
+// bundle (the first, attached run was cut off): it exits 3 at once instead of waiting for an input. A restarted
+// container gets a new standard input without a writer that never ends, so without the marker it would wait 60 s as
+// `running` and start again; with it, the container keeps exiting 3 (`restarting`, with a growing back-off) until ensure
+// replaces it. The helper channel runs with --rm and is never restarted.
+//
+// Every failure (invalid arguments, started before without its bundle, the input ended before the bundle, no bundle
+// within LOADER_BUNDLE_TIMEOUT_MS, a line longer than MAX_BUNDLE_LINE_LENGTH, not a JSON string, another hash, the file
+// cannot be stored or loaded, no such function, the entry threw) writes one line `devenv loader: …` to stderr and exits
+// with LOADER_EXIT_CODE; nothing of a refused bundle is stored. The hash protects against a broken or mixed-up transfer and a changed stored file; it is no defence
 // against someone who already has the Docker socket of the engine (who can run anything anyway).
 //
 // So no code goes into a variable or an argument of the container: the command line holds only the loader, the path,
@@ -42,10 +49,12 @@ export const PIPE_LOADER = [
   `x=t=>{process.stderr.write('devenv loader: '+t+'\\n');process.exit(${LOADER_EXIT_CODE})},`,
   `h=t=>c.createHash('sha256').update(t,'utf8').digest('hex'),`,
   `go=r=>{let f;try{f=require(P)[E]}catch(e){x('the bundle cannot be loaded: '+e.message)}`,
-  `typeof f==='function'?f(r):x('the bundle has no function '+E)};`,
+  `if(typeof f!=='function')x('the bundle has no function '+E);try{f(r)}catch(e){x('the entry failed: '+(e&&e.message))}};`,
   `if(!/^[0-9a-f]{64}$/.test(H||'')||!P||!p.isAbsolute(P)||!/^[A-Za-z]+$/.test(E||''))x('invalid arguments');`,
   `let o;try{o=fs.readFileSync(P,'utf8')}catch{}`,
   `if(o!==undefined&&h(o)===H)go('');else{`,
+  `try{if(fs.existsSync(P+'.started'))x('started before without its bundle');`,
+  `fs.mkdirSync(p.dirname(P),{recursive:true});fs.writeFileSync(P+'.started','')}catch(e){x('the bundle cannot be stored: '+e.message)}`,
   `let b='';const s=process.stdin;s.setEncoding('utf8');`,
   `const t=setTimeout(()=>x('no bundle within ${LOADER_BUNDLE_TIMEOUT_MS / 1000} s'),${LOADER_BUNDLE_TIMEOUT_MS}),`,
   `e=()=>x('the input ended before the bundle'),`,
@@ -53,7 +62,7 @@ export const PIPE_LOADER = [
   `s.off('data',f);s.off('end',e);s.pause();clearTimeout(t);`,
   `let v;try{v=JSON.parse(b.slice(0,i))}catch{}`,
   `if(typeof v!=='string'||h(v)!==H)x('the bundle does not match its hash');`,
-  `try{fs.mkdirSync(p.dirname(P),{recursive:true});fs.writeFileSync(P+'.tmp',v);fs.renameSync(P+'.tmp',P)}`,
+  `try{fs.writeFileSync(P+'.tmp',v);fs.renameSync(P+'.tmp',P)}`,
   `catch(e){x('the bundle cannot be stored: '+e.message)}`,
   `go(b.slice(i+1))};`,
   `s.on('data',f);s.on('end',e)}`,
@@ -62,6 +71,24 @@ export const PIPE_LOADER = [
 /** The sha256 of a bundle as the loader checks it: 64 lower-case hex digits over its UTF-8 bytes. */
 export function bundleHash(bundle: string): string {
   return createHash('sha256').update(bundle, 'utf8').digest('hex');
+}
+
+/** The longest line of stderr that readableStderr keeps (review round 1 of PR #69, A-R1-3). */
+export const MAX_READABLE_STDERR_LINE = 1_000;
+
+/**
+ * Review round 1 of PR #69 (A-R1-3): the lines of the stderr tail of a loader container that may go to the log. `tail`
+ * holds at most `cap` characters (the end of stderr); at the cap its first line may be the cut end of a longer one, so it
+ * is dropped. Only lines of 1 to MAX_READABLE_STDERR_LINE characters stay (trimmed): Node.js prints the source line of an
+ * uncaught error, and a bundle is one long line, which must never reach the log.
+ */
+export function readableStderr(tail: string, cap: number): string {
+  const lines = tail.split('\n');
+  if (tail.length >= cap) lines.shift();
+  return lines
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 1 && line.length <= MAX_READABLE_STDERR_LINE)
+    .join('\n');
 }
 
 /** The first line of the input: the bundle as a JSON string and a line feed (JSON.stringify escapes every line feed). */

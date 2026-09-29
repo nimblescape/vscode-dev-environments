@@ -12,7 +12,9 @@
 // ensure on a running, a stopped, and a missing container; the records and forget subcommands; an invalid heartbeat
 // writes nothing. Plan step 3 (pipe loading): the container runs the pipe loader and gets the script on its input only;
 // `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
-// replaces the container.
+// replaces the container (review round 1 of PR #69, A-R1-1: with the restart policy kept); a monitor whose first load
+// was cut off is replaced too.
+import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
@@ -22,7 +24,13 @@ import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/works
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { LOADER_EXIT_CODE, PIPE_LOADER, bundleHash } from '../../src/core/loader/pipeLoader';
-import { LABEL_SESSION_MONITOR, REMOTE_MONITOR_READY_TEXT, REMOTE_MONITOR_SCRIPT_PATH, heartbeatFileName } from '../../src/core/remoteMonitor/protocol';
+import {
+  LABEL_SESSION_MONITOR,
+  REMOTE_MONITOR_READY_TEXT,
+  REMOTE_MONITOR_SCRIPT_PATH,
+  heartbeatFileName,
+  remoteMonitorLabelValue,
+} from '../../src/core/remoteMonitor/protocol';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, Timings, dockerTestContext } from './harness';
@@ -134,7 +142,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
     // the configuration of the container.
     expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, REMOTE_MONITOR_SCRIPT_PATH, bundleHash(script), 'startMonitor']);
     expect(details.Config.OpenStdin).toBe(true);
-    expect(JSON.stringify(details)).not.toContain(script.slice(0, 200));
+    // Review round 1 of PR #69 (B-R1-8): changed expectation (before: script.slice(0, 200), which JSON.stringify escapes, so
+    // the check could never fail): the piece as it appears in the JSON of the details.
+    expect(JSON.stringify(details)).not.toContain(JSON.stringify(script).slice(1, 201));
     // The stored script is the one that was sent.
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
     await waitUntil(() => cli.run(['logs', containerName]).out.includes(REMOTE_MONITOR_READY_TEXT), 'the start of the monitor', 30_000);
@@ -224,20 +234,54 @@ describe('the Session Monitor container of a remote Docker host', () => {
     await waitUntil(() => running(containerName), 'the monitor');
     const id = cli.container(containerName)!.Id;
     cli.ok(['exec', containerName, 'sh', '-c', `echo '// changed' >> ${REMOTE_MONITOR_SCRIPT_PATH}`]);
-    // Without the restart policy for this check, so that the state after the refusal stays visible (with it, Docker starts
-    // the loader again and again: `restarting`, or `running` while it waits for an input that never comes).
-    cli.ok(['update', '--restart', 'no', containerName]);
+    // Review round 1 of PR #69 (A-R1-1): changed expectation (before: `docker update --restart no` first, and a wait for
+    // `restarting` or `exited` with 3): the production configuration, unless-stopped, stays. The loader exits 3 at once
+    // (the marker of its first start: started before without its bundle), Docker restarts it (RestartCount ≥ 1), and
+    // ensure replaces it whether it finds it `restarting` or, between two restarts, `running` (the hash check).
     cli.ok(['restart', containerName]);
-    await timings.measure('exit 3 of the loader', () =>
-      waitUntil(() => {
-        const state = cli.container(containerName)?.State;
-        return state?.Status === 'restarting' || (state?.Status === 'exited' && state.ExitCode === LOADER_EXIT_CODE);
-      }, 'the exit of the loader', 150_000),
+    await timings.measure('exit 3 of the loader and a restart by the policy', () =>
+      waitUntil(() => (cli.container(containerName)?.RestartCount ?? 0) >= 1, 'a restart by the policy', 90_000),
     );
-    expect(cli.run(['logs', containerName]).err).toContain('devenv loader: ');
+    expect(cli.container(containerName)!.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(cli.run(['logs', containerName]).err).toContain('devenv loader: started before without its bundle');
+    expect(LOADER_EXIT_CODE).toBe(3);
     expect(await monitor.ensure(helperTag, socket)).toBe('created');
     const details = cli.container(containerName)!;
     expect(details.Id).not.toBe(id);
+    expect(details.State.Running).toBe(true);
+    expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
+  });
+
+  // Review round 1 of PR #69 (A-R1-1): the first, attached `docker run` is cut off before it wrote the script (the window
+  // reloaded, the SSH connection dropped). The loader reads the end of its input and exits 3; the restart policy starts
+  // it again with an input that never ends, and the marker of the first start makes it exit 3 at once, so ensure finds
+  // it restarting (or running with RestartCount ≥ 1 and no stored script) and replaces it.
+  it('replaces a monitor whose first load was cut off (review round 1 of PR #69, A-R1-1)', { timeout: 240_000 }, async () => {
+    cli.run(['rm', '-f', containerName]);
+    const label = remoteMonitorLabelValue(script, helperTag, []);
+    const client = spawn(run.dockerPath, monitor.runArgs(helperTag, socket, label, script), { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    client.stdin.on('error', () => {});
+    client.stdout.resume();
+    client.stderr.resume();
+    const clientEnded = new Promise<void>((resolve) => client.on('close', () => resolve()));
+    try {
+      await waitUntil(() => running(containerName), 'the start of the interrupted monitor', 60_000);
+      // Before any write: the client is killed as a closed window or a lost connection would end it.
+      client.kill('SIGKILL');
+      await clientEnded;
+      await timings.measure('restart of the interrupted monitor by the policy', () =>
+        waitUntil(() => (cli.container(containerName)?.RestartCount ?? 0) >= 1, 'a restart by the policy', 90_000),
+      );
+    } finally {
+      if (client.exitCode === null && client.signalCode === null) client.kill('SIGKILL');
+    }
+    const interrupted = cli.container(containerName)!;
+    expect(interrupted.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(cli.run(['exec', containerName, 'test', '-f', REMOTE_MONITOR_SCRIPT_PATH]).code).not.toBe(0);
+    expect(await monitor.ensure(helperTag, socket)).toBe('created');
+    const details = cli.container(containerName)!;
+    expect(details.Id).not.toBe(interrupted.Id);
     expect(details.State.Running).toBe(true);
     expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));

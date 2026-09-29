@@ -10,10 +10,12 @@ import {
   LOADER_BUNDLE_TIMEOUT_MS,
   LOADER_EXIT_CODE,
   MAX_BUNDLE_LINE_LENGTH,
+  MAX_READABLE_STDERR_LINE,
   PIPE_LOADER,
   bundleHash,
   encodeBundle,
   loaderCommand,
+  readableStderr,
 } from './pipeLoader';
 
 describe('the pipe loader', () => {
@@ -58,5 +60,18 @@ describe('the pipe loader', () => {
     expect(bundleHash('ä€')).toBe(createHash('sha256').update(Buffer.from('ä€', 'utf8')).digest('hex'));
     expect(bundleHash('a')).toMatch(/^[0-9a-f]{64}$/);
     expect(bundleHash('a')).not.toBe(bundleHash('b'));
+  });
+
+  it('review round 1 of PR #69 (A-R1-3): readableStderr keeps only short lines, and drops the cut first line at the cap', () => {
+    expect(MAX_READABLE_STDERR_LINE).toBe(1_000);
+    const long = 'y'.repeat(4_000);
+    expect(readableStderr(`${long}\ndevenv loader: x\n`, 10_000)).toBe('devenv loader: x');
+    expect(readableStderr(`  one  \n\n${'a'.repeat(1_000)}\n${'b'.repeat(1_001)}\ntwo\r\n`, 10_000)).toBe(`one\n${'a'.repeat(1_000)}\ntwo`);
+    // Below the cap the first line is whole; at the cap it is the end of a longer line.
+    expect(readableStderr('first\nsecond', 100)).toBe('first\nsecond');
+    const atCap = `cut end\n${'s'.repeat(92)}`;
+    expect(atCap).toHaveLength(100);
+    expect(readableStderr(atCap, 100)).toBe('s'.repeat(92));
+    expect(readableStderr('', 100)).toBe('');
   });
 });

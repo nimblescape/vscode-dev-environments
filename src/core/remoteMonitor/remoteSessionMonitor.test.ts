@@ -9,6 +9,7 @@ import { MAX_BUNDLE_LINE_LENGTH, PIPE_LOADER, bundleHash, encodeBundle } from '.
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   IMAGE_MAINTENANCE_LABEL_PART,
+  LABEL_MONITOR_CREATE,
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
@@ -28,13 +29,23 @@ const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
 const result = (exitCode: number, stdout = '', stderr = ''): RunResult => ({ exitCode, stdout, stderr, timedOut: false });
 /**
- * The answer of `docker container inspect`: `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}`.
+ * The answer of `docker container inspect`: `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}`
+ * `\t{{json .RestartCount}}` (review round 1 of PR #69, A-R1-1: the restart count added, 0 by default).
  * `state`: true is `running`, false is `exited` (with `exitCode`), a string is that status.
  */
-const inspected = (state: boolean | string, label: string | undefined, exitCode = 0): RunResult => {
+const inspected = (state: boolean | string, label: string | undefined, exitCode = 0, restartCount = 0): RunResult => {
   const status = state === true ? 'running' : state === false ? 'exited' : state;
-  return result(0, `${JSON.stringify(status)}\t${exitCode}\t${JSON.stringify(label === undefined ? {} : { [LABEL_SESSION_MONITOR]: label, other: 'x' })}\n`);
+  const labels = JSON.stringify(label === undefined ? {} : { [LABEL_SESSION_MONITOR]: label, other: 'x' });
+  return result(0, `${JSON.stringify(status)}\t${exitCode}\t${labels}\t${restartCount}\n`);
 };
+/** Review round 1 of PR #69 (A-R1-2): the ID of the container of a create, as `docker ps -aq --no-trunc` prints it. */
+const CREATED_ID = 'c0ffee'.padEnd(64, '0');
+/** The answers for a create after a missing container, with the container of the create found by its nonce label. */
+const missingThenCreated = (args: readonly string[]): RunResult =>
+  args[0] === 'container' ? MISSING : args[0] === 'ps' ? result(0, `${CREATED_ID}\n`) : result(0);
+/** The nonce of the create in the arguments of `docker run` (LABEL_MONITOR_CREATE). */
+const createIdOf = (args: readonly string[]): string | undefined =>
+  args.find((arg) => arg.startsWith(`${LABEL_MONITOR_CREATE}=`))?.slice(LABEL_MONITOR_CREATE.length + 1);
 const MISSING = result(1, '', 'Error response from daemon: No such container: devenv-session-monitor');
 const READY_LINE = `2026-09-29T10:00:00.000Z ${REMOTE_MONITOR_READY_TEXT} (Node.js v24.0.0, a check every 15 s).\n`;
 const CONFLICT = 'docker: Error response from daemon: Conflict. The container name "/devenv-session-monitor" is already in use.\n';
@@ -135,11 +146,13 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(docker.commands()).toEqual(['inspect']);
     // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: the format
     // {{json .State.Running}}\t{{json .Config.Labels}}; now the status and the exit code, for the decision table of ensure).
+    // Review round 1 of PR #69 (A-R1-1): changed expectation (before: without \t{{json .RestartCount}}): the restart count,
+    // so that a container that Docker restarted is checked for its stored script.
     expect(docker.calls[0].args).toEqual([
       'container',
       'inspect',
       '--format',
-      '{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}',
+      '{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}\t{{json .RestartCount}}',
       'devenv-session-monitor',
     ]);
   });
@@ -165,8 +178,11 @@ describe('RemoteSessionMonitor.ensure', () => {
     const byId = docker.calls[1].args;
     const byTag = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
     await monitor(byTag).ensure(TAG, SOCKET);
-    // The same arguments as with the tag, the label included; only the image reference differs.
-    expect(byId).toEqual(byTag.calls[1].args.map((arg) => (arg === TAG ? imageId : arg)));
+    // The same arguments as with the tag, the label included; only the image reference differs. Review round 1 of PR #69
+    // (A-R1-2): changed expectation (before: the arguments compared as they are): the nonce of each create differs too.
+    const byTagArgs = byTag.calls[1].args.map((arg) => (arg === TAG ? imageId : arg === `${LABEL_MONITOR_CREATE}=${createIdOf(byTag.calls[1].args)}` ? `${LABEL_MONITOR_CREATE}=${createIdOf(byId)}` : arg));
+    expect(byId).toEqual(byTagArgs);
+    expect(createIdOf(byId)).not.toBe(createIdOf(byTag.calls[1].args));
     expect(byId).toContain(`${LABEL_SESSION_MONITOR}=${LABEL}`);
     expect(byId).not.toContain(TAG);
     expect(logger.lines).toContain(`info The Session Monitor on the Docker host was created (devenv-session-monitor, image ${TAG}).`);
@@ -183,6 +199,8 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(await monitor(docker).ensure(TAG, '/run/user/1000/docker.sock')).toBe('created');
     expect(docker.commands()).toEqual(['inspect', 'run']);
     const args = docker.calls[1].args;
+    const createId = createIdOf(args);
+    expect(createId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(args).toEqual([
       'run',
       // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: '-d'): attached with an open
@@ -196,6 +214,9 @@ describe('RemoteSessionMonitor.ensure', () => {
       'devenv-session-monitor',
       '--label',
       `${LABEL_SESSION_MONITOR}=${LABEL}`,
+      // Review round 1 of PR #69 (A-R1-2): changed expectation (before: no second label): the nonce of this create.
+      '--label',
+      `${LABEL_MONITOR_CREATE}=${createId}`,
       '--restart',
       'unless-stopped',
       '--network',
@@ -373,12 +394,15 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
   it('fails without a ready line within the time limit: the client is killed and the container removed', async () => {
     vi.useFakeTimers();
     const logger = new Log();
-    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)), () => {});
+    const docker = new FakeDocker(missingThenCreated, () => {});
     const ensured = monitor(docker, logger).ensure(TAG, SOCKET);
     await vi.advanceTimersByTimeAsync(REMOTE_MONITOR_DOCKER_TIMEOUT_MS);
     expect(await ensured).toBe('failed');
-    expect(docker.commands()).toEqual(['inspect', 'run', 'rm']);
-    expect(docker.calls[2].args).toEqual(['rm', '-f', 'devenv-session-monitor']);
+    // Review round 1 of PR #69 (A-R1-2): changed expectation (before: ['inspect', 'run', 'rm'] with `rm -f
+    // devenv-session-monitor`): the container of this create is found by its nonce and removed by its ID.
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+    expect(docker.calls[2].args).toEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_MONITOR_CREATE}=${createIdOf(docker.calls[1].args)}`]);
+    expect(docker.calls[3].args).toEqual(['rm', '-f', CREATED_ID]);
     expect(docker.clients[0].ended).toBe(true);
     expect(docker.clients[0].killed).toBe(true);
     expect(logger.lines.join('\n')).toContain('did not report its start within 60 seconds');
@@ -390,29 +414,36 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
       client.complain('devenv loader: the bundle does not match its hash\n');
       client.exit(3);
     };
-    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)), refused);
+    const docker = new FakeDocker(missingThenCreated, refused);
     expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('failed');
-    expect(docker.commands()).toEqual(['inspect', 'run', 'rm']);
+    // Review round 1 of PR #69 (A-R1-2): changed expectation (before: ['inspect', 'run', 'rm'] by the name): by the nonce.
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+    expect(docker.calls[3].args).toEqual(['rm', '-f', CREATED_ID]);
     expect(logger.lines.join('\n')).toContain('docker run failed: devenv loader: the bundle does not match its hash');
     expect(logger.lines.some((line) => line.includes(SCRIPT))).toBe(false);
   });
 
   it('fails when the client ends before the ready line without a word', async () => {
-    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)), (client) => client.exit(1));
+    const docker = new FakeDocker(missingThenCreated, (client) => client.exit(1));
     const logger = new Log();
     expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('failed');
-    expect(docker.commands()).toEqual(['inspect', 'run', 'rm']);
+    // Review round 1 of PR #69 (A-R1-2): changed expectation (before: ['inspect', 'run', 'rm'] by the name): by the nonce.
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+    expect(docker.calls[3].args).toEqual(['rm', '-f', CREATED_ID]);
     expect(logger.lines.join('\n')).toContain('docker run failed: exit code 1');
   });
 
   it('passes a cancellation during the create on, after it killed the client and removed the container', async () => {
     const controller = new AbortController();
-    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)), () => controller.abort());
+    const docker = new FakeDocker(missingThenCreated, () => controller.abort());
     await expect(monitor(docker).ensure(TAG, SOCKET, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
     expect(docker.clients[0].killed).toBe(true);
-    expect(docker.commands()).toEqual(['inspect', 'run', 'rm']);
+    // Review round 1 of PR #69 (A-R1-2): changed expectation (before: ['inspect', 'run', 'rm'] by the name): by the nonce.
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+    expect(docker.calls[3].args).toEqual(['rm', '-f', CREATED_ID]);
     // The removal does not take the cancelled signal.
     expect(docker.calls[2].options?.signal).toBeUndefined();
+    expect(docker.calls[3].options?.signal).toBeUndefined();
   });
 
   it('fails without a Docker CLI to start', async () => {
@@ -449,6 +480,187 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
       expect(args.some((arg) => arg.includes(piece))).toBe(false);
     }
     expect(args.join(' ').length).toBeLessThan(10_000);
+  });
+});
+
+// Review round 1 of PR #69: a monitor whose first load was cut off (A-R1-1), the removal of a failed create by its
+// nonce (A-R1-2), the log of stderr (A-R1-3), and the tests of reviewer B (B-R1-2, B-R1-3, B-R1-4, B-R1-5, B-R1-7).
+describe('RemoteSessionMonitor.ensure (review round 1 of PR #69)', () => {
+  const SHA256SUM = ['exec', 'devenv-session-monitor', 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH];
+  const sha256sumOutput = (hash: string) => result(0, `${hash}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`);
+
+  for (const state of ['running', 'paused'] as const) {
+    for (const [what, answer] of [
+      ['no stored script', result(1, '', `sha256sum: ${REMOTE_MONITOR_SCRIPT_PATH}: No such file or directory\n`)],
+      ['another stored script', sha256sumOutput(bundleHash(`${SCRIPT}// changed`))],
+      ['no answer in time', { exitCode: null, stdout: '', stderr: '', timedOut: true } as unknown as RunResult],
+      ['a failed call', new Error('Docker Desktop is not installed.')],
+      ['an empty answer', result(0, '')],
+      ['a failed call that printed the hash', result(1, `${bundleHash(SCRIPT)}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`, 'error')],
+    ] as const) {
+      it(`A-R1-1: ${state} with RestartCount 1 and ${what} → replaced`, async () => {
+        const logger = new Log();
+        const docker = new FakeDocker((args) => {
+          if (args[0] === 'container') return inspected(state, LABEL, 3, 1);
+          if (args[0] === 'exec') return answer instanceof Error ? Promise.reject(answer) : answer;
+          return result(0);
+        });
+        expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('created');
+        expect(docker.commands()).toEqual(['inspect', 'exec', 'rm', 'run']);
+        expect(docker.calls[1].args).toEqual(SHA256SUM);
+        expect(docker.calls[1].options?.timeoutMs).toBe(20_000);
+        expect(docker.calls[2].args).toEqual(['rm', '-f', 'devenv-session-monitor']);
+        expect(logger.lines).toContain('info The Session Monitor on the Docker host was restarted without its script; it is replaced (devenv-session-monitor).');
+      });
+    }
+
+    it(`A-R1-1: ${state} with RestartCount 1 and the stored script of this version → running, nothing removed`, async () => {
+      const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(state, LABEL, 0, 1) : args[0] === 'exec' ? sha256sumOutput(bundleHash(SCRIPT)) : result(0)));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      expect(docker.calls[1].args).toEqual(SHA256SUM);
+    });
+
+    it(`A-R1-1: ${state} with RestartCount 0 → running without any other call`, async () => {
+      const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(state, LABEL, 0, 0) : result(1)));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect']);
+    });
+  }
+
+  it('A-R1-1: a larger RestartCount is checked too; one that cannot be read counts as 0', async () => {
+    const restarted = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL, 3, 17) : args[0] === 'exec' ? result(1) : result(0)));
+    expect(await monitor(restarted).ensure(TAG, SOCKET)).toBe('created');
+    expect(restarted.commands()).toEqual(['inspect', 'exec', 'rm', 'run']);
+    const unreadable = new FakeDocker((args) =>
+      args[0] === 'container' ? result(0, `"running"\t0\t${JSON.stringify({ [LABEL_SESSION_MONITOR]: LABEL })}\tnull\n`) : result(1),
+    );
+    expect(await monitor(unreadable).ensure(TAG, SOCKET)).toBe('running');
+    expect(unreadable.commands()).toEqual(['inspect']);
+  });
+
+  it('A-R1-1: a cancellation during the check of the stored script passes', async () => {
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL, 0, 1) : Promise.reject(abortError())));
+    await expect(monitor(docker).ensure(TAG, SOCKET, new AbortController().signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(docker.commands()).toEqual(['inspect', 'exec']);
+  });
+
+  it('A-R1-2: a create whose client ends with "No such container" removes only its own container, by its nonce', async () => {
+    const gone = (client: FakeClient) => {
+      client.complain('docker: Error response from daemon: No such container: 4f1c2a9e.\n');
+      client.exit(125);
+    };
+    const docker = new FakeDocker(missingThenCreated, gone);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    const createId = createIdOf(docker.calls[1].args);
+    expect(createId).toBeDefined();
+    expect(docker.calls.map((call) => call.args)).toEqual([
+      expect.arrayContaining(['container', 'inspect']),
+      expect.arrayContaining(['run', `${LABEL_MONITOR_CREATE}=${createId}`]),
+      ['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_MONITOR_CREATE}=${createId}`],
+      ['rm', '-f', CREATED_ID],
+    ]);
+    expect(docker.calls.some((call) => call.args[0] === 'rm' && call.args.includes('devenv-session-monitor'))).toBe(false);
+  });
+
+  it('A-R1-2: nothing is removed when no container has the nonce, or the list fails; each create has its own nonce', async () => {
+    const none = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, '\n')), (client) => client.exit(1));
+    expect(await monitor(none).ensure(TAG, SOCKET)).toBe('failed');
+    expect(none.commands()).toEqual(['inspect', 'run', 'ps']);
+    const failing = new FakeDocker((args) => (args[0] === 'container' ? MISSING : args[0] === 'ps' ? result(1, CREATED_ID, 'error') : result(0)), (client) => client.exit(1));
+    expect(await monitor(failing).ensure(TAG, SOCKET)).toBe('failed');
+    expect(failing.commands()).toEqual(['inspect', 'run', 'ps']);
+    const twice = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)));
+    await monitor(twice).ensure(TAG, SOCKET);
+    await monitor(twice).ensure(TAG, SOCKET);
+    const runs = twice.calls.filter((call) => call.args[0] === 'run').map((call) => createIdOf(call.args));
+    expect(runs).toHaveLength(2);
+    expect(runs[0]).not.toBe(runs[1]);
+    // Not part of the label of the version.
+    expect(remoteMonitorLabelValue(SCRIPT, TAG)).toBe(LABEL);
+  });
+
+  it('A-R1-3: a long line of stderr (the source line of an uncaught error) is not logged, the loader line is', async () => {
+    const logger = new Log();
+    const crashed = (client: FakeClient) => {
+      client.complain(`/opt/devenv/monitor.js:1\n${'y'.repeat(4_000)}\n`);
+      client.complain('devenv loader: x\n');
+      client.exit(3);
+    };
+    const docker = new FakeDocker(missingThenCreated, crashed);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('failed');
+    const log = logger.lines.join('\n');
+    expect(log).toContain('docker run failed: devenv loader: x');
+    expect(log).not.toContain('yyyyyyyyyy');
+  });
+
+  it('A-R1-3: at the cap of the tail its first line (the cut end of a longer one) is dropped, even when it is short', async () => {
+    const logger = new Log();
+    const rest = `${'short line\n'.repeat(300)}devenv loader: x\n`;
+    const cut = 4_000 - rest.length - 1;
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThanOrEqual(1_000);
+    const crashed = (client: FakeClient) => {
+      client.complain(`${'z'.repeat(10_000)}\n${rest}`);
+      client.exit(3);
+    };
+    const docker = new FakeDocker(missingThenCreated, crashed);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('failed');
+    const log = logger.lines.join('\n');
+    expect(log).toContain('short line\ndevenv loader: x');
+    expect(log).not.toContain('z');
+  });
+
+  it('B-R1-2: other output without the ready line is not a start', async () => {
+    const other = (client: FakeClient) => {
+      client.say('2026-09-29T10:00:00.000Z something else\n');
+      setTimeout(() => client.exit(1), 20);
+    };
+    const docker = new FakeDocker(missingThenCreated, other);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+  });
+
+  it('B-R1-3: a conflict with a container of this version that does not run is a failure', async () => {
+    const conflict = (client: FakeClient) => {
+      client.complain(CONFLICT);
+      client.exit(125);
+    };
+    const docker = new FakeDocker((args, index) => (index === 0 ? MISSING : inspected(false, LABEL, 3)), conflict);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    // Not ours: not removed.
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect']);
+  });
+
+  it('B-R1-4: a signal aborted before the create is passed on without writing the script or waiting for the monitor', async () => {
+    const controller = new AbortController();
+    const docker = new FakeDocker((args) => {
+      if (args[0] === 'container') controller.abort();
+      return missingThenCreated(args);
+    });
+    await expect(monitor(docker).ensure(TAG, SOCKET, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(docker.clients[0].written).toEqual([]);
+    expect(docker.clients[0].killed).toBe(true);
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+  });
+
+  it('B-R1-5: a script whose line is exactly MAX_BUNDLE_LINE_LENGTH is accepted', async () => {
+    const script = 'a'.repeat(MAX_BUNDLE_LINE_LENGTH - 2);
+    expect(encodeBundle(script).length - 1).toBe(MAX_BUNDLE_LINE_LENGTH);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)));
+    expect(await monitor(docker, new Log(), script).ensure(TAG, SOCKET)).toBe('created');
+    expect(docker.clients[0].written[0]).toHaveLength(MAX_BUNDLE_LINE_LENGTH + 1);
+  });
+
+  it('B-R1-7: a conflict whose stderr comes in two pieces is still recognised', async () => {
+    const conflict = (client: FakeClient) => {
+      client.complain('docker: Error response from daemon: Conflict. The container name "/devenv-session-monitor" is already in use');
+      client.complain(' by container "abc". You have to remove (or rename) that container to be able to reuse that name.\n');
+      client.exit(125);
+    };
+    const docker = new FakeDocker((args, index) => (index === 0 ? MISSING : inspected(true, LABEL)), conflict);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect']);
   });
 });
 

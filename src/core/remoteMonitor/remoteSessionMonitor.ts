@@ -12,11 +12,13 @@
 // of its input, waits for the monitor's REMOTE_MONITOR_READY_TEXT, then ends its input and the client (the container
 // goes on: no signal is passed on). The loader stores the script at REMOTE_MONITOR_SCRIPT_PATH, so a restart of the
 // container resumes from it without input. Neither the script line nor any other input is logged.
+import { randomUUID } from 'crypto';
 import { errorMessage } from '../errors';
-import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
+import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from '../loader/pipeLoader';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   IMAGE_MAINTENANCE_LABEL_PART,
+  LABEL_MONITOR_CREATE,
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_CONTAINER,
   REMOTE_MONITOR_ENTRY,
@@ -42,6 +44,8 @@ import {
 export const REMOTE_MONITOR_DOCKER_TIMEOUT_MS = 60_000;
 /** Time limit of a heartbeat, `records`, and `forget` (`docker exec`). */
 export const REMOTE_MONITOR_EXEC_TIMEOUT_MS = 20_000;
+/** The characters of the end of stderr of the attached `docker run` that are kept (for the conflict and the log). */
+const STDERR_TAIL_LENGTH = 4_000;
 
 /**
  * Monitor cleanup, user decision 2026-09-29 (R5): the log options of the monitor container, `docker logs` of at most
@@ -91,9 +95,10 @@ export type MonitorExecResult = { ok: true; stdout: string } | { ok: false; miss
 
 /**
  * The state of the monitor container: missing, or its status (`created`, `running`, `paused`, `restarting`, `removing`,
- * `exited`, `dead`), the exit code of its last run, and its label.
+ * `exited`, `dead`), the exit code of its last run, its label, and how often Docker restarted it by its restart policy
+ * since its last start by a client (`RestartCount`; 0 when it cannot be read).
  */
-type Inspected = { exists: false } | { exists: true; status: string; exitCode: number | undefined; label: string };
+type Inspected = { exists: false } | { exists: true; status: string; exitCode: number | undefined; label: string; restartCount: number };
 
 /** How the attached `docker run` of the monitor ended for ensure. */
 type Created = { kind: 'ready' } | { kind: 'exited'; detail: string; conflict: boolean } | { kind: 'timeout' } | { kind: 'aborted' };
@@ -121,7 +126,10 @@ export class RemoteSessionMonitor {
   /**
    * Makes sure that the monitor container runs the current script with the helper image `helperTag`, by the state of the
    * container with the name (plan step 3, pipe loading):
-   * - the matching label and running or paused → nothing;
+   * - the matching label and running or paused → nothing; review round 1 of PR #69 (A-R1-1): when Docker restarted it
+   *   (RestartCount > 0), only when `docker exec … sha256sum` of the stored script gives the hash of the script (a
+   *   restarted container whose first load was cut off has none: its loader exits 3 again and again, or waits),
+   *   otherwise → `docker rm -f`, then create;
    * - the matching label and exited with an exit code other than LOADER_EXIT_CODE → `docker start` (the loader resumes
    *   from the stored script);
    * - the matching label and created, restarting, dead, removing, or exited with LOADER_EXIT_CODE (the loader refused
@@ -131,7 +139,8 @@ export class RemoteSessionMonitor {
    * monitor is up when its output has REMOTE_MONITOR_READY_TEXT within REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then the client
    * is ended. When another window created it meanwhile (a name conflict), it looks once more and accepts a matching one
    * that runs. Any other failure (no ready line in time, the container ended, a cancellation) kills the client and
-   * removes the container (`docker rm -f`, best effort). `socketPath`: the source of the socket mount on the host of the
+   * removes the container of this create (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
+   * #69, A-R1-2: never by its name). `socketPath`: the source of the socket mount on the host of the
    * engine (as for the workspace helper, rootless aware). `helperImage`: the image reference of `docker run` when it is
    * not `helperTag`: the checked image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3
    * of PR #64, P2); the label and the log lines keep the tag. Never throws, except an AbortError; a failure is logged as
@@ -151,17 +160,25 @@ export class RemoteSessionMonitor {
       // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
       // time zone on the same engine do not replace it at each open.
       const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
-      const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images);
+      // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
+      const createId = randomUUID();
+      const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images, createId);
       const current = await this.inspect(signal);
       if (current.exists && current.label === label) {
-        if (isRunning(current.status)) return 'running';
-        if (current.status === 'exited' && current.exitCode !== LOADER_EXIT_CODE) {
+        if (isRunning(current.status)) {
+          // Review round 1 of PR #69 (A-R1-1): a container that Docker restarted runs its stored script only when it has
+          // one; one whose first load was cut off gets a new input without a writer and never its script. RestartCount 0
+          // (a normal open, or the create of another window that is still loading) needs no extra call.
+          if (current.restartCount === 0 || (await this.storesScript(script, signal))) return 'running';
+          logger.info(`The Session Monitor on the Docker host was restarted without its script; it is replaced (${this.containerName}).`);
+        } else if (current.status === 'exited' && current.exitCode !== LOADER_EXIT_CODE) {
           await this.docker(['start', this.containerName], signal);
           logger.info(`The Session Monitor on the Docker host was started again (${this.containerName}).`);
           return 'started';
+        } else {
+          const how = current.status === 'exited' ? `exited with ${current.exitCode}` : current.status;
+          logger.info(`The Session Monitor on the Docker host does not run (${how}); it is replaced (${this.containerName}).`);
         }
-        const how = current.status === 'exited' ? `exited with ${current.exitCode}` : current.status;
-        logger.info(`The Session Monitor on the Docker host does not run (${how}); it is replaced (${this.containerName}).`);
       } else if (current.exists) {
         logger.info(`The Session Monitor on the Docker host is of another version; it is replaced (${this.containerName}).`);
       }
@@ -178,7 +195,7 @@ export class RemoteSessionMonitor {
         if (again.exists && again.label === label && isRunning(again.status)) return 'running';
         throw new Error(`docker run failed: ${created.detail}`);
       }
-      await this.removeBestEffort();
+      await this.removeBestEffort(createId);
       if (created.kind === 'aborted') throw abortError();
       if (created.kind === 'timeout') {
         throw new Error(`the monitor did not report its start within ${REMOTE_MONITOR_DOCKER_TIMEOUT_MS / 1000} seconds.`);
@@ -222,10 +239,12 @@ export class RemoteSessionMonitor {
         if (output.includes(REMOTE_MONITOR_READY_TEXT)) settle({ kind: 'ready' });
       });
       client.onStderr((text) => {
-        stderr = (stderr + text).slice(-4_000);
+        stderr = (stderr + text).slice(-STDERR_TAIL_LENGTH);
       });
       void client.exited.then(({ exitCode, error }) => {
-        const detail = error ? error.message : stderr.trim() || `exit code ${exitCode}`;
+        // Review round 1 of PR #69 (A-R1-3): the conflict is recognised in the whole tail, but only its short lines are
+        // logged (Node.js prints the source line of an uncaught error, and the script is one long line).
+        const detail = error ? error.message : readableStderr(stderr, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
         settle({ kind: 'exited', detail, conflict: /conflict|already in use/i.test(stderr) });
       });
       if (!settled) {
@@ -241,12 +260,40 @@ export class RemoteSessionMonitor {
     return created;
   }
 
-  /** `docker rm -f` of the monitor after a failed create; a failure is ignored (the next open replaces it anyway). */
-  private async removeBestEffort(): Promise<void> {
+  /**
+   * `docker rm -f` of the container of a failed create; a failure is ignored (the next open replaces it anyway). Review
+   * round 1 of PR #69 (A-R1-2): by the nonce label of this create (`docker ps -aq --no-trunc --filter label=…`, then
+   * `docker rm -f <id>`), never by the name: when the create failed because another window removed and replaced the
+   * container meanwhile ("No such container"), the container of the name is that of the other window.
+   */
+  private async removeBestEffort(createId: string): Promise<void> {
     try {
-      await this.options.docker.run(['rm', '-f', this.containerName], { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS });
+      const options = { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS };
+      const listed = await this.options.docker.run(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_MONITOR_CREATE}=${createId}`], options);
+      if (listed.exitCode !== 0 || listed.timedOut) return;
+      for (const id of listed.stdout.split(/\s+/).filter((line) => /^[0-9a-f]{64}$/.test(line))) {
+        await this.options.docker.run(['rm', '-f', id], options);
+      }
     } catch {
       // Best effort.
+    }
+  }
+
+  /**
+   * Review round 1 of PR #69 (A-R1-1): true when the running container holds the script (`docker exec <name> sha256sum
+   * REMOTE_MONITOR_SCRIPT_PATH` gives its bundleHash). Any failure is false (the container is replaced); a cancellation
+   * passes.
+   */
+  private async storesScript(script: string, signal: AbortSignal | undefined): Promise<boolean> {
+    try {
+      const result = await this.options.docker.run(['exec', this.containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH], {
+        timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS,
+        signal,
+      });
+      return result.exitCode === 0 && !result.timedOut && result.stdout.trim().split(/\s+/)[0] === bundleHash(script);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return false;
     }
   }
 
@@ -303,12 +350,15 @@ export class RemoteSessionMonitor {
    * step 3 (pipe loading): attached with an open input (`-i`, no `-d`) and without passing signals on
    * (`--sig-proxy=false`), so ending the client leaves the container running; the command is the pipe loader with the
    * path, the hash of `script`, and REMOTE_MONITOR_ENTRY. The script itself goes over the input (ensure), never here.
+   * `createId`: the nonce of this create (LABEL_MONITOR_CREATE; review round 1 of PR #69, A-R1-2), which ensure always
+   * passes.
    */
-  runArgs(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings): string[] {
+  runArgs(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string): string[] {
     const imagePrefixes = images?.prefixes ?? [];
     // Review round 4 of PR #64 (R4-8): never a pull, like the helper runs: the helper image exists only on the engine, and
     // a missing image must not be looked up in a registry under its name.
     const args = ['run', '-i', '--sig-proxy=false', '--pull', 'never', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
+    if (createId !== undefined) args.push('--label', `${LABEL_MONITOR_CREATE}=${createId}`);
     for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
     // Our own container: it survives a restart of the daemon (the refusal of restart policies is for the containers of
     // repositories); after a restart the loader resumes from the stored script. No published port, no capability: it
@@ -352,22 +402,24 @@ export class RemoteSessionMonitor {
   }
 
   private async inspect(signal: AbortSignal | undefined): Promise<Inspected> {
-    const args = ['container', 'inspect', '--format', `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}`, this.containerName];
+    const args = ['container', 'inspect', '--format', `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}\t{{json .RestartCount}}`, this.containerName];
     const result = await this.options.docker.run(args, { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
     if (result.exitCode !== 0) {
       if (isMissingContainer(result)) return { exists: false };
       throw new Error(`docker container inspect failed: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
     }
-    const [statusText = '', exitCodeText = '', labelsText = ''] = result.stdout.trim().split('\t');
+    const [statusText = '', exitCodeText = '', labelsText = '', restartCountText = ''] = result.stdout.trim().split('\t');
     const status = parseJson(statusText);
     const exitCode = parseJson(exitCodeText);
     const labels = parseJson(labelsText);
+    const restartCount = parseJson(restartCountText);
     const value = typeof labels === 'object' && labels !== null ? (labels as Record<string, unknown>)[LABEL_SESSION_MONITOR] : undefined;
     return {
       exists: true,
       status: typeof status === 'string' ? status : '',
       exitCode: typeof exitCode === 'number' && Number.isInteger(exitCode) ? exitCode : undefined,
       label: typeof value === 'string' ? value : '',
+      restartCount: typeof restartCount === 'number' && Number.isInteger(restartCount) && restartCount > 0 ? restartCount : 0,
     };
   }
 

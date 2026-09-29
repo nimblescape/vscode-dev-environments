@@ -113,26 +113,32 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
   });
 
   it('exits 3 when the input ends before the first line', async () => {
-    const file = newPath();
+    // Review round 1 of PR #69 (A-R1-1): changed expectation (before: one path for all cases): a new path per case, as
+    // the marker of the first start makes a second start on the same path exit at once (its own test below).
     for (const input of ['', JSON.stringify(START_BUNDLE)]) {
+      const file = newPath();
       const ended = await load(file, bundleHash(START_BUNDLE), 'start', input);
       expect(ended.code).toBe(LOADER_EXIT_CODE);
       expect(ended.stderr).toBe('devenv loader: the input ended before the bundle\n');
+      expect(fs.existsSync(file)).toBe(false);
     }
-    expect(fs.existsSync(file)).toBe(false);
   });
 
   it('exits 3 for a first line that is no JSON string', async () => {
-    const file = newPath();
+    // Review round 1 of PR #69 (A-R1-1): changed expectation (before: one path for all cases): a new path per case (the
+    // marker of the first start).
     for (const line of ['{"start":1}', '42', 'null', 'not json', '"unterminated']) {
+      const file = newPath();
       const ended = await load(file, bundleHash(line), 'start', `${line}\n`);
       expect(ended.code, line).toBe(LOADER_EXIT_CODE);
       expect(ended.stderr, line).toBe('devenv loader: the bundle does not match its hash\n');
+      expect(fs.existsSync(file)).toBe(false);
     }
-    expect(fs.existsSync(file)).toBe(false);
   });
 
   it('exits 3 for a first line longer than MAX_BUNDLE_LINE_LENGTH, with or without its line feed', { timeout: 30_000 }, async () => {
+    // Review round 1 of PR #69 (A-R1-1): changed expectation (before: one path for both cases): a new path per case (the
+    // marker of the first start).
     const file = newPath();
     const long = `"${'a'.repeat(MAX_BUNDLE_LINE_LENGTH)}"`;
     // Without a line feed, and the input stays open: the loader does not wait for more.
@@ -142,10 +148,12 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     open.end();
     expect(ended.code).toBe(LOADER_EXIT_CODE);
     expect(ended.stderr).toBe('devenv loader: the bundle is too long\n');
-    const whole = await load(file, bundleHash('a'.repeat(MAX_BUNDLE_LINE_LENGTH)), 'start', `${long}\n`);
+    expect(fs.existsSync(file)).toBe(false);
+    const other = newPath();
+    const whole = await load(other, bundleHash('a'.repeat(MAX_BUNDLE_LINE_LENGTH)), 'start', `${long}\n`);
     expect(whole.code).toBe(LOADER_EXIT_CODE);
     expect(whole.stderr).toBe('devenv loader: the bundle is too long\n');
-    expect(fs.existsSync(file)).toBe(false);
+    expect(fs.existsSync(other)).toBe(false);
   });
 
   it('exits 3 when the bundle has no such function or cannot be loaded', async () => {
@@ -187,6 +195,112 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     const ended = await again.ended;
     again.end();
     expect(ended).toEqual({ code: 0, stdout: 'started "" null', stderr: '' });
+    // Review round 1 of PR #69 (A-R1-1): the marker of the first start is there and does not stop the resume.
+    expect(fs.existsSync(`${file}.started`)).toBe(true);
+  });
+
+  it('review round 1 of PR #69 (A-R1-1): a second start without a stored bundle exits 3 at once, also with its input open', async () => {
+    const file = newPath();
+    const hash = bundleHash(START_BUNDLE);
+    // The first start: its input ended before the bundle (the attached client was cut off).
+    const first = await load(file, hash, 'start', '');
+    expect(first.stderr).toBe('devenv loader: the input ended before the bundle\n');
+    expect(fs.existsSync(`${file}.started`)).toBe(true);
+    // The restart: a new input without a writer that never ends. The loader does not wait for it (60 s before).
+    const startedAt = Date.now();
+    const again = startLoader(file, hash, 'start');
+    const ended = await again.ended;
+    again.end();
+    expect(ended).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: started before without its bundle\n' });
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(fs.existsSync(file)).toBe(false);
+    // The same with a stored file of another hash (changed in the container): never read from an input again.
+    fs.writeFileSync(file, 'exports.start = () => process.stdout.write("changed");');
+    const changed = startLoader(file, hash, 'start');
+    changed.write(encodeBundle(START_BUNDLE));
+    const refused = await changed.ended;
+    changed.end();
+    expect(refused).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: started before without its bundle\n' });
+  });
+
+  it('review round 1 of PR #69 (A-R1-1): a valid stored bundle still resumes with the marker present', async () => {
+    const file = newPath();
+    const hash = bundleHash(START_BUNDLE);
+    expect((await load(file, hash, 'start', '')).code).toBe(LOADER_EXIT_CODE);
+    expect(fs.existsSync(`${file}.started`)).toBe(true);
+    // The script came some other way (a later load of the same container is not possible; here written directly).
+    fs.writeFileSync(file, START_BUNDLE);
+    const again = startLoader(file, hash, 'start');
+    const ended = await again.ended;
+    again.end();
+    expect(ended).toEqual({ code: 0, stdout: 'started "" null', stderr: '' });
+  });
+
+  it('review round 1 of PR #69 (A-R1-1): exits 3 when the marker cannot be written', async () => {
+    const file = newPath();
+    // The folder of the bundle is a file: neither the folder nor the marker can be created.
+    fs.mkdirSync(path.dirname(path.dirname(file)), { recursive: true });
+    fs.writeFileSync(path.dirname(file), 'not a folder');
+    const running = startLoader(file, bundleHash(START_BUNDLE), 'start');
+    const ended = await running.ended;
+    running.end();
+    expect(ended.code).toBe(LOADER_EXIT_CODE);
+    expect(ended.stderr).toMatch(/^devenv loader: the bundle cannot be stored: .+\n$/);
+  });
+
+  it('review round 1 of PR #69 (A-R1-3): an entry that throws exits 3 with one line, never the source of the bundle', async () => {
+    const throwing = `exports.start = () => { throw new Error('boom'); }; // ${'x'.repeat(5_000)}`;
+    const ended = await load(newPath(), bundleHash(throwing), 'start', encodeBundle(throwing));
+    expect(ended).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: the entry failed: boom\n' });
+  });
+
+  it('review round 1 of PR #69 (B-R1-1): exits 3 when no bundle comes within 60 s while the input stays open', { timeout: 90_000 }, async () => {
+    const startedAt = Date.now();
+    const running = startLoader(newPath(), bundleHash('x'), 'start');
+    const ended = await running.ended;
+    running.end();
+    expect(ended.code).toBe(LOADER_EXIT_CODE);
+    expect(ended.stderr).toBe('devenv loader: no bundle within 60 s\n');
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(59_000);
+  });
+
+  it('review round 1 of PR #69 (B-R1-5): a first line of exactly MAX_BUNDLE_LINE_LENGTH loads, also with its line feed later; one more is refused', { timeout: 60_000 }, async () => {
+    const head = 'exports.start=()=>process.stdout.write(String.fromCharCode(111,107));//';
+    const bundle = head + 'a'.repeat(MAX_BUNDLE_LINE_LENGTH - 2 - head.length);
+    const line = encodeBundle(bundle);
+    expect(line.length - 1).toBe(MAX_BUNDLE_LINE_LENGTH);
+    const ok = startLoader(newPath(), bundleHash(bundle), 'start');
+    ok.write(line.slice(0, -1));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    ok.write('\n');
+    ok.end();
+    expect(await ok.ended).toEqual({ code: 0, stdout: 'ok', stderr: '' });
+    const longer = `${bundle}a`;
+    const refused = await load(newPath(), bundleHash(longer), 'start', encodeBundle(longer));
+    expect(refused.code).toBe(LOADER_EXIT_CODE);
+    expect(refused.stderr).toBe('devenv loader: the bundle is too long\n');
+  });
+
+  it('review round 1 of PR #69 (B-R1-5): exactly MAX_BUNDLE_LINE_LENGTH characters without a line feed are not too long', { timeout: 60_000 }, async () => {
+    const running = startLoader(newPath(), bundleHash('a'), 'start');
+    running.write('a'.repeat(MAX_BUNDLE_LINE_LENGTH));
+    running.end();
+    const ended = await running.ended;
+    expect(ended.code).toBe(LOADER_EXIT_CODE);
+    expect(ended.stderr).toBe('devenv loader: the input ended before the bundle\n');
+  });
+
+  it('review round 1 of PR #69 (B-R1-6): the bundle replaces the file at the path by a rename, never writes into what is there', async () => {
+    const file = newPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const other = path.join(path.dirname(file), 'other.js');
+    fs.writeFileSync(other, 'old');
+    fs.symlinkSync(other, file);
+    const ended = await load(file, bundleHash(START_BUNDLE), 'start', encodeBundle(START_BUNDLE));
+    expect(ended).toEqual({ code: 0, stdout: 'started "" false', stderr: '' });
+    expect(fs.readFileSync(other, 'utf8')).toBe('old');
+    expect(fs.lstatSync(file).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe(START_BUNDLE);
   });
 
   it('replaces a stored file with another hash by the bundle from its input', async () => {

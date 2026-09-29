@@ -129,7 +129,9 @@ describe('the helper channel with the real Docker engine', () => {
     // entry; the script came over stdin and is nowhere in the configuration of the container.
     expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', bundleHash(script), 'startChannel']);
     expect(details.Config.OpenStdin).toBe(true);
-    expect(JSON.stringify(details)).not.toContain(script.slice(0, 200));
+    // Review round 1 of PR #69 (B-R1-8): changed expectation (before: script.slice(0, 200), which JSON.stringify escapes, so
+    // the check could never fail): the piece as it appears in the JSON of the details.
+    expect(JSON.stringify(details)).not.toContain(JSON.stringify(script).slice(1, 201));
 
     const version = await timings.measure('docker version through the channel', () => channel.docker(['version', '--format', '{{.Server.Version}}']));
     expect(version.exitCode).toBe(0);

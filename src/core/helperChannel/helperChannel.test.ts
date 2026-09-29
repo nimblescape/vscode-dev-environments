@@ -129,6 +129,31 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     expect(silent.state.killed).toBe(true);
   });
 
+  it('review round 1 of PR #69 (A-R1-3): a long line of stderr (the source line of an uncaught error) is not in the reason, the loader line is', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    crashed.stderr(`${'y'.repeat(4_000)}\n`);
+    crashed.stderr('devenv loader: x\n');
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toBe('The helper channel to build-box could not be opened: the helper ended (devenv loader: x)');
+    expect(JSON.stringify(lines)).not.toContain('yyyyyyyyyy');
+  });
+
+  it('review round 1 of PR #69 (B-R1-5): a script whose line is exactly MAX_BUNDLE_LINE_LENGTH is written', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'a'.repeat(MAX_BUNDLE_LINE_LENGTH - 2), { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.lines[0]).toHaveLength(MAX_BUNDLE_LINE_LENGTH);
+    fake.answer(HELLO);
+    expect((await opening).isOpen).toBe(true);
+  });
+
   it('closes a channel whose script speaks another protocol', async () => {
     const fake = fakeProcess();
     const { logger } = recordingLogger();

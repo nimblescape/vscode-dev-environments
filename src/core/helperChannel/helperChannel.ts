@@ -10,7 +10,7 @@
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
-import { MAX_BUNDLE_LINE_LENGTH, encodeBundle } from '../loader/pipeLoader';
+import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
@@ -35,6 +35,8 @@ import {
   type ServerMessage,
 } from './protocol';
 
+/** The characters of the end of the stderr of `docker run` that are kept for the log (readableStderr). */
+const STDERR_TAIL_LENGTH = 4_000;
 /** Time for the start of the container and the answer to `hello` (an SSH connection, the container, Node.js). */
 export const CHANNEL_OPEN_TIMEOUT_MS = 120_000;
 /** After `close`, `docker run` gets this long to end by itself before it is stopped. */
@@ -201,10 +203,12 @@ export class HelperChannel {
     const splitter = new LineSplitter(MAX_SERVER_LINE, (line) => this.onLine(line), () => this.lose('a line of the helper is too long'));
     this.process.onStdout((text) => splitter.push(text));
     this.process.onStderr((text) => {
-      this.stderrTail = (this.stderrTail + text).slice(-4_000);
+      this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_LENGTH);
     });
     void this.process.exited.then(({ exitCode, error }) => {
-      const detail = error ? error.message : this.stderrTail.trim() || `exit code ${exitCode}`;
+      // Review round 1 of PR #69 (A-R1-3): only the short lines of the tail reach the log (Node.js prints the source line
+      // of an uncaught error, and the script is one long line).
+      const detail = error ? error.message : readableStderr(this.stderrTail, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
       this.lose(`the helper ended (${detail})`);
     });
     // Review round 1 (P6): the loader limits the escaped line, so the same is checked here (plan step 3: the memory guard

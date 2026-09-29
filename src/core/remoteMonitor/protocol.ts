@@ -20,6 +20,12 @@ export const REMOTE_MONITOR_VOLUME = 'devenv-session-monitor';
 /** Label of the container: 12 hex digits of sha256 of the script, the helper tag and the loader (remoteMonitorLabelValue). */
 export const LABEL_SESSION_MONITOR = 'nimblescape.devenv.session-monitor';
 /**
+ * Review round 1 of PR #69 (A-R1-2): a label with a random nonce per create of the monitor container (not part of
+ * remoteMonitorLabelValue). A failed create removes only the container with its own nonce (`docker ps -aq --filter
+ * label=…`, then `docker rm -f <id>`), never the container of the name, which may be that of another window by then.
+ */
+export const LABEL_MONITOR_CREATE = 'nimblescape.devenv.monitor-create';
+/**
  * Where the pipe loader stores the script (plan step 3; its own file system, so it matches the container version). A
  * restart of the container starts it from there without new input (resume); the `docker exec` subcommands run it too.
  */
