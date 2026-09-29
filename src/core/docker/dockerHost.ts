@@ -22,9 +22,9 @@ export function remoteContextName(host: string): string {
   return `${REMOTE_CONTEXT_PREFIX}-${createHash('sha256').update(host, 'utf8').digest('hex').slice(0, 8)}`;
 }
 
-/** True for a context that Dev Environments created (remoteContextName; `devenv-remote` of earlier builds). */
+/** True for a context that Dev Environments created (remoteContextName). */
 export function isOwnRemoteContext(name: string | undefined): boolean {
-  return name !== undefined && (name === REMOTE_CONTEXT_PREFIX || /^devenv-remote-[0-9a-f]{8}$/.test(name));
+  return name !== undefined && /^devenv-remote-[0-9a-f]{8}$/.test(name);
 }
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */
 export const DEFAULT_CONTEXT_NAME = 'default';

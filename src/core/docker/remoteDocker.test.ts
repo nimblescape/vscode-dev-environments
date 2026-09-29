@@ -238,7 +238,7 @@ describe('readRootlessSocket', () => {
 });
 
 describe('ensureDockerHostReachable (the Docker start of a remote host)', () => {
-  const target = { kind: 'remote' as const, host: 'box', endpoint: 'ssh://box', context: 'devenv-remote' };
+  const target = { kind: 'remote' as const, host: 'box', endpoint: 'ssh://box', context: 'devenv-remote-26f8567f' };
 
   it('asks docker info through the current context; a rootful engine has no recorded socket', async () => {
     await state.setRootlessSocket('box', '/run/user/1000/docker.sock');
@@ -385,10 +385,12 @@ describe('the Docker context commands', () => {
   });
 
   it('goes back to the remembered context, else default', () => {
-    expect(localContextChoice('desktop-linux', ['default', 'desktop-linux', 'devenv-remote'])).toBe('desktop-linux');
+    expect(localContextChoice('desktop-linux', ['default', 'desktop-linux', 'devenv-remote-26f8567f'])).toBe('desktop-linux');
     expect(localContextChoice('gone', ['default'])).toBe('default');
     expect(localContextChoice(undefined, ['default', 'desktop-linux'])).toBe('default');
-    expect(localContextChoice('devenv-remote', ['default', 'devenv-remote'])).toBe('default');
+    // Greenfield, drop migration logic, user decision 2026-09-28: the bare `devenv-remote` of earlier builds is no
+    // longer one of ours; like any context of the user it is remembered (before: default).
+    expect(localContextChoice('devenv-remote', ['default', 'devenv-remote'])).toBe('devenv-remote');
     // review, C1: every context of ours.
     expect(localContextChoice(remoteContextName('box'), ['default', remoteContextName('box')])).toBe('default');
   });

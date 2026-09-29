@@ -146,7 +146,8 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
 
   beforeEach(async () => {
     u = createHarness({ dockerTarget: async () => ({ kind: 'unsupported', host: ENDPOINT, endpoint: ENDPOINT }) });
-    // Seeded as an earlier build recorded it after a restore on that endpoint, and one of the local Docker.
+    // Seeded with a recorded endpoint that is neither local nor SSH (the registry is a file that anything can change),
+    // and one of the local Docker.
     await seedEnvironment(u, { container: 'running', extra: { dockerHost: ENDPOINT } });
     await seedEnvironment(u, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
     const docker = u.docker as unknown as Record<string, (...args: unknown[]) => unknown>;

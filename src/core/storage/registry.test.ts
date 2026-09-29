@@ -123,6 +123,9 @@ describe('EnvironmentRegistry reading', () => {
     ['a list', '[]'],
     ['null', 'null'],
     ['version 0', { version: 0, environments: [environment(ID_A, 'o/r')] }],
+    // Greenfield, drop migration logic, user decision 2026-09-28: a file without a version is invalid (before: version 1).
+    ['no version', { environments: [environment(ID_A, 'o/r')] }],
+    ['an object without a version', {}],
     ['a text version', { version: '1', environments: [environment(ID_A, 'o/r')] }],
     ['environments that are not a list', { version: 1, environments: { a: 1 } }],
   ])('tolerates %s', async (_name, content) => {
@@ -132,11 +135,13 @@ describe('EnvironmentRegistry reading', () => {
     await expect(registry.read()).resolves.toEqual({ version: 1, environments: [] });
   });
 
+  // Greenfield, drop migration logic, user decision 2026-09-28: with a version, as every file of this extension has one
+  // (before: `{}` and `{ environments: [...] }`, taken as version 1; now invalid, see "tolerates" above).
   it('normalizes missing parts', async () => {
-    writeRaw({});
+    writeRaw({ version: 1 });
     const registry = new EnvironmentRegistry(paths);
     await expect(registry.read()).resolves.toEqual({ version: 1, environments: [] });
-    writeRaw({ environments: [environment(ID_A, 'o/r')] });
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/r')] });
     await expect(registry.list()).resolves.toEqual([environment(ID_A, 'o/r')]);
   });
 
@@ -314,7 +319,10 @@ describe('EnvironmentRegistry.needsRestore (concept 7.5 "registry lost")', () =>
     }
   });
 
-  it('is true for an unknown version below 1 and for environments that are not a list', async () => {
+  it('is true for no version, an unknown version below 1, and for environments that are not a list', async () => {
+    // Greenfield, drop migration logic, user decision 2026-09-28: a file without a version is invalid (before: false).
+    writeRaw({ environments: [ENTRY] });
+    expect(await needsRestore()).toBe(true);
     writeRaw({ version: 0, environments: [ENTRY] });
     expect(await needsRestore()).toBe(true);
     writeRaw({ version: 'one', environments: [ENTRY] });
@@ -330,12 +338,11 @@ describe('EnvironmentRegistry.needsRestore (concept 7.5 "registry lost")', () =>
     expect(await needsRestore()).toBe(true);
   });
 
-  it('is false for a valid registry, also an empty one or one without a version', async () => {
+  // Greenfield, drop migration logic, user decision 2026-09-28: a file without a version moved to the invalid ones above.
+  it('is false for a valid registry, also an empty one', async () => {
     writeRaw({ version: 1, environments: [ENTRY] });
     expect(await needsRestore()).toBe(false);
     writeRaw({ version: 1, environments: [] });
-    expect(await needsRestore()).toBe(false);
-    writeRaw({ environments: [ENTRY] });
     expect(await needsRestore()).toBe(false);
     writeRaw({ version: 1 });
     expect(await needsRestore()).toBe(false);
