@@ -1710,6 +1710,33 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
   });
 
+  // Review round 23 of PR #64 (A-R23-2): with the host access checks off, a container that was created while they were off
+  // is current (containerIsCurrent, unrestrictedServiceContainer): Later opens the running dev container and starts the
+  // stopped services, and the question names that reason only for checks that are on now.
+  it.each([
+    ['the dev container and db', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED }, dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+    ['db', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+  ])('opens a running dev container on Later with the checks off when %s were created while they were off (review round 23 of PR #64, A-R23-2)', async (_case, labels) => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await seedCompose({ dev: 'running', db: 'stopped', ...labels });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    expect(h.ui.kindQuestions[0]).toContain('while the host access checks were off and the checks are on now');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([`start ${db?.id}`]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+  });
+
   it.each([
     ['created by an older version', { devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }, false],
     ['created while the host access checks were off', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }, false],
@@ -1738,7 +1765,9 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment and names the host access
     // checks (before: "a dev container that runs already and is current opens as it is", "one that must be created again").
     expect(h.ui.kindQuestions[0]).toContain('if the dev container runs already and no container of the environment must be created again, the dev container opens as it is');
-    expect(h.ui.kindQuestions[0]).toContain('because they were created while the host access checks were off');
+    // Review round 23 of PR #64 (A-R23-2): changed expectation, the host access reason applies only while the checks are on
+    // (before: "because they were created while the host access checks were off").
+    expect(h.ui.kindQuestions[0]).toContain('because they were created while the host access checks were off and the checks are on now');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
