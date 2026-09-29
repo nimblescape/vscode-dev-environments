@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { AsyncLocalStorage } from 'async_hooks';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -681,6 +682,91 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
     };
     expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I3 });
     expect(docker.imageIdCalls).toBe(calls + 1);
+  });
+});
+
+describe('WorkspaceHelper keeps the helper image of each engine apart for overlapping opens (review round 8 of PR #64, R8-1)', () => {
+  const REMOTE_ID = `sha256:${'r'.repeat(64)}`;
+
+  /**
+   * One window with two engines: the local Docker and a remote one (key `box`). Each operation keeps its engine, as the
+   * Docker target of an open does (AsyncLocalStorage); the Docker calls go to the engine of the operation.
+   */
+  function engines() {
+    const als = new AsyncLocalStorage<string>();
+    const local = new FakeDocker();
+    const remote = new FakeDocker();
+    remote.ids.set(TAG, REMOTE_ID);
+    const dispatch = new Proxy({} as HelperDocker, {
+      get: (_target, property) => {
+        const target = als.getStore() === 'box' ? remote : local;
+        const value = Reflect.get(target, property) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const helper = new WorkspaceHelper({
+      docker: dispatch,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'linux',
+      clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+      statePath: path.join(dir, 'storage', 'helper.json'),
+      engine: async () => ({ key: als.getStore() ?? '' }),
+    });
+    const onRemote = <T>(action: () => Promise<T>): Promise<T> => als.run('box', action);
+    return { helper, local, remote, onRemote };
+  }
+
+  /** A build of `docker` that waits for `release`. */
+  function blockBuild(docker: FakeDocker): { release: () => void } {
+    const gate = { release: () => undefined as void };
+    docker.buildHandler = () =>
+      new Promise<void>((resolve) => {
+        gate.release = resolve;
+      });
+    return gate;
+  }
+
+  it('gives a local open the local image when a remote open replaced the cache during the check of the cached image', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    // The next local open checks the cached image (cachedImageCurrent); the check waits.
+    const imageId = local.imageId.bind(local);
+    let answer: (() => void) | undefined;
+    local.imageId = (reference) =>
+      new Promise((resolve) => {
+        answer = () => resolve(imageId(reference));
+      });
+    const first = helper.ensureImageUse();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    local.imageId = imageId;
+    // Meanwhile, an open on the remote engine replaces the cache with the image of its engine.
+    expect(await onRemote(() => helper.ensureImageUse())).toEqual({ tag: TAG, id: REMOTE_ID });
+    answer?.();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(local.builds).toHaveLength(1);
+    expect(remote.builds).toHaveLength(1);
+  });
+
+  it('gives a local open that joins the prebuild the local image when a remote open replaced the cache meanwhile', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    const localBuild = blockBuild(local);
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    await vi.waitFor(() => expect(local.builds).toHaveLength(1));
+    // The local open joins the prebuild (the result of a helper run without the maintenance).
+    const first = helper.ensureImageUse();
+    // Meanwhile, an open on the remote engine starts the build of its engine.
+    const remoteBuild = blockBuild(remote);
+    const second = onRemote(() => helper.ensureImageUse());
+    await vi.waitFor(() => expect(remote.builds).toHaveLength(1));
+    localBuild.release();
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    remoteBuild.release();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await second).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(local.builds).toHaveLength(1);
+    expect(remote.builds).toHaveLength(1);
   });
 });
 

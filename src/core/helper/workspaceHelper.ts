@@ -1137,8 +1137,7 @@ export class WorkspaceHelper {
   private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     // Unit 7: an image of another engine (the Docker context changed) is not reused.
-    if (this.imagePromise && engine.key !== this.imageEngine) this.resetImage();
-    this.imageEngine = engine.key;
+    this.adoptEngine(engine.key);
     const statePath = this.statePathFor(engine);
     if (recheck && this.imagePromise && !this.imageMaintained) {
       // The result of a helper run: wait until it is ready (a missing tag is built only once), then maintain.
@@ -1153,6 +1152,8 @@ export class WorkspaceHelper {
         }
       }
       if (this.imagePromise === pending) this.resetImage();
+      // Review round 8 of PR #64 (R8-1): another open with another engine may have replaced the cache during the join.
+      this.adoptEngine(engine.key);
     }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
@@ -1160,6 +1161,9 @@ export class WorkspaceHelper {
       else if (recheck && !(await this.cachedImageCurrent())) this.resetImage();
       else await this.recordUse(now, statePath);
     }
+    // Review round 8 of PR #64 (R8-1): another open with another engine may have replaced the cache during the awaits
+    // above. No await follows until the join below, so the caller joins a promise of its own engine.
+    this.adoptEngine(engine.key);
     if (!this.imagePromise) {
       // Review round 7 of PR #64 (R7-3): a caller cancelled during the awaits above starts no shared ensure, whose
       // rejection nothing would handle (join rejects at once for an aborted signal) and which could start a build.
@@ -1216,6 +1220,16 @@ export class WorkspaceHelper {
       if (isAbortError(error) && !options.signal?.aborted) return this.image(options, recheck);
       throw error;
     }
+  }
+
+  /**
+   * Unit 7: makes `key` the engine of the cache; a cache of another engine is reset (its image is not reused). Review
+   * round 8 of PR #64 (R8-1): called again after each await of `image`, because the opens of a window (each with the
+   * engine of its operation) share the cache.
+   */
+  private adoptEngine(key: string): void {
+    if (this.imagePromise && key !== this.imageEngine) this.resetImage();
+    this.imageEngine = key;
   }
 
   private resetImage(): void {
