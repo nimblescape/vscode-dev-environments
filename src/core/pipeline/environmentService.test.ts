@@ -41,7 +41,7 @@ import {
 } from '../names';
 import { abortError } from '../ports';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
-import { MAX_REFUSED_ITEMS_LENGTH, PipelineTexts, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
+import { MAX_REFUSED_ITEMS_LENGTH, PipelineTexts, withdrawnOutcome, type EnvironmentServiceDeps, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -1779,12 +1779,279 @@ describe('open: existing environment', () => {
       expect(error.detail).toContain('its lifecycle commands could not run. It was removed; the next open creates it again.');
       expect(h.ui.warnings).toEqual([]);
       // The next open, with the helper back, creates the container from the previous image and runs the lifecycle commands.
+      // Review round 2 of PR #68 (A-R2-5): changed expectation (before: the checker still reported DIGEST_NEW, so the next
+      // open built IMAGE_3, and only one `up` was counted, whatever happened to the container). With the updates off, only
+      // the removal of the container makes the next open create it from IMAGE_1 and run its lifecycle commands.
+      h.settings.updateImagesOnConnect = false;
       h.helper.userCommandsError = undefined;
       const runs = h.helper.userCommandRuns.length;
       h.helper.calls.length = 0;
       await h.service.open(TARGET, options());
-      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toHaveLength(1);
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+      expect(h.helper.builds).toHaveLength(1);
       expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ image: IMAGE_1, state: 'running' })]);
+    });
+
+    /** Review round 2 of PR #68: the next open with the helper back and the updates off runs `up` and the lifecycle commands. */
+    async function nextOpenRunsLifecycle(expectedUp: string, open: () => Promise<unknown> = () => h.service.open(TARGET, options())): Promise<void> {
+      h.settings.updateImagesOnConnect = false;
+      h.helper.userCommandsError = undefined;
+      h.helper.upError = () => undefined;
+      h.helper.upFailsBeforeRemoval = false;
+      const runs = h.helper.userCommandRuns.length;
+      h.helper.calls.length = 0;
+      await open();
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([expectedUp]);
+      expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ state: 'running' })]);
+    }
+
+    it('R2B-1 the removal of the replaced container fails: it is stopped, and the detail says so (review round 2 of PR #68, B-R2-1, A-R2-2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.userCommandsError = gone();
+      const remove = h.docker.removeContainer.bind(h.docker);
+      h.docker.removeContainer = async () => {
+        throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.message).toBe(Messages.helperFailed);
+      // Adapted to the root fix of round 2 (the validated test expected the plain helper detail): the container is stopped.
+      expect(error.detail).toBe(
+        `The container was created again from the new environment image, but its lifecycle commands could not run. It could not be removed and was stopped; the next open starts it and runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).not.toContain(before);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ image: IMAGE_2, state: 'stopped' })]);
+      expect(h.logger.warnings.join('\n')).toContain('Cannot connect to the Docker daemon');
+      h.docker.removeContainer = remove;
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('R2B-1b neither the removal nor the stop of the replaced container works: the detail says so (review round 2 of PR #68, A-R2-2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.userCommandsError = gone();
+      h.docker.removeContainer = async () => {
+        throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      h.docker.stopContainer = async () => {
+        throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The container was created again from the new environment image, but its lifecycle commands could not run. It could be neither removed nor stopped. No such image: sha256:${'4'.repeat(64)}`,
+      );
+    });
+
+    it('R2B-2 the detail after the removal keeps the message and the detail of the helper error', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.message).toBe(Messages.helperFailed);
+      expect(error.detail).toBe(`The container was created again from the new environment image, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`);
+    });
+
+    it('R2B-2b the detail ends with errorDetail of an error without its own detail (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed);
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toMatch(/^The container was created again from the new environment image, but its lifecycle commands could not run\. It was removed; the next open creates it again\. \S/);
+    });
+
+    it('R2B-3 a failed lookup of the replaced container is logged, and the container of `up` is removed all the same (review round 2 of PR #68, B-R2-2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.userCommandsError = gone();
+      // Adapted to the root fix of round 2: the lookup after run-user-commands is the listing of the containers (before:
+      // findContainer, whose failure ended with the plain helper detail).
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (h.helper.userCommandRuns.length > 0) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toContain(`It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`);
+      expect(h.logger.warnings.join('\n')).toContain('could not be listed after its lifecycle commands could not run: ');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      h.docker.listEnvironmentContainers = list;
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('R2B-3b the containers cannot be listed before `up`: logged, and the container of `up` is only stopped, never removed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.userCommandsError = gone();
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.logger.warnings.join('\n')).toContain('could not be listed before up: ');
+      expect(error.detail).toContain('It was stopped; the next open starts it again and runs its lifecycle commands.');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ image: IMAGE_2, state: 'stopped' })]);
+      h.docker.listEnvironmentContainers = list;
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('the sentences about the container whose lifecycle commands could not run (review round 2 of PR #68)', () => {
+      const name = NAME;
+      expect(withdrawnOutcome({ outcome: 'removed', created: true, name })).toBe('It was removed; the next open creates it again.');
+      expect(withdrawnOutcome({ outcome: 'removed', created: true, name }, true)).toBe('It was removed.');
+      expect(withdrawnOutcome({ outcome: 'stopped', created: false, name })).toBe('It was stopped; the next open starts it again and runs its lifecycle commands.');
+      expect(withdrawnOutcome({ outcome: 'stoppedAfterRemovalFailed', created: true, name })).toBe(
+        'It could not be removed and was stopped; the next open starts it and runs its lifecycle commands.',
+      );
+      expect(withdrawnOutcome({ outcome: 'kept', created: true, name })).toBe('It could be neither removed nor stopped.');
+      expect(withdrawnOutcome({ outcome: 'kept', created: false, name })).toBe('It could not be stopped.');
+      expect(withdrawnOutcome({ outcome: 'unchanged', created: false, name })).toBe('It runs as before this open.');
+    });
+
+    it('R2B-6 Cancel during run-user-commands that fails with helperFailed ends as cancelled', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const controller = new AbortController();
+      Object.defineProperty(h.helper, 'userCommandsError', {
+        configurable: true,
+        get: () => {
+          controller.abort();
+          return gone();
+        },
+      });
+      const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+      expect(error.code).toBe('cancelled');
+    });
+
+    it('N1 a first open whose run-user-commands fails with helperFailed says that the new environment is removed again (review round 2 of PR #68)', async () => {
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The container was created, but its lifecycle commands could not run. The new environment is removed again; open the repository again to create it. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(await h.registry.findForAccount(REPO, ACCOUNT.id)).toBeUndefined();
+      expect([...h.docker.containers.values()]).toEqual([]);
+    });
+
+    it('a container that `up` created where none was does not open as it is when run-user-commands fails with helperFailed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: null });
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The container was created from the environment image, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('A-R2-1 the restore creates the container again from the previous image, and its run-user-commands fails with helperFailed: it is removed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      // `up` of the new image removes the old container and fails for its own reason; the restore creates it again.
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs') : undefined);
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1} --remove-existing-container`]);
+      expect(error.detail).toBe(
+        `The update failed, and the container was created again from the previous environment image, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('A-R2-1 the restore starts the stopped previous container, and its run-user-commands fails with helperFailed: it is stopped again (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs') : undefined);
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
+      expect(error.detail).toBe(
+        `The update failed, and the previous container was started again, but its lifecycle commands could not run. It was stopped; the next open starts it again and runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'stopped' })]);
+      expect(h.docker.log).toContain(`stop ${before}`);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+      expect(h.docker.containersOf(ENV_ID)[0].id).toBe(before);
+    });
+
+    it('A-R2-1 the restore finds the previous container running: it is left as it is, and the detail says so (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs') : undefined);
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(`The update failed. The previous container runs as before this open. No such image: sha256:${'4'.repeat(64)}`);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
+      expect(h.docker.log.filter((line) => line.startsWith('stop ') || line.startsWith('rm '))).toEqual([]);
+    });
+
+    it('Step 9: a stopped container that `up` started is stopped again when run-user-commands fails with helperFailed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+      expect(error.detail).toBe(
+        `The container was started, but its lifecycle commands could not run. It was stopped; the next open starts it again and runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'stopped' })]);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+      expect(h.docker.containersOf(ENV_ID)[0].id).toBe(before);
+    });
+
+    it('Step 9: a container that `up` created where none was is removed when run-user-commands fails with helperFailed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.builds).toEqual([]);
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+      expect(error.detail).toBe(
+        `The container was created, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+    });
+
+    it('the container of `up` is told from the containers before it by its whole ID, not by a prefix (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      expect(before).toBe('container-1');
+      // Containers of another environment, so that the container that `up` creates gets the ID container-10, which starts
+      // with the ID of the running container before `up`.
+      for (let i = 0; i < 8; i++) h.docker.addContainer({ environmentId: OTHER_ID, name: `other-${i}`, state: 'stopped', image: IMAGE_1 });
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.userCommandRuns.at(-1)?.containerId).toBe('container-10');
+      expect(error.detail).toContain('It was removed; the next open creates it again.');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    });
+
+    it('Step 9: an outdated container that `up` created again is removed when run-user-commands fails with helperFailed (review round 2 of PR #68)', async () => {
+      await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1} --remove-existing-container`]);
+      expect(error.detail).toBe(
+        `The container was created again, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+      expect(h.docker.containersOf(ENV_ID)[0].id).not.toBe(before);
     });
 
     it('a container that was stopped during the failing build does not open as it is (review round 4 of PR #64, R4-7 M2)', async () => {

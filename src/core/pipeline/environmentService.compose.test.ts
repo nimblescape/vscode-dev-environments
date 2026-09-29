@@ -1464,6 +1464,29 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop '))).toEqual([]);
   });
 
+  it('A-R2-4 (review round 2 of PR #68): run-user-commands of the new single container fails with helperFailed: it is removed, the detail is true, and "Rebuild later" does not open it as it is', async () => {
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toBe(
+      `The configuration no longer uses Docker Compose. Its container was created, but its lifecycle commands could not run. It was removed. The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. The change removed the container ${db?.name} of the service db. The Dev Container CLI removed the previous dev container. The files in the volumes are kept. No such image: sha256:${'4'.repeat(64)}`,
+    );
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    // "Rebuild later": the environment keeps its kind (Docker Compose), which has no container: startFailed, no `up`.
+    h.helper.userCommandsError = undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    const runs = h.helper.userCommandRuns.length;
+    h.helper.calls.length = 0;
+    const later = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(later.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.helper.userCommandRuns.length).toBe(runs);
+  });
+
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
     const db = dbContainer()?.id;
     h.ui.configurationChangedAnswer = 'later';
@@ -3796,6 +3819,68 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     });
   });
 
+  describe('review round 2 of PR #68 (A-R2-3): run-user-commands of the new dev service fails with helperFailed after up', () => {
+    const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+
+    it('removes the new dev container, says what happened to the previous one, keeps the previous configuration, and the next open runs up and the lifecycle commands', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      const web = byService('web')!;
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.message).toBe(Messages.helperFailed);
+      // Compose created the renamed previous dev container again as the service app (the fake recreates it: its labels changed).
+      expect(error.detail).toBe(
+        `The dev service changed from app to web. The dev container of the service web was created, but its lifecycle commands could not run. It was removed. Docker Compose created the previous dev container again as the service app (${PROJECT}-app-1); the files outside its volumes are gone. The previous configuration stays selected. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      // The new dev container is gone (never opened as it is); the previous one (created again by Compose) is stopped.
+      expect(h.docker.containersOf(ENV_ID).some((c) => c.name === NAME)).toBe(false);
+      expect(h.docker.containers.has(web.id)).toBe(false);
+      expect(h.docker.containers.has(app.id)).toBe(false);
+      expect(byService('app')).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+      expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(IMAGE_1);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+
+      // The next open (helper back, updates off) opens the configuration app through `up` and its lifecycle commands.
+      h.helper.userCommandsError = undefined;
+      h.settings.updateImagesOnConnect = false;
+      const runs = h.helper.userCommandRuns.length;
+      h.helper.calls.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      expect(h.helper.calls.filter((call) => call.startsWith('up'))).toHaveLength(1);
+      expect(h.helper.ups.at(-1)?.override.service).toBe('app');
+      expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+    });
+
+    it('when the rename of the previous dev container failed, the detail says that it was removed', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      h.docker.renameError = new CommandError('docker rename', 1, '', 'Error response from daemon: rename failed');
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The dev service changed from app to web. The dev container of the service web was created, but its lifecycle commands could not run. It was removed. The previous dev container ${NAME} could not be renamed and was removed; its volumes are kept. The previous configuration stays selected. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(h.docker.containers.has(app.id)).toBe(false);
+      expect(h.docker.containersOf(ENV_ID).some((c) => c.name === NAME)).toBe(false);
+    });
+
+    it('when the rename failed and `up` itself fails with helperFailed, the detail says that the previous dev container was removed', async () => {
+      await h.service.open(TARGET, options());
+      h.docker.renameError = new CommandError('docker rename', 1, '', 'Error response from daemon: rename failed');
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_1 ? undefined : gone());
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The dev service changed from app to web. The previous dev container ${NAME} could not be renamed and was removed; its volumes are kept. No such image: sha256:${'4'.repeat(64)}`,
+      );
+    });
+  });
+
   describe('final review, FC-1: the new configuration does not start the previous dev service (runServices)', () => {
     const RUN_TEXT = WEB_TEXT.replace('"service": "web"', '"service": "web",\n  "runServices": ["web", "db"]');
 
@@ -3828,6 +3913,33 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       expect(h.docker.containers.get(web.id)?.state).toBe('running');
       expect(h.docker.containers.get(app.id)?.state).toBe('stopped');
       expect((await h.registry.get(ENV_ID))?.configPath).toBe(WEB_PATH);
+    });
+
+    it('review round 2 of PR #68 (A-R2-3): run-user-commands fails with helperFailed after up: the new dev container is removed, the previous one is kept, stopped, and the detail says so', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        'The dev service changed from app to web. The dev container of the service web was created, but its lifecycle commands could not run. It was removed. The previous dev container is kept, stopped. The previous configuration stays selected. No such image: x',
+      );
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect(byService('web')).toBeUndefined();
+    });
+
+    it('review round 2 of PR #68 (A-R2-3): the previous dev container that cannot be stopped is not called stopped', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      const stop = h.docker.stopContainer.bind(h.docker);
+      h.docker.stopContainer = async (ref) => {
+        if (ref === app.id) throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+        return stop(ref);
+      };
+      h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toContain('It was removed. The previous dev container is kept, but it could not be stopped. The previous configuration stays selected.');
     });
 
     it('connects to the dev container with the name of the environment even when the previous one runs again', async () => {
@@ -4369,5 +4481,84 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.progress.details).toContain(Messages.containerRecreatedDamaged([`${FOLDER}/node_modules`]));
     expect(h.docker.volumes.has(anonymous)).toBe(true);
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+  });
+});
+
+describe('review round 2 of PR #68: run-user-commands of Docker Compose fails with helperFailed after up returned', () => {
+  const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+
+  /** The next open with the helper back and the updates off runs `up` and the lifecycle commands, and the dev container runs. */
+  async function nextOpenRunsLifecycle(): Promise<void> {
+    h.helper.userCommandsError = undefined;
+    h.settings.updateImagesOnConnect = false;
+    const runs = h.helper.userCommandRuns.length;
+    h.helper.calls.length = 0;
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toHaveLength(1);
+    expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+    expect(devContainer()?.state).toBe('running');
+  }
+
+  it('R2B-5 an update of Docker Compose whose run-user-commands fails with helperFailed removes the new dev container', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
+    const dev = devContainer()?.id;
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.ups).toHaveLength(1);
+    expect(devContainer()?.id).not.toBe(dev);
+    expect(devContainer()).toBeUndefined();
+    expect(error.detail).toContain('It was removed; the next open creates it again. No such image: x');
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    h.helper.userCommandsError = undefined;
+    const runs = h.helper.userCommandRuns.length;
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+    expect(devContainer()?.state).toBe('running');
+  });
+
+  it('Step 9: the stopped containers that `up` started are stopped again, and the next open runs up and the lifecycle commands', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    const dev = devContainer()!;
+    const db = dbContainer()!;
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(error.detail).toBe(
+      `The container was started, but its lifecycle commands could not run. It was stopped; the next open starts it again and runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
+    );
+    expect(devContainer()).toMatchObject({ id: dev.id, state: 'stopped' });
+    // The side service that `up` started (it did not run before) is stopped too.
+    expect(dbContainer()).toMatchObject({ id: db.id, state: 'stopped' });
+    await nextOpenRunsLifecycle();
+    expect(devContainer()?.id).toBe(dev.id);
+  });
+
+  it('Step 9: a side service that ran before `up` keeps running', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    const db = dbContainer()!;
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()).toMatchObject({ id: db.id, state: 'running' });
+    expect(h.docker.log).not.toContain(`stop ${db.id}`);
+  });
+
+  it('A-R2-4: a switch of a single container to Docker Compose whose run-user-commands fails with helperFailed removes the new dev container, and the detail is true', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toBe(
+      `The configuration now uses Docker Compose. Its dev container was created, but its lifecycle commands could not run. It was removed. The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. The change removed the container ${single.name}. The containers that Docker Compose had created were removed again: the container ${PROJECT}-db-1 of the service db. The files in the volumes are kept. No such image: sha256:${'4'.repeat(64)}`,
+    );
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 });

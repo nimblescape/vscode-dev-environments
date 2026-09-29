@@ -652,6 +652,17 @@ interface PipelineContext {
    */
   devServiceMoved?: boolean;
   /**
+   * Review round 2 of PR #68 (A-R2-3): what movePreviousDevContainer did with the previous dev container of another
+   * service: its ID, its name now (after the rename), and whether it was removed (its rename failed).
+   */
+  previousDevContainer?: { id: string; name: string; removed: boolean };
+  /**
+   * Review round 2 of PR #68 (A-R2-1 to A-R2-4): `up` of this run returned, and run-user-commands then failed with
+   * helperFailed, so the lifecycle commands of its container did not run (withdrawAfterHelperFailed): what happened to that
+   * container, for the detail of the error. Reset before each `up`.
+   */
+  upWithdrawn?: UpWithdrawn;
+  /**
    * Recreate offer (user request 2026-09-26): the user chose to create the damaged dev container of this Docker Compose
    * environment again (offerRecreation). runComposeUp removes only that container (never a volume, never another
    * service) after the checks, right before `up`.
@@ -669,6 +680,40 @@ interface PipelineContext {
 interface GitHubSession {
   token: string;
   account: GitHubAccount;
+}
+
+/**
+ * Review round 2 of PR #68: what withdrawAfterHelperFailed did with the container of an `up` whose lifecycle commands could
+ * not run (run-user-commands failed with helperFailed). `created`: this `up` created it (it was not among the containers
+ * of the environment right before `up`). `removed`: it was removed; `stopped`: it existed and did not run before `up`, and
+ * was stopped again; `stoppedAfterRemovalFailed`: its removal failed, so it was stopped; `kept`: neither worked;
+ * `unchanged`: it ran already before `up` (it ran before this open).
+ */
+export interface UpWithdrawn {
+  outcome: 'removed' | 'stopped' | 'stoppedAfterRemovalFailed' | 'kept' | 'unchanged';
+  created: boolean;
+  name: string;
+}
+
+/** Review round 2 of PR #68: the sentence of the detail that says what happened to the container (UpWithdrawn). */
+export function withdrawnOutcome(withdrawn: UpWithdrawn, inSwitch = false): string {
+  switch (withdrawn.outcome) {
+    case 'removed':
+      return inSwitch ? 'It was removed.' : 'It was removed; the next open creates it again.';
+    case 'stopped':
+      return 'It was stopped; the next open starts it again and runs its lifecycle commands.';
+    case 'stoppedAfterRemovalFailed':
+      return 'It could not be removed and was stopped; the next open starts it and runs its lifecycle commands.';
+    case 'kept':
+      return withdrawn.created ? 'It could be neither removed nor stopped.' : 'It could not be stopped.';
+    case 'unchanged':
+      return 'It runs as before this open.';
+  }
+}
+
+/** The cause at the end of a detail: the detail of a UserFacingError (for example of helperFailed), else errorDetail. */
+function causeOf(error: unknown): string {
+  return isUserFacingError(error) && error.detail ? error.detail : errorDetail(error);
 }
 
 /** What steps 8 and 9 did with the container. */
@@ -749,6 +794,16 @@ function sameContainerId(a: string, b: string): boolean {
 }
 
 /**
+ * Review round 2 of PR #68: the same container. Two full IDs (64 hexadecimal digits) are compared exactly; only a short
+ * one is compared as a prefix (sameContainerId), so that no ID that merely starts with another one matches.
+ */
+function sameContainer(a: string, b: string): boolean {
+  if (a === b) return true;
+  const full = /^[0-9a-f]{64}$/;
+  return full.test(a) !== full.test(b) && sameContainerId(a, b);
+}
+
+/**
  * Whether the text of a configuration names a Dockerfile (`build.dockerfile` or the older `dockerFile`), also one that
  * the text names with a variable. A text that is no valid JSONC names none.
  */
@@ -795,7 +850,8 @@ function volumeLabels(environment: Environment): Record<string, string> {
  * environment is not started with its previous kind, and what the switch removed before (`removed`) is named; the
  * volumes are kept. Review round 3 (P3-3): towards Docker Compose, `created` names the containers that the failed `up`
  * created and that were removed again (removeFailedComposeContainers); review round 4 (D4-1): `kept` the containers of
- * Docker Compose that existed before and stay.
+ * Docker Compose that existed before and stay. Review round 2 of PR #68 (A-R2-4): `afterUp`, the sentence of
+ * withdrawnOutcome when `up` returned and the lifecycle commands of its (dev) container could not run (helperFailed).
  */
 export function kindSwitchFailure(
   toCompose: boolean,
@@ -803,17 +859,26 @@ export function kindSwitchFailure(
   cause: string,
   created: readonly string[] = [],
   kept: readonly string[] = [],
+  afterUp?: string,
 ): string {
-  const what = toCompose
-    ? 'The configuration now uses Docker Compose, and its containers could not all be created and started.'
-    : 'The configuration no longer uses Docker Compose, and its container could not be created.';
+  const what =
+    afterUp !== undefined
+      ? toCompose
+        ? `The configuration now uses Docker Compose. Its dev container was created, but its lifecycle commands could not run. ${afterUp}`
+        : `The configuration no longer uses Docker Compose. Its container was created, but its lifecycle commands could not run. ${afterUp}`
+      : toCompose
+        ? 'The configuration now uses Docker Compose, and its containers could not all be created and started.'
+        : 'The configuration no longer uses Docker Compose, and its container could not be created.';
   const gone = removed.length > 0 ? `The change removed ${removed.join(', ')}.` : 'The change removed no container of the other kind.';
   const again = created.length > 0 ? ` The containers that Docker Compose had created were removed again: ${created.join(', ')}.` : '';
   // Review round 4 (D4-1): the containers of Docker Compose that existed before this start stay.
   const stayed = kept.length > 0 ? ` The containers of Docker Compose that existed before this start were kept: ${kept.join(', ')}.` : '';
   // `up --remove-existing-container` of a single container removes the dev container that it finds by the ID label.
-  const cli = toCompose ? '' : ' The Dev Container CLI may have removed the previous dev container before it failed.';
-  return `${what} The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. ${gone}${again}${stayed}${cli} Nothing else was removed, and the files in the volumes are kept. ${cause}`;
+  // Review round 2 of PR #68 (A-R2-4): after `up` returned, the CLI did remove it (--remove-existing-container).
+  const cli = toCompose ? '' : afterUp !== undefined ? ' The Dev Container CLI removed the previous dev container.' : ' The Dev Container CLI may have removed the previous dev container before it failed.';
+  // After `up` returned, `afterUp` names what happened to the new container, so "nothing else" would not be true.
+  const rest = afterUp !== undefined ? 'The files in the volumes are kept.' : 'Nothing else was removed, and the files in the volumes are kept.';
+  return `${what} The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. ${gone}${again}${stayed}${cli} ${rest} ${cause}`;
 }
 
 /**
@@ -2405,7 +2470,17 @@ export class EnvironmentService {
         // run, and only those that did not exist before `up` (an earlier switch that was cancelled may have created
         // containers that the user worked with since).
         const failed = loaded.compose !== undefined ? await this.removeFailedComposeContainers(ctx) : { removed: [], kept: [] };
-        const detail = kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept);
+        // Review round 2 of PR #68 (A-R2-4): `up` returned, and the lifecycle commands of its container could not run: runUp
+        // or runComposeUp removed (or stopped) that container already (withdrawAfterHelperFailed), and the detail says so.
+        const withdrawn = helperFailed ? ctx.upWithdrawn : undefined;
+        const detail = kindSwitchFailure(
+          loaded.compose !== undefined,
+          ctx.kindSwitchRemoved ?? [],
+          helperFailed ? causeOf(error) : errorDetail(error),
+          failed.removed,
+          failed.kept,
+          withdrawn !== undefined ? withdrawnOutcome(withdrawn, true) : undefined,
+        );
         // Review round 4 of PR #64 (R4-5): the cleanup of the switch above stays (the containers of the other kind are
         // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
         if (helperFailed) {
@@ -2422,14 +2497,24 @@ export class EnvironmentService {
       const previousService = composeRecordOf(record)?.service;
       if (loaded.compose !== undefined && previousService !== undefined && previousService !== loaded.compose.service) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
-        this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
+        if (ctx.previousDevContainer?.removed !== true) {
+          this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
+        }
         // Review round 4 of PR #64 (R4-5): the helper image of the open is gone: helperFailed, with the detail of the switch.
         if (helperFailed) {
           this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its dev service could not be completed.`, error);
+          // Review round 2 of PR #68 (A-R2-3): after `up` returned, the dev container of the new service (its lifecycle
+          // commands did not run) was removed already (withdrawAfterHelperFailed); the detail says what happened to it and
+          // to the previous dev container.
+          const change = `The dev service changed from ${previousService} to ${loaded.compose.service}.`;
+          const previous = await this.previousDevContainerAfterFailedSwitch(ctx, previousService);
+          const withdrawn = ctx.upWithdrawn;
           throw new UserFacingError(
             'helperFailed',
             Messages.helperFailed,
-            `The dev service changed from ${previousService} to ${loaded.compose.service}. The previous dev container is kept, stopped. ${errorDetail(error)}`,
+            withdrawn !== undefined
+              ? `${change} The dev container of the service ${loaded.compose.service} was ${withdrawn.created ? 'created' : 'started'}, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn, true)} ${previous} The previous configuration stays selected. ${causeOf(error)}`
+              : `${change} ${previous} ${causeOf(error)}`,
           );
         }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
@@ -2438,29 +2523,13 @@ export class EnvironmentService {
       // started either (that needs the helper too): no buildFailed warning and no restore; the open ends with helperFailed
       // (not startFailed; user decision 2026-09-29: a running container is not opened as it is).
       if (helperFailed) {
-        // Review round 1 of PR #68 (A-R1-1): `up` returned (the R11-1 branch above takes the rest), so it replaced the
-        // container, and the lifecycle commands of the new one did not run. It is removed (it was never attached; the files
-        // are in the volume), so that the build record, the container and the images agree and the next open creates it
-        // again with all lifecycle commands, instead of opening it as it is. Then its image can be removed, too.
-        const replaced = await this.deps.docker.findContainer(env.id, env.containerName).catch(() => undefined);
-        let removed = false;
-        if (replaced !== undefined && replaced.id !== container?.id) {
-          this.logger.info(`The container ${replaced.name} was created from ${imageName}, but its lifecycle commands did not run. It is removed; the next open creates it again.`);
-          try {
-            await this.deps.docker.removeContainer(replaced.id);
-            removed = true;
-          } catch (removeError) {
-            this.logger.warn(`Could not remove the container ${replaced.name}: ${errorMessage(removeError)}`);
-          }
-        }
+        // Review round 1 of PR #68 (A-R1-1), round 2 (A-R2-2): `up` returned (the R11-1 branch above takes the rest), and the
+        // lifecycle commands of its container did not run. runUp or runComposeUp removed that container already
+        // (withdrawAfterHelperFailed; stopped when the removal failed), so that the next open creates (or starts) it again
+        // with all lifecycle commands, instead of opening it as it is. Then the new image can be removed, too.
+        const withdrawn = ctx.upWithdrawn;
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
-        return this.helperFailedInUpdate(
-          ctx,
-          error,
-          removed
-            ? `The container was created again from the new environment image, but its lifecycle commands could not run. It was removed; the next open creates it again. ${isUserFacingError(error) && error.detail ? error.detail : errorDetail(error)}`
-            : undefined,
-        );
+        return this.helperFailedInUpdate(ctx, error, withdrawn !== undefined ? this.updateWithdrawnDetail(ctx, withdrawn, container, error) : undefined);
       }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
@@ -2486,8 +2555,21 @@ export class EnvironmentService {
         result = await this.runUp(ctx, previousImage, loaded.config, !keep, !keep, loaded.compose);
       } catch (restoreError) {
         if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError) || isHostAccess(restoreError)) throw restoreError;
-        // Review round 3 of PR #64 (P6b): the helper image of the open is gone: helperFailed, not startFailed.
-        if (isHelperFailed(restoreError)) return this.helperFailedInUpdate(ctx, restoreError);
+        // Review round 3 of PR #64 (P6b): the helper image of the open is gone: helperFailed, not startFailed. Review round 2
+        // of PR #68 (A-R2-1): when the restore's `up` returned, its container (whose lifecycle commands did not run) was
+        // removed or stopped (withdrawAfterHelperFailed), and the detail says so.
+        if (isHelperFailed(restoreError)) {
+          const withdrawn = ctx.upWithdrawn;
+          const detail =
+            withdrawn === undefined
+              ? undefined
+              : keep && withdrawn.outcome === 'unchanged'
+                ? `The update failed. The previous container runs as before this open. ${causeOf(restoreError)}`
+                : keep
+                  ? `The update failed, and the previous container was started again, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(restoreError)}`
+                  : `The update failed, and the container was created again from the previous environment image, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(restoreError)}`;
+          return this.helperFailedInUpdate(ctx, restoreError, detail);
+        }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(restoreError));
       }
       return keep ? { result, created: false, container: survivor } : { result, created: true };
@@ -2579,6 +2661,18 @@ export class EnvironmentService {
     // Review round 1 of PR #68 (A-R1-1): with `detail`, the error says what happened to the container.
     if (detail !== undefined) throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
     throw error;
+  }
+
+  /**
+   * Review round 2 of PR #68: the detail of a helperFailed of run-user-commands after the `up` of an update or a rebuild
+   * returned (P6b). On a first open, the whole new environment is removed afterwards (removeFailedFirstOpen).
+   */
+  private updateWithdrawnDetail(ctx: PipelineContext, withdrawn: UpWithdrawn, container: ContainerInfo | undefined, error: unknown): string {
+    if (ctx.firstOpen) {
+      return `The container was created, but its lifecycle commands could not run. The new environment is removed again; open the repository again to create it. ${causeOf(error)}`;
+    }
+    const what = container === undefined ? 'The container was created from the environment image' : 'The container was created again from the new environment image';
+    return `${what}, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(error)}`;
   }
 
   /**
@@ -2764,7 +2858,14 @@ export class EnvironmentService {
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
       // No docker start fallback (user decision 2026-09-29): a workspace helper that failed during `up` fails the open.
-      if (isUserFacingError(error) && error.code === 'helperFailed') throw error;
+      // Review round 2 of PR #68: when `up` returned, the container whose lifecycle commands did not run was stopped (or
+      // removed, when this `up` created it) by withdrawAfterHelperFailed, and the detail says so.
+      if (isHelperFailed(error)) {
+        const withdrawn = ctx.upWithdrawn;
+        if (withdrawn === undefined) throw error;
+        const what = container === undefined ? 'The container was created' : outdated ? 'The container was created again' : 'The container was started';
+        throw new UserFacingError('helperFailed', Messages.helperFailed, `${what}, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(error)}`);
+      }
       this.logger.error(`The container of ${ctx.env.repository} could not be started.`, error);
       // Recreate offer: `up` or run-user-commands of the existing container failed because the container itself is
       // damaged. Never for a container that this run creates (it is created again anyway).
@@ -3035,7 +3136,18 @@ export class EnvironmentService {
       const result = await this.runUp(ctx, image, loaded?.config, true, true, loaded?.compose);
       return { result, created: true };
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error) || isHelperFailed(error)) throw error;
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      if (isHelperFailed(error)) {
+        // Review round 2 of PR #68: `up` returned, and the lifecycle commands of the new container could not run: it was
+        // removed (withdrawAfterHelperFailed), and the detail says so.
+        const withdrawn = ctx.upWithdrawn;
+        if (withdrawn === undefined) throw error;
+        throw new UserFacingError(
+          'helperFailed',
+          Messages.helperFailed,
+          `The damaged container was created again, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(error)}`,
+        );
+      }
       // Review round 2 (E1–E3): the direct check refused it (requireOtherServicesKept), with its own detail.
       if (isUserFacingError(error) && error.code === 'startFailed') throw error;
       this.logger.error(`The container of ${env.repository} could not be created again from ${image}.`, error);
@@ -3165,6 +3277,8 @@ export class EnvironmentService {
     createsContainer: boolean,
     compose?: LoadedCompose,
   ): Promise<DevcontainerResult> {
+    // Review round 2 of PR #68: set only by this `up` (a restore after a failed update runs a second one).
+    ctx.upWithdrawn = undefined;
     if (compose) return this.runComposeUp(ctx, image, config, compose, removeExistingContainer, createsContainer);
     const env = ctx.env;
     // Without the configuration, the container gets no runArgs and appPort of the repository. Its label makes the next
@@ -3261,6 +3375,10 @@ export class EnvironmentService {
     // Review round 11 (G3): the recorded paths of the services stay (before, round 10 cleared them here): their data is
     // still in the volume. finish drops those that no longer exist.
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
+    // Review round 2 of PR #68: the containers right before `up`, so that a helperFailed of run-user-commands can tell a
+    // container that this `up` created from one that it only started (withdrawAfterHelperFailed).
+    const before = await this.containersBeforeUp(ctx, false);
+    let upContainer: string | undefined;
     try {
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
@@ -3274,9 +3392,11 @@ export class EnvironmentService {
         signal: ctx.signal,
       });
       ctx.upStarted = true;
+      upContainer = nonEmptyString(result.containerId);
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
       result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
+      if (upContainer !== undefined && isHelperFailed(error)) await this.withdrawAfterHelperFailed(ctx, upContainer, before, false);
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
         // A container that `up` created before it failed or was cancelled mounts its volumes already.
@@ -3426,6 +3546,9 @@ export class EnvironmentService {
       files: { [COMPOSE_MODEL_PATH]: JSON.stringify(model, null, 2) },
       env: { COMPOSE_PROJECT_NAME: compose.project },
     };
+    // Review round 2 of PR #68: as in runUp, with the containers of the project.
+    const containersBefore = await this.containersBeforeUp(ctx, true);
+    let upContainer: string | undefined;
     try {
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
@@ -3439,9 +3562,11 @@ export class EnvironmentService {
         signal: ctx.signal,
       });
       ctx.upStarted = true;
+      upContainer = nonEmptyString(result.containerId);
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
       result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {
+      if (upContainer !== undefined && isHelperFailed(error)) await this.withdrawAfterHelperFailed(ctx, upContainer, containersBefore, true);
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
         await this.quietly('record the volumes of the containers', () => this.recordContainerVolumes(ctx, true));
@@ -3456,6 +3581,139 @@ export class EnvironmentService {
     }
     const failure = nonEmptyString(result.lifecycleCommandFailure);
     return failure === undefined ? result : this.openAfterLifecycleFailure(ctx, result, failure, image, userArgs);
+  }
+
+  /**
+   * Review round 2 of PR #68: the containers of the environment (with `compose`, also those of its Docker Compose project)
+   * right before `up`, by ID, with whether each ran. `undefined` when they cannot be listed (logged): then a container of
+   * `up` whose lifecycle commands could not run is only stopped, never removed (withdrawAfterHelperFailed).
+   */
+  private async containersBeforeUp(ctx: PipelineContext, compose: boolean): Promise<ReadonlyMap<string, boolean> | undefined> {
+    try {
+      return new Map((await this.upContainers(ctx.env, compose)).map((container) => [container.id, container.state === 'running']));
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(
+        `The containers of ${ctx.env.repository} could not be listed before up: ${errorMessage(error)}. If the lifecycle commands cannot run, its container is only stopped, never removed.`,
+      );
+      return undefined;
+    }
+  }
+
+  /** The containers with the ID label of the environment and, with `compose`, those of its Docker Compose project, once each. */
+  private async upContainers(env: Environment, compose: boolean): Promise<ContainerInfo[]> {
+    const all = [...(await this.environmentContainers(env.id)), ...(compose ? await this.deps.docker.listProjectContainers(composeProjectName(env.id)) : [])];
+    const seen = new Set<string>();
+    return all.filter((container) => {
+      if (seen.has(container.id)) return false;
+      seen.add(container.id);
+      return true;
+    });
+  }
+
+  /**
+   * Review round 2 of PR #68 (A-R2-1 to A-R2-4; user decision 2026-09-29: never opened as it is after the helper was
+   * prepared): `up` returned the container `containerId`, and run-user-commands then failed with helperFailed, so its
+   * lifecycle commands did not run. So that no later open opens it as it is: a container that this `up` created (not
+   * among `before`) is removed (the files are in the volumes), and stopped when that fails; one that existed and did not
+   * run before `up` is stopped again (the next open starts it and runs its lifecycle commands); one that ran before `up`
+   * is left as it is (it ran before this open). With `before` unknown, it is only stopped. The containers of the other
+   * services that did not run before `up` (new ones, or stopped ones that `up` started) are stopped too. Every failure is
+   * logged; a cancellation does not stop the cleanup. The result goes to PipelineContext.upWithdrawn.
+   */
+  private async withdrawAfterHelperFailed(
+    ctx: PipelineContext,
+    containerId: string,
+    before: ReadonlyMap<string, boolean> | undefined,
+    compose: boolean,
+  ): Promise<void> {
+    const env = ctx.env;
+    const { docker } = this.deps;
+    let current: ContainerInfo[] | undefined;
+    try {
+      current = await this.upContainers(env, compose);
+    } catch (error) {
+      this.logger.warn(`The containers of ${env.repository} could not be listed after its lifecycle commands could not run: ${errorMessage(error)}`);
+    }
+    const found = current?.find((container) => sameContainer(container.id, containerId));
+    const id = found?.id ?? containerId;
+    const name = found?.name ?? env.containerName;
+    const known = before === undefined ? undefined : [...before.keys()].find((other) => sameContainer(other, id));
+    const created = before !== undefined && known === undefined;
+    const ranBefore = known !== undefined && before?.get(known) === true;
+    const stop = async (): Promise<boolean> => {
+      try {
+        await docker.stopContainer(id);
+        return true;
+      } catch (error) {
+        this.logger.warn(`The container ${name} could not be stopped: ${errorMessage(error)}`);
+        return false;
+      }
+    };
+    let outcome: UpWithdrawn['outcome'];
+    if (ranBefore) {
+      this.logger.info(`The container ${name} ran before this open; its lifecycle commands could not run now. It is left as it is.`);
+      outcome = 'unchanged';
+    } else if (created) {
+      this.logger.info(`The container ${name} was created, but its lifecycle commands did not run. It is removed; the next open creates it again.`);
+      try {
+        await docker.removeContainer(id);
+        outcome = 'removed';
+      } catch (error) {
+        this.logger.warn(`Could not remove the container ${name}: ${errorMessage(error)}. It is stopped instead.`);
+        outcome = (await stop()) ? 'stoppedAfterRemovalFailed' : 'kept';
+      }
+    } else {
+      this.logger.info(`The container ${name} was started, but its lifecycle commands did not run. It is stopped; the next open starts it again.`);
+      outcome = (await stop()) ? 'stopped' : 'kept';
+    }
+    // The other services (Docker Compose) that `up` created or started are stopped again; those that ran before stay.
+    if (before !== undefined) {
+      for (const other of current ?? []) {
+        if (sameContainer(other.id, id) || other.state !== 'running') continue;
+        const ran = [...before.entries()].some(([known, running]) => running && sameContainer(known, other.id));
+        if (ran) continue;
+        await this.quietly(`stop the container ${other.name}`, () => docker.stopContainer(other.id));
+      }
+    }
+    ctx.upWithdrawn = { outcome, created, name };
+  }
+
+  /**
+   * Review round 2 of PR #68 (A-R2-3): the sentence of the detail of a failed switch of the dev service about the previous
+   * dev container (PipelineContext.previousDevContainer): removed when its rename failed; else kept, stopped (it is stopped
+   * here when it runs); or created again by Docker Compose as its own service (`up` returned), stopped too.
+   */
+  private async previousDevContainerAfterFailedSwitch(ctx: PipelineContext, previousService: string): Promise<string> {
+    const previous = ctx.previousDevContainer;
+    if (previous === undefined) return 'The previous dev container is kept, stopped.';
+    if (previous.removed) return `The previous dev container ${previous.name} could not be renamed and was removed; its volumes are kept.`;
+    let containers: ContainerInfo[];
+    try {
+      containers = await this.composeContainers(ctx.env);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The containers of ${ctx.env.repository} could not be listed: ${errorMessage(error)}`);
+      return `The state of the previous dev container ${previous.name} is not known.`;
+    }
+    const stopped = async (container: ContainerInfo): Promise<boolean> => {
+      if (container.state !== 'running') return true;
+      try {
+        await this.deps.docker.stopContainer(container.id);
+        return true;
+      } catch (error) {
+        this.logger.warn(`The container ${container.name} could not be stopped: ${errorMessage(error)}`);
+        return false;
+      }
+    };
+    const same = containers.find((container) => container.id === previous.id);
+    if (same !== undefined) return (await stopped(same)) ? 'The previous dev container is kept, stopped.' : 'The previous dev container is kept, but it could not be stopped.';
+    const again = containers.find((container) => container.labels[COMPOSE_SERVICE_LABEL] === previousService);
+    if (again !== undefined) {
+      const state = (await stopped(again)) ? '' : ' It could not be stopped.';
+      return `Docker Compose created the previous dev container again as the service ${previousService} (${again.name}); the files outside its volumes are gone.${state}`;
+    }
+    return `The previous dev container ${previous.name} is gone.`;
   }
 
   /**
@@ -3488,13 +3746,17 @@ export class EnvironmentService {
       // to the current name, and the container must never be removed for that.
       if (previous.name !== name) await docker.renameContainer(previous.id, name);
       renamed = true;
+      // Review round 2 of PR #68 (A-R2-3): for the detail of a failed switch.
+      ctx.previousDevContainer = { id: previous.id, name, removed: false };
       this.logger.info(`The container ${previous.name} is now ${name}; Docker Compose creates it again as the service ${previousService} when the configuration starts it.`);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.info(`The container ${previous.name} could not be renamed (${errorMessage(error)}). It is removed; its volumes are kept.`);
       ctx.steps.detail(Messages.containerComposeDevServiceChanged);
+      ctx.previousDevContainer = { id: previous.id, name: previous.name, removed: false };
       await this.stopServiceBeforeRemoval(previous, env);
       await docker.removeContainer(previous.id);
+      ctx.previousDevContainer = { id: previous.id, name: previous.name, removed: true };
       (ctx.kindSwitchRemoved ??= []).push(`the container ${previous.name} of the service ${previousService}`);
     }
     // Final review (FC-1): a renamed one is stopped (never removed, nor its volumes), as it keeps the labels of a dev
