@@ -2388,6 +2388,14 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
   });
 
+  it('runs no ownership fix before up when a rebuild creates the containers of an existing clone again (review round 20 of PR #64, B-R20-1)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect(h.helper.ups.length).toBeGreaterThan(0);
+    // The fix before `up` is for a new clone only (R12-1): the services have run on these files.
+    expect(h.docker.runs.filter((run) => run.all.includes('--entrypoint'))).toEqual([]);
+  });
+
   it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
     withDataFolder();
     await seedCompose({ dev: 'stopped', db: 'stopped' });

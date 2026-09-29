@@ -1576,6 +1576,33 @@ describe('open: existing environment', () => {
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1} --remove-existing-container`]);
     });
 
+    it('(b) a restore with the previous image that fails otherwise ends the open with startFailed, not through the helperFailed path (review round 20 of PR #64, B-R20-2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+      h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs');
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('startFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1} --remove-existing-container`]);
+    });
+
+    it('(b) a running container whose restore fails otherwise does not open as it is (review round 20 of PR #64, B-R20-2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = () => new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs');
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('startFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
+      expect(h.ui.warnings).not.toContain(Messages.helperFailedOpenedAsItIs('update'));
+    });
+
+    it('(c) a build that fails with another UserFacingError is a failed build: the running container starts with the buildFailed warning and the Git setup (review round 20 of PR #64, B-R20-3)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      h.helper.buildError = () => new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled, 'docker: not found');
+      const result = await h.service.open(TARGET, options());
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.buildFailed]);
+      expect(h.helper.calls).toContain('prepareGit');
+    });
+
     it('(c) a running current container opens as it is when the build fails with helperFailed: no buildFailed and no gitSetupFailed warning, no Git setup', async () => {
       // Reproduced: the running container opened, with the warnings buildFailed and gitSetupFailed (prepareGit ran).
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
