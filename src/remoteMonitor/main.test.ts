@@ -575,6 +575,7 @@ describe('RemoteMonitorLoop', () => {
   // Review round 5 of PR #63 (R5-6): a pass may end long after the tick that decided it, when containers of the environment
   // may exist again. The forgotten records of an environment go oldest first (of equal `at`, a keep last), and after one
   // that is not removed the rest of it stay: the newest records stay until all are gone, so no stop or keep changes.
+  // Review round 6 of PR #63 (R6-1): the order is that of `decide`, by the times as the rules see them (clamped).
   it.each([
     ['removed', async () => true, ['D', 'T', 'C']],
     ['not removed', async () => false, ['D']],
@@ -593,6 +594,46 @@ describe('RemoteMonitorLoop', () => {
     expect(attempts).toEqual(expected);
   });
 
+  // Review round 6 of PR #63 (R6-2): the records that stay after a removal that is not done are those of its environment
+  // only; the forgotten records of other environments and the superseded ones are still removed in that pass.
+  it('keeps only the rest of the environment whose removal failed', async () => {
+    const C = '9e8d7c6b-0000-4000-8000-000000000003';
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, C, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, A, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, A, { at: T0 - MINUTE, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const removeRecord = async (record: RemoteRecord) => {
+      attempts.push(`${record.environmentId}.${record.source}`);
+      if (record.environmentId === B && record.source === OTHER) throw new Error('locked');
+      return true;
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    await loop.tick();
+    await loop.removals;
+    expect([...attempts].sort()).toEqual([`${A}.${SOURCE}`, `${B}.${OTHER}`, `${C}.${SOURCE}`].sort());
+  });
+
+  // Review round 6 of PR #63 (R6-3): a record that a pass skips (an older one of its environment was not removed) keeps
+  // its logged failure, so it is logged once across that pass.
+  it('logs a failed removal once across a pass that skipped it', async () => {
+    const results: boolean[] = [true, false, true];
+    const removeRecord = async (record: RemoteRecord) => {
+      if (record.source === OTHER) return results.shift() ?? true;
+      throw new Error('locked');
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    for (let pass = 0; pass < 3; pass++) {
+      await loop.tick();
+      await loop.removals;
+    }
+    expect(results).toEqual([]);
+    expect(lines.filter((line) => line.includes('could not be removed'))).toHaveLength(1);
+  });
+
   // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "removes a file without a valid record whose
   // modification time is more than 7 days from now". Such a file may hold a record in a newer format of a running
   // environment (monitors of different versions on one engine): it is kept, whatever its age and environment.
@@ -602,9 +643,10 @@ describe('RemoteMonitorLoop', () => {
     const files = [heartbeatFileName(SOURCE, A), heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, B), heartbeatFileName(OTHER, B)];
     for (const [index, name] of files.entries()) {
       const file = path.join(dir, name);
-      // Review round 5 of PR #63 (R5-3): the first file holds a record in an incompatible format (was a cut one, now the
-      // second file); the others are corrupt.
-      const texts = [JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 'x' }), JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1)];
+      // Review round 5 of PR #63 (R5-3): a file holds a record in an incompatible format (was a cut one, now the second
+      // file); the others are corrupt. Changed fixture, review round 6 of PR #63 (R6-5): was the first file, with `at` T0;
+      // now the third, of B (no container) and older than 7 days, so it would be removed if it counted as a record.
+      const texts = ['not a record', JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1), JSON.stringify({ at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600, seq: 'x' })];
       fs.writeFileSync(file, texts[index] ?? 'not a record');
       const time = (T0 + (index % 2 === 0 ? -8 : 8) * 24 * 60 * MINUTE) / 1000;
       fs.utimesSync(file, time, time);

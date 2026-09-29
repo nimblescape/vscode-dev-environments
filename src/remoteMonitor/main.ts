@@ -360,10 +360,11 @@ export class RemoteMonitorLoop {
     // its stops while no pass runs starts the next one, with the records it read at its start; a duplicate removal finds a
     // missing file or another `at` and does nothing; the "Removed…" line comes when the removal ends. A removed record
     // never matters to a stop: a superseded one is never the newest, and (review round 5, R5-6) the forgotten ones of an
-    // environment go oldest first (a keep last of equal `at`), and after one that is not removed the rest of it stay, so
-    // the newest records of an environment stay until all are gone, even if containers of it are created meanwhile.
+    // environment go oldest first (a keep last of equal `at`; review round 6, R6-1: in the order of `decide`, by the times
+    // as the rules see them, clamped), and after one that is not removed the rest of it stay, so the newest records of an
+    // environment stay until all are gone, even if containers of it are created meanwhile.
     const removals = [
-      ...[...decision.forget].sort((a, b) => a.at - b.at || +a.keepRunning - +b.keepRunning).map((record) => ({ record, reason: 'no container of it exists', forget: true })),
+      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists', forget: true })),
       ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists', forget: false })),
     ];
     this.removing ??= (async () => {
@@ -371,7 +372,11 @@ export class RemoteMonitorLoop {
       const held = new Set<string>();
       for (const { record, reason, forget } of removals) {
         const key = `${record.source}.${record.environmentId}.${record.at}`;
-        if (forget && held.has(record.environmentId)) continue;
+        // Review round 6 of PR #63 (R6-3): a skipped record keeps its logged failure.
+        if (forget && held.has(record.environmentId)) {
+          if (this.removeFailedLogged.has(key)) failing.add(key);
+          continue;
+        }
         let removed = false;
         try {
           removed = await this.deps.removeRecord(record);

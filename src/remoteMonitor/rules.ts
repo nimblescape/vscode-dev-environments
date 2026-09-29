@@ -101,7 +101,9 @@ export interface RemoteDecision {
   kept: string[];
   /**
    * Records to remove: their environment has no container at all, and their `at` is more than RECORD_MAX_AGE_MS from now
-   * (in either direction; monitor cleanup, user decision 2026-09-29, R2).
+   * (in either direction; monitor cleanup, user decision 2026-09-29, R2). Review round 6 of PR #63 (R6-1): in the order of
+   * removal, oldest first by the `at` as the rules see it (clamped), of equal `at` a keepRunning record last; none that
+   * is newer, so seen, than a record of its environment that stays.
    */
   forget: RemoteRecord[];
   /**
@@ -193,7 +195,14 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
 
   // Monitor cleanup, user decision 2026-09-29 (R2): the absolute age, so a record far in the future (a skewed clock of a
   // computer) whose environment is gone is removed too; before, it was kept until its time had passed by 7 days.
-  const forget = input.records.filter((record) => !present.has(record.environmentId) && Math.abs(now - record.at) > RECORD_MAX_AGE_MS);
+  // Review round 6 of PR #63 (R6-1): in the order of removal, by the times as the rules see them (of equal `at`, a keep
+  // last), and never one that is newer, as the rules see it, than a record of its environment that stays (one clamped
+  // later than a record that is not old), so the newest records of an environment stay until all are gone.
+  const old = (record: RemoteRecord) => !present.has(record.environmentId) && Math.abs(now - record.at) > RECORD_MAX_AGE_MS;
+  const forget = clamped
+    .filter((record, index) => old(input.records[index]) && !clamped.some((other, j) => other.environmentId === record.environmentId && !old(input.records[j]) && (other.at < record.at || (other.at === record.at && record.keepRunning))))
+    .sort((a, b) => a.at - b.at || +a.keepRunning - +b.keepRunning)
+    .map((record) => input.records[clamped.indexOf(record)]);
   // Monitor cleanup, user decision 2026-09-29 (R1): an old record that a strictly newer one of the same environment
   // replaced, with the times as the rules see them. Never one that says keepRunning, never the newest, never on a tie.
   const forgotten = new Set(forget);

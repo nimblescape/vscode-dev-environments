@@ -224,6 +224,39 @@ describe('decide of the remote Session Monitor', () => {
       expect(decide({ now: T0, containers: [container(B, 'exited')], records: [far], state: running() }).forget).toEqual([]);
     });
 
+    // Review round 6 of PR #63 (R6-1): `forget` is in the order of removal, by the times as the rules see them (a time in
+    // the future counts from when it was first seen), of equal `at` a keep last; the loop removes them in this order.
+    describe('in the order of removal (review round 6 of PR #63, R6-1)', () => {
+      const DAY = 24 * 60 * MINUTE;
+
+      it('puts a keep last of two far-future records seen at the same tick, whatever their written times', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const past = record(B, T0 - 8 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        // Also after every start of the monitor, when nothing was seen before.
+        expect(decide({ now: T0, containers: [], records: [keep, other, past], state: running() }).forget).toEqual([past, other, keep]);
+      });
+
+      it('orders by the time first seen, not the written time', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const state = running({ futureSeen: { [`${OTHER}.${B}.${other.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, other], state }).forget).toEqual([other, keep]);
+      });
+
+      it('never forgets a far-future record seen later than a record of its environment that stays', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const young = record(B, T0 - DAY, { source: OTHER });
+        const past = record(B, T0 - 9 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        expect(decide({ now: T0, containers: [], records: [keep, young, past], state: running() }).forget).toEqual([past]);
+        // A keep seen at the same time as the one that stays stays too; one seen before it is forgotten.
+        const same = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: same }).forget).toEqual([]);
+        const before = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - 2 * DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: before }).forget).toEqual([keep]);
+      });
+    });
+
     describe('superseded records (monitor cleanup, user decision 2026-09-29, R1)', () => {
       const THIRD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
