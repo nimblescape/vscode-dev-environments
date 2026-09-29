@@ -10,9 +10,9 @@
 //   run                          the loop: a tick every 15 s (rules.ts)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
-//   forget <source> <env id>     removes that record (Delete of an environment)
-//   forget <source> <env id> <at>  removes it only while its `at` is that one, prints `removed` (the loop; review round 1
-//                                of PR #63, F2)
+//   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
+//   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
+//                                (the loop; review round 1 of PR #63, F2; review round 4, F3: no other meaning of an `at`)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
@@ -45,7 +45,6 @@ import {
 } from '../core/remoteMonitor/protocol';
 import {
   DEFAULT_REMOTE_TIMING,
-  RECORD_MAX_AGE_MS,
   REMOTE_TICK_MS,
   decide,
   initialRemoteState,
@@ -100,10 +99,11 @@ export function parseContainerLines(stdout: string): RemoteContainer[] {
 
 /**
  * The valid records of the folder: files named `<source>.<environment id>.json` (regular files, at most 4 KB) with a
- * valid record. Everything else is ignored. A missing folder has none. Review round 3 of PR #63 (R3-9): a regular file
- * with such a name but no valid record goes to `invalid`, with its modification time as `at`.
+ * valid record. Everything else is ignored, and not removed. A missing folder has none. Review round 4 of PR #63 (N4-1):
+ * R3-9 reverted: a file with such a name but no valid record may be a record in a newer format of a running environment
+ * (monitors of different versions on one engine), so the loop never removes it; Delete's plain forget removes it by name.
  */
-export async function readRecords(dir: string, invalid?: RemoteRecord[]): Promise<RemoteRecord[]> {
+export async function readRecords(dir: string): Promise<RemoteRecord[]> {
   let names: string[];
   try {
     names = await fs.promises.readdir(dir);
@@ -116,10 +116,8 @@ export async function readRecords(dir: string, invalid?: RemoteRecord[]): Promis
     const parts = parseHeartbeatFileName(name);
     if (!parts) continue;
     // Removed meanwhile, or not readable: ignored.
-    const file = path.join(dir, name);
-    const record = await readRecordFile(file);
+    const record = await readRecordFile(path.join(dir, name));
     if (record) records.push({ ...parts, ...record });
-    else if (invalid) await fs.promises.lstat(file).then((stat) => stat.isFile() && invalid.push({ ...parts, at: stat.mtimeMs, keepRunning: false, limitSeconds: 0 }), () => 0);
   }
   return records;
 }
@@ -193,12 +191,12 @@ export async function recordsOf(dir: string, environmentId: string, now: number)
 
 /**
  * Removes one record; a missing one is no error. Review round 1 of PR #63 (F2): with `at`, only while the file holds a
- * record with that `at` (the caller holds the lock of the records). True when it removed it. Review round 3 (R3-9): `at`
- * 0 also removes a file without a valid record (heartbeats write whole records, so it is no live one).
+ * record with that `at` (the caller holds the lock of the records). True when it removed it; a missing file or one
+ * without a valid record is kept and gives false (review round 4 of PR #63, N4-1: R3-9 reverted).
  */
 export async function removeRecord(dir: string, source: string, environmentId: string, at?: number): Promise<boolean> {
   const file = path.join(dir, heartbeatFileName(source, environmentId));
-  if (at !== undefined && ((await readRecordFile(file))?.at ?? 0) !== at) return false;
+  if (at !== undefined && (await readRecordFile(file))?.at !== at) return false;
   await fs.promises.rm(file, { force: true });
   return true;
 }
@@ -281,11 +279,21 @@ export class RemoteMonitorLoop {
    */
   private removeFailedLogged = new Set<string>();
   private graceLogged = false;
+  /**
+   * Review round 4 of PR #63 (N4-5): the pass of removals that runs in the background, at most one at a time. Never
+   * rejects (each removal catches its error). Read by the tests through `removals`.
+   */
+  private removing?: Promise<void>;
 
   constructor(private readonly deps: RemoteLoopDeps) {}
 
   get currentState(): RemoteMonitorState {
     return this.state;
+  }
+
+  /** The pass of removals that runs now, if any (for the tests). */
+  get removals(): Promise<void> | undefined {
+    return this.removing;
   }
 
   /** One tick; returns the environments whose containers were stopped. Never throws. */
@@ -300,16 +308,14 @@ export class RemoteMonitorLoop {
     if (this.listFailing) log('Docker answers again.');
     this.listFailing = false;
     let records: RemoteRecord[];
-    const invalid: RemoteRecord[] = [];
     try {
-      records = await readRecords(this.deps.dir, invalid);
+      records = await readRecords(this.deps.dir);
     } catch (error) {
       log(`The heartbeat records could not be read; nothing is stopped. ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
-    const now = this.deps.now();
     const decision = decide({
-      now,
+      now: this.deps.now(),
       containers: parseContainerLines(listed.stdout),
       records,
       state: this.state,
@@ -349,31 +355,27 @@ export class RemoteMonitorLoop {
     // (F2): each under the lock of the records and only while the file still holds the record that `decide` saw, so a
     // heartbeat written since stays. Review round 2 (R2-1): after the stops, which a removal (up to FORGET_TIMEOUT_MS each)
     // would otherwise delay; the `at` check makes a late removal safe. A failed one is logged once per series (R2-3).
-    // Review round 3 (R3-9): also a file without a valid record whose modification time is more than RECORD_MAX_AGE_MS
-    // from now. Review round 3 (R3-1): none starts after REMOTE_TICK_MS since `now`, so that slow ones do not make a gap
-    // (the gap rule would hold every stop); the rest follow at the next ticks, the ones that failed last.
-    const key = (record: RemoteRecord) => `${record.source}.${record.environmentId}.${record.at}`;
-    const logged = this.removeFailedLogged;
+    // Review round 4 of PR #63 (N4-5): R3-1 replaced. The removals run in the background, one pass at a time, and never
+    // lengthen a tick (a long one would make the next tick a gap, which holds every stop); a tick while a pass runs starts
+    // none, the next one after it decides again. The `at` check under the lock keeps a late removal safe: a removed record
+    // never matters to a stop (a forgotten one has no container, a superseded one is never the newest).
     const removals = [
       ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
       ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
-      ...invalid.filter((record) => Math.abs(now - record.at) > RECORD_MAX_AGE_MS).map((record) => ({ record: { ...record, at: 0 }, reason: 'it is not valid' })),
-    ].sort((a, b) => +logged.has(key(a.record)) - +logged.has(key(b.record)));
-    const failing = new Set<string>();
-    for (const { record, reason } of removals) {
-      const id = key(record);
-      if (this.deps.now() - now > REMOTE_TICK_MS) {
-        if (logged.has(id)) failing.add(id);
-        continue;
+    ];
+    this.removing ??= (async () => {
+      const failing = new Set<string>();
+      for (const { record, reason } of removals) {
+        const key = `${record.source}.${record.environmentId}.${record.at}`;
+        try {
+          if (await this.deps.removeRecord(record)) log(`Removed the old record of ${record.environmentId} (${reason}).`);
+        } catch (error) {
+          if (!this.removeFailedLogged.has(key)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+          failing.add(key);
+        }
       }
-      try {
-        if (await this.deps.removeRecord(record)) log(`Removed the old record of ${record.environmentId} (${reason}).`);
-      } catch (error) {
-        if (!logged.has(id)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
-        failing.add(id);
-      }
-    }
-    this.removeFailedLogged = failing;
+      this.removeFailedLogged = failing;
+    })().finally(() => (this.removing = undefined));
     return stopped;
   }
 }

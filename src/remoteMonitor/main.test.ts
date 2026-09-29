@@ -239,12 +239,18 @@ describe('monitor.js records and forget', () => {
     expect(await run(['forget', SOURCE, A, String(T0 - 1000)])).toEqual({ code: 0, out: '', err: '' });
   });
 
-  // Review round 3 of PR #63 (R3-9): `at` 0 removes a file without a valid record, never a valid record of another `at`.
-  it('with the `at` 0, removes a file without a valid record', async () => {
+  // Changed test, review round 4 of PR #63 (N4-1, N4-2: R3-9 reverted): was "with the `at` 0, removes a file without a
+  // valid record". An `at` (also 0) never removes a file without a valid record, and a missing file prints nothing; the
+  // plain forget of Delete removes such a file by name.
+  it('with an `at`, keeps a file without a valid record and prints nothing for a missing file; without, removes it', async () => {
     writeRecord(SOURCE, A, { at: T0 - 1000, keepRunning: false, limitSeconds: 600 });
     fs.writeFileSync(path.join(heartbeatDir(stateDir), heartbeatFileName(OTHER, A)), '{"at":');
     expect(await run(['forget', SOURCE, A, '0'])).toEqual({ code: 0, out: '', err: '' });
-    expect(await run(['forget', OTHER, A, '0'])).toEqual({ code: 0, out: 'removed\n', err: '' });
+    expect(await run(['forget', OTHER, A, '0'])).toEqual({ code: 0, out: '', err: '' });
+    expect(await run(['forget', OTHER, B, '0'])).toEqual({ code: 0, out: '', err: '' });
+    expect(await run(['forget', OTHER, B, String(T0)])).toEqual({ code: 0, out: '', err: '' });
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, A)].sort());
+    expect(await run(['forget', OTHER, A])).toEqual({ code: 0, out: '', err: '' });
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
@@ -291,12 +297,9 @@ describe('readRecords', () => {
       fs.symlinkSync(target, path.join(dir, heartbeatFileName('fedcba9876543210fedcba9876543212', B)));
     }
     expect(await readRecords(dir)).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 600, seq: 0 }]);
-    // Review round 3 of PR #63 (R3-9): the regular files with a record name but no valid record, with their modification
-    // time; no folder, no link.
-    const invalid: RemoteRecord[] = [];
-    await readRecords(dir, invalid);
-    expect(invalid.map((one) => one.source).sort()).toEqual(['11111111111111111111111111111111', OTHER, big].sort());
-    expect(invalid.find((one) => one.source === OTHER)).toEqual({ source: OTHER, environmentId: A, at: fs.lstatSync(path.join(dir, heartbeatFileName(OTHER, A))).mtimeMs, keepRunning: false, limitSeconds: 0 });
+    // Changed expectation, review round 4 of PR #63 (N4-1: R3-9 reverted): was the list of the files without a valid
+    // record (the `invalid` argument, gone). They are ignored and stay.
+    for (const source of ['11111111111111111111111111111111', OTHER, big]) expect(fs.existsSync(path.join(dir, heartbeatFileName(source, source === OTHER ? A : B)))).toBe(true);
   });
 });
 
@@ -365,9 +368,12 @@ describe('RemoteMonitorLoop', () => {
     });
   });
 
+  // Review round 4 of PR #63 (N4-5): the removals run in the background; the tests wait for the pass after the tick.
   async function tickAt(time: number): Promise<string[]> {
     now = time;
-    return loop.tick();
+    const stopped = await loop.tick();
+    await loop.removals;
+    return stopped;
   }
 
   it('lists only containers with the environment label, and stops a stale environment after the grace, dev container first', async () => {
@@ -462,6 +468,8 @@ describe('RemoteMonitorLoop', () => {
     const failing = new RemoteMonitorLoop({ docker: async () => ps, removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     await failing.tick();
+    // Review round 4 of PR #63 (N4-5): the removals run in the background.
+    await failing.removals;
     expect(lines).toContain(`The old record of ${B} could not be removed: the heartbeat records stayed locked`);
   });
 
@@ -476,93 +484,125 @@ describe('RemoteMonitorLoop', () => {
       log: (message) => lines.push(message),
     });
     const failed = () => lines.filter((line) => line.includes('could not be removed')).length;
+    // Review round 4 of PR #63 (N4-5): the removals run in the background; each tick waits for its pass here.
+    const tick = async () => {
+      await failing.tick();
+      await failing.removals;
+    };
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    await failing.tick();
-    await failing.tick();
-    await failing.tick();
+    await tick();
+    await tick();
+    await tick();
     expect(failed()).toBe(1);
     // Another record (another `at`) is a series of its own.
     writeRecord(SOURCE, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    await failing.tick();
-    await failing.tick();
+    await tick();
+    await tick();
     expect(failed()).toBe(2);
     // A success ends the series.
     fail = false;
-    await failing.tick();
+    await tick();
     fail = true;
-    await failing.tick();
+    await tick();
     expect(failed()).toBe(3);
     // A tick without the removal ends it too.
     fs.rmSync(path.join(heartbeatDir(stateDir), heartbeatFileName(SOURCE, B)));
-    await failing.tick();
+    await tick();
     writeRecord(SOURCE, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    await failing.tick();
+    await tick();
     expect(failed()).toBe(4);
   });
 
-  // Review round 3 of PR #63 (R3-1): the next tick measures its gap from the time of this one, so removals of up to 20 s
-  // each (FORGET_TIMEOUT_MS) after it would make every tick a gap, and the gap rule would hold every stop.
-  it('starts no removal after one tick interval, so slow removals keep no grace on; the rest follow at the next ticks', async () => {
-    const sources = ['1', '2', '3', '4'].map((digit) => digit.repeat(32));
-    for (const source of sources) writeRecord(source, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+  /** A loop whose removals wait until the test ends them (`release`), with the clock `clock`. */
+  function slowLoop(): { loop: RemoteMonitorLoop; attempts: string[]; release: (removed: boolean) => void; setClock: (time: number) => void } {
     let clock = T0;
-    let stuck: string | undefined;
+    const pending: Array<(removed: boolean) => void> = [];
     const attempts: string[] = [];
     const slow = new RemoteMonitorLoop({
       docker: async (args) => (args[0] === 'ps' ? ps : { code: 0, stdout: '', stderr: '' }),
-      // Each removal takes 20 s; the one tried first never succeeds.
-      removeRecord: async (record) => {
-        clock += 20_000;
+      removeRecord: (record) => {
         attempts.push(record.source);
-        stuck ??= record.source;
-        if (record.source === stuck) throw new Error('no answer within 20 s');
-        return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
+        return new Promise<boolean>((resolve) => pending.push(resolve));
       },
       dir: heartbeatDir(stateDir),
       now: () => clock,
       log: (message) => lines.push(message),
     });
+    return { loop: slow, attempts, release: (removed) => pending.shift()?.(removed), setClock: (time) => (clock = time) };
+  }
+
+  // Changed test, review round 4 of PR #63 (N4-5, R3-1 replaced): was "starts no removal after one tick interval, so slow
+  // removals keep no grace on; the rest follow at the next ticks". The removals run in the background: a tick never waits
+  // for them, so the next tick is no gap, and the stops come as without removals, while a removal still hangs.
+  it('ends a tick while a slow removal is still pending, so the stops come without a gap', async () => {
+    writeRecord(OTHER, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { loop: slow, attempts, setClock } = slowLoop();
     const stoppedAt: number[] = [];
-    for (let tick = 0; tick < 8; tick++) {
+    for (let tick = 0; tick <= REMOTE_GRACE_MS / REMOTE_TICK_MS + 1; tick++) {
+      setClock(T0 + tick * REMOTE_TICK_MS);
       if ((await slow.tick()).includes(A)) stoppedAt.push(tick);
-      clock += REMOTE_TICK_MS;
     }
-    // One removal per tick (35 s apart): the grace of the start ends after 120 s, at the fifth tick.
-    expect(stoppedAt).toEqual([4, 5, 6, 7]);
-    // The failing one goes last, so the others follow one per tick; it is logged once.
-    expect(attempts.slice(0, 5)).toEqual([stuck, ...sources.filter((source) => source !== stuck), stuck]);
-    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), heartbeatFileName(stuck!, B)].sort());
-    expect(lines.filter((line) => line.includes('could not be removed'))).toHaveLength(1);
+    // The grace of the start ends after 120 s, and no gap starts another one.
+    expect(stoppedAt).toEqual([REMOTE_GRACE_MS / REMOTE_TICK_MS, REMOTE_GRACE_MS / REMOTE_TICK_MS + 1]);
+    expect(lines.filter((line) => line.includes('nothing is stopped until'))).toHaveLength(1);
+    expect(attempts).toEqual([OTHER]);
+    expect(slow.removals).toBeDefined();
   });
 
-  // Review round 3 of PR #63 (R3-9): a file with a record name but no valid record, under the same rules as the stale
-  // temporary files: its modification time more than 7 days from now, in either direction.
-  it('removes a file without a valid record whose modification time is more than 7 days from now', async () => {
+  // Review round 4 of PR #63 (N4-5): at most one pass at a time; the first tick after it decides the removals again.
+  it('starts no second pass of removals while one runs', async () => {
+    writeRecord(OTHER, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { loop: slow, attempts, release } = slowLoop();
+    await slow.tick();
+    const pass = slow.removals;
+    await slow.tick();
+    await slow.tick();
+    expect(attempts).toEqual([OTHER]);
+    expect(slow.removals).toBe(pass);
+    release(true);
+    await pass;
+    expect(slow.removals).toBeUndefined();
+    expect(lines).toContain(`Removed the old record of ${B} (no container of it exists).`);
+    await slow.tick();
+    expect(attempts).toEqual([OTHER, OTHER]);
+    release(false);
+    await slow.removals;
+  });
+
+  // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "removes a file without a valid record whose
+  // modification time is more than 7 days from now". Such a file may hold a record in a newer format of a running
+  // environment (monitors of different versions on one engine): it is kept, whatever its age and environment.
+  it('keeps a file without a valid record, also one older than 7 days of a running environment', async () => {
     const dir = heartbeatDir(stateDir);
-    const [old, future, fresh] = ['1', '2', '3'].map((digit) => digit.repeat(32));
-    for (const [source, days] of [[old, -8], [future, 8], [fresh, -6]] as const) {
-      const file = path.join(dir, heartbeatFileName(source, B));
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(file, 'not a record');
-      fs.utimesSync(file, (T0 + days * 24 * 60 * MINUTE) / 1000, (T0 + days * 24 * 60 * MINUTE) / 1000);
+    fs.mkdirSync(dir, { recursive: true });
+    const files = [heartbeatFileName(SOURCE, A), heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, B), heartbeatFileName(OTHER, B)];
+    for (const [index, name] of files.entries()) {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, index === 0 ? JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1) : 'not a record');
+      const time = (T0 + (index % 2 === 0 ? -8 : 8) * 24 * 60 * MINUTE) / 1000;
+      fs.utimesSync(file, time, time);
     }
-    await tickAt(T0);
-    expect(calls.filter((call) => call[0] === 'forget').sort()).toEqual([['forget', old, B, '0'], ['forget', future, B, '0']].sort());
-    expect(recordFiles()).toEqual([heartbeatFileName(fresh, B)]);
-    expect(lines.filter((line) => line.startsWith('Removed'))).toEqual([`Removed the old record of ${B} (it is not valid).`, `Removed the old record of ${B} (it is not valid).`]);
+    for (let time = T0; time <= T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
+    expect(calls.filter((call) => call[0] === 'forget' || call[0] === 'stop')).toEqual([]);
+    expect(recordFiles()).toEqual([...files].sort());
+    expect(lines.filter((line) => line.startsWith('Removed'))).toEqual([]);
   });
 
-  // Review round 3 of PR #63 (R3-9): a heartbeat between the read and the removal writes a valid record, which stays.
-  it('keeps a valid record that a heartbeat wrote over a file without a valid record', async () => {
+  // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "keeps a valid record that a heartbeat wrote over a
+  // file without a valid record" (the race of the removal with the `at` 0, which is gone). Only a valid record is removed:
+  // once a heartbeat wrote one over such a file, it is handled like any record.
+  it('removes a file without a valid record only after it holds a valid old record', async () => {
     const file = path.join(heartbeatDir(stateDir), heartbeatFileName(SOURCE, B));
     fs.mkdirSync(heartbeatDir(stateDir), { recursive: true });
     fs.writeFileSync(file, 'not a record');
     fs.utimesSync(file, (T0 - 8 * 24 * 60 * MINUTE) / 1000, (T0 - 8 * 24 * 60 * MINUTE) / 1000);
-    beforeRemove = (record) => writeRecord(record.source, record.environmentId, { at: T0, keepRunning: false, limitSeconds: 600 });
     await tickAt(T0);
-    expect(readRecord(SOURCE, B)).toMatchObject({ at: T0 });
-    expect(lines.filter((line) => line.startsWith('Removed'))).toEqual([]);
+    expect(calls.filter((call) => call[0] === 'forget')).toEqual([]);
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tickAt(T0 + REMOTE_TICK_MS);
+    expect(calls.filter((call) => call[0] === 'forget')).toEqual([['forget', SOURCE, B, String(T0 - 8 * 24 * 60 * MINUTE)]]);
+    expect(recordFiles()).toEqual([]);
   });
 });
 
