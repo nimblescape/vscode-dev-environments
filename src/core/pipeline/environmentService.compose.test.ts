@@ -1669,6 +1669,8 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(error.detail).toContain('no longer uses Docker Compose');
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // Review round 23 of PR #64 (B-R23-1): the question says that a stopped dev container does not start.
+    expect(h.ui.kindQuestions[0]).toContain('Otherwise nothing starts: a stopped dev container');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
@@ -1768,6 +1770,9 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     // Review round 23 of PR #64 (A-R23-2): changed expectation, the host access reason applies only while the checks are on
     // (before: "because they were created while the host access checks were off").
     expect(h.ui.kindQuestions[0]).toContain('because they were created while the host access checks were off and the checks are on now');
+    // Review round 23 of PR #64 (B-R23-1): the question names both reasons, and the detail why nothing can start.
+    expect(h.ui.kindQuestions[0]).toContain('because an older version created them');
+    expect(error.detail).toMatch(/\), which needs the configuration\.$/);
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
