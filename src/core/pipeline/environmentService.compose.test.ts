@@ -769,6 +769,19 @@ describe('existing Docker Compose environment', () => {
     expect(h.helper.ups).toEqual([]);
   });
 
+  // Review round 10 of PR #64 (R10-2): a configuration of another kind is not kept (keepsKind false), so the running
+  // single container created without the configuration counts as current and opens as it is.
+  it('opens a running single container created without the configuration as it is when the configuration now uses Docker Compose and the rebuild fails with helperFailed', async () => {
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.buildError = () => new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+  });
+
   it('opens running current containers as they are and warns that the update was not applied when the build fails with helperFailed (review round 5 of PR #64, R5-3 f)', async () => {
     await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
     const dev = devContainer()?.id;
@@ -1522,6 +1535,8 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     // Docker Compose but cannot start them (before: docker start of the dev container).
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
+    // Review round 10 of PR #64 (R10-4): the detail names the change of kind (keepsKind reads the kind of the containers).
+    expect(error.detail).toContain('no longer uses Docker Compose');
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
     expect(h.helper.builds).toEqual([]);

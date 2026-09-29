@@ -1328,7 +1328,7 @@ export class EnvironmentService {
       // that is outdated would be created again, which needs the helper, too. Review round 2 of PR #64 (A-N4): whether
       // it opens as it is (a Docker listing) is asked only when the answer is needed, and a failure of the listing counts
       // as `false`, so the error of the configuration is never lost.
-      if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record)))) throw error;
+      if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record, false)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
       if (!usable || cancelled || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
@@ -1341,7 +1341,7 @@ export class EnvironmentService {
         // Review round 2 of PR #64 (B2): the configuration was not the problem.
         this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
       } else {
-        const next = (await this.opensAsItIsOrFalse(ctx, container, record))
+        const next = (await this.opensAsItIsOrFalse(ctx, container, record, false))
           ? 'The running environment is opened as it is.'
           : this.isComposeEnvironment(ctx.env, record, container)
             ? 'Its containers are not started.'
@@ -2570,7 +2570,9 @@ export class EnvironmentService {
       this.logger.warn(`The container of ${ctx.env.repository} could not be found: ${errorDetail(lookupError)}`);
       throw error;
     }
-    if (container === undefined || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record, this.keepsKind(ctx, loaded, container, record)))) throw error;
+    // Review round 10 of PR #64 (R10-1): only a container that ran already at Step 5 opens as it is; Step 9 gets that
+    // container, so one that the restore started meanwhile would be announced as opened as it is and then fail.
+    if (container?.state !== 'running' || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record, this.keepsKind(ctx, loaded, container, record)))) throw error;
     this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
     // Review round 4 of PR #64 (R4-4): runPipeline tells the user that the change was not applied.
     ctx.helperFailedInUpdate = true;
@@ -3079,7 +3081,7 @@ export class EnvironmentService {
    * used: it runs and is current (containerIsCurrent without the configuration, and for Docker Compose with the host
    * access checks on, no container of another service that was created while they were off).
    */
-  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown = false): Promise<boolean> {
+  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown: boolean): Promise<boolean> {
     if (container?.state !== 'running' || !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks)) return false;
     if (ctx.hostAccessChecks !== 'on' || !this.isComposeEnvironment(ctx.env, record, container)) return true;
     return (await this.unrestrictedServiceContainer(ctx)) === undefined;
@@ -3096,7 +3098,7 @@ export class EnvironmentService {
    * Review round 2 of PR #64 (A-N4): opensAsItIs for the handling of an error at Step 5: a failure of its Docker listing
    * is logged and counts as `false`, so the caller goes on with its own error; a cancellation passes through.
    */
-  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown = false): Promise<boolean> {
+  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown: boolean): Promise<boolean> {
     try {
       return await this.opensAsItIs(ctx, container, record, configKnown);
     } catch (error) {

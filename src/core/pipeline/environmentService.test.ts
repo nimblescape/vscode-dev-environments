@@ -1379,6 +1379,17 @@ describe('open: existing environment', () => {
     expect(h.docker.tokenWrites()).toEqual([]);
   });
 
+  // Review round 10 of PR #64 (R10-3): at Step 5 the configuration is not known yet, so a running container created
+  // without it counts as current and opens as it is.
+  it('opens a running container that was created without the configuration without the workspace helper', async () => {
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
   it('opens a running container without the workspace helper, and starts nothing', async () => {
     // No docker start fallback, user decision 2026-09-29: a running container is not started, so it
     // still opens without the helper (as before).
@@ -1527,6 +1538,20 @@ describe('open: existing environment', () => {
       expect(h.logger.infos.join('\n')).not.toContain('started instead');
       expect(h.helper.ups).toEqual([]);
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    });
+
+    it('(a2) a stopped container that the restore started does not open as it is when a later helper run fails with helperFailed (review round 10 of PR #64, R10-1)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid runArgs') : undefined);
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${IMAGE_1}`]);
+      expect(h.ui.warnings).not.toContain(Messages.helperFailedOpenedAsItIs('update'));
+      expect(h.logger.errors.filter((line) => line.includes('opened as it is'))).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
     });
 
     it('(b) an `up` of the new image that fails with helperFailed ends the open with helperFailed, without the start of the previous image', async () => {
