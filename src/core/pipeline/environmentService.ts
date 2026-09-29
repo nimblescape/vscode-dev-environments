@@ -572,8 +572,9 @@ interface PipelineContext {
   busy: boolean;
   /**
    * The workspace helper image could not be prepared (for example offline after an extension update: user decision
-   * 2026-09-29, no previous helper image). A running container that is current still opens (review round 1 of PR #64,
-   * L2); nothing is started (no docker start fallback, user decision 2026-09-29).
+   * 2026-09-29, no previous helper image). At Step 5 a running container that is current still opens (review round 1
+   * of PR #64, L2); a helperFailed after Step 5 ends the open (user decision 2026-09-29; review round 1 of PR #68,
+   * A-R1-5). Nothing is started (no docker start fallback, user decision 2026-09-29).
    */
   helperUnavailable: boolean;
   /**
@@ -1355,8 +1356,9 @@ export class EnvironmentService {
             : 'The existing environment is started without it.';
         this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
       }
-      // Review round 14 of PR #64 (R14-1): as in Step 8 (R4-4), a Rebuild or a selected configuration says what was not
-      // applied; the selected configuration was never saved, so the previous one stays selected.
+      // Review round 14 of PR #64 (R14-1): a Rebuild or a selected configuration says what was not applied; the selected
+      // configuration was never saved, so the previous one stays selected. (A helperFailed in Step 8 ends the open instead,
+      // user decision 2026-09-29.)
       const selected = ctx.configPath !== ctx.env.configPath;
       this.deps.ui.warn(
         helperFailed && (ctx.forced || selected)
@@ -2436,8 +2438,29 @@ export class EnvironmentService {
       // started either (that needs the helper too): no buildFailed warning and no restore; the open ends with helperFailed
       // (not startFailed; user decision 2026-09-29: a running container is not opened as it is).
       if (helperFailed) {
+        // Review round 1 of PR #68 (A-R1-1): `up` returned (the R11-1 branch above takes the rest), so it replaced the
+        // container, and the lifecycle commands of the new one did not run. It is removed (it was never attached; the files
+        // are in the volume), so that the build record, the container and the images agree and the next open creates it
+        // again with all lifecycle commands, instead of opening it as it is. Then its image can be removed, too.
+        const replaced = await this.deps.docker.findContainer(env.id, env.containerName).catch(() => undefined);
+        let removed = false;
+        if (replaced !== undefined && replaced.id !== container?.id) {
+          this.logger.info(`The container ${replaced.name} was created from ${imageName}, but its lifecycle commands did not run. It is removed; the next open creates it again.`);
+          try {
+            await this.deps.docker.removeContainer(replaced.id);
+            removed = true;
+          } catch (removeError) {
+            this.logger.warn(`Could not remove the container ${replaced.name}: ${errorMessage(removeError)}`);
+          }
+        }
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
-        return this.helperFailedInUpdate(ctx, error);
+        return this.helperFailedInUpdate(
+          ctx,
+          error,
+          removed
+            ? `The container was created again from the new environment image, but its lifecycle commands could not run. It was removed; the next open creates it again. ${isUserFacingError(error) && error.detail ? error.detail : errorDetail(error)}`
+            : undefined,
+        );
       }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
@@ -2549,10 +2572,12 @@ export class EnvironmentService {
    * an update fails the open): `error` ends the open, also when the container still runs; the environment is never
    * opened as it is after Step 5, and the rest of the open uses no helper. A cancellation passes through.
    */
-  private helperFailedInUpdate(ctx: PipelineContext, error: unknown): never {
+  private helperFailedInUpdate(ctx: PipelineContext, error: unknown, detail?: string): never {
     ctx.helperUnavailable = true;
     this.throwIfCancelled(ctx.signal);
-    this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The update could not be completed.`, error);
+    this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The build or start of its environment could not be completed; the open ends.`, error);
+    // Review round 1 of PR #68 (A-R1-1): with `detail`, the error says what happened to the container.
+    if (detail !== undefined) throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
     throw error;
   }
 
@@ -4024,8 +4049,8 @@ export class EnvironmentService {
       });
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
-      // Review round 11 of PR #64 (R11-2): before `up`, the caller handles the helperFailed (for example opens the running
-      // container as it is), without the warning about the Git configuration.
+      // Review round 11 of PR #64 (R11-2): before `up`, the caller handles the helperFailed (the open ends with it, user
+      // decision 2026-09-29), without the warning about the Git configuration.
       if (beforeUp && isHelperFailed(error)) {
         ctx.helperUnavailable = true;
         throw error;

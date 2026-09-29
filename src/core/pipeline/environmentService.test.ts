@@ -1619,7 +1619,9 @@ describe('open: existing environment', () => {
       expect(h.ui.warnings).toEqual([]);
       expect(h.helper.calls).not.toContain('prepareGit');
       expect(h.helper.ups).toEqual([]);
-      expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The update could not be completed. ${Messages.helperFailed}`]);
+      // Review round 1 of PR #68 (A-R1-3): changed expectation, also true for a first open, a Rebuild and a selected
+      // configuration (before: "The update could not be completed.").
+      expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The build or start of its environment could not be completed; the open ends. ${Messages.helperFailed}`]);
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
       expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
     });
@@ -1766,12 +1768,23 @@ describe('open: existing environment', () => {
       h.helper.userCommandsError = gone();
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('helperFailed');
-      // `up` created a new running container of the current setup; it is not the container that Step 5 found.
-      const after = h.docker.containersOf(ENV_ID);
-      expect(after).toHaveLength(1);
-      expect(after[0].id).not.toBe(before);
-      expect(after[0].state).toBe('running');
+      expect(before).toBeDefined();
+      // Review round 1 of PR #68 (A-R1-1): changed expectation. The new container that `up` created (its lifecycle commands
+      // did not run) is removed, and so is its image, so that the next open creates it again with all lifecycle commands
+      // (before: the new container stayed running, and the next open opened it as it is).
+      expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+      expect(h.docker.log).toContain(`rmi ${IMAGE_2}`);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+      expect((await entry())?.buildRecord?.environmentImage).toBe(IMAGE_1);
+      expect(error.detail).toContain('its lifecycle commands could not run. It was removed; the next open creates it again.');
       expect(h.ui.warnings).toEqual([]);
+      // The next open, with the helper back, creates the container from the previous image and runs the lifecycle commands.
+      h.helper.userCommandsError = undefined;
+      const runs = h.helper.userCommandRuns.length;
+      h.helper.calls.length = 0;
+      await h.service.open(TARGET, options());
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toHaveLength(1);
+      expect(h.helper.userCommandRuns.length).toBe(runs + 1);
     });
 
     it('a container that was stopped during the failing build does not open as it is (review round 4 of PR #64, R4-7 M2)', async () => {
@@ -1789,22 +1802,25 @@ describe('open: existing environment', () => {
       expect(h.ui.warnings).toEqual([]);
     });
 
-    it('ends with helperFailed after the failing build, also when the container could not be looked up again (review round 4 of PR #64, R4-7 M3)', async () => {
+    it('ends with helperFailed after the failing build without looking the container up again (review round 4 of PR #64, R4-7 M3; user decision 2026-09-29)', async () => {
+      // Review round 1 of PR #68 (A-R1-4): the lookup after the build is gone (before: a failing lookup was set up here and
+      // its warning checked); the test now counts that no lookup happens.
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const find = h.docker.findContainer.bind(h.docker);
-      let failLookup = false;
+      let afterBuild = false;
+      let lookupsAfterBuild = 0;
       h.docker.findContainer = async (id, name) => {
-        if (failLookup) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        if (afterBuild) lookupsAfterBuild++;
         return find(id, name);
       };
       h.helper.onBuild = () => {
-        failLookup = true;
+        afterBuild = true;
       };
       h.helper.buildError = gone;
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('helperFailed');
-      // User decision 2026-09-29 (a helperFailed during an update fails the open): the container is no longer looked up again after
-      // the failing build, so there is no warning that it could not be found (before: that warning was logged).
+      expect(lookupsAfterBuild).toBe(0);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
       expect(h.ui.warnings).toEqual([]);
     });
 
