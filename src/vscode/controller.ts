@@ -2424,7 +2424,8 @@ export class Controller implements vscode.Disposable {
    * <host> again?" (RemoteDockerCommands.offerSwitchBack: the same test and modal as the commands). True when Docker uses
    * the environment's host (then the open continues); otherwise the window closes its remote connection with the
    * message, and nothing runs on the other host. The pipeline of this extension runs on the current context; the Dev
-   * Containers extension attaches through the context in the window's authority. Assumption (V-2): VS Code waits for activate() before it resolves the authority.
+   * Containers extension attaches through the context in the window's authority. Assumption (V-2): VS Code waits for
+   * activate() before it resolves the authority.
    */
   private async onWindowHost(environment: Environment): Promise<boolean> {
     if (!this.deps.dockerTargets) return true;
