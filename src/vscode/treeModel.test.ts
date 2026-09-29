@@ -799,7 +799,7 @@ describe('state texts and icons', () => {
     expect(stateText('filesMissing')).toBe('Files missing');
   });
 
-  it('maps every state to an icon (the monitors of the extension, or blank)', () => {
+  it('maps every state to a monitor of the extension', () => {
     // User requests 2026-09-28: a switched-on monitor with the connection sign in this window, a switched-on monitor in
     // another window, the silhouette of a monitor when stopped (the icon font of the extension, review round 2, K1).
     expect(stateIcon('connected')).toEqual({ id: 'devenv-monitor-connected' });

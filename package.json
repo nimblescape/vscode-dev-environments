@@ -53,7 +53,7 @@
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E004" }
       },
       "devenv-monitor-running": {
-        "description": "Dev Environments: an environment whose container runs without a window (a monitor switched on, with the play sign).",
+        "description": "Dev Environments: an environment whose container runs without a window (a monitor switched off, with the play sign).",
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E005" }
       },
       "devenv-monitor-updating": {
