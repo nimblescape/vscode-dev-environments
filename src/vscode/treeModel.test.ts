@@ -811,8 +811,8 @@ describe('state texts and icons', () => {
     expect(stateIcon('running')).toEqual({ id: 'devenv-monitor-running' });
     expect(stateIcon('stopped')).toEqual({ id: 'devenv-monitor-off' });
     expect(stateIcon('updating').id).toBe('devenv-monitor-updating');
-    // User request 2026-09-28 ("No container --> no icon"): the blank icon, as a repository without environment.
-    expect(stateIcon('noContainer').id).toBe('blank');
+    // User request 2026-09-29 ("Switched-off monitor with a ring: No container").
+    expect(stateIcon('noContainer').id).toBe('devenv-monitor-no-container');
     expect(stateIcon('filesMissing')).toEqual({ id: 'devenv-monitor-warning', color: 'list.warningForeground' });
   });
 

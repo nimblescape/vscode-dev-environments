@@ -48,7 +48,7 @@ BADGE = (
     " 10.808 11.646 10.854L13.146 12.354C13.24 12.448 13.367 12.501 13.5 12.501C13.633 12.501 13.76 12.448 13.854 12.354"
     "C13.948 12.26 14.001 12.133 14.001 12C14.001 11.867 13.948 11.74 13.854 11.646L12.707 10.5Z"
 )
-# The badges of the codicons `vm-running` (play) and `vm-pending` (clock), in the circle of `vm-connect`.
+# The badges of the codicons `vm-running` (play), `vm-pending` (clock) and `vm-outline` (ring), in the circle of `vm-connect`.
 BADGE_PLAY = (
     "M16 11.5C16 12.39 15.736 13.26 15.242 14C14.748 14.74 14.045 15.317 13.222 15.657C12.4 15.998 11.495 16.087 10.6"
     "22 15.913C9.749 15.739 8.947 15.311 8.318 14.681C7.689 14.052 7.26 13.25 7.086 12.377C6.912 11.504 7.001 10.599 "
@@ -63,6 +63,10 @@ BADGE_CLOCK = (
     "M16 11.5C16 13.985 13.985 16 11.5 16C9.015 16 7 13.985 7 11.5C7 9.015 9.015 7 11.5 7C13.985 7 16 9.015 16 11.5ZM"
     "14 11.5C14 11.224 13.776 11 13.5 11H12V9C12 8.724 11.776 8.5 11.5 8.5C11.224 8.5 11 8.724 11 9V11.5C11 11.776 11"
     ".224 12 11.5 12H13.5C13.776 12 14 11.776 14 11.5Z"
+)
+BADGE_RING = (
+    "M16 11.5C16 13.981 13.981 16 11.5 16C9.019 16 7 13.981 7 11.5C7 9.019 9.019 7 11.5 7C13.981 7 16 9.019 16 11.5ZM"
+    "15 11.5C15 9.57 13.43 8 11.5 8C9.57 8 8 9.57 8 11.5C8 13.43 9.57 15 11.5 15C13.43 15 15 13.43 15 11.5Z"
 )
 # A warning badge in the same circle: an exclamation mark cut out.
 BADGE_WARNING = (
@@ -86,6 +90,7 @@ GLYPHS = [
     # User request 2026-09-28 ("align all the icons used with the new icon set"): the other states of an environment.
     ("monitorRunning", 0xE005, "devenv-monitor-running"),
     ("monitorUpdating", 0xE006, "devenv-monitor-updating"),
+    ("monitorNoContainer", 0xE007, "devenv-monitor-no-container"),
     ("monitorWarning", 0xE008, "devenv-monitor-warning"),
 ]
 UNITS_PER_EM = 1000
@@ -128,6 +133,7 @@ def glyphs():
         # Switched off: no window uses it (user, 2026-09-26: a running environment must not look like a connected one).
         "monitorRunning": badged(frame, BADGE_PLAY),
         "monitorUpdating": badged(frame, BADGE_CLOCK),
+        "monitorNoContainer": badged(frame, BADGE_RING),
         "monitorWarning": badged(frame, BADGE_WARNING),
     }
 
