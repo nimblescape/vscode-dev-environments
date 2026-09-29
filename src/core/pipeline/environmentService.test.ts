@@ -1606,6 +1606,21 @@ describe('open: existing environment', () => {
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
     });
 
+    it('(c) a running current container opens as it is when the Git setup before the `up` of the new image fails with helperFailed: no gitSetupFailed warning, no `up` (review round 11 of PR #64, R11-2)', async () => {
+      // Reproduced: prepareGit turned the helperFailed into the gitSetupFailed warning, and `up` then failed the same way:
+      // the warnings were [gitSetupFailed, helperFailedOpenedAsItIs('update')].
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.prepareGitError = gone();
+      h.helper.upError = (image) => (image === IMAGE_2 ? gone() : undefined);
+      const result = await h.service.open(TARGET, options());
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+      expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
+      expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    });
+
     it('(c) a running container created without the configuration, which can be read now, does not open as it is when the build fails with helperFailed (review round 9 of PR #64, R9-1)', async () => {
       await seedEnvironment(h, {
         record: { images: { [BASE_IMAGE]: DIGEST_OLD } },

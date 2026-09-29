@@ -644,6 +644,11 @@ interface PipelineContext {
    */
   composeSwitch?: { existing: ReadonlySet<string> };
   /**
+   * Review round 11 of PR #64 (R11-1): runComposeUp began to move the previous dev container of another service out of
+   * the way in this run (movePreviousDevContainer), so a failed `up` is a failed switch of the dev service.
+   */
+  devServiceMoved?: boolean;
+  /**
    * Recreate offer (user request 2026-09-26): the user chose to create the damaged dev container of this Docker Compose
    * environment again (offerRecreation). runComposeUp removes only that container (never a volume, never another
    * service) after the checks, right before `up`.
@@ -2372,6 +2377,13 @@ export class EnvironmentService {
       // previous kind is not started from here: its image is not an image of the new kind, and the configuration is of
       // the new kind. The next build tries again.
       const previousCompose = record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
+      // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container changed nothing
+      // (for example when the folders of the bind mounts or the Git configuration were written): the running container
+      // may still open as it is (helperFailedInUpdate), without the detail of a switch.
+      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true) {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        return this.helperFailedInUpdate(ctx, error, container, record, loaded);
+      }
       if ((record !== undefined || container !== undefined) && previousCompose !== (loaded.compose !== undefined)) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         // Review round 3 (D3-1, P3-3): the containers that the failed `up` of Docker Compose created (for example of a
@@ -3215,7 +3227,7 @@ export class EnvironmentService {
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
     // After the ownership fix (the files get the owner of the repository folder), and before `up`, so that the lifecycle
     // commands have the Git configuration (the token goes into the container after `up`, before them: runUserCommands).
-    await this.prepareGit(ctx);
+    await this.prepareGit(ctx, true);
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
     // of the other services have too, so they go first. Review round 3 (D3-1): also the containers of other services that
     // exist without a Docker Compose dev container or record (for example after a failed switch to Docker Compose).
@@ -3403,7 +3415,7 @@ export class EnvironmentService {
       await docker.removeContainer(damaged.id);
     }
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
-    await this.prepareGit(ctx);
+    await this.prepareGit(ctx, true);
     const override = buildComposeOverrideConfig({
       modelPath: COMPOSE_MODEL_PATH,
       service: compose.service,
@@ -3464,6 +3476,8 @@ export class EnvironmentService {
     previousService: string,
     removeExistingContainer: boolean,
   ): Promise<void> {
+    // Review round 11 of PR #64 (R11-1): from here on, the switch of the dev service may have changed the containers.
+    ctx.devServiceMoved = true;
     const env = ctx.env;
     const { docker } = this.deps;
     const number = previous.labels[COMPOSE_CONTAINER_NUMBER_LABEL] ?? '1';
@@ -4015,9 +4029,10 @@ export class EnvironmentService {
    * Concept section 9 "Git inside the container": the Git configuration of the container, written into the volume once
    * per run, before `up` (unit 15: without the token, which goes into the memory of the container after its start,
    * writeGitToken). A failure is a warning: the environment
-   * opens, but Git may not reach GitHub.
+   * opens, but Git may not reach GitHub. Review round 11 of PR #64 (R11-2): before `up` (`beforeUp`), a helperFailed (the
+   * helper image of the open is gone) ends the step instead, as `up` would fail the same way: nothing is removed for it.
    */
-  private async prepareGit(ctx: PipelineContext): Promise<void> {
+  private async prepareGit(ctx: PipelineContext, beforeUp = false): Promise<void> {
     if (ctx.gitPrepared || ctx.helperUnavailable) return;
     ctx.gitPrepared = true;
     const env = ctx.env;
@@ -4035,6 +4050,12 @@ export class EnvironmentService {
       });
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
+      // Review round 11 of PR #64 (R11-2): before `up`, the caller handles the helperFailed (for example opens the running
+      // container as it is), without the warning about the Git configuration.
+      if (beforeUp && isHelperFailed(error)) {
+        ctx.helperUnavailable = true;
+        throw error;
+      }
       this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
       this.deps.ui.warn(Messages.gitSetupFailed);
     }

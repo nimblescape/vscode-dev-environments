@@ -40,6 +40,7 @@ import {
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
+  configurationName,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -1005,6 +1006,32 @@ describe('existing Docker Compose environment', () => {
     expect(h.ui.warnings).toEqual([]);
   });
 
+  it('opens the running single container as it is when the folders of the bind mounts cannot be written with helperFailed before the switch to Docker Compose removed it (review round 11 of PR #64, R11-1)', async () => {
+    // Reproduced: the switch branch of the failed `up` ended the open with helperFailed and the detail "removed the
+    // container …", although nothing was removed, and the running container did not open as it is.
+    const SOURCE = `${FOLDER}/data/postgres`;
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: FOLDER };
+    useCompose(h, out);
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.createFoldersError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).toContain(`createRepositoryFolders ${SOURCE}`);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.log).not.toContain(`rm ${single.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('rename'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: single.id, name: NAME, state: 'running' })]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
   it('starts the single container as it is on "Rebuild later" when the configuration became a Compose configuration (review round 1, P-1)', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     h.docker.images.add(DB_IMAGE);
@@ -1340,6 +1367,22 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
     expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+  });
+
+  it('ends with helperFailed and keeps the other services when the Git setup before up of the new single container fails with helperFailed (review round 11 of PR #64, R11-2)', async () => {
+    // Reproduced: prepareGit turned the helperFailed into the gitSetupFailed warning, and the switch then removed the
+    // container of the service db although the helper image was known to be gone.
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail ?? '').not.toContain('no longer uses Docker Compose');
+    expect(h.docker.log).not.toContain(`rm ${db?.id}`);
+    expect(dbContainer()).toMatchObject({ id: db?.id });
+    expect(h.ui.warnings).not.toContain(Messages.gitSetupFailed);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
@@ -3384,6 +3427,35 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
     expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+  });
+
+  it('opens the running previous dev container as it is when the folders of the bind mounts cannot be written with helperFailed before it was moved (review round 11 of PR #64, R11-1)', async () => {
+    // Reproduced: the branch of the switched dev service ended the open with helperFailed and "The previous dev container
+    // is kept, stopped", although it was neither renamed nor stopped, and it did not open as it is.
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    expect(app).toMatchObject({ name: NAME, state: 'running' });
+    const SOURCE = `${FOLDER}/data/postgres`;
+    const out = output((m) => {
+      delete m.services.app.volumes;
+      m.services.web = { image: BASE_IMAGE, command: ['sleep', 'infinity'], networks: { default: null } };
+      m.services.db.volumes = [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: FOLDER };
+    h.helper.composeOutput = out;
+    const log = h.docker.log.length;
+    const ups = h.helper.ups.length;
+    h.helper.createFoldersError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).toContain(`createRepositoryFolders ${SOURCE}`);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(DEFAULT_CONFIG_PATH))]);
+    expect(h.helper.ups.slice(ups)).toEqual([]);
+    const after = h.docker.log.slice(log);
+    expect(after.filter((line) => line.startsWith('rename') || line.startsWith('rm ') || line.startsWith('stop'))).toEqual([]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: NAME, state: 'running' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
   });
 
   describe('final review, FF-1: a failed switch keeps the previous dev container', () => {
