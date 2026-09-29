@@ -60,10 +60,6 @@
         "description": "Dev Environments: an environment that is being updated, rebuilt or deleted (a monitor switched off, with the clock sign).",
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E006" }
       },
-      "devenv-monitor-no-container": {
-        "description": "Dev Environments: an environment whose container is missing (a monitor switched off, with the ring sign).",
-        "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E007" }
-      },
       "devenv-monitor-warning": {
         "description": "Dev Environments: an environment whose workspace volume is missing, or a Docker endpoint that is not supported (a monitor switched off, with the warning sign).",
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E008" }

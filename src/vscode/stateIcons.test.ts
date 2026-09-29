@@ -39,8 +39,9 @@ describe('the monitor icons of the states', () => {
     const icons = contributedIcons();
     expect(Object.keys(icons).sort()).toEqual(Object.values(MonitorIcons).sort());
     // User request 2026-09-28: a fourth monitor for the header row of a remote Docker host.
-    // User request 2026-09-28 ("align all the icons used with the new icon set"): four more for the other states.
-    expect(Object.values(icons).map((icon) => icon.default.fontCharacter)).toEqual(['\\E001', '\\E002', '\\E003', '\\E004', '\\E005', '\\E006', '\\E007', '\\E008']);
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): more for the other states; E007 (no
+    // container) was dropped again ("No container --> no icon").
+    expect(Object.values(icons).map((icon) => icon.default.fontCharacter)).toEqual(['\\E001', '\\E002', '\\E003', '\\E004', '\\E005', '\\E006', '\\E008']);
     for (const icon of Object.values(icons)) expect(icon.default.fontPath).toBe(`./${FONT}`);
     const font = fs.readFileSync(path.join(ROOT, FONT));
     expect(font.subarray(0, 4).toString('latin1')).toBe('wOFF');
@@ -49,7 +50,7 @@ describe('the monitor icons of the states', () => {
   });
 
   it('builds each glyph on the frame of the codicon vm, with the screen on whole pixels and the smaller sign', () => {
-    // "the monitor icons are left aligned": the same frame in all three glyphs.
+    // "the monitor icons are left aligned": the same frame in all glyphs.
     expect(constant('FRAME')).toBe(VM_FRAME);
     // User request 2026-09-28 (the line between frame and screen equally wide on light and dark themes): the screen
     // is 1 inside the inner edge of the frame (x 2..14, y 2..11), from 3 to 13 and from 3 to 10.

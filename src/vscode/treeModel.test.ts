@@ -799,7 +799,7 @@ describe('state texts and icons', () => {
     expect(stateText('filesMissing')).toBe('Files missing');
   });
 
-  it('maps every state to a codicon', () => {
+  it('maps every state to an icon (the monitors of the extension, or blank)', () => {
     // User requests 2026-09-28: a switched-on monitor with the connection sign in this window, a switched-on monitor in
     // another window, the silhouette of a monitor when stopped (the icon font of the extension, review round 2, K1).
     expect(stateIcon('connected')).toEqual({ id: 'devenv-monitor-connected' });
@@ -811,7 +811,8 @@ describe('state texts and icons', () => {
     expect(stateIcon('running')).toEqual({ id: 'devenv-monitor-running' });
     expect(stateIcon('stopped')).toEqual({ id: 'devenv-monitor-off' });
     expect(stateIcon('updating').id).toBe('devenv-monitor-updating');
-    expect(stateIcon('noContainer').id).toBe('devenv-monitor-no-container');
+    // User request 2026-09-28 ("No container --> no icon"): the blank icon, as a repository without environment.
+    expect(stateIcon('noContainer').id).toBe('blank');
     expect(stateIcon('filesMissing')).toEqual({ id: 'devenv-monitor-warning', color: 'list.warningForeground' });
   });
 

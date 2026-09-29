@@ -231,10 +231,9 @@ export const MonitorIcons = {
   /** User request 2026-09-28: the header row of a remote Docker host. */
   remote: 'devenv-monitor-remote',
   // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states, with the badges of
-  // the codicons vm-running (play), vm-pending (clock), vm-outline (ring), and a warning sign.
+  // the codicons vm-running (play) and vm-pending (clock), and a warning sign.
   running: 'devenv-monitor-running',
   updating: 'devenv-monitor-updating',
-  noContainer: 'devenv-monitor-no-container',
   /** Files missing, and the header row of a Docker endpoint that is not supported. */
   warning: 'devenv-monitor-warning',
 } as const;
@@ -248,18 +247,20 @@ const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
   connectedOtherWindow: { id: MonitorIcons.on },
   // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states are the switched-off
   // monitor (no window uses it; user, 2026-09-26: a running environment must not look like a connected one) with a sign:
-  // play while its container runs, a clock while it is updated, a ring without container, a warning without files.
+  // play while its container runs, a clock while it is updated, a warning without files. User request 2026-09-28 ("No
+  // container --> no icon"): no symbol without container (the blank icon keeps the names aligned).
+  noContainer: { id: 'blank' },
   running: { id: MonitorIcons.running },
   stopped: { id: MonitorIcons.off },
+  // Not animated as the former `sync~spin`: `~spin` would turn the whole monitor; the clock marks the work.
   updating: { id: MonitorIcons.updating },
-  noContainer: { id: MonitorIcons.noContainer },
   filesMissing: { id: MonitorIcons.warning, color: 'list.warningForeground' },
 };
 
 /**
  * Icon of a state: a switched-on monitor with the connection sign connected (this window), a switched-on monitor
  * connected in another window, and a switched-off monitor otherwise: plain when stopped, with a play sign running, a
- * clock updating, a ring without container, a warning without files.
+ * clock updating, a warning without files; none without container.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
