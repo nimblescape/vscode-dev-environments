@@ -4,9 +4,9 @@
 
 // Image of the workspace helper (implementation notes 7): built locally from resources/helper/Dockerfile. With a state
 // file, the base image is checked once a week in the background (a changed base image rebuilds the same tag at the next
-// ensure), and helper images that no window uses anymore are removed once a day. When the current tag is missing and
-// cannot be built (offline after an extension update), the newest previous helper image that this installation built
-// is used for that ensure (user decision 2026-09-29: every start runs through the Dev Container CLI, no `docker start`).
+// ensure), and helper images that no window uses anymore are removed once a day. User decision 2026-09-29: there is no
+// previous helper image. When the current tag is missing and cannot be built, the ensure fails (the open then fails with
+// helperFailed); the background prebuild after an extension update (HelperPrebuild) builds the new tag early.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -32,19 +32,12 @@ export const HELPER_IMAGE_REPOSITORY = 'devenv-helper';
 
 /**
  * Review round 2 of PR #64 (A-N2): the helper generation of this extension version, recorded per tag in helper.json
- * (`generation`) at each build and rebuild. It rises with HELPER_MIN_PREVIOUS_GENERATION. Review round 3 of PR #64 (P5):
- * it is part of the helper tag (helperImageTag), so raising it gives a new current tag, which is built: an image of an
- * older generation never stays the current helper.
+ * (`generation`, for diagnosis) at each build and rebuild. Review round 3 of PR #64 (P5): it is part of the helper tag
+ * (helperImageTag), so raising it gives a new current tag, which is built: an image of an older generation never stays
+ * the current helper (for example after a release that fixes a security problem in the helper image, when neither the
+ * Dockerfile nor the CLI version changed).
  */
 export const HELPER_GENERATION = 1;
-
-/**
- * Review round 2 of PR #64 (A-N2): the lowest helper generation that is used as a previous helper when the current tag
- * cannot be built. A release that fixes a security problem in the helper image raises HELPER_GENERATION and this value
- * to it, so the fallback never brings back a helper image with that problem. Records without a generation (built before
- * it existed) are never used.
- */
-export const HELPER_MIN_PREVIOUS_GENERATION = 1;
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -129,21 +122,18 @@ export function helperImageTag(
  * The helper image that an ensure resolved (ensureHelperImageUse), and the helper image of an open (review round 2 of
  * PR #64, A-N1): the open pipeline resolves it once per open and passes it to every helper run of that open (`image`),
  * so the configuration that the CLI of one helper image read and checked is run with the same CLI, whatever another open
- * in this window resolves meanwhile.
+ * in this window resolves meanwhile. Always the current tag (user decision 2026-09-29: no previous helper image).
  */
 export interface HelperImageUse {
   /** The helper tag: the key of helper.json, the label of the remote Session Monitor, and the name in log lines. */
   tag: string;
   /**
-   * Review round 3 of PR #64 (P2): the ID of the image that the ensure checked: for the current tag the image that this
-   * ensure built (found by its build label, review round 4 of PR #64, R4-2/R4-3) or found for the tag, for a previous helper the ID that helper.json recorded for its build
-   * (review round 1 of PR #64, S1). The runs of an open use it as the image reference, so a tag that moves (a rebuild of
-   * another window, a build of another installation) never changes the helper image of an open. `undefined` only for a
-   * current tag whose ID could not be read; its runs then use the tag.
+   * Review round 3 of PR #64 (P2): the ID of the image that the ensure checked: the image that this ensure built (found by
+   * its build label, review round 4 of PR #64, R4-2/R4-3) or found for the tag. The runs of an open use it as the image
+   * reference, so a tag that moves (a rebuild of another window, a build of another installation) never changes the
+   * helper image of an open. `undefined` only when the ID could not be read; its runs then use the tag.
    */
   id?: string;
-  /** A previous helper tag, used because the current tag could not be built (user decision 2026-09-29); `id` is set. */
-  previous?: boolean;
 }
 
 /** `create`: a missing tag is built; `refresh`: an existing tag is built again from a new base image. */
@@ -173,13 +163,6 @@ export interface EnsureHelperImageOptions {
   checkBaseImage?: boolean;
   /** Called right before a build of the helper image. */
   onBuild?: (kind: HelperBuildKind) => void;
-  /**
-   * Previous helper (user decision 2026-09-29): called when the current tag could not be built and the previous helper
-   * tag `tag` is returned in its place. `imageId` is the ID of its image that was checked against helper.json: the helper
-   * runs use it, not the tag, so a tag that moves after the check is never run (review round 1 of PR #64, S1). The next
-   * ensure tries to build the current tag again.
-   */
-  onPreviousHelper?: (tag: string, imageId: string) => void;
   /**
    * Called with the check of the base image when it starts. It runs in the background, after this function returned; the
    * promise never rejects (for tests, and for callers that want to wait for it).
@@ -223,10 +206,8 @@ interface Maintenance {
  *   answer), it starts in the background, under its own time limit: this function does not wait for it. It compares the
  *   registry digest of the base image with the recorded one; a change asks the next ensure for a rebuild.
  * - `lastUsedAt` of the tag is written (at most once per hour); with `maintain`, the cleanup runs (at most once per day).
- * - Previous helper (user decision 2026-09-29): when the missing tag cannot be built, the newest previous helper tag
- *   that this installation built, whose image is still the one it built, and whose helper generation is at least
- *   HELPER_MIN_PREVIOUS_GENERATION (usePreviousHelper) is returned instead, and
- *   `onPreviousHelper` is called with it and the ID of its image; without one, the error of the build is thrown.
+ * - User decision 2026-09-29: when the missing tag cannot be built, the error of the build is thrown; no other helper
+ *   image is used in its place.
  * Problems of the check, the state file, and the cleanup are logged and never make this function fail.
  */
 export async function ensureHelperImage(
@@ -238,8 +219,8 @@ export async function ensureHelperImage(
 }
 
 /**
- * ensureHelperImage, with the image that it resolved (HelperImageUse): the tag, the ID of its image, and whether it is a
- * previous helper (review round 3 of PR #64, P1/P2). The ID of an image that this call built comes from the build
+ * ensureHelperImage, with the image that it resolved (HelperImageUse): the tag and the ID of its image (review round 3 of
+ * PR #64, P1/P2). The ID of an image that this call built comes from the build
  * (its build label: review round 3 of PR #64, P4; review round 4 of PR #64, R4-2/R4-3), not from the tag.
  */
 export async function ensureHelperImageUse(
@@ -357,15 +338,8 @@ async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
   let change: RecordChange | undefined;
 
   if (currentId === undefined) {
-    let created: { change: RecordChange; id: string | undefined };
-    try {
-      created = await create(m, checkBaseImage);
-    } catch (error) {
-      if (isAbortError(error) || options.signal?.aborted) throw error;
-      const previous = await usePreviousHelper(m, error);
-      if (previous === undefined) throw error;
-      return { tag: previous.tag, id: previous.imageId, previous: true };
-    }
+    // User decision 2026-09-29: a tag that cannot be built fails the ensure (no previous helper image).
+    const created = await create(m, checkBaseImage);
     // Review round 3 of PR #64 (P4): helper.json records the ID of the image that this build made (by its build label), never
     // one read back by the tag, which another build may have moved meanwhile. The tag is read only for the cleanup
     // (which keeps the current image) and the ID of the open, when the build gave no ID.
@@ -378,8 +352,7 @@ async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
     currentId = rebuilt.currentId;
   }
   // Review round 2 of PR #64 (A-N3): `imageId` comes only from a build or rebuild of this installation. A tag that it
-  // built before the field existed gets none (another installation may have built the image that the tag has now), and
-  // without an ID and a generation it is never a previous helper.
+  // built before the field existed gets none (another installation may have built the image that the tag has now).
 
   // The check starts now, so its request runs while the open pipeline goes on; its result is written after the writes
   // of this function.
@@ -606,66 +579,6 @@ async function imageIdQuietly(m: Maintenance): Promise<string | undefined> {
   }
 }
 
-/**
- * Review round 2 of PR #64 (A-N2): the record has a helper generation of at least `minimum` (HELPER_MIN_PREVIOUS_GENERATION),
- * so its tag may be used as a previous helper. A record without one (built before the generation existed) never qualifies.
- */
-export function hasPreviousGeneration(record: HelperImageRecord, minimum: number = HELPER_MIN_PREVIOUS_GENERATION): boolean {
-  return record.generation !== undefined && record.generation >= minimum;
-}
-
-/**
- * Previous helper (user decision 2026-09-29): the current tag is missing and could not be built (`error`). The newest
- * (by `builtAt`) other helper tag that this installation built is used, if the engine still has it: an image with the
- * label nimblescape.devenv.helper=true, the tag, and exactly the image ID that `helper.json` recorded for the build
- * (`imageId`), and with a helper generation of at least HELPER_MIN_PREVIOUS_GENERATION (review round 2 of PR #64, A-N2).
- * An image of the helper repository that someone else made, a foreign or removed tag, a tag of an older generation or
- * without one, and a tag whose image changed are never used. Records the use (`lastUsedAt`, which keeps the image for 7 days) and the tag as `previousTag`.
- * Returns the tag and the checked image ID, or `undefined` when there is none; `onPreviousHelper` gets them too. The
- * helper runs use the ID (review round 1 of PR #64, S1). Never throws, except for an abort.
- */
-async function usePreviousHelper(m: Maintenance, error: unknown): Promise<{ tag: string; imageId: string } | undefined> {
-  const state = await readHelperState(m.statePath);
-  const candidates = Object.entries(state.images)
-    .filter(
-      ([tag, record]) =>
-        tag !== m.tag &&
-        isHelperImageTag(tag) &&
-        record.imageId !== undefined &&
-        record.builtAt !== undefined &&
-        !isForeign(record) &&
-        hasPreviousGeneration(record),
-    )
-    .sort(([, a], [, b]) => (Date.parse(b.builtAt ?? '') || 0) - (Date.parse(a.builtAt ?? '') || 0));
-  const images = candidates.length > 0 ? await listHelperImages(m) : undefined;
-  if (m.options.signal?.aborted) throw abortError();
-  let previous: { tag: string; imageId: string } | undefined;
-  for (const [tag, record] of candidates) {
-    const image = images?.find((item) => item.tags.includes(tag));
-    if (image === undefined) continue;
-    if (record.imageId === undefined || image.id !== record.imageId) {
-      m.logger.warn(`The helper image ${tag} is not the image that this installation of Dev Environments built for it. It is not used as the previous helper.`);
-      continue;
-    }
-    previous = { tag, imageId: record.imageId };
-    break;
-  }
-  if (previous === undefined) {
-    m.logger.warn(`The workspace helper image ${m.tag} could not be built, and there is no previous helper image of Dev Environments.`);
-    return undefined;
-  }
-  const { tag, imageId } = previous;
-  m.logger.warn(
-    `The workspace helper image ${m.tag} could not be built: ${errorMessage(error)}. The previous helper image ${tag} is used for now; ${m.tag} is built again at the next open.`,
-  );
-  await writeState(m, (fresh) => {
-    fresh.images[tag] = { ...owned(fresh.images[tag]), lastUsedAt: isoTime(m.clock) };
-    fresh.previousTag = tag;
-  });
-  m.options.onPreviousHelper?.(tag, imageId);
-  return { tag, imageId };
-}
-
 async function writeState(m: Maintenance, update: (state: HelperState) => void): Promise<void> {
   try {
     await updateHelperState(m.statePath, update);
@@ -714,11 +627,7 @@ async function removeHelperImage(m: Maintenance, image: ImageInfo, reference: st
  * installation of VS Code with its own helper.json, which never writes `lastUsedAt` here): it gets a grace period of 7
  * days, so old windows during an update keep their helper. A removed tag gets a tombstone: when it comes back, another
  * installation built it again and uses it, so it stays (for HELPER_TOMBSTONE_MS), and two installations do not remove
- * each other's helper in a loop. Tags of other repositories are never removed. Previous helper (user decision
- * 2026-09-29): the cleanup runs only when the current tag exists, so it forgets the `previousTag` of the state; the rules
- * above apply to its image (its `lastUsedAt` of the fallback keeps it for 7 days). Review round 1 of PR #64 (S4): before,
- * it was kept until the current tag was an image that this installation built, which may never happen when another
- * installation built it.
+ * each other's helper in a loop. Tags of other repositories are never removed.
  */
 async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   const nowMs = m.clock.now();
@@ -757,7 +666,6 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
 
   await writeState(m, (fresh) => {
     fresh.lastCleanupAt = now;
-    delete fresh.previousTag;
     for (const tag of graced) {
       const record = fresh.images[tag];
       if (hasTombstone(record, nowMs)) continue;

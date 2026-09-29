@@ -82,7 +82,7 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(docker.calls[1].args).toEqual(['rm', '-f', 'devenv-session-monitor']);
   });
 
-  it('runs a previous helper by its checked image ID, with the label and the log line of its tag (review round 1 of PR #64, S1)', async () => {
+  it('runs the helper image of the open by its checked image ID, with the label and the log line of its tag (review round 1 of PR #64, S1)', async () => {
     const imageId = `sha256:${'7'.repeat(64)}`;
     const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
     const logger = new Log();

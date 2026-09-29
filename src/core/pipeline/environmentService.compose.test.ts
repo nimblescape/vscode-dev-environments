@@ -719,7 +719,7 @@ describe('existing Docker Compose environment', () => {
   it('refuses to start the containers when the configuration cannot be read (D-15)', async () => {
     await seedCompose();
     h.helper.composeOutput = { error: 'yaml: invalid' };
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started the
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started the
     // containers as they were; now the start fails, and nothing starts.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
@@ -894,7 +894,7 @@ describe('existing Docker Compose environment', () => {
   it('fails with helperFailed when up fails because the workspace helper failed (review round 1, P-3)', async () => {
     await seedCompose();
     h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started all
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started all
     // containers; now the open fails with helperFailed.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('helperFailed');
@@ -904,7 +904,7 @@ describe('existing Docker Compose environment', () => {
   it('fails with helperFailed and starts nothing when the workspace helper is not available', async () => {
     await seedCompose();
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started all
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started all
     // containers; now the open fails with helperFailed.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('helperFailed');
@@ -913,23 +913,13 @@ describe('existing Docker Compose environment', () => {
     expect(devContainer()?.state).toBe('stopped');
   });
 
-  it('starts the containers through up with a previous helper image when the current one cannot be built', async () => {
-    // No docker start fallback, previous helper, user decision 2026-09-29.
+  it('passes the helper image of the open to every helper run of a Docker Compose open (review round 2 of PR #64, A-N1)', async () => {
     await seedCompose();
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
-    expect(devContainer()?.state).toBe('running');
-  });
-
-  it('passes the previous helper image of the open to every helper run of a Docker Compose open (review round 2 of PR #64, A-N1)', async () => {
-    await seedCompose();
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
-    await h.service.openEnvironment(ENV_ID, options());
-    // Changed expectation (review round 3 of PR #64, P2): the HelperImageUse names the image ID `id` and marks the
-    // previous helper with `previous`.
-    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    // Changed expectation (review round 3 of PR #64, P2): the HelperImageUse names the image ID `id`. user decision
+    // 2026-09-29: no previous helper image. Changed expectation: the current tag with its image ID (before, a previous
+    // helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
     expect(h.helper.helperImages.map((entry) => entry.call)).toEqual(expect.arrayContaining(['readConfiguration', 'composeModel', 'up']));
     expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
   });
@@ -1326,7 +1316,7 @@ describe('a Docker Compose environment whose configuration became a single conta
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
     const db = dbContainer()?.id;
     h.ui.configurationChangedAnswer = 'later';
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started the
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started the
     // containers of Docker Compose; without a Docker Compose configuration there is no `up`, so the start fails.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
@@ -1512,7 +1502,7 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     useSingle();
     // Review round 4, D4-3: changed expectation, a question of its own that names the switch (configurationKindChanged).
     h.ui.configurationKindChangedAnswer = 'later';
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): Later keeps the containers of
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): Later keeps the containers of
     // Docker Compose but cannot start them (before: docker start of the dev container).
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
@@ -1540,7 +1530,7 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
       missing: [`${FOLDER}/db/Dockerfile`],
     });
     h.ui.configurationChangedAnswer = 'rebuildNow';
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): the configuration cannot be used,
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): the configuration cannot be used,
     // so there is no model and no `up`: the start fails (before: docker start of the containers as they were).
     const failed = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(failed.code).toBe('startFailed');
@@ -1821,7 +1811,7 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     useSingle();
     expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH) });
     // The pipeline asks the same question.
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): Later then fails to start (no
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): Later then fails to start (no
     // Docker Compose configuration, no `up`); before, docker start started the containers.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
@@ -2040,12 +2030,13 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     useCompose(h, out);
   }
 
-  it('creates the folder with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
+  it('creates the folder with the helper image of the open (review round 3 of PR #64, P7)', async () => {
     withDataFolder(FOLDER);
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
     await h.service.open(TARGET, options());
     expect(h.helper.createdFolders).toEqual([[SOURCE]]);
-    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the current tag with its image ID (before,
+    // a previous helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
     expect(h.helper.helperImages.filter((entry) => entry.call === 'createRepositoryFolders')).toEqual([{ call: 'createRepositoryFolders', image: previous }]);
   });
 
@@ -2414,7 +2405,7 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
   it('does not blame the configuration when the daemon fails at the load (G1)', async () => {
     await seedCompose();
     h.docker.transientImages = 'all';
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): a Docker Compose environment
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): a Docker Compose environment
     // whose configuration could not be used is not started as it is (before: docker start of its containers); the open
     // fails with startFailed, and the warning still names Docker, not the configuration.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
@@ -3866,14 +3857,16 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
       expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
     }
 
-    it('computes the hashes with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
+    it('computes the hashes with the helper image of the open (review round 3 of PR #64, P7)', async () => {
       await openedEnvironment();
       damageDevContainer();
       h.ui.recreateAnswer = true;
-      h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+      // user decision 2026-09-29: no previous helper image. Changed input and expectation: the helper image of this open
+      // is the current tag with another image ID than the first open's (before, a previous helper).
+      h.helper.currentHelperImageId = `sha256:${'5'.repeat(64)}`;
       h.helper.helperImages.length = 0;
       await h.service.openEnvironment(ENV_ID, options());
-      const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+      const previous = { tag: 'devenv-helper:test', id: `sha256:${'5'.repeat(64)}` };
       const hashes = h.helper.helperImages.filter((entry) => entry.call === 'composeServiceHashes');
       expect(hashes.length).toBeGreaterThan(0);
       expect(hashes.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);

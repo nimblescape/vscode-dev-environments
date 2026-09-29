@@ -15,6 +15,7 @@ import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
+import { HelperPrebuild, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
@@ -518,7 +519,7 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toEqual(['node:22-bookworm-slim']);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
-    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
     expect(state().images[TAG]).toEqual({
       baseImage: 'node:22-bookworm-slim',
       baseDigest: DIGEST,
@@ -683,24 +684,20 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
   });
 });
 
-describe('WorkspaceHelper with a previous helper image (no docker start fallback, previous helper, user decision 2026-09-29)', () => {
-  const PREVIOUS = 'devenv-helper:0123456789ab';
+describe('WorkspaceHelper without a previous helper image (user decision 2026-09-29)', () => {
+  /** A helper image of an older extension version that this installation built. It is never used. */
+  const OLDER = 'devenv-helper:0123456789ab';
   const START = Date.parse('2026-09-24T12:00:00Z');
 
   function setup() {
     let now = START;
     const statePath = path.join(dir, 'storage', 'helper.json');
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    // A helper image that this installation built for the previous extension version (review round 2 of PR #64, A-N2:
-    // with its helper generation, which a previous helper needs).
-    docker.images.add(PREVIOUS);
+    docker.images.add(OLDER);
     fs.writeFileSync(
       statePath,
-      JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(PREVIOUS), generation: HELPER_GENERATION } } }),
+      JSON.stringify({ version: 1, images: { [OLDER]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION } } }),
     );
-    docker.buildHandler = async () => {
-      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
-    };
     const helper = new WorkspaceHelper({
       docker,
       logger,
@@ -719,145 +716,41 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     };
   }
 
-  /** The arguments of the last `docker run`, without the random container name and with the image tag as IMAGE. */
-  function lastRunArgs(tag: string): string[] {
-    const args = [...docker.runs[docker.runs.length - 1].args];
-    const name = args.indexOf('--name');
-    if (name >= 0) args.splice(name, 2);
-    return args.map((arg) => (arg === tag ? 'IMAGE' : arg));
-  }
+  const offline = async (): Promise<void> => {
+    throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+  };
 
-  it('runs the previous helper with exactly the arguments of the current one, and tries the current tag again at the next ensureImage', async () => {
-    const { helper, advance, state } = setup();
-    const previous: string[] = [];
-    expect(await helper.ensureImage({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(PREVIOUS);
-    expect(previous).toEqual([PREVIOUS]);
-    expect(state().previousTag).toBe(PREVIOUS);
-    // Changed expectation (review round 1 of PR #64, S1): the previous helper runs by the checked ID of its image, not by
-    // its tag; the arguments are those of the current helper except the image reference.
-    await helper.run('vol', ['true']);
-    expect(docker.runs[docker.runs.length - 1].args).not.toContain(PREVIOUS);
-    const withSocket = lastRunArgs(fakeImageId(PREVIOUS));
-    await helper.run('vol', ['true'], { docker: false, network: false, secrets: true });
-    const withoutSocket = lastRunArgs(fakeImageId(PREVIOUS));
-    // The helper runs reuse the previous helper; they do not build.
-    expect(docker.builds).toHaveLength(2);
+  /** The image reference of each `docker run` from index `from` on. */
+  const references = (from = 0) => docker.runs.slice(from).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
 
-    // The next open (a minute later, online again) builds the current tag and uses it.
-    docker.buildHandler = async () => undefined;
-    advance(60_000);
-    expect(await helper.ensureImage({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(TAG);
-    expect(previous).toEqual([PREVIOUS]);
-    expect(docker.builds).toHaveLength(3);
-    await helper.run('vol', ['true']);
-    expect(lastRunArgs(TAG)).toEqual(withSocket);
-    await helper.run('vol', ['true'], { docker: false, network: false, secrets: true });
-    expect(lastRunArgs(TAG)).toEqual(withoutSocket);
-    expect(withSocket.some((arg) => arg.includes('docker.sock'))).toBe(true);
-    expect(withoutSocket.some((arg) => arg.includes('docker.sock'))).toBe(false);
-  });
-
-  it('runs the previous helper by the image ID it checked, also when its tag points to another image afterwards (review round 1 of PR #64, S1)', async () => {
-    const { helper } = setup();
-    const previous: Array<[string, string]> = [];
-    expect(await helper.ensureImage({ onPreviousHelper: (tag, imageId) => previous.push([tag, imageId]) })).toBe(PREVIOUS);
-    expect(previous).toEqual([[PREVIOUS, fakeImageId(PREVIOUS)]]);
-    // The tag moves to another image after the check (for example someone builds or pulls devenv-helper:<hash>).
-    docker.ids.set(PREVIOUS, `sha256:${'9'.repeat(64)}`);
-    await helper.run('vol', ['true']);
-    const args = docker.runs[docker.runs.length - 1].args;
-    expect(args).toContain(fakeImageId(PREVIOUS));
-    expect(args).not.toContain(PREVIOUS);
-    expect(args).not.toContain(`sha256:${'9'.repeat(64)}`);
-    expect(commandOfImage(args, fakeImageId(PREVIOUS))).toEqual(['true']);
-  });
-
-  it('asks for the image again when the previous helper image is gone at a run outside an open, and uses another previous helper (review round 1 of PR #64, S1)', async () => {
-    const { helper, state } = setup();
-    // An older helper image that this installation built, too.
-    const OLDER = 'devenv-helper:00000000000a';
-    docker.images.add(OLDER);
-    const saved = state();
-    // Review round 2 of PR #64 (A-N2): with its helper generation.
-    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION };
-    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
-    expect(await helper.ensureImage()).toBe(PREVIOUS);
-    // The image is removed before the run (for example by a prune): docker run answers "No such image" for the ID.
-    docker.handler = (args) => {
-      if (args.includes(fakeImageId(PREVIOUS))) {
-        docker.images.delete(PREVIOUS);
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(PREVIOUS)}.\n` };
-      }
-      return {};
-    };
-    const result = await helper.run('vol', ['true']);
-    expect(result.exitCode).toBe(0);
-    expect(docker.runs.map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')))).toEqual([
-      fakeImageId(PREVIOUS),
-      fakeImageId(OLDER),
-    ]);
-    // Changed expectation (review round 2 of PR #64, B3): the log line says that the helper image is prepared again (the
-    // current tag, or else another previous helper), not that the previous helper image is built again.
-    expect(logger.lines).toContain(
-      `warn The previous helper image ${PREVIOUS} (${fakeImageId(PREVIOUS).slice(0, 19)}) is missing. The workspace helper image is prepared again.`,
-    );
-    // The current tag was tried once more (offline), then the older previous helper was used.
-    expect(docker.builds.filter((build) => build.tag === TAG).length).toBeGreaterThan(2);
-  });
-
-  it('keeps the runs of an open on its previous helper when another open builds the current tag (review round 2 of PR #64, A-N1)', async () => {
+  it('fails with helperFailed when the current tag cannot be built, never runs an older helper image, and builds the tag again at the next ensureImage', async () => {
+    // user decision 2026-09-29: no previous helper image. Changed expectation: before, the older helper image of this
+    // installation was returned and the helper runs used it by its image ID.
     const { helper, advance } = setup();
-    // Open A (offline): the previous helper. Review round 3 of PR #64 (P1): the open pins what ensureImageUse returns.
-    const openA = await helper.ensureImageUse();
-    expect(openA).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
-    await helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'a', merged: false, image: openA }).catch(() => undefined);
-    // Open B of another repository (online again) builds the current tag; the cache of the window now has it.
+    docker.buildHandler = offline;
+    const error = await helper.ensureImageUse().catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: 'helperFailed' });
+    expect((error as UserFacingError).message).toBe('The workspace helper could not be prepared.');
+    await expect(helper.run('vol', ['true'])).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(docker.runs).toEqual([]);
+    expect(logger.lines.join('\n')).not.toContain('previous helper');
+
+    // The next open (online again) builds the current tag and uses it.
     docker.buildHandler = async () => undefined;
     advance(60_000);
-    expect(await helper.ensureImage()).toBe(TAG);
-    // The later runs of open A stay on the image ID of the previous helper that read its configuration.
-    const before = docker.runs.length;
-    await helper.run('vol', ['true'], { image: openA });
-    await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image: openA });
-    const images = docker.runs.slice(before).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
-    expect(images).toEqual([fakeImageId(PREVIOUS), fakeImageId(PREVIOUS)]);
-    // A run outside an open uses the image of the window: the current tag.
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     await helper.run('vol', ['true']);
-    expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
+    expect(references()).toEqual([TAG]);
   });
 
-  it('fails with helperFailed and does not switch when the previous helper image of an open is gone at its run (review round 2 of PR #64, A-N1)', async () => {
-    const { helper, state } = setup();
-    // An older previous helper exists, which a run outside an open would switch to.
-    const OLDER = 'devenv-helper:00000000000a';
-    docker.images.add(OLDER);
-    const saved = state();
-    saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION };
-    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
-    // Review round 3 of PR #64 (P1): the open pins what ensureImageUse returns.
-    const image = await helper.ensureImageUse();
-    expect(image).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
-    const builds = docker.builds.length;
-    docker.handler = (args) => {
-      if (args.includes(fakeImageId(PREVIOUS))) return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(PREVIOUS)}.\n` };
-      return {};
-    };
-    await expect(helper.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
-    // One run, no build of the current tag, and no run with another helper image.
-    expect(docker.runs).toHaveLength(1);
-    expect(docker.builds).toHaveLength(builds);
-    expect(logger.lines.join('\n')).toContain(`The previous helper image ${PREVIOUS} (${fakeImageId(PREVIOUS).slice(0, 19)}) that this open uses was removed.`);
-  });
-
-  it('fails with helperFailed without a build when the current image of an open is gone at a run, and never switches to a previous helper (review round 2 of PR #64, A-N1; review round 3 of PR #64, P2)', async () => {
+  it('fails with helperFailed without a build when the current image of an open is gone at a run (review round 2 of PR #64, A-N1; review round 3 of PR #64, P2)', async () => {
     const { helper } = setup();
-    docker.buildHandler = async () => undefined;
     // Review round 3 of PR #64 (P2): the open pins the current tag by the ID of its image.
     const image = await helper.ensureImageUse();
     expect(image).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     // Changed expectation (review round 3 of PR #64, P2): before, the same tag was built again and the run went on with
     // it; a pinned run now uses the image ID, and when that image is gone the open ends with helperFailed: nothing is
-    // built (a build may give another image), and no previous helper is used (another CLI).
+    // built (a build may give another image).
     docker.handler = (args) => {
       if (args.includes(fakeImageId(TAG))) {
         docker.images.delete(TAG);
@@ -872,18 +765,17 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     expect((error as UserFacingError).detail).toBe(`No such image: ${fakeImageId(TAG)}`);
     expect(docker.runs).toHaveLength(runs + 1);
     expect(docker.builds).toHaveLength(builds);
-    expect(docker.runs.some((run) => run.args.includes(fakeImageId(PREVIOUS)) || run.args.includes(TAG))).toBe(false);
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the check that no older helper image is
+    // run now covers every image other than the pinned one.
+    expect(references(runs)).toEqual([fakeImageId(TAG)]);
     expect(logger.lines).toContain(
       `warn The workspace helper image ${TAG} (${fakeImageId(TAG).slice(0, 19)}) that this open uses was removed. The open cannot go on with another helper image.`,
     );
-    // Review round 3 of PR #64 (P8): no log line or state write of a previous helper for a pinned run.
-    expect(logger.lines.join('\n')).not.toContain('is used for now');
     expect(logger.lines.join('\n')).not.toContain('It is built again');
   });
 
   it('keeps the runs of an open on the image ID of its current tag when another window rebuilds the tag in the middle of the open (review round 3 of PR #64, P2)', async () => {
     const { helper } = setup();
-    docker.buildHandler = async () => undefined;
     const image = await helper.ensureImageUse();
     expect(image.id).toBe(fakeImageId(TAG));
     await helper.run('vol', ['true'], { image });
@@ -892,18 +784,17 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     docker.ids.set(TAG, rebuilt);
     await helper.run('vol', ['true'], { image });
     await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
-    const references = docker.runs.map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
-    expect(references).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
+    expect(references()).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
     // A run outside an open uses the tag, whatever image it has now.
     await helper.run('vol', ['true']);
     expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
     expect(docker.runs[docker.runs.length - 1].args).not.toContain(rebuilt);
   });
 
-  it('pins the previous helper with its ID when the cache of the window is replaced while the ensure of the open is pending (review round 3 of PR #64, P1)', async () => {
-    // Reproduced: the open learned the ID of a previous helper only through onPreviousHelper, which image() called only
-    // when its cache still held the pending ensure. A reset of the cache meanwhile (here: a helper run of another Docker
-    // engine) left the open with the tag of the previous helper and without its ID.
+  it('pins the image that the ensure of the open awaited when the cache of the window is replaced while it is pending (review round 3 of PR #64, P1)', async () => {
+    // user decision 2026-09-29: no previous helper image. Changed expectation: before, the open was offline and pinned the
+    // previous helper; now the pending ensure of the open builds the current tag while a helper run of another Docker
+    // engine replaces the cache, and the open still gets the image that its ensure built.
     const { helper } = setup();
     let engineKey = '';
     (helper as unknown as { deps: HelperDeps }).deps.engine = async () => ({ key: engineKey });
@@ -914,27 +805,21 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
         first = false;
         await new Promise<void>((resolve) => (release = resolve));
       }
-      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
     };
-    const notified: Array<[string, string]> = [];
-    const pending = helper.ensureImageUse({ onPreviousHelper: (tag, imageId) => notified.push([tag, imageId]) });
+    const pending = helper.ensureImageUse();
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
     // A helper run for another engine replaces the cache while the build of the open still runs.
     engineKey = 'ssh://build-box';
     const other = helper.run('vol', ['true']).catch((e: unknown) => e);
-    await vi.waitFor(() => expect(docker.builds.length).toBeGreaterThan(1));
+    await vi.waitFor(() => expect(docker.runs.length).toBeGreaterThan(0));
     release();
     const image = await pending;
-    expect(image).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
-    expect(notified).toEqual([[PREVIOUS, fakeImageId(PREVIOUS)]]);
-    // The run of the other engine found no previous helper there.
-    expect(await other).toMatchObject({ code: 'helperFailed' });
-    // The runs of the open use the ID, never the tag of the previous helper.
+    expect(image).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    await other;
     engineKey = '';
+    const before = docker.runs.length;
     await helper.run('vol', ['true'], { image });
-    const args = docker.runs[docker.runs.length - 1].args;
-    expect(args).toContain(fakeImageId(PREVIOUS));
-    expect(args).not.toContain(PREVIOUS);
+    expect(references(before)).toEqual([fakeImageId(TAG)]);
   });
 
   describe('every public method runs the helper image of the open that it gets as `image` (review round 3 of PR #64, P7)', () => {
@@ -971,30 +856,187 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     ];
 
     it.each(cases)('%s', async (_name, call) => {
-      const { helper, advance } = setup();
-      // Open A (offline): the previous helper.
+      // user decision 2026-09-29: no previous helper image. Changed expectation: before, open A pinned a previous helper
+      // and another open switched the cache to the current tag; now another window rebuilds the tag, and another open
+      // of this window switches the cache to the new image.
+      const { helper } = setup();
       const pinned = await helper.ensureImageUse();
-      expect(pinned).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
-      // Another open (online again) switches the cache of the window to the current tag.
-      docker.buildHandler = async () => undefined;
-      advance(60_000);
-      expect(await helper.ensureImage()).toBe(TAG);
+      expect(pinned).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      const rebuilt = `sha256:${'7'.repeat(64)}`;
+      docker.ids.set(TAG, rebuilt);
+      expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: rebuilt });
       docker.handler = (args) => {
         if (args[0] !== 'run') return {};
         return { stdout: '{"outcome":"success","containerId":"cccc","configuration":{},"services":{}}\n' };
       };
       const before = docker.runs.length;
       await call(helper, pinned).catch(() => undefined);
-      const references = docker.runs.slice(before).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
-      expect(references.length).toBeGreaterThan(0);
-      expect(references.every((reference) => reference === fakeImageId(PREVIOUS))).toBe(true);
+      const used = references(before);
+      expect(used.length).toBeGreaterThan(0);
+      expect(used.every((reference) => reference === fakeImageId(TAG))).toBe(true);
     });
   });
+});
 
-  it('fails with helperFailed when the current tag cannot be built and no previous helper of this installation exists', async () => {
-    const { helper } = setup();
-    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify({ version: 1, images: {} }));
-    await expect(helper.ensureImage()).rejects.toMatchObject({ code: 'helperFailed' });
+describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild, user decision 2026-09-29)', () => {
+  const statePath = () => path.join(dir, 'storage', 'helper.json');
+
+  function stateHelper(engine?: () => Promise<HelperEngine>): WorkspaceHelper {
+    return new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'darwin',
+      clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+      statePath: statePath(),
+      engine,
+    });
+  }
+
+  /** A build that waits for `release` and ends with an AbortError when its signal aborts. */
+  function blockingBuild(): { release: () => void } {
+    const gate = { release: () => undefined as void };
+    docker.buildHandler = (options) =>
+      new Promise<void>((resolve, reject) => {
+        gate.release = resolve;
+        options.signal?.addEventListener('abort', () => reject(abortError()), { once: true });
+      });
+    return gate;
+  }
+
+  function prebuild(helper: WorkspaceHelper, overrides: Partial<HelperPrebuildDeps> = {}): HelperPrebuild {
+    return new HelperPrebuild({
+      helper,
+      dockerRunning: async () => true,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      statePath: statePath(),
+      version: '0.2.0',
+      lastVersion: '0.1.0',
+      saveVersion: () => undefined,
+      logger,
+      ...overrides,
+    });
+  }
+
+  it('builds a missing tag once: an open that starts during the prebuild waits for it and does not build again', async () => {
+    const helper = stateHelper();
+    const gate = blockingBuild();
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const open = helper.ensureImageUse();
+    const run = helper.run('vol', ['true']);
+    gate.release();
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect((await run).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
+  });
+
+  it('joins the build of an open that runs already', async () => {
+    const helper = stateHelper();
+    const gate = blockingBuild();
+    const open = helper.ensureImageUse();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    gate.release();
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+  });
+
+  it('is cancelled by its signal; an open that waited for it builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const controller = new AbortController();
+    const pre = helper.prebuildImage({ signal: controller.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const open = helper.ensureImageUse();
+    docker.buildHandler = async () => undefined;
+    controller.abort();
+    expect(await pre).toMatchObject({ name: 'AbortError' });
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(2);
+  });
+
+  it('builds nothing when the Docker context is a remote host', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toBeUndefined();
+    expect(await helper.usesLocalEngine()).toBe(false);
+    expect(docker.builds).toEqual([]);
+    expect(await prebuild(helper).start()).toBe('remote');
+    expect(docker.builds).toEqual([]);
+  });
+
+  it('HelperPrebuild builds the new tag after an update, logs it, remembers the version, and the next open does not build', async () => {
+    const helper = stateHelper();
+    const saved: string[] = [];
+    const task = prebuild(helper, { saveVersion: (version) => void saved.push(version) });
+    expect(await task.start()).toBe('built');
+    expect(saved).toEqual(['0.2.0']);
+    expect(logger.lines).toContain('info The workspace helper image is built in the background.');
+    expect(logger.lines).toContain(`info The workspace helper image ${TAG} was built in the background.`);
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+    // start() runs once.
+    expect(await task.start()).toBe('built');
+    expect(docker.builds).toHaveLength(1);
+  });
+
+  it('HelperPrebuild runs when helper.json does not know the current tag, also without an update, and finds an existing tag', async () => {
+    docker.images.add(TAG);
+    const helper = stateHelper();
+    expect(await prebuild(helper, { lastVersion: '0.2.0' }).start()).toBe('present');
+    expect(docker.builds).toEqual([]);
+    expect(logger.lines).toContain(`info The workspace helper image ${TAG} is ready.`);
+  });
+
+  it('HelperPrebuild asks Docker nothing when it is not due', async () => {
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }));
+    let asked = false;
+    const helper = stateHelper(async () => {
+      asked = true;
+      return { key: '' };
+    });
+    const running = vi.fn(async () => true);
+    expect(await prebuild(helper, { lastVersion: '0.2.0', dockerRunning: running }).start()).toBe('notDue');
+    expect(asked).toBe(false);
+    expect(running).not.toHaveBeenCalled();
+    expect(docker.imageIdCalls).toBe(0);
+    // A tag that the cleanup removed is not known.
+    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { removedAt: '2026-09-20T12:00:00.000Z' } } }));
+    expect(await prebuild(helper, { lastVersion: '0.2.0', dockerRunning: running }).start()).toBe('built');
+  });
+
+  it('HelperPrebuild does not build when Docker is not running, and does not remember the version', async () => {
+    const helper = stateHelper();
+    const saved: string[] = [];
+    expect(await prebuild(helper, { dockerRunning: async () => false, saveVersion: (version) => void saved.push(version) }).start()).toBe('dockerNotRunning');
+    expect(docker.builds).toEqual([]);
+    expect(saved).toEqual([]);
+    expect(logger.lines.join('\n')).toContain('Docker is not running');
+  });
+
+  it('HelperPrebuild is cancelled by dispose, and a failed build is logged without remembering the version', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const task = prebuild(helper);
+    const outcome = task.start();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    task.dispose();
+    expect(await outcome).toBe('cancelled');
+    // The docker build got the signal of the prebuild.
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+    };
+    const saved: string[] = [];
+    expect(await prebuild(helper, { saveVersion: (version) => void saved.push(version) }).start()).toBe('failed');
+    expect(saved).toEqual([]);
+    expect(logger.lines.join('\n')).toContain('The workspace helper image could not be prepared in the background');
   });
 });
 

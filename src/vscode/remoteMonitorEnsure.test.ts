@@ -22,7 +22,8 @@ function fakeMonitor() {
 }
 
 describe('remoteMonitorEnsure (the remote Session Monitor of extension.ts, review round 2 of PR #64, B-M9)', () => {
-  it('passes the checked image ID of a previous helper on as the image of the monitor', async () => {
+  // user decision 2026-09-29: no previous helper image; the image ID is the one of the helper image of the open.
+  it('passes the checked image ID of the helper image of the open on as the image of the monitor', async () => {
     const { calls, monitor } = fakeMonitor();
     const signal = new AbortController().signal;
     const image = `sha256:${'5'.repeat(64)}`;
@@ -30,7 +31,7 @@ describe('remoteMonitorEnsure (the remote Session Monitor of extension.ts, revie
     expect(calls).toEqual([['devenv-helper:0123456789ab', DOCKER_SOCKET, signal, image]]);
   });
 
-  it('runs the current tag without an image ID, with the rootless socket of the host', async () => {
+  it('runs the tag when the image ID is unknown, with the rootless socket of the host', async () => {
     const { calls, monitor } = fakeMonitor();
     const hosts: string[] = [];
     const ensure = remoteMonitorEnsure(monitor, async (host) => {

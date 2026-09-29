@@ -22,6 +22,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
+import { HelperPrebuild } from '../core/helper/helperPrebuild';
 import { DOCKER_SOCKET, WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
@@ -74,6 +75,9 @@ export const ImageListTexts = {
     `To keep all images of the setting "Remote Image Updates" on ${host} up to date, Dev Environments needs to read your GitHub packages.`,
   signIn: 'Sign in',
 } as const;
+
+/** The extension version of the last background prebuild of the workspace helper image (HelperPrebuild), in globalState. */
+const HELPER_PREBUILD_VERSION_KEY = 'devEnvironments.helperPrebuildVersion';
 
 /** Kept for deactivate(), which must be synchronous. */
 let coordinator: SessionCoordinator | undefined;
@@ -530,6 +534,24 @@ async function activateExtension(
   if (view.visible) background(sidebar.refreshStates(), 'update the sidebar');
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
+  // User decision 2026-09-29 (no previous helper image): after an extension update, or when helper.json does not know the
+  // current helper tag, the helper image is built in the background on the local Docker, when it runs. The build is
+  // shared with the open pipeline (WorkspaceHelper.prebuildImage) and cancelled when the extension is deactivated.
+  const helperPrebuild = new HelperPrebuild({
+    helper,
+    dockerRunning: (signal) => docker.isRunning(signal),
+    dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
+    statePath: paths.helperState,
+    version: String(context.extension.packageJSON.version ?? ''),
+    lastVersion: context.globalState.get<string>(HELPER_PREBUILD_VERSION_KEY),
+    saveVersion: (version) => context.globalState.update(HELPER_PREBUILD_VERSION_KEY, version),
+    logger,
+  });
+  context.subscriptions.push(helperPrebuild);
+  background(
+    targets.current().then((target) => (target.kind === 'local' ? runWithDockerTarget(target, () => helperPrebuild.start()) : helperPrebuild.start())),
+    'prepare the workspace helper image in the background',
+  );
 
   if (currentEnvironment && containerName && docker.isInstalled()) {
     // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window. Only for an

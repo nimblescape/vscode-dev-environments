@@ -129,13 +129,6 @@ export interface EnsureImageOptions {
   checkBaseImage?: boolean;
   /** Called right before a build of the helper image: `create` for a missing tag, `refresh` for a rebuild. */
   onBuild?: (kind: HelperBuildKind) => void;
-  /**
-   * Previous helper (user decision 2026-09-29): called when the resolved tag is a previous helper tag, because the
-   * current tag could not be built (ensureHelperImage), with the ID of its image that was checked against helper.json.
-   * The next ensureImage tries to build the current tag again. Review round 3 of PR #64 (P1): only for log lines and
-   * notices; the helper image of an open is the HelperImageUse that ensureImageUse returns.
-   */
-  onPreviousHelper?: (tag: string, imageId: string) => void;
 }
 
 /**
@@ -202,8 +195,8 @@ function mountOption(fields: Record<string, string>): string {
 
 export interface HelperRunSpec {
   /**
-   * The image reference: the image ID of the helper image of an open (review round 3 of PR #64, P2), the checked image
-   * ID of a previous helper (review round 1 of PR #64, S1), or the current helper tag for a run outside an open.
+   * The image reference: the image ID of the helper image of an open (review round 3 of PR #64, P2), or the helper tag
+   * for a run outside an open.
    */
   tag: string;
   volumeName: string;
@@ -361,14 +354,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/**
- * The image reference of a helper run outside an open: the current tag by its tag (such a run takes the image that the
- * tag has), a previous helper by the ID of its image that was checked (review round 1 of PR #64, S1).
- */
-function runReference(use: HelperImageUse): string {
-  return use.previous === true && use.id !== undefined ? use.id : use.tag;
-}
-
 /** `sha256:` and the first 12 hex characters of an image ID, for log lines. */
 function shortImageId(id: string): string {
   return id.slice(0, 'sha256:'.length + 12);
@@ -478,8 +463,6 @@ export class WorkspaceHelper {
    * the cache.
    */
   private imageCachedId: string | undefined;
-  /** The cached tag is a previous helper tag (user decision 2026-09-29): ensureImage never reuses it. */
-  private imagePrevious = false;
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
@@ -519,13 +502,31 @@ export class WorkspaceHelper {
   }
 
   /**
-   * ensureImage, with the helper image that this call awaited (HelperImageUse: the tag, the ID of its image, and whether
-   * it is a previous helper). Review round 3 of PR #64 (P1): the open pipeline pins this return value as the helper image
+   * ensureImage, with the helper image that this call awaited (HelperImageUse: the tag and the ID of its image). Review
+   * round 3 of PR #64 (P1): the open pipeline pins this return value as the helper image
    * of the open and passes it as `image` to every helper run of the open, because the cache of this instance is shared by
    * all opens of the window and may be replaced meanwhile (another engine, a missing image at another run).
    */
   async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
     return this.image(options, true);
+  }
+
+  /** Whether the engine of the operation (HelperDeps.engine) is the local Docker. */
+  async usesLocalEngine(): Promise<boolean> {
+    return (await this.currentEngine()).key === '';
+  }
+
+  /**
+   * The background prebuild (user decision 2026-09-29: no previous helper image; HelperPrebuild): makes sure that the
+   * helper tag exists on the local Docker engine, and builds it when it is missing, without the maintenance of
+   * ensureImage (like the helper runs). It shares the cached promise of this instance with ensureImage and the helper
+   * runs, so an open that starts meanwhile waits for this build instead of building a second time; when `signal` aborts,
+   * the build is cancelled, and an open that waited for it builds again for itself. Returns `undefined` without a build
+   * when the engine of the operation is not the local Docker. Throws like ensureImage.
+   */
+  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse | undefined> {
+    if (!(await this.usesLocalEngine())) return undefined;
+    return this.image({ signal: options.signal, onBuild: options.onBuild }, false);
   }
 
   /**
@@ -1140,8 +1141,7 @@ export class WorkspaceHelper {
     }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
-      // Previous helper (user decision 2026-09-29): each open tries to build the current tag again.
-      if (recheck && (this.imagePrevious || Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS)) this.resetImage();
+      if (recheck && Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS) this.resetImage();
       else if (recheck && !(await this.cachedImageCurrent())) this.resetImage();
       else await this.recordUse(now, statePath);
     }
@@ -1164,7 +1164,6 @@ export class WorkspaceHelper {
             this.imageUsedAt = this.imageReadyAt;
             this.imageTag = use.tag;
             this.imageCachedId = use.id;
-            this.imagePrevious = use.previous === true;
           }
           return use;
         },
@@ -1180,10 +1179,8 @@ export class WorkspaceHelper {
     }
     try {
       // Review round 3 of PR #64 (P1): the caller gets the image that it awaited, also when the cache was replaced
-      // meanwhile (resetImage), and every caller of a previous helper learns it.
-      const use = await this.imagePromise;
-      if (use.previous === true && use.id !== undefined) options.onPreviousHelper?.(use.tag, use.id);
-      return use;
+      // meanwhile (resetImage).
+      return await this.imagePromise;
     } catch (error) {
       // Another caller cancelled the shared build: build again for this caller.
       if (isAbortError(error) && !options.signal?.aborted) return this.image(options, recheck);
@@ -1196,7 +1193,6 @@ export class WorkspaceHelper {
     this.imageMaintained = false;
     this.imageReadyAt = undefined;
     this.imageCachedId = undefined;
-    this.imagePrevious = false;
   }
 
   /**
@@ -1315,35 +1311,29 @@ export class WorkspaceHelper {
       const result = await this.runContainer(reference, volumeName, command, env, options);
       if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
         // Review round 2 of PR #64 (A-N1, B3), review round 3 of PR #64 (P2, P8): the image of the open was removed (for
-        // example by `docker image prune -a`, by another window that rebuilt the tag and removed the image that the tag
-        // had before, or by the cleanup of another installation). The open ends: nothing is built and no other image is
+        // example by `docker image prune -a`, or by another window that rebuilt the tag and removed the image that the tag
+        // had before). The open ends: nothing is built and no other image is
         // used, because another helper image has another Dev Container CLI than the one that read and checked the
         // configuration of this open. Review round 4 of PR #64 (R4-1): the cache of the window is reset when it still
         // holds this image, so the next open resolves the helper image again instead of pinning the removed ID.
         if (this.imageReadyAt !== undefined && this.imageTag === pinned.tag && this.imageCachedId === pinned.id) this.resetImage();
         this.deps.logger.warn(
-          `The ${pinned.previous === true ? 'previous helper image' : 'workspace helper image'} ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
+          `The workspace helper image ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
         );
         throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${reference}`);
       }
       return result;
     }
     let use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-    // A run outside an open: the current tag runs by its tag; a previous helper runs by the ID of its image that was
-    // checked, not by its tag (review round 1 of PR #64, S1).
-    let result = await this.runContainer(runReference(use), volumeName, command, env, options);
+    // A run outside an open runs the helper tag by its tag.
+    let result = await this.runContainer(use.tag, volumeName, command, env, options);
     if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
-      // The image was removed after it was checked (for example by `docker image prune -a`, or the cleanup of another
-      // installation for a previous helper). The run takes what ensureHelperImage returns now: the current tag, built
-      // again, or else a previous helper.
-      this.deps.logger.warn(
-        use.previous === true && use.id !== undefined
-          ? `The previous helper image ${use.tag} (${shortImageId(use.id)}) is missing. The workspace helper image is prepared again.`
-          : `The workspace helper image ${use.tag} is missing. It is built again.`,
-      );
+      // The image was removed after it was checked (for example by `docker image prune -a`). The run takes what
+      // ensureHelperImage returns now: the tag, built again.
+      this.deps.logger.warn(`The workspace helper image ${use.tag} is missing. It is built again.`);
       this.resetImage();
       use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-      result = await this.runContainer(runReference(use), volumeName, command, env, options);
+      result = await this.runContainer(use.tag, volumeName, command, env, options);
     }
     return result;
   }

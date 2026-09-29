@@ -476,12 +476,13 @@ describe('open: first open', () => {
     expect(h.helper.clones).toEqual([]);
   });
 
-  it('lists and reads the fallback configuration with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+  it('lists and reads the fallback configuration with the helper image of the open (review round 3 of PR #64, P7)', async () => {
     h.helper.files = { '.devcontainer/python/devcontainer.json': { configText: DEFAULT_CONFIG_TEXT } };
     await h.service.open(TARGET, options({ branch: 'feature-x' }));
     expect(h.ui.infos).toEqual([Messages.configurationNotFound(DEFAULT_CONFIG_PATH, 'python')]);
-    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the helper image of the open is the
+    // current tag with its image ID (before, a previous helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
     const used = h.helper.helperImages.filter((entry) => entry.call === 'listConfigurations' || entry.call === 'readConfigFiles');
     expect(used.filter((entry) => entry.call === 'listConfigurations')).toHaveLength(1);
     // The read of the missing configuration and the read of the fallback.
@@ -1362,10 +1363,10 @@ describe('open: existing environment', () => {
     expect(h.helper.calls).toEqual([]);
   });
 
-  it('fails with helperFailed and starts nothing when the helper (and no previous helper) can be prepared for a stopped container', async () => {
+  it('fails with helperFailed and starts nothing when the helper cannot be prepared for a stopped container', async () => {
     await seedEnvironment(h);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, the container was
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, the container was
     // started with docker start after a warning; now the open fails with helperFailed, without the warning.
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('helperFailed');
@@ -1379,7 +1380,7 @@ describe('open: existing environment', () => {
   });
 
   it('opens a running container without the workspace helper, and starts nothing', async () => {
-    // No docker start fallback, previous helper, user decision 2026-09-29: a running container is not started, so it
+    // No docker start fallback, user decision 2026-09-29: a running container is not started, so it
     // still opens without the helper (as before).
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
@@ -1413,8 +1414,8 @@ describe('open: existing environment', () => {
   });
 
   it('uses no helper for the rest of the open when a helper run of the open fails with helperFailed (review round 2 of PR #64, A-N1)', async () => {
-    // The previous helper image of the open was removed at a helper run: the run fails with helperFailed instead of
-    // switching the helper image; a running container that is current opens as it is, without further helper runs.
+    // The helper image of the open was removed at a helper run: the run fails with helperFailed instead of switching the
+    // helper image; a running container that is current opens as it is, without further helper runs.
     await seedEnvironment(h, { container: 'running' });
     h.helper.readConfigurationError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'5'.repeat(64)}`);
     const result = await h.service.open(TARGET, options());
@@ -1433,42 +1434,30 @@ describe('open: existing environment', () => {
     expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
   });
 
-  it('starts through the Dev Container CLI with a previous helper image when the current one cannot be built', async () => {
-    // No docker start fallback, previous helper, user decision 2026-09-29.
-    await seedEnvironment(h);
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
-    const result = await h.service.open(TARGET, options());
-    expect(result.containerName).toBe(NAME);
-    expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
-    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
-    expect(h.ui.warnings).toEqual([]);
-  });
-
-  it('tries the build of the current helper once per open when it falls back to a previous helper', async () => {
-    // No docker start fallback, previous helper, user decision 2026-09-29: the first open prepares the helper before the
-    // clone and again before the configuration; with a previous helper, the second time does not try the build again.
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+  it('resolves the helper image once per open (review round 2 of PR #64, A-N1)', async () => {
+    // The first open prepares the helper before the clone and again before the configuration; the second time resolves
+    // nothing again. user decision 2026-09-29: no previous helper image. Changed input: before, with a previous helper.
     await h.service.open(TARGET, options());
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
     expect(h.helper.calls.filter((c) => c.startsWith('up'))).toHaveLength(1);
   });
 
   it('passes the helper image of the open to every helper run of the open (review round 2 of PR #64, A-N1)', async () => {
-    // A first open (clone, configuration, build, up, lifecycle commands) with a previous helper, and a reconnect with the
-    // current tag: every helper run of an open gets the image that the open resolved once.
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    // A first open (clone, configuration, build, up, lifecycle commands), and a reconnect after the tag was rebuilt: every
+    // helper run of an open gets the image that the open resolved once. user decision 2026-09-29: no previous helper
+    // image. Changed expectation: before, the first open used a previous helper and the reconnect the current tag; now
+    // both use the current tag, each with the image ID that its open resolved.
+    const firstId = `sha256:${'5'.repeat(64)}`;
+    h.helper.currentHelperImageId = firstId;
     await h.service.open(TARGET, options());
-    // Changed expectation (review round 3 of PR #64, P2): the HelperImageUse names the image ID `id` and marks the
-    // previous helper with `previous`.
-    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    const previous = { tag: 'devenv-helper:test', id: firstId };
     const calls = h.helper.helperImages.map((entry) => entry.call);
     expect(calls).toEqual(expect.arrayContaining(['clone', 'readConfigFiles', 'readConfiguration', 'build', 'up', 'runUserCommands', 'prepareGit']));
     expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
 
     await h.service.stop(ENV_ID);
     h.helper.helperImages.length = 0;
-    h.helper.previousHelperTag = undefined;
+    h.helper.currentHelperImageId = `sha256:${'4'.repeat(64)}`;
     await h.service.open(TARGET, options());
     expect(h.helper.helperImages.length).toBeGreaterThan(0);
     // Changed expectation (review round 3 of PR #64, P2): the current tag is pinned by the ID of its image, too.
@@ -1487,7 +1476,7 @@ describe('open: existing environment', () => {
   it('unit 15: writes no token into a container when the helper cannot be prepared', async () => {
     await seedEnvironment(h);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
-    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start
     // started the container without the helper and the token was written into its memory; now nothing starts, so no
     // token is written.
     const error = await rejection(h.service.open(TARGET, options()));
@@ -3151,14 +3140,15 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     expect(h.helper.builds).toHaveLength(1);
   });
 
-  it('reads the Dockerfile that the resolved configuration names with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
-    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+  it('reads the Dockerfile that the resolved configuration names with the helper image of the open (review round 3 of PR #64, P7)', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
     h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
     await h.service.open(TARGET, options());
     expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
-    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the helper image of the open is the
+    // current tag with its image ID (before, a previous helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
     const reads = h.helper.helperImages.filter((entry) => entry.call === 'readConfigFiles');
     // The read of the configuration and the read of the Dockerfile.
     expect(reads.length).toBeGreaterThanOrEqual(2);

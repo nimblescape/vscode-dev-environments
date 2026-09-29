@@ -6,8 +6,8 @@
 // Per helper tag, it records the digest of the base image of the last build and when the tag was built, checked, and
 // last used, so that the base image is checked once a week and helper images that no window uses are removed; for tags
 // of other installations and removed tags, the marks of the cleanup; the ID of the image that this installation built
-// for a tag and its helper generation, and the previous helper tag that an open used when the current one could not be
-// built (for diagnosis only).
+// for a tag and its helper generation (for diagnosis only). User decision 2026-09-29: no previous helper image, so no
+// previous helper tag (an older file's `previousTag` is dropped when the state is read and written again).
 // The state is advisory: two windows may read and write it at the same time. Each write is atomic, and each update
 // reads the file again right before it writes, so a lost update costs at most a second check or a second build.
 import { writeJsonAtomic } from '../storage/atomicJson';
@@ -22,17 +22,13 @@ export interface HelperImageRecord {
   builtAt?: string;
   /**
    * ID of the image that this installation built for the tag (`sha256:…`, written after each build of this installation,
-   * never taken from an image that it did not build: review round 2 of PR #64, A-N3). Previous helper (user decision
-   * 2026-09-29): only a tag whose image still has this ID is ever used in place of a current tag that cannot be built,
-   * never an image of the helper repository that someone else made, and it runs by this ID, not by its tag (review round
-   * 1 of PR #64, S1). Only a full `sha256:<64 hex characters>` ID is kept (S5).
+   * never taken from an image that it did not build: review round 2 of PR #64, A-N3), for diagnosis. Only a full
+   * `sha256:<64 hex characters>` ID is kept (review round 1 of PR #64, S5).
    */
   imageId?: string;
   /**
    * Review round 2 of PR #64 (A-N2): the helper generation (HELPER_GENERATION) of the extension that built the tag,
-   * written with each build and rebuild. A previous helper is used only with a generation of at least
-   * HELPER_MIN_PREVIOUS_GENERATION, so a release that fixes a security problem of the helper image can keep older
-   * helper images out of the fallback. A positive safe integer.
+   * written with each build and rebuild, for diagnosis. A positive safe integer.
    */
   generation?: number;
   /**
@@ -62,12 +58,6 @@ export interface HelperState {
   images: Record<string, HelperImageRecord>;
   /** Last cleanup of other helper images. */
   lastCleanupAt?: string;
-  /**
-   * Previous helper (user decision 2026-09-29): the helper tag that an open used because the current tag could not be
-   * built. The daily cleanup, which runs only when the current tag exists, forgets it (review round 1 of PR #64, S4).
-   * For diagnosis only: no code reads it (review round 2 of PR #64, A-N5).
-   */
-  previousTag?: string;
 }
 
 const HELPER_TAG = /^devenv-helper:[0-9a-f]{12}$/;
@@ -126,7 +116,6 @@ export function parseHelperState(value: unknown): HelperState {
   const state = emptyHelperState();
   if (!isRecord(value) || value.version !== 1) return state;
   if (isTime(value.lastCleanupAt)) state.lastCleanupAt = value.lastCleanupAt;
-  if (typeof value.previousTag === 'string' && isHelperImageTag(value.previousTag)) state.previousTag = value.previousTag;
   if (!isRecord(value.images)) return state;
   for (const [tag, entry] of Object.entries(value.images)) {
     if (!isHelperImageTag(tag) || !isRecord(entry)) continue;
@@ -135,7 +124,7 @@ export function parseHelperState(value: unknown): HelperState {
       const fieldValue = entry[field];
       if (typeof fieldValue !== 'string' || fieldValue === '') continue;
       if (TIME_FIELDS.has(field) && !isTime(fieldValue)) continue;
-      // Review round 1 of PR #64 (S5): the helper runs of a previous helper use this ID as the image reference.
+      // Review round 1 of PR #64 (S5): only a full image ID.
       if (field === 'imageId' && !IMAGE_ID.test(fieldValue)) continue;
       record[field] = fieldValue;
     }

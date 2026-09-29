@@ -253,9 +253,10 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     expect(docker.refused).toEqual([]);
   });
 
-  it('previous helper: a new tag that cannot be built uses the helper image that this run built, and records it as the previous tag', async () => {
-    // No docker start fallback, previous helper, user decision 2026-09-29: the helper Dockerfile of an "extension update"
-    // whose build fails (as offline), in its own folder, so its tag differs from `tag`.
+  it('a new tag that cannot be built fails with helperFailed and uses no other helper image', async () => {
+    // user decision 2026-09-29: no previous helper image. Changed expectation: before, the helper image that this run
+    // built was used as the previous helper and recorded as the previous tag. The helper Dockerfile of an "extension
+    // update" whose build fails (as offline), in its own folder, so its tag differs from `tag`.
     const updatedPath = path.join(run.runDir, 'tiny-helper-update', 'Dockerfile');
     const updated = [`FROM ${TEST_BASE_IMAGE}`, 'RUN exit 1', `LABEL ${TEST_RUN_LABEL}=${run.runId}`, ''].join('\n');
     fs.mkdirSync(path.dirname(updatedPath), { recursive: true });
@@ -264,23 +265,15 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     expect(updatedTag).not.toBe(tag);
     const currentId = cli.image(tag)?.Id;
     expect((await readHelperState(statePath)).images[tag]?.imageId).toBe(currentId);
-    const previous: string[] = [];
-    // Review round 1 of PR #64 (S1): the checked image ID, by which the helper runs start the previous helper.
-    const previousIds: string[] = [];
     const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
 
-    const onPreviousHelper = (used: string, id: string): void => {
-      previous.push(used);
-      previousIds.push(id);
-    };
-    expect(await timings.measure('failed build, previous helper', () => helper.ensureImage({ onPreviousHelper }))).toBe(tag);
+    const failure = await timings.measure('failed build', () => helper.ensureImage().catch((error: unknown) => error));
     await settled();
-    expect(previous).toEqual([tag]);
-    expect(previousIds).toEqual([currentId]);
+    expect(failure).toMatchObject({ code: 'helperFailed' });
     expect(cli.image(updatedTag)).toBeUndefined();
     expect(docker.builds.slice(-2).map((build) => build.tag)).toEqual([updatedTag, updatedTag]);
     const state = await readHelperState(statePath);
-    expect(state.previousTag).toBe(tag);
+    expect(state).not.toHaveProperty('previousTag');
     expect(state.images[updatedTag]).toBeUndefined();
     expect(cli.image(tag)?.Id).toBe(currentId);
     expect(docker.refused).toEqual([]);

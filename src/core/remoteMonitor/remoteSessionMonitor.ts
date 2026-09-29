@@ -104,8 +104,8 @@ export class RemoteSessionMonitor {
    * then `docker run`. When another window created it meanwhile (a name conflict), it looks once more and accepts a
    * matching one that runs. `socketPath`: the source of the socket mount on the host of the engine (as for the workspace
    * helper, rootless aware). `helperImage`: the image reference of `docker run` when it is not `helperTag`: the checked
-   * image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3 of PR #64, P2: current or
-   * previous); the label and the log lines keep the tag. Never throws,
+   * image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3 of PR #64, P2); the label and
+   * the log lines keep the tag. Never throws,
    * except an AbortError; a failure is logged as a warning.
    */
   async ensure(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<EnsureOutcome> {

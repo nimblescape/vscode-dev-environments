@@ -100,6 +100,10 @@ describe('no message at activation when Docker is missing', () => {
       extensionUri: { fsPath: ROOT },
       extensionMode: 1,
       asAbsolutePath: (relative: string) => path.join(storage, 'extension', relative),
+      // user decision 2026-09-29: no previous helper image. Changed input: the background prebuild of the helper image
+      // reads the extension version and remembers it in globalState.
+      extension: { packageJSON: { version: '0.1.0' } },
+      globalState: { get: () => undefined, update: async () => undefined },
     };
     try {
       const { activate } = await import('./extension');

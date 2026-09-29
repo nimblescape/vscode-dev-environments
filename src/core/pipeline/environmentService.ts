@@ -570,17 +570,16 @@ interface PipelineContext {
   /** This run holds a busy mark. */
   busy: boolean;
   /**
-   * The workspace helper image could not be prepared (for example offline after an extension update, without a previous
-   * helper image). A running container that is current still opens (review round 1 of PR #64, L2); nothing is started (no
-   * docker start fallback, previous helper, user decision 2026-09-29).
+   * The workspace helper image could not be prepared (for example offline after an extension update: user decision
+   * 2026-09-29, no previous helper image). A running container that is current still opens (review round 1 of PR #64,
+   * L2); nothing is started (no docker start fallback, user decision 2026-09-29).
    */
   helperUnavailable: boolean;
   /**
-   * Review round 2 of PR #64 (A-N1): the helper image of this run (the current tag, or a previous helper image with its
-   * checked ID, user decision 2026-09-29), resolved once by the first prepareHelper of the run and passed to every helper
-   * run of it: the configuration that the Dev Container CLI of this image read and checked is built and started with the
-   * same CLI, whatever another open of the window resolves meanwhile. Further prepareHelper calls of the run do not
-   * resolve it again (with a previous helper, they do not try the build of the current tag again).
+   * Review round 2 of PR #64 (A-N1): the helper image of this run (the current tag with the ID of its image), resolved
+   * once by the first prepareHelper of the run and passed to every helper run of it: the configuration that the Dev
+   * Container CLI of this image read and checked is built and started with the same CLI, whatever another open of the
+   * window resolves meanwhile. Further prepareHelper calls of the run do not resolve it again.
    */
   helperImage?: HelperImageUse;
   /**
@@ -5267,9 +5266,6 @@ export class EnvironmentService {
     }
     // Review round 3 of PR #64 (P2): pinned by the ID of its image, for the current tag too.
     ctx.helperImage = { ...image };
-    if (image.previous === true) {
-      this.logger.info(`${ctx.env.repository} is opened with the previous helper image ${image.tag}${image.id !== undefined ? ` (${image.id.slice(0, 19)})` : ''}.`);
-    }
     await this.ensureRemoteMonitor(ctx, image);
   }
 
@@ -5280,7 +5276,7 @@ export class EnvironmentService {
    * every remote environment. The keep-running flag follows the rules of the local Session Monitor (keptWhenClosed). A
    * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
    * its ticks). Review round 3 of PR #64 (P2): the monitor gets the tag for its label and the log lines, and the ID of the
-   * helper image of the open (current or previous) as the image of its `docker run`, like every helper run of the open;
+   * helper image of the open as the image of its `docker run`, like every helper run of the open;
    * the tag only when the ID could not be read.
    */
   private async ensureRemoteMonitor(ctx: PipelineContext, image: HelperImageUse): Promise<void> {
