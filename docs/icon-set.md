@@ -15,4 +15,6 @@ The extension contributes eight icons (`contributes.icons` in `package.json`) fr
 | `devenv-monitor-no-container` | `\E007` | Switched-off monitor with a ring | No container |
 | `devenv-monitor-warning` | `\E008` | Switched-off monitor with a warning sign | Files missing (warning colour) · unsupported-endpoint header |
 
+The activity bar icon of the sidebar is `resources/icon.svg`, the codicon `open-in-window` (user request 2026-09-29).
+
 The states are described in [6.2 Sidebar view](vscode-dev-environments.md#62-sidebar-view), the status bar in [6.3 Status bar](vscode-dev-environments.md#63-status-bar).
