@@ -37,7 +37,7 @@
   "contributes": {
     "icons": {
       "devenv-monitor-off": {
-        "description": "Dev Environments: an environment that no window uses (a monitor switched off).",
+        "description": "Dev Environments: a stopped environment, the local Docker, and Open environment… (a monitor switched off).",
         "default": { "fontPath": "./resources/icons/devenv-icons.woff", "fontCharacter": "\\E001" }
       },
       "devenv-monitor-on": {
