@@ -10,14 +10,11 @@
 // File: `disconnect/<environment-id>.json` in the global storage folder, written atomically. The content has the fields
 // of a pending operation (`PendingOperation`). No `vscode` import.
 import * as fs from 'fs';
-import * as path from 'path';
 import { removeFile, writeJsonAtomic } from '../core/storage/atomicJson';
-import { DISCONNECT_DIR_NAME, errorCode, isStorageId, readJsonTolerant, retryTransient } from '../core/storage/paths';
+import { StoragePaths, errorCode, readJsonTolerant, retryTransient } from '../core/storage/paths';
 import { isPendingOperation } from '../core/storage/sessionFiles';
 import type { PendingOperation } from '../core/types';
 
-/** Folder of the requests in the global storage folder (defined in paths.ts, where the storage layout lives). */
-export { DISCONNECT_DIR_NAME };
 /**
  * A request older than this is dropped without running: the connected window checks every 15 seconds (heartbeat) and
  * on each change of the folder, so a request that is still there after this time found no window that answers.
@@ -35,10 +32,13 @@ export function isFreshDisconnectRequest(request: DisconnectRequest, now: number
 
 export class DisconnectRequests {
   readonly dir: string;
+  /** Review round 1 of PR #63 (B5): the paths of the storage layout (paths.ts), not built a second time here. */
+  private readonly paths: StoragePaths;
 
   /** @param root The global storage folder (`StoragePaths.root`). */
   constructor(root: string) {
-    this.dir = path.join(root, DISCONNECT_DIR_NAME);
+    this.paths = new StoragePaths(root);
+    this.dir = this.paths.disconnectDir;
   }
 
   async write(request: DisconnectRequest): Promise<void> {
@@ -89,10 +89,8 @@ export class DisconnectRequests {
     }
   }
 
+  /** `disconnect/<environment-id>.json`; throws for an invalid ID (StoragePaths.disconnectFile). */
   private file(environmentId: string): string {
-    if (!isStorageId(environmentId)) {
-      throw new Error(`Invalid environment ID for a storage file name: ${JSON.stringify(environmentId)}`);
-    }
-    return path.join(this.dir, `${environmentId}.json`);
+    return this.paths.disconnectFile(environmentId);
   }
 }

@@ -100,9 +100,9 @@ async function regularFile(file: string): Promise<fs.Stats | undefined> {
 
 /**
  * Removes `file` when it is still the file of `stat` (a window may have replaced it with a new one by a rename meanwhile).
- * True when it was removed.
+ * True when it was removed. Exported for the tests (review round 1 of PR #63, B4).
  */
-async function unlinkSame(file: string, stat: fs.Stats): Promise<boolean> {
+export async function unlinkSame(file: string, stat: fs.Stats): Promise<boolean> {
   const again = await regularFile(file);
   if (!again || again.ino !== stat.ino || again.mtimeMs !== stat.mtimeMs) return false;
   try {

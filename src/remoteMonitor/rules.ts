@@ -108,7 +108,9 @@ export interface RemoteDecision {
    * Monitor cleanup, user decision 2026-09-29 (R1): records to remove that are not in `forget`: they do not say
    * keepRunning, their `at` (as the rules see it, a time in the future counts from when it was first seen) is older than
    * RECORD_MAX_AGE_MS, and another record of the same environment has a strictly later `at`. So the newest record of an
-   * environment, a keepRunning record, and a record with the same `at` as the newest are never removed by it.
+   * environment, a keepRunning record, and a record with the same `at` as the newest are never removed by it. Review round
+   * 1 of PR #63 (F1): nor one while a keepRunning record of another source of the same environment has an `at` not later
+   * than its own.
    */
   superseded: RemoteRecord[];
   /** The gap rule holds every stop in this tick. */
@@ -197,7 +199,12 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     if (forgotten.has(record) || record.keepRunning) return false;
     const at = clamped[index].at;
     if (now - at <= RECORD_MAX_AGE_MS) return false;
-    return (recordsOf.get(record.environmentId) ?? []).some((other) => other.at > at);
+    const same = recordsOf.get(record.environmentId) ?? [];
+    // Review round 1 of PR #63 (F1): never while a keepRunning record of another computer is not newer than it. This record
+    // is the only one of its computer for the environment, and the local check of that computer (inUseByOtherComputer)
+    // counts such a keep only while it is at least as new as its own newest record; without it, an old keep would count.
+    if (same.some((other) => other.keepRunning && other.source !== record.source && other.at <= at)) return false;
+    return same.some((other) => other.at > at);
   });
   const state: RemoteMonitorState = { lastTickAt: now };
   if (Object.keys(futureSeen).length > 0) state.futureSeen = futureSeen;

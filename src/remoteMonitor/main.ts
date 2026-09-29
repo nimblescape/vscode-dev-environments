@@ -11,6 +11,8 @@
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record (Delete of an environment)
+//   forget <source> <env id> <at>  removes it only while its `at` is that one, prints `removed` (the loop; review round 1
+//                                of PR #63, F2)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
@@ -28,9 +30,11 @@ import {
   parseImageSettingsInput,
   REMOTE_MONITOR_STATE_DIR,
   SEQ_ORDER_WINDOW_MS,
+  forgetIfUnchangedCommand,
   heartbeatFileName,
   isRemoteEnvironmentId,
   isSourceId,
+  monitorExecFailure,
   parseHeartbeatFileName,
   parseHeartbeatInput,
   parseHeartbeatRecord,
@@ -183,9 +187,15 @@ export async function recordsOf(dir: string, environmentId: string, now: number)
   return { now, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) };
 }
 
-/** Removes one record; a missing one is no error. */
-export async function removeRecord(dir: string, source: string, environmentId: string): Promise<void> {
-  await fs.promises.rm(path.join(dir, heartbeatFileName(source, environmentId)), { force: true });
+/**
+ * Removes one record; a missing one is no error. Review round 1 of PR #63 (F2): with `at`, only while the file holds a
+ * record with that `at` (the caller holds the lock of the records). True when it removed it.
+ */
+export async function removeRecord(dir: string, source: string, environmentId: string, at?: number): Promise<boolean> {
+  const file = path.join(dir, heartbeatFileName(source, environmentId));
+  if (at !== undefined && (await readRecordFile(file))?.at !== at) return false;
+  await fs.promises.rm(file, { force: true });
+  return true;
 }
 
 export interface DockerResult {
@@ -206,8 +216,29 @@ export const nodeDocker: DockerRunner = (args, timeoutMs) =>
     });
   });
 
+/**
+ * Review round 1 of PR #63 (F2): removes an old record that `decide` named, under the lock of the records and only while
+ * the file still holds it (the `at` it read). True when it removed it.
+ */
+export type RecordRemover = (record: RemoteRecord) => Promise<boolean>;
+
+/** The time limit of a removal: the wait for the lock and the run limit (protocol.ts), plus the start of Node.js. */
+const FORGET_TIMEOUT_MS = 20_000;
+
+/** Runs `forget <source> <env id> <at>` of this script under the lock of the records (forgetIfUnchangedCommand). */
+export const nodeRecordRemover: RecordRemover = (record) =>
+  new Promise((resolve, reject) => {
+    const [file, ...args] = forgetIfUnchangedCommand(record.source, record.environmentId, record.at);
+    execFile(file, args, { timeout: FORGET_TIMEOUT_MS, windowsHide: true }, (error, stdout, stderr) => {
+      if (error) reject(new Error(monitorExecFailure(typeof error.code === 'number' ? error.code : null, String(stderr), true)));
+      else resolve(String(stdout).trim() === 'removed');
+    });
+  });
+
 export interface RemoteLoopDeps {
   docker: DockerRunner;
+  /** Removes an old record (nodeRecordRemover); the tests remove it in the process. */
+  removeRecord: RecordRemover;
   /** The folder of the records. */
   dir: string;
   now: () => number;
@@ -265,6 +296,21 @@ export class RemoteMonitorLoop {
     this.keptLogged.clear();
     for (const id of decision.kept) this.keptLogged.add(id);
 
+    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names why a record is removed. Review round 1 of PR #63
+    // (F2): before the stops (up to STOP_TIMEOUT_MS each), each under the lock of the records and only while the file still
+    // holds the record that `decide` saw, so a heartbeat written since stays.
+    const removals = [
+      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
+      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
+    ];
+    for (const { record, reason } of removals) {
+      try {
+        if (await this.deps.removeRecord(record)) log(`Removed the old record of ${record.environmentId} (${reason}).`);
+      } catch (error) {
+        log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
     const stopped: string[] = [];
     for (const { environmentId, containers, reason } of decision.stop) {
       let failed = false;
@@ -282,20 +328,6 @@ export class RemoteMonitorLoop {
       } else {
         this.stopFailedLogged.delete(environmentId);
         stopped.push(environmentId);
-      }
-    }
-
-    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names why a record is removed.
-    const removals = [
-      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
-      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
-    ];
-    for (const { record, reason } of removals) {
-      try {
-        await removeRecord(this.deps.dir, record.source, record.environmentId);
-        log(`Removed the old record of ${record.environmentId} (${reason}).`);
-      } catch (error) {
-        log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return stopped;
@@ -588,11 +620,13 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       return 0;
     }
     case 'forget': {
-      if (args.length !== 2 || !isSourceId(args[0]) || !isRemoteEnvironmentId(args[1])) {
+      // Review round 1 of PR #63 (F2): optionally the `at` of the record as the loop read it.
+      const at = args.length === 3 && /^\d{1,16}$/.test(args[2]) ? Number(args[2]) : undefined;
+      if (args.length < 2 || (args.length > 2 && !Number.isSafeInteger(at)) || !isSourceId(args[0]) || !isRemoteEnvironmentId(args[1])) {
         err('Invalid record.\n');
         return EXIT_INVALID;
       }
-      await removeRecord(dir, args[0], args[1]);
+      if ((await removeRecord(dir, args[0], args[1], at)) && at !== undefined) out('removed\n');
       return 0;
     }
     case 'images': {
@@ -624,7 +658,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const { tickMs, timing } = timingFromEnv(deps.env);
       const log = timestamped(out);
       const docker = deps.docker ?? nodeDocker;
-      const loop = new RemoteMonitorLoop({ docker, dir, now, log, timing });
+      const loop = new RemoteMonitorLoop({ docker, removeRecord: nodeRecordRemover, dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
       // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
       const leftovers = await removeStaleStateTemporaryFiles(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, now());
@@ -661,7 +695,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
     }
     default:
-      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> | images - | settings -\n');
+      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> [<at>] | images - | settings -\n');
       return EXIT_INVALID;
   }
 }

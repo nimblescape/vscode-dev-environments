@@ -16,6 +16,7 @@ import {
   RECORDS_LOCK_BUSY_EXIT,
   REMOTE_MONITOR_SCRIPT_PATH,
   forgetCommand,
+  forgetIfUnchangedCommand,
   heartbeatCommand,
   heartbeatFileName,
   type HeartbeatInput,
@@ -202,6 +203,28 @@ describe.skipIf(process.platform !== 'linux')('the lock of the heartbeat records
     killGroup(holder);
     expect(await exited(forget)).toBe(0);
     expect(fs.existsSync(path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A)))).toBe(false);
+  });
+
+  // Review round 1 of PR #63 (F2): the removal of an old record by the loop waits for the lock too, and removes the record
+  // only while it still has the `at` that the loop read; a heartbeat that wrote it meanwhile wins.
+  it('forget with an `at` waits for the lock and keeps a record that a heartbeat wrote meanwhile', { timeout: 20_000 }, async () => {
+    expect(await exited(start(command(heartbeat(1, false))))).toBe(0);
+    const seen = (readRecord() as { at: number }).at;
+    const local = (argv: string[]) => argv.flatMap((part) => (part === HEARTBEAT_LOCK_PATH ? [lockPath()] : part === REMOTE_MONITOR_SCRIPT_PATH ? [script, stateDir] : [part]));
+    const holder = await holdLock();
+    const forget = start(local(forgetIfUnchangedCommand(SOURCE, A, seen)));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(forget.exitCode).toBeNull();
+    // A heartbeat under the lock (the holder) writes the record again with a new `at`.
+    const file = path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A));
+    fs.writeFileSync(file, JSON.stringify({ ...(readRecord() as object), at: seen + 1 }));
+    killGroup(holder);
+    expect(await exited(forget)).toBe(0);
+    expect(readRecord()).toMatchObject({ at: seen + 1 });
+    // With the `at` of the file, it removes it and says so.
+    const [file0, ...args] = local(forgetIfUnchangedCommand(SOURCE, A, seen + 1));
+    expect(execFileSync(file0, args, { encoding: 'utf8', timeout: 15_000 })).toBe('removed\n');
+    expect(fs.existsSync(file)).toBe(false);
   });
 
   it('kills a heartbeat that holds the lock longer than 10 seconds, which frees the lock', { timeout: 30_000 }, async () => {

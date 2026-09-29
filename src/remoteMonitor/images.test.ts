@@ -438,15 +438,16 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     expect(stored[DEV].slice(0, 2)).toEqual(['sha256:old1', 'sha256:old2']);
   });
 
-  // Monitor cleanup, user decision 2026-09-29 (R3): the store drops empty lists and repositories of former prefixes.
-  it('prunes the stored IDs: no empty lists, no repositories that match no current prefix', () => {
+  // Monitor cleanup, user decision 2026-09-29 (R3): the store drops empty lists. Review round 1 of PR #63 (B1): changed
+  // expectation, the repositories of other prefixes are kept now (before: dropped); the prefixes change between the
+  // computers of a shared engine.
+  it('prunes the stored IDs: no empty lists, and keeps the repositories of other prefixes', () => {
     const OLD = 'ghcr.io/someone/else';
     const given: ReplacedImages = { [DEV]: ['sha256:a'], [WEB]: [], [OLD]: ['sha256:b'] };
-    expect(pruneReplacedImages(given, PREFIXES)).toEqual({ [DEV]: ['sha256:a'] });
-    // The given record is not changed; with the other prefix, that repository is kept.
-    expect(given[OLD]).toEqual(['sha256:b']);
-    expect(pruneReplacedImages(given, ['ghcr.io/someone/'])).toEqual({ [OLD]: ['sha256:b'] });
-    expect(pruneReplacedImages(given, [])).toEqual({});
+    expect(pruneReplacedImages(given)).toEqual({ [DEV]: ['sha256:a'], [OLD]: ['sha256:b'] });
+    // The given record is not changed.
+    expect(given[WEB]).toEqual([]);
+    expect(pruneReplacedImages({})).toEqual({});
   });
 
   it('writes the pruned store at the end of a pass', async () => {
@@ -460,7 +461,9 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       knownRepositories: async () => [],
       replaced: { read: async () => stored, write: async (value) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) },
     }).pass();
-    expect(stored).toEqual({ [DEV]: ['sha256:v1'] });
+    // Review round 1 of PR #63 (B1): changed expectation, the repository of another prefix stays in the store (before: it
+    // was dropped); only the empty list goes.
+    expect(stored).toEqual({ [DEV]: ['sha256:v1'], [OLD]: ['sha256:gone'] });
   });
 
   // Review round 1 of PR #57 (G): Docker removes the tag of an image that another image is built on and keeps the image.

@@ -15,6 +15,7 @@ import {
   STALE_PENDING_MAX_AGE_MS,
   STALE_TEMPORARY_MAX_AGE_MS,
   sweepStorage,
+  unlinkSame,
 } from './storageSweep';
 
 const ENV_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -109,6 +110,56 @@ describe('sweepStorage', () => {
     expect(names(paths.root)).toContain('registry.json');
     expect(names(paths.root)).not.toContain('.x.json.1234.0123abcd.tmp');
     expect(names(path.join(root, 'other'))).toEqual(['.x.json.1234.0123abcd.tmp']);
+  });
+
+  // Review round 1 of PR #63 (B4): the absolute age, so a temporary file with a time in the future (a clock that was
+  // ahead) is removed too.
+  it('R8: removes a temporary file whose modification time is more than an hour in the future', async () => {
+    const file = path.join(paths.sessionsDir, '.x.json.1234.0123abcd.tmp');
+    write(file, '{}', T0 + 2 * STALE_TEMPORARY_MAX_AGE_MS);
+    expect((await sweepStorage(paths, T0)).temporary).toEqual([path.join('sessions', '.x.json.1234.0123abcd.tmp')]);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  // Review round 1 of PR #63 (B4): a file that a window replaced after the sweep looked at it stays.
+  describe('unlinkSame', () => {
+    it('removes the file of the stat', async () => {
+      const file = paths.pendingFile(ENV_A);
+      write(file, '{}');
+      expect(await unlinkSame(file, fs.lstatSync(file))).toBe(true);
+      expect(fs.existsSync(file)).toBe(false);
+    });
+
+    it('keeps a file that a rename replaced meanwhile, with the same modification time', async () => {
+      const file = paths.pendingFile(ENV_A);
+      write(file, '{}');
+      const seen = fs.lstatSync(file);
+      const replacement = path.join(paths.pendingDir, 'replacement');
+      write(replacement, '{"new":1}');
+      fs.renameSync(replacement, file);
+      expect(fs.lstatSync(file).ino).not.toBe(seen.ino);
+      expect(fs.lstatSync(file).mtimeMs).toBe(seen.mtimeMs);
+      expect(await unlinkSame(file, seen)).toBe(false);
+      expect(fs.readFileSync(file, 'utf8')).toBe('{"new":1}');
+    });
+
+    it('keeps a file that was written again in place meanwhile', async () => {
+      const file = paths.pendingFile(ENV_A);
+      write(file, '{}');
+      const seen = fs.lstatSync(file);
+      write(file, '{"new":1}', T0 + MINUTE);
+      expect(fs.lstatSync(file).ino).toBe(seen.ino);
+      expect(await unlinkSame(file, seen)).toBe(false);
+      expect(fs.existsSync(file)).toBe(true);
+    });
+
+    it('removes nothing that is gone now', async () => {
+      const file = paths.pendingFile(ENV_A);
+      write(file, '{}');
+      const seen = fs.lstatSync(file);
+      fs.rmSync(file);
+      expect(await unlinkSame(file, seen)).toBe(false);
+    });
   });
 
   it('R8: the pattern matches the names that writeJsonAtomic makes', async () => {
