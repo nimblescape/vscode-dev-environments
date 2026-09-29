@@ -20,7 +20,7 @@ import {
   environmentIdLabel,
   splitRepository,
 } from '../names';
-import { isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
+import { abortError, isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
 import type { DevcontainerConfig, DevcontainerResult, GitSummary } from '../types';
 import {
   DevcontainerCommandError,
@@ -468,6 +468,13 @@ export class WorkspaceHelper {
   private readonly clock: Clock;
   /** The engine of the cached image (HelperDeps.engine). */
   private imageEngine = '';
+  /**
+   * Review round 5 of PR #64 (R5-1): the build that the cached image promise has started (HelperBuildKind), until it
+   * settles, and the onBuild callbacks of the callers that await it. A caller that joins the promise gets the progress
+   * too: at once when the build has started, otherwise when it starts.
+   */
+  private imageBuilding: HelperBuildKind | undefined;
+  private imageBuildListeners: Set<(kind: HelperBuildKind) => void> | undefined;
 
   constructor(private readonly deps: HelperDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -1136,7 +1143,15 @@ export class WorkspaceHelper {
     if (recheck && this.imagePromise && !this.imageMaintained) {
       // The result of a helper run: wait until it is ready (a missing tag is built only once), then maintain.
       const pending = this.imagePromise;
-      if (this.imageReadyAt === undefined) await pending.catch(() => undefined);
+      if (this.imageReadyAt === undefined) {
+        try {
+          await this.join(pending, options);
+        } catch (error) {
+          // Review round 5 of PR #64 (R5-1): the abort of this caller ends this call; a failure of the shared build
+          // does not (it is tried again below).
+          if (isAbortError(error) && options.signal?.aborted) throw error;
+        }
+      }
       if (this.imagePromise === pending) this.resetImage();
     }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
@@ -1146,6 +1161,7 @@ export class WorkspaceHelper {
       else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
+      const listeners = new Set<(kind: HelperBuildKind) => void>();
       const promise: Promise<HelperImageUse> = ensureHelperImageUse(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
@@ -1153,13 +1169,19 @@ export class WorkspaceHelper {
         baseDigest: this.deps.baseDigest,
         maintain: recheck,
         checkBaseImage: options.checkBaseImage,
-        onBuild: options.onBuild,
+        // Review round 5 of PR #64 (R5-1): the progress reaches every caller that awaits this promise (join), not only
+        // the caller that started it.
+        onBuild: (kind) => {
+          if (this.imagePromise === promise) this.imageBuilding = kind;
+          for (const listener of [...listeners]) listener(kind);
+        },
         onBaseImageCheck: this.deps.onBaseImageCheck,
         clock: this.clock,
         logger: this.deps.logger,
       }).then(
         (use) => {
           if (this.imagePromise === promise) {
+            this.imageBuilding = undefined;
             this.imageReadyAt = this.clock.now();
             this.imageUsedAt = this.imageReadyAt;
             this.imageTag = use.tag;
@@ -1168,7 +1190,10 @@ export class WorkspaceHelper {
           return use;
         },
         (error: unknown) => {
-          if (this.imagePromise === promise) this.imagePromise = undefined;
+          if (this.imagePromise === promise) {
+            this.imagePromise = undefined;
+            this.imageBuilding = undefined;
+          }
           if (isAbortError(error) || isUserFacingError(error)) throw error;
           this.deps.logger.error('The workspace helper image could not be built.', error);
           throw new UserFacingError('helperFailed', Messages.helperFailed, errorMessage(error));
@@ -1176,11 +1201,13 @@ export class WorkspaceHelper {
       );
       this.imagePromise = promise;
       this.imageMaintained = recheck;
+      this.imageBuilding = undefined;
+      this.imageBuildListeners = listeners;
     }
     try {
       // Review round 3 of PR #64 (P1): the caller gets the image that it awaited, also when the cache was replaced
-      // meanwhile (resetImage).
-      return await this.imagePromise;
+      // meanwhile (resetImage). Review round 5 of PR #64 (R5-1): its own signal ends its wait (join).
+      return await this.join(this.imagePromise, options);
     } catch (error) {
       // Another caller cancelled the shared build: build again for this caller.
       if (isAbortError(error) && !options.signal?.aborted) return this.image(options, recheck);
@@ -1193,6 +1220,50 @@ export class WorkspaceHelper {
     this.imageMaintained = false;
     this.imageReadyAt = undefined;
     this.imageCachedId = undefined;
+    this.imageBuilding = undefined;
+    this.imageBuildListeners = undefined;
+  }
+
+  /**
+   * Review round 5 of PR #64 (R5-1): awaits the cached image promise `pending` (the current one) for one caller. The
+   * signal of the caller ends only its own wait: it rejects with an AbortError at once (also when it was aborted before),
+   * and the shared build goes on with the signal of the caller that started it. The onBuild of the caller gets the
+   * progress of the shared build: at once when a build has started, otherwise when it starts, until `pending` settles.
+   */
+  private join(pending: Promise<HelperImageUse>, options: EnsureImageOptions): Promise<HelperImageUse> {
+    const { signal, onBuild } = options;
+    if (signal?.aborted) return Promise.reject(abortError());
+    const listeners = this.imageBuildListeners;
+    let listener: ((kind: HelperBuildKind) => void) | undefined;
+    if (onBuild !== undefined) {
+      if (this.imageBuilding !== undefined) onBuild(this.imageBuilding);
+      else if (listeners !== undefined) {
+        listener = (kind) => onBuild(kind);
+        listeners.add(listener);
+      }
+    }
+    if (signal === undefined && listener === undefined) return pending;
+    return new Promise<HelperImageUse>((resolve, reject) => {
+      const cleanup = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        if (listener !== undefined) listeners?.delete(listener);
+      };
+      const onAbort = (): void => {
+        cleanup();
+        reject(abortError());
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      pending.then(
+        (use) => {
+          cleanup();
+          resolve(use);
+        },
+        (error: unknown) => {
+          cleanup();
+          reject(error);
+        },
+      );
+    });
   }
 
   /**

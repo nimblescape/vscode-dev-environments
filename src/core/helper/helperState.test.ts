@@ -35,16 +35,15 @@ describe('isHelperImageTag', () => {
 });
 
 describe('parseHelperState', () => {
-  it('keeps the image ID of a build, and drops the previous helper tag of an older file', () => {
+  // Review round 5 of PR #64, R5-4: the previousTag of an older file was never shipped, so this test no longer names it;
+  // an unknown key is dropped like any other.
+  it('keeps the image ID of a build', () => {
     const state = {
       version: 1,
       images: { [TAG]: { builtAt: TIME, imageId: `sha256:${'1'.repeat(64)}`, lastUsedAt: TIME } },
     };
-    // user decision 2026-09-29: no previous helper image. Changed expectation: before, a valid `previousTag` was kept.
-    expect(parseHelperState({ ...state, previousTag: TAG })).toEqual(state);
-    for (const previousTag of ['mine:1', '__proto__', 'devenv-helper:latest', 1, '']) {
-      expect(parseHelperState({ version: 1, images: {}, previousTag })).toEqual({ version: 1, images: {} });
-    }
+    expect(parseHelperState(state)).toEqual(state);
+    expect(parseHelperState({ version: 1, images: {}, extra: 1 })).toEqual({ version: 1, images: {} });
     expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: 7 } } })).toEqual({ version: 1, images: { [TAG]: {} } });
   });
 

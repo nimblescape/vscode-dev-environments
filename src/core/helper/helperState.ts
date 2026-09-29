@@ -6,8 +6,7 @@
 // Per helper tag, it records the digest of the base image of the last build and when the tag was built, checked, and
 // last used, so that the base image is checked once a week and helper images that no window uses are removed; for tags
 // of other installations and removed tags, the marks of the cleanup; the ID of the image that this installation built
-// for a tag and its helper generation (for diagnosis only). User decision 2026-09-29: no previous helper image, so no
-// previous helper tag (an older file's `previousTag` is dropped when the state is read and written again).
+// for a tag and its helper generation (for diagnosis only). User decision 2026-09-29: no previous helper image.
 // The state is advisory: two windows may read and write it at the same time. Each write is atomic, and each update
 // reads the file again right before it writes, so a lost update costs at most a second check or a second build.
 import { writeJsonAtomic } from '../storage/atomicJson';

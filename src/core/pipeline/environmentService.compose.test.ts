@@ -769,6 +769,22 @@ describe('existing Docker Compose environment', () => {
     expect(h.helper.ups).toEqual([]);
   });
 
+  it('opens running current containers as they are and warns that the update was not applied when the build fails with helperFailed (review round 5 of PR #64, R5-3 f)', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
+    const dev = devContainer()?.id;
+    const db = dbContainer()?.id;
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    h.helper.buildError = () => new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+  });
+
   it('opens running containers of the checks-off time as they are without the workspace helper while the checks are off (review round 2 of PR #64, B-M3)', async () => {
     h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
     await seedCompose({

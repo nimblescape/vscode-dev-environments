@@ -1395,14 +1395,6 @@ describe('ensureHelperImage with a state file: no previous helper image (user de
     expect(h.docker.labelQueries).toEqual([]);
   });
 
-  it('drops the previous helper tag of an older helper.json at the next write', async () => {
-    const h = new Harness();
-    h.docker.addImage([h.tag]);
-    h.writeState({ version: 1, images: {}, previousTag: OLD_TAG, lastCleanupAt: h.iso(-HOUR) } as HelperState);
-    await h.ensure({ baseDigest: undefined });
-    expect(h.state()).not.toHaveProperty('previousTag');
-  });
-
   it('records no image ID for a current tag whose record is of another installation (review round 1 of PR #64, L3)', async () => {
     const h = new Harness();
     h.docker.addImage([h.tag]);
