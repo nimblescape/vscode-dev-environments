@@ -618,8 +618,10 @@ describe('RemoteMonitorLoop', () => {
   // Review round 8 of PR #63 (R8-5): after a forgotten record that is not removed, only the forgotten records of its
   // environment stay; a superseded record of the same environment is still removed in that pass (it is never the
   // newest). One environment with both needs a record in the future: here one written while the clock of the host was
-  // two weeks ahead, first seen eight days ago while the environment still had a container (else it would have been
-  // forgotten then).
+  // two weeks ahead, first seen eight days ago. Changed comment, review round 9 of PR #63 (B3): it named the container
+  // of the first tick as the reason the record in the future was not forgotten then; the reason is that at the first
+  // tick SOURCE's record is one day old (it stays) and, by the times as the rules see them (R6-1: the record in the
+  // future counts as of now), earlier, so the record in the future is not forgotten then.
   it('still removes a superseded record of an environment whose forgotten record was not removed', async () => {
     const DAY = 24 * 60 * MINUTE;
     const THIRD = '1'.repeat(32);
@@ -747,10 +749,17 @@ describe('recordRemover', () => {
     await expect(remover({ code: null, killed: false, signal: 'SIGKILL', message: 'Command failed' }, '', '').remove(old)).rejects.toThrow(/^killed by SIGKILL$/);
   });
 
+  // Review round 9 of PR #63 (B2): also the removal of the leftover temporary files of the volume at the start of `run`.
   it('is the removal of `run`', async () => {
     vi.useFakeTimers();
     try {
       writeRecord(SOURCE, B, { at: old.at, keepRunning: false, limitSeconds: 600 });
+      const leftover = (name: string, mtime: number) => {
+        fs.writeFileSync(path.join(stateDir, name), 'x');
+        fs.utimesSync(path.join(stateDir, name), mtime / 1000, mtime / 1000);
+      };
+      leftover('images.json.1.1.tmp', T0 - 2 * 60 * MINUTE);
+      leftover('images.json.1.2.tmp', T0);
       let out = '';
       const called = new Promise<unknown[]>((resolve) => {
         void main(['run'], {
@@ -767,6 +776,9 @@ describe('recordRemover', () => {
       });
       expect(await called).toEqual(forgetIfUnchangedCommand(SOURCE, B, old.at));
       await vi.waitFor(() => expect(out).toContain(`Removed the old record of ${B} (no container of it exists).`));
+      expect(out).toContain('Removed 1 leftover temporary file(s) of the volume.');
+      expect(fs.existsSync(path.join(stateDir, 'images.json.1.1.tmp'))).toBe(false);
+      expect(fs.existsSync(path.join(stateDir, 'images.json.1.2.tmp'))).toBe(true);
     } finally {
       // The loop of `run` waits for a fake timer that never fires.
       vi.useRealTimers();

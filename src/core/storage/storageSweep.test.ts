@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { writeJsonAtomic } from './atomicJson';
+import { atomicTemporaryPath, writeJsonAtomic } from './atomicJson';
 import { StoragePaths } from './paths';
 import {
   ATOMIC_TEMPORARY_FILE,
@@ -194,6 +194,16 @@ describe('sweepStorage', () => {
       expect(written[0]).toMatch(ATOMIC_TEMPORARY_FILE);
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  // Review round 9 of PR #63 (A4/B6): all atomic writers name their temporary file with atomicTemporaryPath.
+  it('R8: the pattern matches the names of atomicTemporaryPath', () => {
+    for (const file of [paths.pendingFile(ENV_A), path.join(paths.root, 'monitor.log'), path.join(paths.root, 'computer.id'), path.join(paths.sessionsDir, 'w.json')]) {
+      const temp = atomicTemporaryPath(file);
+      expect(path.dirname(temp)).toBe(path.dirname(file));
+      expect(path.basename(temp).startsWith(`.${path.basename(file)}.${process.pid}.`)).toBe(true);
+      expect(path.basename(temp)).toMatch(ATOMIC_TEMPORARY_FILE);
     }
   });
 

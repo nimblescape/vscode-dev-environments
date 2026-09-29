@@ -190,9 +190,10 @@ export async function recordsOf(dir: string, environmentId: string, now: number)
 }
 
 /**
- * Removes one record; a missing one is no error. Review round 1 of PR #63 (F2): with `at`, only while the file holds a
- * record with that `at` (the caller holds the lock of the records). True when it removed it; a missing file or one
- * without a valid record is kept and gives false (review round 4 of PR #63, N4-1: R3-9 reverted).
+ * Removes one record. Review round 1 of PR #63 (F2): with `at`, only while the file holds a record with that `at` (the
+ * caller holds the lock of the records). With `at`: true when it removed the file, false when the file is missing or does
+ * not hold a record with that `at` (review round 4 of PR #63, N4-1: R3-9 reverted). Without `at`: removes it if present,
+ * always true (review round 9 of PR #63, B7).
  */
 export async function removeRecord(dir: string, source: string, environmentId: string, at?: number): Promise<boolean> {
   const file = path.join(dir, heartbeatFileName(source, environmentId));
@@ -467,7 +468,10 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
  * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
  */
 export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
-/** Such a file whose modification time is more than this from now is removed at the start of `run`. */
+/**
+ * Such a file whose modification time is more than this from now is removed at the start of `run` (only then: a younger
+ * one stays until the next start; review round 9 of PR #63, A2).
+ */
 export const STATE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
 
 /**
@@ -725,6 +729,8 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
       // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
+      // Only here, at the start of `run`: a leftover younger than STATE_TEMPORARY_MAX_AGE_MS at a start stays until the
+      // next start (review round 9 of PR #63, A2).
       const leftovers = await removeStaleStateTemporaryFiles(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, now());
       if (leftovers.length > 0) log(`Removed ${leftovers.length} leftover temporary file(s) of the volume.`);
       // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the schedule.

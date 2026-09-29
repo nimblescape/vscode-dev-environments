@@ -5,11 +5,11 @@
 // Log file of the Session Monitor process (monitor.log). The process has no output channel and no console (it runs
 // detached with stdio 'ignore'), so this file is the only trace of its decisions. Writes are synchronous: they are short,
 // keep their order, and are not lost when the process ends.
-import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { errorMessage } from '../core/errors';
 import { systemClock, type Clock, type Logger } from '../core/ports';
+import { atomicTemporaryPath } from '../core/storage/atomicJson';
 
 /** When the file grows above this size, it is cut to its newer half. */
 export const MONITOR_LOG_MAX_BYTES = 1_000_000;
@@ -96,7 +96,7 @@ export class FileLogger implements Logger {
     const kept = content.subarray(start);
     // Review round 8 of PR #63 (R8-1): the name form of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`, atomicJson.ts),
     // so that the sweep of the storage folder (storageSweep.ts, R8) removes one that a killed cut left behind.
-    const temp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+    const temp = atomicTemporaryPath(this.file);
     try {
       fs.writeFileSync(temp, kept);
       fs.renameSync(temp, this.file);

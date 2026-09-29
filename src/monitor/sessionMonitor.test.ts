@@ -131,6 +131,37 @@ describe('sessionMonitor bundle', () => {
     expect(fs.existsSync(path.join(root, 'monitor.lock'))).toBe(false);
   }, 20_000);
 
+  // Review round 9 of PR #63 (B1): the caller of sweepStorage in main() (the wall clock, the log line) at the first tick.
+  it('removes the outdated files of the storage folder at its first tick and logs their counts', async () => {
+    const root = storageRoot();
+    const now = Date.now();
+    const old = now - 2 * 60 * 60_000;
+    const window = 'b7c1d2e3-0000-4000-8000-000000000001';
+    for (const dir of ['pending', 'disconnect', 'sessions']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    const oldPending = path.join(root, 'pending', '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d.json');
+    fs.writeFileSync(oldPending, JSON.stringify({ environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d', windowId: window, createdAt: new Date(old).toISOString() }));
+    const oldTemp = path.join(root, '.x.json.1.0123abcd.tmp');
+    fs.writeFileSync(oldTemp, '{}');
+    fs.utimesSync(oldTemp, old / 1000, old / 1000);
+    // Stays: a fresh temporary file and a fresh disconnect request (not a fresh pending file: it would keep the monitor
+    // running for its 2 minutes).
+    const freshTemp = path.join(root, 'sessions', '.y.json.1.89abcdef.tmp');
+    fs.writeFileSync(freshTemp, '{}');
+    const freshRequest = path.join(root, 'disconnect', '7c1d2e3f-0000-4000-8000-000000000002.json');
+    fs.writeFileSync(
+      freshRequest,
+      JSON.stringify({ environmentId: '7c1d2e3f-0000-4000-8000-000000000002', operation: 'stop', requestedAt: new Date(now).toISOString(), requestedBy: window, reason: 'manual' }),
+    );
+    expect(await exitOf(start([root]))).toBe(0);
+    expect(fs.existsSync(oldPending)).toBe(false);
+    expect(fs.existsSync(oldTemp)).toBe(false);
+    expect(fs.existsSync(freshTemp)).toBe(true);
+    expect(fs.existsSync(freshRequest)).toBe(true);
+    const log = readLog(root);
+    expect(log).toContain('Removed outdated files of the storage folder: 1 pending connection(s), 0 disconnect request(s), 1 temporary file(s).');
+    expect(log).toContain('Session Monitor ends (idle).');
+  }, 20_000);
+
   it('ends at once when another live monitor holds the lock', async () => {
     const root = storageRoot();
     const lock = path.join(root, 'monitor.lock');
