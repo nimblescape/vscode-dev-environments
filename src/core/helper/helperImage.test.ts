@@ -662,9 +662,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual([BASE]);
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
-    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
-    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
-    // made, found by its build label.
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 2 of PR #64,
+    // A-N3; comment corrected in review round 25, A-R25-1): the record keeps the ID of the image of the earlier build of this
+    // installation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
@@ -855,9 +855,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.docker.idOf(h.tag)).toBe(oldId);
     expect(h.docker.removals).toEqual([]);
     expect(h.warnings().join('\n')).toMatch(/could not be built again\. The existing image is used: .*Temporary failure/);
-    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
-    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
-    // made, found by its build label.
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 2 of PR #64,
+    // A-N3; comment corrected in review round 25, A-R25-1): the record keeps the ID of the image of the earlier build of this
+    // installation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
