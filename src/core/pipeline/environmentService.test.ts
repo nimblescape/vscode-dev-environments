@@ -1405,6 +1405,17 @@ describe('open: existing environment', () => {
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
   });
 
+  it('unit 15: writes no token into a container when the helper cannot be prepared', async () => {
+    await seedEnvironment(h);
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start
+    // started the container without the helper and the token was written into its memory; now nothing starts, so no
+    // token is written.
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.tokenWrites()).toEqual([]);
+  });
+
   it('starts the old container again when the replacement fails before it was removed', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
     const before = h.docker.containersOf(ENV_ID)[0].id;
