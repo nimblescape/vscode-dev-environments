@@ -6,7 +6,10 @@
 // longer than MAX_SCRIPT_LENGTH or a command line longer than MAX_WINDOWS_COMMAND_LINE: then no monitor starts at all. The image maintenance of
 // PR #57 and the monitor cleanup of PR #63 made the script about 29 K of the 30 K characters (review round 3 of PR #63,
 // R3-5), so the build as esbuild.mjs makes it, and the whole command line of
-// `docker run` (windowsCommandLineLength), are checked here.
+// `docker run` (windowsCommandLineLength), are checked here. Review round 5 of PR #63 (R5-5), measured at the head of
+// the round-5 fixes: the script is 29,741 of the 30,000 characters; the line with one prefix of 128 characters is 31,041
+// of the 32,000 (30,993 with the two default prefixes). runArgs fills the rest of the line with prefixes (the most that
+// the settings allow give 31,973), so the script limit binds first: a script that fits leaves room for one prefix.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { describe, expect, it } from 'vitest';

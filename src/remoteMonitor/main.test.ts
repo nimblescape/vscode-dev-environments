@@ -298,7 +298,8 @@ describe('readRecords', () => {
     }
     expect(await readRecords(dir)).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 600, seq: 0 }]);
     // Changed expectation, review round 4 of PR #63 (N4-1: R3-9 reverted): was the list of the files without a valid
-    // record (the `invalid` argument, gone). They are ignored and stay.
+    // record (the `invalid` argument, gone). They are ignored and stay. Review round 5 of PR #63 (R5-4): a regression guard
+    // (readRecords removes nothing), kept although readRecords no longer takes the argument that removed them.
     for (const source of ['11111111111111111111111111111111', OTHER, big]) expect(fs.existsSync(path.join(dir, heartbeatFileName(source, source === OTHER ? A : B)))).toBe(true);
   });
 });
@@ -550,7 +551,8 @@ describe('RemoteMonitorLoop', () => {
     expect(slow.removals).toBeDefined();
   });
 
-  // Review round 4 of PR #63 (N4-5): at most one pass at a time; the first tick after it decides the removals again.
+  // Review round 4 of PR #63 (N4-5): at most one pass at a time. Review round 5 (R5-7): a tick that reaches the end of its
+  // stops while no pass runs starts the next one, with the records it read at its start.
   it('starts no second pass of removals while one runs', async () => {
     writeRecord(OTHER, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     const { loop: slow, attempts, release } = slowLoop();
@@ -570,6 +572,27 @@ describe('RemoteMonitorLoop', () => {
     await slow.removals;
   });
 
+  // Review round 5 of PR #63 (R5-6): a pass may end long after the tick that decided it, when containers of the environment
+  // may exist again. The forgotten records of an environment go oldest first (of equal `at`, a keep last), and after one
+  // that is not removed the rest of it stay: the newest records stay until all are gone, so no stop or keep changes.
+  it.each([
+    ['removed', async () => true, ['D', 'T', 'C']],
+    ['not removed', async () => false, ['D']],
+    ['failed', async () => Promise.reject(new Error('locked')), ['D']],
+  ])('removes the forgotten records of an environment oldest first, a keep last; the oldest %s', async (_, first, expected) => {
+    const THIRD = '1'.repeat(32);
+    const names: Record<string, string> = { [SOURCE]: 'C', [THIRD]: 'T', [OTHER]: 'D' };
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: true, limitSeconds: 600 });
+    writeRecord(THIRD, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const removeRecord = (record: RemoteRecord) => (attempts.push(names[record.source]) === 1 ? first() : Promise.resolve(true));
+    const ordered = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    await ordered.tick();
+    await ordered.removals;
+    expect(attempts).toEqual(expected);
+  });
+
   // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "removes a file without a valid record whose
   // modification time is more than 7 days from now". Such a file may hold a record in a newer format of a running
   // environment (monitors of different versions on one engine): it is kept, whatever its age and environment.
@@ -579,7 +602,10 @@ describe('RemoteMonitorLoop', () => {
     const files = [heartbeatFileName(SOURCE, A), heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, B), heartbeatFileName(OTHER, B)];
     for (const [index, name] of files.entries()) {
       const file = path.join(dir, name);
-      fs.writeFileSync(file, index === 0 ? JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1) : 'not a record');
+      // Review round 5 of PR #63 (R5-3): the first file holds a record in an incompatible format (was a cut one, now the
+      // second file); the others are corrupt.
+      const texts = [JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 'x' }), JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1)];
+      fs.writeFileSync(file, texts[index] ?? 'not a record');
       const time = (T0 + (index % 2 === 0 ? -8 : 8) * 24 * 60 * MINUTE) / 1000;
       fs.utimesSync(file, time, time);
     }

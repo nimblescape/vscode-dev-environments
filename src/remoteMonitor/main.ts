@@ -12,7 +12,7 @@
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
 //   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
-//                                (the loop; review round 1 of PR #63, F2; review round 4, F3: no other meaning of an `at`)
+//                                (the loop; review round 1 of PR #63, F2; review round 4, N4-2: no other meaning of an `at`)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
@@ -356,23 +356,31 @@ export class RemoteMonitorLoop {
     // heartbeat written since stays. Review round 2 (R2-1): after the stops, which a removal (up to FORGET_TIMEOUT_MS each)
     // would otherwise delay; the `at` check makes a late removal safe. A failed one is logged once per series (R2-3).
     // Review round 4 of PR #63 (N4-5): R3-1 replaced. The removals run in the background, one pass at a time, and never
-    // lengthen a tick (a long one would make the next tick a gap, which holds every stop); a tick while a pass runs starts
-    // none, the next one after it decides again. The `at` check under the lock keeps a late removal safe: a removed record
-    // never matters to a stop (a forgotten one has no container, a superseded one is never the newest).
+    // lengthen a tick (a long one would make the next tick a gap, which holds every stop). A tick that reaches the end of
+    // its stops while no pass runs starts the next one, with the records it read at its start; a duplicate removal finds a
+    // missing file or another `at` and does nothing; the "Removed…" line comes when the removal ends. A removed record
+    // never matters to a stop: a superseded one is never the newest, and (review round 5, R5-6) the forgotten ones of an
+    // environment go oldest first (a keep last of equal `at`), and after one that is not removed the rest of it stay, so
+    // the newest records of an environment stay until all are gone, even if containers of it are created meanwhile.
     const removals = [
-      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists' })),
-      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists' })),
+      ...[...decision.forget].sort((a, b) => a.at - b.at || +a.keepRunning - +b.keepRunning).map((record) => ({ record, reason: 'no container of it exists', forget: true })),
+      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists', forget: false })),
     ];
     this.removing ??= (async () => {
       const failing = new Set<string>();
-      for (const { record, reason } of removals) {
+      const held = new Set<string>();
+      for (const { record, reason, forget } of removals) {
         const key = `${record.source}.${record.environmentId}.${record.at}`;
+        if (forget && held.has(record.environmentId)) continue;
+        let removed = false;
         try {
-          if (await this.deps.removeRecord(record)) log(`Removed the old record of ${record.environmentId} (${reason}).`);
+          removed = await this.deps.removeRecord(record);
+          if (removed) log(`Removed the old record of ${record.environmentId} (${reason}).`);
         } catch (error) {
           if (!this.removeFailedLogged.has(key)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
           failing.add(key);
         }
+        if (!removed) held.add(record.environmentId);
       }
       this.removeFailedLogged = failing;
     })().finally(() => (this.removing = undefined));
