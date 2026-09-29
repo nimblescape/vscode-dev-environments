@@ -1161,6 +1161,9 @@ export class WorkspaceHelper {
       else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
+      // Review round 7 of PR #64 (R7-3): a caller cancelled during the awaits above starts no shared ensure, whose
+      // rejection nothing would handle (join rejects at once for an aborted signal) and which could start a build.
+      if (options.signal?.aborted) throw abortError();
       const listeners = new Set<(kind: HelperBuildKind) => void>();
       const promise: Promise<HelperImageUse> = ensureHelperImageUse(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,

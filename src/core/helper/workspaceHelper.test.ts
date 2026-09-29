@@ -968,6 +968,42 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
 
   // Review round 5 of PR #64, R5-2: helper.json alone decides whether the prebuild is due; there is no extension version
   // to remember anymore (the expectation on the saved version is gone).
+  // Review round 7 of PR #64 (R7-3): a caller whose signal is already aborted when it would start the shared ensure
+  // starts nothing (no build, no Docker call) and leaves no unhandled rejection behind.
+  it('a cancelled caller starts no shared ensure and leaves no unhandled rejection', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      docker.buildHandler = async (options) => {
+        if (options.signal?.aborted) throw abortError();
+      };
+      const helper = stateHelper();
+      await expect(helper.prebuildImage({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(helper.ensureImageUse({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(docker.builds).toEqual([]);
+      expect(docker.imageIdCalls).toBe(0);
+      // Cancelled during the check of a cached image: the tag is gone, so the cache is reset, and nothing starts.
+      await helper.ensureImageUse();
+      expect(docker.builds).toHaveLength(1);
+      docker.images.delete(TAG);
+      const controller = new AbortController();
+      const imageId = docker.imageId.bind(docker);
+      docker.imageId = async (...args: Parameters<typeof docker.imageId>) => {
+        controller.abort();
+        return imageId(...args);
+      };
+      await expect(helper.ensureImageUse({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(docker.builds).toHaveLength(1);
+      docker.imageId = imageId;
+      await helper.ensureImageUse();
+      expect(docker.builds).toHaveLength(2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('HelperPrebuild builds the tag that helper.json does not know, logs it, and the next open does not build', async () => {
     const helper = stateHelper();
     const task = prebuild(helper);
