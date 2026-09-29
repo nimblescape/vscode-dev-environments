@@ -1359,7 +1359,16 @@ export class EnvironmentService {
             : 'The existing environment is started without it.';
         this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
       }
-      this.deps.ui.warn(isUserFacingError(error) ? error.message : Messages.buildFailed);
+      // Review round 14 of PR #64 (R14-1): as in Step 8 (R4-4), a Rebuild or a selected configuration says what was not
+      // applied; the selected configuration was never saved, so the previous one stays selected.
+      const selected = ctx.configPath !== ctx.env.configPath;
+      this.deps.ui.warn(
+        helperFailed && (ctx.forced || selected)
+          ? Messages.helperFailedOpenedAsItIs(selected ? 'configuration' : 'rebuild', selected ? configurationName(ctx.env.configPath) : undefined)
+          : isUserFacingError(error)
+            ? error.message
+            : Messages.buildFailed,
+      );
     }
 
     let outcome: ContainerOutcome | undefined;

@@ -1747,6 +1747,56 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
     expect(error.detail).not.toContain('were removed again');
   });
 
+  async function cancelledSwitch(): Promise<ContainerInfo | undefined> {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const cancel = new AbortController();
+    h.helper.upError = (image) => (image === IMAGE_2 ? abortError() : undefined);
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+      h.docker.addContainer({
+        environmentId: ENV_ID,
+        name: NAME,
+        state: 'running',
+        image: IMAGE_2,
+        labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', 'com.docker.compose.config-hash': 'y' },
+      });
+      cancel.abort();
+    };
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: cancel.signal }).catch(() => undefined);
+    h.helper.upError = () => undefined;
+    h.helper.beforeUpError = undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    return db;
+  }
+
+  it('B14 up helperFailed after a cancelled switch: the running compose containers open as they are', async () => {
+    const db = await cancelledSwitch();
+    const dev = devContainer();
+    h.ui.warnings.length = 0;
+    const logAt = h.docker.log.length;
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()?.id).toBe(db?.id);
+    expect(h.docker.log.slice(logAt).filter((l) => l.startsWith('rm '))).toEqual([]);
+  });
+
+  it('B14 run-user-commands helperFailed after up replaced the dev container of a cancelled switch: detail of the switch', async () => {
+    await cancelledSwitch();
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('now uses Docker Compose');
+  });
+
   it('removes only the containers that the failed up created when the switch removed the single container (D4-1)', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     h.docker.images.add(DB_IMAGE);

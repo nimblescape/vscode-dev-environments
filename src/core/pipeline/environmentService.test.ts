@@ -1668,6 +1668,34 @@ describe('open: existing environment', () => {
       expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
     });
 
+    it('R14-1 a rebuild whose Step 5 helper run fails with helperFailed says that it was not rebuilt', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      h.helper.readConfigurationError = gone();
+      const result = await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    });
+
+    it('R14-1 a selected configuration whose helper cannot be prepared is not applied, and the user learns it', async () => {
+      const env = await seedEnvironment(h, { container: 'running' });
+      const python = '.devcontainer/python/devcontainer.json';
+      h.helper.files[python] = { configText: '{ "image": "python:3.12" }' };
+      h.helper.config = { image: 'python:3.12' };
+      h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+      const result = await h.service.openEnvironment(ENV_ID, options({ configPath: python }));
+      expect(result.containerName).toBe(NAME);
+      expect((await entry())?.configPath).toBe(env.configPath);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(env.configPath))]);
+    });
+
+    it('R14-1 a plain open whose helper cannot be prepared keeps the helperFailed warning', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      h.helper.readConfigurationError = gone();
+      const result = await h.service.open(TARGET, options());
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    });
+
     it('a container that `up` replaced does not open as it is when runUserCommands fails with helperFailed (review round 4 of PR #64, R4-7 M1)', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const before = h.docker.containersOf(ENV_ID)[0].id;
@@ -1729,12 +1757,18 @@ describe('open: existing environment', () => {
       expect(h.ui.warnings).toEqual([]);
     });
 
-    it('a running container that `up` removed does not open as it is: helperFailed', async () => {
+    // Changed expectation, review round 14 of PR #64 (R14-4): a helperFailed of `up` itself means that its helper container
+    // never started, so `up` removed nothing (R13-2); the fake no longer removes the container before such an error. The
+    // running container therefore opens as it is, and the open fails only when the container is gone (see R4-7 M1 above).
+    it('a running container that `up` could not reach opens as it is: helperFailed of `up` removed nothing', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
       h.helper.upError = (image) => (image === IMAGE_2 ? gone() : undefined);
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.code).toBe('helperFailed');
+      const result = await h.service.open(TARGET, options());
+      expect(result.containerName).toBe(NAME);
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+      expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([before]);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
     });
   });
 

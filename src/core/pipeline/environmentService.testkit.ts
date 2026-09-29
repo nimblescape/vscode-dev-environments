@@ -11,7 +11,7 @@ import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
-import { CommandError } from '../errors';
+import { CommandError, UserFacingError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
@@ -846,7 +846,9 @@ export class FakeHelper implements EnvironmentHelper {
     this.ups.push({ image, removeExistingContainer: p.removeExistingContainer, override: p.override });
     const existing = this.docker.containersOf(p.environmentId)[0];
     const error = this.upError(image, p.removeExistingContainer);
-    if (error && this.upFailsBeforeRemoval) throw error;
+    // Review round 14 of PR #64 (R14-4): a helperFailed of `up` means that its helper container never started, so the CLI
+    // removed nothing (R13-2).
+    if (error && (this.upFailsBeforeRemoval || (error instanceof UserFacingError && error.code === 'helperFailed'))) throw error;
     if (existing && p.removeExistingContainer) this.docker.containers.delete(existing.id);
     if (error) throw error;
     const workspaceFolder = String(p.override.workspaceFolder);
@@ -969,7 +971,9 @@ export class FakeHelper implements EnvironmentHelper {
         .find((c) => c.labels['com.docker.compose.project'] === project && c.labels['com.docker.compose.service'] === name);
     const existing = ofProject(service);
     const error = this.upError(image, p.removeExistingContainer);
-    if (error && this.upFailsBeforeRemoval) throw error;
+    // Review round 14 of PR #64 (R14-4): a helperFailed of `up` means that its helper container never started, so the CLI
+    // removed nothing (R13-2).
+    if (error && (this.upFailsBeforeRemoval || (error instanceof UserFacingError && error.code === 'helperFailed'))) throw error;
     if (existing && p.removeExistingContainer) this.docker.containers.delete(existing.id);
     if (error) {
       this.beforeUpError?.();
