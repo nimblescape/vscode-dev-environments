@@ -168,6 +168,23 @@ describe('recreate offer: a stopped container that cannot be started or used', (
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
+  it('review round 13 of PR #64 (R13-1): the helper image of the open is gone at the recreation: helperFailed, the volume is kept', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (_image, removeExisting) =>
+      removeExisting ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : upFailure(PASSWD_DAMAGED);
+    h.ui.recreateAnswer = true;
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('helperFailed');
+    expect(ups()).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+    expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
+    expectVolumesKept();
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
   it('a Cancel of the operation during the question: cancelled, nothing is removed', async () => {
     h = createHarness();
     await seedEnvironment(h);

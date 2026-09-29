@@ -639,7 +639,8 @@ interface PipelineContext {
   kindSwitchRemoved?: string[];
   /**
    * Review round 12 of PR #64 (R12-2): `devcontainer up` ran in this run (it may have removed or replaced the dev container
-   * with --remove-existing-container), so a later helperFailed did not leave everything as it was.
+   * with --remove-existing-container), so a later helperFailed did not leave everything as it was. Set once `up` returned
+   * (review round 13, R13-2): a helperFailed of `up` itself means that its helper container never started.
    */
   upStarted?: boolean;
   /**
@@ -2917,7 +2918,7 @@ export class EnvironmentService {
         signal: ctx.signal,
       });
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal)) throw error;
+      if (this.isCancellation(error, ctx.signal) || isHelperFailed(error)) throw error;
       this.logger.warn(`The configuration hashes of the services of ${env.repository} could not be computed: ${errorDetail(error)}`);
     }
     for (const other of others) {
@@ -3045,7 +3046,7 @@ export class EnvironmentService {
       const result = await this.runUp(ctx, image, loaded?.config, true, true, loaded?.compose);
       return { result, created: true };
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error) || isHelperFailed(error)) throw error;
       // Review round 2 (E1–E3): the direct check refused it (requireOtherServicesKept), with its own detail.
       if (isUserFacingError(error) && error.code === 'startFailed') throw error;
       this.logger.error(`The container of ${env.repository} could not be created again from ${image}.`, error);
@@ -3272,7 +3273,6 @@ export class EnvironmentService {
     // still in the volume. finish drops those that no longer exist.
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
-      ctx.upStarted = true;
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
         repository: env.repository,
@@ -3284,6 +3284,7 @@ export class EnvironmentService {
         image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
       result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
@@ -3437,7 +3438,6 @@ export class EnvironmentService {
       env: { COMPOSE_PROJECT_NAME: compose.project },
     };
     try {
-      ctx.upStarted = true;
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
         repository: env.repository,
@@ -3449,6 +3449,7 @@ export class EnvironmentService {
         image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
       result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {

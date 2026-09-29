@@ -1427,14 +1427,23 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
   });
 
-  it('R12-2b gives the detail of the switch when up fails with helperFailed after it removed the only dev container', async () => {
+  it('R12-2b, review round 13 of PR #64 (R13-2): up that fails with helperFailed never ran, so the running dev container opens as it is', async () => {
+    // A helperFailed of `up` means that the helper container never started (its pinned image is gone), so the CLI removed nothing.
     const db = dbContainer();
     if (db) h.docker.containers.delete(db.id);
+    const dev = devContainer();
+    if (dev) {
+      dev.state = 'running';
+      dev.rawState = 'running';
+    }
     h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upFailsBeforeRemoval = true;
     h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
-    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
-    expect(error.code).toBe('helperFailed');
-    expect(error.detail).toContain('no longer uses Docker Compose');
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toContain(Messages.helperFailedOpenedAsItIs('rebuild'));
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop '))).toEqual([]);
   });
 
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
@@ -3772,6 +3781,21 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
     expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('review round 13 of PR #64 (R13-1): the hashes of the other services fail with helperFailed: helperFailed, nothing is removed', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running', dbLabels: DB_IMAGE_ID });
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+    h.helper.serviceHashes = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail ?? '').not.toContain('would also create the containers of other services again');
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
   });
 
   it('Cancel: nothing is removed, startFailed', async () => {
