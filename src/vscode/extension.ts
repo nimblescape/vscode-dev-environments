@@ -532,9 +532,10 @@ async function activateExtension(
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after an
-  // update that changed it), the helper image is built in the background on the local Docker, when it runs, by one
-  // window (review round 5 of PR #64, R5-2: a lock file). The build is shared with the open pipeline of this window
-  // (WorkspaceHelper.prebuildImage) and cancelled when the extension is deactivated.
+  // update that changed it), the helper image is built in the background on the local Docker, when it runs (review round
+  // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
+  // The build is shared with the open pipeline of this window (WorkspaceHelper.prebuildImage) and cancelled when the
+  // extension is deactivated.
   const helperPrebuild = new HelperPrebuild({
     helper,
     dockerRunning: (signal) => docker.isRunning(signal),

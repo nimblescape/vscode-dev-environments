@@ -8,26 +8,18 @@
 // network goes away later. Without a previous helper image, an open that finds no usable helper image and cannot build
 // one fails with helperFailed.
 import * as fs from 'fs';
-import * as path from 'path';
 import { errorMessage } from '../errors';
-import { isAbortError, systemClock, type Clock, type Logger } from '../ports';
+import { isAbortError, type Logger } from '../ports';
 import { helperImageTag } from './helperImage';
 import { readHelperState } from './helperState';
 import type { WorkspaceHelper } from './workspaceHelper';
 
 /**
  * What a prebuild did. `notDue`: helper.json knows the current tag; `remote`: the Docker context is not the local Docker;
- * `dockerNotRunning`: the local Docker does not answer; `busy`: another window prebuilds (its lock file exists); `built`:
- * the tag was missing and was built; `present`: the tag exists; `failed`: the build failed (the next open tries again);
- * `cancelled`: dispose ended it.
+ * `dockerNotRunning`: the local Docker does not answer; `built`: the tag was missing and was built; `present`: the tag
+ * exists; `failed`: the build failed (the next open tries again); `cancelled`: dispose ended it.
  */
-export type HelperPrebuildOutcome = 'notDue' | 'remote' | 'dockerNotRunning' | 'busy' | 'built' | 'present' | 'failed' | 'cancelled';
-
-/** The lock file of the prebuild, next to helper.json: only one window prebuilds (review round 5 of PR #64, R5-2). */
-export const HELPER_PREBUILD_LOCK = 'helper-prebuild.lock';
-
-/** A lock file older than this is left over by a window that ended without removing it: it is taken over. */
-export const HELPER_PREBUILD_LOCK_STALE_MS = 30 * 60 * 1000;
+export type HelperPrebuildOutcome = 'notDue' | 'remote' | 'dockerNotRunning' | 'built' | 'present' | 'failed' | 'cancelled';
 
 export interface HelperPrebuildDeps {
   helper: Pick<WorkspaceHelper, 'usesLocalEngine' | 'prebuildImage'>;
@@ -35,11 +27,9 @@ export interface HelperPrebuildDeps {
   dockerRunning: (signal: AbortSignal) => Promise<boolean>;
   /** resources/helper/Dockerfile of the installed extension: its content gives the current helper tag. */
   dockerfilePath: string;
-  /** `helper.json` of the local Docker (StoragePaths.helperState). The lock file is in the same folder. */
+  /** `helper.json` of the local Docker (StoragePaths.helperState). */
   statePath: string;
   logger: Logger;
-  /** For the age of the lock file. Default: the system clock. */
-  clock?: Clock;
 }
 
 /**
@@ -51,9 +41,11 @@ export interface HelperPrebuildDeps {
  * decides, so a window that starts after the build of another one finds the record and does nothing. It asks Docker
  * nothing when it is not due, so an activation does not wake Docker Desktop from its Resource Saver mode. Only on the
  * local Docker engine (a remote Docker host builds its helper at its first open), and only when Docker runs (it is never
- * started for this). Of the windows that start at the same time, only the one that creates the lock file
- * (HELPER_PREBUILD_LOCK) prebuilds; the others return `busy`. The build is the one of WorkspaceHelper.prebuildImage,
- * shared with ensureImage, so an open of the same window that starts meanwhile never builds a second time.
+ * started for this). The build is the one of WorkspaceHelper.prebuildImage, shared with ensureImage, so an open of the
+ * same window that starts meanwhile never builds a second time. Review round 6 of PR #64 (R6-1): there is no lock across
+ * windows (a lock left behind by a window that closed during the prebuild would block the prebuild of every window).
+ * Windows that start at the same time may each build the tag once (BuildKit shares the layer cache; the extra images
+ * are dangling and the daily cleanup removes them); windows that start later find the record and do nothing.
  */
 export class HelperPrebuild {
   private readonly controller = new AbortController();
@@ -89,32 +81,21 @@ export class HelperPrebuild {
       deps.logger.info('The workspace helper image is not prepared in the background: Docker is not running. It is prepared at the next open.');
       return 'dockerNotRunning';
     }
-    const lock = await this.lock();
-    if (lock === undefined) {
-      deps.logger.info('The workspace helper image is not prepared in the background: another window prepares it.');
-      return 'busy';
-    }
-    try {
-      let built = false;
-      const use = await deps.helper.prebuildImage({
-        signal,
-        onBuild: () => {
-          built = true;
-          deps.logger.info('The workspace helper image is built in the background.');
-        },
-      });
-      if (use === undefined) return 'remote';
-      deps.logger.info(
-        built
-          ? `The workspace helper image ${use.tag} was built in the background.`
-          : `The workspace helper image ${use.tag} is ready.`,
-      );
-      return built ? 'built' : 'present';
-    } finally {
-      await fs.promises.unlink(lock).catch((error: unknown) => {
-        deps.logger.warn(`The lock file ${lock} of the helper prebuild could not be removed: ${errorMessage(error)}`);
-      });
-    }
+    let built = false;
+    const use = await deps.helper.prebuildImage({
+      signal,
+      onBuild: () => {
+        built = true;
+        deps.logger.info('The workspace helper image is built in the background.');
+      },
+    });
+    if (use === undefined) return 'remote';
+    deps.logger.info(
+      built
+        ? `The workspace helper image ${use.tag} was built in the background.`
+        : `The workspace helper image ${use.tag} is ready.`,
+    );
+    return built ? 'built' : 'present';
   }
 
   /** helper.json has no record of the current tag (or only a removal mark). */
@@ -124,47 +105,4 @@ export class HelperPrebuild {
     const record = (await readHelperState(deps.statePath)).images[tag];
     return record === undefined || record.removedAt !== undefined;
   }
-
-  /**
-   * Creates the lock file (exclusively) with the process ID and the time, and returns its path; `undefined` when another
-   * window holds it. A lock file older than HELPER_PREBUILD_LOCK_STALE_MS is removed and the creation tried once more.
-   */
-  private async lock(): Promise<string | undefined> {
-    const { deps } = this;
-    const lockPath = path.join(path.dirname(deps.statePath), HELPER_PREBUILD_LOCK);
-    await fs.promises.mkdir(path.dirname(lockPath), { recursive: true });
-    const clock = deps.clock ?? systemClock;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const handle = await fs.promises.open(lockPath, 'wx');
-        try {
-          await handle.writeFile(JSON.stringify({ pid: process.pid, time: new Date(clock.now()).toISOString() }));
-        } finally {
-          await handle.close();
-        }
-        return lockPath;
-      } catch (error) {
-        if (errorCode(error) !== 'EEXIST') throw error;
-      }
-      if (attempt > 0) return undefined;
-      let mtimeMs: number | undefined;
-      try {
-        mtimeMs = (await fs.promises.stat(lockPath)).mtimeMs;
-      } catch (error) {
-        // Removed meanwhile: it is created once more.
-        if (errorCode(error) !== 'ENOENT') throw error;
-      }
-      if (mtimeMs !== undefined) {
-        if (clock.now() - mtimeMs <= HELPER_PREBUILD_LOCK_STALE_MS) return undefined;
-        deps.logger.info(`The lock file ${lockPath} of the helper prebuild is old. It is taken over.`);
-        await fs.promises.unlink(lockPath).catch((error: unknown) => {
-          if (errorCode(error) !== 'ENOENT') throw error;
-        });
-      }
-    }
-  }
-}
-
-function errorCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException | undefined)?.code;
 }
