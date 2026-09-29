@@ -598,7 +598,9 @@ async function listHelperImages(m: Maintenance): Promise<ImageInfo[] | undefined
 
 /**
  * Removes the image of the previous build after a rebuild, if it has no tag anymore. A running helper of another
- * window may still use it: then Docker refuses, and the cleanup removes it later.
+ * window may still use it: then Docker refuses, and the cleanup removes it later. An open that pinned it and waits
+ * between its helper runs (in this window or another) does not keep it: its next helper run fails with helperFailed
+ * (accepted, review round 21 of PR #64, A-R21-1).
  */
 async function removePreviousImage(m: Maintenance, previousId: string, currentId: string): Promise<void> {
   const images = await listHelperImages(m);
