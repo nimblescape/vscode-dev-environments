@@ -3,6 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import { Messages } from '../messages';
@@ -676,6 +678,19 @@ describe('images', () => {
     expect(runner.calls[0].options.signal).toBe(controller.signal);
   });
 
+  /**
+   * Review round 3 of PR #64 (P4): the arguments of `docker build` without the pair `--iidfile <file>` before the
+   * context, which is checked here: a file in a private temporary folder.
+   */
+  function withoutIidfile(args: readonly string[]): string[] {
+    const index = args.indexOf('--iidfile');
+    expect(index).toBe(args.length - 3);
+    const file = args[index + 1];
+    expect(path.isAbsolute(file)).toBe(true);
+    expect(path.dirname(path.dirname(file))).toBe(path.resolve(os.tmpdir()));
+    return [...args.slice(0, index), ...args.slice(index + 2)];
+  }
+
   it('buildImage builds with tag, Dockerfile, labels and build arguments', async () => {
     const output: string[] = [];
     const { docker, runner } = adapter((call) => {
@@ -690,7 +705,8 @@ describe('images', () => {
       buildArgs: { DEVCONTAINER_CLI_VERSION: '0.89.0' },
       onOutput: (text) => output.push(text),
     });
-    expect(runner.calls[0].args).toEqual([
+    // Changed expectation (review round 3 of PR #64, P4): the build also gets `--iidfile <file>` (withoutIidfile checks it).
+    expect(withoutIidfile(runner.calls[0].args)).toEqual([
       'build',
       '-t',
       'devenv-helper:abc',
@@ -710,7 +726,8 @@ describe('images', () => {
     await docker.buildImage({ tag: 't:1', dockerfile: 'D', context: '.', labels: { l: 'v' }, pull: true, noCache: true });
     await docker.buildImage({ tag: 't:2', dockerfile: 'D', context: '.', pull: true });
     await docker.buildImage({ tag: 't:3', dockerfile: 'D', context: '.', pull: false, noCache: false });
-    expect(runner.calls.map((call) => call.args)).toEqual([
+    // Changed expectation (review round 3 of PR #64, P4): each build also gets `--iidfile <file>` (withoutIidfile checks it).
+    expect(runner.calls.map((call) => withoutIidfile(call.args))).toEqual([
       ['build', '-t', 't:1', '-f', 'D', '--pull', '--no-cache', '--label', 'l=v', '.'],
       ['build', '-t', 't:2', '-f', 'D', '--pull', '.'],
       ['build', '-t', 't:3', '-f', 'D', '.'],
@@ -1029,6 +1046,50 @@ describe('images', () => {
     controller.abort();
     const { docker: cancelled } = adapter(() => ok(''));
     await expect(cancelled.listEnvironmentImages(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('buildImage returns the ID of the built image from its --iidfile, and removes the file and its folder (review round 3 of PR #64, P4)', async () => {
+    const id = `sha256:${'c'.repeat(64)}`;
+    let file = '';
+    let mode = 0;
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'image') return ok(`${JSON.stringify(id)}\n`);
+      file = call.args[call.args.indexOf('--iidfile') + 1];
+      mode = fs.statSync(path.dirname(file)).mode & 0o777;
+      fs.writeFileSync(file, `${id}\n`);
+      return ok();
+    });
+    expect(await docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).toBe(id);
+    // The engine is asked for the image by the digest of the file, never by the tag.
+    expect(runner.calls[1].args).toEqual(['image', 'inspect', '--format', '{{json .Id}}', id]);
+    // Only the owner can use the folder of the file.
+    expect(mode).toBe(0o700);
+    expect(fs.existsSync(path.dirname(file))).toBe(false);
+  });
+
+  it('buildImage returns no ID when the --iidfile is missing or holds no image ID, and removes its folder after a failed build (review round 3 of PR #64, P4)', async () => {
+    const warnings: string[] = [];
+    const logger: Logger = { ...silentLogger, warn: (message) => warnings.push(message) };
+    const folders: string[] = [];
+    let content: string | undefined;
+    const runner = new FakeRunner((call) => {
+      if (call.args[0] === 'image') return fail(`Error response from daemon: No such image: ${call.args[call.args.length - 1]}`);
+      const file = call.args[call.args.indexOf('--iidfile') + 1];
+      folders.push(path.dirname(file));
+      if (content !== undefined) fs.writeFileSync(file, content);
+      return content === 'fail' ? fail('failed to solve') : ok();
+    });
+    const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin' }, logger, 'linux');
+    expect(await docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).toBeUndefined();
+    content = 'devenv-helper:abc\n';
+    expect(await docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).toBeUndefined();
+    // A digest that the engine does not find.
+    content = `sha256:${'d'.repeat(64)}`;
+    expect(await docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).toBeUndefined();
+    content = 'fail';
+    await expect(docker.buildImage({ tag: 't', dockerfile: 'D', context: '.' })).rejects.toBeInstanceOf(CommandError);
+    expect(warnings).toHaveLength(3);
+    expect(folders.filter((folder) => fs.existsSync(folder))).toEqual([]);
   });
 
   it('buildImage throws CommandError', async () => {

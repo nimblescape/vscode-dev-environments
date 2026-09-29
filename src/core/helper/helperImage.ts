@@ -32,7 +32,9 @@ export const HELPER_IMAGE_REPOSITORY = 'devenv-helper';
 
 /**
  * Review round 2 of PR #64 (A-N2): the helper generation of this extension version, recorded per tag in helper.json
- * (`generation`) at each build and rebuild. It rises with HELPER_MIN_PREVIOUS_GENERATION.
+ * (`generation`) at each build and rebuild. It rises with HELPER_MIN_PREVIOUS_GENERATION. Review round 3 of PR #64 (P5):
+ * it is part of the helper tag (helperImageTag), so raising it gives a new current tag, which is built: an image of an
+ * older generation never stays the current helper.
  */
 export const HELPER_GENERATION = 1;
 
@@ -105,16 +107,43 @@ export function registryBaseDigest(
 }
 
 /**
- * `devenv-helper:<first 12 hex characters of sha256(Dockerfile content + CLI version)>`.
- * Line endings are normalized, so that a checkout with CRLF line endings gives the same tag.
+ * `devenv-helper:<first 12 hex characters of sha256(Dockerfile content + CLI version + "\ngeneration " + helper
+ * generation)>`. Line endings are normalized, so that a checkout with CRLF line endings gives the same tag. Review round
+ * 3 of PR #64 (P5): the helper generation (HELPER_GENERATION) is part of the hash.
  */
-export function helperImageTag(dockerfileContent: string, cliVersion: string = DEVCONTAINER_CLI_VERSION): string {
+export function helperImageTag(
+  dockerfileContent: string,
+  cliVersion: string = DEVCONTAINER_CLI_VERSION,
+  generation: number = HELPER_GENERATION,
+): string {
   const hash = crypto
     .createHash('sha256')
     .update(dockerfileContent.replace(/\r\n/g, '\n'))
     .update(cliVersion)
+    .update(`\ngeneration ${generation}`)
     .digest('hex');
   return `${HELPER_IMAGE_REPOSITORY}:${hash.slice(0, 12)}`;
+}
+
+/**
+ * The helper image that an ensure resolved (ensureHelperImageUse), and the helper image of an open (review round 2 of
+ * PR #64, A-N1): the open pipeline resolves it once per open and passes it to every helper run of that open (`image`),
+ * so the configuration that the CLI of one helper image read and checked is run with the same CLI, whatever another open
+ * in this window resolves meanwhile.
+ */
+export interface HelperImageUse {
+  /** The helper tag: the key of helper.json, the label of the remote Session Monitor, and the name in log lines. */
+  tag: string;
+  /**
+   * Review round 3 of PR #64 (P2): the ID of the image that the ensure checked: for the current tag the image that this
+   * ensure built (`--iidfile`) or found for the tag, for a previous helper the ID that helper.json recorded for its build
+   * (review round 1 of PR #64, S1). The runs of an open use it as the image reference, so a tag that moves (a rebuild of
+   * another window, a build of another installation) never changes the helper image of an open. `undefined` only for a
+   * current tag whose ID could not be read; its runs then use the tag.
+   */
+  id?: string;
+  /** A previous helper tag, used because the current tag could not be built (user decision 2026-09-29); `id` is set. */
+  previous?: boolean;
 }
 
 /** `create`: a missing tag is built; `refresh`: an existing tag is built again from a new base image. */
@@ -174,7 +203,8 @@ interface Maintenance {
   options: EnsureHelperImageOptions;
   clock: Clock;
   logger: Logger;
-  build(flags: BuildFlags): Promise<void>;
+  /** The build; resolves with the ID of the built image (`--iidfile`), `undefined` when Docker gave none. */
+  build(flags: BuildFlags): Promise<string | undefined>;
 }
 
 /**
@@ -204,9 +234,23 @@ export async function ensureHelperImage(
   dockerfilePath: string,
   options: EnsureHelperImageOptions = {},
 ): Promise<string> {
+  return (await ensureHelperImageUse(docker, dockerfilePath, options)).tag;
+}
+
+/**
+ * ensureHelperImage, with the image that it resolved (HelperImageUse): the tag, the ID of its image, and whether it is a
+ * previous helper (review round 3 of PR #64, P1/P2). The ID of an image that this call built comes from the build
+ * (`--iidfile`, P4), not from the tag.
+ */
+export async function ensureHelperImageUse(
+  docker: HelperImageDocker,
+  dockerfilePath: string,
+  options: EnsureHelperImageOptions = {},
+): Promise<HelperImageUse> {
   const content = await fs.promises.readFile(dockerfilePath, 'utf8');
   const tag = helperImageTag(content);
-  const build = (flags: BuildFlags): Promise<void> =>
+  const logger = options.logger ?? silentLogger;
+  const build = (flags: BuildFlags): Promise<string | undefined> =>
     docker.buildImage({
       tag,
       dockerfile: dockerfilePath,
@@ -218,10 +262,10 @@ export async function ensureHelperImage(
       signal: options.signal,
     });
   if (options.statePath === undefined) {
-    if (await docker.imageExists(tag)) return tag;
+    if (await docker.imageExists(tag)) return withId(tag, await imageIdOf(docker, tag, logger));
     options.onBuild?.('create');
-    await build({});
-    return tag;
+    const builtId = await build({});
+    return withId(tag, builtId ?? (await imageIdOf(docker, tag, logger)));
   }
   return ensureWithState({
     docker,
@@ -230,9 +274,24 @@ export async function ensureHelperImage(
     baseImage: baseImageOf(content),
     options,
     clock: options.clock ?? systemClock,
-    logger: options.logger ?? silentLogger,
+    logger,
     build,
   });
+}
+
+/** The HelperImageUse of the current tag `tag`, with the ID of its image when it is known. */
+function withId(tag: string, id: string | undefined): HelperImageUse {
+  return id !== undefined ? { tag, id } : { tag };
+}
+
+/** The ID of the image of `reference`, `undefined` (with a warning) when it cannot be read. */
+async function imageIdOf(docker: HelperImageDocker, reference: string, logger: Logger): Promise<string | undefined> {
+  try {
+    return await docker.imageId(reference);
+  } catch (error) {
+    logger.warn(`The ID of the workspace helper image ${reference} could not be read: ${errorMessage(error)}`);
+    return undefined;
+  }
 }
 
 /**
@@ -289,7 +348,7 @@ function owned(record: HelperImageRecord | undefined): HelperImageRecord {
   return rest;
 }
 
-async function ensureWithState(m: Maintenance): Promise<string> {
+async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
   const { docker, tag, options } = m;
   const maintain = options.maintain !== false;
   const checkBaseImage = options.checkBaseImage !== false;
@@ -298,18 +357,21 @@ async function ensureWithState(m: Maintenance): Promise<string> {
   let change: RecordChange | undefined;
 
   if (currentId === undefined) {
-    let created: RecordChange;
+    let created: { change: RecordChange; id: string | undefined };
     try {
       created = await create(m, checkBaseImage);
     } catch (error) {
       if (isAbortError(error) || options.signal?.aborted) throw error;
       const previous = await usePreviousHelper(m, error);
       if (previous === undefined) throw error;
-      return previous;
+      return { tag: previous.tag, id: previous.imageId, previous: true };
     }
-    currentId = await imageIdQuietly(m);
-    const builtId = currentId;
-    change = builtId === undefined ? created : (record) => ({ ...created(record), imageId: builtId });
+    // Review round 3 of PR #64 (P4): helper.json records the ID of the image that this build made (`--iidfile`), never
+    // one read back by the tag, which another build may have moved meanwhile. The tag is read only for the cleanup
+    // (which keeps the current image) and the ID of the open, when the build gave no ID.
+    const builtId = created.id;
+    currentId = builtId ?? (await imageIdQuietly(m));
+    change = builtId === undefined ? created.change : (record) => ({ ...created.change(record), imageId: builtId });
   } else if (maintain && checkBaseImage && m.baseImage !== undefined && recorded?.latestBaseDigest !== undefined) {
     const rebuilt = await rebuild(m, m.baseImage, recorded, recorded.latestBaseDigest, currentId);
     change = rebuilt.change;
@@ -341,7 +403,7 @@ async function ensureWithState(m: Maintenance): Promise<string> {
       });
     options.onBaseImageCheck?.(done);
   }
-  return tag;
+  return withId(tag, currentId);
 }
 
 /** The weekly check of the base image is due: 7 days after the last answer of the registry, a day after an attempt. */
@@ -356,10 +418,10 @@ function isCheckDue(m: Maintenance, record: HelperImageRecord | undefined): bool
  * takes much longer than this read), to decide about `--pull` and to record the digest. Returns the new record: it
  * replaces an old record of the tag (for example after an image prune).
  */
-async function create(m: Maintenance, checkBaseImage: boolean): Promise<RecordChange> {
+async function create(m: Maintenance, checkBaseImage: boolean): Promise<{ change: RecordChange; id: string | undefined }> {
   const lookedUp = checkBaseImage && m.options.baseDigest !== undefined && m.baseImage !== undefined;
   const digest = lookedUp ? await lookUpBaseDigest(m, m.options.signal) : undefined;
-  const pulled = await buildMissing(m, digest !== 'unreachable');
+  const { pulled, id } = await buildMissing(m, digest !== 'unreachable');
   const now = isoTime(m.clock);
   // Review round 2 of PR #64 (A-N2): the helper generation of this build.
   const record: HelperImageRecord = { builtAt: now, generation: HELPER_GENERATION };
@@ -373,28 +435,26 @@ async function create(m: Maintenance, checkBaseImage: boolean): Promise<RecordCh
   }
   // No digest yet: the check runs again in a day. Without a lookup (no check of the base image), at the next ensure.
   if (lookedUp && record.checkedAt === undefined) record.attemptedAt = now;
-  return () => record;
+  return { change: () => record, id };
 }
 
 /**
  * Builds a missing tag, with `--pull` unless `pull` is false. A build with `--pull` that fails (the pull of the daemon
  * can fail where the request of the extension host worked: the pull limit, stored credentials that the registry
- * refuses, a proxy) is tried again without it. Returns whether the build pulled the base image. Throws when the tag
- * cannot be built.
+ * refuses, a proxy) is tried again without it. Returns whether the build pulled the base image, and the ID of the built
+ * image (`--iidfile`). Throws when the tag cannot be built.
  */
-async function buildMissing(m: Maintenance, pull: boolean): Promise<boolean> {
+async function buildMissing(m: Maintenance, pull: boolean): Promise<{ pulled: boolean; id: string | undefined }> {
   m.options.onBuild?.('create');
   try {
-    await m.build({ pull });
-    return pull;
+    return { pulled: pull, id: await m.build({ pull }) };
   } catch (error) {
     if (!pull || isAbortError(error) || m.options.signal?.aborted) throw error;
     m.logger.warn(
       `The workspace helper image ${m.tag} could not be built with a fresh base image. It is built from the local base image: ${errorMessage(error)}`,
     );
   }
-  await m.build({ pull: false });
-  return false;
+  return { pulled: false, id: await m.build({ pull: false }) };
 }
 
 /**
@@ -416,9 +476,10 @@ async function rebuild(
       : `The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again.`,
   );
   m.options.onBuild?.('refresh');
+  let builtId: string | undefined;
   try {
     // A fresh base image, and no cache: the Debian packages and the Docker CLI are installed again, too.
-    await m.build({ pull: true, noCache: true });
+    builtId = await m.build({ pull: true, noCache: true });
   } catch (error) {
     if (isAbortError(error) || m.options.signal?.aborted) throw error;
     // Docker moves the tag only after a successful build: the existing image stays. The next check is in a week.
@@ -433,7 +494,9 @@ async function rebuild(
     };
   }
   const builtAt = isoTime(m.clock);
-  const newId = await imageIdQuietly(m);
+  // Review round 3 of PR #64 (P4): the ID of the rebuilt image comes from the build (`--iidfile`); the tag is read only
+  // when the build gave none, and such an ID is not recorded.
+  const newId = builtId ?? (await imageIdQuietly(m));
   if (newId !== undefined && newId !== currentId) await removePreviousImage(m, currentId, newId);
   return {
     change: (record) => {
@@ -446,7 +509,7 @@ async function rebuild(
         builtAt,
         checkedAt: builtAt,
         generation: HELPER_GENERATION,
-        ...(newId !== undefined ? { imageId: newId } : {}),
+        ...(builtId !== undefined ? { imageId: builtId } : {}),
       };
     },
     currentId: newId,
@@ -558,10 +621,10 @@ export function hasPreviousGeneration(record: HelperImageRecord, minimum: number
  * (`imageId`), and with a helper generation of at least HELPER_MIN_PREVIOUS_GENERATION (review round 2 of PR #64, A-N2).
  * An image of the helper repository that someone else made, a foreign or removed tag, a tag of an older generation or
  * without one, and a tag whose image changed are never used. Records the use (`lastUsedAt`, which keeps the image for 7 days) and the tag as `previousTag`.
- * Returns the tag, or `undefined` when there is none; `onPreviousHelper` gets the tag and the checked image ID, which the
- * helper runs use (review round 1 of PR #64, S1). Never throws, except for an abort.
+ * Returns the tag and the checked image ID, or `undefined` when there is none; `onPreviousHelper` gets them too. The
+ * helper runs use the ID (review round 1 of PR #64, S1). Never throws, except for an abort.
  */
-async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string | undefined> {
+async function usePreviousHelper(m: Maintenance, error: unknown): Promise<{ tag: string; imageId: string } | undefined> {
   const state = await readHelperState(m.statePath);
   const candidates = Object.entries(state.images)
     .filter(
@@ -600,7 +663,7 @@ async function usePreviousHelper(m: Maintenance, error: unknown): Promise<string
     fresh.previousTag = tag;
   });
   m.options.onPreviousHelper?.(tag, imageId);
-  return tag;
+  return { tag, imageId };
 }
 
 async function writeState(m: Maintenance, update: (state: HelperState) => void): Promise<void> {

@@ -273,7 +273,7 @@ export type EnvironmentDocker = Pick<
 /** The part of WorkspaceHelper that the service uses. */
 export type EnvironmentHelper = Pick<
   WorkspaceHelper,
-  | 'ensureImage'
+  | 'ensureImageUse'
   | 'clone'
   | 'readConfigFiles'
   | 'listConfigurations'
@@ -309,8 +309,9 @@ export type EnvironmentSessionFiles = Pick<
 export interface EnvironmentRemoteMonitor {
   /**
    * Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context).
-   * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of a previous
-   * helper (review round 1 of PR #64, S1); the label and the log lines keep the tag. Review round 2 of PR #64 (B-M9): the
+   * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of the helper
+   * image of the open (review round 1 of PR #64, S1; review round 3 of PR #64, P2: for the current tag too); the label
+   * and the log lines keep the tag. Review round 2 of PR #64 (B-M9): the
    * parameters are required, so an implementation states what it does with them.
    */
   ensure(host: string, helperTag: string, signal: AbortSignal | undefined, helperImage: string | undefined): Promise<unknown>;
@@ -749,6 +750,11 @@ function namesDockerfile(configText: string): boolean {
   if (!isRecord(config)) return false;
   const build = isRecord(config.build) ? config.build : {};
   return typeof build.dockerfile === 'string' || typeof config.dockerFile === 'string';
+}
+
+/** The workspace helper could not be prepared, or the helper image of the open is gone (UserFacingError helperFailed). */
+function isHelperFailed(error: unknown): boolean {
+  return isUserFacingError(error) && error.code === 'helperFailed';
 }
 
 function isFilesMissing(error: unknown): boolean {
@@ -2306,6 +2312,8 @@ export class EnvironmentService {
       });
       if (!present) throw new Error(`The environment image ${imageName} is missing after the build.`);
     } catch (error) {
+      // Review round 3 of PR #64 (P6a): the helper image of the open is gone; no "started instead" and no buildFailed.
+      if (isHelperFailed(error)) return this.helperFailedInUpdate(ctx, error, container, record);
       return this.updateFailed(ctx, error, canFallBack, plan.check);
     }
 
@@ -2375,6 +2383,13 @@ export class EnvironmentService {
         this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
       }
+      // Review round 3 of PR #64 (P6b): the helper image of the open is gone, so the old environment image cannot be
+      // started either (that needs the helper too): no buildFailed warning and no restore; a running container that is
+      // current opens as it is, otherwise the open ends with helperFailed (not startFailed).
+      if (isHelperFailed(error)) {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        return this.helperFailedInUpdate(ctx, error, container, record);
+      }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
       const previousImage =
@@ -2399,6 +2414,8 @@ export class EnvironmentService {
         result = await this.runUp(ctx, previousImage, loaded.config, !keep, !keep, loaded.compose);
       } catch (restoreError) {
         if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError) || isHostAccess(restoreError)) throw restoreError;
+        // Review round 3 of PR #64 (P6b): the helper image of the open is gone: helperFailed, not startFailed.
+        if (isHelperFailed(restoreError)) return this.helperFailedInUpdate(ctx, restoreError, container, record);
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(restoreError));
       }
       return keep ? { result, created: false, container: survivor } : { result, created: true };
@@ -2475,6 +2492,36 @@ export class EnvironmentService {
     await this.updateEntry(ctx, (entry) => {
       entry.refusedUpdate = refusedUpdate;
     });
+  }
+
+  /**
+   * Review round 3 of PR #64 (P6): a helper run of Step 8 (the build, `up`, or the restore with the previous environment
+   * image) failed with helperFailed: the helper image of the open is gone. The rest of the open uses no
+   * helper (ctx.helperUnavailable, so the Git setup is skipped too). When the container that Step 5 found still exists,
+   * runs, and is current, it opens as it is (returns `undefined`: no warning that the update failed, no start with the
+   * previous image, which needs the helper too); otherwise `error` ends the open. A cancellation passes through.
+   */
+  private async helperFailedInUpdate(
+    ctx: PipelineContext,
+    error: unknown,
+    container: ContainerInfo | undefined,
+    record: BuildRecord | undefined,
+  ): Promise<undefined> {
+    ctx.helperUnavailable = true;
+    this.throwIfCancelled(ctx.signal);
+    // The container may have been removed or replaced in this step (for example by `up --remove-existing-container`, or
+    // at a switch between Docker Compose and a single container): it is looked up again.
+    let current: ContainerInfo | undefined;
+    try {
+      current = await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName);
+    } catch (lookupError) {
+      if (this.isCancellation(lookupError, ctx.signal)) throw lookupError;
+      this.logger.warn(`The container of ${ctx.env.repository} could not be found: ${errorDetail(lookupError)}`);
+      throw error;
+    }
+    if (container === undefined || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record))) throw error;
+    this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
+    return undefined;
   }
 
   /**
@@ -5151,10 +5198,11 @@ export class EnvironmentService {
       announced = true;
       ctx.steps.detail(text);
     };
-    let tag: string;
-    let previousId: string | undefined;
+    let image: HelperImageUse;
     try {
-      tag = await this.deps.helper.ensureImage({
+      // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
+      // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
+      image = await this.deps.helper.ensureImageUse({
         onOutput: (text) => {
           announce(PipelineTexts.preparingHelper);
           this.logger.output(text);
@@ -5162,9 +5210,6 @@ export class EnvironmentService {
         // A new helper after an extension update, or the rebuild of an existing one from a new base image.
         onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
         checkBaseImage: this.deps.settings().updateImagesOnConnect,
-        onPreviousHelper: (_tag, imageId) => {
-          previousId = imageId;
-        },
         signal: ctx.signal,
       });
     } catch (error) {
@@ -5173,8 +5218,12 @@ export class EnvironmentService {
     } finally {
       if (announced) ctx.steps.clearDetail();
     }
-    ctx.helperImage = previousId !== undefined ? { tag, previousId } : { tag };
-    await this.ensureRemoteMonitor(ctx, tag, previousId);
+    // Review round 3 of PR #64 (P2): pinned by the ID of its image, for the current tag too.
+    ctx.helperImage = { ...image };
+    if (image.previous === true) {
+      this.logger.info(`${ctx.env.repository} is opened with the previous helper image ${image.tag}${image.id !== undefined ? ` (${image.id.slice(0, 19)})` : ''}.`);
+    }
+    await this.ensureRemoteMonitor(ctx, image);
   }
 
   /**
@@ -5183,17 +5232,19 @@ export class EnvironmentService {
    * started: the remote monitor acts only on environments with a record, so this keeps the stop without contact for
    * every remote environment. The keep-running flag follows the rules of the local Session Monitor (keptWhenClosed). A
    * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
-   * its ticks).
+   * its ticks). Review round 3 of PR #64 (P2): the monitor gets the tag for its label and the log lines, and the ID of the
+   * helper image of the open (current or previous) as the image of its `docker run`, like every helper run of the open;
+   * the tag only when the ID could not be read.
    */
-  private async ensureRemoteMonitor(ctx: PipelineContext, helperTag: string, previousId: string | undefined): Promise<void> {
+  private async ensureRemoteMonitor(ctx: PipelineContext, image: HelperImageUse): Promise<void> {
     const remoteMonitor = this.deps.remoteMonitor;
     if (!remoteMonitor || ctx.remoteMonitorEnsured) return;
     const target = await this.dockerTarget();
     if (target.kind !== 'remote') return;
     ctx.remoteMonitorEnsured = true;
     try {
-      // Review round 1 of PR #64 (S1): a previous helper runs by the ID of its image that was checked, not by its tag.
-      await remoteMonitor.ensure(target.host, helperTag, ctx.signal, previousId);
+      // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): by the ID of the image that the open pinned.
+      await remoteMonitor.ensure(target.host, image.tag, ctx.signal, image.id);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);

@@ -65,9 +65,10 @@ class RunScopedDocker implements HelperDocker {
     return this.docker.imageId(reference);
   }
 
-  async buildImage(options: Parameters<ContainerAdapter['buildImage']>[0]): Promise<void> {
+  async buildImage(options: Parameters<ContainerAdapter['buildImage']>[0]): Promise<string | undefined> {
     this.builds.push({ tag: options.tag, pull: options.pull === true, noCache: options.noCache === true });
-    await this.docker.buildImage(options);
+    // Review round 3 of PR #64 (P4): the ID of the built image (`--iidfile`).
+    return this.docker.buildImage(options);
   }
 
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {

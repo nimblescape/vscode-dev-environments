@@ -25,6 +25,7 @@ import {
   HELPER_TOMBSTONE_MS,
   HELPER_UNUSED_LIMIT_MS,
   ensureHelperImage,
+  ensureHelperImageUse,
   hasPreviousGeneration,
   helperImageTag,
   recordHelperImageUse,
@@ -73,6 +74,13 @@ class FakeDocker implements HelperImageDocker {
   buildHandler: (options: BuildOptions) => Promise<void> = async () => undefined;
   listError: Error | undefined;
   imageIdError: Error | undefined;
+  /**
+   * Review round 3 of PR #64 (P4): the build returns the ID of its image, as the `--iidfile` of the Docker CLI gives it;
+   * with this flag it returns none (an iidfile that could not be read).
+   */
+  iidfileMissing = false;
+  /** Review round 3 of PR #64 (P4): runs after a successful build (after the tag moved), before buildImage returns. */
+  afterBuild: () => void = () => undefined;
   private counter = 0;
 
   /** Adds an image with these tags (moving them from other images, as a build does) and returns its ID. */
@@ -98,11 +106,13 @@ class FakeDocker implements HelperImageDocker {
     return this.idOf(reference);
   }
 
-  async buildImage(options: BuildOptions): Promise<void> {
+  async buildImage(options: BuildOptions): Promise<string | undefined> {
     this.builds.push(options);
     // Docker moves the tag only after a successful build.
     await this.buildHandler(options);
-    this.addImage([options.tag], { helper: options.labels?.['nimblescape.devenv.helper'] === 'true' });
+    const id = this.addImage([options.tag], { helper: options.labels?.['nimblescape.devenv.helper'] === 'true' });
+    this.afterBuild();
+    return this.iidfileMissing ? undefined : id;
   }
 
   async listImagesByLabel(label: string): Promise<ImageInfo[]> {
@@ -190,9 +200,16 @@ describe('helperImageTag', () => {
     expect(helperImageTag('FROM x\nRUN y\n')).toBe(helperImageTag('FROM x\nRUN y\n', DEVCONTAINER_CLI_VERSION));
   });
 
-  it('matches the hash of the file content plus the version', () => {
-    // sha256('abc' + '1') = sha256('abc1')
-    expect(helperImageTag('abc', '1')).toBe('devenv-helper:dbfcfd0d8722');
+  it('matches the hash of the file content plus the version plus the helper generation', () => {
+    // Changed expectation (review round 3 of PR #64, P5): the helper generation is part of the hash.
+    // sha256('abc' + '1' + '\ngeneration 1')
+    expect(helperImageTag('abc', '1', 1)).toBe('devenv-helper:cdcde07033de');
+    expect(helperImageTag('abc', '1')).toBe(helperImageTag('abc', '1', HELPER_GENERATION));
+  });
+
+  it('changes with the helper generation, so raising it builds a new current tag (review round 3 of PR #64, P5)', () => {
+    expect(helperImageTag('FROM x\n', '0.89.0', 2)).not.toBe(helperImageTag('FROM x\n', '0.89.0', 1));
+    expect(helperImageTag('FROM x\n', '0.89.0', HELPER_GENERATION + 1)).not.toBe(helperImageTag('FROM x\n', '0.89.0'));
   });
 });
 
@@ -719,7 +736,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
   it('drops the recorded image ID when the ID of the rebuilt image cannot be read (review round 1 of PR #64, L3)', async () => {
     const { h, oldId } = await changed();
     expect(h.state().images[h.tag]?.imageId).toBe(oldId);
-    // The build succeeds, but Docker does not answer for the ID of the new image.
+    // The build succeeds, but Docker does not answer for the ID of the new image. Review round 3 of PR #64 (P4): the ID
+    // comes from the --iidfile of the build now; it is unavailable here too.
+    h.docker.iidfileMissing = true;
     h.docker.buildHandler = async () => {
       h.docker.imageIdError = new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
     };
@@ -735,6 +754,39 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
       lastUsedAt: h.iso(),
       generation: HELPER_GENERATION,
     });
+  });
+
+  it('records the ID of the rebuilt image from the build, not the image that the tag has afterwards (review round 3 of PR #64, P4)', async () => {
+    const { h } = await changed();
+    let builtId: string | undefined;
+    let otherId: string | undefined;
+    h.docker.afterBuild = () => {
+      h.docker.afterBuild = () => undefined;
+      builtId = h.docker.idOf(h.tag);
+      // Another installation on the same engine builds the tag right after this build.
+      otherId = h.docker.addImage([h.tag]);
+    };
+    const use = await ensureHelperImageUse(h.docker, h.file, { statePath: h.statePath, baseDigest: h.baseDigest, clock: h.clock, logger: h.logger });
+    expect(builtId).toBeDefined();
+    expect(otherId).not.toBe(builtId);
+    expect(h.state().images[h.tag]?.imageId).toBe(builtId);
+    expect(use).toEqual({ tag: h.tag, id: builtId });
+  });
+
+  it('records no image ID read back by the tag when the build gave none (review round 3 of PR #64, P4)', async () => {
+    const { h } = await changed();
+    h.docker.iidfileMissing = true;
+    expect(await h.ensure()).toBe(h.tag);
+    expect(h.docker.builds).toHaveLength(1);
+    // The tag has an image, but it may be one of another build: it is no image ID of this installation.
+    expect(h.docker.idOf(h.tag)).toBeDefined();
+    expect(h.state().images[h.tag]?.imageId).toBeUndefined();
+    const fresh = new Harness();
+    fresh.docker.iidfileMissing = true;
+    const use = await ensureHelperImageUse(fresh.docker, fresh.file, { statePath: fresh.statePath, clock: fresh.clock, logger: fresh.logger });
+    expect(fresh.state().images[fresh.tag]?.imageId).toBeUndefined();
+    // The open still runs the image of the tag by its ID.
+    expect(use).toEqual({ tag: fresh.tag, id: fresh.docker.idOf(fresh.tag) });
   });
 
   it('keeps the previous image when it still has another tag', async () => {
@@ -1149,6 +1201,8 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
   it('removes nothing when the ID of the current image cannot be read after a build', async () => {
     const h = new Harness();
     const danglingId = h.docker.addImage([]);
+    // Review round 3 of PR #64 (P4): the ID comes from the --iidfile of the build now; it is unavailable here too.
+    h.docker.iidfileMissing = true;
     h.docker.buildHandler = async () => {
       h.docker.imageIdError = new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
     };
@@ -1547,6 +1601,53 @@ describe('ensureHelperImage with a state file: previous helper (no docker start 
     other.writeState({ version: 1, images: { [other.tag]: { lastUsedAt: other.iso(-10 * HOUR) } }, lastCleanupAt: other.iso() });
     await other.ensure({ baseDigest: undefined });
     expect(other.state().images[other.tag]).toEqual({ lastUsedAt: other.iso() });
+  });
+});
+
+describe('ensureHelperImageUse (review round 3 of PR #64, P1/P2/P4)', () => {
+  const offline = async (): Promise<void> => {
+    throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+  };
+
+  function use(h: Harness, options: Partial<EnsureHelperImageOptions> = {}) {
+    return ensureHelperImageUse(h.docker, h.file, { statePath: h.statePath, clock: h.clock, logger: h.logger, ...options });
+  }
+
+  it('returns the current tag with the ID of its image, and the ID of a build from the build, also when the tag moved right after it', async () => {
+    const h = new Harness();
+    let builtId: string | undefined;
+    h.docker.afterBuild = () => {
+      h.docker.afterBuild = () => undefined;
+      builtId = h.docker.idOf(h.tag);
+      h.docker.addImage([h.tag]);
+    };
+    expect(await use(h)).toEqual({ tag: h.tag, id: builtId });
+    // helper.json records the ID of the build, never the one that the tag has now.
+    expect(h.state().images[h.tag]?.imageId).toBe(builtId);
+    expect(h.docker.idOf(h.tag)).not.toBe(builtId);
+    // An existing tag: the ID of its image.
+    expect(await use(h)).toEqual({ tag: h.tag, id: h.docker.idOf(h.tag) });
+  });
+
+  it('returns a previous helper with its recorded image ID and the mark `previous`', async () => {
+    const h = new Harness();
+    const oldId = h.docker.addImage([OLD_TAG]);
+    h.writeState({ version: 1, images: { [OLD_TAG]: { builtAt: h.iso(-DAY), imageId: oldId, lastUsedAt: h.iso(-DAY), generation: HELPER_GENERATION } } });
+    h.docker.buildHandler = offline;
+    expect(await use(h)).toEqual({ tag: OLD_TAG, id: oldId, previous: true });
+  });
+
+  it('without a state file: the ID of the build, or of the existing tag, and the tag alone when the ID cannot be read', async () => {
+    const h = new Harness();
+    let builtId: string | undefined;
+    h.docker.afterBuild = () => {
+      builtId = h.docker.idOf(h.tag);
+    };
+    expect(await ensureHelperImageUse(h.docker, h.file)).toEqual({ tag: h.tag, id: builtId });
+    expect(await ensureHelperImageUse(h.docker, h.file)).toEqual({ tag: h.tag, id: h.docker.idOf(h.tag) });
+    h.docker.imageIdError = new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
+    expect(await ensureHelperImageUse(h.docker, h.file, { logger: h.logger })).toEqual({ tag: h.tag });
+    expect(h.warnings().join('\n')).toContain(`The ID of the workspace helper image ${h.tag} could not be read`);
   });
 });
 

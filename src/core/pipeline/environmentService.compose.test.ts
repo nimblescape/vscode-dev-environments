@@ -785,6 +785,48 @@ describe('existing Docker Compose environment', () => {
     expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
   });
 
+  it('logs that a running current dev container is opened as it is when its configuration cannot be read (review round 3 of PR #64, P9)', async () => {
+    // A configuration error, not helperFailed: the log line of the configuration says that the environment opens as it is.
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.logger.errors.filter((line) => line.startsWith('The configuration of'))).toEqual([
+      expect.stringMatching(new RegExp(`^The configuration of ${REPO} could not be used\\. The running environment is opened as it is\\. `)),
+    ]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()?.state).toBe('running');
+  });
+
+  it.each([
+    ['helperFailed', () => (h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed)), () => h.helper.calls.includes('ensureImage')],
+    [
+      'a configuration error',
+      () => (h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError')),
+      () => h.helper.readConfigurations.length > 0,
+    ],
+  ] as const)('ends the open as cancelled when it is cancelled while Step 5 lists the containers after %s (review round 3 of PR #64, P9)', async (_name, fail, reached) => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    fail();
+    const controller = new AbortController();
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    let aborted = false;
+    h.docker.listEnvironmentContainers = async () => {
+      // The listing of opensAsItIsOrFalse: after the error of Step 5.
+      if (reached()) {
+        aborted = true;
+        controller.abort();
+        throw abortError();
+      }
+      return list();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { ...options(), signal: controller.signal }));
+    expect(aborted).toBe(true);
+    expect(error.code).toBe('cancelled');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.includes('could not be listed'))).toBe(false);
+  });
+
   it('keeps helperFailed when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
     await seedCompose({ dev: 'running', db: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
@@ -885,7 +927,9 @@ describe('existing Docker Compose environment', () => {
     await seedCompose();
     h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
     await h.service.openEnvironment(ENV_ID, options());
-    const previous = { tag: 'devenv-helper:0123456789ab', previousId: h.helper.previousHelperImageId };
+    // Changed expectation (review round 3 of PR #64, P2): the HelperImageUse names the image ID `id` and marks the
+    // previous helper with `previous`.
+    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
     expect(h.helper.helperImages.map((entry) => entry.call)).toEqual(expect.arrayContaining(['readConfiguration', 'composeModel', 'up']));
     expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
   });
@@ -1963,6 +2007,15 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     out.mountAncestors = { [SOURCE]: ancestor };
     useCompose(h, out);
   }
+
+  it('creates the folder with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
+    withDataFolder(FOLDER);
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    await h.service.open(TARGET, options());
+    expect(h.helper.createdFolders).toEqual([[SOURCE]]);
+    const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+    expect(h.helper.helperImages.filter((entry) => entry.call === 'createRepositoryFolders')).toEqual([{ call: 'createRepositoryFolders', image: previous }]);
+  });
 
   it('creates the folder in the workspace volume before up, and mounts it as a folder of the volume', async () => {
     withDataFolder(FOLDER);
@@ -3763,6 +3816,19 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
       expect(h.logger.warnings.some((line) => line.startsWith(`Docker Compose would create the service db of ${REPO} again`))).toBe(true);
       expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
     }
+
+    it('computes the hashes with the previous helper of the open (review round 3 of PR #64, P7)', async () => {
+      await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+      h.helper.helperImages.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      const previous = { tag: 'devenv-helper:0123456789ab', id: h.helper.previousHelperImageId, previous: true };
+      const hashes = h.helper.helperImages.filter((entry) => entry.call === 'composeServiceHashes');
+      expect(hashes.length).toBeGreaterThan(0);
+      expect(hashes.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
+    });
 
     it('the happy path: the hashes of the exact up model and the image IDs match; only the dev container is recreated', async () => {
       const { devId, dbId } = await openedEnvironment();

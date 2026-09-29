@@ -44,6 +44,7 @@ import {
   isPassableEnvName,
   type HelperDeps,
   type HelperDocker,
+  type HelperImageUse,
 } from './workspaceHelper';
 
 const TOKEN = 'gho_0123456789abcdefSECRET';
@@ -96,10 +97,12 @@ class FakeDocker implements HelperDocker {
     return this.ids.get(tag) ?? fakeImageId(tag);
   }
 
-  async buildImage(options: BuildOptions): Promise<void> {
+  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as the `--iidfile` of the Docker CLI gives it. */
+  async buildImage(options: BuildOptions): Promise<string | undefined> {
     this.builds.push(options);
     await this.buildHandler(options);
     this.images.add(options.tag);
+    return this.idOf(options.tag);
   }
 
   async listImagesByLabel(): Promise<ImageInfo[]> {
@@ -694,11 +697,9 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
 
   it('keeps the runs of an open on its previous helper when another open builds the current tag (review round 2 of PR #64, A-N1)', async () => {
     const { helper, advance } = setup();
-    // Open A (offline): the previous helper.
-    let previousId: string | undefined;
-    const tagA = await helper.ensureImage({ onPreviousHelper: (_tag, imageId) => (previousId = imageId) });
-    expect(tagA).toBe(PREVIOUS);
-    const openA = { tag: tagA, previousId };
+    // Open A (offline): the previous helper. Review round 3 of PR #64 (P1): the open pins what ensureImageUse returns.
+    const openA = await helper.ensureImageUse();
+    expect(openA).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
     await helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'a', merged: false, image: openA }).catch(() => undefined);
     // Open B of another repository (online again) builds the current tag; the cache of the window now has it.
     docker.buildHandler = async () => undefined;
@@ -723,9 +724,9 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     const saved = state();
     saved.images[OLDER] = { builtAt: '2026-09-10T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION };
     fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify(saved));
-    let previousId: string | undefined;
-    const tag = await helper.ensureImage({ onPreviousHelper: (_tag, imageId) => (previousId = imageId) });
-    const image = { tag, previousId };
+    // Review round 3 of PR #64 (P1): the open pins what ensureImageUse returns.
+    const image = await helper.ensureImageUse();
+    expect(image).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
     const builds = docker.builds.length;
     docker.handler = (args) => {
       if (args.includes(fakeImageId(PREVIOUS))) return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(PREVIOUS)}.\n` };
@@ -738,41 +739,146 @@ describe('WorkspaceHelper with a previous helper image (no docker start fallback
     expect(logger.lines.join('\n')).toContain(`The previous helper image ${PREVIOUS} (${fakeImageId(PREVIOUS).slice(0, 19)}) that this open uses was removed.`);
   });
 
-  it('builds the current tag of an open again when its image is gone at a run, and fails instead of switching to a previous helper (review round 2 of PR #64, A-N1)', async () => {
+  it('fails with helperFailed without a build when the current image of an open is gone at a run, and never switches to a previous helper (review round 2 of PR #64, A-N1; review round 3 of PR #64, P2)', async () => {
     const { helper } = setup();
     docker.buildHandler = async () => undefined;
-    expect(await helper.ensureImage()).toBe(TAG);
-    const image = { tag: TAG };
-    // The image is removed before the run; the same tag is built again (the same CLI), and the run goes on with it.
-    let missing = true;
+    // Review round 3 of PR #64 (P2): the open pins the current tag by the ID of its image.
+    const image = await helper.ensureImageUse();
+    expect(image).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    // Changed expectation (review round 3 of PR #64, P2): before, the same tag was built again and the run went on with
+    // it; a pinned run now uses the image ID, and when that image is gone the open ends with helperFailed: nothing is
+    // built (a build may give another image), and no previous helper is used (another CLI).
     docker.handler = (args) => {
-      if (args.includes(TAG) && missing) {
-        missing = false;
+      if (args.includes(fakeImageId(TAG))) {
         docker.images.delete(TAG);
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}.\n` };
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(TAG)}.\n` };
       }
       return {};
     };
     const builds = docker.builds.length;
-    expect((await helper.run('vol', ['true'], { image })).exitCode).toBe(0);
-    expect(docker.builds).toHaveLength(builds + 1);
-    expect(docker.runs.slice(-2).map((run) => run.args.includes(TAG))).toEqual([true, true]);
+    const runs = docker.runs.length;
+    const error = await helper.run('vol', ['true'], { image }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: 'helperFailed' });
+    expect((error as UserFacingError).detail).toBe(`No such image: ${fakeImageId(TAG)}`);
+    expect(docker.runs).toHaveLength(runs + 1);
+    expect(docker.builds).toHaveLength(builds);
+    expect(docker.runs.some((run) => run.args.includes(fakeImageId(PREVIOUS)) || run.args.includes(TAG))).toBe(false);
+    expect(logger.lines).toContain(
+      `warn The workspace helper image ${TAG} (${fakeImageId(TAG).slice(0, 19)}) that this open uses was removed. The open cannot go on with another helper image.`,
+    );
+    // Review round 3 of PR #64 (P8): no log line or state write of a previous helper for a pinned run.
+    expect(logger.lines.join('\n')).not.toContain('is used for now');
+    expect(logger.lines.join('\n')).not.toContain('It is built again');
+  });
 
-    // Removed again, and offline now: ensureHelperImage would give the previous helper, which has another CLI.
+  it('keeps the runs of an open on the image ID of its current tag when another window rebuilds the tag in the middle of the open (review round 3 of PR #64, P2)', async () => {
+    const { helper } = setup();
+    docker.buildHandler = async () => undefined;
+    const image = await helper.ensureImageUse();
+    expect(image.id).toBe(fakeImageId(TAG));
+    await helper.run('vol', ['true'], { image });
+    // Another window rebuilds the tag (--pull --no-cache): the tag points to another image now.
+    const rebuilt = `sha256:${'7'.repeat(64)}`;
+    docker.ids.set(TAG, rebuilt);
+    await helper.run('vol', ['true'], { image });
+    await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
+    const references = docker.runs.map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
+    expect(references).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
+    // A run outside an open uses the tag, whatever image it has now.
+    await helper.run('vol', ['true']);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
+    expect(docker.runs[docker.runs.length - 1].args).not.toContain(rebuilt);
+  });
+
+  it('pins the previous helper with its ID when the cache of the window is replaced while the ensure of the open is pending (review round 3 of PR #64, P1)', async () => {
+    // Reproduced: the open learned the ID of a previous helper only through onPreviousHelper, which image() called only
+    // when its cache still held the pending ensure. A reset of the cache meanwhile (here: a helper run of another Docker
+    // engine) left the open with the tag of the previous helper and without its ID.
+    const { helper } = setup();
+    let engineKey = '';
+    (helper as unknown as { deps: HelperDeps }).deps.engine = async () => ({ key: engineKey });
+    let release: () => void = () => undefined;
+    let first = true;
     docker.buildHandler = async () => {
+      if (first) {
+        first = false;
+        await new Promise<void>((resolve) => (release = resolve));
+      }
       throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
     };
-    docker.handler = (args) => {
-      if (args.includes(TAG)) {
-        docker.images.delete(TAG);
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}.\n` };
-      }
-      return {};
-    };
-    const runs = docker.runs.length;
-    await expect(helper.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
-    expect(docker.runs).toHaveLength(runs + 1);
-    expect(docker.runs.some((run) => run.args.includes(fakeImageId(PREVIOUS)))).toBe(false);
+    const notified: Array<[string, string]> = [];
+    const pending = helper.ensureImageUse({ onPreviousHelper: (tag, imageId) => notified.push([tag, imageId]) });
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    // A helper run for another engine replaces the cache while the build of the open still runs.
+    engineKey = 'ssh://build-box';
+    const other = helper.run('vol', ['true']).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds.length).toBeGreaterThan(1));
+    release();
+    const image = await pending;
+    expect(image).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
+    expect(notified).toEqual([[PREVIOUS, fakeImageId(PREVIOUS)]]);
+    // The run of the other engine found no previous helper there.
+    expect(await other).toMatchObject({ code: 'helperFailed' });
+    // The runs of the open use the ID, never the tag of the previous helper.
+    engineKey = '';
+    await helper.run('vol', ['true'], { image });
+    const args = docker.runs[docker.runs.length - 1].args;
+    expect(args).toContain(fakeImageId(PREVIOUS));
+    expect(args).not.toContain(PREVIOUS);
+  });
+
+  describe('every public method runs the helper image of the open that it gets as `image` (review round 3 of PR #64, P7)', () => {
+    const OVERRIDE = { image: 'devenv-x:1' };
+    const cases: Array<[string, (helper: WorkspaceHelper, image: HelperImageUse) => Promise<unknown>]> = [
+      ['run', (helper, image) => helper.run('vol', ['true'], { image })],
+      ['clone', (helper, image) => helper.clone({ volumeName: 'vol', repository: 'o/a', token: TOKEN, image })],
+      ['readConfigFiles', (helper, image) => helper.readConfigFiles({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', image })],
+      ['listConfigurations', (helper, image) => helper.listConfigurations({ volumeName: 'vol', repository: 'o/a', image })],
+      [
+        'readConfiguration (merged)',
+        (helper, image) => helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'e', image }),
+      ],
+      [
+        'readConfiguration (without the merged configuration, with an override)',
+        (helper, image) =>
+          helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'e', merged: false, override: OVERRIDE, image }),
+      ],
+      ['build', (helper, image) => helper.build({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', image })],
+      [
+        'build (with an override)',
+        (helper, image) => helper.build({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', override: OVERRIDE, image }),
+      ],
+      ['composeModel', (helper, image) => helper.composeModel({ volumeName: 'vol', repository: 'o/a', files: ['/workspaces/a/compose.yaml'], project: 'p', image })],
+      ['composeServiceHashes', (helper, image) => helper.composeServiceHashes({ volumeName: 'vol', repository: 'o/a', model: '{}', project: 'p', image })],
+      ['createRepositoryFolders', (helper, image) => helper.createRepositoryFolders({ volumeName: 'vol', repository: 'o/a', folders: ['/workspaces/a/data'], image })],
+      ['up', (helper, image) => helper.up({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', removeExistingContainer: false, image })],
+      [
+        'runUserCommands',
+        (helper, image) => helper.runUserCommands({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', containerId: 'c'.repeat(64), token: TOKEN, image }),
+      ],
+      ['prepareGit', (helper, image) => helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image })],
+      ['fixConfigOwnership', (helper, image) => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv', uid: '1000', gid: '1000', image })],
+    ];
+
+    it.each(cases)('%s', async (_name, call) => {
+      const { helper, advance } = setup();
+      // Open A (offline): the previous helper.
+      const pinned = await helper.ensureImageUse();
+      expect(pinned).toEqual({ tag: PREVIOUS, id: fakeImageId(PREVIOUS), previous: true });
+      // Another open (online again) switches the cache of the window to the current tag.
+      docker.buildHandler = async () => undefined;
+      advance(60_000);
+      expect(await helper.ensureImage()).toBe(TAG);
+      docker.handler = (args) => {
+        if (args[0] !== 'run') return {};
+        return { stdout: '{"outcome":"success","containerId":"cccc","configuration":{},"services":{}}\n' };
+      };
+      const before = docker.runs.length;
+      await call(helper, pinned).catch(() => undefined);
+      const references = docker.runs.slice(before).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
+      expect(references.length).toBeGreaterThan(0);
+      expect(references.every((reference) => reference === fakeImageId(PREVIOUS))).toBe(true);
+    });
   });
 
   it('fails with helperFailed when the current tag cannot be built and no previous helper of this installation exists', async () => {

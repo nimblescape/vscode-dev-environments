@@ -17,7 +17,8 @@ export function remoteMonitorEnsure(
   monitor: Pick<RemoteSessionMonitor, 'ensure'>,
   rootlessSocket: (host: string) => Promise<string | undefined>,
 ): EnvironmentRemoteMonitor['ensure'] {
-  // Review round 1 of PR #64 (S1): `helperImage`, the checked image ID of a previous helper, is the image of `docker run`.
+  // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): `helperImage`, the checked image ID of the helper image of
+  // the open (current or previous), is the image of `docker run`.
   return async (host, helperTag, signal, helperImage) =>
     monitor.ensure(helperTag, (await rootlessSocket(host)) ?? DOCKER_SOCKET, signal, helperImage);
 }

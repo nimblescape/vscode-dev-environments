@@ -35,10 +35,11 @@ import {
 } from './devcontainerCli';
 import {
   HELPER_LAST_USED_INTERVAL_MS,
-  ensureHelperImage,
+  ensureHelperImageUse,
   recordHelperImageUse,
   type BaseDigestLookup,
   type HelperBuildKind,
+  type HelperImageUse,
 } from './helperImage';
 import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
 import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
@@ -129,30 +130,19 @@ export interface EnsureImageOptions {
   /** Called right before a build of the helper image: `create` for a missing tag, `refresh` for a rebuild. */
   onBuild?: (kind: HelperBuildKind) => void;
   /**
-   * Previous helper (user decision 2026-09-29): called when the returned tag is a previous helper tag, because the
-   * current tag could not be built (ensureHelperImage). `imageId` is the ID of its image that was checked against
-   * helper.json; the helper runs use it as the image reference (review round 1 of PR #64, S1), and so should any other
-   * container of the helper image (the Session Monitor on a remote Docker host). The next ensureImage tries to build the
-   * current tag again.
+   * Previous helper (user decision 2026-09-29): called when the resolved tag is a previous helper tag, because the
+   * current tag could not be built (ensureHelperImage), with the ID of its image that was checked against helper.json.
+   * The next ensureImage tries to build the current tag again. Review round 3 of PR #64 (P1): only for log lines and
+   * notices; the helper image of an open is the HelperImageUse that ensureImageUse returns.
    */
   onPreviousHelper?: (tag: string, imageId: string) => void;
 }
 
 /**
- * The result of ensureHelperImage that WorkspaceHelper caches, and the helper image of an open. Review round 2 of PR #64
- * (A-N1): the open pipeline resolves it once per open and passes it to every helper run of that open (`image`), so the
- * configuration that the CLI of one helper image read and checked is run with the same CLI, whatever another open in
- * this window resolves meanwhile.
+ * The result of ensureHelperImage that WorkspaceHelper caches, and the helper image of an open (see HelperImageUse in
+ * helperImage.ts). Review round 3 of PR #64 (P2): the runs of an open use its `id`, for the current tag too.
  */
-export interface HelperImageUse {
-  /** The helper tag: the key of helper.json, and the name in log lines. */
-  tag: string;
-  /**
-   * Previous helper: the checked ID of its image, which the helper runs use as the image reference instead of the tag
-   * (review round 1 of PR #64, S1). `undefined` for the current tag, which runs by its tag.
-   */
-  previousId?: string;
-}
+export type { HelperImageUse };
 
 /**
  * ensureImage reuses its result for this long. After that, it runs ensureHelperImage again, so a window that stays open
@@ -212,8 +202,8 @@ function mountOption(fields: Record<string, string>): string {
 
 export interface HelperRunSpec {
   /**
-   * The image reference: the current helper tag, or the checked image ID of a previous helper (review round 1 of PR #64,
-   * S1).
+   * The image reference: the image ID of the helper image of an open (review round 3 of PR #64, P2), the checked image
+   * ID of a previous helper (review round 1 of PR #64, S1), or the current helper tag for a run outside an open.
    */
   tag: string;
   volumeName: string;
@@ -371,6 +361,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * The image reference of a helper run outside an open: the current tag by its tag (such a run takes the image that the
+ * tag has), a previous helper by the ID of its image that was checked (review round 1 of PR #64, S1).
+ */
+function runReference(use: HelperImageUse): string {
+  return use.previous === true && use.id !== undefined ? use.id : use.tag;
+}
+
 /** `sha256:` and the first 12 hex characters of an image ID, for log lines. */
 function shortImageId(id: string): string {
   return id.slice(0, 'sha256:'.length + 12);
@@ -508,11 +506,20 @@ export class WorkspaceHelper {
    * image (in the background), the cleanup of old helper images. The open pipeline calls it before the helper runs; a
    * result older than HELPER_IMAGE_RECHECK_MS, or one of a helper run (without the maintenance), is not reused. A failed
    * build throws UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors
-   * pass through. Review round 2 of PR #64 (A-N1): the open pipeline passes the result (the tag, and the image ID of
-   * onPreviousHelper) as `image` to every helper run of the open, because this cache is shared by all opens of the window.
+   * pass through. Returns the tag.
    */
   async ensureImage(options: EnsureImageOptions = {}): Promise<string> {
-    return (await this.image(options, true)).tag;
+    return (await this.ensureImageUse(options)).tag;
+  }
+
+  /**
+   * ensureImage, with the helper image that this call awaited (HelperImageUse: the tag, the ID of its image, and whether
+   * it is a previous helper). Review round 3 of PR #64 (P1): the open pipeline pins this return value as the helper image
+   * of the open and passes it as `image` to every helper run of the open, because the cache of this instance is shared by
+   * all opens of the window and may be replaced meanwhile (another engine, a missing image at another run).
+   */
+  async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
+    return this.image(options, true);
   }
 
   /**
@@ -1106,8 +1113,8 @@ export class WorkspaceHelper {
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
   /**
-   * The helper tag. `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older than
-   * HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
+   * The helper image (HelperImageUse). `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older
+   * than HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
    * and only record the use (at most once per hour); without a result (a new window), they run ensureHelperImage without
    * the maintenance, which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays
    * a stop, a delete, or a branch switch. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
@@ -1132,8 +1139,7 @@ export class WorkspaceHelper {
       else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
-      let previousId: string | undefined;
-      const promise: Promise<HelperImageUse> = ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
+      const promise: Promise<HelperImageUse> = ensureHelperImageUse(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
         statePath,
@@ -1141,21 +1147,18 @@ export class WorkspaceHelper {
         maintain: recheck,
         checkBaseImage: options.checkBaseImage,
         onBuild: options.onBuild,
-        onPreviousHelper: (_tag, imageId) => {
-          previousId = imageId;
-        },
         onBaseImageCheck: this.deps.onBaseImageCheck,
         clock: this.clock,
         logger: this.deps.logger,
       }).then(
-        (tag) => {
+        (use) => {
           if (this.imagePromise === promise) {
             this.imageReadyAt = this.clock.now();
             this.imageUsedAt = this.imageReadyAt;
-            this.imageTag = tag;
-            this.imagePrevious = previousId !== undefined;
+            this.imageTag = use.tag;
+            this.imagePrevious = use.previous === true;
           }
-          return { tag, previousId };
+          return use;
         },
         (error: unknown) => {
           if (this.imagePromise === promise) this.imagePromise = undefined;
@@ -1168,10 +1171,10 @@ export class WorkspaceHelper {
       this.imageMaintained = recheck;
     }
     try {
-      const pending = this.imagePromise;
-      const use = await pending;
-      // Every caller that got the tag of a shared ensure learns that it is a previous helper.
-      if (this.imagePromise === pending && use.previousId !== undefined) options.onPreviousHelper?.(use.tag, use.previousId);
+      // Review round 3 of PR #64 (P1): the caller gets the image that it awaited, also when the cache was replaced
+      // meanwhile (resetImage), and every caller of a previous helper learns it.
+      const use = await this.imagePromise;
+      if (use.previous === true && use.id !== undefined) options.onPreviousHelper?.(use.tag, use.id);
       return use;
     } catch (error) {
       // Another caller cancelled the shared build: build again for this caller.
@@ -1267,36 +1270,40 @@ export class WorkspaceHelper {
     // Review round 2 of PR #64 (A-N1): a run of an open uses the helper image of that open, never the image that this
     // instance resolved for another open meanwhile.
     const pinned = options.image;
-    let use = pinned ?? (await this.image({ onOutput: options.onStderr, signal: options.signal }, false));
-    // Review round 1 of PR #64 (S1): a previous helper runs by the ID of its image that was checked, not by its tag.
-    let result = await this.runContainer(use.previousId ?? use.tag, volumeName, command, env, options);
+    if (pinned !== undefined) {
+      // Review round 3 of PR #64 (P2): by the ID of its image, for the current tag too, so a rebuild of the tag by another
+      // window (`--pull --no-cache`, other packages) never changes the helper image in the middle of an open.
+      const reference = pinned.id ?? pinned.tag;
+      const result = await this.runContainer(reference, volumeName, command, env, options);
+      if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
+        // Review round 2 of PR #64 (A-N1, B3), review round 3 of PR #64 (P2, P8): the image of the open was removed (for
+        // example by `docker image prune -a`, the removal of the previous image after a rebuild, or the cleanup of another
+        // installation). The open ends: nothing is built and no other image is used, because another helper image has
+        // another Dev Container CLI than the one that read and checked the configuration of this open; the next open
+        // chooses the helper image again.
+        this.deps.logger.warn(
+          `The ${pinned.previous === true ? 'previous helper image' : 'workspace helper image'} ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
+        );
+        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${reference}`);
+      }
+      return result;
+    }
+    let use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
+    // A run outside an open: the current tag runs by its tag; a previous helper runs by the ID of its image that was
+    // checked, not by its tag (review round 1 of PR #64, S1).
+    let result = await this.runContainer(runReference(use), volumeName, command, env, options);
     if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
       // The image was removed after it was checked (for example by `docker image prune -a`, or the cleanup of another
-      // installation for a previous helper).
-      if (pinned?.previousId !== undefined) {
-        // Review round 2 of PR #64 (A-N1, B3): the open ends. Another helper image has another Dev Container CLI than the
-        // one that read and checked the configuration of this open; the next open chooses the helper image again.
-        this.deps.logger.warn(
-          `The previous helper image ${pinned.tag} (${shortImageId(pinned.previousId)}) that this open uses was removed. The open cannot go on with another helper image.`,
-        );
-        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${pinned.previousId}`);
-      }
-      // The current tag is built again (the same tag, the same CLI). A run outside an open takes what ensureHelperImage
-      // returns: the current tag, or else a previous helper.
+      // installation for a previous helper). The run takes what ensureHelperImage returns now: the current tag, built
+      // again, or else a previous helper.
       this.deps.logger.warn(
-        use.previousId !== undefined
-          ? `The previous helper image ${use.tag} (${shortImageId(use.previousId)}) is missing. The workspace helper image is prepared again.`
+        use.previous === true && use.id !== undefined
+          ? `The previous helper image ${use.tag} (${shortImageId(use.id)}) is missing. The workspace helper image is prepared again.`
           : `The workspace helper image ${use.tag} is missing. It is built again.`,
       );
       this.resetImage();
       use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-      if (pinned !== undefined && (use.tag !== pinned.tag || use.previousId !== undefined)) {
-        // Review round 2 of PR #64 (A-N1): the current tag of the open could not be built again; a previous helper has
-        // another CLI.
-        this.deps.logger.warn(`The workspace helper image ${pinned.tag} of this open could not be built again. The open cannot go on with another helper image.`);
-        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${pinned.tag}`);
-      }
-      result = await this.runContainer(use.previousId ?? use.tag, volumeName, command, env, options);
+      result = await this.runContainer(runReference(use), volumeName, command, env, options);
     }
     return result;
   }

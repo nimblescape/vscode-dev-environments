@@ -1216,9 +1216,13 @@ export class ContainerAdapter {
   }
 
   /**
-   * `docker build -t <tag> -f <dockerfile> [--pull] [--no-cache] [--label k=v]… [--build-arg k=v]… <context>`.
-   * `pull`: pull the base images even if they exist locally; `noCache`: build every step again. Docker moves the tag
-   * only when the build succeeds. Throws CommandError.
+   * `docker build -t <tag> -f <dockerfile> [--pull] [--no-cache] [--label k=v]… [--build-arg k=v]… --iidfile <file>
+   * <context>`. `pull`: pull the base images even if they exist locally; `noCache`: build every step again. Docker moves
+   * the tag only when the build succeeds. Throws CommandError. Review round 3 of PR #64 (P4): returns the ID of the image
+   * that this build made, from the `--iidfile` that the Docker CLI writes (into a private temporary folder, mode 0700,
+   * removed afterwards), as the engine lists it for that digest (`docker image inspect <digest>`), not by the tag, which
+   * another build may have moved meanwhile; `undefined` (with a warning) when the file holds no image ID or the engine
+   * does not find it.
    */
   async buildImage(options: {
     tag: string;
@@ -1230,22 +1234,55 @@ export class ContainerAdapter {
     noCache?: boolean;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
-  }): Promise<void> {
+  }): Promise<string | undefined> {
     const flags = [...(options.pull ? ['--pull'] : []), ...(options.noCache ? ['--no-cache'] : [])];
     this.logger.info(`Building image ${options.tag}${flags.length > 0 ? ` (${flags.join(' ')})` : ''}.`);
     const onOutput = options.onOutput ?? ((text: string) => this.logger.output(text));
-    const args = [
-      'build',
-      '-t',
-      options.tag,
-      '-f',
-      options.dockerfile,
-      ...flags,
-      ...labelArgs(options.labels, '--label'),
-      ...labelArgs(options.buildArgs, '--build-arg'),
-      options.context,
-    ];
-    await this.runChecked(args, { signal: options.signal, onStdout: onOutput, onStderr: onOutput });
+    const folder = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'devenv-build-'));
+    try {
+      await fs.promises.chmod(folder, 0o700);
+      const iidfile = path.join(folder, 'image-id');
+      const args = [
+        'build',
+        '-t',
+        options.tag,
+        '-f',
+        options.dockerfile,
+        ...flags,
+        ...labelArgs(options.labels, '--label'),
+        ...labelArgs(options.buildArgs, '--build-arg'),
+        '--iidfile',
+        iidfile,
+        options.context,
+      ];
+      await this.runChecked(args, { signal: options.signal, onStdout: onOutput, onStderr: onOutput });
+      let text: string;
+      try {
+        text = (await fs.promises.readFile(iidfile, 'utf8')).trim();
+      } catch (error) {
+        this.logger.warn(`The ID of the image ${options.tag} that was just built could not be read: ${errorMessage(error)}`);
+        return undefined;
+      }
+      if (!/^sha256:[0-9a-f]{64}$/.test(text)) {
+        this.logger.warn(`The ID of the image ${options.tag} that was just built is not valid: ${text.slice(0, 100)}`);
+        return undefined;
+      }
+      // The ID that the engine lists for the image that the file names (by that digest, never by the tag): with the
+      // containerd image store the file may hold another digest of the same image.
+      let id: string | undefined;
+      try {
+        id = await this.imageId(text);
+      } catch (error) {
+        this.logger.warn(`The image ${text} that the build of ${options.tag} made could not be inspected: ${errorMessage(error)}`);
+        return undefined;
+      }
+      if (id === undefined) this.logger.warn(`The image ${text} that the build of ${options.tag} made was not found.`);
+      return id;
+    } finally {
+      await fs.promises
+        .rm(folder, { recursive: true, force: true })
+        .catch((error: unknown) => this.logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`));
+    }
   }
 
   /** Labels of a local image (`{}` if it has none), or `undefined` if the image does not exist. */

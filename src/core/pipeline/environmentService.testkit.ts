@@ -554,12 +554,14 @@ export class FakeHelper implements EnvironmentHelper {
   remoteUser = 'vscode';
   ensureImageError: Maybe<Error>;
   /**
-   * Previous helper (user decision 2026-09-29): ensureImage returns this tag and calls onPreviousHelper, as when the
+   * Previous helper (user decision 2026-09-29): ensureImageUse returns this tag and calls onPreviousHelper, as when the
    * current helper image could not be built.
    */
   previousHelperTag: string | undefined;
   /** The checked image ID of the previous helper (review round 1 of PR #64, S1). */
   previousHelperImageId = `sha256:${'5'.repeat(64)}`;
+  /** Review round 3 of PR #64 (P2): the ID of the image of the current tag `devenv-helper:test`, which the open pins. */
+  currentHelperImageId = `sha256:${'4'.repeat(64)}`;
   cloneError: Maybe<Error>;
   readConfigurationError: Maybe<Error>;
   buildError: (imageName: string) => Maybe<Error> = () => undefined;
@@ -681,14 +683,15 @@ export class FakeHelper implements EnvironmentHelper {
     }
   }
 
-  async ensureImage(options: { onOutput?: (text: string) => void; onPreviousHelper?: (tag: string, imageId: string) => void } = {}): Promise<string> {
+  /** Recorded in `calls` as `ensureImage` (review round 3 of PR #64, P1: the variant that returns the HelperImageUse). */
+  async ensureImageUse(options: { onOutput?: (text: string) => void; onPreviousHelper?: (tag: string, imageId: string) => void } = {}): Promise<HelperImageUse> {
     this.calls.push('ensureImage');
     if (this.ensureImageError) throw this.ensureImageError;
     if (this.previousHelperTag !== undefined) {
       options.onPreviousHelper?.(this.previousHelperTag, this.previousHelperImageId);
-      return this.previousHelperTag;
+      return { tag: this.previousHelperTag, id: this.previousHelperImageId, previous: true };
     }
-    return 'devenv-helper:test';
+    return { tag: 'devenv-helper:test', id: this.currentHelperImageId };
   }
 
   async clone(p: { volumeName: string; repository: string; branch?: string; token: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<void> {
