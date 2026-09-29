@@ -615,6 +615,41 @@ describe('RemoteMonitorLoop', () => {
     expect([...attempts].sort()).toEqual([`${A}.${SOURCE}`, `${B}.${OTHER}`, `${C}.${SOURCE}`].sort());
   });
 
+  // Review round 8 of PR #63 (R8-5): after a forgotten record that is not removed, only the forgotten records of its
+  // environment stay; a superseded record of the same environment is still removed in that pass (it is never the
+  // newest). One environment with both needs a record in the future: here one written while the clock of the host was
+  // two weeks ahead, first seen eight days ago while the environment still had a container (else it would have been
+  // forgotten then).
+  it('still removes a superseded record of an environment whose forgotten record was not removed', async () => {
+    const DAY = 24 * 60 * MINUTE;
+    const THIRD = '1'.repeat(32);
+    let clock = T0 - 8 * DAY;
+    let listed: DockerResult = { code: 0, stdout: `${'c'.repeat(64)}\texited\tdevenv-b\t${B}\t\n`, stderr: '' };
+    writeRecord(SOURCE, B, { at: T0 - 9 * DAY, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, B, { at: T0 + 6 * DAY, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const remove = async (record: RemoteRecord) => {
+      attempts.push(record.source);
+      if (record.source === SOURCE) throw new Error('locked');
+      return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => listed, removeRecord: remove, dir: heartbeatDir(stateDir), now: () => clock, log: (message) => lines.push(message) });
+    await loop.tick();
+    await loop.removals;
+    expect(attempts).toEqual([]);
+    // Eight days later the environment has no container any more, and another computer sent a heartbeat a day ago: the
+    // record of SOURCE is forgotten, the one in the future (first seen more than 7 days ago) superseded.
+    listed = { code: 0, stdout: '', stderr: '' };
+    writeRecord(THIRD, B, { at: T0 - DAY, keepRunning: false, limitSeconds: 600 });
+    clock = T0;
+    await loop.tick();
+    await loop.removals;
+    expect(attempts).toEqual([SOURCE, OTHER]);
+    expect(lines).toContain(`The old record of ${B} could not be removed: locked`);
+    expect(lines).toContain(`Removed the old record of ${B} (a newer record of it exists).`);
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, B), heartbeatFileName(THIRD, B)].sort());
+  });
+
   // Review round 6 of PR #63 (R6-3): a record that a pass skips (an older one of its environment was not removed) keeps
   // its logged failure, so it is logged once across that pass.
   // Changed test, review round 7 of PR #63 (R7-2): was three passes with results [true, false, true] (failure logged,
@@ -767,7 +802,14 @@ describe('removeStaleStateTemporaryFiles', () => {
     fs.writeFileSync(target, 'x');
     fs.symlinkSync(target, path.join(stateDir, 'images.json.1.1.tmp'));
     fs.mkdirSync(path.join(stateDir, 'images.json.2.1.tmp'));
-    expect(await removeStaleStateTemporaryFiles(stateDir, T0 + 48 * HOUR)).toEqual([]);
+    // Changed fixture, review round 8 of PR #63 (R8-2): was the time of the test run for all three, with `now` T0 + 48
+    // hours, so in a run within an hour of that time the age rule alone kept them; now they are 48 hours old at `now`
+    // T0, so only the check of a regular file keeps them.
+    const old = (T0 - 48 * HOUR) / 1000;
+    fs.utimesSync(target, old, old);
+    fs.lutimesSync(path.join(stateDir, 'images.json.1.1.tmp'), old, old);
+    fs.utimesSync(path.join(stateDir, 'images.json.2.1.tmp'), old, old);
+    expect(await removeStaleStateTemporaryFiles(stateDir, T0)).toEqual([]);
     expect(fs.readdirSync(stateDir).sort()).toEqual(['images.json.1.1.tmp', 'images.json.2.1.tmp', 'target']);
   });
 

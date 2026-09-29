@@ -9,9 +9,10 @@
 //       PENDING_MAX_AGE_MS, 2 minutes);
 //   R7  disconnect/<environment id>.json whose requestedAt is more than 10 minutes from now (readers ignore it after
 //       DISCONNECT_REQUEST_MAX_AGE_MS, 1 minute);
-//   R8  temporary files of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`) whose modification time is more than an hour
-//       from now (review round 2 of PR #63, R2-9: either way, as R6 and R7), in the storage folder,
-//       sessions/, pending/, operations/ and disconnect/ (a write that was killed between the write and the rename).
+//   R8  temporary files of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`; the cut of monitor.log in FileLogger names its
+//       own the same way, review round 8 of PR #63, R8-1) whose modification time is more than an hour from now (review
+//       round 2 of PR #63, R2-9: either way, as R6 and R7), in the storage folder, sessions/, pending/, operations/ and
+//       disconnect/ (a write that was killed between the write and the rename).
 // Only regular files are removed, never a link or what it points to, never a folder; a folder that is a link is not
 // entered. Every error is ignored (the next sweep tries again). No `vscode`.
 import * as fs from 'fs';
@@ -26,7 +27,7 @@ export const STALE_DISCONNECT_MAX_AGE_MS = 10 * 60_000;
 export const STALE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
 /** The Session Monitor sweeps at most this often (of its own run time). */
 export const STORAGE_SWEEP_INTERVAL_MS = 60 * 60_000;
-/** The name of a temporary file of writeJsonAtomic (atomicJson.ts, tempPath). */
+/** The name of a temporary file of writeJsonAtomic (atomicJson.ts, tempPath), also of FileLogger (monitorLog.ts). */
 export const ATOMIC_TEMPORARY_FILE = /^\..+\.\d+\.[0-9a-f]{8}\.tmp$/;
 /** A pending file or a disconnect request larger than this is not read (its modification time counts then). */
 const MAX_READ_BYTES = 64 * 1024;

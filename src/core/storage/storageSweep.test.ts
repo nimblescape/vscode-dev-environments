@@ -76,6 +76,18 @@ describe('sweepStorage', () => {
     expect(names(paths.pendingDir)).toEqual([`${ENV_B}.json`, 'a.b.json', 'notes.txt']);
   });
 
+  // Review round 8 of PR #63 (R8-5): a file larger than 64 KB (MAX_READ_BYTES) is not read, so its modification time
+  // decides, not the time in it: both ways.
+  it('R6: a pending file larger than 64 KB counts by its modification time, whatever its createdAt', async () => {
+    const large = (environmentId: string, createdAt: number) => `${pending(environmentId, createdAt).slice(0, -1)},"padding":"${'x'.repeat(64 * 1024)}"}`;
+    write(paths.pendingFile(ENV_A), large(ENV_A, T0 - MINUTE), T0 - 2 * STALE_PENDING_MAX_AGE_MS);
+    write(paths.pendingFile(ENV_B), large(ENV_B, T0 - 2 * STALE_PENDING_MAX_AGE_MS), T0 - MINUTE);
+    expect(fs.statSync(paths.pendingFile(ENV_A)).size).toBeGreaterThan(64 * 1024);
+    const removed = await sweepStorage(paths, T0);
+    expect(removed.pending).toEqual([path.join('pending', `${ENV_A}.json`)]);
+    expect(names(paths.pendingDir)).toEqual([`${ENV_B}.json`]);
+  });
+
   it('R7: removes disconnect requests older than 10 minutes and keeps younger ones', async () => {
     write(paths.disconnectFile(ENV_A), request(ENV_A, T0 - STALE_DISCONNECT_MAX_AGE_MS - 1));
     write(paths.disconnectFile(ENV_B), request(ENV_B, T0 - STALE_DISCONNECT_MAX_AGE_MS));
@@ -119,6 +131,17 @@ describe('sweepStorage', () => {
     write(file, '{}', T0 + 2 * STALE_TEMPORARY_MAX_AGE_MS);
     expect((await sweepStorage(paths, T0)).temporary).toEqual([path.join('sessions', '.x.json.1234.0123abcd.tmp')]);
     expect(fs.existsSync(file)).toBe(false);
+  });
+
+  // Review round 8 of PR #63 (R8-1): the cut of monitor.log (FileLogger, monitorLog.ts) names its temporary file as
+  // writeJsonAtomic does, in the storage folder, so one that a killed cut left behind is removed too.
+  it('R8: removes an old temporary file of the cut of monitor.log in the storage folder', async () => {
+    const file = path.join(paths.root, '.monitor.log.1.0123abcd.tmp');
+    write(file, 'x', T0 - STALE_TEMPORARY_MAX_AGE_MS - MINUTE);
+    write(paths.monitorLog, 'x', T0 - STALE_TEMPORARY_MAX_AGE_MS - MINUTE);
+    expect((await sweepStorage(paths, T0)).temporary).toEqual(['.monitor.log.1.0123abcd.tmp']);
+    expect(names(paths.root)).not.toContain('.monitor.log.1.0123abcd.tmp');
+    expect(names(paths.root)).toContain('monitor.log');
   });
 
   // Review round 1 of PR #63 (B4): a file that a window replaced after the sweep looked at it stays.
@@ -186,6 +209,11 @@ describe('sweepStorage', () => {
       write(path.join(outside, '.x.json.1.0123abcd.tmp'), '{}', old);
       fs.rmSync(paths.disconnectDir, { recursive: true });
       fs.symlinkSync(outside, paths.disconnectDir);
+      // Changed fixture, review round 8 of PR #63 (R8-2): the links and the folder had the time of the test run, so in
+      // a run within an hour of T0 the age rule alone kept them; now they are as old as the files, so only the checks
+      // of a regular file and of a folder that is a link keep them.
+      for (const link of [paths.pendingFile(ENV_A), path.join(paths.root, '.x.json.1.0123abcd.tmp'), paths.disconnectDir]) fs.lutimesSync(link, old / 1000, old / 1000);
+      fs.utimesSync(path.join(paths.sessionsDir, '.x.json.1.0123abcd.tmp'), old / 1000, old / 1000);
       const removed = await sweepStorage(paths, T0);
       expect(removed).toEqual({ pending: [], disconnect: [], temporary: [] });
       expect(fs.existsSync(target)).toBe(true);

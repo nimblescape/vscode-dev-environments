@@ -3,9 +3,11 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import * as fs from 'fs';
+import { createRequire, syncBuiltinESMExports } from 'module';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ATOMIC_TEMPORARY_FILE } from '../core/storage/storageSweep';
 import { FileLogger } from './monitorLog';
 
 const T0 = Date.parse('2026-09-24T17:00:00.000Z');
@@ -54,6 +56,30 @@ describe('FileLogger', () => {
     expect(text.startsWith('2026-09-24T17:00:00.000Z [1] INFO entry ')).toBe(true);
     expect(text.endsWith('INFO entry 0499\n')).toBe(true);
     expect(fs.readdirSync(root)).toEqual(['monitor.log']);
+  });
+
+  // Review round 8 of PR #63 (R8-1): the temporary file of the cut has the name form of writeJsonAtomic, in the folder
+  // of the log, so that the sweep of the storage folder (storageSweep.ts, R8) removes one left behind by a killed cut.
+  it('writes the cut to a temporary file that the sweep of the storage folder recognises', () => {
+    // The namespace of the ES module `fs` cannot be spied on; its CommonJS exports can, and syncBuiltinESMExports
+    // passes the spy on to the namespace that monitorLog.ts reads. Only the cut renames: temporary file → log.
+    const spy = vi.spyOn(createRequire(import.meta.url)('fs') as typeof fs, 'renameSync');
+    syncBuiltinESMExports();
+    try {
+      const logger = new FileLogger(file, { maxBytes: 1024, clock: { now: () => T0 }, pid: 1 });
+      for (let i = 0; i < 100; i++) logger.info(`entry ${String(i).padStart(4, '0')}`);
+      expect(spy.mock.calls.length).toBeGreaterThan(0);
+      for (const [temporary, target] of spy.mock.calls) {
+        expect(target).toBe(file);
+        expect(path.dirname(String(temporary))).toBe(root);
+        expect(path.basename(String(temporary))).toMatch(ATOMIC_TEMPORARY_FILE);
+        expect(path.basename(String(temporary)).startsWith(`.monitor.log.${process.pid}.`)).toBe(true);
+      }
+      expect(fs.readdirSync(root)).toEqual(['monitor.log']);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 
   it('measures the file now and then, so that content of another process counts too', () => {

@@ -143,8 +143,8 @@ export function isRunningState(state: string): boolean {
  * that stays, nor a keepRunning one with the same `at` (review round 6 of PR #63, R6-1; round 7, R7-3); so are records
  * without keepRunning older than RECORD_MAX_AGE_MS for which a strictly newer record of the same environment exists
  * (`superseded`; monitor cleanup, user decision 2026-09-29), except while a keepRunning record of another source of the
- * same environment has an `at` not later than its own (review round 1 of PR #63, F1; review round 3, R3-7). The monitor never acts on containers without the label nimblescape.devenv.environment-id (the caller lists
- * only those).
+ * same environment has an `at` not later than its own (review round 1 of PR #63, F1; review round 3, R3-7). The monitor
+ * never acts on containers without the label nimblescape.devenv.environment-id (the caller lists only those).
  */
 export function decide(input: RemoteDecideInput): RemoteDecision {
   const { now } = input;
@@ -203,7 +203,16 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
   // environment stay until all are gone.
   const old = (record: RemoteRecord) => !present.has(record.environmentId) && Math.abs(now - record.at) > RECORD_MAX_AGE_MS;
   const forget = clamped
-    .filter((record, index) => old(input.records[index]) && !clamped.some((other, j) => other.environmentId === record.environmentId && !old(input.records[j]) && (other.at < record.at || (other.at === record.at && record.keepRunning))))
+    .filter(
+      (record, index) =>
+        old(input.records[index]) &&
+        !clamped.some(
+          (other, j) =>
+            other.environmentId === record.environmentId &&
+            !old(input.records[j]) &&
+            (other.at < record.at || (other.at === record.at && record.keepRunning)),
+        ),
+    )
     .sort((a, b) => a.at - b.at || +a.keepRunning - +b.keepRunning)
     .map((record) => input.records[clamped.indexOf(record)]);
   // Monitor cleanup, user decision 2026-09-29 (R1): an old record that a strictly newer one of the same environment

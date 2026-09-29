@@ -219,8 +219,9 @@ describe('decide of the remote Session Monitor', () => {
       const far = record(B, T0 + RECORD_MAX_AGE_MS + 1);
       const near = record(B, T0 + RECORD_MAX_AGE_MS, { source: OTHER });
       // Changed fixture, review round 7 of PR #63 (R7-1): a recent record of another environment (with a container) is
-      // added; it is later than `far` as the rules see it (clamped to now) and must not hold it, as only the records
-      // of its own environment do.
+      // added; it stays, and it is earlier than `far` as the rules see it (`far` is clamped to now), so it would hold
+      // `far` if the records of other environments counted; only those of its own environment do (wording corrected in
+      // review round 8 of PR #63, R8-3).
       const recent = record(A, T0 - MINUTE);
       const decision = decide({ now: T0, containers: [container(A)], records: [far, near, recent], state: running() });
       expect(decision.forget).toEqual([far]);
@@ -398,6 +399,22 @@ describe('decide of the remote Session Monitor', () => {
         const remaining = [own, keep, newest].filter((one) => !decision.superseded.includes(one));
         const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
         expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
+      });
+
+      // Review round 8 of PR #63 (R8-5): the other way round. A keep of another computer whose written time is later
+      // than the record, but that was first seen before it (a time in the future), does not hold the record back: by
+      // the written times it is newer, and the local check of the computer of the record counts it either way.
+      it('removes an old record although a keep of another computer in the future was first seen before it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 + 30 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${OTHER}.${A}.${keep.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state });
+        expect(decision.superseded).toEqual([own]);
+        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
+        expect(inUseByOtherComputer(output([keep, own, newest]), SOURCE)).toBe(true);
+        expect(inUseByOtherComputer(output([keep, newest]), SOURCE)).toBe(true);
       });
     });
   });

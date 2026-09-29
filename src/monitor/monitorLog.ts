@@ -94,7 +94,9 @@ export class FileLogger implements Logger {
     const lineEnd = content.indexOf(0x0a, start);
     start = lineEnd >= 0 ? lineEnd + 1 : start;
     const kept = content.subarray(start);
-    const temp = `${this.file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    // Review round 8 of PR #63 (R8-1): the name form of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`, atomicJson.ts),
+    // so that the sweep of the storage folder (storageSweep.ts, R8) removes one that a killed cut left behind.
+    const temp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
     try {
       fs.writeFileSync(temp, kept);
       fs.renameSync(temp, this.file);
