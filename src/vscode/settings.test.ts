@@ -143,9 +143,20 @@ describe('settings (concept section 8)', () => {
     expect(settings({ remoteStopAfterMinutes: Number.NaN }).remoteStopAfterMinutes).toBe(10);
     // The same bounds in package.json.
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
-      contributes: { configuration: { properties: Record<string, { minimum?: number; maximum?: number }> } };
+      contributes: { configuration: { properties: Record<string, { minimum?: number; maximum?: number; scope?: string }> } };
     };
-    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.remoteStopAfterMinutes`]).toMatchObject({ minimum: 5, maximum: 1440 });
+    // User request 2026-09-29: one value per user and computer (scope application), so a workspace cannot give one
+    // window another limit; all windows write the same monitor.json and heartbeats.
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.remoteStopAfterMinutes`]).toMatchObject({
+      minimum: 5,
+      maximum: 1440,
+      scope: 'application',
+    });
+    // Review round 1 of PR #61 (R1): the other settings of the one monitor.json and of the heartbeats too, so that a
+    // repository's workspace settings cannot keep every environment of the computer running or change its waiting time.
+    for (const key of ['stopOnClose', 'waitingTimeSeconds', 'respectShutdownActionNone']) {
+      expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.${key}`], key).toMatchObject({ scope: 'application' });
+    }
   });
 
   it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {
