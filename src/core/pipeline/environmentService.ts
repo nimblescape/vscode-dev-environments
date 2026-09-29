@@ -638,6 +638,11 @@ interface PipelineContext {
    */
   kindSwitchRemoved?: string[];
   /**
+   * Review round 12 of PR #64 (R12-2): `devcontainer up` ran in this run (it may have removed or replaced the dev container
+   * with --remove-existing-container), so a later helperFailed did not leave everything as it was.
+   */
+  upStarted?: boolean;
+  /**
    * Review round 4 (D4-1): runComposeUp removed the single container of the environment in this run (a switch to Docker
    * Compose), and the IDs of the containers of Docker Compose of the project that existed before its `up`. After a failed
    * `up`, removeFailedComposeContainers removes only the others (those that the failed `up` created).
@@ -2380,7 +2385,7 @@ export class EnvironmentService {
       // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container changed nothing
       // (for example when the folders of the bind mounts or the Git configuration were written): the running container
       // may still open as it is (helperFailedInUpdate), without the detail of a switch.
-      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true) {
+      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true && ctx.upStarted !== true) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         return this.helperFailedInUpdate(ctx, error, container, record, loaded);
       }
@@ -3267,6 +3272,7 @@ export class EnvironmentService {
     // still in the volume. finish drops those that no longer exist.
     let result: DevcontainerResult & { lifecycleCommandFailure?: unknown };
     try {
+      ctx.upStarted = true;
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
         repository: env.repository,
@@ -3382,6 +3388,10 @@ export class EnvironmentService {
     }
     // The user of the dev service decides the owner of the files (imageRemoteUser reads `--user`).
     const userArgs = composeUserArgs(compose.output.model.services[compose.service]);
+    // Review round 12 of PR #64 (R12-1): before anything is removed, stopped or renamed (as in runUp), so that a helperFailed
+    // of the Git setup leaves the running containers as they are.
+    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
+    await this.prepareGit(ctx, true);
     if (replaced) {
       this.logger.info(
         `The container ${replaced.name} of ${env.repository} was not created by Docker Compose. It is replaced by the containers of the Docker Compose configuration; the files in the volume are kept.`,
@@ -3414,8 +3424,6 @@ export class EnvironmentService {
       await this.stopServiceBeforeRemoval(damaged, env);
       await docker.removeContainer(damaged.id);
     }
-    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
-    await this.prepareGit(ctx, true);
     const override = buildComposeOverrideConfig({
       modelPath: COMPOSE_MODEL_PATH,
       service: compose.service,
@@ -3429,6 +3437,7 @@ export class EnvironmentService {
       env: { COMPOSE_PROJECT_NAME: compose.project },
     };
     try {
+      ctx.upStarted = true;
       result = await this.deps.helper.up({
         volumeName: env.volumeName,
         repository: env.repository,

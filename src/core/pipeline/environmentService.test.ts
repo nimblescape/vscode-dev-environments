@@ -2794,6 +2794,18 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     expect(h.helper.ups).toHaveLength(1);
   });
 
+  it('R12-4 warns and opens a running current container when the Git setup fails with helperFailed (no update, no up)', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const before = h.docker.containersOf(ENV_ID)[0].id;
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).toContain('prepareGit');
+    expect(h.ui.warnings).toEqual([Messages.gitSetupFailed]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
+  });
+
   it('takes the identity from the GitHub profile of the account, once per window, with the session as fallback', async () => {
     const viewer = vi.fn(async () => ({ databaseId: 1001, login: 'octo', name: 'Octo Cat' }));
     h = recreate({ viewer });

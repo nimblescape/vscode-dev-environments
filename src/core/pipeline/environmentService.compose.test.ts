@@ -799,6 +799,22 @@ describe('existing Docker Compose environment', () => {
     expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
   });
 
+  it('R12-3 opens running current containers as they are, without the Git warning, when the Git setup before up of the update fails with helperFailed', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
+    const dev = devContainer()?.id;
+    const db = dbContainer()?.id;
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    h.helper.prepareGitError = gone();
+    h.helper.upError = () => gone();
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+  });
+
   it('opens running containers of the checks-off time as they are without the workspace helper while the checks are off (review round 2 of PR #64, B-M3)', async () => {
     h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
     await seedCompose({
@@ -1028,6 +1044,21 @@ describe('existing Docker Compose environment', () => {
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
     expect(h.docker.log).not.toContain(`rm ${single.id}`);
     expect(h.docker.log.filter((line) => line.startsWith('rename'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: single.id, name: NAME, state: 'running' })]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('R12-1a opens the running single container as it is when the Git setup before up fails with helperFailed before the switch to Docker Compose removed it', async () => {
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop') || line.startsWith('rename'))).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: single.id, name: NAME, state: 'running' })]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
@@ -1383,6 +1414,27 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.ui.warnings).not.toContain(Messages.gitSetupFailed);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('R12-2a gives the detail of the switch when run-user-commands fails with helperFailed after up replaced the only dev container', async () => {
+    const db = dbContainer();
+    if (db) h.docker.containers.delete(db.id);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+  });
+
+  it('R12-2b gives the detail of the switch when up fails with helperFailed after it removed the only dev container', async () => {
+    const db = dbContainer();
+    if (db) h.docker.containers.delete(db.id);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
   });
 
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
@@ -3450,6 +3502,23 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
     expect(result.containerName).toBe(NAME);
     expect(h.helper.calls).toContain(`createRepositoryFolders ${SOURCE}`);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(DEFAULT_CONFIG_PATH))]);
+    expect(h.helper.ups.slice(ups)).toEqual([]);
+    const after = h.docker.log.slice(log);
+    expect(after.filter((line) => line.startsWith('rename') || line.startsWith('rm ') || line.startsWith('stop'))).toEqual([]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: NAME, state: 'running' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+  });
+
+  it('R12-1b opens the running previous dev container as it is when the Git setup before up fails with helperFailed before it was moved', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    expect(app).toMatchObject({ name: NAME, state: 'running' });
+    const log = h.docker.log.length;
+    const ups = h.helper.ups.length;
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+    expect(result.containerName).toBe(NAME);
     expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(DEFAULT_CONFIG_PATH))]);
     expect(h.helper.ups.slice(ups)).toEqual([]);
     const after = h.docker.log.slice(log);
