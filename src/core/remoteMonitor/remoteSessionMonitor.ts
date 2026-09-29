@@ -208,7 +208,9 @@ export class RemoteSessionMonitor {
   /** The arguments of `docker run` for the monitor container. `helperImage`: the helper tag, or an image ID (S1). */
   runArgs(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings): string[] {
     const imagePrefixes = images?.prefixes ?? [];
-    const args = ['run', '-d', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
+    // Review round 4 of PR #64 (R4-8): never a pull, like the helper runs: the helper image exists only on the engine, and
+    // a missing image must not be looked up in a registry under its name.
+    const args = ['run', '-d', '--pull', 'never', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
     for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
     // Our own container: it survives a restart of the daemon (the refusal of restart policies is for the containers of
     // repositories). No published port, no capability: it needs the socket and its volume. User requests 2026-09-28:

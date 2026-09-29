@@ -472,6 +472,12 @@ export class WorkspaceHelper {
   /** When the cached image promise resolved, and its tag. */
   private imageReadyAt: number | undefined;
   private imageTag: string | undefined;
+  /**
+   * Review round 4 of PR #64 (R4-1): the image ID of the cached result (HelperImageUse.id), set when it resolved. A pinned
+   * run that finds no such image resets the cache when it still holds this ID, and ensureImage checks it before it reuses
+   * the cache.
+   */
+  private imageCachedId: string | undefined;
   /** The cached tag is a previous helper tag (user decision 2026-09-29): ensureImage never reuses it. */
   private imagePrevious = false;
   /** Last time this instance recorded a use of the tag in the state file. */
@@ -1136,6 +1142,7 @@ export class WorkspaceHelper {
       const now = this.clock.now();
       // Previous helper (user decision 2026-09-29): each open tries to build the current tag again.
       if (recheck && (this.imagePrevious || Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS)) this.resetImage();
+      else if (recheck && !(await this.cachedImageCurrent())) this.resetImage();
       else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
@@ -1156,6 +1163,7 @@ export class WorkspaceHelper {
             this.imageReadyAt = this.clock.now();
             this.imageUsedAt = this.imageReadyAt;
             this.imageTag = use.tag;
+            this.imageCachedId = use.id;
             this.imagePrevious = use.previous === true;
           }
           return use;
@@ -1187,7 +1195,37 @@ export class WorkspaceHelper {
     this.imagePromise = undefined;
     this.imageMaintained = false;
     this.imageReadyAt = undefined;
+    this.imageCachedId = undefined;
     this.imagePrevious = false;
+  }
+
+  /**
+   * Review round 4 of PR #64 (R4-1): whether the resolved result in the cache is still the image of its tag, before an
+   * open reuses it (ensureImage, within HELPER_IMAGE_RECHECK_MS). Another window may have rebuilt the tag (its old image
+   * is then removed, or the containerd store drops it) or a prune may have removed it: an open would then pin an ID that
+   * no longer exists and fail. `false` when the tag is gone or has another image now; `true` when Docker cannot answer
+   * (the cache stays, as before the check) or when the cache changed meanwhile (the caller then awaits the new promise).
+   */
+  private async cachedImageCurrent(): Promise<boolean> {
+    const promise = this.imagePromise;
+    const tag = this.imageTag;
+    const cachedId = this.imageCachedId;
+    if (promise === undefined || tag === undefined) return true;
+    let current: string | undefined;
+    try {
+      current = await this.deps.docker.imageId(tag);
+    } catch (error) {
+      this.deps.logger.warn(`The workspace helper image ${tag} could not be checked: ${errorMessage(error)}`);
+      return true;
+    }
+    if (this.imagePromise !== promise) return true;
+    if (current === cachedId) return true;
+    this.deps.logger.info(
+      current === undefined
+        ? `The workspace helper image ${tag} was removed. It is prepared again.`
+        : `The workspace helper image ${tag} has another image now. It is prepared again.`,
+    );
+    return false;
   }
 
   /** `lastUsedAt` of the tag in the state file, at most once per hour per instance. Never throws. */
@@ -1277,10 +1315,12 @@ export class WorkspaceHelper {
       const result = await this.runContainer(reference, volumeName, command, env, options);
       if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
         // Review round 2 of PR #64 (A-N1, B3), review round 3 of PR #64 (P2, P8): the image of the open was removed (for
-        // example by `docker image prune -a`, the removal of the previous image after a rebuild, or the cleanup of another
-        // installation). The open ends: nothing is built and no other image is used, because another helper image has
-        // another Dev Container CLI than the one that read and checked the configuration of this open; the next open
-        // chooses the helper image again.
+        // example by `docker image prune -a`, by another window that rebuilt the tag and removed the image that the tag
+        // had before, or by the cleanup of another installation). The open ends: nothing is built and no other image is
+        // used, because another helper image has another Dev Container CLI than the one that read and checked the
+        // configuration of this open. Review round 4 of PR #64 (R4-1): the cache of the window is reset when it still
+        // holds this image, so the next open resolves the helper image again instead of pinning the removed ID.
+        if (this.imageReadyAt !== undefined && this.imageTag === pinned.tag && this.imageCachedId === pinned.id) this.resetImage();
         this.deps.logger.warn(
           `The ${pinned.previous === true ? 'previous helper image' : 'workspace helper image'} ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
         );

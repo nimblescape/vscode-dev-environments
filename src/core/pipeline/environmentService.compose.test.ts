@@ -968,6 +968,24 @@ describe('existing Docker Compose environment', () => {
     expect(h.docker.images.has(IMAGE_1)).toBe(true);
   });
 
+  it('ends with helperFailed, with the detail of the switch, when the helper image of the open is gone at up of the new Compose configuration (review round 4 of PR #64, R4-5)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('now uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${single.name}`);
+    // The cleanup of the switch stays, and nothing of the other kind is started.
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+    expect(h.ui.warnings).toEqual([]);
+  });
+
   it('starts the single container as it is on "Rebuild later" when the configuration became a Compose configuration (review round 1, P-1)', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     h.docker.images.add(DB_IMAGE);
@@ -1289,6 +1307,20 @@ describe('a Docker Compose environment whose configuration became a single conta
     // project and was then taken for a container of Compose.
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('ends with helperFailed, with the detail of the switch, when the helper image of the open is gone at up of the new single container (review round 4 of PR #64, R4-5)', async () => {
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${db?.name} of the service db`);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
   });
 
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
@@ -3313,6 +3345,23 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
     expect(error.code).toBe('startFailed');
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+  });
+
+  it('ends with helperFailed and keeps the previous dev container stopped when the helper image of the open is gone at up of the new dev service (review round 4 of PR #64, R4-5)', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    const ups = h.helper.ups.length;
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (image) => (image === IMAGE_1 ? undefined : new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`));
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('The dev service changed from app to web. The previous dev container is kept, stopped.');
+    // Not opened as it is, and no `up` with the previous image.
+    expect(h.helper.ups.slice(ups).map((up) => up.image)).toEqual([IMAGE_2]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
   });
 
   describe('final review, FF-1: a failed switch keeps the previous dev container', () => {

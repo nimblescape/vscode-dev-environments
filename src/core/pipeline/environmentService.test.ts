@@ -34,6 +34,7 @@ import {
   LABEL_HOST_ACCESS,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  configurationName,
   environmentImageName,
   environmentImageRepository,
   resourceName,
@@ -1568,7 +1569,9 @@ describe('open: existing environment', () => {
       const result = await h.service.open(TARGET, options());
       expect(result.containerName).toBe(NAME);
       expect(h.helper.builds).toHaveLength(1);
-      expect(h.ui.warnings).toEqual([]);
+      // Changed expectation (review round 4 of PR #64, R4-4): no buildFailed and no gitSetupFailed warning, but the user
+      // learns that the update was not applied.
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
       expect(h.helper.calls).not.toContain('prepareGit');
       expect(h.helper.ups).toEqual([]);
       expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
@@ -1583,9 +1586,103 @@ describe('open: existing environment', () => {
       const result = await h.service.open(TARGET, options());
       expect(result.containerName).toBe(NAME);
       expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
-      expect(h.ui.warnings).toEqual([]);
+      // Changed expectation (review round 4 of PR #64, R4-4): the user learns that the update was not applied.
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
       expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: before, state: 'running' })]);
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    });
+
+    it('(c) a rebuild that fails with helperFailed opens the running current container as it is and says that it was not rebuilt (review round 4 of PR #64, R4-4)', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      h.helper.buildError = gone;
+      const result = await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    });
+
+    it('(c) "Rebuild now" after a configuration change that fails with helperFailed says that it was not rebuilt (review round 4 of PR #64, R4-4)', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      h.helper.files['.devcontainer/devcontainer.json'] = { configText: '{ "image": "node:22", "remoteUser": "node" }' };
+      h.ui.configurationChangedAnswer = 'rebuildNow';
+      h.helper.buildError = gone;
+      await h.service.open(TARGET, options());
+      expect(h.ui.prompts).toContain(`configurationChanged ${REPO}`);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    });
+
+    it('(c) a selected configuration whose build fails with helperFailed is not applied: the previous one stays selected, and the user learns it (review round 4 of PR #64, R4-4)', async () => {
+      const env = await seedEnvironment(h, { container: 'running' });
+      const python = '.devcontainer/python/devcontainer.json';
+      h.helper.files[python] = { configText: '{ "image": "python:3.12" }' };
+      h.helper.config = { image: 'python:3.12' };
+      h.checker.outcome = checked({ 'python:3.12': DIGEST_NEW });
+      h.helper.buildError = gone;
+      const result = await h.service.openEnvironment(ENV_ID, options({ configPath: python }));
+      expect(result.containerName).toBe(NAME);
+      expect((await entry())?.configPath).toBe(env.configPath);
+      expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(env.configPath))]);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+    });
+
+    it('a container that `up` replaced does not open as it is when runUserCommands fails with helperFailed (review round 4 of PR #64, R4-7 M1)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const before = h.docker.containersOf(ENV_ID)[0].id;
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      // `up` created a new running container of the current setup; it is not the container that Step 5 found.
+      const after = h.docker.containersOf(ENV_ID);
+      expect(after).toHaveLength(1);
+      expect(after[0].id).not.toBe(before);
+      expect(after[0].state).toBe('running');
+      expect(h.ui.warnings).toEqual([]);
+    });
+
+    it('a container that was stopped during the failing build does not open as it is (review round 4 of PR #64, R4-7 M2)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const container = h.docker.containersOf(ENV_ID)[0];
+      // For example stopped by the user, or by the Session Monitor, while the build ran: the same ID, not running.
+      h.helper.onBuild = () => {
+        container.state = 'stopped';
+        container.rawState = 'exited';
+      };
+      h.helper.buildError = gone;
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: container.id, state: 'stopped' })]);
+      expect(h.ui.warnings).toEqual([]);
+    });
+
+    it('ends with helperFailed when the container cannot be looked up again after the failing build (review round 4 of PR #64, R4-7 M3)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const find = h.docker.findContainer.bind(h.docker);
+      let failLookup = false;
+      h.docker.findContainer = async (id, name) => {
+        if (failLookup) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return find(id, name);
+      };
+      h.helper.onBuild = () => {
+        failLookup = true;
+      };
+      h.helper.buildError = gone;
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.logger.warnings.join('\n')).toContain(`The container of ${REPO} could not be found`);
+      expect(h.ui.warnings).toEqual([]);
+    });
+
+    it('ends as cancelled, not opened as it is, when Cancel is pressed during the build that fails with helperFailed (review round 4 of PR #64, R4-7 M3)', async () => {
+      await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
+      const controller = new AbortController();
+      // The build fails with helperFailed while Cancel is pressed.
+      h.helper.buildError = () => {
+        controller.abort();
+        return gone();
+      };
+      const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+      expect(error.code).toBe('cancelled');
+      expect(h.logger.errors.join('\n')).not.toContain('The running environment is opened as it is');
+      expect(h.ui.warnings).toEqual([]);
     });
 
     it('a running container that `up` removed does not open as it is: helperFailed', async () => {

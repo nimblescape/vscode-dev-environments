@@ -136,7 +136,7 @@ export interface HelperImageUse {
   tag: string;
   /**
    * Review round 3 of PR #64 (P2): the ID of the image that the ensure checked: for the current tag the image that this
-   * ensure built (`--iidfile`) or found for the tag, for a previous helper the ID that helper.json recorded for its build
+   * ensure built (found by its build label, review round 4 of PR #64, R4-2/R4-3) or found for the tag, for a previous helper the ID that helper.json recorded for its build
    * (review round 1 of PR #64, S1). The runs of an open use it as the image reference, so a tag that moves (a rebuild of
    * another window, a build of another installation) never changes the helper image of an open. `undefined` only for a
    * current tag whose ID could not be read; its runs then use the tag.
@@ -203,7 +203,7 @@ interface Maintenance {
   options: EnsureHelperImageOptions;
   clock: Clock;
   logger: Logger;
-  /** The build; resolves with the ID of the built image (`--iidfile`), `undefined` when Docker gave none. */
+  /** The build; resolves with the ID of the built image (by its build label), `undefined` when it could not be found. */
   build(flags: BuildFlags): Promise<string | undefined>;
 }
 
@@ -240,7 +240,7 @@ export async function ensureHelperImage(
 /**
  * ensureHelperImage, with the image that it resolved (HelperImageUse): the tag, the ID of its image, and whether it is a
  * previous helper (review round 3 of PR #64, P1/P2). The ID of an image that this call built comes from the build
- * (`--iidfile`, P4), not from the tag.
+ * (its build label: review round 3 of PR #64, P4; review round 4 of PR #64, R4-2/R4-3), not from the tag.
  */
 export async function ensureHelperImageUse(
   docker: HelperImageDocker,
@@ -366,7 +366,7 @@ async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
       if (previous === undefined) throw error;
       return { tag: previous.tag, id: previous.imageId, previous: true };
     }
-    // Review round 3 of PR #64 (P4): helper.json records the ID of the image that this build made (`--iidfile`), never
+    // Review round 3 of PR #64 (P4): helper.json records the ID of the image that this build made (by its build label), never
     // one read back by the tag, which another build may have moved meanwhile. The tag is read only for the cleanup
     // (which keeps the current image) and the ID of the open, when the build gave no ID.
     const builtId = created.id;
@@ -442,7 +442,7 @@ async function create(m: Maintenance, checkBaseImage: boolean): Promise<{ change
  * Builds a missing tag, with `--pull` unless `pull` is false. A build with `--pull` that fails (the pull of the daemon
  * can fail where the request of the extension host worked: the pull limit, stored credentials that the registry
  * refuses, a proxy) is tried again without it. Returns whether the build pulled the base image, and the ID of the built
- * image (`--iidfile`). Throws when the tag cannot be built.
+ * image (by its build label). Throws when the tag cannot be built.
  */
 async function buildMissing(m: Maintenance, pull: boolean): Promise<{ pulled: boolean; id: string | undefined }> {
   m.options.onBuild?.('create');
@@ -494,7 +494,7 @@ async function rebuild(
     };
   }
   const builtAt = isoTime(m.clock);
-  // Review round 3 of PR #64 (P4): the ID of the rebuilt image comes from the build (`--iidfile`); the tag is read only
+  // Review round 3 of PR #64 (P4): the ID of the rebuilt image comes from the build (its build label); the tag is read only
   // when the build gave none, and such an ID is not recorded.
   const newId = builtId ?? (await imageIdQuietly(m));
   if (newId !== undefined && newId !== currentId) await removePreviousImage(m, currentId, newId);

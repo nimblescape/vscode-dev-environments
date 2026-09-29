@@ -272,6 +272,19 @@ export const Messages = {
   deleteServiceDataPossiblePlaceholder:
     'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
+  /**
+   * Review round 4 of PR #64 (R4-4): the helper image of an open was gone in the middle of an update, a rebuild, or the
+   * switch to a newly selected configuration, and the running container opened as it is. `change` names what was not
+   * applied; with a selected configuration, `previous` names the configuration that stays selected.
+   */
+  helperFailedOpenedAsItIs: (change: 'update' | 'rebuild' | 'configuration', previous?: string) =>
+    `The workspace helper could not be prepared. The running environment is opened as it is: ${
+      change === 'configuration'
+        ? `the selected configuration was not applied${previous !== undefined ? `, and ${previous} stays selected` : ''}`
+        : change === 'rebuild'
+          ? 'it was not rebuilt'
+          : 'the update was not applied'
+    }. Open it again to try again.`,
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
   /**

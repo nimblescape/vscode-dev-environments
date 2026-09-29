@@ -97,7 +97,7 @@ class FakeDocker implements HelperDocker {
     return this.ids.get(tag) ?? fakeImageId(tag);
   }
 
-  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as the `--iidfile` of the Docker CLI gives it. */
+  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as ContainerAdapter.buildImage finds it by its build label. */
   async buildImage(options: BuildOptions): Promise<string | undefined> {
     this.builds.push(options);
     await this.buildHandler(options);
@@ -568,8 +568,118 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toHaveLength(2);
     expect(state().images[TAG].checkedAt).toBe(iso());
     await helper.ensureImage();
-    expect(docker.imageIdCalls).toBe(calls + 1);
+    // Changed expectation (review round 4 of PR #64, R4-1): an open that reuses the cache checks once that the tag still
+    // has the cached image (one imageId call), without running ensureHelperImage again.
+    expect(docker.imageIdCalls).toBe(calls + 2);
+    expect(lookups).toHaveLength(2);
     expect(docker.builds).toHaveLength(1);
+  });
+});
+
+describe('WorkspaceHelper reuses its cached helper image only while the tag still has it (review round 4 of PR #64, R4-1)', () => {
+  const START = Date.parse('2026-09-24T12:00:00Z');
+  const I1 = fakeImageId(TAG);
+  const I2 = `sha256:${'2'.repeat(64)}`;
+  const DIGEST_A = `sha256:${'a'.repeat(64)}`;
+  const DIGEST_B = `sha256:${'b'.repeat(64)}`;
+
+  /** Two windows with the same Docker engine and the same helper.json. */
+  function windows() {
+    const now = START;
+    const statePath = path.join(dir, 'storage', 'helper.json');
+    const window = (baseDigest?: BaseDigestLookup) =>
+      new WorkspaceHelper({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'darwin', clock: { now: () => now }, statePath, baseDigest });
+    // docker run answers "No such image" for an image ID that no tag has anymore (the engine removed that image).
+    docker.handler = (args) => {
+      if (args[0] !== 'run') return {};
+      const reference = args.find((arg) => arg.startsWith('sha256:'));
+      if (reference !== undefined && ![...docker.images].some((tag) => docker.idOf(tag) === reference)) {
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${reference}.\n` };
+      }
+      return {};
+    };
+    return { a: window(), b: window(async () => DIGEST_B), statePath };
+  }
+
+  it('gives the next open of window A the image that window B rebuilt, without a build, after B removed the old image', async () => {
+    const { a, b, statePath } = windows();
+    const first = await a.ensureImageUse();
+    expect(first).toEqual({ tag: TAG, id: I1 });
+    expect((await a.run('vol', ['true'], { image: first })).exitCode).toBe(0);
+    // Window B rebuilds the tag from a new base image (a check asked for it); the image I1 is gone.
+    const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState;
+    saved.images[TAG] = { ...saved.images[TAG], baseImage: 'node:22-bookworm-slim', baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B };
+    fs.writeFileSync(statePath, JSON.stringify(saved));
+    docker.buildHandler = async () => {
+      docker.ids.set(TAG, I2);
+    };
+    expect(await b.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+    const builds = docker.builds.length;
+    // Within the hour of its cache, the next open of window A pins the new image and succeeds.
+    const second = await a.ensureImageUse();
+    expect(second).toEqual({ tag: TAG, id: I2 });
+    expect(docker.builds).toHaveLength(builds);
+    expect((await a.run('vol', ['true'], { image: second })).exitCode).toBe(0);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(I2);
+  });
+
+  it('builds the tag again for the next open of window A after a prune removed it', async () => {
+    const { a } = windows();
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I1 });
+    // docker image prune -a.
+    docker.images.delete(TAG);
+    docker.buildHandler = async () => {
+      docker.ids.set(TAG, I2);
+    };
+    const image = await a.ensureImageUse();
+    expect(image).toEqual({ tag: TAG, id: I2 });
+    expect(docker.builds).toHaveLength(2);
+    expect((await a.run('vol', ['true'], { image })).exitCode).toBe(0);
+  });
+
+  it('resets the cache of the window when a pinned run finds its image gone, and keeps it when Docker cannot answer the check', async () => {
+    const { a } = windows();
+    const image = await a.ensureImageUse();
+    const cache = a as unknown as { imagePromise: unknown };
+    // Another window moved the tag; the pinned image of this open is gone.
+    docker.ids.set(TAG, I2);
+    await expect(a.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(cache.imagePromise).toBeUndefined();
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+
+    // Docker does not answer the check of the cached image: the cache stays.
+    const calls = docker.imageIdCalls;
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async () => {
+      throw new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+    docker.imageId = imageId;
+    expect(docker.imageIdCalls).toBe(calls);
+    expect(docker.builds).toHaveLength(1);
+    expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} could not be checked`);
+  });
+
+  it('awaits the new cache when it was replaced during the check', async () => {
+    const { a } = windows();
+    await a.ensureImageUse();
+    const I3 = `sha256:${'3'.repeat(64)}`;
+    const calls = docker.imageIdCalls;
+    const imageId = docker.imageId.bind(docker);
+    let replaced = false;
+    docker.imageId = async (reference) => {
+      if (!replaced) {
+        replaced = true;
+        // Meanwhile, a run outside an open found its image missing and reset the cache (resetImage).
+        (a as unknown as { resetImage(): void }).resetImage();
+        docker.ids.set(TAG, I2);
+        // The new (pending) result of another caller; this caller awaits it and does not reset it.
+        (a as unknown as { imagePromise: Promise<HelperImageUse> }).imagePromise = Promise.resolve({ tag: TAG, id: I3 });
+      }
+      return imageId(reference);
+    };
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I3 });
+    expect(docker.imageIdCalls).toBe(calls + 1);
   });
 });
 

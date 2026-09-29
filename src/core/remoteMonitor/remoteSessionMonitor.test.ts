@@ -111,6 +111,9 @@ describe('RemoteSessionMonitor.ensure', () => {
     expect(args).toEqual([
       'run',
       '-d',
+      // Changed expectation (review round 4 of PR #64, R4-8): never a pull, like the helper runs.
+      '--pull',
+      'never',
       '--name',
       'devenv-session-monitor',
       '--label',

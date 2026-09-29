@@ -584,6 +584,11 @@ interface PipelineContext {
    */
   helperImage?: HelperImageUse;
   /**
+   * Review round 4 of PR #64 (R4-4): the helper image of this run was gone in Step 8 and the running container opens as it
+   * is (helperFailedInUpdate): the update, the rebuild, or the selected configuration was not applied.
+   */
+  helperFailedInUpdate?: boolean;
+  /**
    * Review round 1 of PR #64 (L2): the configuration was read, but its check could not run (AnalysisFailure `internal`,
    * for example Docker did not answer for its images): the reason of a Docker Compose start that fails says so.
    */
@@ -1398,6 +1403,7 @@ export class EnvironmentService {
         }
         throw error;
       }
+      if (ctx.helperFailedInUpdate === true) await this.warnHelperFailedInUpdate(ctx, previousConfigPath, plan.forced);
     }
     outcome ??= await this.startContainer(ctx, container, record, imagePresent, this.configurationOfKind(ctx, loaded, container, record));
     return this.finish(ctx, outcome, loaded);
@@ -2353,7 +2359,10 @@ export class EnvironmentService {
         return undefined;
       }
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
-      this.logger.error(`The container of ${env.repository} could not be created from ${imageName}.`, error);
+      // Review round 4 of PR #64 (R4-5): the helper image of the open is gone; the new image is not the cause.
+      const helperFailed = isHelperFailed(error);
+      if (helperFailed) ctx.helperUnavailable = true;
+      else this.logger.error(`The container of ${env.repository} could not be created from ${imageName}.`, error);
       // Review round 2 (D2-4): the build switched the kind of the environment (Docker Compose or a single container). The
       // previous kind is not started from here: its image is not an image of the new kind, and the configuration is of
       // the new kind. The next build tries again.
@@ -2366,11 +2375,14 @@ export class EnvironmentService {
         // run, and only those that did not exist before `up` (an earlier switch that was cancelled may have created
         // containers that the user worked with since).
         const failed = loaded.compose !== undefined ? await this.removeFailedComposeContainers(ctx) : { removed: [], kept: [] };
-        throw new UserFacingError(
-          'startFailed',
-          PipelineTexts.startFailed,
-          kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept),
-        );
+        const detail = kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept);
+        // Review round 4 of PR #64 (R4-5): the cleanup of the switch above stays (the containers of the other kind are
+        // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
+        if (helperFailed) {
+          this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its configuration could not be completed.`, error);
+          throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+        }
+        throw new UserFacingError('startFailed', PipelineTexts.startFailed, detail);
       }
       // Final review (FF-1): the build switched the dev service of the Docker Compose project (Select configuration…
       // between two configurations of one compose file, D22-1). The previous dev container was renamed out of the way
@@ -2381,12 +2393,21 @@ export class EnvironmentService {
       if (loaded.compose !== undefined && previousService !== undefined && previousService !== loaded.compose.service) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
+        // Review round 4 of PR #64 (R4-5): the helper image of the open is gone: helperFailed, with the detail of the switch.
+        if (helperFailed) {
+          this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its dev service could not be completed.`, error);
+          throw new UserFacingError(
+            'helperFailed',
+            Messages.helperFailed,
+            `The dev service changed from ${previousService} to ${loaded.compose.service}. The previous dev container is kept, stopped. ${errorDetail(error)}`,
+          );
+        }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
       }
       // Review round 3 of PR #64 (P6b): the helper image of the open is gone, so the old environment image cannot be
       // started either (that needs the helper too): no buildFailed warning and no restore; a running container that is
       // current opens as it is, otherwise the open ends with helperFailed (not startFailed).
-      if (isHelperFailed(error)) {
+      if (helperFailed) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         return this.helperFailedInUpdate(ctx, error, container, record);
       }
@@ -2495,11 +2516,35 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 4 of PR #64 (R4-4): the running container opens as it is after the helper image of the open was gone
+   * in Step 8 (helperFailedInUpdate). A newly selected configuration does not stay selected (as after a failed start,
+   * review round 22, D22-1), since the running container is of the previous one; the user learns what was not applied:
+   * the selected configuration, the rebuild (Rebuild, "Rebuild now"), or the update of the images or the configuration.
+   */
+  private async warnHelperFailedInUpdate(ctx: PipelineContext, previousConfigPath: string, rebuild: boolean): Promise<void> {
+    const configurationChanged = ctx.env.configPath !== previousConfigPath;
+    if (configurationChanged) {
+      this.logger.info(`The configuration ${ctx.env.configPath} of ${ctx.env.repository} was not applied; ${previousConfigPath} stays selected.`);
+      await this.quietly('restore the configuration path', () =>
+        this.updateEntry(ctx, (entry) => {
+          entry.configPath = previousConfigPath;
+        }),
+      );
+    }
+    this.deps.ui.warn(
+      configurationChanged
+        ? Messages.helperFailedOpenedAsItIs('configuration', configurationName(previousConfigPath))
+        : Messages.helperFailedOpenedAsItIs(rebuild ? 'rebuild' : 'update'),
+    );
+  }
+
+  /**
    * Review round 3 of PR #64 (P6): a helper run of Step 8 (the build, `up`, or the restore with the previous environment
    * image) failed with helperFailed: the helper image of the open is gone. The rest of the open uses no
    * helper (ctx.helperUnavailable, so the Git setup is skipped too). When the container that Step 5 found still exists,
    * runs, and is current, it opens as it is (returns `undefined`: no warning that the update failed, no start with the
-   * previous image, which needs the helper too); otherwise `error` ends the open. A cancellation passes through.
+   * previous image, which needs the helper too; review round 4 of PR #64, R4-4: runPipeline warns that the change was not
+   * applied, warnHelperFailedInUpdate); otherwise `error` ends the open. A cancellation passes through.
    */
   private async helperFailedInUpdate(
     ctx: PipelineContext,
@@ -2521,6 +2566,8 @@ export class EnvironmentService {
     }
     if (container === undefined || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record))) throw error;
     this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
+    // Review round 4 of PR #64 (R4-4): runPipeline tells the user that the change was not applied.
+    ctx.helperFailedInUpdate = true;
     return undefined;
   }
 
