@@ -1671,6 +1671,10 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
     // Review round 23 of PR #64 (B-R23-1): the question says that a stopped dev container does not start.
     expect(h.ui.kindQuestions[0]).toContain('Otherwise nothing starts: a stopped dev container');
+    // Review round 24 of PR #64 (B-R24-1): the question says that Later keeps Docker Compose without a rebuild and that
+    // the containers start only with a Docker Compose configuration.
+    expect(h.ui.kindQuestions[0]).toContain('Later keeps Docker Compose without a rebuild');
+    expect(h.ui.kindQuestions[0]).toContain('start only with a Docker Compose configuration.');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
@@ -2137,6 +2141,8 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     const changed = await h.service.configurationChanged(ENV_ID, options());
     expect(changed).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
     const question = typeof changed === 'object' ? changed.question : '';
+    // Review round 24 of PR #64 (B-R24-1): also in the connected window, Later keeps Docker Compose without a rebuild.
+    expect(question).toContain('Later keeps Docker Compose without a rebuild');
     expect(question).toContain('this window stays connected, and nothing is started or removed');
     expect(question).not.toContain('are started');
     expect(question).not.toContain('opens as it is');
