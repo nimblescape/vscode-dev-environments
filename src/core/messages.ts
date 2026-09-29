@@ -38,12 +38,23 @@ export const Messages = {
   configurationChanged: 'The environment configuration changed.',
   /**
    * Review round 4 (D4-3): an environment without a build record (restored after a lost registry) whose containers are of
-   * another kind than its configuration. Rebuild now switches the kind; Later keeps it (the non-destructive answer).
+   * another kind than its configuration. Rebuild now switches the kind; Later keeps it (the non-destructive answer). No
+   * docker start fallback (user decision 2026-09-29): Later starts no stopped dev container of Docker Compose without a
+   * Docker Compose configuration; a running one opens as it is and its stopped services start when no container of the
+   * environment must be created again (D-22, review round 19 of PR #64, R19-1; review round 22, A-R22-1; a container created
+   * while the host access checks were off only while they are on now, review round 23, A-R23-2).
    */
   configurationKindChanged: (containersUseCompose: boolean, configPath: string) =>
     containersUseCompose
-      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
+      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: if the dev container runs already and no container of the environment must be created again, the dev container opens as it is, and the stopped containers of the other services are started. Otherwise nothing starts: a stopped dev container, or containers that must be created again (for example because an older version created them, or because they were created while the host access checks were off and the checks are on now), start only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
       : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
+  /**
+   * Review round 20 of PR #64 (R20-2): configurationKindChanged(true, …) in the window that is connected to the
+   * environment (Switch branch…, configurationChanged). Later there only keeps the window connected: nothing is started
+   * or removed (the next open starts the stopped services, D-22).
+   */
+  configurationKindChangedConnected: (configPath: string) =>
+    `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: this window stays connected, and nothing is started or removed. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`,
   /**
    * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts
    * nothing then (composeDevContainerMissing).
@@ -270,6 +281,19 @@ export const Messages = {
   deleteServiceDataPossiblePlaceholder:
     'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
+  /**
+   * Review round 4 of PR #64 (R4-4): the helper image of an open was gone in the middle of an update, a rebuild, or the
+   * switch to a newly selected configuration, and the running container opened as it is. `change` names what was not
+   * applied; with a selected configuration, `previous` names the configuration that stays selected.
+   */
+  helperFailedOpenedAsItIs: (change: 'update' | 'rebuild' | 'configuration', previous?: string) =>
+    `The workspace helper could not be prepared. The running environment is opened as it is: ${
+      change === 'configuration'
+        ? `the selected configuration was not applied${previous !== undefined ? `, and ${previous} stays selected` : ''}`
+        : change === 'rebuild'
+          ? 'it was not rebuilt'
+          : 'the update was not applied'
+    }. Open it again to try again.`,
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
   /**

@@ -22,6 +22,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { registryBaseDigest } from '../core/helper/helperImage';
+import { HelperPrebuild } from '../core/helper/helperPrebuild';
 import { DOCKER_SOCKET, WorkspaceHelper } from '../core/helper/workspaceHelper';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
@@ -56,6 +57,7 @@ import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
+import { remoteMonitorEnsure } from './remoteMonitorEnsure';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
@@ -323,8 +325,7 @@ async function activateExtension(
     dockerTarget: () => targets.current(),
     // Unit 7, PR 2: the Session Monitor on a remote host, with the socket that the workspace helper mounts there.
     remoteMonitor: {
-      ensure: async (host, helperTag, signal) =>
-        remoteMonitor.ensure(helperTag, (await remoteState.rootlessSocket(host)) ?? DOCKER_SOCKET, signal),
+      ensure: remoteMonitorEnsure(remoteMonitor, (host) => remoteState.rootlessSocket(host)),
       heartbeat: async (_host, environmentId, keepRunning, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),
@@ -530,6 +531,23 @@ async function activateExtension(
   if (view.visible) background(sidebar.refreshStates(), 'update the sidebar');
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
+  // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
+  // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background on the local Docker, when it runs (review round
+  // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
+  // The build is shared with the open pipeline of this window (WorkspaceHelper.prebuildImage) and cancelled when the
+  // extension is deactivated.
+  const helperPrebuild = new HelperPrebuild({
+    helper,
+    dockerRunning: (signal) => docker.isRunning(signal),
+    dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
+    statePath: paths.helperState,
+    logger,
+  });
+  context.subscriptions.push(helperPrebuild);
+  background(
+    targets.current().then((target) => (target.kind === 'local' ? runWithDockerTarget(target, () => helperPrebuild.start()) : helperPrebuild.start())),
+    'prepare the workspace helper image in the background',
+  );
 
   if (currentEnvironment && containerName && docker.isInstalled()) {
     // User request 2026-09-28: which Docker the Dev Containers extension asks when it resolves this window. Only for an

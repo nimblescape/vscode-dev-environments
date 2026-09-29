@@ -35,6 +35,46 @@ describe('isHelperImageTag', () => {
 });
 
 describe('parseHelperState', () => {
+  // Review round 5 of PR #64, R5-4: the previousTag of an older file was never shipped, so this test no longer names it;
+  // an unknown key is dropped like any other.
+  it('keeps the image ID of a build', () => {
+    const state = {
+      version: 1,
+      images: { [TAG]: { builtAt: TIME, imageId: `sha256:${'1'.repeat(64)}`, lastUsedAt: TIME } },
+    };
+    expect(parseHelperState(state)).toEqual(state);
+    expect(parseHelperState({ version: 1, images: {}, extra: 1 })).toEqual({ version: 1, images: {} });
+    expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: 7 } } })).toEqual({ version: 1, images: { [TAG]: {} } });
+  });
+
+  it('keeps only a full sha256: image ID (review round 1 of PR #64, S5)', () => {
+    const id = `sha256:${'0123456789abcdef'.repeat(4)}`;
+    expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: id } } })).toEqual({ version: 1, images: { [TAG]: { imageId: id } } });
+    for (const imageId of [
+      'id:devenv-helper:0123456789ab',
+      'sha256:0123',
+      `sha256:${'A'.repeat(64)}`,
+      `sha256:${'0'.repeat(65)}`,
+      `${'0'.repeat(64)}`,
+      `sha512:${'0'.repeat(64)}`,
+      ` sha256:${'0'.repeat(64)}`,
+      `sha256:${'0'.repeat(64)}\n`,
+      'devenv-helper:0123456789ab',
+      '--privileged',
+    ]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, imageId } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME } } });
+    }
+  });
+
+  it('keeps a helper generation that is a positive safe integer (review round 2 of PR #64, A-N2)', () => {
+    for (const generation of [1, 2, Number.MAX_SAFE_INTEGER]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } });
+    }
+    for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY, '1', null, true]) {
+      expect(parseHelperState({ version: 1, images: { [TAG]: { builtAt: TIME, generation } } })).toEqual({ version: 1, images: { [TAG]: { builtAt: TIME } } });
+    }
+  });
+
   it('keeps valid records', () => {
     const state = {
       version: 1,

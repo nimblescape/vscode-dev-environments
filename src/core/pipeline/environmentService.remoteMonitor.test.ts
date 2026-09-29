@@ -39,8 +39,9 @@ function setup(
   const calls: string[] = [];
   seqs = [];
   const remoteMonitor: EnvironmentRemoteMonitor = {
-    ensure: async (host, helperTag) => {
-      calls.push(`ensure ${host} ${helperTag}`);
+    ensure: async (host, helperTag, _signal, helperImage) => {
+      // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): the image ID of the helper image of the open.
+      calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
       // In the order of the helper calls.
       created.helper.calls.push('remote monitor');
       return behavior.ensure?.();
@@ -68,8 +69,9 @@ describe('the Session Monitor on a remote host in the open pipeline', () => {
   it('a first open on a remote host ensures it once, with the helper tag, after the helper image and before up', async () => {
     const { h, calls } = setup(REMOTE);
     const result = await h.service.open(TARGET, { progress: h.progress });
-    // Then the first heartbeat of this computer for the new environment, not kept.
-    expect(calls).toEqual(['ensure build-box devenv-helper:test', `heartbeat build-box ${result.environment.id} false`]);
+    // Then the first heartbeat of this computer for the new environment, not kept. Changed expectation (review round 3 of
+    // PR #64, P2): the monitor runs the image ID that the open pinned for the current tag too; the label keeps the tag.
+    expect(calls).toEqual([`ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat build-box ${result.environment.id} false`]);
     const order = h.helper.calls;
     expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
     expect(order.indexOf('remote monitor')).toBeLessThan(order.indexOf('first heartbeat'));
@@ -81,7 +83,8 @@ describe('the Session Monitor on a remote host in the open pipeline', () => {
     const { h, calls } = setup(REMOTE);
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
-    expect(calls).toEqual(['ensure build-box devenv-helper:test', `heartbeat build-box ${ENV_ID} false`]);
+    // Changed expectation (review round 3 of PR #64, P2): the monitor runs the image ID that the open pinned.
+    expect(calls).toEqual([`ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat build-box ${ENV_ID} false`]);
     // The stopped container is started with `up` of the Dev Container CLI.
     const up = h.helper.calls.findIndex((call) => call.startsWith('up '));
     expect(up).toBeGreaterThan(h.helper.calls.indexOf('first heartbeat'));

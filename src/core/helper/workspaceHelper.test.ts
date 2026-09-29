@@ -2,6 +2,9 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { AsyncLocalStorage } from 'async_hooks';
+import * as crypto from 'crypto';
+import { getEventListeners } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -13,7 +16,8 @@ import { abortError, type Logger, type RunOptions, type RunResult } from '../por
 import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
-import { HELPER_CHECK_INTERVAL_MS, helperImageTag, type BaseDigestLookup } from './helperImage';
+import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
+import { HelperPrebuild, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
@@ -43,6 +47,7 @@ import {
   isPassableEnvName,
   type HelperDeps,
   type HelperDocker,
+  type HelperImageUse,
 } from './workspaceHelper';
 
 const TOKEN = 'gho_0123456789abcdefSECRET';
@@ -57,8 +62,18 @@ interface Call {
   options: RunOptions;
 }
 
+/**
+ * The image ID of the fake for a tag: a full `sha256:` ID, which helper.json keeps (review round 1 of PR #64, S5: an ID
+ * of another form, like the former `id:<tag>`, is dropped).
+ */
+function fakeImageId(tag: string): string {
+  return `sha256:${crypto.createHash('sha256').update(tag).digest('hex')}`;
+}
+
 class FakeDocker implements HelperDocker {
   readonly images = new Set<string>();
+  /** Image IDs that differ from fakeImageId(tag): a tag that points to another image now. */
+  readonly ids = new Map<string, string>();
   readonly builds: BuildOptions[] = [];
   readonly calls: Call[] = [];
   buildHandler: (options: BuildOptions) => Promise<void> = async () => undefined;
@@ -78,18 +93,24 @@ class FakeDocker implements HelperDocker {
 
   async imageId(reference: string): Promise<string | undefined> {
     this.imageIdCalls++;
-    return this.images.has(reference) ? `id:${reference}` : undefined;
+    return this.images.has(reference) ? this.idOf(reference) : undefined;
   }
 
-  async buildImage(options: BuildOptions): Promise<void> {
+  idOf(tag: string): string {
+    return this.ids.get(tag) ?? fakeImageId(tag);
+  }
+
+  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as ContainerAdapter.buildImage finds it by its build label. */
+  async buildImage(options: BuildOptions): Promise<string | undefined> {
     this.builds.push(options);
     await this.buildHandler(options);
     this.images.add(options.tag);
+    return this.idOf(options.tag);
   }
 
   async listImagesByLabel(): Promise<ImageInfo[]> {
     this.listCalls++;
-    return [...this.images].map((tag) => ({ id: `id:${tag}`, tags: [tag], createdAt: '' }));
+    return [...this.images].map((tag) => ({ id: this.idOf(tag), tags: [tag], createdAt: '' }));
   }
 
   async removeImage(reference: string): Promise<boolean> {
@@ -120,6 +141,13 @@ function hasDockerAccess(args: string[]): boolean {
 function hasNoNetwork(args: string[]): boolean {
   const index = args.indexOf('--network');
   return index >= 0 && args[index + 1] === 'none';
+}
+
+/** The command after the image reference `image` in docker run arguments. */
+function commandOfImage(args: string[], image: string): string[] {
+  const index = args.indexOf(image);
+  expect(index).toBeGreaterThan(0);
+  return args.slice(index + 1);
 }
 
 /** The command after the image tag in docker run arguments. */
@@ -493,12 +521,19 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toEqual(['node:22-bookworm-slim']);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     expect(state().images[TAG]).toEqual({
       baseImage: 'node:22-bookworm-slim',
       baseDigest: DIGEST,
       builtAt: iso(),
       checkedAt: iso(),
       lastUsedAt: iso(),
+      // Changed expectation (review round 1 of PR #64, S5): the fake gives full sha256: IDs, the only form helper.json keeps.
+      imageId: fakeImageId(TAG),
+      // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
+      generation: HELPER_GENERATION,
     });
   });
 
@@ -538,8 +573,1107 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toHaveLength(2);
     expect(state().images[TAG].checkedAt).toBe(iso());
     await helper.ensureImage();
-    expect(docker.imageIdCalls).toBe(calls + 1);
+    // Changed expectation (review round 4 of PR #64, R4-1): an open that reuses the cache checks once that the tag still
+    // has the cached image (one imageId call), without running ensureHelperImage again.
+    expect(docker.imageIdCalls).toBe(calls + 2);
+    expect(lookups).toHaveLength(2);
     expect(docker.builds).toHaveLength(1);
+  });
+});
+
+describe('WorkspaceHelper reuses its cached helper image only while the tag still has it (review round 4 of PR #64, R4-1)', () => {
+  const START = Date.parse('2026-09-24T12:00:00Z');
+  const I1 = fakeImageId(TAG);
+  const I2 = `sha256:${'2'.repeat(64)}`;
+  const DIGEST_A = `sha256:${'a'.repeat(64)}`;
+  const DIGEST_B = `sha256:${'b'.repeat(64)}`;
+
+  /** Two windows with the same Docker engine and the same helper.json. */
+  function windows() {
+    const now = START;
+    const statePath = path.join(dir, 'storage', 'helper.json');
+    const window = (baseDigest?: BaseDigestLookup) =>
+      new WorkspaceHelper({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'darwin', clock: { now: () => now }, statePath, baseDigest });
+    // docker run answers "No such image" for an image ID that no tag has anymore (the engine removed that image).
+    docker.handler = (args) => {
+      if (args[0] !== 'run') return {};
+      const reference = args.find((arg) => arg.startsWith('sha256:'));
+      if (reference !== undefined && ![...docker.images].some((tag) => docker.idOf(tag) === reference)) {
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${reference}.\n` };
+      }
+      return {};
+    };
+    return { a: window(), b: window(async () => DIGEST_B), statePath };
+  }
+
+  it('gives the next open of window A the image that window B rebuilt, without a build, after B removed the old image', async () => {
+    const { a, b, statePath } = windows();
+    const first = await a.ensureImageUse();
+    expect(first).toEqual({ tag: TAG, id: I1 });
+    expect((await a.run('vol', ['true'], { image: first })).exitCode).toBe(0);
+    // Window B rebuilds the tag from a new base image (a check asked for it); the image I1 is gone.
+    const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState;
+    saved.images[TAG] = { ...saved.images[TAG], baseImage: 'node:22-bookworm-slim', baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B };
+    fs.writeFileSync(statePath, JSON.stringify(saved));
+    docker.buildHandler = async () => {
+      docker.ids.set(TAG, I2);
+    };
+    expect(await b.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+    const builds = docker.builds.length;
+    // Within the hour of its cache, the next open of window A pins the new image and succeeds.
+    const second = await a.ensureImageUse();
+    expect(second).toEqual({ tag: TAG, id: I2 });
+    expect(docker.builds).toHaveLength(builds);
+    expect((await a.run('vol', ['true'], { image: second })).exitCode).toBe(0);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(I2);
+  });
+
+  it('builds the tag again for the next open of window A after a prune removed it', async () => {
+    const { a } = windows();
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I1 });
+    // docker image prune -a.
+    docker.images.delete(TAG);
+    docker.buildHandler = async () => {
+      docker.ids.set(TAG, I2);
+    };
+    const image = await a.ensureImageUse();
+    expect(image).toEqual({ tag: TAG, id: I2 });
+    expect(docker.builds).toHaveLength(2);
+    expect((await a.run('vol', ['true'], { image })).exitCode).toBe(0);
+  });
+
+  it('resets the cache of the window when a pinned run finds its image gone, and keeps it when Docker cannot answer the check', async () => {
+    const { a } = windows();
+    const image = await a.ensureImageUse();
+    const cache = a as unknown as { imagePromise: unknown };
+    // Another window moved the tag; the pinned image of this open is gone.
+    docker.ids.set(TAG, I2);
+    await expect(a.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(cache.imagePromise).toBeUndefined();
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+
+    // Docker does not answer the check of the cached image: the cache stays.
+    const calls = docker.imageIdCalls;
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async () => {
+      throw new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+    docker.imageId = imageId;
+    expect(docker.imageIdCalls).toBe(calls);
+    expect(docker.builds).toHaveLength(1);
+    expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} could not be checked`);
+  });
+
+  it('keeps a newer cache of the window when a pinned run of an older open finds its image gone (review round 20 of PR #64, B-R20-4)', async () => {
+    const { a } = windows();
+    const old = await a.ensureImageUse();
+    // Another window moved the tag; the next open of this window resolves the new image.
+    docker.ids.set(TAG, I2);
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
+    const cache = a as unknown as { imagePromise: unknown };
+    const held = cache.imagePromise;
+    expect(held).toBeDefined();
+    // The older open still pins I1, which is gone: it fails, and the cache of the window (I2) stays.
+    await expect(a.run('vol', ['true'], { image: old })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(cache.imagePromise).toBe(held);
+  });
+
+  it('awaits the new cache when it was replaced during the check', async () => {
+    const { a } = windows();
+    await a.ensureImageUse();
+    const I3 = `sha256:${'3'.repeat(64)}`;
+    const calls = docker.imageIdCalls;
+    const imageId = docker.imageId.bind(docker);
+    let replaced = false;
+    docker.imageId = async (reference) => {
+      if (!replaced) {
+        replaced = true;
+        // Meanwhile, a run outside an open found its image missing and reset the cache (resetImage).
+        (a as unknown as { resetImage(): void }).resetImage();
+        docker.ids.set(TAG, I2);
+        // The new (pending) result of another caller; this caller awaits it and does not reset it.
+        (a as unknown as { imagePromise: Promise<HelperImageUse> }).imagePromise = Promise.resolve({ tag: TAG, id: I3 });
+      }
+      return imageId(reference);
+    };
+    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I3 });
+    expect(docker.imageIdCalls).toBe(calls + 1);
+  });
+});
+
+describe('WorkspaceHelper keeps the helper image of each engine apart for overlapping opens (review round 8 of PR #64, R8-1)', () => {
+  const REMOTE_ID = `sha256:${'r'.repeat(64)}`;
+
+  /**
+   * One window with two engines: the local Docker and a remote one (key `box`). Each operation keeps its engine, as the
+   * Docker target of an open does (AsyncLocalStorage); the Docker calls go to the engine of the operation.
+   */
+  function engines() {
+    const als = new AsyncLocalStorage<string>();
+    const local = new FakeDocker();
+    const remote = new FakeDocker();
+    remote.ids.set(TAG, REMOTE_ID);
+    const dispatch = new Proxy({} as HelperDocker, {
+      get: (_target, property) => {
+        const target = als.getStore() === 'box' ? remote : local;
+        const value = Reflect.get(target, property) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const helper = new WorkspaceHelper({
+      docker: dispatch,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'linux',
+      clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+      statePath: path.join(dir, 'storage', 'helper.json'),
+      engine: async () => ({ key: als.getStore() ?? '' }),
+    });
+    const onRemote = <T>(action: () => Promise<T>): Promise<T> => als.run('box', action);
+    return { helper, local, remote, onRemote };
+  }
+
+  /** A build of `docker` that waits for `release`. */
+  function blockBuild(docker: FakeDocker): { release: () => void } {
+    const gate = { release: () => undefined as void };
+    docker.buildHandler = () =>
+      new Promise<void>((resolve) => {
+        gate.release = resolve;
+      });
+    return gate;
+  }
+
+  it('gives a local open the local image when a remote open replaced the cache during the check of the cached image', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    // The next local open checks the cached image (cachedImageCurrent); the check waits.
+    const imageId = local.imageId.bind(local);
+    let answer: (() => void) | undefined;
+    local.imageId = (reference) =>
+      new Promise((resolve) => {
+        answer = () => resolve(imageId(reference));
+      });
+    const first = helper.ensureImageUse();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    local.imageId = imageId;
+    // Meanwhile, an open on the remote engine replaces the cache with the image of its engine.
+    expect(await onRemote(() => helper.ensureImageUse())).toEqual({ tag: TAG, id: REMOTE_ID });
+    answer?.();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(local.builds).toHaveLength(1);
+    expect(remote.builds).toHaveLength(1);
+  });
+
+  it('gives a local open that joins the prebuild the local image when a remote open replaced the cache meanwhile', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    const localBuild = blockBuild(local);
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    await vi.waitFor(() => expect(local.builds).toHaveLength(1));
+    // The local open joins the prebuild (the result of a helper run without the maintenance).
+    const first = helper.ensureImageUse();
+    // Meanwhile, an open on the remote engine starts the build of its engine.
+    const remoteBuild = blockBuild(remote);
+    const second = onRemote(() => helper.ensureImageUse());
+    await vi.waitFor(() => expect(remote.builds).toHaveLength(1));
+    localBuild.release();
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    remoteBuild.release();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await second).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(local.builds).toHaveLength(1);
+    expect(remote.builds).toHaveLength(1);
+  });
+
+  // Review round 20 of PR #64 (B-R20-5d): a replaced (stale) ensure touches neither the cache nor the progress of the new one.
+  it('a replaced ensure that fails later leaves the cache of the other engine alone: no second build', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    let fail: (() => void) | undefined;
+    let failed = false;
+    // The build with --pull waits for `fail`; the retry without --pull fails at once.
+    local.buildHandler = () =>
+      failed
+        ? Promise.reject(new CommandError('docker build', 1, '', 'network unreachable'))
+        : new Promise<void>((_resolve, reject) => {
+            fail = () => {
+              failed = true;
+              reject(new CommandError('docker build', 1, '', 'network unreachable'));
+            };
+          });
+    const first = helper.ensureImageUse().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(fail).toBeDefined());
+    const remoteBuild = blockBuild(remote);
+    const second = onRemote(() => helper.ensureImageUse());
+    await vi.waitFor(() => expect(remote.builds).toHaveLength(1));
+    // The replaced local ensure fails while the remote build runs.
+    fail?.();
+    expect(await first).toMatchObject({ code: 'helperFailed' });
+    // Another remote open joins the running remote build.
+    const third = onRemote(() => helper.ensureImageUse());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(remote.builds).toHaveLength(1);
+    remoteBuild.release();
+    expect(await second).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(await third).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(remote.builds).toHaveLength(1);
+  });
+
+  it('a replaced ensure that succeeds later does not put its image into the cache of the other engine', async () => {
+    const { helper, local, onRemote } = engines();
+    const localBuild = blockBuild(local);
+    const first = helper.ensureImageUse();
+    await vi.waitFor(() => expect(local.builds).toHaveLength(1));
+    expect(await onRemote(() => helper.ensureImageUse())).toEqual({ tag: TAG, id: REMOTE_ID });
+    localBuild.release();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    // The next remote open reuses its cache: no "has another image now".
+    expect(await onRemote(() => helper.ensureImageUse())).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(logger.lines.join('\n')).not.toContain('It is prepared again');
+  });
+
+  it('a replaced ensure that starts its build later gives no build progress to an open of the other engine', async () => {
+    const { helper, local, remote, onRemote } = engines();
+    remote.images.add(TAG);
+    // The local ensure waits before it finds its tag missing.
+    const imageId = local.imageId.bind(local);
+    let answer: (() => void) | undefined;
+    local.imageId = (reference) =>
+      new Promise((resolve) => {
+        answer = () => resolve(imageId(reference));
+      });
+    const first = helper.ensureImageUse();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    local.imageId = imageId;
+    expect(await onRemote(() => helper.ensureImageUse())).toEqual({ tag: TAG, id: REMOTE_ID });
+    answer?.();
+    expect(await first).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(local.builds).toHaveLength(1);
+    const onBuild = vi.fn();
+    expect(await onRemote(() => helper.ensureImageUse({ onBuild }))).toEqual({ tag: TAG, id: REMOTE_ID });
+    expect(remote.builds).toEqual([]);
+    expect(onBuild).not.toHaveBeenCalled();
+  });
+});
+
+describe('WorkspaceHelper without a previous helper image (user decision 2026-09-29)', () => {
+  /** A helper image of an older extension version that this installation built. It is never used. */
+  const OLDER = 'devenv-helper:0123456789ab';
+  const START = Date.parse('2026-09-24T12:00:00Z');
+
+  function setup() {
+    let now = START;
+    const statePath = path.join(dir, 'storage', 'helper.json');
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    docker.images.add(OLDER);
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({ version: 1, images: { [OLDER]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: fakeImageId(OLDER), generation: HELPER_GENERATION } } }),
+    );
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'darwin',
+      clock: { now: () => now },
+      statePath,
+    });
+    return {
+      helper,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
+    };
+  }
+
+  const offline = async (): Promise<void> => {
+    throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+  };
+
+  /** The image reference of each `docker run` from index `from` on. */
+  const references = (from = 0) => docker.runs.slice(from).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
+
+  it('fails with helperFailed when the current tag cannot be built, never runs an older helper image, and builds the tag again at the next ensureImage', async () => {
+    // user decision 2026-09-29: no previous helper image. Changed expectation: before, the older helper image of this
+    // installation was returned and the helper runs used it by its image ID.
+    const { helper, advance } = setup();
+    docker.buildHandler = offline;
+    const error = await helper.ensureImageUse().catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: 'helperFailed' });
+    expect((error as UserFacingError).message).toBe('The workspace helper could not be prepared.');
+    await expect(helper.run('vol', ['true'])).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(docker.runs).toEqual([]);
+    expect(logger.lines.join('\n')).not.toContain('previous helper');
+
+    // The next open (online again) builds the current tag and uses it.
+    docker.buildHandler = async () => undefined;
+    advance(60_000);
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    await helper.run('vol', ['true']);
+    expect(references()).toEqual([TAG]);
+  });
+
+  it('fails with helperFailed without a build when the current image of an open is gone at a run (review round 2 of PR #64, A-N1; review round 3 of PR #64, P2)', async () => {
+    const { helper } = setup();
+    // Review round 3 of PR #64 (P2): the open pins the current tag by the ID of its image.
+    const image = await helper.ensureImageUse();
+    expect(image).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    // Changed expectation (review round 3 of PR #64, P2): before, the same tag was built again and the run went on with
+    // it; a pinned run now uses the image ID, and when that image is gone the open ends with helperFailed: nothing is
+    // built (a build may give another image).
+    docker.handler = (args) => {
+      if (args.includes(fakeImageId(TAG))) {
+        docker.images.delete(TAG);
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(TAG)}.\n` };
+      }
+      return {};
+    };
+    const builds = docker.builds.length;
+    const runs = docker.runs.length;
+    const error = await helper.run('vol', ['true'], { image }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: 'helperFailed' });
+    expect((error as UserFacingError).detail).toBe(`No such image: ${fakeImageId(TAG)}`);
+    expect(docker.runs).toHaveLength(runs + 1);
+    expect(docker.builds).toHaveLength(builds);
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the check that no older helper image is
+    // run now covers every image other than the pinned one.
+    expect(references(runs)).toEqual([fakeImageId(TAG)]);
+    expect(logger.lines).toContain(
+      `warn The workspace helper image ${TAG} (${fakeImageId(TAG).slice(0, 19)}) that this open uses was removed. The open cannot go on with another helper image.`,
+    );
+    expect(logger.lines.join('\n')).not.toContain('It is built again');
+  });
+
+  it('keeps the runs of an open on the image ID of its current tag when another window rebuilds the tag in the middle of the open (review round 3 of PR #64, P2)', async () => {
+    const { helper } = setup();
+    const image = await helper.ensureImageUse();
+    expect(image.id).toBe(fakeImageId(TAG));
+    await helper.run('vol', ['true'], { image });
+    // Another window rebuilds the tag (--pull --no-cache): the tag points to another image now.
+    const rebuilt = `sha256:${'7'.repeat(64)}`;
+    docker.ids.set(TAG, rebuilt);
+    await helper.run('vol', ['true'], { image });
+    await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
+    expect(references()).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
+    // A run outside an open uses the tag, whatever image it has now.
+    await helper.run('vol', ['true']);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
+    expect(docker.runs[docker.runs.length - 1].args).not.toContain(rebuilt);
+  });
+
+  it('pins the image that the ensure of the open awaited when the cache of the window is replaced while it is pending (review round 3 of PR #64, P1)', async () => {
+    // user decision 2026-09-29: no previous helper image. Changed expectation: before, the open was offline and pinned the
+    // previous helper; now the pending ensure of the open builds the current tag while a helper run of another Docker
+    // engine replaces the cache, and the open still gets the image that its ensure built.
+    const { helper } = setup();
+    let engineKey = '';
+    (helper as unknown as { deps: HelperDeps }).deps.engine = async () => ({ key: engineKey });
+    let release: () => void = () => undefined;
+    let first = true;
+    docker.buildHandler = async () => {
+      if (first) {
+        first = false;
+        await new Promise<void>((resolve) => (release = resolve));
+      }
+    };
+    const pending = helper.ensureImageUse();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    // A helper run for another engine replaces the cache while the build of the open still runs.
+    engineKey = 'ssh://build-box';
+    const other = helper.run('vol', ['true']).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.runs.length).toBeGreaterThan(0));
+    release();
+    const image = await pending;
+    expect(image).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    await other;
+    engineKey = '';
+    const before = docker.runs.length;
+    await helper.run('vol', ['true'], { image });
+    expect(references(before)).toEqual([fakeImageId(TAG)]);
+  });
+
+  describe('every public method runs the helper image of the open that it gets as `image` (review round 3 of PR #64, P7)', () => {
+    const OVERRIDE = { image: 'devenv-x:1' };
+    const cases: Array<[string, (helper: WorkspaceHelper, image: HelperImageUse) => Promise<unknown>]> = [
+      ['run', (helper, image) => helper.run('vol', ['true'], { image })],
+      ['clone', (helper, image) => helper.clone({ volumeName: 'vol', repository: 'o/a', token: TOKEN, image })],
+      ['readConfigFiles', (helper, image) => helper.readConfigFiles({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', image })],
+      ['listConfigurations', (helper, image) => helper.listConfigurations({ volumeName: 'vol', repository: 'o/a', image })],
+      [
+        'readConfiguration (merged)',
+        (helper, image) => helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'e', image }),
+      ],
+      [
+        'readConfiguration (without the merged configuration, with an override)',
+        (helper, image) =>
+          helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'e', merged: false, override: OVERRIDE, image }),
+      ],
+      ['build', (helper, image) => helper.build({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', image })],
+      [
+        'build (with an override)',
+        (helper, image) => helper.build({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', override: OVERRIDE, image }),
+      ],
+      ['composeModel', (helper, image) => helper.composeModel({ volumeName: 'vol', repository: 'o/a', files: ['/workspaces/a/compose.yaml'], project: 'p', image })],
+      ['composeServiceHashes', (helper, image) => helper.composeServiceHashes({ volumeName: 'vol', repository: 'o/a', model: '{}', project: 'p', image })],
+      ['createRepositoryFolders', (helper, image) => helper.createRepositoryFolders({ volumeName: 'vol', repository: 'o/a', folders: ['/workspaces/a/data'], image })],
+      ['up', (helper, image) => helper.up({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', removeExistingContainer: false, image })],
+      [
+        'runUserCommands',
+        (helper, image) => helper.runUserCommands({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', containerId: 'c'.repeat(64), token: TOKEN, image }),
+      ],
+      ['prepareGit', (helper, image) => helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image })],
+      ['fixConfigOwnership', (helper, image) => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv', uid: '1000', gid: '1000', image })],
+    ];
+
+    it.each(cases)('%s', async (_name, call) => {
+      // user decision 2026-09-29: no previous helper image. Changed expectation: before, open A pinned a previous helper
+      // and another open switched the cache to the current tag; now another window rebuilds the tag, and another open
+      // of this window switches the cache to the new image.
+      const { helper } = setup();
+      const pinned = await helper.ensureImageUse();
+      expect(pinned).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      const rebuilt = `sha256:${'7'.repeat(64)}`;
+      docker.ids.set(TAG, rebuilt);
+      expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: rebuilt });
+      docker.handler = (args) => {
+        if (args[0] !== 'run') return {};
+        return { stdout: '{"outcome":"success","containerId":"cccc","configuration":{},"services":{}}\n' };
+      };
+      const before = docker.runs.length;
+      await call(helper, pinned).catch(() => undefined);
+      const used = references(before);
+      expect(used.length).toBeGreaterThan(0);
+      expect(used.every((reference) => reference === fakeImageId(TAG))).toBe(true);
+    });
+  });
+});
+
+describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild, user decision 2026-09-29)', () => {
+  const statePath = () => path.join(dir, 'storage', 'helper.json');
+
+  function stateHelper(engine?: () => Promise<HelperEngine>): WorkspaceHelper {
+    return new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'darwin',
+      clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+      statePath: statePath(),
+      engine,
+    });
+  }
+
+  /** A build that waits for `release` and ends with an AbortError when its signal aborts. */
+  function blockingBuild(): { release: () => void } {
+    const gate = { release: () => undefined as void };
+    docker.buildHandler = (options) =>
+      new Promise<void>((resolve, reject) => {
+        gate.release = resolve;
+        options.signal?.addEventListener('abort', () => reject(abortError()), { once: true });
+      });
+    return gate;
+  }
+
+  function prebuild(helper: WorkspaceHelper, overrides: Partial<HelperPrebuildDeps> = {}): HelperPrebuild {
+    return new HelperPrebuild({
+      helper,
+      dockerRunning: async () => true,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      statePath: statePath(),
+      logger,
+      ...overrides,
+    });
+  }
+
+  it('builds a missing tag once: an open that starts during the prebuild waits for it and does not build again', async () => {
+    const helper = stateHelper();
+    const gate = blockingBuild();
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const open = helper.ensureImageUse();
+    const run = helper.run('vol', ['true']);
+    gate.release();
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect((await run).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
+  });
+
+  it('joins the build of an open that runs already', async () => {
+    const helper = stateHelper();
+    const gate = blockingBuild();
+    const open = helper.ensureImageUse();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const pre = helper.prebuildImage({ signal: new AbortController().signal });
+    gate.release();
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+  });
+
+  it('is cancelled by its signal; an open that waited for it builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const controller = new AbortController();
+    const pre = helper.prebuildImage({ signal: controller.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const open = helper.ensureImageUse();
+    docker.buildHandler = async () => undefined;
+    controller.abort();
+    expect(await pre).toMatchObject({ name: 'AbortError' });
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(2);
+  });
+
+  // Review round 16 of PR #64 (R16-2): a caller that joined the build of another caller that is cancelled builds for itself.
+  it('R16-2: an open that joined the build of another open that is cancelled builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const a = new AbortController();
+    const openA = helper.ensureImageUse({ signal: a.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const openB = helper.ensureImageUse();
+    docker.buildHandler = async () => undefined;
+    a.abort();
+    expect(await openA).toMatchObject({ name: 'AbortError' });
+    expect(await openB).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(2);
+  });
+
+  it('R16-2: a helper run that joined the build of an open that is cancelled builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const a = new AbortController();
+    const openA = helper.ensureImageUse({ signal: a.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const run = helper.run('vol', ['true']);
+    docker.buildHandler = async () => undefined;
+    a.abort();
+    expect(await openA).toMatchObject({ name: 'AbortError' });
+    expect((await run).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(2);
+    expect(docker.runs).toHaveLength(1);
+  });
+
+  // Review round 16 of PR #64 (R16-1): only a docker run that finds no helper image counts as a missing helper image.
+  describe('R16-1: only a docker run that fails with exit code 125 and "No such image" counts as a missing helper image', () => {
+    const cases: Array<[string, Partial<RunResult>]> = [
+      ['a command that reports a missing image of its own (exit code 1)', { exitCode: 1, stderr: 'Error: No such image: sha256:abc\n' }],
+      ['another docker run error (exit code 125)', { exitCode: 125, stderr: 'docker: Error response from daemon: Conflict. The container name "/x" is already in use.\n' }],
+    ];
+
+    it.each(cases)('pinned run: %s is the result of the run', async (_name, failure) => {
+      const helper = stateHelper();
+      const use = await helper.ensureImageUse();
+      docker.handler = (args) => (args[0] === 'run' ? failure : {});
+      const result = await helper.run('vol', ['true'], { image: use });
+      expect(result).toMatchObject(failure);
+      expect(docker.runs).toHaveLength(1);
+      // The cache of the window is kept: the next open reuses the image without a build.
+      expect(await helper.ensureImageUse()).toEqual(use);
+      expect(docker.builds).toHaveLength(1);
+      expect(logger.lines.join('\n')).not.toContain('was removed');
+    });
+
+    it.each(cases)('unpinned run: %s is the result of the run, which is not run again', async (_name, failure) => {
+      const helper = stateHelper();
+      await helper.ensureImageUse();
+      docker.handler = (args) => (args[0] === 'run' ? failure : {});
+      const result = await helper.run('vol', ['true']);
+      expect(result).toMatchObject(failure);
+      expect(docker.runs).toHaveLength(1);
+      expect(logger.lines.join('\n')).not.toContain('It is built again');
+    });
+  });
+
+  it('a helper run outside an open builds a removed image again without the maintenance of an open (review round 20 of PR #64, B-R20-5f)', async () => {
+    const helper = stateHelper();
+    let first = true;
+    docker.handler = (args) => {
+      if (args[0] !== 'run') return {};
+      if (first) {
+        first = false;
+        // docker image prune -a between the ensure and the run.
+        docker.images.delete(TAG);
+        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}\n` };
+      }
+      return {};
+    };
+    expect((await helper.run('vol', ['true'])).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(2);
+    expect(docker.runs).toHaveLength(2);
+    // No cleanup of old helper images (only an open maintains).
+    expect(docker.listCalls).toBe(0);
+  });
+
+  it('builds nothing when the Docker context is a remote host', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toBeUndefined();
+    expect(await helper.usesLocalEngine()).toBe(false);
+    expect(docker.builds).toEqual([]);
+    expect(await prebuild(helper).start()).toBe('remote');
+    expect(docker.builds).toEqual([]);
+  });
+
+  it('asks no Docker engine whether it runs when the Docker context is a remote host (review round 17 of PR #64, R17-2)', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    const running = vi.fn(async () => true);
+    expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('remote');
+    // Not even `docker info`: outside an operation it would go to the remote host (over SSH) at every activation.
+    expect(running).not.toHaveBeenCalled();
+    expect(docker.builds).toEqual([]);
+  });
+
+  // Review round 5 of PR #64, R5-2: helper.json alone decides whether the prebuild is due; there is no extension version
+  // to remember anymore (the expectation on the saved version is gone).
+  // Review round 7 of PR #64 (R7-3): a caller whose signal is already aborted when it would start the shared ensure
+  // starts nothing (no build, no Docker call) and leaves no unhandled rejection behind.
+  it('a cancelled caller starts no shared ensure and leaves no unhandled rejection', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      docker.buildHandler = async (options) => {
+        if (options.signal?.aborted) throw abortError();
+      };
+      const helper = stateHelper();
+      await expect(helper.prebuildImage({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(helper.ensureImageUse({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(docker.builds).toEqual([]);
+      expect(docker.imageIdCalls).toBe(0);
+      // Cancelled during the check of a cached image: the tag is gone, so the cache is reset, and nothing starts.
+      await helper.ensureImageUse();
+      expect(docker.builds).toHaveLength(1);
+      docker.images.delete(TAG);
+      const controller = new AbortController();
+      const imageId = docker.imageId.bind(docker);
+      docker.imageId = async (...args: Parameters<typeof docker.imageId>) => {
+        controller.abort();
+        return imageId(...args);
+      };
+      await expect(helper.ensureImageUse({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(docker.builds).toHaveLength(1);
+      docker.imageId = imageId;
+      await helper.ensureImageUse();
+      expect(docker.builds).toHaveLength(2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
+  it('HelperPrebuild builds the tag that helper.json does not know, logs it, and the next open does not build', async () => {
+    const helper = stateHelper();
+    const task = prebuild(helper);
+    expect(await task.start()).toBe('built');
+    expect(logger.lines).toContain('info The workspace helper image is built in the background.');
+    expect(logger.lines).toContain(`info The workspace helper image ${TAG} was built in the background.`);
+    expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+    // start() runs once.
+    expect(await task.start()).toBe('built');
+    expect(docker.builds).toHaveLength(1);
+    // Review round 5 of PR #64, R5-2: a window that starts later finds the record of the build and does nothing.
+    const running = vi.fn(async () => true);
+    expect(await prebuild(stateHelper(), { dockerRunning: running }).start()).toBe('notDue');
+    expect(running).not.toHaveBeenCalled();
+  });
+
+  it('HelperPrebuild runs when helper.json does not know the current tag, and finds an existing tag', async () => {
+    docker.images.add(TAG);
+    const helper = stateHelper();
+    expect(await prebuild(helper).start()).toBe('present');
+    expect(docker.builds).toEqual([]);
+    expect(logger.lines).toContain(`info The workspace helper image ${TAG} is ready.`);
+  });
+
+  it('HelperPrebuild asks Docker nothing when it is not due', async () => {
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }));
+    let asked = false;
+    const helper = stateHelper(async () => {
+      asked = true;
+      return { key: '' };
+    });
+    const running = vi.fn(async () => true);
+    // Review round 5 of PR #64, R5-2: a live record of the current tag is enough (no version).
+    expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('notDue');
+    expect(asked).toBe(false);
+    expect(running).not.toHaveBeenCalled();
+    expect(docker.imageIdCalls).toBe(0);
+    // A tag that the cleanup removed is not known.
+    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { removedAt: '2026-09-20T12:00:00.000Z' } } }));
+    expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('built');
+  });
+
+  // Review round 5 of PR #64, R5-2: no version to remember (the expectation on the saved version is gone).
+  // Changed expectation (review round 6 of PR #64, R6-1: no cross-window lock): the expectation that no lock file exists is gone.
+  it('HelperPrebuild does not build when Docker is not running', async () => {
+    const helper = stateHelper();
+    expect(await prebuild(helper, { dockerRunning: async () => false }).start()).toBe('dockerNotRunning');
+    expect(docker.builds).toEqual([]);
+    expect(logger.lines.join('\n')).toContain('Docker is not running');
+  });
+
+  // Review round 5 of PR #64, R5-2: no version to remember (the expectation on the saved version is gone).
+  // Changed expectation (review round 6 of PR #64, R6-1: no cross-window lock): the expectations on the lock file are gone.
+  it('HelperPrebuild is cancelled by dispose, and a failed build is logged', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const task = prebuild(helper);
+    const outcome = task.start();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    task.dispose();
+    expect(await outcome).toBe('cancelled');
+    // The docker build got the signal of the prebuild.
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+    };
+    expect(await prebuild(helper).start()).toBe('failed');
+    expect(logger.lines.join('\n')).toContain('The workspace helper image could not be prepared in the background');
+  });
+
+  // Changed expectation (review round 6 of PR #64, R6-1: no cross-window lock): this replaces the test "two windows over
+  // the same helper.json: exactly one build, the other window is busy".
+  it('HelperPrebuild disposed while it reads helper.json asks Docker nothing (review round 20 of PR #64, B-R20-5b)', async () => {
+    const helper = {
+      usesLocalEngine: vi.fn(async () => true),
+      prebuildImage: vi.fn(async (options: { signal: AbortSignal }) => {
+        if (options.signal.aborted) throw abortError();
+        return { tag: TAG, id: fakeImageId(TAG) };
+      }),
+    };
+    const running = vi.fn(async () => true);
+    const task = prebuild(stateHelper(), { helper, dockerRunning: running });
+    const outcome = task.start();
+    task.dispose();
+    expect(await outcome).toBe('cancelled');
+    expect(helper.usesLocalEngine).not.toHaveBeenCalled();
+    expect(running).not.toHaveBeenCalled();
+    expect(helper.prebuildImage).not.toHaveBeenCalled();
+  });
+
+  it('HelperPrebuild disposed during the build is cancelled, also when the build then fails with another error (review round 20 of PR #64, B-R20-5c)', async () => {
+    const helper = {
+      usesLocalEngine: vi.fn(async () => true),
+      prebuildImage: vi.fn(
+        (options: { signal: AbortSignal }) =>
+          new Promise<undefined>((_resolve, reject) => {
+            // The killed docker build ends with an ordinary failure, which the helper reports as helperFailed.
+            options.signal.addEventListener('abort', () => reject(new UserFacingError('helperFailed', 'The workspace helper could not be prepared.', 'exit code 143')), { once: true });
+          }),
+      ),
+    };
+    const task = prebuild(stateHelper(), { helper });
+    const outcome = task.start();
+    await vi.waitFor(() => expect(helper.prebuildImage).toHaveBeenCalled());
+    task.dispose();
+    expect(await outcome).toBe('cancelled');
+    expect(logger.lines.join('\n')).not.toContain('could not be prepared in the background');
+  });
+
+  it('HelperPrebuild is cancelled, without a warning, when a step fails with another error after dispose (review round 20 of PR #64, B-R20-5c)', async () => {
+    let task: HelperPrebuild | undefined;
+    const helper = {
+      // Deactivation while the Docker context is read; the read then fails with an ordinary error.
+      usesLocalEngine: async () => {
+        task?.dispose();
+        throw new Error('the Docker context cannot be read');
+      },
+      prebuildImage: async () => undefined,
+    };
+    task = prebuild(stateHelper(), { helper });
+    expect(await task.start()).toBe('cancelled');
+    expect(logger.lines.join('\n')).not.toContain('could not be prepared in the background');
+  });
+
+  describe('windows without a cross-window lock (review round 6 of PR #64, R6-1)', () => {
+    it('two windows that start together may each build; a window that starts later is not due and asks Docker nothing', async () => {
+      const releases: Array<() => void> = [];
+      docker.buildHandler = () => new Promise<void>((resolve) => releases.push(resolve));
+      const first = prebuild(stateHelper()).start();
+      const second = prebuild(stateHelper()).start();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(2));
+      for (const release of releases) release();
+      expect(await Promise.all([first, second])).toEqual(['built', 'built']);
+      expect(logger.lines.join('\n')).not.toContain('another window');
+      const builds = docker.builds.length;
+      const imageIdCalls = docker.imageIdCalls;
+      let asked = false;
+      const third = stateHelper(async () => {
+        asked = true;
+        return { key: '' };
+      });
+      const running = vi.fn(async () => true);
+      expect(await prebuild(third, { dockerRunning: running }).start()).toBe('notDue');
+      expect(asked).toBe(false);
+      expect(running).not.toHaveBeenCalled();
+      expect(docker.builds).toHaveLength(builds);
+      expect(docker.imageIdCalls).toBe(imageIdCalls);
+    });
+
+    it('asks Docker nothing for a live record of the current tag', async () => {
+      fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+      fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }));
+      const helper = { usesLocalEngine: vi.fn(async () => true), prebuildImage: vi.fn(async () => undefined) };
+      const running = vi.fn(async () => true);
+      expect(await prebuild(stateHelper(), { helper, dockerRunning: running }).start()).toBe('notDue');
+      expect(helper.usesLocalEngine).not.toHaveBeenCalled();
+      expect(helper.prebuildImage).not.toHaveBeenCalled();
+      expect(running).not.toHaveBeenCalled();
+      expect(docker.imageIdCalls).toBe(0);
+    });
+  });
+
+  // Review round 5 of PR #64, R5-3 (a): the prebuild does no maintenance.
+  it('does no maintenance: no rebuild that a check asked for, no check of the base image, no cleanup', async () => {
+    docker.images.add(TAG);
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    const old = '2026-09-01T12:00:00.000Z';
+    const record = {
+      baseImage: 'node:22-bookworm-slim',
+      baseDigest: `sha256:${'a'.repeat(64)}`,
+      latestBaseDigest: `sha256:${'b'.repeat(64)}`,
+      builtAt: old,
+      checkedAt: old,
+      lastUsedAt: old,
+    };
+    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old }));
+    const helper = stateHelper();
+    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toEqual([]);
+    expect(docker.listCalls).toBe(0);
+    expect(docker.removals).toEqual([]);
+  });
+
+  describe('a caller that joins the shared build can cancel its wait and gets the progress (review round 5 of PR #64, R5-1)', () => {
+    it('an open that waits for the prebuild ends at once when its signal aborts; the prebuild goes on and its result is reused', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const controller = new AbortController();
+      let openError: unknown;
+      // Its onBuild tells when it waits for the build (the build has started).
+      let waits = false;
+      const open = helper
+        .ensureImageUse({ signal: controller.signal, onBuild: () => (waits = true) })
+        .catch((error: unknown) => (openError = error));
+      await vi.waitFor(() => expect(waits).toBe(true));
+      controller.abort();
+      await vi.waitFor(() => expect(openError).toMatchObject({ name: 'AbortError' }));
+      await open;
+      // The shared build did not get the abort.
+      expect(docker.builds[0].signal?.aborted).toBe(false);
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+      expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+    });
+
+    // Review round 21 of PR #64 (B-R21-1): the abort of an open that waits for the build of a helper run (here the
+    // prebuild) keeps that still-running build in the cache, so a helper run that starts before it ends joins it.
+    it('an open that cancels its wait keeps the running prebuild in the cache; a later helper run joins it', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const controller = new AbortController();
+      let waits = false;
+      const open = helper.ensureImageUse({ signal: controller.signal, onBuild: () => (waits = true) });
+      await vi.waitFor(() => expect(waits).toBe(true));
+      controller.abort();
+      await expect(open).rejects.toMatchObject({ name: 'AbortError' });
+      const run = helper.run('vol', ['true']);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The run waits for the build of the prebuild; it starts no build of its own (checked before the release, which a
+      // second build would replace).
+      expect(docker.builds).toHaveLength(1);
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect((await run).exitCode).toBe(0);
+      expect(docker.builds).toHaveLength(1);
+      expect(docker.runs).toHaveLength(1);
+    });
+
+    it('a helper run that waits for the prebuild ends at once when its signal aborts, without a docker run', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const controller = new AbortController();
+      let runError: unknown;
+      const run = helper.run('vol', ['true'], { signal: controller.signal }).catch((error: unknown) => (runError = error));
+      // The run waits for the build now (the engine is known at once).
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(runError).toBeUndefined();
+      controller.abort();
+      await vi.waitFor(() => expect(runError).toMatchObject({ name: 'AbortError' }));
+      await run;
+      expect(docker.runs).toEqual([]);
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+      expect(docker.runs).toEqual([]);
+    });
+
+    it('a caller whose signal was aborted before it joins ends at once', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      await expect(helper.ensureImageUse({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(helper.run('vol', ['true'], { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+    });
+
+    // Review round 6 of PR #64, R6-5: renamed to what it covers (prebuildImage awaits usesLocalEngine first, so the open
+    // creates the shared promise and the prebuild joins it); the test below covers the prebuild that owns the promise.
+    it('a prebuild that joins an open that has not started its build yet; a later open gets create', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const own: string[] = [];
+      const pre = helper.prebuildImage({ signal: new AbortController().signal, onBuild: (kind) => own.push(kind) });
+      // Joins before the build started (the Dockerfile is not read yet).
+      const early: string[] = [];
+      const first = helper.ensureImageUse({ onBuild: (kind) => early.push(kind) });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      // Joins after the build started.
+      const late: string[] = [];
+      const second = helper.ensureImageUse({ onBuild: (kind) => late.push(kind) });
+      await vi.waitFor(() => expect(late).toEqual(['create']));
+      gate.release();
+      await pre;
+      await first;
+      await second;
+      expect(own).toEqual(['create']);
+      expect(early).toEqual(['create']);
+      expect(late).toEqual(['create']);
+      expect(docker.builds).toHaveLength(1);
+      // A caller that reuses the result later gets no progress.
+      const after: string[] = [];
+      await helper.ensureImageUse({ onBuild: (kind) => after.push(kind) });
+      expect(after).toEqual([]);
+    });
+
+    // Review round 6 of PR #64, R6-5: the prebuild owns the shared promise (it waits for the digest of the base image);
+    // an open that joins it before the build started gets create when the build starts, and does not start its own.
+    it('an open that joins the promise of the prebuild before its build started gets create when it starts', async () => {
+      let asked = false;
+      let releaseDigest: (digest: string) => void = () => undefined;
+      const helper = new WorkspaceHelper({
+        docker,
+        logger,
+        dockerfilePath: path.join(dir, 'Dockerfile'),
+        env: {},
+        platform: 'darwin',
+        clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+        statePath: statePath(),
+        baseDigest: () => {
+          asked = true;
+          return new Promise<string>((resolve) => (releaseDigest = resolve));
+        },
+      });
+      const gate = blockingBuild();
+      const controller = new AbortController();
+      const pre = helper.prebuildImage({ signal: controller.signal });
+      await vi.waitFor(() => expect(asked).toBe(true));
+      const early: string[] = [];
+      const open = helper.ensureImageUse({ onBuild: (kind) => early.push(kind) });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(early).toEqual([]);
+      releaseDigest('sha256:' + 'a'.repeat(64));
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      // The build is the one of the prebuild.
+      expect(docker.builds[0].signal).toBe(controller.signal);
+      await vi.waitFor(() => expect(early).toEqual(['create']));
+      gate.release();
+      await pre;
+      await open;
+      expect(docker.builds).toHaveLength(1);
+    });
+
+    it('a prebuild that joins the build of an open gets its progress', async () => {
+      const helper = createHelper();
+      const gate = blockingBuild();
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const kinds: string[] = [];
+      const pre = helper.prebuildImage({ signal: new AbortController().signal, onBuild: (kind) => kinds.push(kind) });
+      await vi.waitFor(() => expect(kinds).toEqual(['create']));
+      gate.release();
+      await open;
+      await pre;
+      expect(docker.builds).toHaveLength(1);
+    });
+
+    // Review round 20 of PR #64 (B-R20-5e): the cleanup of a caller that joined the shared build.
+    it('a caller that cancelled its wait before the build started gets no progress of that build', async () => {
+      let releaseDigest: (digest: string) => void = () => undefined;
+      let asked = false;
+      const helper = new WorkspaceHelper({
+        docker,
+        logger,
+        dockerfilePath: path.join(dir, 'Dockerfile'),
+        env: {},
+        platform: 'darwin',
+        clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+        statePath: statePath(),
+        baseDigest: () => {
+          asked = true;
+          return new Promise<string>((resolve) => (releaseDigest = resolve));
+        },
+      });
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(asked).toBe(true));
+      const controller = new AbortController();
+      const kinds: string[] = [];
+      const open = helper.ensureImageUse({ signal: controller.signal, onBuild: (kind) => kinds.push(kind) }).catch((error: unknown) => error);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      controller.abort();
+      expect(await open).toMatchObject({ name: 'AbortError' });
+      releaseDigest('sha256:' + 'a'.repeat(64));
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(kinds).toEqual([]);
+    });
+
+    it('a helper run that joined the prebuild leaves no abort listener on its signal', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const controller = new AbortController();
+      const run = helper.run('vol', ['true'], { signal: controller.signal });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      gate.release();
+      await pre;
+      expect((await run).exitCode).toBe(0);
+      expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
+    });
+
+    it('a caller that joins a promise that only finds the existing tag gets no onBuild', async () => {
+      docker.images.add(TAG);
+      const helper = stateHelper();
+      const kinds: string[] = [];
+      const pre = helper.prebuildImage({ signal: new AbortController().signal, onBuild: (kind) => kinds.push(kind) });
+      const open = helper.ensureImageUse({ onBuild: (kind) => kinds.push(kind) });
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(kinds).toEqual([]);
+      expect(docker.builds).toEqual([]);
+    });
   });
 });
 

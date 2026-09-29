@@ -61,7 +61,7 @@ import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, 
 import { writeContainerToken } from '../helper/containerToken';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
-import type { HelperFiles, WorkspaceHelper } from '../helper/workspaceHelper';
+import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   compareWithBuildRecord,
   type CheckedOutcome,
@@ -171,7 +171,6 @@ import {
   DEFAULT_CONFIG_PATH,
   baseImageKey,
   composeConfigurationChange,
-  composeContainerOrder,
   composeMountVolumes,
   composeRecordOf,
   serviceFoldersOf,
@@ -274,7 +273,7 @@ export type EnvironmentDocker = Pick<
 /** The part of WorkspaceHelper that the service uses. */
 export type EnvironmentHelper = Pick<
   WorkspaceHelper,
-  | 'ensureImage'
+  | 'ensureImageUse'
   | 'clone'
   | 'readConfigFiles'
   | 'listConfigurations'
@@ -308,8 +307,14 @@ export type EnvironmentSessionFiles = Pick<
  * host and the id of this computer). Both never throw, except an AbortError.
  */
 export interface EnvironmentRemoteMonitor {
-  /** Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context). */
-  ensure(host: string, helperTag: string, signal?: AbortSignal): Promise<unknown>;
+  /**
+   * Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context).
+   * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of the helper
+   * image of the open (review round 1 of PR #64, S1; review round 3 of PR #64, P2: for the current tag too); the label
+   * and the log lines keep the tag. Review round 2 of PR #64 (B-M9): the
+   * parameters are required, so an implementation states what it does with them.
+   */
+  ensure(host: string, helperTag: string, signal: AbortSignal | undefined, helperImage: string | undefined): Promise<unknown>;
   /**
    * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
    * only on environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
@@ -416,8 +421,9 @@ export interface RepositoryTarget {
 
 /**
  * Review round 5 (D5-3): configurationChanged of an environment without a build record whose containers are of another
- * kind than the configuration that the pipeline would use: `question` asks about the switch as the pipeline asks
- * (Messages.configurationKindChanged, or configurationKindChangedDevContainerMissing).
+ * kind than the configuration that the pipeline would use: `question` asks about the switch (Messages.configurationKindChanged
+ * of a single container, configurationKindChangedConnected of Docker Compose, where Later only keeps the connected window,
+ * review round 20 of PR #64, R20-2, or configurationKindChangedDevContainerMissing).
  */
 export interface ConfigurationKindChange {
   question: string;
@@ -564,8 +570,29 @@ interface PipelineContext {
   serviceFolders?: ServiceFolders;
   /** This run holds a busy mark. */
   busy: boolean;
-  /** The workspace helper image could not be prepared (for example offline after an extension update). */
+  /**
+   * The workspace helper image could not be prepared (for example offline after an extension update: user decision
+   * 2026-09-29, no previous helper image). A running container that is current still opens (review round 1 of PR #64,
+   * L2); nothing is started (no docker start fallback, user decision 2026-09-29).
+   */
   helperUnavailable: boolean;
+  /**
+   * Review round 2 of PR #64 (A-N1): the helper image of this run (the current tag with the ID of its image), resolved
+   * once by the first prepareHelper of the run and passed to every helper run of it: the configuration that the Dev
+   * Container CLI of this image read and checked is built and started with the same CLI, whatever another open of the
+   * window resolves meanwhile. Further prepareHelper calls of the run do not resolve it again.
+   */
+  helperImage?: HelperImageUse;
+  /**
+   * Review round 4 of PR #64 (R4-4): the helper image of this run was gone in Step 8 and the running container opens as it
+   * is (helperFailedInUpdate): the update, the rebuild, or the selected configuration was not applied.
+   */
+  helperFailedInUpdate?: boolean;
+  /**
+   * Review round 1 of PR #64 (L2): the configuration was read, but its check could not run (AnalysisFailure `internal`,
+   * for example Docker did not answer for its images): the reason of a Docker Compose start that fails says so.
+   */
+  configurationUnchecked?: boolean;
   /** Unit 7, PR 2: the Session Monitor on the remote Docker host was ensured in this run (once per run). */
   remoteMonitorEnsured?: boolean;
   /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
@@ -597,7 +624,8 @@ interface PipelineContext {
   compose?: boolean;
   /**
    * The configuration is of the other kind (Docker Compose or a single container) than the environment, and no build
-   * applies it: the environment starts as it is (configurationOfKind).
+   * applies it: the environment is kept as it is (configurationOfKind); a Docker Compose environment then does not start
+   * (no docker start fallback, user decision 2026-09-29).
    */
   kindKept?: boolean;
   /**
@@ -611,11 +639,22 @@ interface PipelineContext {
    */
   kindSwitchRemoved?: string[];
   /**
+   * Review round 12 of PR #64 (R12-2): `devcontainer up` ran in this run (it may have removed or replaced the dev container
+   * with --remove-existing-container), so a later helperFailed did not leave everything as it was. Set once `up` returned
+   * (review round 13, R13-2): a helperFailed of `up` itself means that its helper container never started.
+   */
+  upStarted?: boolean;
+  /**
    * Review round 4 (D4-1): runComposeUp removed the single container of the environment in this run (a switch to Docker
    * Compose), and the IDs of the containers of Docker Compose of the project that existed before its `up`. After a failed
    * `up`, removeFailedComposeContainers removes only the others (those that the failed `up` created).
    */
   composeSwitch?: { existing: ReadonlySet<string> };
+  /**
+   * Review round 11 of PR #64 (R11-1): runComposeUp began to move the previous dev container of another service out of
+   * the way in this run (movePreviousDevContainer), so a failed `up` is a failed switch of the dev service.
+   */
+  devServiceMoved?: boolean;
   /**
    * Recreate offer (user request 2026-09-26): the user chose to create the damaged dev container of this Docker Compose
    * environment again (offerRecreation). runComposeUp removes only that container (never a volume, never another
@@ -727,6 +766,11 @@ function namesDockerfile(configText: string): boolean {
   if (!isRecord(config)) return false;
   const build = isRecord(config.build) ? config.build : {};
   return typeof build.dockerfile === 'string' || typeof config.dockerFile === 'string';
+}
+
+/** The workspace helper could not be prepared, or the helper image of the open is gone (UserFacingError helperFailed). */
+function isHelperFailed(error: unknown): boolean {
+  return isUserFacingError(error) && error.code === 'helperFailed';
 }
 
 function isFilesMissing(error: unknown): boolean {
@@ -1277,20 +1321,55 @@ export class EnvironmentService {
         '.',
     );
 
-    // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside. A
-    // configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
+    // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside (a Docker
+    // Compose environment does not: without its model there is no `up`, and no docker start fallback, user decision
+    // 2026-09-29; except a dev container that runs already when no container of the environment must be created again, which opens as it is, D-22). A configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
     let loaded: LoadedConfiguration | undefined;
     try {
       loaded = await this.loadConfiguration(ctx, imagePresent, container);
     } catch (error) {
       const usable = container !== undefined || imagePresent;
+      const cancelled = this.isCancellation(error, ctx.signal);
+      const helperFailed = isUserFacingError(error) && error.code === 'helperFailed';
+      // Review round 2 of PR #64 (A-N1): also when a helper run of this open failed (its helper image was removed), not
+      // only prepareHelper: the rest of the open uses no helper.
+      if (helperFailed) ctx.helperUnavailable = true;
+      // No docker start fallback (user decision 2026-09-29): without the workspace helper only a running container
+      // opens; otherwise the open fails with helperFailed at once, without a warning that the environment is started.
+      // Review round 1 of PR #64 (L2): only a running container that is current opens as it is (Step 9); a running one
+      // that is outdated would be created again, which needs the helper, too. Review round 2 of PR #64 (A-N4): whether
+      // it opens as it is (a Docker listing) is asked only when the answer is needed, and a failure of the listing counts
+      // as `false`, so the error of the configuration is never lost.
+      if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record, false)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
-      if (!usable || this.isCancellation(error, ctx.signal) || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
+      if (!usable || cancelled || isFilesMissing(error) || (isHostAccess(error) && !isInternalAnalysisFailure(error))) {
         throw configurationError(error);
       }
-      this.logger.error(`The configuration of ${ctx.env.repository} could not be used. The existing environment is started.`, error);
-      this.deps.ui.warn(isUserFacingError(error) ? error.message : Messages.buildFailed);
+      // Review round 1 of PR #64 (L2): the log line says what happens next. A Docker Compose environment that is not
+      // opened as it is starts nothing (startContainer: startFailed); a single container starts through `up`.
+      if (isInternalAnalysisFailure(error)) ctx.configurationUnchecked = true;
+      if (helperFailed) {
+        // Review round 2 of PR #64 (B2): the configuration was not the problem.
+        this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
+      } else {
+        const next = (await this.opensAsItIsOrFalse(ctx, container, record, false))
+          ? 'The running environment is opened as it is.'
+          : this.isComposeEnvironment(ctx.env, record, container)
+            ? 'Its containers are not started.'
+            : 'The existing environment is started without it.';
+        this.logger.error(`The configuration of ${ctx.env.repository} could not be used. ${next}`, error);
+      }
+      // Review round 14 of PR #64 (R14-1): as in Step 8 (R4-4), a Rebuild or a selected configuration says what was not
+      // applied; the selected configuration was never saved, so the previous one stays selected.
+      const selected = ctx.configPath !== ctx.env.configPath;
+      this.deps.ui.warn(
+        helperFailed && (ctx.forced || selected)
+          ? Messages.helperFailedOpenedAsItIs(selected ? 'configuration' : 'rebuild', selected ? configurationName(ctx.env.configPath) : undefined)
+          : isUserFacingError(error)
+            ? error.message
+            : Messages.buildFailed,
+      );
     }
 
     let outcome: ContainerOutcome | undefined;
@@ -1312,7 +1391,7 @@ export class EnvironmentService {
       this.throwIfCancelled(ctx.signal);
       if (answer === 'rebuildNow') ctx.forced = true;
       else {
-        this.logger.info('Rebuild later: the existing containers are started as they are.');
+        this.logger.info('Rebuild later: the existing containers are kept.');
         await this.saveConfiguration(ctx, loaded, record);
         if (container === undefined) {
           // Without its dev container, the Docker Compose environment cannot start without the switch: nothing is removed.
@@ -1344,6 +1423,7 @@ export class EnvironmentService {
         }
         throw error;
       }
+      if (ctx.helperFailedInUpdate === true) await this.warnHelperFailedInUpdate(ctx, previousConfigPath, plan.forced);
     }
     outcome ??= await this.startContainer(ctx, container, record, imagePresent, this.configurationOfKind(ctx, loaded, container, record));
     return this.finish(ctx, outcome, loaded);
@@ -1353,8 +1433,10 @@ export class EnvironmentService {
    * Review round 1 (P-1): the environment switches between Docker Compose and a single container only with a build (as
    * the configuration changes otherwise apply only with a rebuild). Without a build ("Rebuild later", a failed or refused
    * update), the configuration of the other kind is not used to start the environment: `undefined`, so a Docker Compose
-   * environment starts its containers with `docker start` (D-15), and a single container starts as a container whose
-   * configuration is not known. The kind of the environment: its dev container, or else its build record.
+   * environment does not start (no docker start fallback, user decision 2026-09-29: without its Docker Compose
+   * configuration there is no `up`; a dev container that runs already opens as it is when no container of the environment must be created again, D-22, review round 19
+   * of PR #64, R19-1), and a single container starts as a container whose configuration is not known. The
+   * kind of the environment: its dev container, or else its build record.
    */
   private configurationOfKind(
     ctx: PipelineContext,
@@ -1362,16 +1444,22 @@ export class EnvironmentService {
     container: ContainerInfo | undefined,
     record: BuildRecord | undefined,
   ): LoadedConfiguration | undefined {
-    if (loaded === undefined || (container === undefined && record === undefined)) return loaded;
+    if (loaded === undefined || this.keepsKind(ctx, loaded, container, record)) return loaded;
     const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
-    if (existingCompose === (loaded.compose !== undefined)) return loaded;
     this.logger.info(
       existingCompose
-        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose are started as they are.`
+        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose start only when the dev container runs already and no container of the environment must be created again (the dev container then opens as it is).`
         : `The configuration ${loaded.configPath} of ${ctx.env.repository} now uses Docker Compose. It applies with the next rebuild; until then, the existing container is started as it is.`,
     );
     ctx.kindKept = true;
     return undefined;
+  }
+
+  /** Whether configurationOfKind keeps `loaded` (Step 9 then counts the configuration as known), without its log line. */
+  private keepsKind(ctx: PipelineContext, loaded: LoadedConfiguration, container: ContainerInfo | undefined, record: BuildRecord | undefined): boolean {
+    if (container === undefined && record === undefined) return true;
+    const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
+    return existingCompose === (loaded.compose !== undefined);
   }
 
   /**
@@ -1394,7 +1482,7 @@ export class EnvironmentService {
     }
     await this.prepareHelper(ctx);
 
-    const resolved = await this.resolveConfigFiles(env, ctx.configPath, ctx.signal);
+    const resolved = await this.resolveConfigFiles(env, ctx.configPath, ctx.signal, ctx.helperImage);
     if (!resolved) throw new UserFacingError('noConfiguration', Messages.noConfiguration(env.repository));
     const { configPath, files, fallback } = resolved;
     if (fallback) {
@@ -1417,6 +1505,7 @@ export class EnvironmentService {
       environmentId: env.id,
       merged: false,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     // Concept section 9 "Host access": checked before any build or container start. With the folders against which the
@@ -1426,7 +1515,7 @@ export class EnvironmentService {
     // configuration hash. The Dockerfile itself is: one that is a link out of the repository or could not be read is
     // refused whatever the switch says (U2), and one too large for the hash is not supported (U1).
     const repository = repositoryFolder(env.repository);
-    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal);
+    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, ctx.signal, ctx.helperImage);
     const input: Omit<HostAccessInput, 'ownVolume'> = {
       config,
       configFolder: path.posix.resolve(repository, configurationFolder(configPath)),
@@ -1469,6 +1558,7 @@ export class EnvironmentService {
       configPath,
       environmentId: env.id,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     let merged = read.merged;
@@ -1541,6 +1631,7 @@ export class EnvironmentService {
     config: DevcontainerConfig,
     files: ConfigFiles,
     signal: AbortSignal | undefined,
+    image?: HelperImageUse,
   ): Promise<{ text?: string; unreadable?: string; missing?: string }> {
     const build: Record<string, unknown> = isRecord(config.build) ? config.build : {};
     const raw: Record<string, unknown> = config as Record<string, unknown>;
@@ -1558,6 +1649,7 @@ export class EnvironmentService {
       repository: env.repository,
       configPath,
       dockerfile: named,
+      image,
       signal,
     });
     if (read?.dockerfileText !== undefined) return { text: read.dockerfileText };
@@ -1612,6 +1704,7 @@ export class EnvironmentService {
       merged: false,
       env: { COMPOSE_PROJECT_NAME: project },
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const service = nonEmptyString(config.service);
@@ -1631,6 +1724,7 @@ export class EnvironmentService {
       repository: env.repository,
       files: composeFiles.files,
       project,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     if ('error' in output) {
@@ -1695,6 +1789,7 @@ export class EnvironmentService {
       files: composeBuildFiles(composeBuildModel(output.model, this.composeParams(env, compose, []))),
       env: { COMPOSE_PROJECT_NAME: project },
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const merged = read.merged;
@@ -1976,17 +2071,18 @@ export class EnvironmentService {
     env: Environment,
     configPath: string,
     signal: AbortSignal | undefined,
+    image?: HelperImageUse,
   ): Promise<{ configPath: string; files: ConfigFiles; fallback: boolean } | undefined> {
     const { helper } = this.deps;
     await this.requireVolume(env);
-    const files = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath, signal });
+    const files = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath, image, signal });
     if (files) return { configPath, files: this.limitedConfigFiles(env, configPath, files), fallback: false };
     await this.requireVolume(env);
-    const available = await helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal });
+    const available = await helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, image, signal });
     if (available.length === 0) return undefined;
     const fallback = available[0];
     await this.requireVolume(env);
-    const fallbackFiles = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath: fallback, signal });
+    const fallbackFiles = await helper.readConfigFiles({ volumeName: env.volumeName, repository: env.repository, configPath: fallback, image, signal });
     return fallbackFiles ? { configPath: fallback, files: this.limitedConfigFiles(env, fallback, fallbackFiles), fallback: true } : undefined;
   }
 
@@ -2237,6 +2333,7 @@ export class EnvironmentService {
         imageName,
         ...(loaded.compose ? this.composeBuildOptions(env, loaded.compose) : {}),
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       // User decision 2026-09-28: the container is made only from an image that the engine has (a build that ended
@@ -2248,6 +2345,8 @@ export class EnvironmentService {
       });
       if (!present) throw new Error(`The environment image ${imageName} is missing after the build.`);
     } catch (error) {
+      // Review round 3 of PR #64 (P6a): the helper image of the open is gone; no "started instead" and no buildFailed.
+      if (isHelperFailed(error)) return this.helperFailedInUpdate(ctx, error, container, record, loaded);
       return this.updateFailed(ctx, error, canFallBack, plan.check);
     }
 
@@ -2287,11 +2386,21 @@ export class EnvironmentService {
         return undefined;
       }
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
-      this.logger.error(`The container of ${env.repository} could not be created from ${imageName}.`, error);
+      // Review round 4 of PR #64 (R4-5): the helper image of the open is gone; the new image is not the cause.
+      const helperFailed = isHelperFailed(error);
+      if (helperFailed) ctx.helperUnavailable = true;
+      else this.logger.error(`The container of ${env.repository} could not be created from ${imageName}.`, error);
       // Review round 2 (D2-4): the build switched the kind of the environment (Docker Compose or a single container). The
       // previous kind is not started from here: its image is not an image of the new kind, and the configuration is of
       // the new kind. The next build tries again.
       const previousCompose = record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
+      // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container changed nothing
+      // (for example when the folders of the bind mounts or the Git configuration were written): the running container
+      // may still open as it is (helperFailedInUpdate), without the detail of a switch.
+      if (helperFailed && (ctx.kindSwitchRemoved ?? []).length === 0 && ctx.devServiceMoved !== true && ctx.upStarted !== true) {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        return this.helperFailedInUpdate(ctx, error, container, record, loaded);
+      }
       if ((record !== undefined || container !== undefined) && previousCompose !== (loaded.compose !== undefined)) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         // Review round 3 (D3-1, P3-3): the containers that the failed `up` of Docker Compose created (for example of a
@@ -2300,11 +2409,14 @@ export class EnvironmentService {
         // run, and only those that did not exist before `up` (an earlier switch that was cancelled may have created
         // containers that the user worked with since).
         const failed = loaded.compose !== undefined ? await this.removeFailedComposeContainers(ctx) : { removed: [], kept: [] };
-        throw new UserFacingError(
-          'startFailed',
-          PipelineTexts.startFailed,
-          kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept),
-        );
+        const detail = kindSwitchFailure(loaded.compose !== undefined, ctx.kindSwitchRemoved ?? [], errorDetail(error), failed.removed, failed.kept);
+        // Review round 4 of PR #64 (R4-5): the cleanup of the switch above stays (the containers of the other kind are
+        // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
+        if (helperFailed) {
+          this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its configuration could not be completed.`, error);
+          throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+        }
+        throw new UserFacingError('startFailed', PipelineTexts.startFailed, detail);
       }
       // Final review (FF-1): the build switched the dev service of the Docker Compose project (Select configuration…
       // between two configurations of one compose file, D22-1). The previous dev container was renamed out of the way
@@ -2315,7 +2427,23 @@ export class EnvironmentService {
       if (loaded.compose !== undefined && previousService !== undefined && previousService !== loaded.compose.service) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
         this.logger.info(`The previous dev container of the service ${previousService} of ${env.repository} is kept, stopped; it is not started with the configuration of the service ${loaded.compose.service}.`);
+        // Review round 4 of PR #64 (R4-5): the helper image of the open is gone: helperFailed, with the detail of the switch.
+        if (helperFailed) {
+          this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its dev service could not be completed.`, error);
+          throw new UserFacingError(
+            'helperFailed',
+            Messages.helperFailed,
+            `The dev service changed from ${previousService} to ${loaded.compose.service}. The previous dev container is kept, stopped. ${errorDetail(error)}`,
+          );
+        }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
+      }
+      // Review round 3 of PR #64 (P6b): the helper image of the open is gone, so the old environment image cannot be
+      // started either (that needs the helper too): no buildFailed warning and no restore; a running container that is
+      // current opens as it is, otherwise the open ends with helperFailed (not startFailed).
+      if (helperFailed) {
+        await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        return this.helperFailedInUpdate(ctx, error, container, record, loaded);
       }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
@@ -2341,6 +2469,8 @@ export class EnvironmentService {
         result = await this.runUp(ctx, previousImage, loaded.config, !keep, !keep, loaded.compose);
       } catch (restoreError) {
         if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError) || isHostAccess(restoreError)) throw restoreError;
+        // Review round 3 of PR #64 (P6b): the helper image of the open is gone: helperFailed, not startFailed.
+        if (isHelperFailed(restoreError)) return this.helperFailedInUpdate(ctx, restoreError, container, record, loaded);
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(restoreError));
       }
       return keep ? { result, created: false, container: survivor } : { result, created: true };
@@ -2417,6 +2547,65 @@ export class EnvironmentService {
     await this.updateEntry(ctx, (entry) => {
       entry.refusedUpdate = refusedUpdate;
     });
+  }
+
+  /**
+   * Review round 4 of PR #64 (R4-4): the running container opens as it is after the helper image of the open was gone
+   * in Step 8 (helperFailedInUpdate). A newly selected configuration does not stay selected (as after a failed start,
+   * review round 22, D22-1), since the running container is of the previous one; the user learns what was not applied:
+   * the selected configuration, the rebuild (Rebuild, "Rebuild now"), or the update of the images or the configuration.
+   */
+  private async warnHelperFailedInUpdate(ctx: PipelineContext, previousConfigPath: string, rebuild: boolean): Promise<void> {
+    const configurationChanged = ctx.env.configPath !== previousConfigPath;
+    if (configurationChanged) {
+      this.logger.info(`The configuration ${ctx.env.configPath} of ${ctx.env.repository} was not applied; ${previousConfigPath} stays selected.`);
+      await this.quietly('restore the configuration path', () =>
+        this.updateEntry(ctx, (entry) => {
+          entry.configPath = previousConfigPath;
+        }),
+      );
+    }
+    this.deps.ui.warn(
+      configurationChanged
+        ? Messages.helperFailedOpenedAsItIs('configuration', configurationName(previousConfigPath))
+        : Messages.helperFailedOpenedAsItIs(rebuild ? 'rebuild' : 'update'),
+    );
+  }
+
+  /**
+   * Review round 3 of PR #64 (P6): a helper run of Step 8 (the build, `up`, or the restore with the previous environment
+   * image) failed with helperFailed: the helper image of the open is gone. The rest of the open uses no
+   * helper (ctx.helperUnavailable, so the Git setup is skipped too). When the container that Step 5 found still exists,
+   * runs, and is current, it opens as it is (returns `undefined`: no warning that the update failed, no start with the
+   * previous image, which needs the helper too; review round 4 of PR #64, R4-4: runPipeline warns that the change was not
+   * applied, warnHelperFailedInUpdate); otherwise `error` ends the open. A cancellation passes through.
+   */
+  private async helperFailedInUpdate(
+    ctx: PipelineContext,
+    error: unknown,
+    container: ContainerInfo | undefined,
+    record: BuildRecord | undefined,
+    loaded: LoadedConfiguration,
+  ): Promise<undefined> {
+    ctx.helperUnavailable = true;
+    this.throwIfCancelled(ctx.signal);
+    // The container may have been removed or replaced in this step (for example by `up --remove-existing-container`, or
+    // at a switch between Docker Compose and a single container): it is looked up again.
+    let current: ContainerInfo | undefined;
+    try {
+      current = await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName);
+    } catch (lookupError) {
+      if (this.isCancellation(lookupError, ctx.signal)) throw lookupError;
+      this.logger.warn(`The container of ${ctx.env.repository} could not be found: ${errorDetail(lookupError)}`);
+      throw error;
+    }
+    // Review round 10 of PR #64 (R10-1): only a container that ran already at Step 5 opens as it is; Step 9 gets that
+    // container, so one that the restore started meanwhile would be announced as opened as it is and then fail.
+    if (container?.state !== 'running' || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record, this.keepsKind(ctx, loaded, container, record)))) throw error;
+    this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
+    // Review round 4 of PR #64 (R4-4): runPipeline tells the user that the change was not applied.
+    ctx.helperFailedInUpdate = true;
+    return undefined;
   }
 
   /**
@@ -2513,15 +2702,16 @@ export class EnvironmentService {
     let outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks);
     // Why a current dev container is created again all the same: the log line and the progress detail.
     let recreation: { log: string; detail: string } | undefined;
+    // The container of another service that makes the environment outdated (review round 22 of PR #64, A-R22-1).
+    let unrestrictedService: string | undefined;
     if (container !== undefined && !outdated && compose && ctx.hostAccessChecks === 'on') {
       // The containers of the other services follow the same rule (containerIsCurrent): one that was created while the
       // checks were off makes the environment outdated; `up` then creates the dev container again, and Compose the
       // services whose model changed (the label nimblescape.devenv.host-access is gone from it).
-      const unrestricted = (await this.environmentContainers(ctx.env.id)).find(
-        (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
-      );
+      const unrestricted = await this.unrestrictedServiceContainer(ctx);
       if (unrestricted) {
         outdated = true;
+        unrestrictedService = unrestricted.name;
         recreation = {
           log: `The container ${unrestricted.name} was created while the host access checks were off. They are on now: the containers of ${ctx.env.repository} are created again; the files in the volumes are kept.`,
           detail: Messages.containerHostAccessChecksOn,
@@ -2547,24 +2737,27 @@ export class EnvironmentService {
       return { created: false, container };
     }
     ctx.steps.step('starting');
-    if (ctx.helperUnavailable) {
-      if (container && !outdated) return this.startWithDocker(ctx, container, compose);
-      throw new UserFacingError('helperFailed', Messages.helperFailed);
-    }
+    // No docker start fallback (user decision 2026-09-29): every start runs through the Dev Container CLI (`up` and
+    // run-user-commands), so postStartCommand always runs. Without the workspace helper nothing starts.
+    if (ctx.helperUnavailable) throw new UserFacingError('helperFailed', Messages.helperFailed);
     if (compose && loaded === undefined) {
-      // D-15: without the configuration there is no model, so no `up`: the containers that exist are started, unless they
-      // must be created again (containerIsCurrent, for example after the host access checks were turned on again).
-      if (container && !outdated) {
-        if (!ctx.kindKept) this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} cannot be read. Its containers are started as they are.`);
-        return this.startWithDocker(ctx, container, true);
-      }
-      const reason = ctx.kindKept ? 'The configuration no longer uses Docker Compose, which applies with a rebuild' : 'The Docker Compose configuration cannot be read';
+      // D-15: without the configuration there is no model, so no `up`, and the containers are not started (user decision
+      // 2026-09-29: no start of the containers as they are).
+      // Review round 1 of PR #64 (L2): a configuration that was read, but that could not be checked (for example Docker did
+      // not answer for its images, review round 11, G1), is not called unreadable.
+      const failure = ctx.configurationUnchecked ? 'could not be checked' : 'cannot be read';
+      const reason = ctx.kindKept ? 'The configuration no longer uses Docker Compose, which applies with a rebuild' : `The Docker Compose configuration ${failure}`;
+      if (!ctx.kindKept) this.logger.warn(`The Docker Compose configuration of ${ctx.env.repository} ${failure}. Its containers are not started.`);
       throw new UserFacingError(
         'startFailed',
         PipelineTexts.startFailed,
-        container
-          ? `${reason}, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
-          : `${reason}, and the environment has no container.`,
+        container && outdated
+          ? unrestrictedService !== undefined
+            ? `${reason}, and the containers of the environment must be created again (the container ${unrestrictedService} was created while the host access checks were off), which needs the configuration.`
+            : `${reason}, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
+          : container
+            ? `${reason}. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.`
+            : `${reason}, and the environment has no container.`,
       );
     }
     // Assumption (V-10): `up` finds an existing container by --id-label and starts it without using the image of the
@@ -2597,8 +2790,8 @@ export class EnvironmentService {
       return { result, created: container === undefined || outdated, container: outdated ? undefined : container };
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
-      // Review round 1 (P-3): every container of a Docker Compose environment, not only the dev container.
-      if (container && !outdated && isUserFacingError(error) && error.code === 'helperFailed') return this.startWithDocker(ctx, container, compose);
+      // No docker start fallback (user decision 2026-09-29): a workspace helper that failed during `up` fails the open.
+      if (isUserFacingError(error) && error.code === 'helperFailed') throw error;
       this.logger.error(`The container of ${ctx.env.repository} could not be started.`, error);
       // Recreate offer: `up` or run-user-commands of the existing container failed because the container itself is
       // damaged. Never for a container that this run creates (it is created again anyway).
@@ -2737,10 +2930,11 @@ export class EnvironmentService {
         repository: env.repository,
         model: JSON.stringify(model, null, 2),
         project: compose.project,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal)) throw error;
+      if (this.isCancellation(error, ctx.signal) || isHelperFailed(error)) throw error;
       this.logger.warn(`The configuration hashes of the services of ${env.repository} could not be computed: ${errorDetail(error)}`);
     }
     for (const other of others) {
@@ -2868,7 +3062,7 @@ export class EnvironmentService {
       const result = await this.runUp(ctx, image, loaded?.config, true, true, loaded?.compose);
       return { result, created: true };
     } catch (error) {
-      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
+      if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error) || isHelperFailed(error)) throw error;
       // Review round 2 (E1–E3): the direct check refused it (requireOtherServicesKept), with its own detail.
       if (isUserFacingError(error) && error.code === 'startFailed') throw error;
       this.logger.error(`The container of ${env.repository} could not be created again from ${image}.`, error);
@@ -2917,6 +3111,38 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 1 of PR #64 (L2): whether startContainer opens `container` as it is when the configuration could not be
+   * used: it runs and is current (containerIsCurrent without the configuration, and for Docker Compose with the host
+   * access checks on, no container of another service that was created while they were off).
+   */
+  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown: boolean): Promise<boolean> {
+    if (container?.state !== 'running' || !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks)) return false;
+    if (ctx.hostAccessChecks !== 'on' || !this.isComposeEnvironment(ctx.env, record, container)) return true;
+    return (await this.unrestrictedServiceContainer(ctx)) === undefined;
+  }
+
+  /** A container of another Docker Compose service of the environment that was created while the host access checks were off. */
+  private async unrestrictedServiceContainer(ctx: PipelineContext): Promise<ContainerInfo | undefined> {
+    return (await this.environmentContainers(ctx.env.id)).find(
+      (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
+    );
+  }
+
+  /**
+   * Review round 2 of PR #64 (A-N4): opensAsItIs for the handling of an error at Step 5: a failure of its Docker listing
+   * is logged and counts as `false`, so the caller goes on with its own error; a cancellation passes through.
+   */
+  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown: boolean): Promise<boolean> {
+    try {
+      return await this.opensAsItIs(ctx, container, record, configKnown);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The containers of ${ctx.env.repository} could not be listed: ${errorDetail(error)}`);
+      return false;
+    }
+  }
+
+  /**
    * A Docker Compose environment (D-15): its build record says so, or its container belongs to the project of the
    * environment.
    */
@@ -2950,39 +3176,6 @@ export class EnvironmentService {
    */
   private async environmentContainers(environmentId: string): Promise<ContainerInfo[]> {
     return (await this.deps.docker.listEnvironmentContainers()).filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === environmentId);
-  }
-
-  /**
-   * Without the workspace helper, a stopped container still starts with `docker start` (offline after an extension update).
-   * `compose`: every container of the Docker Compose environment, the other services first and the dev container last.
-   */
-  private async startWithDocker(ctx: PipelineContext, container: ContainerInfo, compose = false): Promise<ContainerOutcome> {
-    if (compose) return this.startComposeWithDocker(ctx, container);
-    this.logger.warn(`The workspace helper is not available. ${container.name} is started with docker start; postStartCommand does not run.`);
-    await this.deps.sessionFiles.writePending(ctx.env.id, this.deps.owner.windowId);
-    try {
-      await this.deps.docker.runChecked(['start', container.id], { timeoutMs: DOCKER_START_TIMEOUT_MS, signal: ctx.signal });
-    } catch (error) {
-      if (this.isCancellation(error, ctx.signal)) throw error;
-      throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
-    }
-    return { created: false, container };
-  }
-
-  /** startWithDocker of a Docker Compose environment: `docker start` of its containers that do not run (D-15, D-20). */
-  private async startComposeWithDocker(ctx: PipelineContext, container: ContainerInfo): Promise<ContainerOutcome> {
-    this.logger.warn(`The containers of ${ctx.env.repository} are started with docker start; postStartCommand does not run.`);
-    await this.deps.sessionFiles.writePending(ctx.env.id, this.deps.owner.windowId);
-    const containers = composeContainerOrder(await this.environmentContainers(ctx.env.id), 'start').filter((c) => c.state !== 'running');
-    try {
-      for (const item of containers) {
-        await this.deps.docker.runChecked(['start', item.id], { timeoutMs: DOCKER_START_TIMEOUT_MS, signal: ctx.signal });
-      }
-    } catch (error) {
-      if (this.isCancellation(error, ctx.signal)) throw error;
-      throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
-    }
-    return { created: false, container };
   }
 
   /**
@@ -3056,7 +3249,7 @@ export class EnvironmentService {
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, dockerRunArgs);
     // After the ownership fix (the files get the owner of the repository folder), and before `up`, so that the lifecycle
     // commands have the Git configuration (the token goes into the container after `up`, before them: runUserCommands).
-    await this.prepareGit(ctx);
+    await this.prepareGit(ctx, true);
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
     // of the other services have too, so they go first. Review round 3 (D3-1): also the containers of other services that
     // exist without a Docker Compose dev container or record (for example after a failed switch to Docker Compose).
@@ -3104,8 +3297,10 @@ export class EnvironmentService {
         removeExistingContainer,
         token: ctx.session.token,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
       result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
@@ -3200,10 +3395,20 @@ export class EnvironmentService {
     // a data folder in .gitignore): Docker would create them; the subpath of the workspace volume must exist.
     if (createFolders !== undefined && createFolders.length > 0) {
       await this.requireVolume(env);
-      await this.deps.helper.createRepositoryFolders({ volumeName: env.volumeName, repository: env.repository, folders: createFolders, signal: ctx.signal });
+      await this.deps.helper.createRepositoryFolders({
+        volumeName: env.volumeName,
+        repository: env.repository,
+        folders: createFolders,
+        image: ctx.helperImage,
+        signal: ctx.signal,
+      });
     }
     // The user of the dev service decides the owner of the files (imageRemoteUser reads `--user`).
     const userArgs = composeUserArgs(compose.output.model.services[compose.service]);
+    // Review round 12 of PR #64 (R12-1): before anything is removed, stopped or renamed (as in runUp), so that a helperFailed
+    // of the Git setup leaves the running containers as they are.
+    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
+    await this.prepareGit(ctx, true);
     if (replaced) {
       this.logger.info(
         `The container ${replaced.name} of ${env.repository} was not created by Docker Compose. It is replaced by the containers of the Docker Compose configuration; the files in the volume are kept.`,
@@ -3236,8 +3441,6 @@ export class EnvironmentService {
       await this.stopServiceBeforeRemoval(damaged, env);
       await docker.removeContainer(damaged.id);
     }
-    if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
-    await this.prepareGit(ctx);
     const override = buildComposeOverrideConfig({
       modelPath: COMPOSE_MODEL_PATH,
       service: compose.service,
@@ -3259,8 +3462,10 @@ export class EnvironmentService {
         ...inputs,
         token: ctx.session.token,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
+      ctx.upStarted = true;
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
       result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {
@@ -3297,6 +3502,8 @@ export class EnvironmentService {
     previousService: string,
     removeExistingContainer: boolean,
   ): Promise<void> {
+    // Review round 11 of PR #64 (R11-1): from here on, the switch of the dev service may have changed the containers.
+    ctx.devServiceMoved = true;
     const env = ctx.env;
     const { docker } = this.deps;
     const number = previous.labels[COMPOSE_CONTAINER_NUMBER_LABEL] ?? '1';
@@ -3626,6 +3833,7 @@ export class EnvironmentService {
       // Review PL-1: the commands can read the token; the helper removes it from their output and from its errors.
       token: ctx.session.token,
       onOutput: this.output,
+      image: ctx.helperImage,
       signal: ctx.signal,
     });
     const failure = nonEmptyString(commands.lifecycleCommandFailure);
@@ -3847,9 +4055,10 @@ export class EnvironmentService {
    * Concept section 9 "Git inside the container": the Git configuration of the container, written into the volume once
    * per run, before `up` (unit 15: without the token, which goes into the memory of the container after its start,
    * writeGitToken). A failure is a warning: the environment
-   * opens, but Git may not reach GitHub.
+   * opens, but Git may not reach GitHub. Review round 11 of PR #64 (R11-2): before `up` (`beforeUp`), a helperFailed (the
+   * helper image of the open is gone) ends the step instead, as `up` would fail the same way: nothing is removed for it.
    */
-  private async prepareGit(ctx: PipelineContext): Promise<void> {
+  private async prepareGit(ctx: PipelineContext, beforeUp = false): Promise<void> {
     if (ctx.gitPrepared || ctx.helperUnavailable) return;
     ctx.gitPrepared = true;
     const env = ctx.env;
@@ -3862,10 +4071,17 @@ export class EnvironmentService {
         repository: env.repository,
         identity,
         onOutput: this.output,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error)) throw error;
+      // Review round 11 of PR #64 (R11-2): before `up`, the caller handles the helperFailed (for example opens the running
+      // container as it is), without the warning about the Git configuration.
+      if (beforeUp && isHelperFailed(error)) {
+        ctx.helperUnavailable = true;
+        throw error;
+      }
       this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
       this.deps.ui.warn(Messages.gitSetupFailed);
     }
@@ -4217,6 +4433,7 @@ export class EnvironmentService {
         uid,
         gid,
         timeoutMs: OWNERSHIP_TIMEOUT_MS,
+        image: ctx.helperImage,
         signal: ctx.signal,
       });
       if (result.exitCode !== 0) {
@@ -4674,7 +4891,10 @@ export class EnvironmentService {
         question:
           container === undefined
             ? Messages.configurationKindChangedDevContainerMissing(resolved.configPath)
-            : Messages.configurationKindChanged(containersCompose, resolved.configPath),
+            : // Review round 20 of PR #64 (R20-2): the only caller is the connected window, where Later starts nothing.
+              containersCompose
+              ? Messages.configurationKindChangedConnected(resolved.configPath)
+              : Messages.configurationKindChanged(false, resolved.configPath),
       };
     } catch (error) {
       throw this.toUserError(error, options.signal);
@@ -5071,18 +5291,23 @@ export class EnvironmentService {
   /**
    * Builds the helper image if needed. The build is shown as a detail of the current step: the steps of concept 6.5
    * keep their order ("Preparing environment" is the build of the environment image). The check of the base image of
-   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7).
+   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7). Review round 2 of PR #64
+   * (A-N1): the first call of a run resolves the helper image of the run (ctx.helperImage); later calls do nothing.
    */
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
+    // Review round 2 of PR #64 (A-N1): the helper image is resolved once per run.
+    if (ctx.helperImage !== undefined) return;
     let announced = false;
     const announce = (text: string): void => {
       if (announced) return;
       announced = true;
       ctx.steps.detail(text);
     };
-    let tag: string;
+    let image: HelperImageUse;
     try {
-      tag = await this.deps.helper.ensureImage({
+      // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
+      // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
+      image = await this.deps.helper.ensureImageUse({
         onOutput: (text) => {
           announce(PipelineTexts.preparingHelper);
           this.logger.output(text);
@@ -5098,7 +5323,9 @@ export class EnvironmentService {
     } finally {
       if (announced) ctx.steps.clearDetail();
     }
-    await this.ensureRemoteMonitor(ctx, tag);
+    // Review round 3 of PR #64 (P2): pinned by the ID of its image, for the current tag too.
+    ctx.helperImage = { ...image };
+    await this.ensureRemoteMonitor(ctx, image);
   }
 
   /**
@@ -5107,16 +5334,19 @@ export class EnvironmentService {
    * started: the remote monitor acts only on environments with a record, so this keeps the stop without contact for
    * every remote environment. The keep-running flag follows the rules of the local Session Monitor (keptWhenClosed). A
    * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
-   * its ticks).
+   * its ticks). Review round 3 of PR #64 (P2): the monitor gets the tag for its label and the log lines, and the ID of the
+   * helper image of the open as the image of its `docker run`, like every helper run of the open;
+   * the tag only when the ID could not be read.
    */
-  private async ensureRemoteMonitor(ctx: PipelineContext, helperTag: string): Promise<void> {
+  private async ensureRemoteMonitor(ctx: PipelineContext, image: HelperImageUse): Promise<void> {
     const remoteMonitor = this.deps.remoteMonitor;
     if (!remoteMonitor || ctx.remoteMonitorEnsured) return;
     const target = await this.dockerTarget();
     if (target.kind !== 'remote') return;
     ctx.remoteMonitorEnsured = true;
     try {
-      await remoteMonitor.ensure(target.host, helperTag, ctx.signal);
+      // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): by the ID of the image that the open pinned.
+      await remoteMonitor.ensure(target.host, image.tag, ctx.signal, image.id);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);
@@ -5157,6 +5387,7 @@ export class EnvironmentService {
         repository: env.repository,
         branch,
         token,
+        image: ctx.helperImage,
         onOutput: this.output,
         signal: ctx.signal,
       });

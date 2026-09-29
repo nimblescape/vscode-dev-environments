@@ -20,7 +20,7 @@ import {
   environmentIdLabel,
   splitRepository,
 } from '../names';
-import { isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
+import { abortError, isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
 import type { DevcontainerConfig, DevcontainerResult, GitSummary } from '../types';
 import {
   DevcontainerCommandError,
@@ -35,10 +35,11 @@ import {
 } from './devcontainerCli';
 import {
   HELPER_LAST_USED_INTERVAL_MS,
-  ensureHelperImage,
+  ensureHelperImageUse,
   recordHelperImageUse,
   type BaseDigestLookup,
   type HelperBuildKind,
+  type HelperImageUse,
 } from './helperImage';
 import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
 import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
@@ -131,6 +132,12 @@ export interface EnsureImageOptions {
 }
 
 /**
+ * The result of ensureHelperImage that WorkspaceHelper caches, and the helper image of an open (see HelperImageUse in
+ * helperImage.ts). Review round 3 of PR #64 (P2): the runs of an open use its `id`, for the current tag too.
+ */
+export type { HelperImageUse };
+
+/**
  * ensureImage reuses its result for this long. After that, it runs ensureHelperImage again, so a window that stays open
  * for days still checks the base image and cleans up when that is due.
  */
@@ -187,6 +194,10 @@ function mountOption(fields: Record<string, string>): string {
 }
 
 export interface HelperRunSpec {
+  /**
+   * The image reference: the image ID of the helper image of an open (review round 3 of PR #64, P2), or the helper tag
+   * for a run outside an open.
+   */
   tag: string;
   volumeName: string;
   socketPath: string;
@@ -343,6 +354,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** `sha256:` and the first 12 hex characters of an image ID, for log lines. */
+function shortImageId(id: string): string {
+  return id.slice(0, 'sha256:'.length + 12);
+}
+
 function describeCommand(command: readonly string[]): string {
   if (command[0] === 'sh' && command[1] === '-c') return ['sh', '<script>', ...command.slice(4)].join(' ');
   if (command[0] === 'node' && command[1] === '-e') return ['node', '<script>', ...command.slice(3)].join(' ');
@@ -389,6 +405,8 @@ interface StreamOptions {
   network?: boolean;
   /** See HelperRunSpec.hideConfigFolder. */
   hideConfigFolder?: boolean;
+  /** The helper image of the open (see HelperImageUse); without it, the image of this instance (WorkspaceHelper.image). */
+  image?: HelperImageUse;
   signal?: AbortSignal;
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
@@ -433,17 +451,30 @@ function overrideInput(files: HelperFiles | undefined, override: Record<string, 
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
 export class WorkspaceHelper {
-  private imagePromise: Promise<string> | undefined;
+  private imagePromise: Promise<HelperImageUse> | undefined;
   /** Whether the cached image promise comes from ensureImage (with the maintenance), not from a helper run. */
   private imageMaintained = false;
   /** When the cached image promise resolved, and its tag. */
   private imageReadyAt: number | undefined;
   private imageTag: string | undefined;
+  /**
+   * Review round 4 of PR #64 (R4-1): the image ID of the cached result (HelperImageUse.id), set when it resolved. A pinned
+   * run that finds no such image resets the cache when it still holds this ID, and ensureImage checks it before it reuses
+   * the cache.
+   */
+  private imageCachedId: string | undefined;
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
   /** The engine of the cached image (HelperDeps.engine). */
   private imageEngine = '';
+  /**
+   * Review round 5 of PR #64 (R5-1): the build that the cached image promise has started (HelperBuildKind), until it
+   * settles, and the onBuild callbacks of the callers that await it. A caller that joins the promise gets the progress
+   * too: at once when the build has started, otherwise when it starts.
+   */
+  private imageBuilding: HelperBuildKind | undefined;
+  private imageBuildListeners: Set<(kind: HelperBuildKind) => void> | undefined;
 
   constructor(private readonly deps: HelperDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -471,10 +502,38 @@ export class WorkspaceHelper {
    * image (in the background), the cleanup of old helper images. The open pipeline calls it before the helper runs; a
    * result older than HELPER_IMAGE_RECHECK_MS, or one of a helper run (without the maintenance), is not reused. A failed
    * build throws UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors
-   * pass through.
+   * pass through. Returns the tag.
    */
   async ensureImage(options: EnsureImageOptions = {}): Promise<string> {
+    return (await this.ensureImageUse(options)).tag;
+  }
+
+  /**
+   * ensureImage, with the helper image that this call awaited (HelperImageUse: the tag and the ID of its image). Review
+   * round 3 of PR #64 (P1): the open pipeline pins this return value as the helper image
+   * of the open and passes it as `image` to every helper run of the open, because the cache of this instance is shared by
+   * all opens of the window and may be replaced meanwhile (another engine, a missing image at another run).
+   */
+  async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
     return this.image(options, true);
+  }
+
+  /** Whether the engine of the operation (HelperDeps.engine) is the local Docker. */
+  async usesLocalEngine(): Promise<boolean> {
+    return (await this.currentEngine()).key === '';
+  }
+
+  /**
+   * The background prebuild (user decision 2026-09-29: no previous helper image; HelperPrebuild): makes sure that the
+   * helper tag exists on the local Docker engine, and builds it when it is missing, without the maintenance of
+   * ensureImage (like the helper runs). It shares the cached promise of this instance with ensureImage and the helper
+   * runs, so an open that starts meanwhile waits for this build instead of building a second time; when `signal` aborts,
+   * the build is cancelled, and an open that waited for it builds again for itself. Returns `undefined` without a build
+   * when the engine of the operation is not the local Docker. Throws like ensureImage.
+   */
+  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse | undefined> {
+    if (!(await this.usesLocalEngine())) return undefined;
+    return this.image({ signal: options.signal, onBuild: options.onBuild }, false);
   }
 
   /**
@@ -492,11 +551,14 @@ export class WorkspaceHelper {
       secrets?: boolean;
       docker?: boolean;
       network?: boolean;
+      /** The helper image of the open (HelperImageUse). */
+      image?: HelperImageUse;
       onOutput?: (text: string) => void;
       signal?: AbortSignal;
     } = {},
   ): Promise<RunResult> {
     return this.runStreams(volumeName, command, {
+      image: options.image,
       env: options.env,
       input: options.input,
       secrets: options.secrets,
@@ -517,6 +579,8 @@ export class WorkspaceHelper {
     repository: string;
     branch?: string;
     token: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -525,6 +589,7 @@ export class WorkspaceHelper {
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, cloneCommand(p.repository, name, p.branch || undefined), {
+      image: p.image,
       input: p.token,
       secrets: true,
       docker: false,
@@ -548,10 +613,13 @@ export class WorkspaceHelper {
     repository: string;
     configPath: string;
     dockerfile?: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } | undefined> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -572,9 +640,10 @@ export class WorkspaceHelper {
   }
 
   /** Configuration paths in the volume, in the order of precedence (concept 7.4). */
-  async listConfigurations(p: { volumeName: string; repository: string; signal?: AbortSignal }): Promise<string[]> {
+  async listConfigurations(p: { volumeName: string; repository: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<string[]> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, listConfigsCommand(folder), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -613,6 +682,8 @@ export class WorkspaceHelper {
     override?: Record<string, unknown>;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<{ config: DevcontainerConfig; merged?: Record<string, unknown> }> {
@@ -639,6 +710,7 @@ export class WorkspaceHelper {
       override?: Record<string, unknown>;
       files?: HelperFiles;
       env?: Record<string, string>;
+      image?: HelperImageUse;
       onOutput?: (text: string) => void;
       signal?: AbortSignal;
     },
@@ -657,6 +729,7 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, withFiles ? writeAndRunCommand({}, args) : ['devcontainer', ...args], {
       input: withFiles ? writeAndRunInput(p.files, p.override) : undefined,
       env: p.env,
+      image: p.image,
       timeoutMs,
       signal: p.signal,
       onStderr: p.onOutput ?? this.logOutput,
@@ -696,6 +769,8 @@ export class WorkspaceHelper {
     override?: Record<string, unknown>;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
@@ -706,6 +781,7 @@ export class WorkspaceHelper {
       const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
       return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
         env: p.env,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -716,6 +792,7 @@ export class WorkspaceHelper {
     return this.runDevcontainer('devcontainer build', p.volumeName, command, {
       input: writeAndRunInput(p.files, p.override),
       env: p.env,
+      image: p.image,
       onOutput: p.onOutput,
       signal: p.signal,
     });
@@ -734,6 +811,8 @@ export class WorkspaceHelper {
     files: readonly string[];
     project: string;
     timeoutMs?: number;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<ComposeModelOutput | { error: string }> {
     const folder = this.repositoryFolder(p.repository);
@@ -742,6 +821,7 @@ export class WorkspaceHelper {
     }
     this.deps.logger.info(`Reading the Docker Compose configuration of ${p.repository} (${p.files.join(', ')}).`);
     const result = await this.runStreams(p.volumeName, composeModelCommand(folder, p.files), {
+      image: p.image,
       env: { COMPOSE_PROJECT_NAME: p.project },
       docker: false,
       network: false,
@@ -760,9 +840,18 @@ export class WorkspaceHelper {
    * one that runs `up` (COMPOSE_HASH_SCRIPT). Without the Docker socket, the cache volume, and network, and with the
    * configuration folder of the volume hidden. Throws CommandError when Compose fails.
    */
-  async composeServiceHashes(p: { volumeName: string; repository: string; model: string; project: string; signal?: AbortSignal }): Promise<Map<string, string>> {
+  async composeServiceHashes(p: {
+    volumeName: string;
+    repository: string;
+    model: string;
+    project: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<Map<string, string>> {
     this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
     const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
+      image: p.image,
       input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },
       docker: false,
@@ -783,7 +872,14 @@ export class WorkspaceHelper {
    * Without the Docker socket, the cache volume, and network, and with the configuration folder of the volume hidden.
    * Throws CommandError when a folder cannot be created.
    */
-  async createRepositoryFolders(p: { volumeName: string; repository: string; folders: readonly string[]; signal?: AbortSignal }): Promise<void> {
+  async createRepositoryFolders(p: {
+    volumeName: string;
+    repository: string;
+    folders: readonly string[];
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<void> {
     const folder = this.repositoryFolder(p.repository);
     if (p.folders.some((entry) => !entry.startsWith(`${folder}/`) || entry.slice(folder.length + 1).split('/').some((part) => part === '..' || part === '.' || part === ''))) {
       throw new Error(`Invalid folders: ${p.folders.join(', ')}`);
@@ -791,6 +887,7 @@ export class WorkspaceHelper {
     if (p.folders.length === 0) return;
     this.deps.logger.info(`Creating the folders ${p.folders.join(', ')} of ${p.repository} for the bind mounts of Docker Compose.`);
     const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
+      image: p.image,
       docker: false,
       network: false,
       hideConfigFolder: true,
@@ -820,6 +917,8 @@ export class WorkspaceHelper {
     env?: Record<string, string>;
     /** Review PL-1: removed from the output and from the error (none of the commands of `up` reads it). */
     token?: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -838,6 +937,7 @@ export class WorkspaceHelper {
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -867,6 +967,8 @@ export class WorkspaceHelper {
      * the error (the command output of DevcontainerCommandError), also when it is split across chunks.
      */
     token: string;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
@@ -882,6 +984,7 @@ export class WorkspaceHelper {
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
+        image: p.image,
         onOutput: p.onOutput,
         signal: p.signal,
       });
@@ -917,6 +1020,8 @@ export class WorkspaceHelper {
     volumeName: string;
     repository: string;
     identity: GitIdentity;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -924,6 +1029,7 @@ export class WorkspaceHelper {
     const output = p.onOutput ?? this.logOutput;
     this.deps.logger.info(`Writing the Git configuration of ${p.repository} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+      image: p.image,
       docker: false,
       network: false,
       signal: p.signal,
@@ -941,8 +1047,18 @@ export class WorkspaceHelper {
    * `volumes_from`, or a tmpfs) is there: the fix walks only the folder of the volume. Throws for IDs that are not numbers
    * (configOwnershipFixCommand); returns the result also for a non-zero exit code.
    */
-  async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string; timeoutMs?: number; signal?: AbortSignal }): Promise<RunResult> {
+  async fixConfigOwnership(p: {
+    volumeName: string;
+    folder: string;
+    uid: string;
+    gid: string;
+    timeoutMs?: number;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<RunResult> {
     return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
+      image: p.image,
       docker: false,
       network: false,
       timeoutMs: p.timeoutMs,
@@ -1011,52 +1127,80 @@ export class WorkspaceHelper {
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
   /**
-   * The helper tag. `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older than
-   * HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
+   * The helper image (HelperImageUse). `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older
+   * than HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
    * and only record the use (at most once per hour); without a result (a new window), they run ensureHelperImage without
    * the maintenance, which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays
-   * a stop, a delete, or a branch switch.
+   * a stop, a delete, or a branch switch. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
+   * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
-  private async image(options: EnsureImageOptions, recheck: boolean): Promise<string> {
+  private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     // Unit 7: an image of another engine (the Docker context changed) is not reused.
-    if (this.imagePromise && engine.key !== this.imageEngine) this.resetImage();
-    this.imageEngine = engine.key;
+    this.adoptEngine(engine.key);
     const statePath = this.statePathFor(engine);
     if (recheck && this.imagePromise && !this.imageMaintained) {
       // The result of a helper run: wait until it is ready (a missing tag is built only once), then maintain.
       const pending = this.imagePromise;
-      if (this.imageReadyAt === undefined) await pending.catch(() => undefined);
+      if (this.imageReadyAt === undefined) {
+        try {
+          await this.join(pending, options);
+        } catch (error) {
+          // Review round 5 of PR #64 (R5-1): the abort of this caller ends this call; a failure of the shared build
+          // does not (it is tried again below).
+          if (isAbortError(error) && options.signal?.aborted) throw error;
+        }
+      }
       if (this.imagePromise === pending) this.resetImage();
+      // Review round 8 of PR #64 (R8-1): another open with another engine may have replaced the cache during the join.
+      this.adoptEngine(engine.key);
     }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
       if (recheck && Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS) this.resetImage();
+      else if (recheck && !(await this.cachedImageCurrent())) this.resetImage();
       else await this.recordUse(now, statePath);
     }
+    // Review round 8 of PR #64 (R8-1): another open with another engine may have replaced the cache during the awaits
+    // above. No await follows until the join below, so the caller joins a promise of its own engine.
+    this.adoptEngine(engine.key);
     if (!this.imagePromise) {
-      const promise: Promise<string> = ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
+      // Review round 7 of PR #64 (R7-3): a caller cancelled during the awaits above starts no shared ensure, whose
+      // rejection nothing would handle (join rejects at once for an aborted signal) and which could start a build.
+      if (options.signal?.aborted) throw abortError();
+      const listeners = new Set<(kind: HelperBuildKind) => void>();
+      const promise: Promise<HelperImageUse> = ensureHelperImageUse(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
         statePath,
         baseDigest: this.deps.baseDigest,
         maintain: recheck,
         checkBaseImage: options.checkBaseImage,
-        onBuild: options.onBuild,
+        // Review round 5 of PR #64 (R5-1): the progress reaches every caller that awaits this promise (join), not only
+        // the caller that started it.
+        onBuild: (kind) => {
+          if (this.imagePromise === promise) this.imageBuilding = kind;
+          for (const listener of [...listeners]) listener(kind);
+        },
         onBaseImageCheck: this.deps.onBaseImageCheck,
         clock: this.clock,
         logger: this.deps.logger,
       }).then(
-        (tag) => {
+        (use) => {
           if (this.imagePromise === promise) {
+            this.imageBuilding = undefined;
             this.imageReadyAt = this.clock.now();
             this.imageUsedAt = this.imageReadyAt;
-            this.imageTag = tag;
+            this.imageTag = use.tag;
+            this.imageCachedId = use.id;
           }
-          return tag;
+          return use;
         },
         (error: unknown) => {
-          if (this.imagePromise === promise) this.imagePromise = undefined;
+          if (this.imagePromise === promise) {
+            this.imagePromise = undefined;
+            this.imageBuilding = undefined;
+          }
           if (isAbortError(error) || isUserFacingError(error)) throw error;
           this.deps.logger.error('The workspace helper image could not be built.', error);
           throw new UserFacingError('helperFailed', Messages.helperFailed, errorMessage(error));
@@ -1064,9 +1208,13 @@ export class WorkspaceHelper {
       );
       this.imagePromise = promise;
       this.imageMaintained = recheck;
+      this.imageBuilding = undefined;
+      this.imageBuildListeners = listeners;
     }
     try {
-      return await this.imagePromise;
+      // Review round 3 of PR #64 (P1): the caller gets the image that it awaited, also when the cache was replaced
+      // meanwhile (resetImage). Review round 5 of PR #64 (R5-1): its own signal ends its wait (join).
+      return await this.join(this.imagePromise, options);
     } catch (error) {
       // Another caller cancelled the shared build: build again for this caller.
       if (isAbortError(error) && !options.signal?.aborted) return this.image(options, recheck);
@@ -1074,10 +1222,94 @@ export class WorkspaceHelper {
     }
   }
 
+  /**
+   * Unit 7: makes `key` the engine of the cache; a cache of another engine is reset (its image is not reused). Review
+   * round 8 of PR #64 (R8-1): called again after each await of `image`, because the opens of a window (each with the
+   * engine of its operation) share the cache.
+   */
+  private adoptEngine(key: string): void {
+    if (this.imagePromise && key !== this.imageEngine) this.resetImage();
+    this.imageEngine = key;
+  }
+
   private resetImage(): void {
     this.imagePromise = undefined;
     this.imageMaintained = false;
     this.imageReadyAt = undefined;
+    this.imageCachedId = undefined;
+    this.imageBuilding = undefined;
+    this.imageBuildListeners = undefined;
+  }
+
+  /**
+   * Review round 5 of PR #64 (R5-1): awaits the cached image promise `pending` (the current one) for one caller. The
+   * signal of the caller ends only its own wait: it rejects with an AbortError at once (also when it was aborted before),
+   * and the shared build goes on with the signal of the caller that started it. The onBuild of the caller gets the
+   * progress of the shared build: at once when a build has started, otherwise when it starts, until `pending` settles.
+   */
+  private join(pending: Promise<HelperImageUse>, options: EnsureImageOptions): Promise<HelperImageUse> {
+    const { signal, onBuild } = options;
+    if (signal?.aborted) return Promise.reject(abortError());
+    const listeners = this.imageBuildListeners;
+    let listener: ((kind: HelperBuildKind) => void) | undefined;
+    if (onBuild !== undefined) {
+      if (this.imageBuilding !== undefined) onBuild(this.imageBuilding);
+      else if (listeners !== undefined) {
+        listener = (kind) => onBuild(kind);
+        listeners.add(listener);
+      }
+    }
+    if (signal === undefined && listener === undefined) return pending;
+    return new Promise<HelperImageUse>((resolve, reject) => {
+      const cleanup = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        if (listener !== undefined) listeners?.delete(listener);
+      };
+      const onAbort = (): void => {
+        cleanup();
+        reject(abortError());
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      pending.then(
+        (use) => {
+          cleanup();
+          resolve(use);
+        },
+        (error: unknown) => {
+          cleanup();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * Review round 4 of PR #64 (R4-1): whether the resolved result in the cache is still the image of its tag, before an
+   * open reuses it (ensureImage, within HELPER_IMAGE_RECHECK_MS). Another window may have rebuilt the tag (its old image
+   * is then removed, or the containerd store drops it) or a prune may have removed it: an open would then pin an ID that
+   * no longer exists and fail. `false` when the tag is gone or has another image now; `true` when Docker cannot answer
+   * (the cache stays, as before the check) or when the cache changed meanwhile (the caller then awaits the new promise).
+   */
+  private async cachedImageCurrent(): Promise<boolean> {
+    const promise = this.imagePromise;
+    const tag = this.imageTag;
+    const cachedId = this.imageCachedId;
+    if (promise === undefined || tag === undefined) return true;
+    let current: string | undefined;
+    try {
+      current = await this.deps.docker.imageId(tag);
+    } catch (error) {
+      this.deps.logger.warn(`The workspace helper image ${tag} could not be checked: ${errorMessage(error)}`);
+      return true;
+    }
+    if (this.imagePromise !== promise) return true;
+    if (current === cachedId) return true;
+    this.deps.logger.info(
+      current === undefined
+        ? `The workspace helper image ${tag} was removed. It is prepared again.`
+        : `The workspace helper image ${tag} has another image now. It is prepared again.`,
+    );
+    return false;
   }
 
   /** `lastUsedAt` of the tag in the state file, at most once per hour per instance. Never throws. */
@@ -1116,7 +1348,14 @@ export class WorkspaceHelper {
     command: string,
     volumeName: string,
     helperCommand: string[],
-    options: { input?: string; env?: Record<string, string>; secret?: string; onOutput?: (text: string) => void; signal?: AbortSignal },
+    options: {
+      input?: string;
+      env?: Record<string, string>;
+      secret?: string;
+      image?: HelperImageUse;
+      onOutput?: (text: string) => void;
+      signal?: AbortSignal;
+    },
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
     const secret = options.secret;
@@ -1128,6 +1367,7 @@ export class WorkspaceHelper {
       result = await this.runStreams(volumeName, helperCommand, {
         input: options.input,
         env: options.env,
+        image: options.image,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
         onStderr: stderr === undefined ? output : (text) => stderr.write(text),
@@ -1149,14 +1389,39 @@ export class WorkspaceHelper {
 
   private async runStreams(volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
     const env = this.helperEnv(options.env ?? {}, options.secrets === true);
-    let tag = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-    let result = await this.runContainer(tag, volumeName, command, env, options);
+    // Review round 2 of PR #64 (A-N1): a run of an open uses the helper image of that open, never the image that this
+    // instance resolved for another open meanwhile.
+    const pinned = options.image;
+    if (pinned !== undefined) {
+      // Review round 3 of PR #64 (P2): by the ID of its image, for the current tag too, so a rebuild of the tag by another
+      // window (`--pull --no-cache`, other packages) never changes the helper image in the middle of an open.
+      const reference = pinned.id ?? pinned.tag;
+      const result = await this.runContainer(reference, volumeName, command, env, options);
+      if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
+        // Review round 2 of PR #64 (A-N1, B3), review round 3 of PR #64 (P2, P8): the image of the open was removed (for
+        // example by `docker image prune -a`, or by another window that rebuilt the tag and removed the image that the tag
+        // had before). The open ends: nothing is built and no other image is
+        // used, because another helper image has another Dev Container CLI than the one that read and checked the
+        // configuration of this open. Review round 4 of PR #64 (R4-1): the cache of the window is reset when it still
+        // holds this image, so the next open resolves the helper image again instead of pinning the removed ID.
+        if (this.imageReadyAt !== undefined && this.imageTag === pinned.tag && this.imageCachedId === pinned.id) this.resetImage();
+        this.deps.logger.warn(
+          `The workspace helper image ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
+        );
+        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${reference}`);
+      }
+      return result;
+    }
+    let use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
+    // A run outside an open runs the helper tag by its tag.
+    let result = await this.runContainer(use.tag, volumeName, command, env, options);
     if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
-      // The image was removed after this instance checked it (for example by `docker image prune -a`).
-      this.deps.logger.warn(`The workspace helper image ${tag} is missing. It is built again.`);
+      // The image was removed after it was checked (for example by `docker image prune -a`). The run takes what
+      // ensureHelperImage returns now: the tag, built again.
+      this.deps.logger.warn(`The workspace helper image ${use.tag} is missing. It is built again.`);
       this.resetImage();
-      tag = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-      result = await this.runContainer(tag, volumeName, command, env, options);
+      use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
+      result = await this.runContainer(use.tag, volumeName, command, env, options);
     }
     return result;
   }
@@ -1177,7 +1442,7 @@ export class WorkspaceHelper {
   }
 
   private async runContainer(
-    tag: string,
+    image: string,
     volumeName: string,
     command: readonly string[],
     env: Record<string, string>,
@@ -1185,7 +1450,7 @@ export class WorkspaceHelper {
   ): Promise<RunResult> {
     const containerName = `devenv-helper-${crypto.randomBytes(6).toString('hex')}`;
     const args = helperRunArgs({
-      tag,
+      tag: image,
       volumeName,
       socketPath: this.socketPathFor(await this.currentEngine()),
       containerName,

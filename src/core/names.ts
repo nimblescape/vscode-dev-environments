@@ -129,6 +129,11 @@ export const COMPOSE_CLEARED_LABELS: readonly string[] = ['com.docker.compose.pr
 export const LABEL_HELPER = 'nimblescape.devenv.helper';
 export const LABEL_HELPER_RUN = 'nimblescape.devenv.helper-run';
 /**
+ * Review round 4 of PR #64 (R4-2/R4-3): a label with a random nonce per build of ContainerAdapter.buildImage, by which it
+ * finds the ID of the image that the build made (`docker image ls --filter label=…`).
+ */
+export const LABEL_BUILD_ID = 'nimblescape.devenv.build-id';
+/**
  * Every label key that the extension reads or writes (on containers, images, and volumes), each with LABEL_PREFIX, in
  * lower case. The host access policy refuses every key with LABEL_PREFIX in a configuration and on images
  * (isReservedLabel in ./policy/rules.ts), these and any later one: such a label would hide a container or volume from
@@ -148,6 +153,7 @@ export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
   LABEL_HOST_ACCESS,
   LABEL_HELPER,
   LABEL_HELPER_RUN,
+  LABEL_BUILD_ID,
   LABEL_SESSION_MONITOR,
   LABEL_HELPER_CHANNEL,
   LABEL_CHANNEL_STEP,

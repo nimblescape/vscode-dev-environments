@@ -150,3 +150,35 @@ describe('the recreate offer, review round 2 (V1): volumes without a name', () =
     expect(Messages.containerRecreatedDamaged()).not.toContain('without a name');
   });
 });
+
+describe('helperFailedOpenedAsItIs (review round 4 of PR #64, R4-4)', () => {
+  it('says that the helper failed, that the running environment opens as it is, and what was not applied', () => {
+    expect(Messages.helperFailedOpenedAsItIs('update')).toBe(
+      'The workspace helper could not be prepared. The running environment is opened as it is: the update was not applied. Open it again to try again.',
+    );
+    expect(Messages.helperFailedOpenedAsItIs('rebuild')).toContain('it was not rebuilt');
+    expect(Messages.helperFailedOpenedAsItIs('configuration', 'devcontainer.json')).toContain(
+      'the selected configuration was not applied, and devcontainer.json stays selected',
+    );
+    for (const change of ['update', 'rebuild', 'configuration'] as const) {
+      expect(Messages.helperFailedOpenedAsItIs(change).startsWith(Messages.helperFailed)).toBe(true);
+    }
+  });
+});
+
+// Review round 21 of PR #64 (B-R21-2): the question of a switch from Docker Compose to a single container names the
+// switch with the configuration path, what Rebuild now removes, and points to Select configuration… (container
+// restrictions, "Switching between Docker Compose and a single container"), also in the window that is connected.
+describe('the question of a switch from Docker Compose to a single container (review round 21 of PR #64, B-R21-2)', () => {
+  const configPath = '.devcontainer/python/devcontainer.json';
+  it.each([
+    ['at an open', Messages.configurationKindChanged(true, configPath)],
+    ['in the connected window', Messages.configurationKindChangedConnected(configPath)],
+  ])('names the switch, what Rebuild now removes, and Select configuration… (%s)', (_where, text) => {
+    expect(text).toContain(`The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container.`);
+    expect(text).toContain(
+      'Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept.',
+    );
+    expect(text).toContain('To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.');
+  });
+});

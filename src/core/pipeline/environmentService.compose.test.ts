@@ -40,6 +40,7 @@ import {
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
+  configurationName,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -716,27 +717,257 @@ describe('existing Docker Compose environment', () => {
     expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
   });
 
-  it('starts the containers with docker start when the configuration cannot be read (D-15), the services first', async () => {
+  it('refuses to start the containers when the configuration cannot be read (D-15)', async () => {
     await seedCompose();
     h.helper.composeOutput = { error: 'yaml: invalid' };
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started the
+    // containers as they were; now the start fails, and nothing starts.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.message).toBe(PipelineTexts.startFailed);
+    expect(error.detail).toContain('The Docker Compose configuration cannot be read');
     expect(h.helper.ups).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()?.state).toBe('stopped');
     expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
   });
 
-  it('starts all containers with docker start when up fails because the workspace helper failed (review round 1, P-3)', async () => {
-    await seedCompose();
-    h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
-    await h.service.openEnvironment(ENV_ID, options());
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+  it.each<[string, () => Promise<void>, string]>([
+    [
+      'there',
+      () => seedCompose(),
+      'The Docker Compose configuration cannot be read. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.',
+    ],
+    [
+      'outdated',
+      () => seedCompose({ devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }),
+      `The Docker Compose configuration cannot be read, and the container ${NAME} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`,
+    ],
+    ['missing', () => seedCompose({ dev: null }), 'The Docker Compose configuration cannot be read, and the environment has no container.'],
+  ])('names in the start failure whether the dev container is %s (review round 1 of PR #64, L3)', async (_name, seed, detail) => {
+    await seed();
+    h.helper.composeOutput = { error: 'yaml: invalid' };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.message).toBe(PipelineTexts.startFailed);
+    expect(error.detail).toBe(detail);
+    expect(h.helper.ups).toEqual([]);
+    // Review round 1 of PR #64 (L2): the log line does not claim that the environment is started.
+    expect(h.logger.errors.filter((line) => line.startsWith('The configuration of'))).toEqual([
+      expect.stringContaining(`The configuration of ${REPO} could not be used. Its containers are not started.`),
+    ]);
+    expect(h.logger.warnings).toContain(`The Docker Compose configuration of ${REPO} cannot be read. Its containers are not started.`);
   });
 
-  it('starts all containers with docker start when the workspace helper is not available', async () => {
-    await seedCompose();
+  it('opens a running dev container that is current as it is without the workspace helper (review round 1 of PR #64, L2)', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    // Changed expectation (review round 2 of PR #64, B2): the log line names the helper, not the configuration.
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  // Review round 10 of PR #64 (R10-2): a configuration of another kind is not kept (keepsKind false), so the running
+  // single container created without the configuration counts as current and opens as it is.
+  it('opens a running single container created without the configuration as it is when the configuration now uses Docker Compose and the rebuild fails with helperFailed', async () => {
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.buildError = () => new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+  });
+
+  it('opens running current containers as they are and warns that the update was not applied when the build fails with helperFailed (review round 5 of PR #64, R5-3 f)', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
+    const dev = devContainer()?.id;
+    const db = dbContainer()?.id;
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    h.helper.buildError = () => new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+  });
+
+  it('R12-3 opens running current containers as they are, without the Git warning, when the Git setup before up of the update fails with helperFailed', async () => {
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { 'com.docker.compose.image': `sha256:image-of-${DB_IMAGE}`, 'com.docker.compose.config-hash': 'hash-of-db' } });
+    const dev = devContainer()?.id;
+    const db = dbContainer()?.id;
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    h.helper.prepareGitError = gone();
+    h.helper.upError = () => gone();
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('update')]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+  });
+
+  it('opens running containers of the checks-off time as they are without the workspace helper while the checks are off (review round 2 of PR #64, B-M3)', async () => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await seedCompose({
+      dev: 'running',
+      db: 'running',
+      devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED },
+      dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED },
+    });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+  });
+
+  it('logs that a running current dev container is opened as it is when its configuration cannot be read (review round 3 of PR #64, P9)', async () => {
+    // A configuration error, not helperFailed: the log line of the configuration says that the environment opens as it is.
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(devContainer()?.name);
+    expect(h.logger.errors.filter((line) => line.startsWith('The configuration of'))).toEqual([
+      expect.stringMatching(new RegExp(`^The configuration of ${REPO} could not be used\\. The running environment is opened as it is\\. `)),
+    ]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()?.state).toBe('running');
+  });
+
+  it.each([
+    ['helperFailed', () => (h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed)), () => h.helper.calls.includes('ensureImage')],
+    [
+      'a configuration error',
+      () => (h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError')),
+      () => h.helper.readConfigurations.length > 0,
+    ],
+  ] as const)('ends the open as cancelled when it is cancelled while Step 5 lists the containers after %s (review round 3 of PR #64, P9)', async (_name, fail, reached) => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    fail();
+    const controller = new AbortController();
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    let aborted = false;
+    h.docker.listEnvironmentContainers = async () => {
+      // The listing of opensAsItIsOrFalse: after the error of Step 5.
+      if (reached()) {
+        aborted = true;
+        controller.abort();
+        throw abortError();
+      }
+      return list();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { ...options(), signal: controller.signal }));
+    expect(aborted).toBe(true);
+    expect(error.code).toBe('cancelled');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.includes('could not be listed'))).toBe(false);
+  });
+
+  it('keeps helperFailed when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    h.docker.listEnvironmentContainers = async () => {
+      throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.some((line) => line.startsWith(`The containers of ${REPO} could not be listed:`))).toBe(true);
+  });
+
+  it('keeps the host access refusal when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
+    // Before, the Step 5 handling asked whether the running dev container opens as it is (a listing of the containers)
+    // for every error, and the error of that listing replaced the refusal.
+    await seedCompose({ dev: 'running', db: 'running' });
+    useCompose(h, output((m) => (m.services.db.privileged = true)));
+    h.docker.listEnvironmentContainers = async () => {
+      throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.message).toBe(Messages.hostAccess('service db: privileged mode'));
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('fails with helperFailed at once, without a warning, for a running dev container that is outdated (review round 1 of PR #64, L2)', async () => {
+    await seedCompose({ dev: 'running', devLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
+  it('fails with helperFailed at once for a running dev container next to a service of the checks-off time (review round 1 of PR #64, L2)', async () => {
+    // The dev container is current, but a container of another service was created while the host access checks were
+    // off: the environment is created again (startContainer), which needs the helper.
+    await seedCompose({ dev: 'running', db: 'running', dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.ui.warnings).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('does not start the environment without the helper when a service of the checks-off time appears after the first look (review round 1 of PR #64, L3)', async () => {
+    // Step 5 saw a running dev container that is current, so the open went on without the helper; startContainer looks
+    // at the containers again and finds one of the checks-off time: the environment would be created again, which needs
+    // the helper, so it fails with helperFailed (never a start without the helper).
+    await seedCompose({ dev: 'running', db: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    let calls = 0;
+    h.docker.listEnvironmentContainers = async () => {
+      if (++calls === 2) dbContainer()!.labels[LABEL_HOST_ACCESS] = HOST_ACCESS_UNRESTRICTED;
+      return list();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
+  it('fails with helperFailed when up fails because the workspace helper failed (review round 1, P-3)', async () => {
+    await seedCompose();
+    h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started all
+    // containers; now the open fails with helperFailed.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+  });
+
+  it('fails with helperFailed and starts nothing when the workspace helper is not available', async () => {
+    await seedCompose();
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started all
+    // containers; now the open fails with helperFailed.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()?.state).toBe('stopped');
+  });
+
+  it('passes the helper image of the open to every helper run of a Docker Compose open (review round 2 of PR #64, A-N1)', async () => {
+    await seedCompose();
+    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (review round 3 of PR #64, P2): the HelperImageUse names the image ID `id`. user decision
+    // 2026-09-29: no previous helper image. Changed expectation: the current tag with its image ID (before, a previous
+    // helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
+    expect(h.helper.helperImages.map((entry) => entry.call)).toEqual(expect.arrayContaining(['readConfiguration', 'composeModel', 'up']));
+    expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
   });
 
   it('replaces a single container of the environment when the configuration became a Compose configuration', async () => {
@@ -771,6 +1002,65 @@ describe('existing Docker Compose environment', () => {
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
     expect(h.docker.images.has(IMAGE_1)).toBe(true);
+  });
+
+  it('ends with helperFailed, with the detail of the switch, when the helper image of the open is gone at up of the new Compose configuration (review round 4 of PR #64, R4-5)', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('now uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${single.name}`);
+    // The cleanup of the switch stays, and nothing of the other kind is started.
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+    expect(h.ui.warnings).toEqual([]);
+  });
+
+  it('opens the running single container as it is when the folders of the bind mounts cannot be written with helperFailed before the switch to Docker Compose removed it (review round 11 of PR #64, R11-1)', async () => {
+    // Reproduced: the switch branch of the failed `up` ended the open with helperFailed and the detail "removed the
+    // container …", although nothing was removed, and the running container did not open as it is.
+    const SOURCE = `${FOLDER}/data/postgres`;
+    const out = output((m) => {
+      m.services.db.volumes = [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: FOLDER };
+    useCompose(h, out);
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.createFoldersError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).toContain(`createRepositoryFolders ${SOURCE}`);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.log).not.toContain(`rm ${single.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('rename'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: single.id, name: NAME, state: 'running' })]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('R12-1a opens the running single container as it is when the Git setup before up fails with helperFailed before the switch to Docker Compose removed it', async () => {
+    await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop') || line.startsWith('rename'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: single.id, name: NAME, state: 'running' })]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 
   it('starts the single container as it is on "Rebuild later" when the configuration became a Compose configuration (review round 1, P-1)', async () => {
@@ -1096,16 +1386,105 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 
-  it('starts the containers of Docker Compose with docker start on "Rebuild later" (review round 1, P-1)', async () => {
-    const db = dbContainer()?.id;
-    const dev = devContainer()?.id;
-    h.ui.configurationChangedAnswer = 'later';
+  it('ends with helperFailed, with the detail of the switch, when the helper image of the open is gone at up of the new single container (review round 4 of PR #64, R4-5)', async () => {
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(error.detail).toContain(`removed the container ${db?.name} of the service db`);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+  });
+
+  it('ends with helperFailed and keeps the other services when the Git setup before up of the new single container fails with helperFailed (review round 11 of PR #64, R11-2)', async () => {
+    // Reproduced: prepareGit turned the helperFailed into the gitSetupFailed warning, and the switch then removed the
+    // container of the service db although the helper image was known to be gone.
+    const db = dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail ?? '').not.toContain('no longer uses Docker Compose');
+    expect(h.docker.log).not.toContain(`rm ${db?.id}`);
+    expect(dbContainer()).toMatchObject({ id: db?.id });
+    expect(h.ui.warnings).not.toContain(Messages.gitSetupFailed);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('R12-2a gives the detail of the switch when run-user-commands fails with helperFailed after up replaced the only dev container', async () => {
+    const db = dbContainer();
+    if (db) h.docker.containers.delete(db.id);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+  });
+
+  it('R12-2b, review round 13 of PR #64 (R13-2): up that fails with helperFailed never ran, so the running dev container opens as it is', async () => {
+    // A helperFailed of `up` means that the helper container never started (its pinned image is gone), so the CLI removed nothing.
+    const db = dbContainer();
+    if (db) h.docker.containers.delete(db.id);
+    const dev = devContainer();
+    if (dev) {
+      dev.state = 'running';
+      dev.rawState = 'running';
+    }
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (image) => (image === IMAGE_2 ? new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`) : undefined);
     await h.service.openEnvironment(ENV_ID, options());
+    expect(h.ui.warnings).toContain(Messages.helperFailedOpenedAsItIs('rebuild'));
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('stop '))).toEqual([]);
+  });
+
+  it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
+    const db = dbContainer()?.id;
+    h.ui.configurationChangedAnswer = 'later';
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started the
+    // containers of Docker Compose; without a Docker Compose configuration there is no `up`, so the start fails.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log).not.toContain(`rm ${db}`);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db}`, `start ${dev}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
     expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
     expect(h.progress.details).not.toContain(Messages.containerComposeReplaced);
+  });
+
+  it('opens a running dev container as it is and starts its stopped services on "Rebuild later" (D-22, review round 19 of PR #64, R19-1)', async () => {
+    const db = dbContainer()?.id;
+    const dev = devContainer();
+    if (dev) {
+      dev.state = 'running';
+      dev.rawState = 'running';
+    }
+    h.ui.configurationChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+    expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
+    // The log line names the exception for a running dev container (before: "the containers of Docker Compose cannot be started").
+    // Review round 20 of PR #64 (R20-1): changed expectation, only a current dev container opens (before: "a stopped dev
+    // container of Docker Compose cannot be started (a dev container that runs already opens as it is)").
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment (before: "a dev container
+    // of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and
+    // is current opens as it is)").
+    expect(h.logger.infos.some((line) => line.includes('the containers of Docker Compose start only when the dev container runs already and no container of the environment must be created again (the dev container then opens as it is)'))).toBe(true);
   });
 
   it('refuses to start on "Rebuild later" when the Docker Compose environment has no dev container (review round 1, P-1)', async () => {
@@ -1282,13 +1661,25 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     useSingle();
     // Review round 4, D4-3: changed expectation, a question of its own that names the switch (configurationKindChanged).
     h.ui.configurationKindChangedAnswer = 'later';
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): Later keeps the containers of
+    // Docker Compose but cannot start them (before: docker start of the dev container).
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    // Review round 10 of PR #64 (R10-4): the detail names the change of kind (keepsKind reads the kind of the containers).
+    expect(error.detail).toContain('no longer uses Docker Compose');
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // Review round 23 of PR #64 (B-R23-1): the question says that a stopped dev container does not start.
+    expect(h.ui.kindQuestions[0]).toContain('Otherwise nothing starts: a stopped dev container');
+    // Review round 24 of PR #64 (B-R24-1): the question says that Later keeps Docker Compose without a rebuild and that
+    // the containers start only with a Docker Compose configuration.
+    expect(h.ui.kindQuestions[0]).toContain('Later keeps Docker Compose without a rebuild');
+    expect(h.ui.kindQuestions[0]).toContain('start only with a Docker Compose configuration.');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${dev?.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(devContainer()?.id).toBe(dev?.id);
     expect(dbContainer()?.id).toBe(db?.id);
     // "Rebuild now" switches, as a rebuild does.
     // Review round 4, D4-3: changed expectation, the answer of configurationKindChanged.
@@ -1298,7 +1689,104 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.docker.log).toContain(`rm ${db?.id}`);
   });
 
-  it('starts the existing environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
+  it('opens a running dev container of a restored Docker Compose environment as it is on Later and starts its stopped services (D-22, review round 19 of PR #64, R19-1)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // The question says what Later does with a running dev container (before: "Later keeps Docker Compose and starts nothing").
+    // Review round 20 of PR #64 (R20-1): changed expectation, "and is current" (before: "a dev container that runs already
+    // opens as it is").
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment (before: "a dev container
+    // that runs already and is current opens as it is, …").
+    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('if the dev container runs already and no container of the environment must be created again, the dev container opens as it is, and the stopped containers of the other services are started');
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db?.id}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+  });
+
+  // Review round 23 of PR #64 (A-R23-2): with the host access checks off, a container that was created while they were off
+  // is current (containerIsCurrent, unrestrictedServiceContainer): Later opens the running dev container and starts the
+  // stopped services, and the question names that reason only for checks that are on now.
+  it.each([
+    ['the dev container and db', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED }, dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+    ['db', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
+  ])('opens a running dev container on Later with the checks off when %s were created while they were off (review round 23 of PR #64, A-R23-2)', async (_case, labels) => {
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await seedCompose({ dev: 'running', db: 'stopped', ...labels });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    expect(h.ui.kindQuestions[0]).toContain('while the host access checks were off and the checks are on now');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([`start ${db?.id}`]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
+  });
+
+  it.each([
+    ['created by an older version', { devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }, false],
+    ['created while the host access checks were off', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }, false],
+    ['next to a service container created while the host access checks were off', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }, true],
+  ])('does not start a running dev container %s of a restored Docker Compose environment on Later, as the question says (review round 20 of PR #64, R20-1)', async (_case, labels, byService) => {
+    await seedCompose({ dev: 'running', db: 'stopped', ...labels });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('must be created again');
+    // Review round 22 of PR #64 (A-R22-1): the detail names the container that must be created again (before: always
+    // the dev container, also when it was the container of the service db).
+    if (byService) {
+      expect(error.detail).toContain(`the container ${db?.name} was created while the host access checks were off`);
+      expect(error.detail).not.toContain(`the container ${dev?.name} must be created again`);
+    } else {
+      expect(error.detail).toContain(`the container ${dev?.name} must be created again`);
+    }
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment and names the host access
+    // checks (before: "a dev container that runs already and is current opens as it is", "one that must be created again").
+    expect(h.ui.kindQuestions[0]).toContain('if the dev container runs already and no container of the environment must be created again, the dev container opens as it is');
+    // Review round 23 of PR #64 (A-R23-2): changed expectation, the host access reason applies only while the checks are on
+    // (before: "because they were created while the host access checks were off").
+    expect(h.ui.kindQuestions[0]).toContain('because they were created while the host access checks were off and the checks are on now');
+    // Review round 23 of PR #64 (B-R23-1): the question names both reasons, and the detail why nothing can start.
+    expect(h.ui.kindQuestions[0]).toContain('because an older version created them');
+    expect(error.detail).toMatch(/\), which needs the configuration\.$/);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'stopped' });
+    // Review round 22 of PR #64 (A-R22-1): changed expectation (before: "that is stopped or must be created again cannot be started").
+    expect(h.logger.infos.some((line) => line.includes('start only when the dev container runs already and no container of the environment must be created again'))).toBe(true);
+  });
+
+  it('does not start the existing Docker Compose environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
@@ -1306,11 +1794,14 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
       missing: [`${FOLDER}/db/Dockerfile`],
     });
     h.ui.configurationChangedAnswer = 'rebuildNow';
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): the configuration cannot be used,
+    // so there is no model and no `up`: the start fails (before: docker start of the containers as they were).
+    const failed = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(failed.code).toBe('startFailed');
     const text = Messages.buildFileMissing(`service db: Dockerfile ${FOLDER}/db/Dockerfile`);
     expect(h.ui.warnings).toContain(text);
     expect(h.helper.builds).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${devContainer()?.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
     // A new environment: a plain error of the configuration, no refusal of the policy.
     const other = createHarness({ newEnvironmentId: () => ENV_ID });
     try {
@@ -1383,6 +1874,56 @@ describe('review round 4 of unit 6 (D4-1, D4-2, D4-3, P4-2, P4-3)', () => {
     expect(h.docker.log).not.toContain(`rm ${db?.id}`);
     expect(dbContainer()?.id).toBe(db?.id);
     expect(error.detail).not.toContain('were removed again');
+  });
+
+  async function cancelledSwitch(): Promise<ContainerInfo | undefined> {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const cancel = new AbortController();
+    h.helper.upError = (image) => (image === IMAGE_2 ? abortError() : undefined);
+    let db: ContainerInfo | undefined;
+    h.helper.beforeUpError = () => {
+      db = addDb();
+      h.docker.addContainer({
+        environmentId: ENV_ID,
+        name: NAME,
+        state: 'running',
+        image: IMAGE_2,
+        labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), ...COMPOSE_LABELS, 'com.docker.compose.service': 'app', 'com.docker.compose.config-hash': 'y' },
+      });
+      cancel.abort();
+    };
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: cancel.signal }).catch(() => undefined);
+    h.helper.upError = () => undefined;
+    h.helper.beforeUpError = undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    await h.service.openEnvironment(ENV_ID, options());
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    return db;
+  }
+
+  it('B14 up helperFailed after a cancelled switch: the running compose containers open as they are', async () => {
+    const db = await cancelledSwitch();
+    const dev = devContainer();
+    h.ui.warnings.length = 0;
+    const logAt = h.docker.log.length;
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('rebuild')]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()?.id).toBe(db?.id);
+    expect(h.docker.log.slice(logAt).filter((l) => l.startsWith('rm '))).toEqual([]);
+  });
+
+  it('B14 run-user-commands helperFailed after up replaced the dev container of a cancelled switch: detail of the switch', async () => {
+    await cancelledSwitch();
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('now uses Docker Compose');
   });
 
   it('removes only the containers that the failed up created when the switch removed the single container (D4-1)', async () => {
@@ -1582,10 +2123,32 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await withoutRecord();
     useSingle();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH) });
-    // The pipeline asks the same question.
-    await h.service.openEnvironment(ENV_ID, options());
+    // Review round 20 of PR #64 (R20-2): changed expectation, the connected window gets its own question, as Later there
+    // only keeps the window connected (before: Messages.configurationKindChanged(true, …), the question of the pipeline).
+    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
+    // The pipeline asks its own question, which says what Later does in an open.
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): Later then fails to start (no
+    // Docker Compose configuration, no `up`); before, docker start started the containers.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+  });
+
+  it('asks the connected window about a switch from Docker Compose without promising a start on Later (review round 20 of PR #64, R20-2)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    await withoutRecord();
+    useSingle();
+    const changed = await h.service.configurationChanged(ENV_ID, options());
+    expect(changed).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
+    const question = typeof changed === 'object' ? changed.question : '';
+    // Review round 24 of PR #64 (B-R24-1): also in the connected window, Later keeps Docker Compose without a rebuild.
+    expect(question).toContain('Later keeps Docker Compose without a rebuild');
+    expect(question).toContain('this window stays connected, and nothing is started or removed');
+    expect(question).not.toContain('are started');
+    expect(question).not.toContain('opens as it is');
+    // Review round 22 of PR #64 (A-R22-2): the checks that nothing started are gone (configurationChanged only reads); that
+    // Later starts nothing in the connected window is checked in controller.test (Switch branch…, D5-3: no openEnvironment
+    // and no open).
   });
 
   it('reports a switch from a single container to Docker Compose in configurationChanged (D5-3)', async () => {
@@ -1800,6 +2363,16 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     useCompose(h, out);
   }
 
+  it('creates the folder with the helper image of the open (review round 3 of PR #64, P7)', async () => {
+    withDataFolder(FOLDER);
+    await h.service.open(TARGET, options());
+    expect(h.helper.createdFolders).toEqual([[SOURCE]]);
+    // user decision 2026-09-29: no previous helper image. Changed expectation: the current tag with its image ID (before,
+    // a previous helper).
+    const previous = { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId };
+    expect(h.helper.helperImages.filter((entry) => entry.call === 'createRepositoryFolders')).toEqual([{ call: 'createRepositoryFolders', image: previous }]);
+  });
+
   it('creates the folder in the workspace volume before up, and mounts it as a folder of the volume', async () => {
     withDataFolder(FOLDER);
     // Before: refused (the path does not exist in the repository).
@@ -1869,6 +2442,14 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     // Review round 10, D10-1 and D10-3: in the entry, not in the build record, and without the read-only INIT_SQL
     // (before: buildRecord.compose.serviceFolders [SOURCE, INIT_SQL]).
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
+  });
+
+  it('runs no ownership fix before up when a rebuild creates the containers of an existing clone again (review round 20 of PR #64, B-R20-1)', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
+    expect(h.helper.ups.length).toBeGreaterThan(0);
+    // The fix before `up` is for a new clone only (R12-1): the services have run on these files.
+    expect(h.docker.runs.filter((run) => run.all.includes('--entrypoint'))).toEqual([]);
   });
 
   it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
@@ -2162,15 +2743,30 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
   });
 
-  it('starts the existing environment when the daemon fails at the load (G1)', async () => {
+  it('does not blame the configuration when the daemon fails at the load (G1)', async () => {
     await seedCompose();
     h.docker.transientImages = 'all';
-    await h.service.openEnvironment(ENV_ID, options());
-    // Before: refused with "Change the configuration of the repository", and nothing started.
+    // Changed expectation (no docker start fallback, user decision 2026-09-29): a Docker Compose environment
+    // whose configuration could not be used is not started as it is (before: docker start of its containers); the open
+    // fails with startFailed, and the warning still names Docker, not the configuration.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    // Before (G1): refused with "Change the configuration of the repository".
     expect(h.ui.warnings).toEqual([INTERNAL]);
-    expect(devContainer()?.state).toBe('running');
-    expect(dbContainer()?.state).toBe('running');
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()?.state).toBe('stopped');
     expect(h.helper.builds).toEqual([]);
+  });
+
+  it('says in the start failure that the configuration could not be checked when the daemon failed at the load (review round 1 of PR #64, L2)', async () => {
+    await seedCompose();
+    h.docker.transientImages = 'all';
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(
+      'The Docker Compose configuration could not be checked. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.',
+    );
+    expect(h.logger.warnings).toContain(`The Docker Compose configuration of ${REPO} could not be checked. Its containers are not started.`);
   });
 
   it('does not use a new configuration whose images Docker could not inspect (G1)', async () => {
@@ -3083,6 +3679,69 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
   });
 
+  it('ends with helperFailed and keeps the previous dev container stopped when the helper image of the open is gone at up of the new dev service (review round 4 of PR #64, R4-5)', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    const ups = h.helper.ups.length;
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (image) => (image === IMAGE_1 ? undefined : new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`));
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toContain('The dev service changed from app to web. The previous dev container is kept, stopped.');
+    // Not opened as it is, and no `up` with the previous image.
+    expect(h.helper.ups.slice(ups).map((up) => up.image)).toEqual([IMAGE_2]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    expect(h.logger.errors.join('\n')).not.toContain('could not be created from');
+  });
+
+  it('opens the running previous dev container as it is when the folders of the bind mounts cannot be written with helperFailed before it was moved (review round 11 of PR #64, R11-1)', async () => {
+    // Reproduced: the branch of the switched dev service ended the open with helperFailed and "The previous dev container
+    // is kept, stopped", although it was neither renamed nor stopped, and it did not open as it is.
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    expect(app).toMatchObject({ name: NAME, state: 'running' });
+    const SOURCE = `${FOLDER}/data/postgres`;
+    const out = output((m) => {
+      delete m.services.app.volumes;
+      m.services.web = { image: BASE_IMAGE, command: ['sleep', 'infinity'], networks: { default: null } };
+      m.services.db.volumes = [{ type: 'bind', source: SOURCE, target: '/var/lib/postgresql/data', bind: { create_host_path: true } }];
+    });
+    out.realPaths = { ...out.realPaths, [SOURCE]: null };
+    out.mountAncestors = { [SOURCE]: FOLDER };
+    h.helper.composeOutput = out;
+    const log = h.docker.log.length;
+    const ups = h.helper.ups.length;
+    h.helper.createFoldersError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls).toContain(`createRepositoryFolders ${SOURCE}`);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(DEFAULT_CONFIG_PATH))]);
+    expect(h.helper.ups.slice(ups)).toEqual([]);
+    const after = h.docker.log.slice(log);
+    expect(after.filter((line) => line.startsWith('rename') || line.startsWith('rm ') || line.startsWith('stop'))).toEqual([]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: NAME, state: 'running' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+  });
+
+  it('R12-1b opens the running previous dev container as it is when the Git setup before up fails with helperFailed before it was moved', async () => {
+    await h.service.open(TARGET, options());
+    const app = byService('app')!;
+    expect(app).toMatchObject({ name: NAME, state: 'running' });
+    const log = h.docker.log.length;
+    const ups = h.helper.ups.length;
+    h.helper.prepareGitError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailedOpenedAsItIs('configuration', configurationName(DEFAULT_CONFIG_PATH))]);
+    expect(h.helper.ups.slice(ups)).toEqual([]);
+    const after = h.docker.log.slice(log);
+    expect(after.filter((line) => line.startsWith('rename') || line.startsWith('rm ') || line.startsWith('stop'))).toEqual([]);
+    expect(h.docker.containers.get(app.id)).toMatchObject({ name: NAME, state: 'running' });
+    expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+  });
+
   describe('final review, FF-1: a failed switch keeps the previous dev container', () => {
     it('restores nothing with the new configuration: the previous dev container stays stopped and intact, and a reopen with the previous configuration starts it', async () => {
       await h.service.open(TARGET, options());
@@ -3328,6 +3987,21 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
     expect(h.docker.log.filter((line) => line.startsWith('rm '))).toEqual([`rm ${dev?.id}`]);
     expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
     expect(h.docker.log.filter((line) => line.startsWith('volume rm'))).toEqual([]);
+  });
+
+  it('review round 13 of PR #64 (R13-1): the hashes of the other services fail with helperFailed: helperFailed, nothing is removed', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running', dbLabels: DB_IMAGE_ID });
+    const ids = h.docker.containersOf(ENV_ID).map((c) => c.id).sort();
+    damageDevContainer();
+    h.ui.recreateAnswer = true;
+    h.helper.serviceHashes = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail ?? '').not.toContain('would also create the containers of other services again');
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id).sort()).toEqual(ids);
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
   });
 
   it('Cancel: nothing is removed, startFailed', async () => {
@@ -3584,6 +4258,21 @@ describe('recreate offer (user request 2026-09-26): Docker Compose', () => {
       expect(h.logger.warnings.some((line) => line.startsWith(`Docker Compose would create the service db of ${REPO} again`))).toBe(true);
       expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
     }
+
+    it('computes the hashes with the helper image of the open (review round 3 of PR #64, P7)', async () => {
+      await openedEnvironment();
+      damageDevContainer();
+      h.ui.recreateAnswer = true;
+      // user decision 2026-09-29: no previous helper image. Changed input and expectation: the helper image of this open
+      // is the current tag with another image ID than the first open's (before, a previous helper).
+      h.helper.currentHelperImageId = `sha256:${'5'.repeat(64)}`;
+      h.helper.helperImages.length = 0;
+      await h.service.openEnvironment(ENV_ID, options());
+      const previous = { tag: 'devenv-helper:test', id: `sha256:${'5'.repeat(64)}` };
+      const hashes = h.helper.helperImages.filter((entry) => entry.call === 'composeServiceHashes');
+      expect(hashes.length).toBeGreaterThan(0);
+      expect(hashes.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
+    });
 
     it('the happy path: the hashes of the exact up model and the image IDs match; only the dev container is recreated', async () => {
       const { devId, dbId } = await openedEnvironment();
