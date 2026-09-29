@@ -165,3 +165,20 @@ describe('helperFailedOpenedAsItIs (review round 4 of PR #64, R4-4)', () => {
     }
   });
 });
+
+// Review round 21 of PR #64 (B-R21-2): the question of a switch from Docker Compose to a single container names the
+// switch with the configuration path, what Rebuild now removes, and points to Select configuration… (container
+// restrictions, "Switching between Docker Compose and a single container"), also in the window that is connected.
+describe('the question of a switch from Docker Compose to a single container (review round 21 of PR #64, B-R21-2)', () => {
+  const configPath = '.devcontainer/python/devcontainer.json';
+  it.each([
+    ['at an open', Messages.configurationKindChanged(true, configPath)],
+    ['in the connected window', Messages.configurationKindChangedConnected(configPath)],
+  ])('names the switch, what Rebuild now removes, and Select configuration… (%s)', (_where, text) => {
+    expect(text).toContain(`The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container.`);
+    expect(text).toContain(
+      'Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept.',
+    );
+    expect(text).toContain('To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.');
+  });
+});

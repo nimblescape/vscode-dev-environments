@@ -1476,6 +1476,31 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
       expect(docker.builds).toHaveLength(1);
     });
 
+    // Review round 21 of PR #64 (B-R21-1): the abort of an open that waits for the build of a helper run (here the
+    // prebuild) keeps that still-running build in the cache, so a helper run that starts before it ends joins it.
+    it('an open that cancels its wait keeps the running prebuild in the cache; a later helper run joins it', async () => {
+      const helper = stateHelper();
+      const gate = blockingBuild();
+      const pre = helper.prebuildImage({ signal: new AbortController().signal });
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const controller = new AbortController();
+      let waits = false;
+      const open = helper.ensureImageUse({ signal: controller.signal, onBuild: () => (waits = true) });
+      await vi.waitFor(() => expect(waits).toBe(true));
+      controller.abort();
+      await expect(open).rejects.toMatchObject({ name: 'AbortError' });
+      const run = helper.run('vol', ['true']);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The run waits for the build of the prebuild; it starts no build of its own (checked before the release, which a
+      // second build would replace).
+      expect(docker.builds).toHaveLength(1);
+      gate.release();
+      expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect((await run).exitCode).toBe(0);
+      expect(docker.builds).toHaveLength(1);
+      expect(docker.runs).toHaveLength(1);
+    });
+
     it('a helper run that waits for the prebuild ends at once when its signal aborts, without a docker run', async () => {
       const helper = stateHelper();
       const gate = blockingBuild();
