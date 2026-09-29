@@ -1481,7 +1481,10 @@ describe('a Docker Compose environment whose configuration became a single conta
     // The log line names the exception for a running dev container (before: "the containers of Docker Compose cannot be started").
     // Review round 20 of PR #64 (R20-1): changed expectation, only a current dev container opens (before: "a stopped dev
     // container of Docker Compose cannot be started (a dev container that runs already opens as it is)").
-    expect(h.logger.infos.some((line) => line.includes('a dev container of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and is current opens as it is)'))).toBe(true);
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment (before: "a dev container
+    // of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and
+    // is current opens as it is)").
+    expect(h.logger.infos.some((line) => line.includes('the containers of Docker Compose start only when the dev container runs already and no container of the environment must be created again (the dev container then opens as it is)'))).toBe(true);
   });
 
   it('refuses to start on "Rebuild later" when the Docker Compose environment has no dev container (review round 1, P-1)', async () => {
@@ -1696,7 +1699,9 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     // The question says what Later does with a running dev container (before: "Later keeps Docker Compose and starts nothing").
     // Review round 20 of PR #64 (R20-1): changed expectation, "and is current" (before: "a dev container that runs already
     // opens as it is").
-    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('a dev container that runs already and is current opens as it is, and the stopped containers of the other services are started');
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment (before: "a dev container
+    // that runs already and is current opens as it is, …").
+    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('if the dev container runs already and no container of the environment must be created again, the dev container opens as it is, and the stopped containers of the other services are started');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db?.id}`]);
@@ -1706,10 +1711,10 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
   });
 
   it.each([
-    ['created by an older version', { devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }],
-    ['created while the host access checks were off', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
-    ['next to a service container created while the host access checks were off', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }],
-  ])('does not start a running dev container %s of a restored Docker Compose environment on Later, as the question says (review round 20 of PR #64, R20-1)', async (_case, labels) => {
+    ['created by an older version', { devLabels: { [LABEL_CONTAINER_VERSION]: '0' } }, false],
+    ['created while the host access checks were off', { devLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }, false],
+    ['next to a service container created while the host access checks were off', { dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } }, true],
+  ])('does not start a running dev container %s of a restored Docker Compose environment on Later, as the question says (review round 20 of PR #64, R20-1)', async (_case, labels, byService) => {
     await seedCompose({ dev: 'running', db: 'stopped', ...labels });
     await h.registry.updateEnvironment(ENV_ID, (e) => {
       delete e.buildRecord;
@@ -1721,15 +1726,26 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('startFailed');
     expect(error.detail).toContain('must be created again');
+    // Review round 22 of PR #64 (A-R22-1): the detail names the container that must be created again (before: always
+    // the dev container, also when it was the container of the service db).
+    if (byService) {
+      expect(error.detail).toContain(`the container ${db?.name} was created while the host access checks were off`);
+      expect(error.detail).not.toContain(`the container ${dev?.name} must be created again`);
+    } else {
+      expect(error.detail).toContain(`the container ${dev?.name} must be created again`);
+    }
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
-    expect(h.ui.kindQuestions[0]).toContain('a dev container that runs already and is current opens as it is');
-    expect(h.ui.kindQuestions[0]).toContain('one that must be created again');
+    // Review round 22 of PR #64 (A-R22-1): changed expectation, the condition is per environment and names the host access
+    // checks (before: "a dev container that runs already and is current opens as it is", "one that must be created again").
+    expect(h.ui.kindQuestions[0]).toContain('if the dev container runs already and no container of the environment must be created again, the dev container opens as it is');
+    expect(h.ui.kindQuestions[0]).toContain('because they were created while the host access checks were off');
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
     expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
     expect(dbContainer()).toMatchObject({ id: db?.id, state: 'stopped' });
-    expect(h.logger.infos.some((line) => line.includes('that is stopped or must be created again cannot be started'))).toBe(true);
+    // Review round 22 of PR #64 (A-R22-1): changed expectation (before: "that is stopped or must be created again cannot be started").
+    expect(h.logger.infos.some((line) => line.includes('start only when the dev container runs already and no container of the environment must be created again'))).toBe(true);
   });
 
   it('does not start the existing Docker Compose environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
@@ -2080,19 +2096,19 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
   });
 
-  it('asks the connected window about a switch from Docker Compose without promising a start on Later, and starts nothing (review round 20 of PR #64, R20-2)', async () => {
+  it('asks the connected window about a switch from Docker Compose without promising a start on Later (review round 20 of PR #64, R20-2)', async () => {
     await seedCompose({ dev: 'running', db: 'stopped' });
     await withoutRecord();
     useSingle();
-    const db = dbContainer();
     const changed = await h.service.configurationChanged(ENV_ID, options());
     expect(changed).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
     const question = typeof changed === 'object' ? changed.question : '';
     expect(question).toContain('this window stays connected, and nothing is started or removed');
     expect(question).not.toContain('are started');
     expect(question).not.toContain('opens as it is');
-    expect(h.docker.log.filter((line) => line.startsWith('start') || line.startsWith('rm'))).toEqual([]);
-    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'stopped' });
+    // Review round 22 of PR #64 (A-R22-2): the checks that nothing started are gone (configurationChanged only reads); that
+    // Later starts nothing in the connected window is checked in controller.test (Switch branch…, D5-3: no openEnvironment
+    // and no open).
   });
 
   it('reports a switch from a single container to Docker Compose in configurationChanged (D5-3)', async () => {

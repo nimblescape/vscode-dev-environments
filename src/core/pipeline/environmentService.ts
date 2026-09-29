@@ -1323,7 +1323,7 @@ export class EnvironmentService {
 
     // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside (a Docker
     // Compose environment does not: without its model there is no `up`, and no docker start fallback, user decision
-    // 2026-09-29; except a dev container that runs already and is current, which opens as it is, D-22). A configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
+    // 2026-09-29; except a dev container that runs already when no container of the environment must be created again, which opens as it is, D-22). A configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
     let loaded: LoadedConfiguration | undefined;
     try {
       loaded = await this.loadConfiguration(ctx, imagePresent, container);
@@ -1434,7 +1434,7 @@ export class EnvironmentService {
    * the configuration changes otherwise apply only with a rebuild). Without a build ("Rebuild later", a failed or refused
    * update), the configuration of the other kind is not used to start the environment: `undefined`, so a Docker Compose
    * environment does not start (no docker start fallback, user decision 2026-09-29: without its Docker Compose
-   * configuration there is no `up`; a dev container that runs already and is current opens as it is, D-22, review round 19
+   * configuration there is no `up`; a dev container that runs already opens as it is when no container of the environment must be created again, D-22, review round 19
    * of PR #64, R19-1), and a single container starts as a container whose configuration is not known. The
    * kind of the environment: its dev container, or else its build record.
    */
@@ -1448,7 +1448,7 @@ export class EnvironmentService {
     const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
     this.logger.info(
       existingCompose
-        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, a dev container of Docker Compose that is stopped or must be created again cannot be started (a dev container that runs already and is current opens as it is).`
+        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose start only when the dev container runs already and no container of the environment must be created again (the dev container then opens as it is).`
         : `The configuration ${loaded.configPath} of ${ctx.env.repository} now uses Docker Compose. It applies with the next rebuild; until then, the existing container is started as it is.`,
     );
     ctx.kindKept = true;
@@ -2702,6 +2702,8 @@ export class EnvironmentService {
     let outdated = container !== undefined && !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks);
     // Why a current dev container is created again all the same: the log line and the progress detail.
     let recreation: { log: string; detail: string } | undefined;
+    // The container of another service that makes the environment outdated (review round 22 of PR #64, A-R22-1).
+    let unrestrictedService: string | undefined;
     if (container !== undefined && !outdated && compose && ctx.hostAccessChecks === 'on') {
       // The containers of the other services follow the same rule (containerIsCurrent): one that was created while the
       // checks were off makes the environment outdated; `up` then creates the dev container again, and Compose the
@@ -2709,6 +2711,7 @@ export class EnvironmentService {
       const unrestricted = await this.unrestrictedServiceContainer(ctx);
       if (unrestricted) {
         outdated = true;
+        unrestrictedService = unrestricted.name;
         recreation = {
           log: `The container ${unrestricted.name} was created while the host access checks were off. They are on now: the containers of ${ctx.env.repository} are created again; the files in the volumes are kept.`,
           detail: Messages.containerHostAccessChecksOn,
@@ -2749,7 +2752,9 @@ export class EnvironmentService {
         'startFailed',
         PipelineTexts.startFailed,
         container && outdated
-          ? `${reason}, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
+          ? unrestrictedService !== undefined
+            ? `${reason}, and the containers of the environment must be created again (the container ${unrestrictedService} was created while the host access checks were off), which needs the configuration.`
+            : `${reason}, and the container ${container.name} must be created again (it was created while the host access checks were off, or by an older version), which needs the configuration.`
           : container
             ? `${reason}. The containers of Docker Compose start only through the Dev Container CLI, which needs the Docker Compose configuration.`
             : `${reason}, and the environment has no container.`,
