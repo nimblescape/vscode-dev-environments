@@ -152,6 +152,11 @@ describe('settings (concept section 8)', () => {
       maximum: 1440,
       scope: 'application',
     });
+    // Review round 1 of PR #61 (R1): the other settings of the one monitor.json and of the heartbeats too, so that a
+    // repository's workspace settings cannot keep every environment of the computer running or change its waiting time.
+    for (const key of ['stopOnClose', 'waitingTimeSeconds', 'respectShutdownActionNone']) {
+      expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.${key}`], key).toMatchObject({ scope: 'application' });
+    }
   });
 
   it('reads hostAccessChecksOff from the user settings only, trimmed, without invalid entries', () => {

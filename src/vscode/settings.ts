@@ -56,7 +56,9 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
  * (hostAccessChecksOffValue). `repositoryGroups` has the scope `application` in
  * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions. The same
  * for `openInNewWindow`: a workspace does not decide which window a Start uses, and for `remoteStopAfterMinutes` (user
- * request 2026-09-29): one limit per user and computer, as every window writes it into monitor.json and heartbeats.
+ * request 2026-09-29): one limit per user and computer, as every window writes it into monitor.json and heartbeats; the
+ * same for `stopOnClose`, `waitingTimeSeconds` and `respectShutdownActionNone` (review round 1 of PR #61), the other
+ * values of monitor.json: a repository's workspace settings cannot keep every environment of the computer running.
  */
 export function readSettings(): ExtensionSettings {
   const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);

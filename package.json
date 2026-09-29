@@ -598,11 +598,13 @@
         },
         "devEnvLauncher.stopOnClose": {
           "type": "boolean",
+          "scope": "application",
           "default": true,
           "description": "Stop an environment when no window uses it, after the waiting time. If false, all environments keep running. To keep only some environments running, use Keep Running When Closed in the context menu of their rows."
         },
         "devEnvLauncher.waitingTimeSeconds": {
           "type": "number",
+          "scope": "application",
           "default": 30,
           "minimum": 0,
           "description": "Waiting time in seconds before a stop. It prevents a stop during a window reload."
@@ -654,6 +656,7 @@
         },
         "devEnvLauncher.respectShutdownActionNone": {
           "type": "boolean",
+          "scope": "application",
           "default": false,
           "description": "If true, a repository with \"shutdownAction\": \"none\" keeps its container running after close."
         },
