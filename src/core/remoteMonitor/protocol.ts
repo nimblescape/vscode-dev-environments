@@ -7,6 +7,7 @@
 // script (dist/remoteMonitor.js, src/remoteMonitor/main.ts), and the strict checks of everything that script reads.
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
+import { PIPE_LOADER } from '../loader/pipeLoader';
 import { isTimeZone, parseCronSchedule } from './cron';
 
 /**
@@ -16,10 +17,20 @@ import { isTimeZone, parseCronSchedule } from './cron';
 export const REMOTE_MONITOR_CONTAINER = 'devenv-session-monitor';
 /** The volume of its heartbeat records, mounted at REMOTE_MONITOR_STATE_DIR. */
 export const REMOTE_MONITOR_VOLUME = 'devenv-session-monitor';
-/** Label of the container: 12 hex digits of sha256 of the script and the helper tag (remoteMonitorLabelValue). */
+/** Label of the container: 12 hex digits of sha256 of the script, the helper tag and the loader (remoteMonitorLabelValue). */
 export const LABEL_SESSION_MONITOR = 'nimblescape.devenv.session-monitor';
-/** Where the container writes its script at each start (its own file system, so it matches the container version). */
+/**
+ * Where the pipe loader stores the script (plan step 3; its own file system, so it matches the container version). A
+ * restart of the container starts it from there without new input (resume); the `docker exec` subcommands run it too.
+ */
 export const REMOTE_MONITOR_SCRIPT_PATH = '/opt/devenv/monitor.js';
+/** The function of the script that the pipe loader starts (src/remoteMonitor/main.ts): the loop, `run`. */
+export const REMOTE_MONITOR_ENTRY = 'startMonitor';
+/**
+ * The start of the log line with which `run` says that it started. The extension waits for it on the output of the
+ * attached `docker run` before it lets the container go (RemoteSessionMonitor.ensure).
+ */
+export const REMOTE_MONITOR_READY_TEXT = 'Session Monitor started';
 /** The mount point of REMOTE_MONITOR_VOLUME in the container. */
 export const REMOTE_MONITOR_STATE_DIR = '/state';
 /** The folder of the heartbeat records in the volume: `<source>.<environment id>.json`. */
@@ -43,25 +54,6 @@ export const MAX_HEARTBEAT_ENVIRONMENTS = 200;
 export const MAX_HEARTBEAT_LENGTH = 32_000;
 /** A record of another computer younger than this makes an environment "in use from another computer" (shared engine). */
 export const OTHER_COMPUTER_FRESH_MS = 90_000;
-/**
- * The longest script that the container takes as an argument of `docker run`. PR #57: the whole command line is checked
- * too (windowsCommandLineLength), as the command line of Windows is limited to 32767 characters and escapes the quotes;
- * before, 24000 characters for the script alone left room for a script of quotes only.
- */
-export const MAX_SCRIPT_LENGTH = 30_000;
-/** The longest command line of `docker run` of the monitor, as Windows writes it (below 32767 for the path of docker). */
-export const MAX_WINDOWS_COMMAND_LINE = 32_000;
-
-/**
- * The length of `args` as one command line of Windows, at most (libuv quotes each argument: a quote or backslash can
- * become two characters, plus the enclosing quotes and a space).
- */
-export function windowsCommandLineLength(args: readonly string[]): number {
-  let length = 0;
-  for (const arg of args) length += arg.length + (arg.match(/["\\]/g)?.length ?? 0) + 3;
-  return length;
-}
-
 const SOURCE_PATTERN = /^[0-9a-f]{32}$/;
 /** The form of `newEnvironmentId` (crypto.randomUUID, lower case). */
 const ENVIRONMENT_ID_PATTERN = /^[0-9a-f-]{36}$/;
@@ -304,7 +296,8 @@ export function imagePrefixesOf(patterns: readonly unknown[]): string[] {
     if (typeof pattern !== 'string') continue;
     const prefix = pattern.trim().replace(/\*$/, '');
     // Review round 6 of PR #57 (F2): all together at most MAX_IMAGE_PREFIXES_JSON_LENGTH characters as JSON, as they go on
-    // the command line of `docker run` of the monitor (DEVENV_IMAGE_PREFIXES), whose length is limited.
+    // the command line of `docker run` of the monitor (DEVENV_IMAGE_PREFIXES), which stays short (plan step 3: the script
+    // is no longer on it, so all of them go there).
     if (isImagePrefix(prefix) && !prefixes.includes(prefix) && JSON.stringify([...prefixes, prefix]).length <= MAX_IMAGE_PREFIXES_JSON_LENGTH) prefixes.push(prefix);
   }
   return prefixes;
@@ -352,7 +345,7 @@ export const IMAGE_SETTINGS_FILE = 'image-settings.json';
 export const MAX_IMAGE_PREFIXES = 50;
 /** The longest prefix (review round 6 of PR #57, F2). */
 export const MAX_IMAGE_PREFIX_LENGTH = 128;
-/** The longest list of prefixes as JSON (review round 6 of PR #57, F2: the command line of `docker run`). */
+/** The longest list of prefixes as JSON (review round 6 of PR #57, F2: they go on the command line of `docker run`). */
 export const MAX_IMAGE_PREFIXES_JSON_LENGTH = 4096;
 
 export interface ImageSettings {
@@ -435,9 +428,14 @@ export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): 
  */
 export const IMAGE_MAINTENANCE_LABEL_PART = 'image-maintenance';
 
-/** The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script, the helper tag, and the `extra` parts. */
+/**
+ * The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script, the helper tag, the pipe loader (plan step
+ * 3: a new loader is a new version of the container, so every monitor of an older way of loading is replaced once), and
+ * the `extra` parts.
+ */
 export function remoteMonitorLabelValue(script: string, helperTag: string, extra: readonly string[] = []): string {
   const hash = createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(helperTag, 'utf8');
+  hash.update('\n', 'utf8').update(PIPE_LOADER, 'utf8');
   if (extra.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(extra), 'utf8');
   return hash.digest('hex').slice(0, 12);
 }

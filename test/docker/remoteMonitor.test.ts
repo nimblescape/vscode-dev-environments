@@ -10,7 +10,9 @@
 // with DEVENV_MONITOR_TICK_MS (read only by main.ts). Checked: a labeled container with a stale record is stopped; one
 // whose record keeps it running is not; one with a fresh heartbeat is not; one without any record is never touched;
 // ensure on a running, a stopped, and a missing container; the records and forget subcommands; an invalid heartbeat
-// writes nothing.
+// writes nothing. Plan step 3 (pipe loading): the container runs the pipe loader and gets the script on its input only;
+// `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
+// replaces the container.
 import * as crypto from 'crypto';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
@@ -19,7 +21,8 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
-import { LABEL_SESSION_MONITOR, heartbeatFileName } from '../../src/core/remoteMonitor/protocol';
+import { LOADER_EXIT_CODE, PIPE_LOADER, bundleHash } from '../../src/core/loader/pipeLoader';
+import { LABEL_SESSION_MONITOR, REMOTE_MONITOR_READY_TEXT, REMOTE_MONITOR_SCRIPT_PATH, heartbeatFileName } from '../../src/core/remoteMonitor/protocol';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, Timings, dockerTestContext } from './harness';
@@ -116,7 +119,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(await timings.measure('ensure (create)', () => monitor.ensure(helperTag, socket))).toBe('created');
     const details = cli.container(containerName) as unknown as {
       State: { Running: boolean };
-      Config: { Labels: Record<string, string>; Image: string };
+      Config: { Labels: Record<string, string>; Image: string; Cmd: string[]; OpenStdin: boolean };
       HostConfig: { NetworkMode: string; RestartPolicy: { Name: string }; CapDrop: string[] | null; PortBindings: unknown };
     };
     expect(details.State.Running).toBe(true);
@@ -126,7 +129,15 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(details.HostConfig.NetworkMode).toBe('none');
     expect(details.HostConfig.RestartPolicy.Name).toBe('unless-stopped');
     expect(details.HostConfig.CapDrop).toEqual(['ALL']);
-    await waitUntil(() => cli.run(['logs', containerName]).out.includes('Session Monitor started'), 'the start of the monitor', 30_000);
+    // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: `sh -c <bootstrap> sh <script>`):
+    // the command is the pipe loader with the path, the hash and the entry; the script came over stdin and is nowhere in
+    // the configuration of the container.
+    expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, REMOTE_MONITOR_SCRIPT_PATH, bundleHash(script), 'startMonitor']);
+    expect(details.Config.OpenStdin).toBe(true);
+    expect(JSON.stringify(details)).not.toContain(script.slice(0, 200));
+    // The stored script is the one that was sent.
+    expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
+    await waitUntil(() => cli.run(['logs', containerName]).out.includes(REMOTE_MONITOR_READY_TEXT), 'the start of the monitor', 30_000);
     // A second ensure finds it running.
     expect(await monitor.ensure(helperTag, socket)).toBe('running');
   });
@@ -188,5 +199,47 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const deadline = Date.now() + 30_000;
     while ((records = await monitor.records(ids.kept)) === undefined && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
     expect(records?.records.map((record) => record.source)).toEqual([OTHER_SOURCE]);
+  });
+
+  // Plan step 3 (pipe loading, user decisions 2026-09-29): a restart starts the stored script without new input.
+  it('resumes from the stored script after docker restart', async () => {
+    expect(['created', 'running']).toContain(await monitor.ensure(helperTag, socket));
+    await waitUntil(() => running(containerName), 'the monitor');
+    const starts = () => cli.run(['logs', containerName]).out.split(REMOTE_MONITOR_READY_TEXT).length - 1;
+    await waitUntil(() => starts() >= 1, 'the start of the monitor', 30_000);
+    const before = starts();
+    const id = cli.container(containerName)!.Id;
+    cli.ok(['restart', containerName]);
+    await timings.measure('start after docker restart', () => waitUntil(() => starts() > before, 'the start after the restart', 30_000));
+    expect(running(containerName)).toBe(true);
+    expect(cli.container(containerName)!.Id).toBe(id);
+    expect(cli.run(['logs', containerName]).err).not.toContain('devenv loader:');
+    expect(await monitor.ensure(helperTag, socket)).toBe('running');
+    // It still answers the subcommands of `docker exec` from the stored script.
+    expect(await monitor.records(ids.kept)).toBeDefined();
+  });
+
+  it('exits with 3 after a restart when the stored script was changed, and ensure then creates it again', async () => {
+    expect(['created', 'running']).toContain(await monitor.ensure(helperTag, socket));
+    await waitUntil(() => running(containerName), 'the monitor');
+    const id = cli.container(containerName)!.Id;
+    cli.ok(['exec', containerName, 'sh', '-c', `echo '// changed' >> ${REMOTE_MONITOR_SCRIPT_PATH}`]);
+    // Without the restart policy for this check, so that the state after the refusal stays visible (with it, Docker starts
+    // the loader again and again: `restarting`, or `running` while it waits for an input that never comes).
+    cli.ok(['update', '--restart', 'no', containerName]);
+    cli.ok(['restart', containerName]);
+    await timings.measure('exit 3 of the loader', () =>
+      waitUntil(() => {
+        const state = cli.container(containerName)?.State;
+        return state?.Status === 'restarting' || (state?.Status === 'exited' && state.ExitCode === LOADER_EXIT_CODE);
+      }, 'the exit of the loader', 150_000),
+    );
+    expect(cli.run(['logs', containerName]).err).toContain('devenv loader: ');
+    expect(await monitor.ensure(helperTag, socket)).toBe('created');
+    const details = cli.container(containerName)!;
+    expect(details.Id).not.toBe(id);
+    expect(details.State.Running).toBe(true);
+    expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
   });
 });
