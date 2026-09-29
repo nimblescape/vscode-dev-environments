@@ -1043,6 +1043,67 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(docker.builds).toHaveLength(2);
   });
 
+  // Review round 16 of PR #64 (R16-2): a caller that joined the build of another caller that is cancelled builds for itself.
+  it('R16-2: an open that joined the build of another open that is cancelled builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const a = new AbortController();
+    const openA = helper.ensureImageUse({ signal: a.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const openB = helper.ensureImageUse();
+    docker.buildHandler = async () => undefined;
+    a.abort();
+    expect(await openA).toMatchObject({ name: 'AbortError' });
+    expect(await openB).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(2);
+  });
+
+  it('R16-2: a helper run that joined the build of an open that is cancelled builds for itself', async () => {
+    const helper = stateHelper();
+    blockingBuild();
+    const a = new AbortController();
+    const openA = helper.ensureImageUse({ signal: a.signal }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const run = helper.run('vol', ['true']);
+    docker.buildHandler = async () => undefined;
+    a.abort();
+    expect(await openA).toMatchObject({ name: 'AbortError' });
+    expect((await run).exitCode).toBe(0);
+    expect(docker.builds).toHaveLength(2);
+    expect(docker.runs).toHaveLength(1);
+  });
+
+  // Review round 16 of PR #64 (R16-1): only a docker run that finds no helper image counts as a missing helper image.
+  describe('R16-1: only a docker run that fails with exit code 125 and "No such image" counts as a missing helper image', () => {
+    const cases: Array<[string, Partial<RunResult>]> = [
+      ['a command that reports a missing image of its own (exit code 1)', { exitCode: 1, stderr: 'Error: No such image: sha256:abc\n' }],
+      ['another docker run error (exit code 125)', { exitCode: 125, stderr: 'docker: Error response from daemon: Conflict. The container name "/x" is already in use.\n' }],
+    ];
+
+    it.each(cases)('pinned run: %s is the result of the run', async (_name, failure) => {
+      const helper = stateHelper();
+      const use = await helper.ensureImageUse();
+      docker.handler = (args) => (args[0] === 'run' ? failure : {});
+      const result = await helper.run('vol', ['true'], { image: use });
+      expect(result).toMatchObject(failure);
+      expect(docker.runs).toHaveLength(1);
+      // The cache of the window is kept: the next open reuses the image without a build.
+      expect(await helper.ensureImageUse()).toEqual(use);
+      expect(docker.builds).toHaveLength(1);
+      expect(logger.lines.join('\n')).not.toContain('was removed');
+    });
+
+    it.each(cases)('unpinned run: %s is the result of the run, which is not run again', async (_name, failure) => {
+      const helper = stateHelper();
+      await helper.ensureImageUse();
+      docker.handler = (args) => (args[0] === 'run' ? failure : {});
+      const result = await helper.run('vol', ['true']);
+      expect(result).toMatchObject(failure);
+      expect(docker.runs).toHaveLength(1);
+      expect(logger.lines.join('\n')).not.toContain('It is built again');
+    });
+  });
+
   it('builds nothing when the Docker context is a remote host', async () => {
     const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
     expect(await helper.prebuildImage({ signal: new AbortController().signal })).toBeUndefined();
