@@ -804,9 +804,22 @@ describe('removeStaleStateTemporaryFiles', () => {
     file('images.json', 48 * HOUR);
     file('other.json.12.1.tmp', 48 * HOUR);
     file('images.json.x.1.tmp', 48 * HOUR);
+    // Review round 11 of PR #63 (B-R11-1): names that only resemble a temporary file (a prefix, a suffix, a count that
+    // is not a number) are kept, so the pattern stays anchored and exact. The expected list below gained them.
+    file('foo-images.json.1.1.tmp', 48 * HOUR);
+    file('images.json.1.1.tmp.bak', 48 * HOUR);
+    file('images.json.1.x.tmp', 48 * HOUR);
     const removed = await removeStaleStateTemporaryFiles(stateDir, T0);
     expect(removed.sort()).toEqual(['image-settings.json.7.3.tmp', 'images.json.12.1.tmp', 'replaced-images.json.99.12.tmp']);
-    expect(fs.readdirSync(stateDir).sort()).toEqual(['images.json', 'images.json.12.2.tmp', 'images.json.x.1.tmp', 'other.json.12.1.tmp']);
+    expect(fs.readdirSync(stateDir).sort()).toEqual([
+      'foo-images.json.1.1.tmp',
+      'images.json',
+      'images.json.1.1.tmp.bak',
+      'images.json.1.x.tmp',
+      'images.json.12.2.tmp',
+      'images.json.x.1.tmp',
+      'other.json.12.1.tmp',
+    ]);
   });
 
   it('never removes a folder or a link with such a name, nor what a link points to', async () => {

@@ -109,6 +109,10 @@ describe('sweepStorage', () => {
     write(path.join(paths.root, '.x.json.1234.ABCDEF01.tmp'), '{}', old);
     write(path.join(paths.root, 'x.json.1234.0123abcd.tmp'), '{}', old);
     write(path.join(paths.root, 'registry.json'), '{}', old);
+    // Review round 11 of PR #63 (B-R11-1): names that only resemble a temporary file (a suffix, a pid that is not a
+    // number, nine or seven hex digits) are kept, so the pattern stays anchored and exact.
+    const nearMisses = ['.x.json.1234.0123abcd.tmp.keep', '.x.json.12a.0123abcd.tmp', '.x.json.1234.0123abcd0.tmp', '.x.json.1234.0123abc.tmp'];
+    for (const name of nearMisses) write(path.join(paths.root, name), '{}', old);
     // In another folder: not swept.
     fs.mkdirSync(path.join(root, 'other'));
     write(temp(path.join(root, 'other'), 'x.json', '0123abcd'), '{}', old);
@@ -120,6 +124,7 @@ describe('sweepStorage', () => {
     expect(names(paths.root)).toContain('.x.json.1234.ABCDEF01.tmp');
     expect(names(paths.root)).toContain('x.json.1234.0123abcd.tmp');
     expect(names(paths.root)).toContain('registry.json');
+    for (const name of nearMisses) expect(names(paths.root)).toContain(name);
     expect(names(paths.root)).not.toContain('.x.json.1234.0123abcd.tmp');
     expect(names(path.join(root, 'other'))).toEqual(['.x.json.1234.0123abcd.tmp']);
   });

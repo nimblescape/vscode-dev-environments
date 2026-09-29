@@ -128,6 +128,8 @@ describe('sessionMonitor bundle', () => {
     const log = readLog(root);
     expect(log).toContain('Session Monitor started');
     expect(log).toContain('Session Monitor ends (idle).');
+    // Review round 11 of PR #63 (B-R11-2): a sweep that removed nothing writes no line.
+    expect(log).not.toContain('Removed outdated files');
     expect(fs.existsSync(path.join(root, 'monitor.lock'))).toBe(false);
   }, 20_000);
 
@@ -160,6 +162,22 @@ describe('sessionMonitor bundle', () => {
     const log = readLog(root);
     expect(log).toContain('Removed outdated files of the storage folder: 1 pending connection(s), 0 disconnect request(s), 1 temporary file(s).');
     expect(log).toContain('Session Monitor ends (idle).');
+  }, 20_000);
+
+  // Review round 11 of PR #63 (B-R11-2): the count of the log line includes the disconnect requests, so a sweep that
+  // removed only an outdated disconnect request logs it.
+  it('logs a sweep that removed only an outdated disconnect request', async () => {
+    const root = storageRoot();
+    const old = Date.now() - 2 * 60 * 60_000;
+    fs.mkdirSync(path.join(root, 'disconnect'), { recursive: true });
+    const oldRequest = path.join(root, 'disconnect', '7c1d2e3f-0000-4000-8000-000000000002.json');
+    fs.writeFileSync(
+      oldRequest,
+      JSON.stringify({ environmentId: '7c1d2e3f-0000-4000-8000-000000000002', operation: 'stop', requestedAt: new Date(old).toISOString(), requestedBy: 'b7c1d2e3-0000-4000-8000-000000000001', reason: 'manual' }),
+    );
+    expect(await exitOf(start([root]))).toBe(0);
+    expect(fs.existsSync(oldRequest)).toBe(false);
+    expect(readLog(root)).toContain('Removed outdated files of the storage folder: 0 pending connection(s), 1 disconnect request(s), 0 temporary file(s).');
   }, 20_000);
 
   it('ends at once when another live monitor holds the lock', async () => {
