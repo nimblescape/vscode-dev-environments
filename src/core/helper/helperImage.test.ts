@@ -787,6 +787,21 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(use).toEqual({ tag: fresh.tag, id: fresh.docker.idOf(fresh.tag) });
   });
 
+  it('runs the rebuilt image by the ID of its tag and removes the previous image when the rebuild gave no ID (review round 17 of PR #64, R17-1)', async () => {
+    const { h, oldId } = await changed();
+    h.docker.builtIdMissing = true;
+    const use = await ensureHelperImageUse(h.docker, h.file, { statePath: h.statePath, baseDigest: h.baseDigest, clock: h.clock, logger: h.logger });
+    expect(h.docker.builds).toHaveLength(1);
+    expect(h.docker.builds[0]).toMatchObject({ pull: true, noCache: true });
+    // The open runs the image by its ID, so a rebuild by another window cannot change it mid-open.
+    expect(use).toEqual({ tag: h.tag, id: h.docker.idOf(h.tag) });
+    expect(use.id).not.toBe(oldId);
+    // The ID read back by the tag is not recorded, but the previous image without a tag is removed.
+    expect(h.state().images[h.tag]?.imageId).toBeUndefined();
+    expect(h.docker.removals).toEqual([oldId]);
+    expect(h.docker.images.has(oldId)).toBe(false);
+  });
+
   it('keeps the previous image when it still has another tag', async () => {
     const { h, oldId } = await changed();
     h.docker.images.get(oldId)!.tags.push('mine:backup');

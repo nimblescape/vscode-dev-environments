@@ -1113,6 +1113,15 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(docker.builds).toEqual([]);
   });
 
+  it('asks no Docker engine whether it runs when the Docker context is a remote host (review round 17 of PR #64, R17-2)', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    const running = vi.fn(async () => true);
+    expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('remote');
+    // Not even `docker info`: outside an operation it would go to the remote host (over SSH) at every activation.
+    expect(running).not.toHaveBeenCalled();
+    expect(docker.builds).toEqual([]);
+  });
+
   // Review round 5 of PR #64, R5-2: helper.json alone decides whether the prebuild is due; there is no extension version
   // to remember anymore (the expectation on the saved version is gone).
   // Review round 7 of PR #64 (R7-3): a caller whose signal is already aborted when it would start the shared ensure
