@@ -10,7 +10,7 @@
 //   1. `docker ps -a --filter label=nimblescape.devenv.environment-id` (parseContainerLines) and the records of the
 //      volume.
 //   2. `decision = decide({ now, containers, records, state })`. Keep `decision.state` for the next tick.
-//   3. `docker stop` of each container of `decision.stop` (the dev container first), and removal of the files of
+//   3. `docker stop` of each container of `decision.stop` (the dev container first), then removal of the files of
 //      `decision.forget` (old records of removed environments) and `decision.superseded` (old records that a newer one of
 //      the same environment replaced).
 /** Interval between two ticks. */
@@ -203,7 +203,8 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     // Review round 1 of PR #63 (F1): never while a keepRunning record of another computer is not newer than it. This record
     // is the only one of its computer for the environment, and the local check of that computer (inUseByOtherComputer)
     // counts such a keep only while it is at least as new as its own newest record; without it, an old keep would count.
-    if (same.some((other) => other.keepRunning && other.source !== record.source && other.at <= at)) return false;
+    // Review round 2 (R2-6): with the written times, as that check sees them (`records` prints them), not the clamped ones.
+    if (input.records.some((other) => other.environmentId === record.environmentId && other.keepRunning && other.source !== record.source && other.at <= record.at)) return false;
     return same.some((other) => other.at > at);
   });
   const state: RemoteMonitorState = { lastTickAt: now };

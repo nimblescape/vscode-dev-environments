@@ -9,7 +9,8 @@
 //       PENDING_MAX_AGE_MS, 2 minutes);
 //   R7  disconnect/<environment id>.json whose requestedAt is more than 10 minutes from now (readers ignore it after
 //       DISCONNECT_REQUEST_MAX_AGE_MS, 1 minute);
-//   R8  temporary files of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`) older than an hour, in the storage folder,
+//   R8  temporary files of writeJsonAtomic (`.<name>.<pid>.<8 hex>.tmp`) whose modification time is more than an hour
+//       from now (review round 2 of PR #63, R2-9: either way, as R6 and R7), in the storage folder,
 //       sessions/, pending/, operations/ and disconnect/ (a write that was killed between the write and the rename).
 // Only regular files are removed, never a link or what it points to, never a folder; a folder that is a link is not
 // entered. Every error is ignored (the next sweep tries again). No `vscode`.

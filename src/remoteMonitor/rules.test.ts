@@ -323,6 +323,31 @@ describe('decide of the remote Session Monitor', () => {
         const newerKeep = record(A, T0 - 8 * DAY, { source: OTHER, keepRunning: true });
         expect(decide({ now: T0, containers: [container(A)], records: [newerKeep, own, newest], state: running() }).superseded).toEqual([own]);
       });
+
+      // Review round 2 of PR #63 (R2-6): a keep of another computer with the same time as the record holds it back too.
+      it('keeps an old record while a keepRunning record of another computer has the same time', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        expect(decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() }).superseded).toEqual([]);
+      });
+
+      // Review round 2 of PR #63 (R2-6): the local check compares the written times (`records` prints them), so the keep
+      // check does too: a record in the future first seen 10 days ago stays while an older keep of another computer
+      // exists, although its clamped time is older than that keep.
+      it('compares the keep of another computer by the written times', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 + 30 * DAY);
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${SOURCE}.${A}.${own.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [own, keep, newest], state });
+        expect(decision.superseded).not.toContain(own);
+        const remaining = [own, keep, newest].filter((one) => !decision.superseded.includes(one));
+        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
+        expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
+      });
     });
   });
 

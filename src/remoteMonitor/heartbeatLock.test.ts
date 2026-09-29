@@ -5,7 +5,7 @@
 // Review round 2 of PR #58: the heartbeats of the remote Session Monitor run under the kernel lock `flock` of
 // heartbeatCommand. These tests run that command line with real processes: `flock` and `timeout` as in the helper image,
 // and the monitor script built with esbuild (its state folder passed by a small entry instead of /state).
-import { execFileSync, spawn, type ChildProcess } from 'child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -21,6 +21,7 @@ import {
   heartbeatFileName,
   type HeartbeatInput,
 } from '../core/remoteMonitor/protocol';
+import { recordRemover } from './main';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const SOURCE = '0123456789abcdef0123456789abcdef';
@@ -225,6 +226,27 @@ describe.skipIf(process.platform !== 'linux')('the lock of the heartbeat records
     const [file0, ...args] = local(forgetIfUnchangedCommand(SOURCE, A, seen + 1));
     expect(execFileSync(file0, args, { encoding: 'utf8', timeout: 15_000 })).toBe('removed\n');
     expect(fs.existsSync(file)).toBe(false);
+  });
+
+  // Review round 2 of PR #63 (R2-4): recordRemover, the removal of `run`, with the real script under `flock`.
+  it('recordRemover removes a record with its `at` under the lock, and rejects while the lock stays held', { timeout: 20_000 }, async () => {
+    expect(await exited(start(command(heartbeat(1, false))))).toBe(0);
+    const seen = (readRecord() as { at: number }).at;
+    const local = (part: string) => (part === HEARTBEAT_LOCK_PATH ? [lockPath()] : part === REMOTE_MONITOR_SCRIPT_PATH ? [script, stateDir] : [part]);
+    const remove = recordRemover((file, args, options, callback) => {
+      const [file0, ...args0] = [file, ...args].flatMap(local);
+      return execFile(file0, args0, options, (error, stdout, stderr) => callback(error, String(stdout), String(stderr)));
+    });
+    const record = { source: SOURCE, environmentId: A, keepRunning: false, limitSeconds: 600 };
+    expect(await remove({ ...record, at: seen + 1 })).toBe(false);
+    expect(readRecord()).toMatchObject({ at: seen });
+    const holder = await holdLock();
+    await expect(remove({ ...record, at: seen })).rejects.toThrow('the heartbeat records stayed locked by another command for 5 s');
+    expect(readRecord()).toMatchObject({ at: seen });
+    killGroup(holder);
+    await exited(holder);
+    expect(await remove({ ...record, at: seen })).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, 'heartbeats', heartbeatFileName(SOURCE, A)))).toBe(false);
   });
 
   it('kills a heartbeat that holds the lock longer than 10 seconds, which frees the lock', { timeout: 30_000 }, async () => {
