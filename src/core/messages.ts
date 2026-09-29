@@ -39,12 +39,13 @@ export const Messages = {
   /**
    * Review round 4 (D4-3): an environment without a build record (restored after a lost registry) whose containers are of
    * another kind than its configuration. Rebuild now switches the kind; Later keeps it (the non-destructive answer). No
-   * docker start fallback (user decision 2026-09-29): Later starts no containers of Docker Compose without a Docker
-   * Compose configuration.
+   * docker start fallback (user decision 2026-09-29): Later starts no stopped dev container of Docker Compose without a
+   * Docker Compose configuration; a running, current one opens as it is and its stopped services start (D-22, review round
+   * 19 of PR #64, R19-1).
    */
   configurationKindChanged: (containersUseCompose: boolean, configPath: string) =>
     containersUseCompose
-      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose and starts nothing: its containers start only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
+      ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: a dev container that runs already opens as it is, and the stopped containers of the other services are started; a stopped dev container does not start, because it starts only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
       : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
   /**
    * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts

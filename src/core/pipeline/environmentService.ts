@@ -1322,7 +1322,7 @@ export class EnvironmentService {
 
     // Step 5. With a broken configuration, the existing environment still starts, so the user can fix it inside (a Docker
     // Compose environment does not: without its model there is no `up`, and no docker start fallback, user decision
-    // 2026-09-29). A configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
+    // 2026-09-29; except a dev container that runs already and is current, which opens as it is, D-22). A configuration that the host access policy refuses starts nothing (the volume stays, NFR-07).
     let loaded: LoadedConfiguration | undefined;
     try {
       loaded = await this.loadConfiguration(ctx, imagePresent, container);
@@ -1433,7 +1433,8 @@ export class EnvironmentService {
    * the configuration changes otherwise apply only with a rebuild). Without a build ("Rebuild later", a failed or refused
    * update), the configuration of the other kind is not used to start the environment: `undefined`, so a Docker Compose
    * environment does not start (no docker start fallback, user decision 2026-09-29: without its Docker Compose
-   * configuration there is no `up`), and a single container starts as a container whose configuration is not known. The
+   * configuration there is no `up`; a dev container that runs already and is current opens as it is, D-22, review round 19
+   * of PR #64, R19-1), and a single container starts as a container whose configuration is not known. The
    * kind of the environment: its dev container, or else its build record.
    */
   private configurationOfKind(
@@ -1446,7 +1447,7 @@ export class EnvironmentService {
     const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
     this.logger.info(
       existingCompose
-        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose cannot be started.`
+        ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, a stopped dev container of Docker Compose cannot be started (a dev container that runs already opens as it is).`
         : `The configuration ${loaded.configPath} of ${ctx.env.repository} now uses Docker Compose. It applies with the next rebuild; until then, the existing container is started as it is.`,
     );
     ctx.kindKept = true;

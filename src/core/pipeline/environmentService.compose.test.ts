@@ -1461,6 +1461,27 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.progress.details).not.toContain(Messages.containerComposeReplaced);
   });
 
+  it('opens a running dev container as it is and starts its stopped services on "Rebuild later" (D-22, review round 19 of PR #64, R19-1)', async () => {
+    const db = dbContainer()?.id;
+    const dev = devContainer();
+    if (dev) {
+      dev.state = 'running';
+      dev.rawState = 'running';
+    }
+    h.ui.configurationChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.helper.builds).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db, state: 'running' });
+    expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
+    // The log line names the exception for a running dev container (before: "the containers of Docker Compose cannot be started").
+    expect(h.logger.infos.some((line) => line.includes('a stopped dev container of Docker Compose cannot be started (a dev container that runs already opens as it is)'))).toBe(true);
+  });
+
   it('refuses to start on "Rebuild later" when the Docker Compose environment has no dev container (review round 1, P-1)', async () => {
     for (const container of h.docker.containersOf(ENV_ID)) h.docker.containers.delete(container.id);
     h.ui.configurationChangedAnswer = 'later';
@@ -1655,6 +1676,29 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.builds).toHaveLength(1);
     expect(h.docker.log).toContain(`rm ${db?.id}`);
+  });
+
+  it('opens a running dev container of a restored Docker Compose environment as it is on Later and starts its stopped services (D-22, review round 19 of PR #64, R19-1)', async () => {
+    await seedCompose({ dev: 'running', db: 'stopped' });
+    await h.registry.updateEnvironment(ENV_ID, (e) => {
+      delete e.buildRecord;
+    });
+    const db = dbContainer();
+    const dev = devContainer();
+    useSingle();
+    h.ui.configurationKindChangedAnswer = 'later';
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
+    expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
+    // The question says what Later does with a running dev container (before: "Later keeps Docker Compose and starts nothing").
+    expect(Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)).toContain('a dev container that runs already opens as it is, and the stopped containers of the other services are started');
+    expect(h.helper.builds).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db?.id}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
+    expect(devContainer()).toMatchObject({ id: dev?.id, state: 'running' });
+    expect(dbContainer()).toMatchObject({ id: db?.id, state: 'running' });
   });
 
   it('does not start the existing Docker Compose environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
