@@ -171,7 +171,7 @@ DEV ENVIRONMENTS   [Select Organizations] [Search] [Refresh] [Collapse All]
         website                                               [Start] [⋯]
 ```
 
-In the sketch, ● stands for the filled monitor with the connection sign (connected in this window) and ○ for the silhouette of the monitor (stopped); see the table of symbols below.
+In the sketch, the symbols stand for the monitors of the extension: ● the switched-on monitor with the connection sign (connected in this window), ▶ the switched-off monitor with the play sign (running without a window, not a tree node), ○ the switched-off monitor (stopped), ⇄ the switched-off monitor with the connection sign (a remote Docker host), and ▭ the switched-off monitor (the local Docker); see the table of symbols below.
 
 The list groups the repositories by owner. In each group, the repositories are in alphabetical order; a repository with an environment keeps its place.
 
@@ -232,7 +232,7 @@ Every state is a monitor: switched on (the screen filled) while a window uses th
 | filled monitor | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
 | switched-off monitor with the play sign | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
 | monitor silhouette (switched off) | Stopped | The container is stopped. The next **Start** starts it. |
-| switched-off monitor with the clock sign (not animated: an icon of the extension cannot spin on its own) | Updating | An update, a rebuild, or a delete is in progress. |
+| switched-off monitor with the clock sign (not animated: spinning would turn the whole monitor) | Updating | An update, a rebuild, or a delete is in progress. |
 | switched-off monitor with the ring sign | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
 | switched-off monitor with the warning sign (warning color) | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
 
