@@ -300,7 +300,7 @@ export type EnvironmentStore = Pick<
 /** The part of SessionFiles that the service uses. */
 export type EnvironmentSessionFiles = Pick<
   SessionFiles,
-  'writePending' | 'removePending' | 'removeOperation' | 'readReopen' | 'removeReopen'
+  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'readReopen' | 'removeReopen'
 >;
 
 /**
@@ -5431,11 +5431,13 @@ export class EnvironmentService {
     }
   }
 
-  /** Removes the pending connection file, the pending operation, and a reopen record of the environment. */
+  /** Removes the pending connection file, the pending operation, the disconnect request (R7), and a reopen record of the environment. */
   private async removeEnvironmentFiles(environmentId: string): Promise<void> {
     const files = this.deps.sessionFiles;
     await this.quietly('remove the pending connection file', () => files.removePending(environmentId));
     await this.quietly('remove the pending operation', () => files.removeOperation(environmentId));
+    // Monitor cleanup, user decision 2026-09-29 (R7): a disconnect request of the deleted environment.
+    await this.quietly('remove the disconnect request', () => files.removeDisconnectRequest(environmentId));
     await this.quietly('remove the reopen record', async () => {
       const record = await files.readReopen();
       if (record?.environmentId === environmentId) await files.removeReopen();

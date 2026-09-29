@@ -10,10 +10,13 @@
 //   run                          the loop: a tick every 15 s (rules.ts)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
-//   forget <source> <env id>     removes that record (Delete of an environment)
+//   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
+//   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
+//                                (the loop; review round 1 of PR #63, F2; review round 4, N4-2: no other meaning of an `at`)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
-// nothing but its own record files. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
+// nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
+// and, with image maintenance, older images of the prefixes. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -27,9 +30,11 @@ import {
   parseImageSettingsInput,
   REMOTE_MONITOR_STATE_DIR,
   SEQ_ORDER_WINDOW_MS,
+  forgetIfUnchangedCommand,
   heartbeatFileName,
   isRemoteEnvironmentId,
   isSourceId,
+  monitorExecFailure,
   parseHeartbeatFileName,
   parseHeartbeatInput,
   parseHeartbeatRecord,
@@ -94,7 +99,9 @@ export function parseContainerLines(stdout: string): RemoteContainer[] {
 
 /**
  * The valid records of the folder: files named `<source>.<environment id>.json` (regular files, at most 4 KB) with a
- * valid record. Everything else is ignored. A missing folder has none.
+ * valid record. Everything else is ignored, and not removed. A missing folder has none. Review round 4 of PR #63 (N4-1):
+ * R3-9 reverted: a file with such a name but no valid record may be a record in a newer format of a running environment
+ * (monitors of different versions on one engine), so the loop never removes it; Delete's plain forget removes it by name.
  */
 export async function readRecords(dir: string): Promise<RemoteRecord[]> {
   let names: string[];
@@ -182,9 +189,17 @@ export async function recordsOf(dir: string, environmentId: string, now: number)
   return { now, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) };
 }
 
-/** Removes one record; a missing one is no error. */
-export async function removeRecord(dir: string, source: string, environmentId: string): Promise<void> {
-  await fs.promises.rm(path.join(dir, heartbeatFileName(source, environmentId)), { force: true });
+/**
+ * Removes one record. Review round 1 of PR #63 (F2): with `at`, only while the file holds a record with that `at` (the
+ * caller holds the lock of the records). With `at`: true when it removed the file, false when the file is missing or does
+ * not hold a record with that `at` (review round 4 of PR #63, N4-1: R3-9 reverted). Without `at`: removes it if present,
+ * always true (review round 9 of PR #63, B7).
+ */
+export async function removeRecord(dir: string, source: string, environmentId: string, at?: number): Promise<boolean> {
+  const file = path.join(dir, heartbeatFileName(source, environmentId));
+  if (at !== undefined && (await readRecordFile(file))?.at !== at) return false;
+  await fs.promises.rm(file, { force: true });
+  return true;
 }
 
 export interface DockerResult {
@@ -205,8 +220,46 @@ export const nodeDocker: DockerRunner = (args, timeoutMs) =>
     });
   });
 
+/**
+ * Review round 1 of PR #63 (F2): removes an old record that `decide` named, under the lock of the records and only while
+ * the file still holds it (the `at` it read). True when it removed it.
+ */
+export type RecordRemover = (record: RemoteRecord) => Promise<boolean>;
+
+/** The time limit of a removal: the wait for the lock and the run limit (protocol.ts), plus the start of Node.js. */
+export const FORGET_TIMEOUT_MS = 20_000;
+
+/** The part of execFile that recordRemover uses (review round 2 of PR #63, R2-4: the tests pass their own). */
+export type ExecFile = (
+  file: string,
+  args: string[],
+  options: { timeout: number; windowsHide: boolean },
+  callback: (error: { code?: string | number | null; killed?: boolean; signal?: string | null; message: string } | null, stdout: string, stderr: string) => void,
+) => unknown;
+
+/**
+ * Runs `forget <source> <env id> <at>` of this script under the lock of the records (forgetIfUnchangedCommand). Review
+ * round 2 of PR #63 (R2-2): a timeout and a failed start (a string code such as ENOENT) say so, not "exit code null".
+ * Review round 3 (R3-2): the timeout kills only `flock`, whose child may still remove the record, so the text says so;
+ * another signal is named.
+ */
+export const recordRemover =
+  (exec: ExecFile = execFile): RecordRemover =>
+  (record) =>
+    new Promise((resolve, reject) => {
+      const [file, ...args] = forgetIfUnchangedCommand(record.source, record.environmentId, record.at);
+      exec(file, args, { timeout: FORGET_TIMEOUT_MS, windowsHide: true }, (error, stdout, stderr) => {
+        if (!error) resolve(String(stdout).trim() === 'removed');
+        else if (error.killed) reject(new Error(`no answer within ${FORGET_TIMEOUT_MS / 1000} s (it may still end)`));
+        else if (error.signal) reject(new Error(`killed by ${error.signal}`));
+        else reject(new Error(typeof error.code === 'string' ? error.message : monitorExecFailure(error.code ?? null, String(stderr), true)));
+      });
+    });
+
 export interface RemoteLoopDeps {
   docker: DockerRunner;
+  /** Removes an old record (recordRemover); the tests remove it in the process. */
+  removeRecord: RecordRemover;
   /** The folder of the records. */
   dir: string;
   now: () => number;
@@ -221,12 +274,27 @@ export class RemoteMonitorLoop {
   /** Env ids whose "keeps running" was logged; env ids whose failed stop was logged. */
   private readonly keptLogged = new Set<string>();
   private readonly stopFailedLogged = new Set<string>();
+  /**
+   * Review round 2 of PR #63 (R2-3): the records (`<source>.<env id>.<at>`) whose failed removal was logged. Like
+   * stopFailedLogged, it is kept across a tick that ends early (review round 3, R3-8).
+   */
+  private removeFailedLogged = new Set<string>();
   private graceLogged = false;
+  /**
+   * Review round 4 of PR #63 (N4-5): the pass of removals that runs in the background, at most one at a time. Never
+   * rejects (each removal catches its error). Read by the tests through `removals`.
+   */
+  private removing?: Promise<void>;
 
   constructor(private readonly deps: RemoteLoopDeps) {}
 
   get currentState(): RemoteMonitorState {
     return this.state;
+  }
+
+  /** The pass of removals that runs now, if any (for the tests). */
+  get removals(): Promise<void> | undefined {
+    return this.removing;
   }
 
   /** One tick; returns the environments whose containers were stopped. Never throws. */
@@ -284,14 +352,44 @@ export class RemoteMonitorLoop {
       }
     }
 
-    for (const record of decision.forget) {
-      try {
-        await removeRecord(this.deps.dir, record.source, record.environmentId);
-        log(`Removed the old record of ${record.environmentId} (no container of it exists).`);
-      } catch (error) {
-        log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names why a record is removed. Review round 1 of PR #63
+    // (F2): each under the lock of the records and only while the file still holds the record that `decide` saw, so a
+    // heartbeat written since stays. Review round 2 (R2-1): after the stops, which a removal (up to FORGET_TIMEOUT_MS each)
+    // would otherwise delay; the `at` check makes a late removal safe. A failed one is logged once per series (R2-3).
+    // Review round 4 of PR #63 (N4-5): R3-1 replaced. The removals run in the background, one pass at a time, and never
+    // lengthen a tick (a long one would make the next tick a gap, which holds every stop). A tick that reaches the end of
+    // its stops while no pass runs starts the next one, with the records it read at its start; a duplicate removal finds a
+    // missing file or another `at` and does nothing; the "Removed…" line comes when the removal ends. A removed record
+    // never matters to a stop: a superseded one is never the newest, and (review round 5, R5-6) the forgotten ones of an
+    // environment go oldest first (a keep last of equal `at`; review round 6, R6-1: in the order of `decide`, by the times
+    // as the rules see them, clamped), and after one that is not removed the rest of it stay, so the newest records of an
+    // environment stay until all are gone, even if containers of it are created meanwhile.
+    const removals = [
+      ...decision.forget.map((record) => ({ record, reason: 'no container of it exists', forget: true })),
+      ...decision.superseded.map((record) => ({ record, reason: 'a newer record of it exists', forget: false })),
+    ];
+    this.removing ??= (async () => {
+      const failing = new Set<string>();
+      const held = new Set<string>();
+      for (const { record, reason, forget } of removals) {
+        const key = `${record.source}.${record.environmentId}.${record.at}`;
+        // Review round 6 of PR #63 (R6-3): a skipped record keeps its logged failure.
+        if (forget && held.has(record.environmentId)) {
+          if (this.removeFailedLogged.has(key)) failing.add(key);
+          continue;
+        }
+        let removed = false;
+        try {
+          removed = await this.deps.removeRecord(record);
+          if (removed) log(`Removed the old record of ${record.environmentId} (${reason}).`);
+        } catch (error) {
+          if (!this.removeFailedLogged.has(key)) log(`The old record of ${record.environmentId} could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+          failing.add(key);
+        }
+        if (!removed) held.add(record.environmentId);
       }
-    }
+      this.removeFailedLogged = failing;
+    })().finally(() => (this.removing = undefined));
     return stopped;
   }
 }
@@ -316,6 +414,8 @@ export interface MainDeps {
   /** The images (user requests 2026-09-28): the registry, and the standard input of `images -`. */
   httpGet?: HttpGet;
   readStdin?: () => Promise<string>;
+  /** Review round 2 of PR #63 (R2-4): the start of the removals of `run` (recordRemover). */
+  exec?: ExecFile;
   now?: () => number;
   out?: (text: string) => void;
   err?: (text: string) => void;
@@ -361,6 +461,41 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
     // Review round 10 of PR #57 (U2): a failed write (a full volume) leaves no temporary file behind.
     await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R4): the temporary files of writeStateFile
+ * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
+ */
+export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
+/**
+ * Such a file whose modification time is more than this from now is removed at the start of `run` (only then: a younger
+ * one stays until the next start; review round 9 of PR #63, A2).
+ */
+export const STATE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * Monitor cleanup, user decision 2026-09-29 (R4): removes the leftover temporary files of writeStateFile in the volume whose
+ * modification time is more than STATE_TEMPORARY_MAX_AGE_MS from now, in either direction (review round 3 of PR #63,
+ * R3-7; a younger one may belong to a write that runs now). Only regular files with
+ * such a name, never a link; every error is ignored. Returns the names it removed.
+ */
+export async function removeStaleStateTemporaryFiles(stateDir: string, now: number): Promise<string[]> {
+  const removed: string[] = [];
+  const names = await fs.promises.readdir(stateDir).catch(() => [] as string[]);
+  for (const name of names) {
+    if (!STATE_TEMPORARY_FILE.test(name)) continue;
+    const file = path.join(stateDir, name);
+    try {
+      const stat = await fs.promises.lstat(file);
+      if (!stat.isFile() || Math.abs(now - stat.mtimeMs) <= STATE_TEMPORARY_MAX_AGE_MS) continue;
+      await fs.promises.unlink(file);
+      removed.push(name);
+    } catch {
+      // Removed meanwhile, or not removable: left alone.
+    }
+  }
+  return removed;
 }
 
 /** The stored list of repositories; none when it is missing or invalid. */
@@ -551,11 +686,13 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       return 0;
     }
     case 'forget': {
-      if (args.length !== 2 || !isSourceId(args[0]) || !isRemoteEnvironmentId(args[1])) {
+      // Review round 1 of PR #63 (F2): optionally the `at` of the record as the loop read it.
+      const at = args.length === 3 && /^\d{1,16}$/.test(args[2]) ? Number(args[2]) : undefined;
+      if (args.length < 2 || (args.length > 2 && !Number.isSafeInteger(at)) || !isSourceId(args[0]) || !isRemoteEnvironmentId(args[1])) {
         err('Invalid record.\n');
         return EXIT_INVALID;
       }
-      await removeRecord(dir, args[0], args[1]);
+      if ((await removeRecord(dir, args[0], args[1], at)) && at !== undefined) out('removed\n');
       return 0;
     }
     case 'images': {
@@ -587,8 +724,15 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const { tickMs, timing } = timingFromEnv(deps.env);
       const log = timestamped(out);
       const docker = deps.docker ?? nodeDocker;
-      const loop = new RemoteMonitorLoop({ docker, dir, now, log, timing });
+      // Review round 2 of PR #63 (R2-10): the removals run /opt/devenv/monitor.js under the lock of /state, so they always
+      // act on /state; deps.stateDir only moves the reading (the tests).
+      const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing });
       log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
+      // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
+      // Only here, at the start of `run`: a leftover younger than STATE_TEMPORARY_MAX_AGE_MS at a start stays until the
+      // next start (review round 9 of PR #63, A2).
+      const leftovers = await removeStaleStateTemporaryFiles(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, now());
+      if (leftovers.length > 0) log(`Removed ${leftovers.length} leftover temporary file(s) of the volume.`);
       // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the schedule.
       // Only when the container got prefixes: only then it has a network (the label says whether it has).
       if (prefixesFromEnv(deps.env).length > 0) {
@@ -621,7 +765,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
     }
     default:
-      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> | images - | settings -\n');
+      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> [<at>] | images - | settings -\n');
       return EXIT_INVALID;
   }
 }

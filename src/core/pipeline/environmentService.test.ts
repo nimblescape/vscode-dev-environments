@@ -1852,6 +1852,10 @@ describe('delete', () => {
     await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
     await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'delete', requestedAt: new Date(0).toISOString(), requestedBy: WINDOW_ID, reason: 'manual' });
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: new Date(0).toISOString() });
+    // Monitor cleanup, user decision 2026-09-29 (R7): a disconnect request of the environment goes with it; one of another stays.
+    fs.mkdirSync(h.paths.disconnectDir, { recursive: true });
+    fs.writeFileSync(h.paths.disconnectFile(ENV_ID), '{}');
+    fs.writeFileSync(h.paths.disconnectFile(OTHER_ID), '{}');
 
     await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: ['api-data', 'shared-cache'] }));
 
@@ -1866,6 +1870,8 @@ describe('delete', () => {
     expect(await pendingIds()).toEqual([]);
     expect(await h.sessionFiles.readOperations()).toEqual([]);
     expect(await h.sessionFiles.readReopen()).toBeUndefined();
+    expect(fs.existsSync(h.paths.disconnectFile(ENV_ID))).toBe(false);
+    expect(fs.existsSync(h.paths.disconnectFile(OTHER_ID))).toBe(true);
     // The other environment keeps its image.
     expect(h.docker.images.has(environmentImageName(OTHER_ID, 1))).toBe(true);
   });

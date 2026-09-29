@@ -9,6 +9,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { atomicTemporaryPath } from './atomicJson';
 import { isSourceId } from '../remoteMonitor/protocol';
 import { errorCode, readTextFileSync, retryTransientSync } from './paths';
 
@@ -33,7 +34,7 @@ export function readOrCreateComputerId(file: string): string {
       }
       // Invalid content (for example a manual edit): a new id, written atomically.
       const replacement = newComputerId();
-      const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+      const temp = atomicTemporaryPath(file);
       fs.writeFileSync(temp, replacement, 'utf8');
       retryTransientSync(() => fs.renameSync(temp, file));
       return replacement;

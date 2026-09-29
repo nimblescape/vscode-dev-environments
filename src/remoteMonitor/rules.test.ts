@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { inUseByOtherComputer } from '../core/remoteMonitor/protocol';
 import {
   FUTURE_RECORD_TOLERANCE_MS,
   RECORD_MAX_AGE_MS,
@@ -211,6 +212,210 @@ describe('decide of the remote Session Monitor', () => {
     it('keeps an old record while a container of its environment exists, also a stopped one', () => {
       const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
       expect(decide({ now: T0, containers: [container(A, 'exited')], records: [old], state: running() }).forget).toEqual([]);
+    });
+
+    // Monitor cleanup, user decision 2026-09-29 (R2): the absolute age, so a record far in the future is removed too.
+    it('removes a record more than 7 days in the future whose environment has no container, and keeps a nearer one', () => {
+      const far = record(B, T0 + RECORD_MAX_AGE_MS + 1);
+      const near = record(B, T0 + RECORD_MAX_AGE_MS, { source: OTHER });
+      // Changed fixture, review round 7 of PR #63 (R7-1): a recent record of another environment (with a container) is
+      // added; it stays, and it is earlier than `far` as the rules see it (`far` is clamped to now), so it would hold
+      // `far` if the records of other environments counted; only those of its own environment do (wording corrected in
+      // review round 8 of PR #63, R8-3).
+      const recent = record(A, T0 - MINUTE);
+      const decision = decide({ now: T0, containers: [container(A)], records: [far, near, recent], state: running() });
+      expect(decision.forget).toEqual([far]);
+      // With a container, it stays.
+      expect(decide({ now: T0, containers: [container(B, 'exited')], records: [far], state: running() }).forget).toEqual([]);
+    });
+
+    // Review round 6 of PR #63 (R6-1): `forget` is in the order of removal, by the times as the rules see them (a time in
+    // the future counts from when it was first seen), of equal `at` a keep last; the loop removes them in this order.
+    describe('in the order of removal (review round 6 of PR #63, R6-1)', () => {
+      const DAY = 24 * 60 * MINUTE;
+
+      it('puts a keep last of two far-future records seen at the same tick, whatever their written times', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const past = record(B, T0 - 8 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        // Also after every start of the monitor, when nothing was seen before.
+        expect(decide({ now: T0, containers: [], records: [keep, other, past], state: running() }).forget).toEqual([past, other, keep]);
+      });
+
+      it('orders by the time first seen, not the written time', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const state = running({ futureSeen: { [`${OTHER}.${B}.${other.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, other], state }).forget).toEqual([other, keep]);
+      });
+
+      it('never forgets a far-future record seen later than a record of its environment that stays', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const young = record(B, T0 - DAY, { source: OTHER });
+        const past = record(B, T0 - 9 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        expect(decide({ now: T0, containers: [], records: [keep, young, past], state: running() }).forget).toEqual([past]);
+        // A keep seen at the same time as the one that stays stays too; one seen before it is forgotten.
+        const same = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: same }).forget).toEqual([]);
+        const before = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - 2 * DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: before }).forget).toEqual([keep]);
+      });
+    });
+
+    describe('superseded records (monitor cleanup, user decision 2026-09-29, R1)', () => {
+      const THIRD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+      it('removes an old record without keepRunning when a newer record of the same environment exists', () => {
+        const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A)], records: [old, newer], state: running() });
+        expect(decision.superseded).toEqual([old]);
+        expect(decision.forget).toEqual([]);
+        // Without a container too; it is then in `forget` only.
+        const gone = decide({ now: T0, containers: [], records: [old, newer], state: running() });
+        expect(gone.forget).toEqual([old]);
+        expect(gone.superseded).toEqual([]);
+      });
+
+      it('keeps a superseded record that is not older than 7 days', () => {
+        const young = record(A, T0 - RECORD_MAX_AGE_MS);
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        expect(decide({ now: T0, containers: [container(A)], records: [young, newer], state: running() }).superseded).toEqual([]);
+      });
+
+      it('keeps an old record that says keepRunning while a container exists, even with a newer record', () => {
+        const keep = record(A, T0 - RECORD_MAX_AGE_MS - 1, { keepRunning: true });
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, newer], state: running() });
+        expect(decision.superseded).toEqual([]);
+        expect(decision.forget).toEqual([]);
+      });
+
+      it('keeps the newest record of an environment, however old', () => {
+        const newest = record(A, T0 - RECORD_MAX_AGE_MS - MINUTE);
+        const older = record(A, T0 - RECORD_MAX_AGE_MS - 2 * MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A, 'exited')], records: [newest, older], state: running() });
+        expect(decision.superseded).toEqual([older]);
+      });
+
+      it('keeps old records on a tie of their times, and removes only those with a strictly newer one', () => {
+        const at = T0 - RECORD_MAX_AGE_MS - MINUTE;
+        const one = record(A, at);
+        const two = record(A, at, { source: OTHER });
+        expect(decide({ now: T0, containers: [container(A)], records: [one, two], state: running() }).superseded).toEqual([]);
+        const newer = record(A, T0 - MINUTE, { source: THIRD });
+        expect(decide({ now: T0, containers: [container(A)], records: [one, two, newer], state: running() }).superseded).toEqual([one, two]);
+      });
+
+      it('compares the times as the rules see them: a record in the future counts from when it was first seen', () => {
+        const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
+        // Far in the future, first seen now: it is newer than the old record, so the old one goes.
+        const future = record(A, T0 + 30 * 24 * 60 * MINUTE, { source: OTHER });
+        const first = decide({ now: T0, containers: [container(A)], records: [old, future], state: running() });
+        expect(first.superseded).toEqual([old]);
+        // The future record itself is not removed by this rule: it is the newest.
+        expect(first.superseded).not.toContain(future);
+        // An old record whose clamped time is not older than 7 days stays, however far its written time is.
+        const later = decide({ now: T0 + MINUTE, containers: [container(A)], records: [future, record(A, T0 + MINUTE, { source: THIRD })], state: first.state });
+        expect(later.superseded).toEqual([]);
+      });
+
+      // Review round 1 of PR #63 (B2): the times of the rules for the record itself and for the others, with a record in the
+      // future that was first seen days ago (futureSeen, `<source>.<environment id>.<at>`).
+      describe('with a record in the future first seen days ago (review round 1 of PR #63, B2)', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const future = record(A, T0 + 30 * DAY, { source: OTHER });
+        const seenAt = (time: number) => running({ futureSeen: { [`${OTHER}.${A}.${future.at}`]: time } });
+
+        it('removes an old record older than the first sight of the future one', () => {
+          const old = record(A, T0 - 11 * DAY);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, old], state: seenAt(T0 - 10 * DAY) }).superseded).toEqual([old]);
+        });
+
+        it('removes the future record itself when it was first seen more than 7 days ago and a newer record exists', () => {
+          const newer = record(A, T0 - 1000);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, newer], state: seenAt(T0 - 8 * DAY) }).superseded).toEqual([future]);
+        });
+
+        it('compares the others by the time of the rules too: its written time does not make it newer', () => {
+          const old = record(A, T0 - 9 * DAY);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, old], state: seenAt(T0 - 10 * DAY) }).superseded).toEqual([future]);
+        });
+      });
+
+      // Review round 1 of PR #63 (F1): the local check of the computer of a removed record (inUseByOtherComputer) would count
+      // an old keep of another computer that is not newer than the removed record.
+      it('keeps an old record while a keepRunning record of another computer is not newer than it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() });
+        expect(decision.superseded).not.toContain(own);
+        const remaining = [keep, own, newest].filter((one) => !decision.superseded.includes(one));
+        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
+        expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
+        // Without its own record, the old keep would count for that computer.
+        expect(inUseByOtherComputer(output([keep, newest]), SOURCE)).toBe(true);
+        // A keep of another computer that is newer than the record does not hold it back.
+        const newerKeep = record(A, T0 - 8 * DAY, { source: OTHER, keepRunning: true });
+        expect(decide({ now: T0, containers: [container(A)], records: [newerKeep, own, newest], state: running() }).superseded).toEqual([own]);
+      });
+
+      // Review round 2 of PR #63 (R2-6): a keep of another computer with the same time as the record holds it back too.
+      // Review round 3 (R3-4): only as a precaution; on a tie the local check counts that keep whether the record stays or
+      // not.
+      it('keeps an old record while a keepRunning record of another computer has the same time', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        expect(decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() }).superseded).toEqual([]);
+      });
+
+      // Review round 3 of PR #63 (R3-3): only a keep of the same environment holds a record back, not one of another.
+      it('removes an old record although an old keepRunning record of another environment is not newer than it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const otherKeep = record(B, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
+        const sameTime = record(B, own.at, { source: OTHER, keepRunning: true });
+        for (const keep of [otherKeep, sameTime]) {
+          expect(decide({ now: T0, containers: [container(A), container(B)], records: [keep, own, newest], state: running() }).superseded).toEqual([own]);
+        }
+      });
+
+      // Review round 2 of PR #63 (R2-6): the local check compares the written times (`records` prints them), so the keep
+      // check does too: a record in the future first seen 10 days ago stays while an older keep of another computer
+      // exists, although its clamped time is older than that keep.
+      it('compares the keep of another computer by the written times', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 + 30 * DAY);
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${SOURCE}.${A}.${own.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [own, keep, newest], state });
+        expect(decision.superseded).not.toContain(own);
+        const remaining = [own, keep, newest].filter((one) => !decision.superseded.includes(one));
+        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
+        expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
+      });
+
+      // Review round 8 of PR #63 (R8-5): the other way round. A keep of another computer whose written time is later
+      // than the record, but that was first seen before it (a time in the future), does not hold the record back: by
+      // the written times it is newer, and the local check of the computer of the record counts it either way.
+      it('removes an old record although a keep of another computer in the future was first seen before it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 + 30 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${OTHER}.${A}.${keep.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state });
+        expect(decision.superseded).toEqual([own]);
+        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
+        expect(inUseByOtherComputer(output([keep, own, newest]), SOURCE)).toBe(true);
+        expect(inUseByOtherComputer(output([keep, newest]), SOURCE)).toBe(true);
+      });
     });
   });
 

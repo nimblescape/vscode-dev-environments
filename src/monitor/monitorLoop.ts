@@ -39,6 +39,7 @@ import {
 } from '../core/remoteMonitor/protocol';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
+import { STORAGE_SWEEP_INTERVAL_MS } from '../core/storage/storageSweep';
 import type { Environment, GitSummary, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 import { isProcessAlive } from './lock';
 import {
@@ -145,6 +146,14 @@ export interface MonitorLoopDeps {
    * Session Monitor and it is not asked about other computers.
    */
   sourceId?: string;
+  /**
+   * Monitor cleanup, user decision 2026-09-29 (R6–R8): the sweep of the storage folder (sweepStorage of
+   * storageSweep.ts), run at the first tick and then at most once per STORAGE_SWEEP_INTERVAL_MS of run time (`uptime`).
+   * Its errors are logged; they never fail a tick. Without it: no sweep.
+   */
+  sweep?: () => Promise<void>;
+  /** The run time for the sweep (a monotonic clock, not the wall clock). Default: performance.now(). */
+  uptime?: () => number;
 }
 
 /** Why the monitor ends. */
@@ -209,6 +218,8 @@ export class MonitorLoop {
   private tickHeartbeat: { target: DockerTarget; settings: MonitorSettings; inUse: ReadonlySet<string> } | undefined;
   /** Unit 7, PR 2: env id → until when it counts as in use from another computer (not asked again before). */
   private readonly otherComputerUntil = new Map<string, number>();
+  /** Monitor cleanup, user decision 2026-09-29: the run time (`uptime`) of the last sweep of the storage folder. */
+  private lastSweepAt: number | undefined;
 
   constructor(private readonly deps: MonitorLoopDeps) {
     this.clock = deps.clock ?? systemClock;
@@ -264,6 +275,7 @@ export class MonitorLoop {
       this.deps.logger.info('Another Session Monitor took over.');
       return { end: 'lockLost', stopped: [] };
     }
+    await this.sweepWhenDue();
     const now = this.clock.now();
     const settings = (await this.deps.sessionFiles.readMonitorSettings()) ?? defaultMonitorSettings();
     const run = async (target: DockerTarget): Promise<TickResult> => {
@@ -277,6 +289,23 @@ export class MonitorLoop {
     };
     const { docker } = this.deps;
     return docker.withCurrentTarget ? docker.withCurrentTarget(run) : run(LOCAL_DOCKER_TARGET);
+  }
+
+  /**
+   * Monitor cleanup, user decision 2026-09-29 (R6–R8): the sweep of the storage folder at the first tick, then when
+   * STORAGE_SWEEP_INTERVAL_MS of run time passed since the last one. Never throws.
+   */
+  private async sweepWhenDue(): Promise<void> {
+    const { sweep } = this.deps;
+    if (!sweep) return;
+    const uptime = (this.deps.uptime ?? (() => performance.now()))();
+    if (this.lastSweepAt !== undefined && uptime - this.lastSweepAt < STORAGE_SWEEP_INTERVAL_MS) return;
+    this.lastSweepAt = uptime;
+    try {
+      await sweep();
+    } catch (error) {
+      this.deps.logger.warn(`The outdated files of the storage folder could not be removed: ${errorMessage(error)}`);
+    }
   }
 
   /** The tick on the Docker target `target` (review D2): the rules, the container list, and the stops. */

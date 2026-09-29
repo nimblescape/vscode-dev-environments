@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
+import { RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
   PS_FORMAT,
@@ -20,10 +20,14 @@ import {
   readImageList,
   parseContainerLines,
   readRecords,
+  recordRemover,
+  removeRecord,
+  removeStaleStateTemporaryFiles,
+  type ExecFile,
   timingFromEnv,
   type DockerResult,
 } from './main';
-import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide } from './rules';
+import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -219,12 +223,54 @@ describe('monitor.js records and forget', () => {
   it('removes one record; a missing one is no error', async () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     writeRecord(OTHER, A, { at: T0, keepRunning: false, limitSeconds: 600 });
-    expect((await run(['forget', SOURCE, A])).code).toBe(0);
+    // Review round 2 of PR #63 (R2-5): without an `at`, nothing is printed.
+    expect(await run(['forget', SOURCE, A])).toEqual({ code: 0, out: '', err: '' });
     expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A)]);
     expect((await run(['forget', SOURCE, A])).code).toBe(0);
   });
 
-  it.each<[string[]]>([[['records', '../x']], [['records']], [['forget', SOURCE, '../x']], [['forget', 'x', A]], [['forget', SOURCE]], [['run', 'x']], [['unknown']], [[]]])(
+  // Review round 1 of PR #63 (F2): the removal of the loop, only while the record still has the `at` it read.
+  it('with an `at`, removes the record only while it still has that `at`, and says so', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 1000, keepRunning: false, limitSeconds: 600 });
+    expect(await run(['forget', SOURCE, A, String(T0 - 2000)])).toEqual({ code: 0, out: '', err: '' });
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
+    expect(await run(['forget', SOURCE, A, String(T0 - 1000)])).toEqual({ code: 0, out: 'removed\n', err: '' });
+    expect(recordFiles()).toEqual([]);
+    expect(await run(['forget', SOURCE, A, String(T0 - 1000)])).toEqual({ code: 0, out: '', err: '' });
+  });
+
+  // Changed test, review round 4 of PR #63 (N4-1, N4-2: R3-9 reverted): was "with the `at` 0, removes a file without a
+  // valid record". An `at` (also 0) never removes a file without a valid record, and a missing file prints nothing; the
+  // plain forget of Delete removes such a file by name.
+  it('with an `at`, keeps a file without a valid record and prints nothing for a missing file; without, removes it', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 1000, keepRunning: false, limitSeconds: 600 });
+    fs.writeFileSync(path.join(heartbeatDir(stateDir), heartbeatFileName(OTHER, A)), '{"at":');
+    expect(await run(['forget', SOURCE, A, '0'])).toEqual({ code: 0, out: '', err: '' });
+    expect(await run(['forget', OTHER, A, '0'])).toEqual({ code: 0, out: '', err: '' });
+    expect(await run(['forget', OTHER, B, '0'])).toEqual({ code: 0, out: '', err: '' });
+    expect(await run(['forget', OTHER, B, String(T0)])).toEqual({ code: 0, out: '', err: '' });
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, A)].sort());
+    expect(await run(['forget', OTHER, A])).toEqual({ code: 0, out: '', err: '' });
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
+  });
+
+  it.each<[string[]]>([
+    [['records', '../x']],
+    [['records']],
+    [['forget', SOURCE, '../x']],
+    [['forget', 'x', A]],
+    [['forget', SOURCE]],
+    // Review round 1 of PR #63 (F2): an invalid `at`, or one argument too many.
+    [['forget', SOURCE, A, '-1']],
+    [['forget', SOURCE, A, '1.5']],
+    [['forget', SOURCE, A, '99999999999999999']],
+    // Review round 2 of PR #63 (R2-5): 16 digits, but not a safe integer.
+    [['forget', SOURCE, A, '9999999999999999']],
+    [['forget', SOURCE, A, String(T0), 'x']],
+    [['run', 'x']],
+    [['unknown']],
+    [[]],
+  ])(
     'refuses %j with exit code 2',
     async (argv) => {
       writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
@@ -251,6 +297,10 @@ describe('readRecords', () => {
       fs.symlinkSync(target, path.join(dir, heartbeatFileName('fedcba9876543210fedcba9876543212', B)));
     }
     expect(await readRecords(dir)).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 600, seq: 0 }]);
+    // Changed expectation, review round 4 of PR #63 (N4-1: R3-9 reverted): was the list of the files without a valid
+    // record (the `invalid` argument, gone). They are ignored and stay. Review round 5 of PR #63 (R5-4): a regression guard
+    // (readRecords removes nothing), kept although readRecords no longer takes the argument that removed them.
+    for (const source of ['11111111111111111111111111111111', OTHER, big]) expect(fs.existsSync(path.join(dir, heartbeatFileName(source, source === OTHER ? A : B)))).toBe(true);
   });
 });
 
@@ -290,6 +340,8 @@ describe('RemoteMonitorLoop', () => {
   let stopResults: Map<string, DockerResult>;
   let calls: string[][];
   let loop: RemoteMonitorLoop;
+  /** Runs right before a removal: a heartbeat that comes between the read and the removal. */
+  let beforeRemove: ((record: RemoteRecord) => void) | undefined;
 
   beforeEach(() => {
     now = T0;
@@ -297,11 +349,19 @@ describe('RemoteMonitorLoop', () => {
     calls = [];
     stopResults = new Map();
     ps = { code: 0, stdout: `${DB_ID}\trunning\tdevenv-api-db-1\t${A}\tdb\n${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    beforeRemove = undefined;
     loop = new RemoteMonitorLoop({
       docker: async (args) => {
         calls.push([...args]);
         if (args[0] === 'ps') return ps;
         return stopResults.get(args[1]) ?? { code: 0, stdout: '', stderr: '' };
+      },
+      // Review round 1 of PR #63 (F2): the removal of `forget <source> <env id> <at>`, in the process (the lock is tested in
+      // heartbeatLock.test.ts).
+      removeRecord: async (record) => {
+        calls.push(['forget', record.source, record.environmentId, String(record.at)]);
+        beforeRemove?.(record);
+        return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
       },
       dir: heartbeatDir(stateDir),
       now: () => now,
@@ -309,9 +369,12 @@ describe('RemoteMonitorLoop', () => {
     });
   });
 
+  // Review round 4 of PR #63 (N4-5): the removals run in the background; the tests wait for the pass after the tick.
   async function tickAt(time: number): Promise<string[]> {
     now = time;
-    return loop.tick();
+    const stopped = await loop.tick();
+    await loop.removals;
+    return stopped;
   }
 
   it('lists only containers with the environment label, and stops a stale environment after the grace, dev container first', async () => {
@@ -363,6 +426,427 @@ describe('RemoteMonitorLoop', () => {
     fs.writeFileSync(path.join(heartbeatDir(stateDir), 'other-file'), 'x');
     await tickAt(T0);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A), 'other-file'].sort());
+    // Monitor cleanup, user decision 2026-09-29 (R1): the log line names the reason.
+    expect(lines).toContain(`Removed the old record of ${B} (no container of it exists).`);
+  });
+
+  // Monitor cleanup, user decision 2026-09-29 (R1): an old record that a newer one of the same environment replaced.
+  it('removes an old record that a newer one of the same environment replaced, and names the reason', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, A, { at: T0 - MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tickAt(T0);
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A)]);
+    expect(lines).toContain(`Removed the old record of ${A} (a newer record of it exists).`);
+  });
+
+  // Review round 1 of PR #63 (F2): a computer that comes back after more than 7 days writes its record between the read of
+  // the loop and the removal; the record stays, and nothing is logged.
+  it('keeps a record that a heartbeat wrote again between the read and the removal', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, A, { at: T0 - MINUTE, keepRunning: false, limitSeconds: 600 });
+    beforeRemove = (record) => writeRecord(record.source, record.environmentId, { at: T0, keepRunning: false, limitSeconds: 600 });
+    await tickAt(T0);
+    expect(calls).toContainEqual(['forget', SOURCE, A, String(T0 - 8 * 24 * 60 * MINUTE)]);
+    expect(recordFiles()).toEqual([heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, A)].sort());
+    expect(readRecord(SOURCE, A)).toMatchObject({ at: T0 });
+    expect(lines.filter((line) => line.startsWith('Removed'))).toEqual([]);
+  });
+
+  // Review round 1 of PR #63 (F2) put the removals before the stops; review round 2 (R2-1) moved them after the stops
+  // again, which a removal (up to 20 s each) would otherwise delay.
+  it('removes the old records after it stops containers', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    for (let time = T0; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) await tickAt(time);
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    calls = [];
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    // Changed expectation, review round 2 of PR #63 (R2-1): was ['ps', 'forget', 'stop', 'stop'].
+    expect(calls.map((call) => call[0])).toEqual(['ps', 'stop', 'stop', 'forget']);
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
+  });
+
+  it('logs a removal that failed', async () => {
+    const failing = new RemoteMonitorLoop({ docker: async () => ps, removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await failing.tick();
+    // Review round 4 of PR #63 (N4-5): the removals run in the background.
+    await failing.removals;
+    expect(lines).toContain(`The old record of ${B} could not be removed: the heartbeat records stayed locked`);
+  });
+
+  // Review round 2 of PR #63 (R2-3): a removal that keeps failing is logged once per series, as a failed stop.
+  it('logs a removal that keeps failing once, and again after it succeeded or the record changed', async () => {
+    let fail = true;
+    const failing = new RemoteMonitorLoop({
+      docker: async () => ps,
+      removeRecord: async () => (fail ? Promise.reject(new Error('locked')) : false),
+      dir: heartbeatDir(stateDir),
+      now: () => T0,
+      log: (message) => lines.push(message),
+    });
+    const failed = () => lines.filter((line) => line.includes('could not be removed')).length;
+    // Review round 4 of PR #63 (N4-5): the removals run in the background; each tick waits for its pass here.
+    const tick = async () => {
+      await failing.tick();
+      await failing.removals;
+    };
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tick();
+    await tick();
+    await tick();
+    expect(failed()).toBe(1);
+    // Another record (another `at`) is a series of its own.
+    writeRecord(SOURCE, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tick();
+    await tick();
+    expect(failed()).toBe(2);
+    // A success ends the series.
+    fail = false;
+    await tick();
+    fail = true;
+    await tick();
+    expect(failed()).toBe(3);
+    // A tick without the removal ends it too.
+    fs.rmSync(path.join(heartbeatDir(stateDir), heartbeatFileName(SOURCE, B)));
+    await tick();
+    writeRecord(SOURCE, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tick();
+    expect(failed()).toBe(4);
+  });
+
+  /** A loop whose removals wait until the test ends them (`release`), with the clock `clock`. */
+  function slowLoop(): { loop: RemoteMonitorLoop; attempts: string[]; release: (removed: boolean) => void; setClock: (time: number) => void } {
+    let clock = T0;
+    const pending: Array<(removed: boolean) => void> = [];
+    const attempts: string[] = [];
+    const slow = new RemoteMonitorLoop({
+      docker: async (args) => (args[0] === 'ps' ? ps : { code: 0, stdout: '', stderr: '' }),
+      removeRecord: (record) => {
+        attempts.push(record.source);
+        return new Promise<boolean>((resolve) => pending.push(resolve));
+      },
+      dir: heartbeatDir(stateDir),
+      now: () => clock,
+      log: (message) => lines.push(message),
+    });
+    return { loop: slow, attempts, release: (removed) => pending.shift()?.(removed), setClock: (time) => (clock = time) };
+  }
+
+  // Changed test, review round 4 of PR #63 (N4-5, R3-1 replaced): was "starts no removal after one tick interval, so slow
+  // removals keep no grace on; the rest follow at the next ticks". The removals run in the background: a tick never waits
+  // for them, so the next tick is no gap, and the stops come as without removals, while a removal still hangs.
+  it('ends a tick while a slow removal is still pending, so the stops come without a gap', async () => {
+    writeRecord(OTHER, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { loop: slow, attempts, setClock } = slowLoop();
+    const stoppedAt: number[] = [];
+    for (let tick = 0; tick <= REMOTE_GRACE_MS / REMOTE_TICK_MS + 1; tick++) {
+      setClock(T0 + tick * REMOTE_TICK_MS);
+      if ((await slow.tick()).includes(A)) stoppedAt.push(tick);
+    }
+    // The grace of the start ends after 120 s, and no gap starts another one.
+    expect(stoppedAt).toEqual([REMOTE_GRACE_MS / REMOTE_TICK_MS, REMOTE_GRACE_MS / REMOTE_TICK_MS + 1]);
+    expect(lines.filter((line) => line.includes('nothing is stopped until'))).toHaveLength(1);
+    expect(attempts).toEqual([OTHER]);
+    expect(slow.removals).toBeDefined();
+  });
+
+  // Review round 4 of PR #63 (N4-5): at most one pass at a time. Review round 5 (R5-7): a tick that reaches the end of its
+  // stops while no pass runs starts the next one, with the records it read at its start.
+  it('starts no second pass of removals while one runs', async () => {
+    writeRecord(OTHER, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { loop: slow, attempts, release } = slowLoop();
+    await slow.tick();
+    const pass = slow.removals;
+    await slow.tick();
+    await slow.tick();
+    expect(attempts).toEqual([OTHER]);
+    expect(slow.removals).toBe(pass);
+    release(true);
+    await pass;
+    expect(slow.removals).toBeUndefined();
+    expect(lines).toContain(`Removed the old record of ${B} (no container of it exists).`);
+    await slow.tick();
+    expect(attempts).toEqual([OTHER, OTHER]);
+    release(false);
+    await slow.removals;
+  });
+
+  // Review round 5 of PR #63 (R5-6): a pass may end long after the tick that decided it, when containers of the environment
+  // may exist again. The forgotten records of an environment go oldest first (of equal `at`, a keep last), and after one
+  // that is not removed the rest of it stay: the newest records stay until all are gone, so no stop or keep changes.
+  // Review round 6 of PR #63 (R6-1): the order is that of `decide`, by the times as the rules see them (clamped).
+  it.each([
+    ['removed', async () => true, ['D', 'T', 'C']],
+    ['not removed', async () => false, ['D']],
+    ['failed', async () => Promise.reject(new Error('locked')), ['D']],
+  ])('removes the forgotten records of an environment oldest first, a keep last; the oldest %s', async (_, first, expected) => {
+    const THIRD = '1'.repeat(32);
+    const names: Record<string, string> = { [SOURCE]: 'C', [THIRD]: 'T', [OTHER]: 'D' };
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: true, limitSeconds: 600 });
+    writeRecord(THIRD, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const removeRecord = (record: RemoteRecord) => (attempts.push(names[record.source]) === 1 ? first() : Promise.resolve(true));
+    const ordered = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    await ordered.tick();
+    await ordered.removals;
+    expect(attempts).toEqual(expected);
+  });
+
+  // Review round 6 of PR #63 (R6-2): the records that stay after a removal that is not done are those of its environment
+  // only; the forgotten records of other environments and the superseded ones are still removed in that pass.
+  it('keeps only the rest of the environment whose removal failed', async () => {
+    const C = '9e8d7c6b-0000-4000-8000-000000000003';
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, C, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, A, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, A, { at: T0 - MINUTE, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const removeRecord = async (record: RemoteRecord) => {
+      attempts.push(`${record.environmentId}.${record.source}`);
+      if (record.environmentId === B && record.source === OTHER) throw new Error('locked');
+      return true;
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    await loop.tick();
+    await loop.removals;
+    expect([...attempts].sort()).toEqual([`${A}.${SOURCE}`, `${B}.${OTHER}`, `${C}.${SOURCE}`].sort());
+  });
+
+  // Review round 8 of PR #63 (R8-5): after a forgotten record that is not removed, only the forgotten records of its
+  // environment stay; a superseded record of the same environment is still removed in that pass (it is never the
+  // newest). One environment with both needs a record in the future: here one written while the clock of the host was
+  // two weeks ahead, first seen eight days ago. Changed comment, review round 9 of PR #63 (B3): it named the container
+  // of the first tick as the reason the record in the future was not forgotten then; the reason is that at the first
+  // tick SOURCE's record is one day old (it stays) and, by the times as the rules see them (R6-1: the record in the
+  // future counts as of now), earlier, so the record in the future is not forgotten then.
+  it('still removes a superseded record of an environment whose forgotten record was not removed', async () => {
+    const DAY = 24 * 60 * MINUTE;
+    const THIRD = '1'.repeat(32);
+    let clock = T0 - 8 * DAY;
+    let listed: DockerResult = { code: 0, stdout: `${'c'.repeat(64)}\texited\tdevenv-b\t${B}\t\n`, stderr: '' };
+    writeRecord(SOURCE, B, { at: T0 - 9 * DAY, keepRunning: false, limitSeconds: 600 });
+    writeRecord(OTHER, B, { at: T0 + 6 * DAY, keepRunning: false, limitSeconds: 600 });
+    const attempts: string[] = [];
+    const remove = async (record: RemoteRecord) => {
+      attempts.push(record.source);
+      if (record.source === SOURCE) throw new Error('locked');
+      return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => listed, removeRecord: remove, dir: heartbeatDir(stateDir), now: () => clock, log: (message) => lines.push(message) });
+    await loop.tick();
+    await loop.removals;
+    expect(attempts).toEqual([]);
+    // Eight days later the environment has no container any more, and another computer sent a heartbeat a day ago: the
+    // record of SOURCE is forgotten, the one in the future (first seen more than 7 days ago) superseded.
+    listed = { code: 0, stdout: '', stderr: '' };
+    writeRecord(THIRD, B, { at: T0 - DAY, keepRunning: false, limitSeconds: 600 });
+    clock = T0;
+    await loop.tick();
+    await loop.removals;
+    expect(attempts).toEqual([SOURCE, OTHER]);
+    expect(lines).toContain(`The old record of ${B} could not be removed: locked`);
+    expect(lines).toContain(`Removed the old record of ${B} (a newer record of it exists).`);
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, B), heartbeatFileName(THIRD, B)].sort());
+  });
+
+  // Review round 6 of PR #63 (R6-3): a record that a pass skips (an older one of its environment was not removed) keeps
+  // its logged failure, so it is logged once across that pass.
+  // Changed test, review round 7 of PR #63 (R7-2): was three passes with results [true, false, true] (failure logged,
+  // skipped, failure again); now four passes, [false, true, false, true]: skipped before the first failure (nothing to
+  // keep), failure logged, skipped (keeps it), failure again not logged. So both keeping the logged failure of a skipped
+  // record and keeping only a logged one are checked.
+  it('logs a failed removal once across a pass that skipped it', async () => {
+    const results: boolean[] = [false, true, false, true];
+    const removeRecord = async (record: RemoteRecord) => {
+      if (record.source === OTHER) return results.shift() ?? true;
+      throw new Error('locked');
+    };
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    for (let pass = 0; pass < 4; pass++) {
+      await loop.tick();
+      await loop.removals;
+    }
+    expect(results).toEqual([]);
+    expect(lines.filter((line) => line.includes('could not be removed'))).toHaveLength(1);
+  });
+
+  // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "removes a file without a valid record whose
+  // modification time is more than 7 days from now". Such a file may hold a record in a newer format of a running
+  // environment (monitors of different versions on one engine): it is kept, whatever its age and environment.
+  it('keeps a file without a valid record, also one older than 7 days of a running environment', async () => {
+    const dir = heartbeatDir(stateDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const files = [heartbeatFileName(SOURCE, A), heartbeatFileName(OTHER, A), heartbeatFileName(SOURCE, B), heartbeatFileName(OTHER, B)];
+    for (const [index, name] of files.entries()) {
+      const file = path.join(dir, name);
+      // Review round 5 of PR #63 (R5-3): a file holds a record in an incompatible format (was a cut one, now the second
+      // file); the others are corrupt. Changed fixture, review round 6 of PR #63 (R6-5): was the first file, with `at` T0;
+      // now the third, of B (no container) and older than 7 days, so it would be removed if it counted as a record.
+      const texts = ['not a record', JSON.stringify({ at: T0, keepRunning: false, limitSeconds: 600, seq: 0, format: 2 }).slice(0, -1), JSON.stringify({ at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600, seq: 'x' })];
+      fs.writeFileSync(file, texts[index] ?? 'not a record');
+      const time = (T0 + (index % 2 === 0 ? -8 : 8) * 24 * 60 * MINUTE) / 1000;
+      fs.utimesSync(file, time, time);
+    }
+    for (let time = T0; time <= T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
+    expect(calls.filter((call) => call[0] === 'forget' || call[0] === 'stop')).toEqual([]);
+    expect(recordFiles()).toEqual([...files].sort());
+    expect(lines.filter((line) => line.startsWith('Removed'))).toEqual([]);
+  });
+
+  // Changed test, review round 4 of PR #63 (N4-1: R3-9 reverted): was "keeps a valid record that a heartbeat wrote over a
+  // file without a valid record" (the race of the removal with the `at` 0, which is gone). Only a valid record is removed:
+  // once a heartbeat wrote one over such a file, it is handled like any record.
+  it('removes a file without a valid record only after it holds a valid old record', async () => {
+    const file = path.join(heartbeatDir(stateDir), heartbeatFileName(SOURCE, B));
+    fs.mkdirSync(heartbeatDir(stateDir), { recursive: true });
+    fs.writeFileSync(file, 'not a record');
+    fs.utimesSync(file, (T0 - 8 * 24 * 60 * MINUTE) / 1000, (T0 - 8 * 24 * 60 * MINUTE) / 1000);
+    await tickAt(T0);
+    expect(calls.filter((call) => call[0] === 'forget')).toEqual([]);
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await tickAt(T0 + REMOTE_TICK_MS);
+    expect(calls.filter((call) => call[0] === 'forget')).toEqual([['forget', SOURCE, B, String(T0 - 8 * 24 * 60 * MINUTE)]]);
+    expect(recordFiles()).toEqual([]);
+  });
+});
+
+// Review round 2 of PR #63 (R2-4): the removal of the loop, `forget <source> <env id> <at>` under the lock of the records
+// (with the real script and `flock` in heartbeatLock.test.ts).
+describe('recordRemover', () => {
+  const old: RemoteRecord = { source: SOURCE, environmentId: B, at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 };
+  type Result = Parameters<Parameters<ExecFile>[3]>;
+  function remover(...result: Result): { remove: ReturnType<typeof recordRemover>; calls: unknown[][] } {
+    const calls: unknown[][] = [];
+    const remove = recordRemover((file, args, options, callback) => {
+      calls.push([file, args, options]);
+      callback(...result);
+    });
+    return { remove, calls };
+  }
+
+  it('runs forgetIfUnchangedCommand with a time limit, and says whether the script removed the record', async () => {
+    const removed = remover(null, 'removed\n', '');
+    expect(await removed.remove(old)).toBe(true);
+    const [file, ...args] = forgetIfUnchangedCommand(SOURCE, B, old.at);
+    expect(removed.calls).toEqual([[file, args, { timeout: 20_000, windowsHide: true }]]);
+    expect(await remover(null, '', '').remove(old)).toBe(false);
+  });
+
+  it('rejects with the reason of a failure', async () => {
+    await expect(remover({ code: RECORDS_LOCK_BUSY_EXIT, message: 'Command failed' }, '', '').remove(old)).rejects.toThrow('the heartbeat records stayed locked by another command');
+    await expect(remover({ code: 1, message: 'Command failed' }, '', 'broken\n').remove(old)).rejects.toThrow(/^broken$/);
+    // Review round 2 of PR #63 (R2-2): not "exit code null".
+    await expect(remover({ code: null, killed: true, message: 'Command failed' }, '', '').remove(old)).rejects.toThrow('no answer within 20 s');
+    await expect(remover({ code: 'ENOENT', message: 'spawn flock ENOENT' }, '', '').remove(old)).rejects.toThrow(/^spawn flock ENOENT$/);
+    // Review round 3 of PR #63 (R3-2): the timeout kills only `flock`, whose child may still remove the record; a kill by
+    // another signal is named.
+    await expect(remover({ code: null, killed: true, signal: 'SIGTERM', message: 'Command failed' }, '', '').remove(old)).rejects.toThrow(/^no answer within 20 s \(it may still end\)$/);
+    await expect(remover({ code: null, killed: false, signal: 'SIGKILL', message: 'Command failed' }, '', '').remove(old)).rejects.toThrow(/^killed by SIGKILL$/);
+  });
+
+  // Review round 9 of PR #63 (B2): also the removal of the leftover temporary files of the volume at the start of `run`.
+  it('is the removal of `run`', async () => {
+    vi.useFakeTimers();
+    try {
+      writeRecord(SOURCE, B, { at: old.at, keepRunning: false, limitSeconds: 600 });
+      const leftover = (name: string, mtime: number) => {
+        fs.writeFileSync(path.join(stateDir, name), 'x');
+        fs.utimesSync(path.join(stateDir, name), mtime / 1000, mtime / 1000);
+      };
+      leftover('images.json.1.1.tmp', T0 - 2 * 60 * MINUTE);
+      leftover('images.json.1.2.tmp', T0);
+      let out = '';
+      const called = new Promise<unknown[]>((resolve) => {
+        void main(['run'], {
+          env: {},
+          stateDir,
+          docker: async () => ({ code: 0, stdout: '', stderr: '' }),
+          exec: (file, args, _options, callback) => {
+            resolve([file, ...args]);
+            callback(null, 'removed\n', '');
+          },
+          now: () => T0,
+          out: (text) => (out += text),
+        });
+      });
+      expect(await called).toEqual(forgetIfUnchangedCommand(SOURCE, B, old.at));
+      await vi.waitFor(() => expect(out).toContain(`Removed the old record of ${B} (no container of it exists).`));
+      expect(out).toContain('Removed 1 leftover temporary file(s) of the volume.');
+      expect(fs.existsSync(path.join(stateDir, 'images.json.1.1.tmp'))).toBe(false);
+      expect(fs.existsSync(path.join(stateDir, 'images.json.1.2.tmp'))).toBe(true);
+    } finally {
+      // The loop of `run` waits for a fake timer that never fires.
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Monitor cleanup, user decision 2026-09-29 (R4): the leftover temporary files of the state files, at the start of `run`.
+describe('removeStaleStateTemporaryFiles', () => {
+  const HOUR = 60 * MINUTE;
+  function file(name: string, ageMs: number): void {
+    const full = path.join(stateDir, name);
+    fs.writeFileSync(full, 'x');
+    const time = (T0 - ageMs) / 1000;
+    fs.utimesSync(full, time, time);
+  }
+
+  it('removes the temporary files of images.json, image-settings.json and replaced-images.json older than an hour', async () => {
+    file('images.json.12.1.tmp', HOUR + MINUTE);
+    file('image-settings.json.7.3.tmp', 2 * HOUR);
+    file('replaced-images.json.99.12.tmp', 24 * HOUR);
+    file('images.json.12.2.tmp', HOUR - MINUTE);
+    file('images.json', 48 * HOUR);
+    file('other.json.12.1.tmp', 48 * HOUR);
+    file('images.json.x.1.tmp', 48 * HOUR);
+    // Review round 11 of PR #63 (B-R11-1): names that only resemble a temporary file (a prefix, a suffix, a count that
+    // is not a number) are kept, so the pattern stays anchored and exact. The expected list below gained them.
+    file('foo-images.json.1.1.tmp', 48 * HOUR);
+    file('images.json.1.1.tmp.bak', 48 * HOUR);
+    file('images.json.1.x.tmp', 48 * HOUR);
+    const removed = await removeStaleStateTemporaryFiles(stateDir, T0);
+    expect(removed.sort()).toEqual(['image-settings.json.7.3.tmp', 'images.json.12.1.tmp', 'replaced-images.json.99.12.tmp']);
+    expect(fs.readdirSync(stateDir).sort()).toEqual([
+      'foo-images.json.1.1.tmp',
+      'images.json',
+      'images.json.1.1.tmp.bak',
+      'images.json.1.x.tmp',
+      'images.json.12.2.tmp',
+      'images.json.x.1.tmp',
+      'other.json.12.1.tmp',
+    ]);
+  });
+
+  it('never removes a folder or a link with such a name, nor what a link points to', async () => {
+    const target = path.join(stateDir, 'target');
+    fs.writeFileSync(target, 'x');
+    fs.symlinkSync(target, path.join(stateDir, 'images.json.1.1.tmp'));
+    fs.mkdirSync(path.join(stateDir, 'images.json.2.1.tmp'));
+    // Changed fixture, review round 8 of PR #63 (R8-2): was the time of the test run for all three, with `now` T0 + 48
+    // hours, so in a run within an hour of that time the age rule alone kept them; now they are 48 hours old at `now`
+    // T0, so only the check of a regular file keeps them.
+    const old = (T0 - 48 * HOUR) / 1000;
+    fs.utimesSync(target, old, old);
+    fs.lutimesSync(path.join(stateDir, 'images.json.1.1.tmp'), old, old);
+    fs.utimesSync(path.join(stateDir, 'images.json.2.1.tmp'), old, old);
+    expect(await removeStaleStateTemporaryFiles(stateDir, T0)).toEqual([]);
+    expect(fs.readdirSync(stateDir).sort()).toEqual(['images.json.1.1.tmp', 'images.json.2.1.tmp', 'target']);
+  });
+
+  // Review round 1 of PR #63 (B4): the absolute age, so a file with a time in the future (a clock that was ahead) goes too.
+  it('removes such a file whose modification time is more than an hour in the future', async () => {
+    file('images.json.12.1.tmp', -2 * HOUR);
+    expect(await removeStaleStateTemporaryFiles(stateDir, T0)).toEqual(['images.json.12.1.tmp']);
+    expect(fs.readdirSync(stateDir)).toEqual([]);
+  });
+
+  it('ignores a missing folder', async () => {
+    expect(await removeStaleStateTemporaryFiles(path.join(stateDir, 'missing'), T0)).toEqual([]);
   });
 });
 
