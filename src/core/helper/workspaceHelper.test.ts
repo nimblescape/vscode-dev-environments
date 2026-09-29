@@ -521,7 +521,9 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toEqual(['node:22-bookworm-slim']);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     expect(state().images[TAG]).toEqual({
       baseImage: 'node:22-bookworm-slim',
       baseDigest: DIGEST,

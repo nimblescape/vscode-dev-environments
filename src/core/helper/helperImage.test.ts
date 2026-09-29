@@ -336,7 +336,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds).toHaveLength(1);
     expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, labels: { 'nimblescape.devenv.helper': 'true' } });
     expect(h.docker.builds[0].noCache).toBeUndefined();
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state()).toEqual({
       version: 1,
@@ -361,7 +363,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure();
     expect(h.docker.builds[0].pull).toBe(false);
     // No digest and no checkedAt, but the mark: the image may come from an old local base image.
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -394,7 +398,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds[1]).toMatchObject({ pull: true, noCache: true });
     expect(h.docker.idOf(h.tag)).not.toBe(firstId);
     expect(h.logger.lines.join('\n')).toContain('was built from the local base image. It is built again from the current base image');
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -453,7 +459,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     const h = new Harness();
     await h.ensure({ baseDigest: undefined });
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag), generation: HELPER_GENERATION });
   });
@@ -466,7 +474,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     });
     await h.ensure();
     expect(h.docker.builds).toHaveLength(1);
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -500,7 +510,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.idOf(h.tag)).toBeDefined();
     expect(h.warnings().join('\n')).toMatch(/could not be built with a fresh base image\. It is built from the local base image: .*toomanyrequests/);
     // The digest of the registry is not the digest of the image, so it is not recorded; the mark asks for a rebuild.
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -520,7 +532,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure();
     expect(h.docker.builds).toHaveLength(3);
     expect(h.docker.builds[2]).toMatchObject({ pull: true, noCache: true });
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build and the rebuild record the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -583,7 +597,9 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.settled();
     expect(h.lookups).toHaveLength(0);
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the build records the helper generation.
     expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag), generation: HELPER_GENERATION });
   });
@@ -646,7 +662,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual([BASE]);
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
@@ -716,7 +734,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(newId).not.toBe(oldId);
     expect(h.docker.removals).toEqual([oldId]);
     expect(h.docker.images.has(oldId)).toBe(false);
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     // Changed expectation (review round 2 of PR #64, A-N2): the rebuild records the helper generation.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
@@ -835,7 +855,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.docker.idOf(h.tag)).toBe(oldId);
     expect(h.docker.removals).toEqual([]);
     expect(h.warnings().join('\n')).toMatch(/could not be built again\. The existing image is used: .*Temporary failure/);
-    // Changed expectation: the ID of the built image (no docker start fallback, user decision 2026-09-29).
+    // Changed expectation (user decision 2026-09-29, for diagnosis since "no previous helper image"; review round 3 of PR #64,
+    // P4; review round 4, R4-2/R4-3; comment corrected in review round 25, A-R25-1): the ID of the image that this build
+    // made, found by its build label.
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
