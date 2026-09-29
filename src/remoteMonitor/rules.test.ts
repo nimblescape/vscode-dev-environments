@@ -218,7 +218,11 @@ describe('decide of the remote Session Monitor', () => {
     it('removes a record more than 7 days in the future whose environment has no container, and keeps a nearer one', () => {
       const far = record(B, T0 + RECORD_MAX_AGE_MS + 1);
       const near = record(B, T0 + RECORD_MAX_AGE_MS, { source: OTHER });
-      const decision = decide({ now: T0, containers: [], records: [far, near], state: running() });
+      // Changed fixture, review round 7 of PR #63 (R7-1): a recent record of another environment (with a container) is
+      // added; it is later than `far` as the rules see it (clamped to now) and must not hold it, as only the records
+      // of its own environment do.
+      const recent = record(A, T0 - MINUTE);
+      const decision = decide({ now: T0, containers: [container(A)], records: [far, near, recent], state: running() });
       expect(decision.forget).toEqual([far]);
       // With a container, it stays.
       expect(decide({ now: T0, containers: [container(B, 'exited')], records: [far], state: running() }).forget).toEqual([]);

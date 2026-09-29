@@ -102,8 +102,9 @@ export interface RemoteDecision {
   /**
    * Records to remove: their environment has no container at all, and their `at` is more than RECORD_MAX_AGE_MS from now
    * (in either direction; monitor cleanup, user decision 2026-09-29, R2). Review round 6 of PR #63 (R6-1): in the order of
-   * removal, oldest first by the `at` as the rules see it (clamped), of equal `at` a keepRunning record last; none that
-   * is newer, so seen, than a record of its environment that stays.
+   * removal, oldest first by the `at` as the rules see it (clamped), of equal `at` a keepRunning record last; none
+   * whose `at`, as the rules see it (clamped), is later than that of a record of its environment that stays, nor a
+   * keepRunning one with the same `at` (review round 7 of PR #63, R7-4).
    */
   forget: RemoteRecord[];
   /**
@@ -138,10 +139,11 @@ export function isRunningState(state: string): boolean {
  * clock was changed), and at the first tick, nothing is stopped for `graceMs`: the computers that still use their
  * environments send heartbeats again first (they retry every tick of their Session Monitor). Records whose environment
  * has no container at all (running or not) and whose `at` is more than RECORD_MAX_AGE_MS before or after now are removed
- * (`forget`); so are records without keepRunning older than RECORD_MAX_AGE_MS for which a strictly newer record of the
- * same environment exists (`superseded`; monitor cleanup, user decision 2026-09-29), except while a keepRunning record of
- * another source of the same environment has an `at` not later than its own (review round 1 of PR #63, F1; review round
- * 3, R3-7). The monitor never acts on containers without the label nimblescape.devenv.environment-id (the caller lists
+ * (`forget`), but none whose `at`, as the rules see it (clamped), is later than that of a record of its environment
+ * that stays, nor a keepRunning one with the same `at` (review round 6 of PR #63, R6-1; round 7, R7-3); so are records
+ * without keepRunning older than RECORD_MAX_AGE_MS for which a strictly newer record of the same environment exists
+ * (`superseded`; monitor cleanup, user decision 2026-09-29), except while a keepRunning record of another source of the
+ * same environment has an `at` not later than its own (review round 1 of PR #63, F1; review round 3, R3-7). The monitor never acts on containers without the label nimblescape.devenv.environment-id (the caller lists
  * only those).
  */
 export function decide(input: RemoteDecideInput): RemoteDecision {
@@ -196,8 +198,9 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
   // Monitor cleanup, user decision 2026-09-29 (R2): the absolute age, so a record far in the future (a skewed clock of a
   // computer) whose environment is gone is removed too; before, it was kept until its time had passed by 7 days.
   // Review round 6 of PR #63 (R6-1): in the order of removal, by the times as the rules see them (of equal `at`, a keep
-  // last), and never one that is newer, as the rules see it, than a record of its environment that stays (one clamped
-  // later than a record that is not old), so the newest records of an environment stay until all are gone.
+  // last), and none whose `at`, as the rules see it (clamped), is later than that of a record of its environment that
+  // stays, nor a keepRunning one with the same `at` (review round 7 of PR #63, R7-4), so the newest records of an
+  // environment stay until all are gone.
   const old = (record: RemoteRecord) => !present.has(record.environmentId) && Math.abs(now - record.at) > RECORD_MAX_AGE_MS;
   const forget = clamped
     .filter((record, index) => old(input.records[index]) && !clamped.some((other, j) => other.environmentId === record.environmentId && !old(input.records[j]) && (other.at < record.at || (other.at === record.at && record.keepRunning))))

@@ -617,8 +617,12 @@ describe('RemoteMonitorLoop', () => {
 
   // Review round 6 of PR #63 (R6-3): a record that a pass skips (an older one of its environment was not removed) keeps
   // its logged failure, so it is logged once across that pass.
+  // Changed test, review round 7 of PR #63 (R7-2): was three passes with results [true, false, true] (failure logged,
+  // skipped, failure again); now four passes, [false, true, false, true]: skipped before the first failure (nothing to
+  // keep), failure logged, skipped (keeps it), failure again not logged. So both keeping the logged failure of a skipped
+  // record and keeping only a logged one are checked.
   it('logs a failed removal once across a pass that skipped it', async () => {
-    const results: boolean[] = [true, false, true];
+    const results: boolean[] = [false, true, false, true];
     const removeRecord = async (record: RemoteRecord) => {
       if (record.source === OTHER) return results.shift() ?? true;
       throw new Error('locked');
@@ -626,7 +630,7 @@ describe('RemoteMonitorLoop', () => {
     const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
     writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    for (let pass = 0; pass < 3; pass++) {
+    for (let pass = 0; pass < 4; pass++) {
       await loop.tick();
       await loop.removals;
     }
