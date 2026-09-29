@@ -171,6 +171,8 @@ DEV ENVIRONMENTS   [Select Organizations] [Search] [Refresh] [Collapse All]
         website                                               [Start] [⋯]
 ```
 
+In the sketch, the symbols stand for the monitors of the extension: ● the switched-on monitor with the connection sign (connected in this window), ▶ the switched-off monitor with the play sign (running without a window, not a tree node), ○ the switched-off monitor (stopped), ⇄ the switched-off monitor with the connection sign (a remote Docker host), and ▭ the switched-off monitor (the local Docker); see the table of symbols below.
+
 The list groups the repositories by owner. In each group, the repositories are in alphabetical order; a repository with an environment keeps its place.
 
 **Repository groups.** The setting `repositoryGroups` (see [section 8](#8-settings)) holds regular expressions (JavaScript syntax) that filter and group the repositories of each owner. Each one is matched against the repository name without the owner. An entry is the regular expression itself, or an object with `pattern`, an optional `name`, and optional `flags` (only `i`, `u`, and `s`; other flags are ignored with a warning).
@@ -222,19 +224,19 @@ The example shows the nodes expanded. The tooltip of a row names the full `owner
 
 States of an environment (see also [7.15](#715-environment-states)):
 
-Green always means that the container runs; the shape tells which window uses it.
+Every state is a monitor: switched on (the screen filled) while a window uses the environment, with the connection sign when this window uses it, and switched off (the silhouette) otherwise, with a small sign for the other states. All monitors share the same frame, so a sign does not move it. They are icons of the extension (`contributes.icons`, the font `resources/icons/devenv-icons.woff`, built by `scripts/build-icon-font.py`), so VS Code colors them like its own icons, also in a selected row, and the switcher, the status bar, and the first row of the view (the Docker host: the switched-off monitor for the local Docker, with the connection sign for a remote host, with the warning sign for an endpoint that is not supported) show the same monitors.
 
 | Symbol | State text | Meaning |
 |---|---|---|
-| ● (green, filled circle) | Connected | This window is connected to the environment. |
-| green window icon | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
-| green play icon (circled) | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
-| ○ (grey ring) | Stopped | The container is stopped. The next **Start** starts it. |
-| ↻ | Updating | An update, a rebuild, or a delete is in progress. |
-| ◌ | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
-| ⚠ | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
+| filled monitor with the connection sign | Connected | This window is connected to the environment. |
+| filled monitor | Connected · other window | Another VS Code window is connected to the environment. **Start** shows that window (see [7.11](#711-switching)). |
+| switched-off monitor with the play sign | Running | The container runs, but no window is connected to it, for example during the waiting time before a stop, or while an AI agent works in it. |
+| monitor silhouette (switched off) | Stopped | The container is stopped. The next **Start** starts it. |
+| switched-off monitor with the clock sign (not animated: spinning would turn the whole monitor) | Updating | An update, a rebuild, or a delete is in progress. |
+| switched-off monitor with the ring sign | No container | The container was removed outside of the extension. The next **Start** creates it again from the environment image. |
+| switched-off monitor with the warning sign (warning color) | Files missing | The workspace volume is missing (see [7.12](#712-automatic-recovery)). |
 
-**Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (green while the container runs, the grey ring while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
+**Kept environments.** An environment with **Keep Running When Closed** (see below and [7.9](#79-stop-on-close-and-crash-handling)) adds ` · kept` to the state text in every state, as its menu offers **Stop When Closed** in every state: `Running · kept`, `Connected · kept`, `Connected · other window · kept`, `Stopped · kept`, and also `No container · kept`, `Files missing · kept`, and `Updating · kept`. Its symbol stays the symbol of the state (the switched-on monitor while a window uses it, the monitor with the play sign while the container runs without a window, the silhouette of the monitor while it is stopped). A tree item of VS Code has exactly one icon, so no pin mark can be added to it; the extension marks the environment with the text `kept` in the row and the tooltip line "Keeps running when closed: stop it yourself.", also while it is stopped. A decoration badge of VS Code (`FileDecoration`) was not used: it would need a resource URI for each row and would color the label. User decision 2026-09-26: "go with the proposal for closing".
 
 **Other services of Docker Compose.** The state of a Docker Compose environment is the state of its dev container, the container that VS Code connects to. When the dev container is stopped or missing while another service still runs (for example a database), the row adds ` · services running` (for example `Stopped · services running`) with the tooltip line "Other services of Docker Compose run. Stop stops them.", and offers **Stop** as well as **Start** (review round 7 of unit 6, P7-2).
 
@@ -265,9 +267,9 @@ One item on the left side of the status bar:
 
 | State | Text | Click action |
 |---|---|---|
-| Connected | `$(vm) acme-university/api · main` | Opens the switcher |
-| Not connected | `$(vm) Open environment…` | Opens the switcher |
-| Busy | `$(sync~spin) Updating acme-university/api…` | Shows the progress details |
+| Connected | `$(devenv-monitor-connected) acme-university/api · main` (the monitor with the connection sign) | Opens the switcher |
+| Not connected | `$(devenv-monitor-off) Open environment…` (the monitor switched off) | Opens the switcher |
+| Busy | `$(devenv-monitor-updating) Updating acme-university/api…` (the monitor with the clock sign) | Shows the progress details |
 | Connection lost | `$(warning) Reconnect acme-university/api` | Runs the open pipeline again |
 
 ### 6.4 Switcher
@@ -415,6 +417,7 @@ flowchart LR
 | `contributes.commands`, `contributes.keybindings`, `contributes.menus` | Start, Stop, Delete, Switch branch, Select configuration, Rebuild, Switch environment, Refresh, Edit Repository Groups… | Command Palette, switcher, menus. The buttons of the Docker setup in the view (install, WSL 2) and Start Docker (after an installation, and the action of the message "Docker is not running." in a local window) are commands too, hidden in the Command Palette. |
 | `contributes.viewsWelcome` | The Docker setup while `devEnvironments.dockerSetupRequired` (intro; on Windows WSL 2 with **Install WSL 2** or "✓ WSL 2 is installed."; **Install Docker** per platform with `isMac`, `isWindows`, `isLinux`; "After the installation…"), Sign in with GitHub, then loading, empty list, and list not loaded (these three only while the setup is not required) | Welcome texts of the empty view (see [6.1](#61-first-start)) |
 | `contributes.configuration` | Settings of section [8](#8-settings) | |
+| `contributes.icons` | `devenv-monitor-off`, `-on`, `-connected`, `-remote`, `-running`, `-updating`, `-no-container`, `-warning` from `resources/icons/devenv-icons.woff` | The monitors of the states and of the Docker host (see 6.2), in the sidebar, the switcher, the environment pickers, the status bar, and the item "Use the Local Docker" |
 
 ### 7.4 Repository discovery
 

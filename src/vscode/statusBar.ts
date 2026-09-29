@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { Actions } from '../core/messages';
 import { SHOW_LOG_COMMAND } from './progress';
+import { MonitorIcons } from './treeModel';
 
 export const STATUS_BAR_ITEM_ID = 'devEnvironments.status';
 const SWITCH_ENVIRONMENT_COMMAND = 'devEnvironments.switchEnvironment';
@@ -45,19 +46,19 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     this.item.show();
   }
 
-  /** `$(vm) owner/name · branch`; select → switcher. */
+  /** `$(devenv-monitor-connected) owner/name · branch`; select → switcher. */
   showConnected(repository: string, branch: string | undefined): void {
     this.base = { kind: 'connected', repository, branch: branch?.trim() || undefined };
     this.render();
   }
 
-  /** `$(vm) Open environment…`; select → switcher. */
+  /** `$(devenv-monitor-off) Open environment…`; select → switcher. */
   showNotConnected(): void {
     this.base = { kind: 'notConnected' };
     this.render();
   }
 
-  /** `$(sync~spin) Updating owner/name…`; select → log with the progress details. */
+  /** `$(devenv-monitor-updating) Updating owner/name…`; select → log with the progress details. */
   showBusy(repository: string): void {
     this.busyRepository = repository;
     this.render();
@@ -83,7 +84,8 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     const item = this.item;
     item.backgroundColor = undefined;
     if (this.busyRepository !== undefined) {
-      item.text = `$(sync~spin) ${StatusBarTexts.updating(this.busyRepository)}`;
+      // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the clock.
+      item.text = `$(${MonitorIcons.updating}) ${StatusBarTexts.updating(this.busyRepository)}`;
       item.tooltip = Actions.showDetails;
       item.command = SHOW_LOG_COMMAND;
       return;
@@ -91,12 +93,15 @@ export class EnvironmentStatusBar implements vscode.Disposable {
     const state = this.base;
     switch (state.kind) {
       case 'connected':
-        item.text = state.branch ? `$(vm) ${state.repository} · ${state.branch}` : `$(vm) ${state.repository}`;
+        // Review round 2 of PR #59 (K2): the monitors of the sidebar, with the connection sign for this window.
+        item.text = state.branch
+          ? `$(${MonitorIcons.connected}) ${state.repository} · ${state.branch}`
+          : `$(${MonitorIcons.connected}) ${state.repository}`;
         item.tooltip = StatusBarTexts.connectedTooltip(state.repository);
         item.command = SWITCH_ENVIRONMENT_COMMAND;
         return;
       case 'notConnected':
-        item.text = `$(vm) ${StatusBarTexts.openEnvironment}`;
+        item.text = `$(${MonitorIcons.off}) ${StatusBarTexts.openEnvironment}`;
         item.tooltip = StatusBarTexts.notConnectedTooltip;
         item.command = SWITCH_ENVIRONMENT_COMMAND;
         return;

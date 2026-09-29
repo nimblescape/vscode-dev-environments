@@ -799,16 +799,28 @@ describe('state texts and icons', () => {
     expect(stateText('filesMissing')).toBe('Files missing');
   });
 
-  it('maps every state to a codicon', () => {
-    expect(stateIcon('connected')).toEqual({ id: 'circle-filled', color: 'charts.green' });
-    // Green always means that the container runs; the shape tells which window uses it (user decision 2026-09-26).
-    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'window', color: 'charts.green' });
-    // A play symbol, not the monitor of vm-running, which looked like a connected window (user, 2026-09-26).
-    expect(stateIcon('running')).toEqual({ id: 'play-circle', color: 'charts.green' });
-    expect(stateIcon('stopped')).toEqual({ id: 'circle-outline' });
-    expect(stateIcon('updating').id).toBe('sync~spin');
-    expect(stateIcon('noContainer').id).toBe('circle-large-outline');
-    expect(stateIcon('filesMissing').id).toBe('warning');
+  it('maps every state to a monitor of the extension', () => {
+    // User requests 2026-09-28: a switched-on monitor with the connection sign in this window, a switched-on monitor in
+    // another window, the silhouette of a monitor when stopped (the icon font of the extension, review round 2, K1).
+    expect(stateIcon('connected')).toEqual({ id: 'devenv-monitor-connected' });
+    // Review round 2 of PR #59 (K3): no longer green; the filled screen tells that another window uses it.
+    expect(stateIcon('connectedOtherWindow')).toEqual({ id: 'devenv-monitor-on' });
+    // Not a switched-on monitor, which would look like a connected window (user, 2026-09-26).
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the switched-off monitor with a
+    // play sign (no window uses it), a clock, a ring, and a warning sign.
+    expect(stateIcon('running')).toEqual({ id: 'devenv-monitor-running' });
+    expect(stateIcon('stopped')).toEqual({ id: 'devenv-monitor-off' });
+    expect(stateIcon('updating').id).toBe('devenv-monitor-updating');
+    // User request 2026-09-29 ("Switched-off monitor with a ring: No container").
+    expect(stateIcon('noContainer').id).toBe('devenv-monitor-no-container');
+    expect(stateIcon('filesMissing')).toEqual({ id: 'devenv-monitor-warning', color: 'list.warningForeground' });
+  });
+
+  // Review round 1 of PR #59 (P1): a Quick Pick cannot color icons, so every state needs a shape of its own there. Round
+  // 2 (K1): the icons of the extension are shapes (switched off, switched on, with the sign), so the icon of the state.
+  it('gives every state an icon of its own shape, also without color', () => {
+    const states = ['connected', 'connectedOtherWindow', 'running', 'stopped', 'updating', 'noContainer', 'filesMissing'] as const;
+    expect(new Set(states.map((state) => stateIcon(state).id)).size).toBe(states.length);
   });
 });
 
@@ -1405,7 +1417,8 @@ describe('Keep Running When Closed in the sidebar (unit 26)', () => {
     expect(api.state).toBe('running');
     expect(api.description).toBe('main   Running · kept');
     expect(api.tooltip.split('\n')).toEqual(expect.arrayContaining(['Running · kept', TreeTexts.kept]));
-    expect(stateIcon(api.state!)).toEqual({ id: 'play-circle', color: 'charts.green' });
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the running monitor.
+    expect(stateIcon(api.state!)).toEqual({ id: 'devenv-monitor-running' });
     expect(flags(api.contextValue)).toContain('kept');
     expect(flags(api.contextValue)).not.toContain('canKeepRunning');
 

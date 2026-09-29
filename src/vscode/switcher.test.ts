@@ -79,8 +79,9 @@ describe('switcher (concept 6.4)', () => {
     const items = showQuickPick.mock.calls[0][0] as Item[];
     expect(items.map((item) => [item.label, item.description ?? ''])).toEqual([
       ['Recent environments', ''],
-      ['$(circle-filled) acme/api', 'main   Connected'],
-      ['$(circle-outline) acme/web', 'main   Stopped'],
+      // User requests 2026-09-28: the monitors of the states (the icon font of the extension, review round 2 of PR #59).
+      ['$(devenv-monitor-connected) acme/api', 'main   Connected'],
+      ['$(devenv-monitor-off) acme/web', 'main   Stopped'],
       ['', ''],
       ['$(repo) Open repository…', ''],
     ]);

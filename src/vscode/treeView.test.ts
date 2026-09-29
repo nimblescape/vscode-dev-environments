@@ -95,7 +95,8 @@ describe('RepositoriesTreeProvider', () => {
       // Unit 7, PR 2: Close and Keep Running for the environment of this window.
       contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning',
     });
-    expect((apiItem.iconPath as ThemeIcon).id).toBe('circle-filled');
+    // User requests 2026-09-28: the switched-on monitor with the connection sign (the icon font of the extension).
+    expect((apiItem.iconPath as ThemeIcon).id).toBe('devenv-monitor-connected');
     // A repository without environment has no state symbol.
     expect(((provider.getTreeItem(web) as unknown as TreeItem).iconPath as ThemeIcon).id).toBe('blank');
 
@@ -158,7 +159,8 @@ describe('RepositoriesTreeProvider', () => {
     const item = provider.getTreeItem(host) as unknown as TreeItem;
     expect(item.label).toBe('Remote Docker host: htldvmhn');
     // User request 2026-09-28 ("use the remote monitor icon"): the monitor with the remote badge (it was `remote`).
-    expect((item.iconPath as ThemeIcon).id).toBe('remote-explorer');
+    // User request 2026-09-28 ("remote unfilled with connect icon"): the switched-off monitor with the connection sign.
+    expect((item.iconPath as ThemeIcon).id).toBe('devenv-monitor-remote');
     expect(item.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
     expect(item.contextValue).toBe('dockerHost');
     expect(provider.getParent(host)).toBeUndefined();
@@ -183,13 +185,15 @@ describe('RepositoriesTreeProvider', () => {
     const localItem = provider.getTreeItem(local) as unknown as TreeItem;
     expect(localItem.label).toBe('Local Docker');
     expect(localItem.label).toBe(DockerHostRowTexts.label({ kind: 'local', host: '' }));
-    expect((localItem.iconPath as ThemeIcon).id).toBe('vm');
+    // User request 2026-09-28 ("local unfilled"): the switched-off monitor of the sidebar.
+    expect((localItem.iconPath as ThemeIcon).id).toBe('devenv-monitor-off');
     expect(localItem.command).toMatchObject({ command: 'devEnvironments.chooseDockerHost' });
     expect(localItem.tooltip).toBe('Docker runs on this computer. Click to use a remote Docker host.');
     provider.setDockerHost({ kind: 'unsupported', host: 'tcp://192.0.2.10:2376' });
     const unsupportedItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
     expect(unsupportedItem.label).toBe('Docker endpoint not supported: tcp://192.0.2.10:2376');
-    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('warning');
+    // User request 2026-09-28 ("align all the icons used with the new icon set"): the monitor with the warning sign.
+    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('devenv-monitor-warning');
     provider.dispose();
   });
 

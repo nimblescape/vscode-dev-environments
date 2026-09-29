@@ -8,6 +8,7 @@ import { Actions } from '../core/messages';
 import type { Logger } from '../core/ports';
 import { Commands } from './commands';
 import {
+  MonitorIcons,
   rootNodes,
   stateIcon,
   type GroupNode,
@@ -55,8 +56,14 @@ export const DockerHostRowTexts = {
         : 'Docker is set to an endpoint that Dev Environments does not support (only the local Docker and SSH hosts). Click to choose the Docker host.',
 } as const;
 
-// User request 2026-09-28 ("use the remote monitor icon"): the monitor with the remote badge for a remote host.
-const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = { local: 'vm', remote: 'remote-explorer', unsupported: 'warning' };
+// User requests 2026-09-28 ("use the remote monitor icon"; "align the header icon: local unfilled, remote unfilled with
+// connect icon"; "align all the icons used with the new icon set"): the monitors of the rows, switched off, with the
+// connection sign for a remote host and the warning sign for an endpoint that is not supported.
+const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = {
+  local: MonitorIcons.off,
+  remote: MonitorIcons.remote,
+  unsupported: MonitorIcons.warning,
+};
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
 export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | DockerHostRow;

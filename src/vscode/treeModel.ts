@@ -210,29 +210,58 @@ export interface GroupNode {
   children: Array<GroupNode | RepositoryRow>;
 }
 
-/** Icon of a state (concept 6.2), as a codicon ID and an optional theme color ID. */
+/**
+ * Icon of a state (concept 6.2), as a codicon ID or an icon of the extension (package.json contributes.icons), and an
+ * optional theme color ID.
+ */
 export interface StateIcon {
   id: string;
   color?: string;
 }
 
+/**
+ * The monitors of the extension (package.json contributes.icons, the font resources/icons/devenv-icons.woff, built by
+ * scripts/build-icon-font.py). User requests 2026-09-28; an icon font (review round 2 of PR #59, K1), so VS Code colors
+ * them like the codicons (theme, selected row, high contrast), also in Quick Picks and the status bar.
+ */
+export const MonitorIcons = {
+  off: 'devenv-monitor-off',
+  on: 'devenv-monitor-on',
+  connected: 'devenv-monitor-connected',
+  /** User request 2026-09-28: the header row of a remote Docker host. */
+  remote: 'devenv-monitor-remote',
+  // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states, with the badges of
+  // the codicons vm-running (play), vm-pending (clock), vm-outline (ring), and a warning sign.
+  running: 'devenv-monitor-running',
+  updating: 'devenv-monitor-updating',
+  noContainer: 'devenv-monitor-no-container',
+  /** Files missing, and the header row of a Docker endpoint that is not supported. */
+  warning: 'devenv-monitor-warning',
+} as const;
+
 const STATE_ICONS: Record<EnvironmentState, StateIcon> = {
-  // Green always means that the container runs (user decision 2026-09-26); the shape tells which window uses it.
-  connected: { id: 'circle-filled', color: 'charts.green' },
-  connectedOtherWindow: { id: 'window', color: 'charts.green' },
-  // Not vm-running: its monitor shape looked like a window although none is connected (user, 2026-09-26).
-  running: { id: 'play-circle', color: 'charts.green' },
-  stopped: { id: 'circle-outline' },
-  updating: { id: 'sync~spin' },
-  // A dashed circle (◌) is not available as a codicon.
-  noContainer: { id: 'circle-large-outline' },
-  filesMissing: { id: 'warning', color: 'list.warningForeground' },
+  // User requests 2026-09-28: a monitor for the three states of a window, all with the frame of the codicon `vm` at the
+  // same place, so the connection sign does not move it ("the monitor icons are left aligned"). A disconnected one is
+  // the silhouette only (switched off), connected in another window the screen is filled inside a line (switched on),
+  // connected in this window with a small connection sign of `vm-connect`. No codicon is a filled monitor.
+  connected: { id: MonitorIcons.connected },
+  connectedOtherWindow: { id: MonitorIcons.on },
+  // User request 2026-09-28 ("align all the icons used with the new icon set"): the other states are the switched-off
+  // monitor (no window uses it; user, 2026-09-26: a running environment must not look like a connected one) with a sign:
+  // play while its container runs, a clock while it is updated, a ring without container, a warning without files (user
+  // request 2026-09-29: "Switched-off monitor with a ring: No container").
+  noContainer: { id: MonitorIcons.noContainer },
+  running: { id: MonitorIcons.running },
+  stopped: { id: MonitorIcons.off },
+  // Not animated as the former `sync~spin`: `~spin` would turn the whole monitor; the clock marks the work.
+  updating: { id: MonitorIcons.updating },
+  filesMissing: { id: MonitorIcons.warning, color: 'list.warningForeground' },
 };
 
 /**
- * Icon of a state: green ● connected (this window), green window icon connected in another window, green running machine
- * without a window, grey ○ stopped, ↻ updating, ◌ no container, ⚠ files missing. Green always means that the container
- * runs.
+ * Icon of a state: a switched-on monitor with the connection sign connected (this window), a switched-on monitor
+ * connected in another window, and a switched-off monitor otherwise: plain when stopped, with a play sign running, a
+ * clock updating, a ring without container, a warning without files.
  */
 export function stateIcon(state: EnvironmentState): StateIcon {
   return STATE_ICONS[state];
