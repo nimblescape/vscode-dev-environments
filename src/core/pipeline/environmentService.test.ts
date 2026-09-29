@@ -1581,6 +1581,21 @@ describe('open: existing environment', () => {
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
     });
 
+    it('(c) a running container created without the configuration, which can be read now, does not open as it is when the build fails with helperFailed (review round 9 of PR #64, R9-1)', async () => {
+      await seedEnvironment(h, {
+        record: { images: { [BASE_IMAGE]: DIGEST_OLD } },
+        container: 'running',
+        containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' },
+      });
+      h.helper.buildError = gone;
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.ui.warnings).toEqual([]);
+      expect(h.logger.errors.filter((line) => line.includes('opened as it is'))).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+    });
+
     it('(c) a rebuild that fails with helperFailed opens the running current container as it is and says that it was not rebuilt (review round 4 of PR #64, R4-4)', async () => {
       await seedEnvironment(h, { container: 'running' });
       h.helper.buildError = gone;

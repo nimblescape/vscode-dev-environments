@@ -1422,9 +1422,8 @@ export class EnvironmentService {
     container: ContainerInfo | undefined,
     record: BuildRecord | undefined,
   ): LoadedConfiguration | undefined {
-    if (loaded === undefined || (container === undefined && record === undefined)) return loaded;
+    if (loaded === undefined || this.keepsKind(ctx, loaded, container, record)) return loaded;
     const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
-    if (existingCompose === (loaded.compose !== undefined)) return loaded;
     this.logger.info(
       existingCompose
         ? `The configuration ${loaded.configPath} of ${ctx.env.repository} no longer uses Docker Compose. It applies with the next rebuild; until then, the containers of Docker Compose cannot be started.`
@@ -1432,6 +1431,13 @@ export class EnvironmentService {
     );
     ctx.kindKept = true;
     return undefined;
+  }
+
+  /** Whether configurationOfKind keeps `loaded` (Step 9 then counts the configuration as known), without its log line. */
+  private keepsKind(ctx: PipelineContext, loaded: LoadedConfiguration, container: ContainerInfo | undefined, record: BuildRecord | undefined): boolean {
+    if (container === undefined && record === undefined) return true;
+    const existingCompose = container !== undefined ? ctx.composeContainer === true : composeRecordOf(record) !== undefined;
+    return existingCompose === (loaded.compose !== undefined);
   }
 
   /**
@@ -2318,7 +2324,7 @@ export class EnvironmentService {
       if (!present) throw new Error(`The environment image ${imageName} is missing after the build.`);
     } catch (error) {
       // Review round 3 of PR #64 (P6a): the helper image of the open is gone; no "started instead" and no buildFailed.
-      if (isHelperFailed(error)) return this.helperFailedInUpdate(ctx, error, container, record);
+      if (isHelperFailed(error)) return this.helperFailedInUpdate(ctx, error, container, record, loaded);
       return this.updateFailed(ctx, error, canFallBack, plan.check);
     }
 
@@ -2408,7 +2414,7 @@ export class EnvironmentService {
       // current opens as it is, otherwise the open ends with helperFailed (not startFailed).
       if (helperFailed) {
         await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
-        return this.helperFailedInUpdate(ctx, error, container, record);
+        return this.helperFailedInUpdate(ctx, error, container, record, loaded);
       }
       // Assumption (V-10, V-12): `up --remove-existing-container` removes the old container before it creates the new one,
       // so after a failure the old container may be gone. It is created again from the old environment image.
@@ -2435,7 +2441,7 @@ export class EnvironmentService {
       } catch (restoreError) {
         if (this.isCancellation(restoreError, ctx.signal) || isFilesMissing(restoreError) || isHostAccess(restoreError)) throw restoreError;
         // Review round 3 of PR #64 (P6b): the helper image of the open is gone: helperFailed, not startFailed.
-        if (isHelperFailed(restoreError)) return this.helperFailedInUpdate(ctx, restoreError, container, record);
+        if (isHelperFailed(restoreError)) return this.helperFailedInUpdate(ctx, restoreError, container, record, loaded);
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(restoreError));
       }
       return keep ? { result, created: false, container: survivor } : { result, created: true };
@@ -2550,6 +2556,7 @@ export class EnvironmentService {
     error: unknown,
     container: ContainerInfo | undefined,
     record: BuildRecord | undefined,
+    loaded: LoadedConfiguration,
   ): Promise<undefined> {
     ctx.helperUnavailable = true;
     this.throwIfCancelled(ctx.signal);
@@ -2563,7 +2570,7 @@ export class EnvironmentService {
       this.logger.warn(`The container of ${ctx.env.repository} could not be found: ${errorDetail(lookupError)}`);
       throw error;
     }
-    if (container === undefined || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record))) throw error;
+    if (container === undefined || current?.id !== container.id || !(await this.opensAsItIsOrFalse(ctx, current, record, this.keepsKind(ctx, loaded, container, record)))) throw error;
     this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The running environment is opened as it is.`, error);
     // Review round 4 of PR #64 (R4-4): runPipeline tells the user that the change was not applied.
     ctx.helperFailedInUpdate = true;
@@ -3072,8 +3079,8 @@ export class EnvironmentService {
    * used: it runs and is current (containerIsCurrent without the configuration, and for Docker Compose with the host
    * access checks on, no container of another service that was created while they were off).
    */
-  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined): Promise<boolean> {
-    if (container?.state !== 'running' || !containerIsCurrent(container.labels, false, ctx.hostAccessChecks)) return false;
+  private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown = false): Promise<boolean> {
+    if (container?.state !== 'running' || !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks)) return false;
     if (ctx.hostAccessChecks !== 'on' || !this.isComposeEnvironment(ctx.env, record, container)) return true;
     return (await this.unrestrictedServiceContainer(ctx)) === undefined;
   }
@@ -3089,9 +3096,9 @@ export class EnvironmentService {
    * Review round 2 of PR #64 (A-N4): opensAsItIs for the handling of an error at Step 5: a failure of its Docker listing
    * is logged and counts as `false`, so the caller goes on with its own error; a cancellation passes through.
    */
-  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined): Promise<boolean> {
+  private async opensAsItIsOrFalse(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown = false): Promise<boolean> {
     try {
-      return await this.opensAsItIs(ctx, container, record);
+      return await this.opensAsItIs(ctx, container, record, configKnown);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The containers of ${ctx.env.repository} could not be listed: ${errorDetail(error)}`);
