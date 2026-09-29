@@ -716,27 +716,52 @@ describe('existing Docker Compose environment', () => {
     expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
   });
 
-  it('starts the containers with docker start when the configuration cannot be read (D-15), the services first', async () => {
+  it('refuses to start the containers when the configuration cannot be read (D-15)', async () => {
     await seedCompose();
     h.helper.composeOutput = { error: 'yaml: invalid' };
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started the
+    // containers as they were; now the start fails, and nothing starts.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.message).toBe(PipelineTexts.startFailed);
+    expect(error.detail).toContain('The Docker Compose configuration cannot be read');
     expect(h.helper.ups).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()?.state).toBe('stopped');
     expect(h.ui.warnings).toEqual([Messages.composeConfigurationFailed]);
   });
 
-  it('starts all containers with docker start when up fails because the workspace helper failed (review round 1, P-3)', async () => {
+  it('fails with helperFailed when up fails because the workspace helper failed (review round 1, P-3)', async () => {
     await seedCompose();
     h.helper.upError = () => new UserFacingError('helperFailed', Messages.helperFailed);
-    await h.service.openEnvironment(ENV_ID, options());
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started all
+    // containers; now the open fails with helperFailed.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
   });
 
-  it('starts all containers with docker start when the workspace helper is not available', async () => {
+  it('fails with helperFailed and starts nothing when the workspace helper is not available', async () => {
     await seedCompose();
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started all
+    // containers; now the open fails with helperFailed.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(devContainer()?.state).toBe('stopped');
+  });
+
+  it('starts the containers through up with a previous helper image when the current one cannot be built', async () => {
+    // No docker start fallback, previous helper, user decision 2026-09-29.
+    await seedCompose();
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
     await h.service.openEnvironment(ENV_ID, options());
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${dbContainer()?.id}`, `start ${devContainer()?.id}`]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(devContainer()?.state).toBe('running');
   });
 
   it('replaces a single container of the environment when the configuration became a Compose configuration', async () => {
@@ -1096,14 +1121,17 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
   });
 
-  it('starts the containers of Docker Compose with docker start on "Rebuild later" (review round 1, P-1)', async () => {
+  it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
     const db = dbContainer()?.id;
-    const dev = devContainer()?.id;
     h.ui.configurationChangedAnswer = 'later';
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, docker start started the
+    // containers of Docker Compose; without a Docker Compose configuration there is no `up`, so the start fails.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('no longer uses Docker Compose');
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log).not.toContain(`rm ${db}`);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([`start ${db}`, `start ${dev}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
     expect(h.docker.networks.has(`${PROJECT}_default`)).toBe(true);
     expect(h.progress.details).not.toContain(Messages.containerComposeReplaced);
   });
@@ -1282,13 +1310,17 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     useSingle();
     // Review round 4, D4-3: changed expectation, a question of its own that names the switch (configurationKindChanged).
     h.ui.configurationKindChangedAnswer = 'later';
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): Later keeps the containers of
+    // Docker Compose but cannot start them (before: docker start of the dev container).
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
     expect(h.ui.prompts).toEqual([`configurationKindChanged ${REPO}`]);
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
     expect(h.helper.builds).toEqual([]);
     expect(h.helper.ups).toEqual([]);
     expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${dev?.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(devContainer()?.id).toBe(dev?.id);
     expect(dbContainer()?.id).toBe(db?.id);
     // "Rebuild now" switches, as a rebuild does.
     // Review round 4, D4-3: changed expectation, the answer of configurationKindChanged.
@@ -1298,7 +1330,7 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.docker.log).toContain(`rm ${db?.id}`);
   });
 
-  it('starts the existing environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
+  it('does not start the existing Docker Compose environment when a Dockerfile of a service does not exist in the repository (P3-1)', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
@@ -1306,11 +1338,14 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
       missing: [`${FOLDER}/db/Dockerfile`],
     });
     h.ui.configurationChangedAnswer = 'rebuildNow';
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): the configuration cannot be used,
+    // so there is no model and no `up`: the start fails (before: docker start of the containers as they were).
+    const failed = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(failed.code).toBe('startFailed');
     const text = Messages.buildFileMissing(`service db: Dockerfile ${FOLDER}/db/Dockerfile`);
     expect(h.ui.warnings).toContain(text);
     expect(h.helper.builds).toEqual([]);
-    expect(h.docker.log.filter((line) => line.startsWith('start'))).toContain(`start ${devContainer()?.id}`);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
     // A new environment: a plain error of the configuration, no refusal of the policy.
     const other = createHarness({ newEnvironmentId: () => ENV_ID });
     try {
@@ -1584,7 +1619,10 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     useSingle();
     expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH) });
     // The pipeline asks the same question.
-    await h.service.openEnvironment(ENV_ID, options());
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): Later then fails to start (no
+    // Docker Compose configuration, no `up`); before, docker start started the containers.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
   });
 
@@ -2162,14 +2200,18 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
     expect((await h.registry.get(ENV_ID))?.refusedUpdate).toBeUndefined();
   });
 
-  it('starts the existing environment when the daemon fails at the load (G1)', async () => {
+  it('does not blame the configuration when the daemon fails at the load (G1)', async () => {
     await seedCompose();
     h.docker.transientImages = 'all';
-    await h.service.openEnvironment(ENV_ID, options());
-    // Before: refused with "Change the configuration of the repository", and nothing started.
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): a Docker Compose environment
+    // whose configuration could not be used is not started as it is (before: docker start of its containers); the open
+    // fails with startFailed, and the warning still names Docker, not the configuration.
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    // Before (G1): refused with "Change the configuration of the repository".
     expect(h.ui.warnings).toEqual([INTERNAL]);
-    expect(devContainer()?.state).toBe('running');
-    expect(dbContainer()?.state).toBe('running');
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()?.state).toBe('stopped');
     expect(h.helper.builds).toEqual([]);
   });
 

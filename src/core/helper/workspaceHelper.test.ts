@@ -493,12 +493,14 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toEqual(['node:22-bookworm-slim']);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(state().images[TAG]).toEqual({
       baseImage: 'node:22-bookworm-slim',
       baseDigest: DIGEST,
       builtAt: iso(),
       checkedAt: iso(),
       lastUsedAt: iso(),
+      imageId: `id:${TAG}`,
     });
   });
 
@@ -540,6 +542,80 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     await helper.ensureImage();
     expect(docker.imageIdCalls).toBe(calls + 1);
     expect(docker.builds).toHaveLength(1);
+  });
+});
+
+describe('WorkspaceHelper with a previous helper image (no docker start fallback, previous helper, user decision 2026-09-29)', () => {
+  const PREVIOUS = 'devenv-helper:0123456789ab';
+  const START = Date.parse('2026-09-24T12:00:00Z');
+
+  function setup() {
+    let now = START;
+    const statePath = path.join(dir, 'storage', 'helper.json');
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    // A helper image that this installation built for the previous extension version.
+    docker.images.add(PREVIOUS);
+    fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [PREVIOUS]: { builtAt: '2026-09-20T12:00:00.000Z', imageId: `id:${PREVIOUS}` } } }));
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+    };
+    const helper = new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'darwin',
+      clock: { now: () => now },
+      statePath,
+    });
+    return {
+      helper,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
+    };
+  }
+
+  /** The arguments of the last `docker run`, without the random container name and with the image tag as IMAGE. */
+  function lastRunArgs(tag: string): string[] {
+    const args = [...docker.runs[docker.runs.length - 1].args];
+    const name = args.indexOf('--name');
+    if (name >= 0) args.splice(name, 2);
+    return args.map((arg) => (arg === tag ? 'IMAGE' : arg));
+  }
+
+  it('runs the previous helper with exactly the arguments of the current one, and tries the current tag again at the next ensureImage', async () => {
+    const { helper, advance, state } = setup();
+    const previous: string[] = [];
+    expect(await helper.ensureImage({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(PREVIOUS);
+    expect(previous).toEqual([PREVIOUS]);
+    expect(state().previousTag).toBe(PREVIOUS);
+    await helper.run('vol', ['true']);
+    const withSocket = lastRunArgs(PREVIOUS);
+    await helper.run('vol', ['true'], { docker: false, network: false, secrets: true });
+    const withoutSocket = lastRunArgs(PREVIOUS);
+    // The helper runs reuse the previous helper; they do not build.
+    expect(docker.builds).toHaveLength(2);
+
+    // The next open (a minute later, online again) builds the current tag and uses it.
+    docker.buildHandler = async () => undefined;
+    advance(60_000);
+    expect(await helper.ensureImage({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(TAG);
+    expect(previous).toEqual([PREVIOUS]);
+    expect(docker.builds).toHaveLength(3);
+    await helper.run('vol', ['true']);
+    expect(lastRunArgs(TAG)).toEqual(withSocket);
+    await helper.run('vol', ['true'], { docker: false, network: false, secrets: true });
+    expect(lastRunArgs(TAG)).toEqual(withoutSocket);
+    expect(withSocket.some((arg) => arg.includes('docker.sock'))).toBe(true);
+    expect(withoutSocket.some((arg) => arg.includes('docker.sock'))).toBe(false);
+  });
+
+  it('fails with helperFailed when the current tag cannot be built and no previous helper of this installation exists', async () => {
+    const { helper } = setup();
+    fs.writeFileSync(path.join(dir, 'storage', 'helper.json'), JSON.stringify({ version: 1, images: {} }));
+    await expect(helper.ensureImage()).rejects.toMatchObject({ code: 'helperFailed' });
   });
 });
 

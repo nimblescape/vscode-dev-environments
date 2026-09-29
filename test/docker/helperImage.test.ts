@@ -251,4 +251,30 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     expect(docker.builds).toHaveLength(2);
     expect(docker.refused).toEqual([]);
   });
+
+  it('previous helper: a new tag that cannot be built uses the helper image that this run built, and records it as the previous tag', async () => {
+    // No docker start fallback, previous helper, user decision 2026-09-29: the helper Dockerfile of an "extension update"
+    // whose build fails (as offline), in its own folder, so its tag differs from `tag`.
+    const updatedPath = path.join(run.runDir, 'tiny-helper-update', 'Dockerfile');
+    const updated = [`FROM ${TEST_BASE_IMAGE}`, 'RUN exit 1', `LABEL ${TEST_RUN_LABEL}=${run.runId}`, ''].join('\n');
+    fs.mkdirSync(path.dirname(updatedPath), { recursive: true });
+    fs.writeFileSync(updatedPath, updated);
+    const updatedTag = helperImageTag(updated);
+    expect(updatedTag).not.toBe(tag);
+    const currentId = cli.image(tag)?.Id;
+    expect((await readHelperState(statePath)).images[tag]?.imageId).toBe(currentId);
+    const previous: string[] = [];
+    const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
+
+    expect(await timings.measure('failed build, previous helper', () => helper.ensureImage({ onPreviousHelper: (used) => previous.push(used) }))).toBe(tag);
+    await settled();
+    expect(previous).toEqual([tag]);
+    expect(cli.image(updatedTag)).toBeUndefined();
+    expect(docker.builds.slice(-2).map((build) => build.tag)).toEqual([updatedTag, updatedTag]);
+    const state = await readHelperState(statePath);
+    expect(state.previousTag).toBe(tag);
+    expect(state.images[updatedTag]).toBeUndefined();
+    expect(cli.image(tag)?.Id).toBe(currentId);
+    expect(docker.refused).toEqual([]);
+  });
 });

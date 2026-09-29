@@ -5,7 +5,8 @@
 // State of the workspace helper images (implementation notes 4 and 7): `helper.json` in the global storage folder.
 // Per helper tag, it records the digest of the base image of the last build and when the tag was built, checked, and
 // last used, so that the base image is checked once a week and helper images that no window uses are removed; for tags
-// of other installations and removed tags, the marks of the cleanup.
+// of other installations and removed tags, the marks of the cleanup; the ID of the image that this installation built
+// for a tag, and the previous helper tag that an open used when the current one could not be built.
 // The state is advisory: two windows may read and write it at the same time. Each write is atomic, and each update
 // reads the file again right before it writes, so a lost update costs at most a second check or a second build.
 import { writeJsonAtomic } from '../storage/atomicJson';
@@ -18,6 +19,13 @@ export interface HelperImageRecord {
   /** Registry digest of `baseImage`, read right before the last build (or at the first check of an older image). */
   baseDigest?: string;
   builtAt?: string;
+  /**
+   * ID of the image that this installation built for the tag (`sha256:…`, written after each build, or once for a tag
+   * that it built before this field existed). Previous helper (user decision 2026-09-29): only a tag whose image still
+   * has this ID is ever used in place of a current tag that cannot be built, never an image of the helper repository
+   * that someone else made.
+   */
+  imageId?: string;
   /**
    * The last build ran without `--pull` (the registry did not answer, or the build with `--pull` failed), so it may have
    * used an old local base image: the next check that gets a digest makes the next ensure build the tag again.
@@ -45,6 +53,11 @@ export interface HelperState {
   images: Record<string, HelperImageRecord>;
   /** Last cleanup of other helper images. */
   lastCleanupAt?: string;
+  /**
+   * Previous helper (user decision 2026-09-29): the helper tag that an open used because the current tag could not be
+   * built. The daily cleanup keeps it until the current tag is an image that this installation built.
+   */
+  previousTag?: string;
 }
 
 const HELPER_TAG = /^devenv-helper:[0-9a-f]{12}$/;
@@ -61,6 +74,7 @@ const RECORD_FIELDS = [
   'baseImage',
   'baseDigest',
   'builtAt',
+  'imageId',
   'builtWithoutPull',
   'checkedAt',
   'attemptedAt',
@@ -100,6 +114,7 @@ export function parseHelperState(value: unknown): HelperState {
   const state = emptyHelperState();
   if (!isRecord(value) || value.version !== 1) return state;
   if (isTime(value.lastCleanupAt)) state.lastCleanupAt = value.lastCleanupAt;
+  if (typeof value.previousTag === 'string' && isHelperImageTag(value.previousTag)) state.previousTag = value.previousTag;
   if (!isRecord(value.images)) return state;
   for (const [tag, entry] of Object.entries(value.images)) {
     if (!isHelperImageTag(tag) || !isRecord(entry)) continue;

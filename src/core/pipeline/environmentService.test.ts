@@ -1348,15 +1348,53 @@ describe('open: existing environment', () => {
     expect(h.helper.calls).toEqual([]);
   });
 
-  it('starts a stopped container with docker start when the helper cannot be prepared', async () => {
+  it('fails with helperFailed and starts nothing when the helper (and no previous helper) can be prepared for a stopped container', async () => {
     await seedEnvironment(h);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
-    const result = await h.service.open(TARGET, options());
-    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    // Changed expectation (no docker start fallback, previous helper, user decision 2026-09-29): before, the container was
+    // started with docker start after a warning; now the open fails with helperFailed, without the warning.
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(h.ui.warnings).toEqual([]);
     const container = h.docker.containersOf(ENV_ID)[0];
-    expect(h.docker.log).toContain(`start ${container.id}`);
-    expect(container.state).toBe('running');
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(container.state).toBe('stopped');
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.tokenWrites()).toEqual([]);
+  });
+
+  it('opens a running container without the workspace helper, and starts nothing', async () => {
+    // No docker start fallback, previous helper, user decision 2026-09-29: a running container is not started, so it
+    // still opens without the helper (as before).
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    const result = await h.service.open(TARGET, options());
     expect(result.containerName).toBe(NAME);
+    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+  });
+
+  it('starts through the Dev Container CLI with a previous helper image when the current one cannot be built', async () => {
+    // No docker start fallback, previous helper, user decision 2026-09-29.
+    await seedEnvironment(h);
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    const result = await h.service.open(TARGET, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls.filter((c) => c.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+    expect(h.ui.warnings).toEqual([]);
+  });
+
+  it('tries the build of the current helper once per open when it falls back to a previous helper', async () => {
+    // No docker start fallback, previous helper, user decision 2026-09-29: the first open prepares the helper before the
+    // clone and again before the configuration; with a previous helper, the second time does not try the build again.
+    h.helper.previousHelperTag = 'devenv-helper:0123456789ab';
+    await h.service.open(TARGET, options());
+    expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
+    expect(h.helper.calls.filter((c) => c.startsWith('up'))).toHaveLength(1);
   });
 
   it('fails with helperFailed when neither the helper nor a container is available', async () => {
@@ -1365,14 +1403,6 @@ describe('open: existing environment', () => {
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('helperFailed');
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
-  });
-
-  it('unit 15: writes the token into the memory of a container that docker start started without the helper', async () => {
-    await seedEnvironment(h);
-    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
-    await h.service.open(TARGET, options());
-    const container = h.docker.containersOf(ENV_ID)[0];
-    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ container: container.id, user: 'root', token: TOKEN, login: 'octo' })]);
   });
 
   it('starts the old container again when the replacement fails before it was removed', async () => {

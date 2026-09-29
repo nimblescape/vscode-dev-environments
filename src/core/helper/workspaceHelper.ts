@@ -128,6 +128,11 @@ export interface EnsureImageOptions {
   checkBaseImage?: boolean;
   /** Called right before a build of the helper image: `create` for a missing tag, `refresh` for a rebuild. */
   onBuild?: (kind: HelperBuildKind) => void;
+  /**
+   * Previous helper (user decision 2026-09-29): called when the returned tag is a previous helper tag, because the
+   * current tag could not be built (ensureHelperImage). The next ensureImage tries to build the current tag again.
+   */
+  onPreviousHelper?: (tag: string) => void;
 }
 
 /**
@@ -439,6 +444,8 @@ export class WorkspaceHelper {
   /** When the cached image promise resolved, and its tag. */
   private imageReadyAt: number | undefined;
   private imageTag: string | undefined;
+  /** The cached tag is a previous helper tag (user decision 2026-09-29): ensureImage never reuses it. */
+  private imagePrevious = false;
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
@@ -1031,10 +1038,12 @@ export class WorkspaceHelper {
     }
     if (this.imagePromise && this.imageReadyAt !== undefined) {
       const now = this.clock.now();
-      if (recheck && Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS) this.resetImage();
+      // Previous helper (user decision 2026-09-29): each open tries to build the current tag again.
+      if (recheck && (this.imagePrevious || Math.abs(now - this.imageReadyAt) >= HELPER_IMAGE_RECHECK_MS)) this.resetImage();
       else await this.recordUse(now, statePath);
     }
     if (!this.imagePromise) {
+      let previous = false;
       const promise: Promise<string> = ensureHelperImage(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
@@ -1043,6 +1052,9 @@ export class WorkspaceHelper {
         maintain: recheck,
         checkBaseImage: options.checkBaseImage,
         onBuild: options.onBuild,
+        onPreviousHelper: () => {
+          previous = true;
+        },
         onBaseImageCheck: this.deps.onBaseImageCheck,
         clock: this.clock,
         logger: this.deps.logger,
@@ -1052,6 +1064,7 @@ export class WorkspaceHelper {
             this.imageReadyAt = this.clock.now();
             this.imageUsedAt = this.imageReadyAt;
             this.imageTag = tag;
+            this.imagePrevious = previous;
           }
           return tag;
         },
@@ -1066,7 +1079,11 @@ export class WorkspaceHelper {
       this.imageMaintained = recheck;
     }
     try {
-      return await this.imagePromise;
+      const pending = this.imagePromise;
+      const tag = await pending;
+      // Every caller that got the tag of a shared ensure learns that it is a previous helper.
+      if (this.imagePromise === pending && this.imagePrevious && this.imageTag === tag) options.onPreviousHelper?.(tag);
+      return tag;
     } catch (error) {
       // Another caller cancelled the shared build: build again for this caller.
       if (isAbortError(error) && !options.signal?.aborted) return this.image(options, recheck);
@@ -1078,6 +1095,7 @@ export class WorkspaceHelper {
     this.imagePromise = undefined;
     this.imageMaintained = false;
     this.imageReadyAt = undefined;
+    this.imagePrevious = false;
   }
 
   /** `lastUsedAt` of the tag in the state file, at most once per hour per instance. Never throws. */

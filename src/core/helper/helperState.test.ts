@@ -35,6 +35,19 @@ describe('isHelperImageTag', () => {
 });
 
 describe('parseHelperState', () => {
+  it('keeps the image ID of a build and the previous helper tag (no docker start fallback, previous helper, user decision 2026-09-29)', () => {
+    const state = {
+      version: 1,
+      images: { [TAG]: { builtAt: TIME, imageId: `sha256:${'1'.repeat(64)}`, lastUsedAt: TIME } },
+      previousTag: TAG,
+    };
+    expect(parseHelperState(state)).toEqual(state);
+    for (const previousTag of ['mine:1', '__proto__', 'devenv-helper:latest', 1, '']) {
+      expect(parseHelperState({ version: 1, images: {}, previousTag })).toEqual({ version: 1, images: {} });
+    }
+    expect(parseHelperState({ version: 1, images: { [TAG]: { imageId: 7 } } })).toEqual({ version: 1, images: { [TAG]: {} } });
+  });
+
   it('keeps valid records', () => {
     const state = {
       version: 1,

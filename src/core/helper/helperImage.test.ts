@@ -30,7 +30,7 @@ import {
   type EnsureHelperImageOptions,
   type HelperImageDocker,
 } from './helperImage';
-import type { HelperState } from './helperState';
+import type { HelperImageRecord, HelperState } from './helperState';
 
 const ROOT = path.resolve(__dirname, '../../..');
 
@@ -318,9 +318,10 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds).toHaveLength(1);
     expect(h.docker.builds[0]).toMatchObject({ tag: h.tag, pull: true, labels: { 'nimblescape.devenv.helper': 'true' } });
     expect(h.docker.builds[0].noCache).toBeUndefined();
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state()).toEqual({
       version: 1,
-      images: { [h.tag]: { baseImage: BASE, baseDigest: DIGEST_A, builtAt: h.iso(), checkedAt: h.iso(), lastUsedAt: h.iso() } },
+      images: { [h.tag]: { baseImage: BASE, baseDigest: DIGEST_A, builtAt: h.iso(), checkedAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) } },
       lastCleanupAt: h.iso(),
     });
   });
@@ -331,12 +332,14 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure();
     expect(h.docker.builds[0].pull).toBe(false);
     // No digest and no checkedAt, but the mark: the image may come from an old local base image.
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       builtAt: h.iso(),
       builtWithoutPull: h.iso(),
       attemptedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
     const firstId = h.docker.idOf(h.tag);
 
@@ -360,12 +363,14 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.builds[1]).toMatchObject({ pull: true, noCache: true });
     expect(h.docker.idOf(h.tag)).not.toBe(firstId);
     expect(h.logger.lines.join('\n')).toContain('was built from the local base image. It is built again from the current base image');
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
       builtAt: h.iso(),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
     await h.ensure();
     await h.settled();
@@ -415,7 +420,8 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     const h = new Harness();
     await h.ensure({ baseDigest: undefined });
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso() });
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) });
   });
 
   it('replaces the record of a tag whose image was removed', async () => {
@@ -426,12 +432,14 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     });
     await h.ensure();
     expect(h.docker.builds).toHaveLength(1);
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
       builtAt: h.iso(),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
   });
 
@@ -456,12 +464,14 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     expect(h.docker.idOf(h.tag)).toBeDefined();
     expect(h.warnings().join('\n')).toMatch(/could not be built with a fresh base image\. It is built from the local base image: .*toomanyrequests/);
     // The digest of the registry is not the digest of the image, so it is not recorded; the mark asks for a rebuild.
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       builtAt: h.iso(),
       builtWithoutPull: h.iso(),
       attemptedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
 
     // The next check (a day later) asks for a build with a fresh base image, and the next ensure runs it.
@@ -472,12 +482,14 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.ensure();
     expect(h.docker.builds).toHaveLength(3);
     expect(h.docker.builds[2]).toMatchObject({ pull: true, noCache: true });
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
       builtAt: h.iso(),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
   });
 
@@ -531,7 +543,8 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     await h.settled();
     expect(h.lookups).toHaveLength(0);
     expect(h.docker.builds[0]).toMatchObject({ pull: true });
-    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso() });
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
+    expect(h.state().images[h.tag]).toEqual({ baseImage: BASE, builtAt: h.iso(), lastUsedAt: h.iso(), imageId: h.docker.idOf(h.tag) });
   });
 
   it('checks the base image of the real Dockerfile of the extension', async () => {
@@ -589,12 +602,14 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual([BASE]);
     expect(h.docker.builds).toHaveLength(0);
     expect(h.docker.idOf(h.tag)).toBe(oldId);
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
       builtAt: h.iso(-30 * DAY),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
 
     h.advance(HELPER_CHECK_INTERVAL_MS - HOUR);
@@ -657,12 +672,14 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(newId).not.toBe(oldId);
     expect(h.docker.removals).toEqual([oldId]);
     expect(h.docker.images.has(oldId)).toBe(false);
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_B,
       builtAt: h.iso(),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
     await h.settled();
     expect(h.lookups).toHaveLength(1);
@@ -701,12 +718,14 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.docker.idOf(h.tag)).toBe(oldId);
     expect(h.docker.removals).toEqual([]);
     expect(h.warnings().join('\n')).toMatch(/could not be built again\. The existing image is used: .*Temporary failure/);
+    // Changed expectation: the ID of the built image (no docker start fallback, previous helper, user decision 2026-09-29).
     expect(h.state().images[h.tag]).toEqual({
       baseImage: BASE,
       baseDigest: DIGEST_A,
       builtAt: h.iso(-30 * DAY),
       checkedAt: h.iso(),
       lastUsedAt: h.iso(),
+      imageId: h.docker.idOf(h.tag),
     });
 
     // Not at each open: the next check, a week later, asks for the rebuild again.
@@ -1208,6 +1227,164 @@ describe('ensureHelperImage with a state file: tombstones of removed helper tags
 function h0(offsetMs: number): string {
   return new Date(START + offsetMs).toISOString();
 }
+
+describe('ensureHelperImage with a state file: previous helper (no docker start fallback, previous helper, user decision 2026-09-29)', () => {
+  const offline = async (): Promise<void> => {
+    throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
+  };
+
+  /** A helper image that this installation built for `tag` `builtAgoMs` ago, as recorded in the state. Returns its ID. */
+  function ownPrevious(h: Harness, tag: string, builtAgoMs: number, extra: Partial<HelperImageRecord> = {}): string {
+    const id = h.docker.addImage([tag]);
+    const state: HelperState = fs.existsSync(h.statePath) ? h.state() : { version: 1, images: {} };
+    state.images[tag] = { builtAt: h.iso(-builtAgoMs), imageId: id, lastUsedAt: h.iso(-builtAgoMs), ...extra };
+    h.writeState(state);
+    return id;
+  }
+
+  it('uses the newest previous helper that this installation built when the current tag cannot be built, and builds the current tag again at the next ensure', async () => {
+    const h = new Harness();
+    ownPrevious(h, OTHER_TAG, 60 * DAY);
+    const oldId = ownPrevious(h, OLD_TAG, 10 * DAY);
+    h.docker.buildHandler = offline;
+    const previous: string[] = [];
+    expect(await h.ensure({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(OLD_TAG);
+    expect(previous).toEqual([OLD_TAG]);
+    // The build was tried with --pull and again without it.
+    expect(h.docker.builds.map((build) => [build.tag, build.pull])).toEqual([
+      [h.tag, true],
+      [h.tag, false],
+    ]);
+    expect(h.warnings().join('\n')).toContain(`The previous helper image ${OLD_TAG} is used for now; ${h.tag} is built again at the next open.`);
+    const state = h.state();
+    expect(state.previousTag).toBe(OLD_TAG);
+    expect(state.images[OLD_TAG]).toEqual({ builtAt: h.iso(-10 * DAY), imageId: oldId, lastUsedAt: h.iso() });
+    expect(state.images[h.tag]).toBeUndefined();
+    expect(state.lastCleanupAt).toBeUndefined();
+    expect(h.docker.removals).toEqual([]);
+
+    // Online again: the next ensure builds the current tag, and the cleanup applies the usual rules again.
+    h.docker.buildHandler = async () => undefined;
+    h.advance(HOUR);
+    expect(await h.ensure({ onPreviousHelper: (tag) => previous.push(tag) })).toBe(h.tag);
+    expect(previous).toEqual([OLD_TAG]);
+    expect(h.docker.builds).toHaveLength(3);
+    const after = h.state();
+    expect(after.images[h.tag]?.imageId).toBe(h.docker.idOf(h.tag));
+    expect(after.previousTag).toBeUndefined();
+    // The previous helper was used an hour ago: it stays for 7 days. The older one, unused for 60 days, is removed.
+    expect(h.docker.idOf(OLD_TAG)).toBe(oldId);
+    expect(h.docker.idOf(OTHER_TAG)).toBeUndefined();
+  });
+
+  it('throws the error of the build when there is no previous helper', async () => {
+    const h = new Harness();
+    h.docker.buildHandler = offline;
+    const previous: string[] = [];
+    await expect(h.ensure({ onPreviousHelper: (tag) => previous.push(tag) })).rejects.toBeInstanceOf(CommandError);
+    expect(previous).toEqual([]);
+    expect(h.warnings().join('\n')).toContain(`${h.tag} could not be built, and there is no previous helper image of Dev Environments.`);
+    expect(fs.existsSync(h.statePath)).toBe(false);
+  });
+
+  it('never uses an image of the helper repository that this installation did not build', async () => {
+    const h = new Harness();
+    // A tag with the helper label that the state does not know (for example built or pulled by someone else).
+    h.docker.addImage(['devenv-helper:111111111111']);
+    // A tag that this installation built, but that points to another image now.
+    const built = h.docker.addImage(['devenv-helper:222222222222']);
+    h.docker.addImage(['devenv-helper:222222222222']);
+    // A tag of another installation (foreign), and a removed one, with an image ID in their records.
+    const foreignId = h.docker.addImage(['devenv-helper:333333333333']);
+    const removedId = h.docker.addImage(['devenv-helper:666666666666']);
+    // An image with the tag and the recorded ID, but without the label nimblescape.devenv.helper=true.
+    const unlabeled = h.docker.addImage(['devenv-helper:444444444444'], { helper: false });
+    // A record with an image ID but without a build of this installation.
+    const unbuilt = h.docker.addImage(['devenv-helper:555555555555']);
+    // The name of the helper repository with another tag form.
+    h.docker.addImage(['devenv-helper:latest']);
+    h.writeState({
+      version: 1,
+      images: {
+        'devenv-helper:222222222222': { builtAt: h.iso(-DAY), imageId: built },
+        'devenv-helper:333333333333': { builtAt: h.iso(-DAY), imageId: foreignId, foreignSince: h.iso(-DAY) },
+        'devenv-helper:666666666666': { builtAt: h.iso(-DAY), imageId: removedId, removedAt: h.iso(-DAY) },
+        'devenv-helper:444444444444': { builtAt: h.iso(-DAY), imageId: unlabeled },
+        'devenv-helper:555555555555': { lastUsedAt: h.iso(-DAY), imageId: unbuilt },
+      },
+    });
+    h.docker.buildHandler = offline;
+    const previous: string[] = [];
+    await expect(h.ensure({ onPreviousHelper: (tag) => previous.push(tag) })).rejects.toBeInstanceOf(CommandError);
+    expect(previous).toEqual([]);
+    expect(h.state().previousTag).toBeUndefined();
+    expect(h.warnings().join('\n')).toContain('devenv-helper:222222222222 is not the image that this installation of Dev Environments built for it.');
+    expect(h.docker.removals).toEqual([]);
+  });
+
+  it('skips a previous tag whose image changed, and uses an older one that is still the image this installation built', async () => {
+    const h = new Harness();
+    const olderId = ownPrevious(h, OTHER_TAG, 30 * DAY);
+    ownPrevious(h, OLD_TAG, DAY);
+    h.docker.addImage([OLD_TAG]);
+    h.docker.buildHandler = offline;
+    expect(await h.ensure()).toBe(OTHER_TAG);
+    expect(h.docker.idOf(OTHER_TAG)).toBe(olderId);
+    expect(h.state().previousTag).toBe(OTHER_TAG);
+  });
+
+  it('does not use a previous helper after an abort, or without a state file', async () => {
+    const h = new Harness();
+    ownPrevious(h, OLD_TAG, DAY);
+    h.docker.buildHandler = async () => {
+      throw abortError();
+    };
+    await expect(h.ensure()).rejects.toMatchObject({ name: 'AbortError' });
+    expect(h.state().previousTag).toBeUndefined();
+
+    h.docker.buildHandler = offline;
+    await expect(ensureHelperImage(h.docker, h.file, { logger: h.logger })).rejects.toBeInstanceOf(CommandError);
+    expect(h.state().previousTag).toBeUndefined();
+  });
+
+  it('the daily cleanup keeps the previous tag until the current tag is an image that this installation built', async () => {
+    const h = new Harness();
+    const oldId = ownPrevious(h, OLD_TAG, 40 * DAY);
+    // The current tag exists, but this installation did not build it (for example another installation of VS Code did).
+    const currentId = h.docker.addImage([h.tag]);
+    h.writeState({ ...h.state(), previousTag: OLD_TAG, lastCleanupAt: h.iso(-2 * DAY) });
+    expect(await h.ensure({ baseDigest: undefined })).toBe(h.tag);
+    expect(h.docker.idOf(OLD_TAG)).toBe(oldId);
+    expect(h.docker.removals).toEqual([]);
+    expect(h.state().previousTag).toBe(OLD_TAG);
+    expect(h.state().lastCleanupAt).toBe(h.iso());
+    expect(h.logger.lines.join('\n')).toContain(`The previous workspace helper image ${OLD_TAG} is kept until ${h.tag} is built.`);
+
+    // Once the current tag is the image that this installation built, the next cleanup applies the usual rules to it.
+    const state = h.state();
+    state.images[h.tag] = { ...state.images[h.tag], builtAt: h.iso(-HOUR), imageId: currentId };
+    h.writeState(state);
+    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    await h.ensure({ baseDigest: undefined });
+    expect(h.docker.idOf(OLD_TAG)).toBeUndefined();
+    expect(h.state().previousTag).toBeUndefined();
+    expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h.iso() });
+  });
+
+  it('records the image ID of a tag that this installation built before the ID was recorded, but not of one it did not build', async () => {
+    const h = new Harness();
+    const id = h.docker.addImage([h.tag]);
+    h.writeState({ version: 1, images: { [h.tag]: { builtAt: h.iso(-DAY), lastUsedAt: h.iso(-10 * HOUR) } }, lastCleanupAt: h.iso() });
+    await h.ensure({ baseDigest: undefined });
+    expect(h.state().images[h.tag]).toEqual({ builtAt: h.iso(-DAY), imageId: id, lastUsedAt: h.iso() });
+
+    const other = new Harness();
+    other.docker.addImage([other.tag]);
+    other.writeState({ version: 1, images: { [other.tag]: { lastUsedAt: other.iso(-10 * HOUR) } }, lastCleanupAt: other.iso() });
+    await other.ensure({ baseDigest: undefined });
+    expect(other.state().images[other.tag]).toEqual({ lastUsedAt: other.iso() });
+  });
+});
 
 describe('registryBaseDigest', () => {
   it('maps the results of the registry client', async () => {

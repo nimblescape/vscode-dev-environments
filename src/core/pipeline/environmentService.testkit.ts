@@ -552,6 +552,11 @@ export class FakeHelper implements EnvironmentHelper {
   merged: Record<string, unknown> | undefined = {};
   remoteUser = 'vscode';
   ensureImageError: Maybe<Error>;
+  /**
+   * Previous helper (user decision 2026-09-29): ensureImage returns this tag and calls onPreviousHelper, as when the
+   * current helper image could not be built.
+   */
+  previousHelperTag: string | undefined;
   cloneError: Maybe<Error>;
   readConfigurationError: Maybe<Error>;
   buildError: (imageName: string) => Maybe<Error> = () => undefined;
@@ -663,9 +668,13 @@ export class FakeHelper implements EnvironmentHelper {
     }
   }
 
-  async ensureImage(): Promise<string> {
+  async ensureImage(options: { onOutput?: (text: string) => void; onPreviousHelper?: (tag: string) => void } = {}): Promise<string> {
     this.calls.push('ensureImage');
     if (this.ensureImageError) throw this.ensureImageError;
+    if (this.previousHelperTag !== undefined) {
+      options.onPreviousHelper?.(this.previousHelperTag);
+      return this.previousHelperTag;
+    }
     return 'devenv-helper:test';
   }
 
