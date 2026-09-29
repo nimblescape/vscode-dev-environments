@@ -609,6 +609,7 @@
         },
         "devEnvLauncher.remoteStopAfterMinutes": {
           "type": "number",
+          "scope": "application",
           "default": 10,
           "minimum": 5,
           "maximum": 1440,
