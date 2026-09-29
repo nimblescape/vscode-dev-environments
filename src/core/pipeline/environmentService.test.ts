@@ -1696,6 +1696,26 @@ describe('open: existing environment', () => {
       expect(h.ui.warnings).toEqual([Messages.helperFailed]);
     });
 
+    // Review round 15 of PR #64 (R15-2): only a helperFailed gets the helper warning; a broken configuration keeps buildFailed.
+    it('R15-2 a rebuild with a broken configuration keeps the buildFailed warning, not the helper warning', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+      const result = await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
+      expect(result.containerName).toBe(NAME);
+      expect(h.ui.warnings).toEqual([Messages.buildFailed]);
+    });
+
+    it('R15-2 a selected configuration that cannot be read keeps the buildFailed warning, not the helper warning', async () => {
+      const env = await seedEnvironment(h, { container: 'running' });
+      const python = '.devcontainer/python/devcontainer.json';
+      h.helper.files[python] = { configText: '{ "image": "python:3.12" }' };
+      h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+      const result = await h.service.openEnvironment(ENV_ID, options({ configPath: python }));
+      expect(result.containerName).toBe(NAME);
+      expect((await entry())?.configPath).toBe(env.configPath);
+      expect(h.ui.warnings).toEqual([Messages.buildFailed]);
+    });
+
     it('a container that `up` replaced does not open as it is when runUserCommands fails with helperFailed (review round 4 of PR #64, R4-7 M1)', async () => {
       await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'running' });
       const before = h.docker.containersOf(ENV_ID)[0].id;
