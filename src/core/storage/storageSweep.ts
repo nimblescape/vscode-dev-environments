@@ -24,7 +24,7 @@ import { isStorageId, parseJson, type StoragePaths } from './paths';
 export const STALE_PENDING_MAX_AGE_MS = 60 * 60_000;
 /** R7: a disconnect request whose requestedAt is further from now than this is removed. */
 export const STALE_DISCONNECT_MAX_AGE_MS = 10 * 60_000;
-/** R8: a temporary file of writeJsonAtomic whose modification time is further from now than this is removed. */
+/** R8: a temporary file of an atomic writer (atomicTemporaryPath, see ATOMIC_TEMPORARY_FILE) whose modification time is further from now than this is removed. */
 export const STALE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
 /** The Session Monitor sweeps at most this often (of its own run time). */
 export const STORAGE_SWEEP_INTERVAL_MS = 60 * 60_000;

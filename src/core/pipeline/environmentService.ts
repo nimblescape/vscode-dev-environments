@@ -5431,7 +5431,7 @@ export class EnvironmentService {
     }
   }
 
-  /** Removes the pending connection file, the pending operation, and a reopen record of the environment. */
+  /** Removes the pending connection file, the pending operation, the disconnect request (R7), and a reopen record of the environment. */
   private async removeEnvironmentFiles(environmentId: string): Promise<void> {
     const files = this.deps.sessionFiles;
     await this.quietly('remove the pending connection file', () => files.removePending(environmentId));
