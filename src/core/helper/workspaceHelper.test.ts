@@ -2980,6 +2980,39 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     ['the local Docker', { key: '' }],
     ['a remote engine', REMOTE],
   ])(
+    'on %s, a cancelled Delete stops waiting for the joined maintaining ensure at once, and the build goes on (PR #74 review round 3, B-R3-1)',
+    async (_name, engine) => {
+      const finish = heldBuild();
+      const helper = helperOn(engine);
+      const asked: string[] = [];
+      const imageId = docker.imageId.bind(docker);
+      docker.imageId = async (reference) => {
+        asked.push(reference);
+        return imageId(reference);
+      };
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const before = asked.length;
+      const controller = new AbortController();
+      const present = helper.ensureImagePresent({ signal: controller.signal });
+      // PR #74 review round 3, B-R3-1: the tag is missing, so the pending ensure is joined; the abort ends that wait.
+      await vi.waitFor(() => expect(asked.slice(before)).toEqual([TAG]));
+      const settled = present.then(
+        () => 'resolved',
+        (error: unknown) => (error instanceof Error ? error.name : 'other'),
+      );
+      controller.abort();
+      expect(await orHung(settled, 200)).toBe('AbortError');
+      finish();
+      expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])(
     'on %s, joins the pending maintaining ensure when the tag cannot be checked, and fails (D1) when that ensure fails, without a fallback (PR #74 review round 2, A-R2-1)',
     async (_name, engine) => {
       const finish = heldBuild();
