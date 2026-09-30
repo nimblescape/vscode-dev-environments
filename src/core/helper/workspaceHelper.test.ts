@@ -11,7 +11,7 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { preparingWorker } from '../docker/workerPreparation';
-import { CommandError, UserFacingError } from '../errors';
+import { CommandError, UserFacingError, isUserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
@@ -2871,6 +2871,34 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(scopes.length).toBeGreaterThanOrEqual(4);
     expect(scopes.every((inScope) => inScope)).toBe(true);
     expect(preparingWorker()).toBe(false);
+  });
+
+  // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks the helper tag: it never builds it and
+  // never waits for a pending build; its check runs in the scope of the worker preparation.
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])('on %s, checkImagePresent checks the tag, never builds it, and never waits for a pending build', async (_name, engine) => {
+    const helper = helperOn(engine);
+    const scopes: boolean[] = [];
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async (reference: string) => {
+      scopes.push(preparingWorker());
+      return imageId(reference);
+    };
+    await expect(helper.checkImagePresent()).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(docker.builds).toHaveLength(0);
+    const finish = heldBuild();
+    const open = helper.ensureImageUse();
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const settled = helper.checkImagePresent().then(() => 'resolved', (error: unknown) => (isUserFacingError(error) ? error.code : 'other'));
+    expect(await orHung(settled, 200)).toBe('helperFailed');
+    finish();
+    await open;
+    await expect(helper.checkImagePresent()).resolves.toBeUndefined();
+    expect(docker.builds).toHaveLength(1);
+    expect(scopes.length).toBeGreaterThanOrEqual(3);
+    expect(scopes.every((inScope) => inScope)).toBe(true);
   });
 
   it('builds the tag again when it was deleted after it was cached (by itself or by an open)', async () => {

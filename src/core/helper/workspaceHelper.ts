@@ -553,6 +553,17 @@ export class WorkspaceHelper {
   }
 
   /**
+   * PR #76 review round 1 (A-R1-1, A-R1-2): whether the current helper tag exists on the engine of the operation, for the
+   * refresh of the sidebar, which never builds it and never joins a pending build (its checks have time limits). Throws
+   * UserFacingError('helperFailed') when the tag is missing or cannot be checked; an AbortError when `signal` aborts. In
+   * the scope of the worker preparation, like ensureImagePresent (its check cannot go through the worker).
+   */
+  async checkImagePresent(options: { signal?: AbortSignal } = {}): Promise<void> {
+    const present = await runPreparingWorker(() => this.presentTag(options.signal));
+    if (present === undefined) throw new UserFacingError('helperFailed', Messages.helperImageNotPresent);
+  }
+
+  /**
    * PR #74 review round 2, A-R2-1: the current helper tag with the ID of its image, when the tag exists; `undefined` when
    * it is missing or cannot be checked (the caller then joins or builds). It leaves the cache untouched and records no
    * use. An abort of `signal` passes through.

@@ -286,6 +286,9 @@ export const Messages = {
    * the worker on the Docker host, and it could not be made ready (the helper image, the open); the call was refused and
    * nothing was run directly. As PipelineTexts.environmentLockUnavailable.
    */
+  /** PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar found no helper image; it never builds one. */
+  helperImageNotPresent:
+    'The workspace helper image is not on this Docker engine (or could not be checked); the next Start, Stop or Delete builds it.',
   workerUnavailable: (cause: string) =>
     `The Dev Environments worker on the Docker host could not be prepared (${cause}), so nothing was run. Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
   /**

@@ -203,6 +203,10 @@ async function activateExtension(
     prepare: async (target, signal) => {
       await runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal }));
     },
+    // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks that the helper image is present.
+    checkPresent: async (target, signal) => {
+      await runWithDockerTarget(target, () => helper.checkImagePresent({ signal }));
+    },
     open: (target) =>
       openHelperChannel(
         {

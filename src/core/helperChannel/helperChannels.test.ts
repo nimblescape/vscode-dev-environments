@@ -634,21 +634,26 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     closedOnce.channels.dispose();
   });
 
-  // Plan step 5, PR D (rule D1 of 2026-09-30): the refresh makes the worker ready like a Docker call.
-  it('prepares the helper image and opens the worker in full; a failure refuses the refresh with the cause', async () => {
+  // Plan step 5, PR D (rule D1 of 2026-09-30): the refresh makes the worker ready like a Docker call. PR #76 review round 1
+  // (A-R1-1, A-R1-2): it only checks the helper image (checkPresent) and never prepares (builds) it.
+  it('checks the helper image and opens the worker in full; a failure refuses the refresh with the cause', async () => {
     const channel = { ...fakeChannel(), operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) };
     const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'no image.')).mockResolvedValueOnce(channel);
     const prepare = vi.fn(async () => {});
-    const channels = new HelperChannels({ open, prepare, logger: silentLogger });
+    const checkPresent = vi.fn(async () => {});
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
     await expect(channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable', message: 'no image.' });
     // Within the wait after the failed open, the next refresh opens again.
     expect(await channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
-    expect(prepare).toHaveBeenCalledTimes(2);
+    // PR #76 review round 1 (A-R1-1, A-R1-2): checked, never prepared (was: prepared twice).
+    expect(checkPresent).toHaveBeenCalledTimes(2);
+    expect(prepare).not.toHaveBeenCalled();
     expect(open).toHaveBeenCalledTimes(2);
     channels.dispose();
     const refused = new HelperChannels({
       open,
-      prepare: async () => {
+      prepare,
+      checkPresent: async () => {
         throw new Error('Cannot connect to the Docker daemon');
       },
       logger: silentLogger,
@@ -658,7 +663,33 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
       message: 'the helper image could not be prepared: Cannot connect to the Docker daemon',
     });
     expect(open).toHaveBeenCalledTimes(2);
+    expect(prepare).not.toHaveBeenCalled();
     refused.dispose();
+  });
+
+  // PR #76 review round 1 (A-R1-1, A-R1-2): a missing helper image refuses each refresh at once and never starts a build,
+  // also after many refreshes; a Docker call of an operation still prepares (builds) it.
+  it('a missing helper image refuses each refresh without a build; a Docker call still prepares it', async () => {
+    const channel = { ...fakeChannel(), operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) };
+    const open = vi.fn(async () => channel as unknown as HelperChannel);
+    const prepare = vi.fn(async () => {});
+    const checkPresent = vi.fn(async () => {
+      throw new Error('The workspace helper image is not on this Docker engine.');
+    });
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
+    for (let i = 0; i < 5; i++) {
+      await expect(channels.refresh(REMOTE, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({
+        code: 'unavailable',
+        message: 'the helper image could not be prepared: The workspace helper image is not on this Docker engine.',
+      });
+    }
+    expect(checkPresent).toHaveBeenCalledTimes(5);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+    await channels.docker(REMOTE, ['ps']);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(checkPresent).toHaveBeenCalledTimes(5);
+    channels.dispose();
   });
 
   it('rejects when the worker failed or answered with an invalid value', async () => {

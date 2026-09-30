@@ -192,6 +192,13 @@ export interface HelperChannelsOptions {
    * `signal` aborts.
    */
   prepare?(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
+  /**
+   * PR #76 review round 1 (A-R1-1, A-R1-2): what the refresh of the sidebar, which no user starts, checks instead of
+   * `prepare`: that the helper image is present (WorkspaceHelper.checkImagePresent), never a build, so a refresh neither
+   * waits for a build without a time limit nor builds again after each failed build. Rejects when the image is missing or
+   * cannot be checked; the refresh is then refused, and the next operation (Start, Stop, Delete) builds it.
+   */
+  checkPresent?(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
   logger: Logger;
   idleCloseMs?: number;
   retryAfterFailureMs?: number;
@@ -301,17 +308,20 @@ export class HelperChannels {
 
   /**
    * Plan step 5, PR D (rule D1 of 2026-09-30): the open channel to the engine of `target`, made ready now if needed: when
-   * none is open, first `prepare` (the helper image), then the open in full (openInFull). Throws
+   * none is open, first `prepare` (the helper image; `checkPresent` when `passive`, for the refresh), then the open in
+   * full (openInFull). Throws
    * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts.
    */
-  private async ready(target: DockerTarget, signal: AbortSignal | undefined): Promise<HelperChannel> {
+  private async ready(target: DockerTarget, signal: AbortSignal | undefined, passive = false): Promise<HelperChannel> {
     if (signal?.aborted) throw abortError();
     const open = this.entries.get(keyOf(target))?.channel;
     if (open?.isOpen) return open;
     this.refuseUnsupported(target);
-    if (this.options.prepare !== undefined) {
+    // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh only checks the helper image (checkPresent), never builds it.
+    const prepare = passive ? this.options.checkPresent : this.options.prepare;
+    if (prepare !== undefined) {
       try {
-        await this.options.prepare(target, signal);
+        await prepare(target, signal);
       } catch (error) {
         if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError();
         const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);
@@ -379,7 +389,7 @@ export class HelperChannels {
     const params = parseRefreshParams({ environments });
     if (params === undefined) throw new HelperChannelError('unsendable', 'The environments are beyond what the refresh of the worker carries.');
     for (let attempt = 0; ; attempt++) {
-      const channel = await this.ready(target, signal);
+      const channel = await this.ready(target, signal, true);
       if (!channel.operations.includes(OP_REFRESH)) throw new HelperChannelError('unavailable', 'the worker does not know the refresh');
       let value: unknown;
       try {
