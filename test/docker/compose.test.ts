@@ -40,6 +40,7 @@ import {
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
+import { FakeEnvironmentLock } from '../../src/core/pipeline/environmentService.testkit';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -97,6 +98,9 @@ describe('open pipeline for a Docker Compose configuration', () => {
   const ui = new FakeUi();
   const service = new EnvironmentService({
     analyzer: inProcessAnalyzer,
+    // Plan step 5, PR B (D1: no unlocked path): the lock is required; this file is not about it, so a lock that is always
+    // granted, whose plain Docker calls run directly as before.
+    environmentLock: new FakeEnvironmentLock((args, options) => docker.runDirect(args, options)).take,
     docker,
     runner,
     helper,

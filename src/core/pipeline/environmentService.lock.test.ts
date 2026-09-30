@@ -202,3 +202,26 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
     expect(events).toEqual([]);
   });
 });
+
+describe('no unlocked path (plan step 5, PR B, D1: no unlocked path)', () => {
+  // The mutant that drops only the re-entrance check (holdsEnvironmentLock) takes a second lock here and fails.
+  it('Stop within a held lock of the environment takes no second lock and runs under the held one', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    await runWithEnvironmentLock(heldLock(ENV_ID), () => h.service.stop(ENV_ID));
+    expect(events).toEqual(['docker stop (locked)']);
+    expect(releases).toBe(0);
+  });
+
+  it('the default lock of the testkit is taken and released by Stop and Delete (the lock is required)', async () => {
+    const plain = createHarness();
+    try {
+      await seedEnvironment(plain, { container: 'running' });
+      await plain.service.stop(ENV_ID);
+      await plain.service.delete(ENV_ID, { progress: plain.progress, additionalVolumesToRemove: [] });
+      expect(plain.lock.acquired).toEqual([ENV_ID, ENV_ID]);
+      expect(plain.lock.released).toEqual([ENV_ID, ENV_ID]);
+    } finally {
+      plain.cleanup();
+    }
+  });
+});

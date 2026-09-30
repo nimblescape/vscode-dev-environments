@@ -32,7 +32,8 @@ import {
   environmentImageName,
   resourceName,
 } from '../names';
-import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunResult } from '../ports';
+import type { HeldEnvironmentLock } from '../docker/environmentLock';
+import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunOptions, type RunResult } from '../ports';
 import { StoragePaths } from '../storage/paths';
 import { EnvironmentRegistry } from '../storage/registry';
 import { SessionFiles } from '../storage/sessionFiles';
@@ -1236,6 +1237,8 @@ export interface Harness {
   sessionFiles: SessionFiles;
   docker: FakeDocker;
   helper: FakeHelper;
+  /** Plan step 5, PR B (D1: no unlocked path): the default lock of the service. */
+  lock: FakeEnvironmentLock;
   checker: FakeImageChecker;
   ui: FakeUi;
   logger: RecordingLogger;
@@ -1260,6 +1263,33 @@ export interface Harness {
   cleanup(): void;
 }
 
+/**
+ * Plan step 5, PR B (D1: no unlocked path): the lock of the environments for the tests that are not about the lock
+ * (EnvironmentServiceDeps.environmentLock is required). It grants every lock and records each acquire and release.
+ * `docker`: the plain Docker calls under the lock (a ContainerAdapter sends them to the lock); without it they fail.
+ */
+export class FakeEnvironmentLock {
+  readonly acquired: string[] = [];
+  readonly released: string[] = [];
+
+  constructor(private readonly docker?: (args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>) => Promise<RunResult>) {}
+
+  readonly take = async (environmentId: string): Promise<HeldEnvironmentLock> => {
+    this.acquired.push(environmentId);
+    return {
+      environmentId,
+      lost: new Promise<string>(() => {}),
+      docker: async (args, options) => {
+        if (this.docker === undefined) throw new Error('The fake lock runs no Docker call.');
+        return this.docker(args, options);
+      },
+      release: async () => {
+        this.released.push(environmentId);
+      },
+    };
+  };
+}
+
 export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const paths = new StoragePaths(root);
@@ -1274,6 +1304,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     sessionFiles: new SessionFiles(paths, clock),
     docker,
     helper: new FakeHelper(docker),
+    lock: new FakeEnvironmentLock(),
     checker: new FakeImageChecker(),
     ui: new FakeUi(),
     logger: new RecordingLogger(),
@@ -1330,6 +1361,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     },
     // Review round 8: the analysis in this thread (the worker is tested in configurationAnalysisRunner.test.ts).
     analyzer: inProcessAnalyzer,
+    // Plan step 5, PR B (D1: no unlocked path): a lock that is always granted, for the tests that are not about it.
+    environmentLock: h.lock.take,
     ...overrides,
   });
   return h;

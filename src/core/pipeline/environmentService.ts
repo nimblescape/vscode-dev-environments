@@ -433,10 +433,9 @@ export interface EnvironmentServiceDeps {
   /**
    * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
    * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
-   * AbortError. Stop and Delete take it (user decision D2); without it (the tests that do not test the lock) they run
-   * without the lock.
+   * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
    */
-  environmentLock?: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
+  environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
 }
 
 export interface RepositoryTarget {
@@ -6725,8 +6724,7 @@ export class EnvironmentService {
    * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear.
    */
   private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-    const take = this.deps.environmentLock;
-    if (take === undefined || holdsEnvironmentLock(env.id)) return fn();
+    if (holdsEnvironmentLock(env.id)) return fn();
     try {
       await this.deps.helper.ensureImageUse({
         onOutput: (text) => this.logger.output(text),
@@ -6741,7 +6739,7 @@ export class EnvironmentService {
     }
     let lock: HeldEnvironmentLock;
     try {
-      lock = await take(env.id, ENVIRONMENT_LOCK_WAIT_SECONDS, signal);
+      lock = await this.deps.environmentLock(env.id, ENVIRONMENT_LOCK_WAIT_SECONDS, signal);
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       if (error instanceof EnvironmentLockError && error.kind === 'busy') {
