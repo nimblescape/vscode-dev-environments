@@ -583,21 +583,23 @@ export class WorkspaceHelper {
     return tag !== undefined && id !== undefined ? { tag, id } : undefined;
   }
 
-  /** Whether the engine of the operation (HelperDeps.engine) is the local Docker. */
-  async usesLocalEngine(): Promise<boolean> {
-    return (await this.currentEngine()).key === '';
+  /**
+   * The key of the engine of the operation (HelperDeps.engine; '' for the local Docker). Plan step 6, PR D: the
+   * background prebuild reads the state file of this engine (helperStatePathFor), the one that an open on it writes.
+   */
+  async engineKey(): Promise<string> {
+    return (await this.currentEngine()).key;
   }
 
   /**
    * The background prebuild (user decision 2026-09-29: no previous helper image; HelperPrebuild): makes sure that the
-   * helper tag exists on the local Docker engine, and builds it when it is missing, without the maintenance of
+   * helper tag exists on the engine of the operation, and builds it when it is missing, without the maintenance of
    * ensureImage (like the helper runs). It shares the cached promise of this instance with ensureImage and the helper
    * runs, so an open that starts meanwhile waits for this build instead of building a second time; when `signal` aborts,
-   * the build is cancelled, and an open that waited for it builds again for itself. Returns `undefined` without a build
-   * when the engine of the operation is not the local Docker. Throws like ensureImage.
+   * the build is cancelled, and an open that waited for it builds again for itself. Plan step 6, PR D: on every engine,
+   * local or remote (it no longer returns `undefined` for a remote one). Throws like ensureImage.
    */
-  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse | undefined> {
-    if (!(await this.usesLocalEngine())) return undefined;
+  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse> {
     return this.image({ signal: options.signal, onBuild: options.onBuild }, false);
   }
 

@@ -22,7 +22,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage, UserFacingError } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
-import { HelperPrebuild } from '../core/helper/helperPrebuild';
+import { HelperPrebuild, dockerEngineAnswers } from '../core/helper/helperPrebuild';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperChannels';
 import { HelperChannelError } from '../core/helperChannel/helperChannel';
@@ -615,20 +615,24 @@ async function activateExtension(
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
   background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
-  // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background on the local Docker, when it runs (review round
+  // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
   // The build is shared with the open pipeline of this window (WorkspaceHelper.prebuildImage) and cancelled when the
-  // extension is deactivated.
+  // extension is deactivated. Plan step 6, PR D: on the Docker engine of the current Docker context, local or remote
+  // alike, as an operation on it (the state file and engine key of an open there); a remote host gets our own SSH check
+  // without questions before its `docker info` (dockerEngineAnswers). A host switch starts no new prebuild: the next
+  // activation, or the first open on that host, builds its tag.
   const helperPrebuild = new HelperPrebuild({
     helper,
-    dockerRunning: (signal) => docker.isRunning(signal),
+    dockerRunning: (target, signal) =>
+      dockerEngineAnswers(target, { daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger }, signal),
     dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
     statePath: paths.helperState,
     logger,
   });
   context.subscriptions.push(helperPrebuild);
   background(
-    targets.current().then((target) => (target.kind === 'local' ? runWithDockerTarget(target, () => helperPrebuild.start()) : helperPrebuild.start())),
+    targets.current().then((target) => helperPrebuild.start(target)),
     'prepare the workspace helper image in the background',
   );
 
