@@ -11,6 +11,9 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { preparingWorker } from '../docker/workerPreparation';
+import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
+import { operationDockerTarget } from '../docker/dockerTargets';
+import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
 import { CommandError, UserFacingError, isUserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
@@ -18,7 +21,7 @@ import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
-import { HelperPrebuild, type HelperPrebuildDeps } from './helperPrebuild';
+import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, dockerEngineAnswers, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
@@ -54,6 +57,8 @@ import {
 const TOKEN = 'gho_0123456789abcdefSECRET';
 const DOCKERFILE = 'FROM node:22-bookworm-slim\n';
 const TAG = helperImageTag(DOCKERFILE);
+/** Plan step 6, PR D: a remote SSH engine for the background prebuild. */
+const REMOTE_TARGET: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devenv-build-box' };
 
 type BuildOptions = Parameters<HelperDocker['buildImage']>[0];
 type Handler = (args: string[], options: RunOptions) => Partial<RunResult> | Promise<Partial<RunResult>>;
@@ -1130,6 +1135,49 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(docker.builds).toHaveLength(2);
   });
 
+  it('PR #77 review round 1 (A-R1-1): a prebuild whose build stalls ends at its time limit; an open and a worker preparation that waited for it build for themselves', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    blockingBuild();
+    const pre = prebuild(helper, { timeoutMs: 200 }).start(REMOTE_TARGET);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const user = new AbortController();
+    const cancelled = helper.ensureImageUse({ signal: user.signal }).catch((e: unknown) => e);
+    user.abort();
+    expect(await cancelled).toMatchObject({ name: 'AbortError' });
+    const open = helper.ensureImageUse({ signal: new AbortController().signal });
+    const lock = helper.ensureImagePresent({ signal: new AbortController().signal });
+    docker.buildHandler = async () => undefined;
+    expect(await pre).toBe('failed');
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await lock).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+  });
+
+  it('PR #77 review round 2 (B-R2-1): without timeoutMs (as extension.ts starts it) a stalled prebuild ends at HELPER_PREBUILD_TIMEOUT_MS, at most 30 minutes', async () => {
+    expect(HELPER_PREBUILD_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(HELPER_PREBUILD_TIMEOUT_MS).toBeLessThanOrEqual(30 * 60_000);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const gate = blockingBuild();
+    try {
+      const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+      let settled = false;
+      const pre = prebuild(helper).start(REMOTE_TARGET);
+      void pre.then(() => { settled = true; });
+      // Not vi.waitFor: under fake timers it would advance the clock itself.
+      for (let i = 0; i < 500 && docker.builds.length === 0; i++) await new Promise((r) => setImmediate(r));
+      expect(docker.builds).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(HELPER_PREBUILD_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(await pre).toBe('failed');
+      expect(docker.builds[0].signal?.aborted).toBe(true);
+    } finally {
+      gate.release();
+      vi.useRealTimers();
+    }
+  });
+
   // Review round 16 of PR #64 (R16-2): a caller that joined the build of another caller that is cancelled builds for itself.
   it('R16-2: an open that joined the build of another open that is cancelled builds for itself', async () => {
     const helper = stateHelper();
@@ -1211,22 +1259,124 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(docker.listCalls).toBe(0);
   });
 
-  it('builds nothing when the Docker context is a remote host', async () => {
+  // Changed expectation (Plan step 6, PR D: the prebuild runs on every engine): this was "builds nothing when the Docker
+  // context is a remote host" (prebuildImage returned undefined, HelperPrebuild answered `remote`).
+  it('builds the missing tag also when the Docker context is a remote host (Plan step 6, PR D)', async () => {
     const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
-    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toBeUndefined();
-    expect(await helper.usesLocalEngine()).toBe(false);
+    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await helper.engineKey()).toBe('build-box');
+    expect(docker.builds).toHaveLength(1);
+  });
+
+  // Changed expectation (Plan step 6, PR D): this was "asks no Docker engine whether it runs when the Docker context is a
+  // remote host" (review round 17 of PR #64, R17-2). The prebuild now runs as an operation on the remote target, so its
+  // `docker info` goes to that host (with our own SSH check first, dockerEngineAnswers), and only when the state file of
+  // that host does not know the tag (the test below: not due, nothing asked).
+  it('prebuilds a remote target as an operation on it, with the state file of that engine (Plan step 6, PR D)', async () => {
+    const helper = stateHelper(async () => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET }));
+    const targetsOfBuild: Array<DockerTarget | undefined> = [];
+    docker.buildHandler = async () => {
+      targetsOfBuild.push(operationDockerTarget());
+    };
+    const running = vi.fn(async (_target: DockerTarget, _signal: AbortSignal) => true);
+    expect(await prebuild(helper, { dockerRunning: running }).start(REMOTE_TARGET)).toBe('built');
+    expect(running).toHaveBeenCalledTimes(1);
+    expect(running.mock.calls[0][0]).toBe(REMOTE_TARGET);
+    // The build ran within the operation on the remote target (its Docker calls get the context of that host).
+    expect(targetsOfBuild).toEqual([REMOTE_TARGET]);
+    // The record is in the state file of the remote engine, not in helper.json of the local Docker.
+    const remoteState = JSON.parse(fs.readFileSync(helperStatePathFor(statePath(), 'build-box'), 'utf8')) as HelperState;
+    expect(remoteState.images[TAG]?.builtAt).toBeDefined();
+    expect(fs.existsSync(statePath())).toBe(false);
+  });
+
+  it('keeps "is due" per engine: a record of one engine does not count for another (Plan step 6, PR D)', async () => {
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    fs.writeFileSync(
+      helperStatePathFor(statePath(), 'build-box'),
+      JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }),
+    );
+    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET });
+    // The remote host knows the tag: not due, and neither it nor its Docker is asked.
+    const running = vi.fn(async () => true);
+    expect(await prebuild(stateHelper(engine), { dockerRunning: running }).start(REMOTE_TARGET)).toBe('notDue');
+    expect(running).not.toHaveBeenCalled();
     expect(docker.builds).toEqual([]);
-    expect(await prebuild(helper).start()).toBe('remote');
+    expect(docker.imageIdCalls).toBe(0);
+    // helper.json of the local Docker does not know it: the local Docker is due and gets the build.
+    expect(await prebuild(stateHelper(engine), { dockerRunning: running }).start(LOCAL_DOCKER_TARGET)).toBe('built');
+    expect(running).toHaveBeenCalledWith(LOCAL_DOCKER_TARGET, expect.any(AbortSignal));
+    expect(docker.builds).toHaveLength(1);
+    // A new remote host has no record yet: it is due and its Docker is asked (the fake Docker of this test has the tag
+    // already, so it is found there).
+    const other: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: 'devenv-other-box' };
+    expect(await prebuild(stateHelper(engine), { dockerRunning: running }).start(other)).toBe('present');
+    expect(running).toHaveBeenCalledWith(other, expect.any(AbortSignal));
+    expect(fs.existsSync(helperStatePathFor(statePath(), 'other-box'))).toBe(true);
+  });
+
+  it('does nothing on a remote host whose Docker does not answer, and never on an unsupported endpoint (Plan step 6, PR D)', async () => {
+    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET });
+    expect(await prebuild(stateHelper(engine), { dockerRunning: async () => false }).start(REMOTE_TARGET)).toBe('dockerNotRunning');
+    expect(docker.builds).toEqual([]);
+    expect(docker.imageIdCalls).toBe(0);
+    expect(logger.lines.join('\n')).toContain('Docker is not running');
+    const running = vi.fn(async () => true);
+    const unsupported: DockerTarget = { kind: 'unsupported', host: 'tcp://10.0.0.5:2375', endpoint: 'tcp://10.0.0.5:2375' };
+    expect(await prebuild(stateHelper(engine), { dockerRunning: running }).start(unsupported)).toBe('unsupported');
+    expect(running).not.toHaveBeenCalled();
     expect(docker.builds).toEqual([]);
   });
 
-  it('asks no Docker engine whether it runs when the Docker context is a remote host (review round 17 of PR #64, R17-2)', async () => {
-    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
-    const running = vi.fn(async () => true);
-    expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('remote');
-    // Not even `docker info`: outside an operation it would go to the remote host (over SSH) at every activation.
-    expect(running).not.toHaveBeenCalled();
-    expect(docker.builds).toEqual([]);
+  describe('dockerEngineAnswers (Plan step 6, PR D)', () => {
+    function sshRunner(result: Partial<RunResult>) {
+      return { run: vi.fn(async (_file: string, _args: readonly string[], _options?: RunOptions): Promise<RunResult> => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false, ...result })) };
+    }
+
+    it('asks the local Docker with docker info only, and never starts it', async () => {
+      const runner = sshRunner({});
+      const daemonStatus = vi.fn(async () => ({ running: false }));
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
+      expect(await dockerEngineAnswers(LOCAL_DOCKER_TARGET, deps, new AbortController().signal)).toBe(false);
+      expect(daemonStatus).toHaveBeenCalledTimes(1);
+      expect(runner.run).not.toHaveBeenCalled();
+    });
+
+    it('checks a remote host with ssh -o BatchMode=yes first, so no question is ever asked; then docker info with the remote time limit', async () => {
+      const runner = sshRunner({});
+      const daemonStatus = vi.fn(async (_signal: AbortSignal, _timeoutMs?: number) => ({ running: true }));
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
+      expect(await dockerEngineAnswers(REMOTE_TARGET, deps, new AbortController().signal)).toBe(true);
+      expect(runner.run).toHaveBeenCalledTimes(1);
+      const [file, args, options] = runner.run.mock.calls[0];
+      expect(file).toBe('/usr/bin/ssh');
+      expect(args).toEqual(expect.arrayContaining(['-o', 'BatchMode=yes']));
+      expect(options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+      expect(daemonStatus).toHaveBeenCalledWith(expect.any(AbortSignal), REMOTE_INFO_TIMEOUT_MS);
+    });
+
+    it('answers false without docker info when the SSH check of a remote host fails, and false for an unsupported endpoint', async () => {
+      const runner = sshRunner({ exitCode: 255, stderr: 'build-box: Permission denied (publickey).' });
+      const daemonStatus = vi.fn(async () => ({ running: true }));
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
+      expect(await dockerEngineAnswers(REMOTE_TARGET, deps, new AbortController().signal)).toBe(false);
+      expect(daemonStatus).not.toHaveBeenCalled();
+      expect(logger.lines.join('\n')).toContain('cannot be reached over SSH');
+      const unsupported: DockerTarget = { kind: 'unsupported', host: 'tcp://10.0.0.5:2375', endpoint: 'tcp://10.0.0.5:2375' };
+      expect(await dockerEngineAnswers(unsupported, deps, new AbortController().signal)).toBe(false);
+      expect(daemonStatus).not.toHaveBeenCalled();
+      expect(runner.run).toHaveBeenCalledTimes(1);
+    });
+
+    it('PR #77 review round 1 (A-R1-2): answers false without docker info for a remote host that our ssh cannot check (no unattended question)', async () => {
+      const runner = sshRunner({});
+      const daemonStatus = vi.fn(async () => ({ running: true }));
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
+      const odd: DockerTarget = { kind: 'remote', host: 'me@corp.example@build-box', endpoint: 'ssh://me@corp.example@build-box', context: 'odd' };
+      expect(await dockerEngineAnswers(odd, deps, new AbortController().signal)).toBe(false);
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(daemonStatus).not.toHaveBeenCalled();
+    });
   });
 
   // Review round 5 of PR #64, R5-2: helper.json alone decides whether the prebuild is due; there is no extension version
@@ -1303,7 +1453,9 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     const running = vi.fn(async () => true);
     // Review round 5 of PR #64, R5-2: a live record of the current tag is enough (no version).
     expect(await prebuild(helper, { dockerRunning: running }).start()).toBe('notDue');
-    expect(asked).toBe(false);
+    // Changed expectation (Plan step 6, PR D): the engine is read for the key of its state file (in the extension the
+    // target of the operation, no Docker call); this was `false`. Docker itself is still not asked (below).
+    expect(asked).toBe(true);
     expect(running).not.toHaveBeenCalled();
     expect(docker.imageIdCalls).toBe(0);
     // A tag that the cleanup removed is not known.
@@ -1344,7 +1496,8 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
   // the same helper.json: exactly one build, the other window is busy".
   it('HelperPrebuild disposed while it reads helper.json asks Docker nothing (review round 20 of PR #64, B-R20-5b)', async () => {
     const helper = {
-      usesLocalEngine: vi.fn(async () => true),
+      // Plan step 6, PR D: engineKey replaces usesLocalEngine (the prebuild reads the state file of the engine).
+      engineKey: vi.fn(async () => ''),
       prebuildImage: vi.fn(async (options: { signal: AbortSignal }) => {
         if (options.signal.aborted) throw abortError();
         return { tag: TAG, id: fakeImageId(TAG) };
@@ -1355,17 +1508,18 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     const outcome = task.start();
     task.dispose();
     expect(await outcome).toBe('cancelled');
-    expect(helper.usesLocalEngine).not.toHaveBeenCalled();
+    expect(helper.engineKey).not.toHaveBeenCalled();
     expect(running).not.toHaveBeenCalled();
     expect(helper.prebuildImage).not.toHaveBeenCalled();
   });
 
   it('HelperPrebuild disposed during the build is cancelled, also when the build then fails with another error (review round 20 of PR #64, B-R20-5c)', async () => {
     const helper = {
-      usesLocalEngine: vi.fn(async () => true),
+      // Plan step 6, PR D: engineKey replaces usesLocalEngine.
+      engineKey: vi.fn(async () => ''),
       prebuildImage: vi.fn(
         (options: { signal: AbortSignal }) =>
-          new Promise<undefined>((_resolve, reject) => {
+          new Promise<HelperImageUse>((_resolve, reject) => {
             // The killed docker build ends with an ordinary failure, which the helper reports as helperFailed.
             options.signal.addEventListener('abort', () => reject(new UserFacingError('helperFailed', 'The workspace helper could not be prepared.', 'exit code 143')), { once: true });
           }),
@@ -1382,12 +1536,13 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
   it('HelperPrebuild is cancelled, without a warning, when a step fails with another error after dispose (review round 20 of PR #64, B-R20-5c)', async () => {
     let task: HelperPrebuild | undefined;
     const helper = {
-      // Deactivation while the Docker context is read; the read then fails with an ordinary error.
-      usesLocalEngine: async () => {
+      // Deactivation while the Docker context is read; the read then fails with an ordinary error. Plan step 6, PR D:
+      // engineKey replaces usesLocalEngine (read for the state file of the engine).
+      engineKey: async (): Promise<string> => {
         task?.dispose();
         throw new Error('the Docker context cannot be read');
       },
-      prebuildImage: async () => undefined,
+      prebuildImage: async () => ({ tag: TAG, id: fakeImageId(TAG) }),
     };
     task = prebuild(stateHelper(), { helper });
     expect(await task.start()).toBe('cancelled');
@@ -1413,7 +1568,9 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
       });
       const running = vi.fn(async () => true);
       expect(await prebuild(third, { dockerRunning: running }).start()).toBe('notDue');
-      expect(asked).toBe(false);
+      // Changed expectation (Plan step 6, PR D): the engine is read for the key of its state file (no Docker call); this
+      // was `false`. Docker itself is still not asked (below).
+      expect(asked).toBe(true);
       expect(running).not.toHaveBeenCalled();
       expect(docker.builds).toHaveLength(builds);
       expect(docker.imageIdCalls).toBe(imageIdCalls);
@@ -1422,10 +1579,12 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     it('asks Docker nothing for a live record of the current tag', async () => {
       fs.mkdirSync(path.dirname(statePath()), { recursive: true });
       fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }));
-      const helper = { usesLocalEngine: vi.fn(async () => true), prebuildImage: vi.fn(async () => undefined) };
+      const helper = { engineKey: vi.fn(async () => ''), prebuildImage: vi.fn(async () => ({ tag: TAG, id: fakeImageId(TAG) })) };
       const running = vi.fn(async () => true);
       expect(await prebuild(stateHelper(), { helper, dockerRunning: running }).start()).toBe('notDue');
-      expect(helper.usesLocalEngine).not.toHaveBeenCalled();
+      // Changed expectation (Plan step 6, PR D): the engine key is read now (it picks the state file of the engine; in
+      // the extension it is the target of the operation, no Docker call); this was "usesLocalEngine not called".
+      expect(helper.engineKey).toHaveBeenCalledTimes(1);
       expect(helper.prebuildImage).not.toHaveBeenCalled();
       expect(running).not.toHaveBeenCalled();
       expect(docker.imageIdCalls).toBe(0);
@@ -1539,6 +1698,8 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
 
     // Review round 6 of PR #64, R6-5: renamed to what it covers (prebuildImage awaits usesLocalEngine first, so the open
     // creates the shared promise and the prebuild joins it); the test below covers the prebuild that owns the promise.
+    // Plan step 6, PR D: prebuildImage no longer awaits usesLocalEngine (it goes to the shared ensure at once); the
+    // expectations stay: one build, and every caller that joins before or after its start gets its progress.
     it('a prebuild that joins an open that has not started its build yet; a later open gets create', async () => {
       const helper = stateHelper();
       const gate = blockingBuild();
