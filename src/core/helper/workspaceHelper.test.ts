@@ -1135,6 +1135,24 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(docker.builds).toHaveLength(2);
   });
 
+  it('PR #77 review round 1 (A-R1-1): a prebuild whose build stalls ends at its time limit; an open and a worker preparation that waited for it build for themselves', async () => {
+    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    blockingBuild();
+    const pre = prebuild(helper, { timeoutMs: 200 }).start(REMOTE_TARGET);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    const user = new AbortController();
+    const cancelled = helper.ensureImageUse({ signal: user.signal }).catch((e: unknown) => e);
+    user.abort();
+    expect(await cancelled).toMatchObject({ name: 'AbortError' });
+    const open = helper.ensureImageUse({ signal: new AbortController().signal });
+    const lock = helper.ensureImagePresent({ signal: new AbortController().signal });
+    docker.buildHandler = async () => undefined;
+    expect(await pre).toBe('failed');
+    expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(await lock).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+  });
+
   // Review round 16 of PR #64 (R16-2): a caller that joined the build of another caller that is cancelled builds for itself.
   it('R16-2: an open that joined the build of another open that is cancelled builds for itself', async () => {
     const helper = stateHelper();
@@ -1323,6 +1341,16 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
       expect(await dockerEngineAnswers(unsupported, deps, new AbortController().signal)).toBe(false);
       expect(daemonStatus).not.toHaveBeenCalled();
       expect(runner.run).toHaveBeenCalledTimes(1);
+    });
+
+    it('PR #77 review round 1 (A-R1-2): answers false without docker info for a remote host that our ssh cannot check (no unattended question)', async () => {
+      const runner = sshRunner({});
+      const daemonStatus = vi.fn(async () => ({ running: true }));
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
+      const odd: DockerTarget = { kind: 'remote', host: 'me@corp.example@build-box', endpoint: 'ssh://me@corp.example@build-box', context: 'odd' };
+      expect(await dockerEngineAnswers(odd, deps, new AbortController().signal)).toBe(false);
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(daemonStatus).not.toHaveBeenCalled();
     });
   });
 

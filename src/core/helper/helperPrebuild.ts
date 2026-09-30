@@ -26,6 +26,14 @@ import { helperStatePathFor, type WorkspaceHelper } from './workspaceHelper';
  */
 export type HelperPrebuildOutcome = 'notDue' | 'unsupported' | 'dockerNotRunning' | 'built' | 'present' | 'failed' | 'cancelled';
 
+/**
+ * PR #77 review round 1 (A-R1-1): the time limit of a prebuild, on every engine. Nobody can cancel the background prebuild, and an open that
+ * joins its build can end only its own wait (R5-1); a build that stalls (a half-open SSH connection after a sleep) would
+ * otherwise block every open and worker preparation on that engine until a reload. At the limit the build is ended, and
+ * a caller that waited for it builds for itself (BuildKit keeps the finished layers).
+ */
+export const HELPER_PREBUILD_TIMEOUT_MS = 15 * 60_000;
+
 export interface HelperPrebuildDeps {
   helper: Pick<WorkspaceHelper, 'engineKey' | 'prebuildImage'>;
   /**
@@ -41,6 +49,8 @@ export interface HelperPrebuildDeps {
    */
   statePath: string;
   logger: Logger;
+  /** The time limit of the prebuild (HELPER_PREBUILD_TIMEOUT_MS by default). */
+  timeoutMs?: number;
 }
 
 /** What dockerEngineAnswers needs. */
@@ -71,6 +81,12 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
         deps.logger.info(`The Docker host ${target.host} cannot be reached over SSH: ${login.detail}`);
         return false;
       }
+      // PR #77 review round 1 (A-R1-2): a host that our ssh cannot check would be asked by the ssh of the Docker CLI, which may ask a question;
+      // nothing asks one unattended. The first open on that host builds the tag.
+      if (login.skipped === 'notAnSshTarget') {
+        deps.logger.info(`The workspace helper image is not prepared in the background on ${target.host}: it is no SSH address that can be checked without questions.`);
+        return false;
+      }
       return (await deps.daemonStatus(signal, REMOTE_INFO_TIMEOUT_MS)).running;
     }
   }
@@ -94,6 +110,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  */
 export class HelperPrebuild {
   private readonly controller = new AbortController();
+  private readonly limit = new AbortController();
   private run: Promise<HelperPrebuildOutcome> | undefined;
 
   constructor(private readonly deps: HelperPrebuildDeps) {}
@@ -104,6 +121,10 @@ export class HelperPrebuild {
    */
   start(target: DockerTarget = LOCAL_DOCKER_TARGET): Promise<HelperPrebuildOutcome> {
     this.run ??= runWithDockerTarget(target, () => this.prebuild(target)).catch((error: unknown) => {
+      if (this.limit.signal.aborted && !this.controller.signal.aborted) {
+        this.deps.logger.warn('The workspace helper image was not ready within the time limit of the background preparation; the next open prepares it.');
+        return 'failed' as const;
+      }
       if (this.controller.signal.aborted || isAbortError(error)) return 'cancelled' as const;
       this.deps.logger.warn(`The workspace helper image could not be prepared in the background: ${errorMessage(error)}`);
       return 'failed' as const;
@@ -118,7 +139,16 @@ export class HelperPrebuild {
 
   private async prebuild(target: DockerTarget): Promise<HelperPrebuildOutcome> {
     const { deps } = this;
-    const signal = this.controller.signal;
+    const timer = setTimeout(() => this.limit.abort(), deps.timeoutMs ?? HELPER_PREBUILD_TIMEOUT_MS);
+    try {
+      return await this.prebuildWithin(target, AbortSignal.any([this.controller.signal, this.limit.signal]));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async prebuildWithin(target: DockerTarget, signal: AbortSignal): Promise<HelperPrebuildOutcome> {
+    const { deps } = this;
     if (target.kind === 'unsupported') {
       deps.logger.info(`The workspace helper image is not prepared in the background: the Docker endpoint ${target.endpoint} is neither local nor SSH.`);
       return 'unsupported';
