@@ -101,16 +101,17 @@ describe('window status files', () => {
     await expect(files.readWindowStatuses()).resolves.toEqual([status(WIN_1)]);
   });
 
-  it('rejects when one status file cannot be read (PR #76 review round 3, A-R3-2): never "no window"', async () => {
+  // PR #76 review round 4 (B-R4-2): also for permissions (EACCES, EPERM), which readTextFile retries first.
+  it.each(['EIO', 'EACCES', 'EPERM'])('rejects when one status file cannot be read (%s; PR #76 review round 3, A-R3-2): never "no window"', async (code) => {
     await files.writeWindowStatus(status(WIN_1));
     await files.writeWindowStatus(status(WIN_2));
     const readFile = fs.promises.readFile;
     const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
-      if (String(file) === paths.sessionFile(WIN_2)) throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+      if (String(file) === paths.sessionFile(WIN_2)) throw Object.assign(new Error(`${code}: cannot read`), { code });
       return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
     }) as typeof fs.promises.readFile);
     try {
-      await expect(files.readWindowStatuses()).rejects.toMatchObject({ code: 'EIO' });
+      await expect(files.readWindowStatuses()).rejects.toMatchObject({ code });
       await expect(files.readPendings()).resolves.toEqual([]);
     } finally {
       spy.mockRestore();

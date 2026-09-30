@@ -1579,11 +1579,11 @@ export class Controller implements vscode.Disposable {
   /** This extension host still runs long after "Close Remote Connection": the connection was kept. */
   private async cancelHandOffIfUnclaimed(environmentId: string): Promise<void> {
     if (this.disposed) return;
-    const operations = await this.deps.sessionFiles.readOperations();
-    const own = operations.some(
-      (operation) => operation.environmentId === environmentId && operation.requestedBy === this.deps.coordinator.windowId,
-    );
-    if (!own) return;
+    // PR #76 review round 4 (A-R4-1): only this environment's file, so an unreadable file of another environment does
+    // not keep this hand-off. When this file cannot be read, its owner is not known (rule D1): it throws, and the hand-off
+    // and the busy mark are kept (never removed without knowing whose request it is).
+    const operation = await this.deps.sessionFiles.readOperation(environmentId);
+    if (operation?.requestedBy !== this.deps.coordinator.windowId) return;
     this.logger.info('The remote connection was not closed. The pending operation is cancelled.');
     await this.cancelHandOff(environmentId);
     this.background(this.deps.sidebar.render(), 'update the sidebar');

@@ -106,6 +106,17 @@ export class SessionFiles {
   }
 
   /**
+   * PR #76 review round 4 (A-R4-1): the pending operation of this environment that no window has claimed yet, if any.
+   * Reads only this environment's file: a file of another environment that cannot be read says nothing about it. A file
+   * that cannot be read throws.
+   */
+  async readOperation(environmentId: string): Promise<PendingOperation | undefined> {
+    const text = await readTextFile(this.paths.operationFile(environmentId));
+    const operation = text === undefined ? undefined : parseJson(text);
+    return isPendingOperation(operation) && operation.environmentId === environmentId ? operation : undefined;
+  }
+
+  /**
    * Atomically claims the pending operation: renames it to `<environment-id>.claimed.<time>.<window-id>`. A rename of one
    * source succeeds only once, also across processes, so only one window wins. Returns the operation if this window won;
    * `undefined` if another window was first or no operation exists. An invalid claimed file is removed.

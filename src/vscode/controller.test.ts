@@ -1610,6 +1610,53 @@ describe('Rebuild', () => {
     await settle(() => h.sidebar.render.mock.calls.length > 0, 'the render');
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
+
+  // PR #76 review round 4 (A-R4-1): an operation file of another environment that cannot be read does not keep the
+  // hand-off; this environment's own file that cannot be read keeps it and the busy mark (rule D1: its owner is not known).
+  it('cancels the hand-off when an operation file of another environment cannot be read (PR #76 review round 4, A-R4-1)', async () => {
+    const env = await handOffWithUnreadable(() => h.paths.operationFile(OTHER_ENV_ID), async () => {
+      await settle(() => h.logger.info.mock.calls.some((call) => String(call[0]).includes('pending operation is cancelled')), 'the cancel');
+      await settle(() => h.sidebar.render.mock.calls.length > 0, 'the render');
+    });
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(false);
+    expect(fs.existsSync(h.paths.operationFile(OTHER_ENV_ID))).toBe(true);
+    expect((await h.registry.get(env.id))?.busy).toBeUndefined();
+    expect(h.logger.error).not.toHaveBeenCalled();
+  });
+
+  it('keeps the hand-off and its busy mark when its own operation file cannot be read (PR #76 review round 4, A-R4-1)', async () => {
+    const env = await handOffWithUnreadable(() => h.paths.operationFile(ENV_ID), async () => {
+      await settle(() => h.logger.error.mock.calls.some((call) => String(call[0]).includes('check the pending operation')), 'the failed check');
+    });
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(true);
+    expect((await h.registry.get(env.id))?.busy).toMatchObject({ operation: 'rebuild', windowId: WINDOW_ID });
+  });
+
+  async function handOffWithUnreadable(unreadable: () => string, waitFor: () => Promise<void>): Promise<Environment> {
+    h.controller.dispose();
+    fs.rmSync(h.root, { recursive: true, force: true });
+    resetFakeVscode();
+    h = createHarness({ handOffCheckMs: 20 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    fs.mkdirSync(h.paths.operationsDir, { recursive: true });
+    fs.writeFileSync(h.paths.operationFile(OTHER_ENV_ID), '{}');
+    const denied = unreadable();
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await run('rebuild', row('acme/api', env));
+      h.sidebar.render.mockClear();
+      await waitFor();
+    } finally {
+      spy.mockRestore();
+    }
+    return env;
+  }
 });
 
 describe('Select configuration…', () => {

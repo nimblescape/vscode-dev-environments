@@ -749,6 +749,8 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
       expect(refreshDone).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(await refreshed).toBe('unavailable: the worker is still being opened');
+      // PR #76 review round 4 (B-R4-1): the bound stays far below a hung open (about 3 minutes), at most 30 s.
+      expect(CHANNEL_PASSIVE_OPEN_WAIT_MS).toBeLessThanOrEqual(30_000);
       let callDone = false;
       void call.then(() => (callDone = true));
       await vi.advanceTimersByTimeAsync(120_000);
