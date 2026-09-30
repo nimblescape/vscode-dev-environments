@@ -2006,6 +2006,53 @@ describe('Window roles', () => {
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
+  it('role B (PR #76 review round 5, A-R5-1): an unreadable operation file of another environment is reported and does not block this one', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const denied = h.paths.operationFile(OTHER_ENV_ID);
+    fs.writeFileSync(denied, '{}');
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await h.controller.runEmptyWindowTasks();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(false);
+    expect(fs.existsSync(denied)).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining(`${OTHER_ENV_ID}.json: EACCES`));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('role B (PR #76 review round 5, A-R5-1): an unreadable operation file alone is reported, not dropped, and the window is not reopened', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const denied = h.paths.operationFile(ENV_ID);
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await h.controller.runEmptyWindowTasks();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(denied)).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining(`${ENV_ID}.json: EACCES`));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
   it('role B: runs a pending stop and keeps the reopen record; a later start reopens the environment (D-5 a)', async () => {
     await h.registry.add(environment());
     h.connection.isEmptyWindow.mockReturnValue(true);

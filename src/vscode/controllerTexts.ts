@@ -35,6 +35,9 @@ export const ControllerTexts = {
    */
   otherWindowsUnknown:
     'It could not be checked whether another window uses this environment: the window status files could not be read. Nothing was changed; see the Dev Environments output.',
+  /** PR #76 review round 5 (A-R5-1): a pending operation (a Stop, Rebuild or Delete handed over by a window) could not be read. */
+  pendingOperationsUnreadable: (cause: string) =>
+    `A pending operation could not be read and was not run (${cause}). Run it again if it is still needed; see the Dev Environments output.`,
   otherWindowContinues: (repository: string) =>
     `The other window of ${repository} closes its connection. The operation continues in that window.`,
   otherWindowNoAnswer: (repository: string) =>

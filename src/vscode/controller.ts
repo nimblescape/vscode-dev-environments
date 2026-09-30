@@ -5,6 +5,7 @@
 // Controller (concept 6, 7.9–7.14): the commands of package.json and the flows of the window roles at activation. It
 // connects the UI components (sidebar, status bar, switcher, progress, messages) with the environment service, the
 // Session Coordinator, and the Connection Adapter.
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
@@ -511,7 +512,22 @@ export class Controller implements vscode.Disposable {
     await sessionFiles
       .cleanupStaleClaims()
       .catch((error: unknown) => this.logger.warn(`Old claimed operations could not be removed: ${errorMessage(error)}`));
-    const { runnable, stale } = sortPendingOperations(await sessionFiles.readOperations(), this.clock.now());
+    // PR #76 review round 5 (A-R5-1), rule D1: an operation file that cannot be read is not run and not dropped, and the
+    // user is told; the operations of the other environments still run (the files are per environment).
+    let known: Awaited<ReturnType<typeof sessionFiles.readOperationsKnown>>;
+    try {
+      known = await sessionFiles.readOperationsKnown();
+    } catch (error) {
+      this.logger.warn(`The pending operations could not be read: ${errorMessage(error)}`);
+      this.warn(ControllerTexts.pendingOperationsUnreadable(errorMessage(error)));
+      return;
+    }
+    for (const { file, error } of known.unreadable) {
+      const cause = `${path.basename(file)}: ${errorMessage(error)}`;
+      this.logger.warn(`A pending operation could not be read: ${cause}`);
+      this.warn(ControllerTexts.pendingOperationsUnreadable(cause));
+    }
+    const { runnable, stale } = sortPendingOperations(known.operations, this.clock.now());
     for (const operation of stale) {
       this.logger.info(`The pending ${operation.operation} of ${operation.environmentId} is too old and is dropped.`);
       await this.removeOperationQuietly(operation.environmentId);
@@ -542,7 +558,8 @@ export class Controller implements vscode.Disposable {
       }
       if (claimed) await this.runPendingOperation(claimed);
     }
-    if (runnable.length > 0) return;
+    // Not known whether an operation is pending: the window is not opened again.
+    if (runnable.length > 0 || known.unreadable.length > 0) return;
 
     await this.delay(this.deps.timing?.reopenCheckDelayMs ?? REOPEN_CHECK_DELAY_MS);
     if (this.disposed) return;
