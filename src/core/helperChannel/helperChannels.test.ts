@@ -11,6 +11,7 @@ import { EnvironmentLockError } from '../docker/environmentLock';
 import { HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
 import {
   CHANNEL_OPEN_WAIT_MS,
+  CHANNEL_PASSIVE_OPEN_WAIT_MS,
   CHANNEL_PROBE_TIMEOUT_MS,
   CHANNEL_REFRESH_TIMEOUT_MS,
   CHANNEL_RETRY_AFTER_FAILURE_MS,
@@ -716,6 +717,62 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     expect(checkPresent).toHaveBeenCalledTimes(2);
     expect(prepare).not.toHaveBeenCalled();
     channels.dispose();
+  });
+
+  // PR #76 review round 3 (A-R3-1): the refresh waits at most CHANNEL_PASSIVE_OPEN_WAIT_MS for an open that is still
+  // running (not the whole open, up to about 3 minutes); the open goes on, and a Docker call of an operation still awaits
+  // it in full. An open within that time gives the states at once.
+  it('the refresh waits at most CHANNEL_PASSIVE_OPEN_WAIT_MS for an open; an operation awaits it in full', async () => {
+    vi.useFakeTimers();
+    try {
+      let fail: (error: Error) => void = () => {};
+      const open = vi.fn(
+        () =>
+          new Promise<HelperChannel>((_resolve, reject) => {
+            fail = reject;
+          }),
+      );
+      const channels = new HelperChannels({ open, prepare: vi.fn(async () => {}), checkPresent: vi.fn(async () => {}), logger: silentLogger });
+      const refreshed = channels.refresh(REMOTE, REFRESH_ENVIRONMENTS).then(
+        () => 'resolved',
+        (error: unknown) => (error instanceof HelperChannelError ? `${error.code}: ${error.message}` : 'other'),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const call = channels.docker(REMOTE, ['ps']).then(
+        () => 'resolved',
+        (error: unknown) => (error instanceof HelperChannelError ? `${error.code}: ${error.message}` : 'other'),
+      );
+      await vi.advanceTimersByTimeAsync(CHANNEL_PASSIVE_OPEN_WAIT_MS - 1);
+      let refreshDone = false;
+      void refreshed.then(() => (refreshDone = true));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(refreshDone).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await refreshed).toBe('unavailable: the worker is still being opened');
+      let callDone = false;
+      void call.then(() => (callDone = true));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(callDone).toBe(false);
+      fail(new HelperChannelError('open', 'The worker on build-box did not answer.'));
+      expect(await call).toBe('unavailable: The worker on build-box did not answer.');
+      // Within the wait after the failure, the refresh is refused at once with the cause.
+      await expect(channels.refresh(REMOTE, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({
+        code: 'unavailable',
+        message: 'The worker on build-box did not answer.',
+      });
+      expect(open).toHaveBeenCalledTimes(1);
+      channels.dispose();
+      // An open that takes longer than CHANNEL_OPEN_WAIT_MS but less than CHANNEL_PASSIVE_OPEN_WAIT_MS gives the states.
+      const channel = { ...fakeChannel(), operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) };
+      const slow = vi.fn(() => new Promise<HelperChannel>((resolve) => setTimeout(() => resolve(channel as unknown as HelperChannel), 4 * CHANNEL_OPEN_WAIT_MS)));
+      const later = new HelperChannels({ open: slow, checkPresent: vi.fn(async () => {}), logger: silentLogger });
+      const states = later.refresh(REMOTE, REFRESH_ENVIRONMENTS);
+      await vi.advanceTimersByTimeAsync(4 * CHANNEL_OPEN_WAIT_MS);
+      expect(await states).toEqual(EXPECTED_STATES);
+      later.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // PR #76 review round 2 (A-R2-1): a worker that cannot be opened is opened again by the refresh only after the wait

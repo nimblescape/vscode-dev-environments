@@ -1083,6 +1083,29 @@ describe('MonitorLoop.run', () => {
     }
   });
 
+  it('stops nothing while one window status file cannot be read (PR #76 review round 3, A-R3-2), and does not crash', async () => {
+    const env = environment(ID_A, 'acme/api');
+    await h.registry.add(env);
+    await writeSettings(h);
+    await writeWindow(h, 'w1', ID_A);
+    h.docker.containers = [containerOf(env)];
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (path.dirname(String(file)) === h.paths.sessionsDir) throw Object.assign(new Error('EIO: i/o error, open'), { code: 'EIO' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      const pauses = { value: 0 };
+      h.loop = h.newLoop({ delay: fakeDelay(h, pauses) });
+      const end = await h.loop.run();
+      expect(end).toBe('failing');
+      expect(h.clock.time - T0).toBeGreaterThan(WAITING_MS + 60_000);
+      expect(h.docker.count('stop')).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('ends after too many failed ticks in a row', async () => {
     const pauses = { value: 0 };
     h.loop = h.newLoop({

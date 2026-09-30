@@ -53,6 +53,13 @@ export const CHANNEL_SWEEP_INTERVAL_MS = 60_000;
 export const CHANNEL_OPEN_WAIT_MS = 5_000;
 
 /**
+ * PR #76 review round 3 (A-R3-1): the refresh of the sidebar, which no user starts, waits at most this long for a worker
+ * that is being opened (longer than a usual open over SSH, far shorter than a hung one); then it is refused, and the
+ * open goes on for the next calls.
+ */
+export const CHANNEL_PASSIVE_OPEN_WAIT_MS = 30_000;
+
+/**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
  * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, no network, no
  * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
@@ -333,10 +340,13 @@ export class HelperChannels {
     if (passive) {
       // PR #76 review round 2 (A-R2-1): the refresh keeps the wait after a failed open (CHANNEL_RETRY_AFTER_FAILURE_MS):
       // within it, it is refused at once; only an operation (docker, lock) opens again at once (openInFull).
-      const channel = await this.get(target, { signal });
+      // PR #76 review round 3 (A-R3-1): at most CHANNEL_PASSIVE_OPEN_WAIT_MS for an open that is still running.
+      const channel = await this.get(target, { signal, waitMs: CHANNEL_PASSIVE_OPEN_WAIT_MS });
       if (channel !== undefined) return channel;
       this.refuseUnsupported(target);
-      throw new HelperChannelError('unavailable', this.entries.get(keyOf(target))?.failure ?? 'the worker could not be opened');
+      const entry = this.entries.get(keyOf(target));
+      if (entry?.opening !== undefined) throw new HelperChannelError('unavailable', 'the worker is still being opened');
+      throw new HelperChannelError('unavailable', entry?.failure ?? 'the worker could not be opened');
     }
     return this.openInFull(target, signal);
   }

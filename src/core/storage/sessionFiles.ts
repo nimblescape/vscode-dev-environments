@@ -200,7 +200,13 @@ async function readAll<T>(dir: string, isValid: (value: unknown) => value is T, 
   const results: Array<T | undefined> = [];
   await Promise.all(
     files.map(async (file, index) => {
-      const value = await readJsonTolerant(file);
+      // PR #76 review round 3 (A-R3-2), rule D1 of 2026-09-30: a file that cannot be read throws (not known), never counts
+      // as missing; a folder named *.json is no one's file and is skipped; invalid JSON stays tolerant (atomic writes).
+      const text = await readTextFile(file).catch((error: unknown) => {
+        if (errorCode(error) === 'EISDIR') return undefined;
+        throw error;
+      });
+      const value = text === undefined ? undefined : parseJson(text);
       if (isValid(value) && `${key(value)}.json` === path.basename(file)) results[index] = value;
     }),
   );
