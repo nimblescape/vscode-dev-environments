@@ -21,7 +21,7 @@ import { errorDetail } from '../pipeline/pipelineRules';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
-import { HelperPrebuild, dockerEngineAnswers, type HelperPrebuildDeps } from './helperPrebuild';
+import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, dockerEngineAnswers, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
 import {
   BUILD_SCRIPT,
@@ -1151,6 +1151,31 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(await lock).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(docker.builds[0].signal?.aborted).toBe(true);
+  });
+
+  it('PR #77 review round 2 (B-R2-1): without timeoutMs (as extension.ts starts it) a stalled prebuild ends at HELPER_PREBUILD_TIMEOUT_MS, at most 30 minutes', async () => {
+    expect(HELPER_PREBUILD_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(HELPER_PREBUILD_TIMEOUT_MS).toBeLessThanOrEqual(30 * 60_000);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const gate = blockingBuild();
+    try {
+      const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+      let settled = false;
+      const pre = prebuild(helper).start(REMOTE_TARGET);
+      void pre.then(() => { settled = true; });
+      // Not vi.waitFor: under fake timers it would advance the clock itself.
+      for (let i = 0; i < 500 && docker.builds.length === 0; i++) await new Promise((r) => setImmediate(r));
+      expect(docker.builds).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(HELPER_PREBUILD_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(await pre).toBe('failed');
+      expect(docker.builds[0].signal?.aborted).toBe(true);
+    } finally {
+      gate.release();
+      vi.useRealTimers();
+    }
   });
 
   // Review round 16 of PR #64 (R16-2): a caller that joined the build of another caller that is cancelled builds for itself.
