@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from './pipeLoader';
+import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from './pipeLoader';
 
 interface Ended {
   code: number | null;
@@ -252,6 +252,39 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     const throwing = `exports.start = () => { throw new Error('boom'); }; // ${'x'.repeat(5_000)}`;
     const ended = await load(newPath(), bundleHash(throwing), 'start', encodeBundle(throwing));
     expect(ended).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: the entry failed: boom\n' });
+  });
+
+  it('B-R2-3: an entry that throws something that is no Error (undefined, null) still exits 3 with one line', async () => {
+    for (const thrown of ['undefined', 'null']) {
+      const throwing = `exports.start = () => { throw ${thrown}; }; // ${'x'.repeat(5_000)}`;
+      const ended = await load(newPath(), bundleHash(throwing), 'start', encodeBundle(throwing));
+      expect(ended, thrown).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: `devenv loader: the entry failed: ${thrown}\n` });
+    }
+  });
+
+  it('review round 2 of PR #69 (A-R2-3): the source excerpt of an asynchronous uncaught error of a multi-line bundle is not in readableStderr', async () => {
+    for (const [thrown, shown] of [
+      ['new TypeError("not a secret: " + 7)', 'TypeError: not a secret: 7'],
+      ['42', '42'],
+    ] as const) {
+      // A bundle of many lines (as template literals keep their line feeds); its line 2 throws later, outside the entry.
+      const SECRET = 'SECRET-cf1d2e3a';
+      const bundle = [
+        `exports.start = () => {`,
+        `  setTimeout(() => { const secret = "${SECRET}"; if (secret) throw ${thrown}; }, 1); };`,
+        `const text = \`${'line\n'.repeat(20)}\`;`,
+      ].join('\n');
+      const file = newPath();
+      const ended = await load(file, bundleHash(bundle), 'start', encodeBundle(bundle));
+      expect(fs.readFileSync(file, 'utf8')).toBe(bundle);
+      expect(ended.code, thrown).toBe(1);
+      expect(ended.stderr).toContain(SECRET);
+      const tail = ended.stderr.slice(-4_000);
+      const readable = readableStderr(tail, 4_000);
+      expect(readable, thrown).not.toContain(SECRET);
+      expect(readable).toContain(`${file}:2`);
+      expect(readable.split('\n')).toContain(shown);
+    }
   });
 
   it('review round 1 of PR #69 (B-R1-1): exits 3 when no bundle comes within 60 s while the input stays open', { timeout: 90_000 }, async () => {

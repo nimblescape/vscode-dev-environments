@@ -74,4 +74,34 @@ describe('the pipe loader', () => {
     expect(readableStderr(atCap, 100)).toBe('s'.repeat(92));
     expect(readableStderr('', 100)).toBe('');
   });
+
+  it('review round 2 of PR #69 (A-R2-3): readableStderr drops the source excerpt of an uncaught error by its shape', () => {
+    const stack = '    at Timeout._onTimeout (/opt/devenv/monitor.js:2:52)';
+    // A POSIX header, the source line, the caret line, the error, its stack (a stack position is no header).
+    expect(readableStderr(`/opt/devenv/monitor.js:2\nconst SECRET = 1; throw e;\n                  ^\n\nError: bad\n${stack}\n`, 10_000)).toBe(
+      '/opt/devenv/monitor.js:2\nError: bad\nat Timeout._onTimeout (/opt/devenv/monitor.js:2:52)',
+    );
+    // A Windows path with a space; `[eval]` with a caret line of several carets.
+    expect(readableStderr('C:\\Program Files\\devenv\\monitor.js:12\n  SECRET();\n  ^\nTypeError: x', 10_000)).toBe('C:\\Program Files\\devenv\\monitor.js:12\nTypeError: x');
+    expect(readableStderr('D:/devenv/monitor.js:3\nSECRET\n^\n42', 10_000)).toBe('D:/devenv/monitor.js:3\n42');
+    expect(readableStderr('[eval]:1\nSECRET.x\n^^^^^^\n\nReferenceError: SECRET is not defined', 10_000)).toBe('[eval]:1\nReferenceError: SECRET is not defined');
+    expect(readableStderr('[eval]-wrapper:6\nSECRET\n', 10_000)).toBe('[eval]-wrapper:6');
+    // An excerpt without a caret line (the column is not known): the line after the header is dropped all the same.
+    expect(readableStderr('/opt/devenv/monitor.js:7\nSECRET\nError: x\n', 10_000)).toBe('/opt/devenv/monitor.js:7\nError: x');
+    expect(readableStderr('C:\\devenv\\monitor.js:7\nSECRET\nError: x\n', 10_000)).toBe('C:\\devenv\\monitor.js:7\nError: x');
+    // The header cut off at the cap: the source line is dropped with its caret line.
+    const cut = `nitor.js:7\nconst SECRET = 1;\n      ^\n42\n`;
+    expect(readableStderr(cut.padStart(100, 'h'), 100)).toBe('42');
+    expect(readableStderr('devenv loader: x\nSECRET\n  ^^\nlast', 10_000)).toBe('devenv loader: x\nlast');
+    // Only the line right above a caret line; a line filtered out already takes nothing else with it.
+    expect(readableStderr(`devenv loader: x\n${'y'.repeat(2_000)}\n^\nlast`, 10_000)).toBe('devenv loader: x\nlast');
+    // Not headers: a plain loader line, a line with a colon and a number that is no path, a stack position.
+    expect(readableStderr('devenv loader: the entry failed: 42\nnext', 10_000)).toBe('devenv loader: the entry failed: 42\nnext');
+    expect(readableStderr('Error: port 22\nnext', 10_000)).toBe('Error: port 22\nnext');
+    expect(readableStderr('Error: connect ECONNREFUSED 127.0.0.1:2375\nnext', 10_000)).toBe('Error: connect ECONNREFUSED 127.0.0.1:2375\nnext');
+    expect(readableStderr(`${stack}\nnext`, 10_000)).toBe('at Timeout._onTimeout (/opt/devenv/monitor.js:2:52)\nnext');
+    expect(readableStderr('/opt/devenv/monitor.js:2:52\nnext', 10_000)).toBe('/opt/devenv/monitor.js:2:52\nnext');
+    // A header with leading blanks is recognised (lines are trimmed).
+    expect(readableStderr('  /opt/devenv/monitor.js:2\nSECRET\nlast', 10_000)).toBe('/opt/devenv/monitor.js:2\nlast');
+  });
 });

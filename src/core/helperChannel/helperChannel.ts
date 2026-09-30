@@ -207,7 +207,8 @@ export class HelperChannel {
     });
     void this.process.exited.then(({ exitCode, error }) => {
       // Review round 1 of PR #69 (A-R1-3): only the short lines of the tail reach the log (Node.js prints the source line
-      // of an uncaught error, and the script is one long line).
+      // of an uncaught error, and the script is one long line). Review round 2 of PR #69 (A-R2-3): the
+      // script has short lines too, so readableStderr also drops the source excerpt by its shape.
       const detail = error ? error.message : readableStderr(this.stderrTail, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
       this.lose(`the helper ended (${detail})`);
     });

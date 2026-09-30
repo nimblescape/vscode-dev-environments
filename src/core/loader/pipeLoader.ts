@@ -11,7 +11,8 @@
 //
 // When the file at the path exists already and has the expected hash (a container that was restarted: `docker start`,
 // `docker restart`, a restart policy), the loader starts it without reading the standard input at all. A stored file
-// with another hash is replaced by the bundle from the input.
+// with another hash is replaced by the bundle from the input only on the first start of a container (before the marker
+// exists, below); a later start of that container exits 3 (review round 2 of PR #69, A-R2-4).
 //
 // Review round 1 of PR #69 (A-R1-1): before it reads the input, the loader creates the marker `<path>.started` (and
 // the folder). A loader that finds the marker but no stored file with the hash was started before and never got its
@@ -77,18 +78,41 @@ export function bundleHash(bundle: string): string {
 export const MAX_READABLE_STDERR_LINE = 1_000;
 
 /**
+ * Review round 2 of PR #69 (A-R2-3): the header of the source excerpt that Node.js prints for an uncaught error
+ * (GetErrorSource in src/node_errors.cc): `<filename>:<line>` at column 0, a POSIX or Windows path or `[eval]`. A stack
+ * position (`at f (/p/x.js:1:2)`, STACK_POSITION) has a column too and is no header.
+ */
+const SOURCE_HEADER = /^(?:\/|[A-Za-z]:[\\/]|\[eval).*:\d+$/;
+const STACK_POSITION = /:\d+:\d+\)?$/;
+/** The caret line under the source line of the excerpt (when the column is known). */
+const CARET_LINE = /^\s*\^+\s*$/;
+
+/**
  * Review round 1 of PR #69 (A-R1-3): the lines of the stderr tail of a loader container that may go to the log. `tail`
  * holds at most `cap` characters (the end of stderr); at the cap its first line may be the cut end of a longer one, so it
- * is dropped. Only lines of 1 to MAX_READABLE_STDERR_LINE characters stay (trimmed): Node.js prints the source line of an
- * uncaught error, and a bundle is one long line, which must never reach the log.
+ * is dropped. Only lines of 1 to MAX_READABLE_STDERR_LINE characters stay (trimmed).
+ * Review round 2 of PR #69 (A-R2-3): Node.js prints the source line of an uncaught error, and a bundle has short lines
+ * too (template literals keep their line feeds), so the source excerpt is dropped by its shape: after a header
+ * (SOURCE_HEADER, kept) the next line (the source line) is dropped; a caret line is dropped, and when no header came
+ * before it (the header was cut off at the cap), the kept line right above it (the source line) is dropped too.
  */
 export function readableStderr(tail: string, cap: number): string {
   const lines = tail.split('\n');
   if (tail.length >= cap) lines.shift();
-  return lines
-    .map((line) => line.trim())
-    .filter((line) => line.length >= 1 && line.length <= MAX_READABLE_STDERR_LINE)
-    .join('\n');
+  const kept: Array<{ at: number; line: string }> = [];
+  let sourceAt = -1;
+  lines.forEach((raw, at) => {
+    if (at === sourceAt) return;
+    const line = raw.trim();
+    if (CARET_LINE.test(raw)) {
+      // After a header the source line is dropped already; otherwise the kept line right above is the source line.
+      if (kept[kept.length - 1]?.at === at - 1) kept.pop();
+      return;
+    }
+    if (SOURCE_HEADER.test(line) && !STACK_POSITION.test(line)) sourceAt = at + 1;
+    if (line.length >= 1 && line.length <= MAX_READABLE_STDERR_LINE) kept.push({ at, line });
+  });
+  return kept.map(({ line }) => line).join('\n');
 }
 
 /** The first line of the input: the bundle as a JSON string and a line feed (JSON.stringify escapes every line feed). */

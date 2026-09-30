@@ -95,10 +95,23 @@ export type MonitorExecResult = { ok: true; stdout: string } | { ok: false; miss
 
 /**
  * The state of the monitor container: missing, or its status (`created`, `running`, `paused`, `restarting`, `removing`,
- * `exited`, `dead`), the exit code of its last run, its label, and how often Docker restarted it by its restart policy
- * since its last start by a client (`RestartCount`; 0 when it cannot be read).
+ * `exited`, `dead`), the exit code of its last run, its label, how often Docker restarted it by its restart policy since
+ * its last start by a client (`RestartCount`; 0 when it cannot be read), and its ID (64 hex digits; undefined when it
+ * cannot be read; review round 2 of PR #69, A-R2-2).
  */
-type Inspected = { exists: false } | { exists: true; status: string; exitCode: number | undefined; label: string; restartCount: number };
+type Inspected =
+  | { exists: false }
+  | { exists: true; status: string; exitCode: number | undefined; label: string; restartCount: number; id: string | undefined };
+
+/**
+ * Review round 2 of PR #69 (A-R2-2): what `docker exec <name> sha256sum REMOTE_MONITOR_SCRIPT_PATH` tells about the
+ * stored script: `same` (its hash), `other` (definite evidence of another or no stored script, or a container that does
+ * not run it), `unknown` (the check itself failed: no answer in time, a transport error, an unexpected answer).
+ */
+type StoredScript = 'same' | 'other' | 'unknown';
+
+/** A failed `sha256sum` that shows that no script is stored (coreutils, BusyBox) or that the container does not run. */
+const NO_STORED_SCRIPT = /No such file or directory|can't open|is not running|is restarting|no such container/i;
 
 /** How the attached `docker run` of the monitor ended for ensure. */
 type Created = { kind: 'ready' } | { kind: 'exited'; detail: string; conflict: boolean } | { kind: 'timeout' } | { kind: 'aborted' };
@@ -126,15 +139,21 @@ export class RemoteSessionMonitor {
   /**
    * Makes sure that the monitor container runs the current script with the helper image `helperTag`, by the state of the
    * container with the name (plan step 3, pipe loading):
-   * - the matching label and running or paused → nothing; review round 1 of PR #69 (A-R1-1): when Docker restarted it
-   *   (RestartCount > 0), only when `docker exec … sha256sum` of the stored script gives the hash of the script (a
-   *   restarted container whose first load was cut off has none: its loader exits 3 again and again, or waits),
-   *   otherwise → `docker rm -f`, then create;
+   * - the matching label and running or paused → nothing; review round 1 of PR #69 (A-R1-1): when Docker restarted a
+   *   running one (RestartCount > 0), `docker exec … sha256sum` checks the stored script (a restarted container whose
+   *   first load was cut off has none: its loader exits 3 again and again; only in the rare case of a first run that was
+   *   killed before it wrote its marker does it wait up to 60 s for an input, as `running`, and this check catches it);
+   *   review round 2 of PR #69 (A-R2-1, A-R2-2): only definite evidence of another or no stored script (storedScript
+   *   `other`) → `docker rm -f`, then create; a check that fails keeps it (logged), and a paused one is kept without a
+   *   check (Docker refuses `docker exec` in a paused container);
    * - the matching label and exited with an exit code other than LOADER_EXIT_CODE → `docker start` (the loader resumes
    *   from the stored script);
    * - the matching label and created, restarting, dead, removing, or exited with LOADER_EXIT_CODE (the loader refused
    *   its stored script and its input), another label, or none → `docker rm -f`, then create;
    * - missing → create.
+   * Review round 2 of PR #69 (A-R2-2): `docker rm -f` removes the container by the ID that inspect read (by the name only
+   * when the ID cannot be read), so a window never removes a container that another window created meanwhile: its `rm`
+   * gets "No such container", and its create meets the name conflict, which accepts a matching container that runs.
    * Create: the attached `docker run -i --sig-proxy=false` (runArgs) gets the script as its first input line, and the
    * monitor is up when its output has REMOTE_MONITOR_READY_TEXT within REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then the client
    * is ended. When another window created it meanwhile (a name conflict), it looks once more and accepts a matching one
@@ -168,8 +187,16 @@ export class RemoteSessionMonitor {
         if (isRunning(current.status)) {
           // Review round 1 of PR #69 (A-R1-1): a container that Docker restarted runs its stored script only when it has
           // one; one whose first load was cut off gets a new input without a writer and never its script. RestartCount 0
-          // (a normal open, or the create of another window that is still loading) needs no extra call.
-          if (current.restartCount === 0 || (await this.storesScript(script, signal))) return 'running';
+          // (a normal open, or the create of another window that is still loading) needs no extra call. Review round 2 of
+          // PR #69 (A-R2-1): a paused one is kept without a check (Docker refuses `docker exec` in it).
+          if (current.restartCount === 0 || current.status === 'paused') return 'running';
+          // Review round 2 of PR #69 (A-R2-2): only definite evidence replaces it; a check that fails keeps it.
+          const stored = await this.storedScript(script, signal);
+          if (stored === 'same') return 'running';
+          if (stored === 'unknown') {
+            logger.info(`The Session Monitor on the Docker host was restarted and its stored script could not be checked; it is kept (${this.containerName}).`);
+            return 'running';
+          }
           logger.info(`The Session Monitor on the Docker host was restarted without its script; it is replaced (${this.containerName}).`);
         } else if (current.status === 'exited' && current.exitCode !== LOADER_EXIT_CODE) {
           await this.docker(['start', this.containerName], signal);
@@ -182,7 +209,8 @@ export class RemoteSessionMonitor {
       } else if (current.exists) {
         logger.info(`The Session Monitor on the Docker host is of another version; it is replaced (${this.containerName}).`);
       }
-      if (current.exists) await this.docker(['rm', '-f', this.containerName], signal);
+      // Review round 2 of PR #69 (A-R2-2): by its ID, so never a container that another window created meanwhile.
+      if (current.exists) await this.docker(['rm', '-f', current.id ?? this.containerName], signal);
       const created = await this.create(runArgs, scriptLine, signal);
       if (created.kind === 'ready') {
         logger.info(`The Session Monitor on the Docker host was created (${this.containerName}, image ${helperTag}).`);
@@ -243,7 +271,8 @@ export class RemoteSessionMonitor {
       });
       void client.exited.then(({ exitCode, error }) => {
         // Review round 1 of PR #69 (A-R1-3): the conflict is recognised in the whole tail, but only its short lines are
-        // logged (Node.js prints the source line of an uncaught error, and the script is one long line).
+        // logged (Node.js prints the source line of an uncaught error, and the script is one long line). Review round 2 of PR #69 (A-R2-3): the
+        // script has short lines too, so readableStderr also drops the source excerpt by its shape.
         const detail = error ? error.message : readableStderr(stderr, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
         settle({ kind: 'exited', detail, conflict: /conflict|already in use/i.test(stderr) });
       });
@@ -280,21 +309,30 @@ export class RemoteSessionMonitor {
   }
 
   /**
-   * Review round 1 of PR #69 (A-R1-1): true when the running container holds the script (`docker exec <name> sha256sum
-   * REMOTE_MONITOR_SCRIPT_PATH` gives its bundleHash). Any failure is false (the container is replaced); a cancellation
-   * passes.
+   * Review round 1 of PR #69 (A-R1-1), review round 2 (A-R2-2): whether the running container holds the script
+   * (`docker exec <name> sha256sum REMOTE_MONITOR_SCRIPT_PATH`, StoredScript). Exit 0 with its bundleHash → `same`; exit
+   * 0 with another hash of 64 hex digits → `other`; a failed call whose stderr says that no file is stored or that the
+   * container does not run (NO_STORED_SCRIPT) → `other`. No answer in time, a thrown error, another answer, or another
+   * stderr → `unknown`. A cancellation passes.
    */
-  private async storesScript(script: string, signal: AbortSignal | undefined): Promise<boolean> {
+  private async storedScript(script: string, signal: AbortSignal | undefined): Promise<StoredScript> {
+    let result: RunResult;
     try {
-      const result = await this.options.docker.run(['exec', this.containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH], {
+      result = await this.options.docker.run(['exec', this.containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH], {
         timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS,
         signal,
       });
-      return result.exitCode === 0 && !result.timedOut && result.stdout.trim().split(/\s+/)[0] === bundleHash(script);
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return false;
+      return 'unknown';
     }
+    if (result.timedOut) return 'unknown';
+    if (result.exitCode === 0) {
+      const hash = result.stdout.trim().split(/\s+/)[0] ?? '';
+      if (!/^[0-9a-f]{64}$/.test(hash)) return 'unknown';
+      return hash === bundleHash(script) ? 'same' : 'other';
+    }
+    return NO_STORED_SCRIPT.test(result.stderr) ? 'other' : 'unknown';
   }
 
   /** One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). */
@@ -402,17 +440,18 @@ export class RemoteSessionMonitor {
   }
 
   private async inspect(signal: AbortSignal | undefined): Promise<Inspected> {
-    const args = ['container', 'inspect', '--format', `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}\t{{json .RestartCount}}`, this.containerName];
+    const args = ['container', 'inspect', '--format', `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}\t{{json .RestartCount}}\t{{json .Id}}`, this.containerName];
     const result = await this.options.docker.run(args, { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
     if (result.exitCode !== 0) {
       if (isMissingContainer(result)) return { exists: false };
       throw new Error(`docker container inspect failed: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
     }
-    const [statusText = '', exitCodeText = '', labelsText = '', restartCountText = ''] = result.stdout.trim().split('\t');
+    const [statusText = '', exitCodeText = '', labelsText = '', restartCountText = '', idText = ''] = result.stdout.trim().split('\t');
     const status = parseJson(statusText);
     const exitCode = parseJson(exitCodeText);
     const labels = parseJson(labelsText);
     const restartCount = parseJson(restartCountText);
+    const id = parseJson(idText);
     const value = typeof labels === 'object' && labels !== null ? (labels as Record<string, unknown>)[LABEL_SESSION_MONITOR] : undefined;
     return {
       exists: true,
@@ -420,6 +459,7 @@ export class RemoteSessionMonitor {
       exitCode: typeof exitCode === 'number' && Number.isInteger(exitCode) ? exitCode : undefined,
       label: typeof value === 'string' ? value : '',
       restartCount: typeof restartCount === 'number' && Number.isInteger(restartCount) && restartCount > 0 ? restartCount : 0,
+      id: typeof id === 'string' && /^[0-9a-f]{64}$/.test(id) ? id : undefined,
     };
   }
 

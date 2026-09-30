@@ -144,6 +144,25 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     expect(JSON.stringify(lines)).not.toContain('yyyyyyyyyy');
   });
 
+  it('B-R2-1: at the cap of the stderr tail its first line (the cut end of a longer one) is not in the reason, even when it is short', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    const rest = `${'short line\n'.repeat(300)}devenv loader: x\n`;
+    const cut = 4_000 - rest.length - 1;
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThanOrEqual(1_000);
+    crashed.stderr(`${'z'.repeat(10_000)}\n${rest}`);
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toContain('short line\ndevenv loader: x)');
+    expect(failure?.message).not.toContain('z');
+    expect(JSON.stringify(lines)).not.toContain('zzz');
+  });
+
   it('review round 1 of PR #69 (B-R1-5): a script whose line is exactly MAX_BUNDLE_LINE_LENGTH is written', async () => {
     const fake = fakeProcess();
     const { logger } = recordingLogger();

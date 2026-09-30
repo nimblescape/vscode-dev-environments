@@ -278,8 +278,13 @@ describe('the Session Monitor container of a remote Docker host', () => {
     }
     const interrupted = cli.container(containerName)!;
     expect(interrupted.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
-    expect(cli.run(['exec', containerName, 'test', '-f', REMOTE_MONITOR_SCRIPT_PATH]).code).not.toBe(0);
+    // Review round 2 of PR #69 (A-R2-5): changed expectation (before: `docker exec … test -f` not 0, which a restarting
+    // container fails anyway, as Docker refuses the exec): `docker cp` reads the file system of a container in any state.
+    const copied = cli.run(['cp', `${containerName}:${REMOTE_MONITOR_SCRIPT_PATH}`, '-']);
+    expect(copied.code).not.toBe(0);
+    expect(copied.err).toMatch(/Could not find the file/);
     expect(await monitor.ensure(helperTag, socket)).toBe('created');
+    expect(cli.run(['cp', `${containerName}:${REMOTE_MONITOR_SCRIPT_PATH}`, '-']).code).toBe(0);
     const details = cli.container(containerName)!;
     expect(details.Id).not.toBe(interrupted.Id);
     expect(details.State.Running).toBe(true);
