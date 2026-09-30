@@ -23,6 +23,7 @@ import {
   GIT_SUMMARY_TIMEOUT_MS,
   MAX_FAILED_TICKS,
   MonitorLoop,
+  defaultMeasureFromTickEnd,
   devContainerFirst,
   environmentLabel,
   type MonitorDocker,
@@ -767,6 +768,21 @@ describe('MonitorLoop.tick', () => {
       uptime += TICK_MS;
       await h.loop.tick();
       expect(h.loop.state.sleepGraceUntil).toBe(h.clock.time + SLEEP_GRACE_MS);
+    });
+
+    // PR #70 review round 2 (B-R2-1): the default is off only on Windows, where performance.now() counts sleep.
+    it('measures from the end of the tick by default except on Windows', () => {
+      expect(defaultMeasureFromTickEnd('win32')).toBe(false);
+      expect(defaultMeasureFromTickEnd('linux')).toBe(true);
+      expect(defaultMeasureFromTickEnd('darwin')).toBe(true);
+    });
+
+    // PR #70 review round 2 (B-R2-1): a loop without the setting uses the default of this platform.
+    it('uses the platform default when measureFromTickEnd is not given', async () => {
+      h.loop = h.newLoop({ uptime: () => uptime });
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(defaultMeasureFromTickEnd() ? end : end - HANG_MS);
+      h.docker.stopHook = undefined;
     });
 
     // PR #70 review round 1: on Windows, performance.now() counts sleep, so the gap is measured from the tick start.

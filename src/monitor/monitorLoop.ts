@@ -165,6 +165,11 @@ export interface MonitorLoopDeps {
   measureFromTickEnd?: boolean;
 }
 
+/** PR #70 review round 2 (B-R2-1): the default of `measureFromTickEnd`, not on Windows. */
+export function defaultMeasureFromTickEnd(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32';
+}
+
 /** Why the monitor ends. */
 export type MonitorEndReason = 'idle' | 'lockLost' | 'stopRequested' | 'failing';
 
@@ -238,7 +243,7 @@ export class MonitorLoop {
     this.tickMs = deps.tickMs ?? TICK_MS;
     this.delay = deps.delay ?? sleep;
     this.uptime = deps.uptime ?? (() => performance.now());
-    this.measureFromTickEnd = deps.measureFromTickEnd ?? process.platform !== 'win32';
+    this.measureFromTickEnd = deps.measureFromTickEnd ?? defaultMeasureFromTickEnd();
   }
 
   /** State of the rules after the last tick. */
