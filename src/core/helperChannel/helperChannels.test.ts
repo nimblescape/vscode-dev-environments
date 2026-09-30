@@ -9,6 +9,7 @@ import { silentLogger, type Logger, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError } from './helperChannel';
 import {
   CHANNEL_OPEN_WAIT_MS,
+  CHANNEL_PROBE_TIMEOUT_MS,
   CHANNEL_RETRY_AFTER_FAILURE_MS,
   HelperChannels,
   channelRunArgs,
@@ -438,14 +439,14 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
 
   it('opens for the local Docker when the engine is the one without the worker, compared in the context of the target', async () => {
     const worker = probeProcess(ENGINE);
-    const direct: { args: readonly string[]; context: string | undefined }[] = [];
+    const direct: { args: readonly string[]; context: string | undefined; timeoutMs: number | undefined }[] = [];
     const target = dockerTargetOf('unix:///run/user/1000/docker.sock', 'rootless');
     expect(target.kind).toBe('local');
     const channel = await openHelperChannel(
       {
         start: () => worker.process,
-        runDirect: async (args) => {
-          direct.push({ args, context: operationDockerTarget()?.context });
+        runDirect: async (args, options) => {
+          direct.push({ args, context: operationDockerTarget()?.context, timeoutMs: options?.timeoutMs });
           return { exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false };
         },
         logger: silentLogger,
@@ -456,7 +457,10 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
       target,
     );
     expect(channel.isOpen).toBe(true);
-    expect(direct).toEqual([{ args: ['info', '--format', '{{json .ID}} {{json .DockerRootDir}}'], context: 'rootless' }]);
+    // PR #71 review round 1 (B-R1-1): the direct call has a time limit, so a hanging engine cannot keep the open pending.
+    expect(direct).toEqual([
+      { args: ['info', '--format', '{{json .ID}} {{json .DockerRootDir}}'], context: 'rootless', timeoutMs: CHANNEL_PROBE_TIMEOUT_MS },
+    ]);
     channel.close();
   });
 
