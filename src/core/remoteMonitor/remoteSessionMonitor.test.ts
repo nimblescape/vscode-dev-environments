@@ -18,7 +18,13 @@ import {
   imagePrefixesOf,
   remoteMonitorLabelValue,
 } from './protocol';
-import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, REMOTE_MONITOR_LOG_OPTIONS, RemoteSessionMonitor, isMissingContainer } from './remoteSessionMonitor';
+import {
+  REMOTE_MONITOR_CONFLICT_WAITS_MS,
+  REMOTE_MONITOR_DOCKER_TIMEOUT_MS,
+  REMOTE_MONITOR_LOG_OPTIONS,
+  RemoteSessionMonitor,
+  isMissingContainer,
+} from './remoteSessionMonitor';
 
 const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';
@@ -540,7 +546,20 @@ describe('RemoteSessionMonitor.ensure (review round 1 of PR #69)', () => {
     ['a container that is not running', result(1, '', 'Error response from daemon: container 4f1c2a9e is not running\n')],
     ['a container that is restarting', result(1, '', 'Error response from daemon: Container 4f1c2a9e is restarting, wait until the container is running\n')],
     ['a container that is gone', result(1, '', 'Error response from daemon: No such container: devenv-session-monitor\n')],
-    ['a stored script that cannot be read (BusyBox)', result(1, '', `sha256sum: can't open '${REMOTE_MONITOR_SCRIPT_PATH}': Permission denied\n`)],
+    // Review round 3 of PR #69 (B-R3-1): the forms of the CLI, the daemon and the runtime, each at the start of a line.
+    ['a container that is gone (the CLI)', result(1, '', 'Error: No such container: devenv-session-monitor\n')],
+    ['a container that is restarting (its full ID)', result(1, '', `Error response from daemon: Container ${MONITOR_ID} is restarting, wait until the container is running\n`)],
+    // Review round 3 of PR #69 (A-R3-5): the runtime refuses the exec in a container that stopped between two restarts.
+    ['a container that stopped (the OCI runtime)', result(126, '', 'OCI runtime exec failed: exec failed: cannot exec in a stopped container: unknown\n')],
+    [
+      'a container that stopped (the OCI runtime, from the daemon)',
+      result(126, '', 'Error response from daemon: OCI runtime exec failed: exec failed: cannot exec in a stopped container: unknown\n'),
+    ],
+    ['a container that stopped (the older runc wording)', result(126, '', 'OCI runtime exec failed: exec failed: cannot exec a container that has stopped: unknown\n')],
+    // Review round 3 of PR #69 (A-R3-5): after the stream was hijacked, the daemon writes the error to the stdout of the exec.
+    ['a container that stopped (the OCI runtime, on stdout, exit 126)', result(126, 'OCI runtime exec failed: exec failed: cannot exec in a stopped container: unknown\r\n', '')],
+    // Review round 3 of PR #69 (A-R3-4): changed expectation (before: here, replaced): a stored script that cannot be read
+    // (BusyBox's `can't open … Permission denied`) is no evidence of another or no script; it is in `keeping` now.
   ] as const;
   // Review round 2 of PR #69 (A-R2-2): a check that fails is no evidence; the monitor is kept.
   const keeping = [
@@ -551,6 +570,25 @@ describe('RemoteSessionMonitor.ensure (review round 1 of PR #69)', () => {
     ['an SSH failure', result(255, '', 'error during connect: ssh: connect to host build-box port 22: Connection refused\n')],
     ['an empty answer', result(0, '')],
     ['a failed call that printed the hash', result(1, `${bundleHash(SCRIPT)}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`, 'error')],
+    // Review round 3 of PR #69 (A-R3-4): changed expectation (before: in `replacing`): a stored script that cannot be read
+    // is no evidence, for BusyBox as for coreutils.
+    ['a stored script that cannot be read (BusyBox)', result(1, '', `sha256sum: can't open '${REMOTE_MONITOR_SCRIPT_PATH}': Permission denied\n`)],
+    ['a stored script that cannot be read (coreutils)', result(1, '', `sha256sum: ${REMOTE_MONITOR_SCRIPT_PATH}: Permission denied\n`)],
+    // Review round 3 of PR #69 (B-R3-1): "No such file or directory" of the transport is no evidence of the stored script.
+    [
+      'an SSH failure whose stderr names a missing identity file',
+      result(
+        255,
+        '',
+        'error during connect: Get "http://docker.example.com/v1.47/exec/1/json": command [ssh -- build-box docker system dial-stdio] has exited with exit status 255, make sure the URL is valid, and Docker 18.09 or later is installed on the remote host: stderr=Warning: Identity file /home/u/.ssh/id_devenv not accessible: No such file or directory.\n',
+      ),
+    ],
+    ['a missing daemon socket', result(1, '', 'Error response from daemon: dial unix /var/run/docker.sock: connect: no such file or directory\n')],
+    // Review round 3 of PR #69 (verifier notes): another failure of the OCI runtime is no evidence that the container stopped.
+    [
+      'another failure of the OCI runtime',
+      result(126, '', 'OCI runtime exec failed: exec failed: unable to start container process: exec: "sha256sum": executable file not found in $PATH: unknown\n'),
+    ],
   ] as const;
   const answering = (state: string, answer: RunResult | Error) =>
     new FakeDocker((args) => {
@@ -946,4 +984,228 @@ describe('RemoteSessionMonitor: images', () => {
     expect(await monitor(failing, log).images([])).toBe(false);
     expect(log.lines).toEqual(['warn The image list could not be given to the Session Monitor: Invalid image list.']);
   });
+});
+
+// Review round 3 of PR #69 (A-R3-1, A-R3-2): two windows that replace or create the monitor at the same time. The `rm`
+// of the old monitor tolerates a removal in progress; a name conflict of the create waits a few seconds while the
+// container of the name is `created` or `removing`, accepts only a matching running or paused one, creates once more when
+// the name became free, and never removes anything but the container of its own nonce.
+describe('RemoteSessionMonitor.ensure (review round 3 of PR #69, A-R3)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const IN_PROGRESS = result(1, '', `Error response from daemon: removal of container ${MONITOR_ID} is already in progress\n`);
+  /** The first create meets the name conflict; the next one (if any) starts. */
+  const conflictThenStarts = (docker: () => FakeDocker) => (client: FakeClient) => {
+    if (docker().clients.indexOf(client) === 0) {
+      client.complain(CONFLICT);
+      client.exit(125);
+    } else {
+      STARTS(client);
+    }
+  };
+  const alwaysConflict = (client: FakeClient) => {
+    client.complain(CONFLICT);
+    client.exit(125);
+  };
+  /** The answers of the inspects in their order; the last one repeats. */
+  const inspects = (...answers: RunResult[]) => {
+    let at = 0;
+    return () => answers[Math.min(at++, answers.length - 1)];
+  };
+  const removals = (docker: FakeDocker) => docker.calls.filter((call) => call.args[0] === 'rm' || call.args[0] === 'ps');
+
+  it('A-R3-1: an rm that finds the removal already in progress goes on; the create waits for the name and creates once more', async () => {
+    vi.useFakeTimers();
+    const logger = new Log();
+    const next = inspects(inspected(true, 'old-label'), inspected('removing', 'old-label'), MISSING);
+    const docker: FakeDocker = new FakeDocker(
+      (args) => (args[0] === 'container' ? next() : args[0] === 'rm' ? IN_PROGRESS : result(0)),
+      conflictThenStarts(() => docker),
+    );
+    const ensured = monitor(docker, logger).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await ensured).toBe('created');
+    expect(docker.commands()).toEqual(['inspect', 'rm', 'run', 'inspect', 'inspect', 'run']);
+    // Only the old monitor by its ID, once; nothing in the conflict loop.
+    expect(removals(docker).map((call) => call.args)).toEqual([['rm', '-f', MONITOR_ID]]);
+    const runs = docker.calls.filter((call) => call.args[0] === 'run');
+    expect(createIdOf(runs[1].args)).toBe(createIdOf(runs[0].args));
+    expect(docker.clients[1].written).toEqual([encodeBundle(SCRIPT)]);
+    expect(logger.lines.some((line) => line.startsWith('warn'))).toBe(false);
+  });
+
+  it('A-R3-1: an rm that fails otherwise still fails, without a create', async () => {
+    for (const answer of [
+      result(1, '', 'Error response from daemon: permission denied\n'),
+      { exitCode: null, stdout: '', stderr: `removal of container ${MONITOR_ID} is already in progress`, timedOut: true } as unknown as RunResult,
+    ]) {
+      const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, 'old-label') : args[0] === 'rm' ? answer : result(0)));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+      expect(docker.commands()).toEqual(['inspect', 'rm']);
+    }
+  });
+
+  it('A-R3-2: a conflict with a matching container that another window is still creating waits until it runs', async () => {
+    vi.useFakeTimers();
+    const next = inspects(MISSING, inspected('created', LABEL), inspected('created', LABEL), inspected(true, LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await ensured).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect', 'inspect', 'inspect']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R3-2: a paused matching container after a removal is accepted too', async () => {
+    vi.useFakeTimers();
+    const next = inspects(MISSING, inspected('removing', 'old-label'), inspected('paused', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await ensured).toBe('running');
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R3-2: a container that is still created after a few seconds is a failure, never accepted and never removed', async () => {
+    vi.useFakeTimers();
+    const logger = new Log();
+    const next = inspects(MISSING, inspected('created', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    let settled = false;
+    const ensured = monitor(docker, logger)
+      .ensure(TAG, SOCKET)
+      .finally(() => (settled = true));
+    const total = REMOTE_MONITOR_CONFLICT_WAITS_MS.reduce((sum, ms) => sum + ms, 0);
+    // A few seconds in all.
+    expect(total).toBeGreaterThanOrEqual(2_000);
+    expect(total).toBeLessThanOrEqual(5_000);
+    await vi.advanceTimersByTimeAsync(total - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', ...REMOTE_MONITOR_CONFLICT_WAITS_MS.map(() => 'inspect'), 'inspect']);
+    expect(removals(docker)).toEqual([]);
+    expect(logger.lines.join('\n')).toMatch(/warn The Session Monitor on the Docker host could not be started: docker run failed: .*already in use/);
+  });
+
+  it('A-R3-2: a running container of another label after a removal is a failure, not removed', async () => {
+    vi.useFakeTimers();
+    const next = inspects(MISSING, inspected('removing', LABEL), inspected(true, 'other-label'));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect', 'inspect']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R3-2: another status (restarting) fails at once, without a wait', async () => {
+    const next = inspects(MISSING, inspected('restarting', LABEL, 3));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect']);
+  });
+
+  it('A-R3-1: when the name is free after a conflict, the create is tried once more only', async () => {
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0)), alwaysConflict);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect', 'run', 'inspect']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R3-1: a create once more that fails otherwise removes only the container of its own nonce', async () => {
+    const docker: FakeDocker = new FakeDocker(
+      (args) => (args[0] === 'container' ? MISSING : args[0] === 'ps' ? result(0, `${CREATED_ID}\n`) : result(0)),
+      (client) => (docker.clients.indexOf(client) === 0 ? alwaysConflict(client) : client.exit(1)),
+    );
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect', 'run', 'ps', 'rm']);
+    expect(docker.calls[4].args).toEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_MONITOR_CREATE}=${createIdOf(docker.calls[3].args)}`]);
+    expect(docker.calls[5].args).toEqual(['rm', '-f', CREATED_ID]);
+  });
+
+  it('A-R3-2: a cancellation during a wait of the conflict passes at once, and nothing is removed', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const next = inspects(MISSING, inspected('created', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET, controller.signal);
+    const rejected = expect(ensured).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect']);
+    controller.abort();
+    await rejected;
+    expect(docker.commands()).toEqual(['inspect', 'run', 'inspect']);
+    expect(removals(docker)).toEqual([]);
+    // The inspects of the conflict get the signal.
+    expect(docker.calls[2].options?.signal).toBe(controller.signal);
+  });
+});
+
+// Review round 3 of PR #69: the tests of reviewer B (mutation testing).
+describe('RemoteSessionMonitor.ensure (review round 3 of PR #69, B-R3)', () => {
+  const SHA = ['exec', 'devenv-session-monitor', 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH];
+  const restartedWith = (answer: RunResult) =>
+    new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL, 0, 1) : args[0] === 'exec' ? answer : result(0)));
+
+  // B-R3-1: NO_STORED_SCRIPT is searched in the whole stderr, so a transport failure whose stderr has an unrelated
+  // "No such file or directory" (an SSH warning, a missing socket) replaces a running monitor on no evidence.
+  for (const [what, stderr] of [
+    ['an SSH warning about an identity file, then a reset connection', 'Warning: Identity file /home/u/.ssh/id_devenv not accessible: No such file or directory.\nerror during connect: Get "http://docker.example.com/v1.47/containers/devenv-session-monitor/json": read: connection reset by peer\n'],
+    ['a missing known_hosts file, then a failed connection', 'hostfile_replace_entries: link /home/u/.ssh/known_hosts to /home/u/.ssh/known_hosts.old: No such file or directory\nssh: connect to host build-box port 22: Connection timed out\n'],
+  ] as const) {
+    it(`B-R3-1: a failed check with ${what} keeps the monitor`, async () => {
+      const docker = restartedWith(result(255, '', stderr));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect', 'exec']);
+    });
+  }
+
+  // B-R3-2: an answer of exit 0 that is no hash of 64 lower-case hex digits is no evidence (hash-i, hash-noStart,
+  // hash-noEnd, hash-plus survived).
+  for (const [what, stdout] of [
+    ['the hash in upper case', `${bundleHash(SCRIPT).toUpperCase()}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`],
+    ['a hash with a prefix', `\\${bundleHash(`${SCRIPT}x`)}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`],
+    ['65 hex digits', `${bundleHash(`${SCRIPT}x`)}0  ${REMOTE_MONITOR_SCRIPT_PATH}\n`],
+    ['63 hex digits', `${bundleHash(`${SCRIPT}x`).slice(1)}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`],
+  ] as const) {
+    it(`B-R3-2: an answer with ${what} keeps the monitor`, async () => {
+      const docker = restartedWith(result(0, stdout));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      expect(docker.calls[1].args).toEqual(SHA);
+    });
+  }
+
+  // B-R3-3: the removal of the old monitor gets the signal of ensure (M-rmNoSignal survived): a cancellation of the open
+  // must not wait up to 60 s for it.
+  it('B-R3-3: the removal of the old monitor gets the signal of ensure', async () => {
+    const controller = new AbortController();
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, 'old-label') : result(0)));
+    expect(await monitor(docker).ensure(TAG, SOCKET, controller.signal)).toBe('created');
+    expect(docker.calls[1].args).toEqual(['rm', '-f', MONITOR_ID]);
+    expect(docker.calls[1].options?.signal).toBe(controller.signal);
+  });
+
+  // B-R3-4: the cleanup of a failed create removes only what `docker ps -aq --no-trunc` listed as a full ID
+  // (M-rbe-filterOff survived): never a name or another word of the output.
+  it('B-R3-4: the cleanup of a failed create removes only full IDs of its list', async () => {
+    const docker = new FakeDocker(
+      (args) => (args[0] === 'container' ? MISSING : args[0] === 'ps' ? result(0, `devenv-session-monitor\n${CREATED_ID.slice(0, 12)}\n${CREATED_ID}\n`) : result(0)),
+      (client) => client.exit(1),
+    );
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
+    expect(docker.calls.filter((call) => call.args[0] === 'rm').map((call) => call.args)).toEqual([['rm', '-f', CREATED_ID]]);
+  });
+
+  // B-R3-5: an ID that is not exactly 64 lower-case hex digits is not used (id-noStart, id-noEnd survived).
+  for (const id of [`x${MONITOR_ID}`, `${MONITOR_ID}0`]) {
+    it(`B-R3-5: an inspected ID ${id.startsWith('x') ? 'with a prefix' : 'with a suffix'} is not used for the removal`, async () => {
+      const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, 'old-label', 0, 0, id) : result(0)));
+      expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('created');
+      expect(docker.calls[1].args).toEqual(['rm', '-f', 'devenv-session-monitor']);
+    });
+  }
 });

@@ -110,8 +110,28 @@ type Inspected =
  */
 type StoredScript = 'same' | 'other' | 'unknown';
 
-/** A failed `sha256sum` that shows that no script is stored (coreutils, BusyBox) or that the container does not run. */
-const NO_STORED_SCRIPT = /No such file or directory|can't open|is not running|is restarting|no such container/i;
+/**
+ * A failed `sha256sum` that shows that no script is stored (coreutils, BusyBox) or that the container does not run.
+ * Review round 3 of PR #69 (B-R3-1): each alternative is tied to the start of a line of its source (`sha256sum`, the
+ * daemon or the CLI, the OCI runtime), so an unrelated line of a transport failure (an SSH warning about an identity
+ * file, a missing daemon socket) that also says "No such file or directory" is no evidence; a miss counts as `unknown`
+ * (kept). A-R3-4: a stored script that cannot be read (`Permission denied`, BusyBox or coreutils) is no evidence of
+ * another or no script either (before, BusyBox's `can't open` counted). A-R3-5: the runtime's refusal of an exec in a
+ * container that stopped between two restarts is evidence that it does not run (the wording of newer runc and the older
+ * one).
+ */
+const NO_STORED_SCRIPT =
+  /^sha256sum: .*No such file or directory|^(?:Error response from daemon|Error): (?:No such container: |container \S+ is (?:not running|restarting)\b)|^(?:Error response from daemon: )?OCI runtime exec failed: exec failed: cannot exec (?:in a stopped container|a container that has stopped)\b/im;
+
+/** Review round 3 of PR #69 (A-R3-1): another window removes the same container right now; its removal goes on. */
+const REMOVAL_IN_PROGRESS = /removal of container .* is already in progress/i;
+
+/**
+ * Review round 3 of PR #69 (A-R3-1, A-R3-2): the waits (ms) between the looks at the container after a name conflict of
+ * the create while that container is `created` (the attached `docker run` of another window between its create and its
+ * start) or `removing` (the old monitor that another window removes): 3.75 s in all.
+ */
+export const REMOTE_MONITOR_CONFLICT_WAITS_MS: readonly number[] = [250, 500, 1_000, 1_000, 1_000];
 
 /** How the attached `docker run` of the monitor ended for ensure. */
 type Created = { kind: 'ready' } | { kind: 'exited'; detail: string; conflict: boolean } | { kind: 'timeout' } | { kind: 'aborted' };
@@ -154,10 +174,15 @@ export class RemoteSessionMonitor {
    * Review round 2 of PR #69 (A-R2-2): `docker rm -f` removes the container by the ID that inspect read (by the name only
    * when the ID cannot be read), so a window never removes a container that another window created meanwhile: its `rm`
    * gets "No such container", and its create meets the name conflict, which accepts a matching container that runs.
+   * Review round 3 of PR #69 (A-R3-1): an `rm` that finds the removal of that container already in progress (another
+   * window removes it) is tolerated too, and the create goes on to the name conflict.
    * Create: the attached `docker run -i --sig-proxy=false` (runArgs) gets the script as its first input line, and the
    * monitor is up when its output has REMOTE_MONITOR_READY_TEXT within REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then the client
-   * is ended. When another window created it meanwhile (a name conflict), it looks once more and accepts a matching one
-   * that runs. Any other failure (no ready line in time, the container ended, a cancellation) kills the client and
+   * is ended. Review round 3 of PR #69 (A-R3-1, A-R3-2): on a name conflict (another window creates or removes the
+   * container meanwhile) it looks again (resolveConflict): while that container is `created` or `removing` it waits and
+   * looks again, a few seconds at most (REMOTE_MONITOR_CONFLICT_WAITS_MS); a matching one that runs or is paused is
+   * accepted; when the name is free, the create is tried once more (once only); anything else (still `created` after the
+   * waits, another label, another status) fails. Nothing is removed there: the container is not ours. Any other failure (no ready line in time, the container ended, a cancellation) kills the client and
    * removes the container of this create (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
    * #69, A-R1-2: never by its name). `socketPath`: the source of the socket mount on the host of the
    * engine (as for the workspace helper, rootless aware). `helperImage`: the image reference of `docker run` when it is
@@ -211,17 +236,25 @@ export class RemoteSessionMonitor {
       }
       // Review round 2 of PR #69 (A-R2-2): by its ID, so never a container that another window created meanwhile.
       if (current.exists) await this.docker(['rm', '-f', current.id ?? this.containerName], signal);
-      const created = await this.create(runArgs, scriptLine, signal);
+      let created = await this.create(runArgs, scriptLine, signal);
+      let triedAgain = false;
+      // Another window creates or removes it at the same time: accept it when it is the same version and runs. It is not
+      // ours, so it is not removed. Review round 3 of PR #69 (A-R3-1, A-R3-2): wait while it is being created or removed,
+      // and create once more when the name became free. A create that met the conflict made no container, so the nonce
+      // of this create stays that of the next one.
+      while (created.kind === 'exited' && created.conflict) {
+        const found = await this.resolveConflict(label, signal);
+        if (found === 'running') return 'running';
+        if (found === 'missing' && !triedAgain) {
+          triedAgain = true;
+          created = await this.create(runArgs, scriptLine, signal);
+          continue;
+        }
+        throw new Error(`docker run failed: ${created.detail}`);
+      }
       if (created.kind === 'ready') {
         logger.info(`The Session Monitor on the Docker host was created (${this.containerName}, image ${helperTag}).`);
         return 'created';
-      }
-      // Another window created it at the same time: accept it when it is the same version and runs. It is not ours, so it
-      // is not removed.
-      if (created.kind === 'exited' && created.conflict) {
-        const again = await this.inspect(signal);
-        if (again.exists && again.label === label && isRunning(again.status)) return 'running';
-        throw new Error(`docker run failed: ${created.detail}`);
       }
       await this.removeBestEffort(createId);
       if (created.kind === 'aborted') throw abortError();
@@ -235,6 +268,23 @@ export class RemoteSessionMonitor {
         `The Session Monitor on the Docker host could not be started: ${errorMessage(error)} Without it, a container there stops after its waiting time only while this computer is online and Docker is set to that host.`,
       );
       return 'failed';
+    }
+  }
+
+  /**
+   * Review round 3 of PR #69 (A-R3-1, A-R3-2): what the container of the name is after a name conflict of the create:
+   * `running` (the matching label, running or paused), `missing` (the name is free again), or `other` (anything else,
+   * also a container that is still `created` or `removing` after the waits of REMOTE_MONITOR_CONFLICT_WAITS_MS). Only
+   * inspects: it never removes anything. A cancellation during a wait passes (AbortError).
+   */
+  private async resolveConflict(label: string, signal: AbortSignal | undefined): Promise<'running' | 'missing' | 'other'> {
+    for (let attempt = 0; ; attempt += 1) {
+      const found = await this.inspect(signal);
+      if (!found.exists) return 'missing';
+      if (found.label === label && isRunning(found.status)) return 'running';
+      const passing = found.status === 'created' || found.status === 'removing';
+      if (!passing || attempt >= REMOTE_MONITOR_CONFLICT_WAITS_MS.length) return 'other';
+      await wait(REMOTE_MONITOR_CONFLICT_WAITS_MS[attempt], signal);
     }
   }
 
@@ -313,7 +363,10 @@ export class RemoteSessionMonitor {
    * (`docker exec <name> sha256sum REMOTE_MONITOR_SCRIPT_PATH`, StoredScript). Exit 0 with its bundleHash → `same`; exit
    * 0 with another hash of 64 hex digits → `other`; a failed call whose stderr says that no file is stored or that the
    * container does not run (NO_STORED_SCRIPT) → `other`. No answer in time, a thrown error, another answer, or another
-   * stderr → `unknown`. A cancellation passes.
+   * stderr → `unknown`. A cancellation passes. Review round 3 of PR #69 (A-R3-5): when the exec fails after the stream
+   * was hijacked (the runtime's refusal of an exec in a container that just stopped), the daemon writes the error to the
+   * stdout of the exec and the CLI exits 126, so a failed call is matched on stderr and stdout; every alternative of
+   * NO_STORED_SCRIPT starts a line, so a hash on stdout never matches.
    */
   private async storedScript(script: string, signal: AbortSignal | undefined): Promise<StoredScript> {
     let result: RunResult;
@@ -332,7 +385,7 @@ export class RemoteSessionMonitor {
       if (!/^[0-9a-f]{64}$/.test(hash)) return 'unknown';
       return hash === bundleHash(script) ? 'same' : 'other';
     }
-    return NO_STORED_SCRIPT.test(result.stderr) ? 'other' : 'unknown';
+    return NO_STORED_SCRIPT.test(`${result.stderr}\n${result.stdout}`) ? 'other' : 'unknown';
   }
 
   /** One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). */
@@ -465,10 +518,31 @@ export class RemoteSessionMonitor {
 
   private async docker(args: readonly string[], signal: AbortSignal | undefined): Promise<void> {
     const result = await this.options.docker.run(args, { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
-    if (result.exitCode !== 0 && !(args[0] === 'rm' && isMissingContainer(result))) {
+    // Review round 3 of PR #69 (A-R3-1): an `rm` whose container is gone or is being removed by another window already.
+    const tolerated = args[0] === 'rm' && (isMissingContainer(result) || (!result.timedOut && REMOVAL_IN_PROGRESS.test(result.stderr)));
+    if (result.exitCode !== 0 && !tolerated) {
       throw new Error(`docker ${args[0]} failed: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
     }
   }
+}
+
+/** Review round 3 of PR #69 (A-R3-1, A-R3-2): waits `ms`; a cancellation ends the wait with an AbortError. */
+function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function parseJson(text: string): unknown {
