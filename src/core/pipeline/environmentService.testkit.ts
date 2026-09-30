@@ -690,6 +690,16 @@ export class FakeHelper implements EnvironmentHelper {
     return { tag: 'devenv-helper:test', id: this.currentHelperImageId };
   }
 
+  /**
+   * PR #74 review round 1 (A-R1-1): the non-maintaining ensure before the environment lock, recorded in `calls` as
+   * `ensureImagePresent`; fails with `ensureImageError` like ensureImageUse.
+   */
+  async ensureImagePresent(_options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
+    this.calls.push('ensureImagePresent');
+    if (this.ensureImageError) throw this.ensureImageError;
+    return { tag: 'devenv-helper:test', id: this.currentHelperImageId };
+  }
+
   async clone(p: { volumeName: string; repository: string; branch?: string; token: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<void> {
     this.usedImage('clone', p.image);
     this.mount(p.volumeName);

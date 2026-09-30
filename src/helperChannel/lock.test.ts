@@ -121,6 +121,21 @@ describe('the lock operation with a fake flock (plan step 5, PR B)', () => {
     expect(events.at(-1)).toBe('close 42');
   });
 
+  // PR #74 review round 1, B-R1-2: flock killed from outside (an OOM kill, a SIGKILL) while it waits has no lock.
+  it('B-R1-2: flock ended by a signal without a cancel fails the operation (code failed), without the lock', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const h = harness();
+    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    await settle();
+    flocks[0].exit(null);
+    const error = await done.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OperationError);
+    expect(error).toMatchObject({ code: 'failed' });
+    expect((error as Error).message).toContain('ended by a signal');
+    expect(h.progress).not.toContain(LOCK_HELD_STEP);
+    expect(events.at(-1)).toBe('close 42');
+  });
+
   it('a cancel while it waits kills flock and closes the file, without the lock', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
@@ -289,6 +304,24 @@ describe.skipIf(process.platform !== 'linux')('the lock operation with real proc
     await expect(lockOperation(deps())({ environmentId: ID, waitSeconds: 1 }, harness().context)).rejects.toMatchObject({ code: 'failed' });
     expect(fs.readFileSync(target, 'utf8')).toBe('data');
     expect(fs.statSync(target).mode & 0o777).toBe(0o644);
+  });
+
+  // PR #74 review round 1, B-R1-7: an existing folder or file with a wider mode is repaired, so no other user can
+  // replace a held lock file.
+  it('B-R1-7: repairs an existing lock folder at 0777 to 0700 and an existing lock file at 0666 to 0600', () => {
+    fs.mkdirSync(lockFolder(stateDir));
+    fs.chmodSync(lockFolder(stateDir), 0o777);
+    fs.writeFileSync(lockFilePath(ID, stateDir), '');
+    fs.chmodSync(lockFilePath(ID, stateDir), 0o666);
+    expect(fs.statSync(lockFolder(stateDir)).mode & 0o777).toBe(0o777);
+    expect(fs.statSync(lockFilePath(ID, stateDir)).mode & 0o777).toBe(0o666);
+    const fd = openLockFile(stateDir, ID);
+    try {
+      expect(fs.statSync(lockFolder(stateDir)).mode & 0o777).toBe(0o700);
+      expect(fs.fstatSync(fd).mode & 0o777).toBe(0o600);
+    } finally {
+      fs.closeSync(fd);
+    }
   });
 
   it('a lock folder that is a symbolic link is refused', { timeout: 20_000 }, async () => {

@@ -15,8 +15,11 @@ import {
   CHANNEL_SLOT_WAIT_MS,
   LOCK_BUSY_CODE,
   LOCK_HELD_STEP,
+  LOCK_HOLD_LIMIT_MS,
   MAX_CHANNEL_REQUEST_BYTES,
   MAX_CLIENT_LINE,
+  MAX_CONCURRENT_LOCKED_OPERATIONS,
+  MAX_CONCURRENT_LOCKS,
   MAX_CONCURRENT_OPERATIONS,
   MAX_DOCKER_ARGS,
   MAX_DOCKER_INPUT_LENGTH,
@@ -663,6 +666,133 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
     fake.answer({ t: 'progress', id: lastOp(fake).id, step: LOCK_HELD_STEP });
     await extra;
     channel.close();
+  });
+
+  // PR #74 review round 1, B-R1-1: the worker reports the step `lock` before flock runs; only LOCK_HELD_STEP means held.
+  it('B-R1-1: the progress `lock` (flock still waits) does not resolve the lock; only `locked` does', async () => {
+    const { channel, fake } = await openWithLock();
+    let settled = false;
+    const locking = channel.lock(ID, 10).finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'progress', id: op.id, step: 'lock', detail: ID });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(settled).toBe(false);
+    fake.answer({ t: 'progress', id: op.id, step: LOCK_HELD_STEP });
+    await expect(locking).resolves.toMatchObject({ environmentId: ID });
+  });
+
+  // PR #74 review round 1, B-R1-3: the worker cancels the lock at the sent time limit, so it must cover the hold limit.
+  it('B-R1-3: sends the time limit of the wait plus the hold limit plus the grace', async () => {
+    const { op } = await held();
+    expect(op.timeoutMs).toBe(10 * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS);
+  });
+
+  // PR #74 review round 1, B-R1-5: a worker that ends the lock operation without `locked` never gives a held lock.
+  it('B-R1-5: a lock answered without `locked` rejects as protocol, not as a held lock', async () => {
+    const { channel, fake } = await openWithLock();
+    const locking = channel.lock(ID, 10);
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: true, value: {} });
+    await expect(locking).rejects.toMatchObject({ name: 'HelperChannelError', code: 'protocol' });
+    expect(channel.busy).toBe(0);
+  });
+
+  // PR #74 review round 1, B-R1-4: the locks have their own bound, which a release frees again; they never touch the
+  // places of the operations (nor the places of the calls under locks, A-R1-2).
+  it(`B-R1-4: at most ${MAX_CONCURRENT_LOCKS} locks; a release frees a place; the other places stay exact after many cycles`, async () => {
+    const { channel, fake } = await openWithLock();
+    const ops = () => fake.messages().filter((message): message is Extract<ClientMessage, { t: 'op' }> => message.t === 'op');
+    const take = async (environmentId: string) => {
+      const locking = channel.lock(environmentId, 10);
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'lock', params: { environmentId } });
+      fake.answer({ t: 'progress', id: op.id, step: LOCK_HELD_STEP });
+      return { lock: await locking, op };
+    };
+    const release = async (taken: Awaited<ReturnType<typeof take>>) => {
+      const releasing = taken.lock.release();
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ t: 'result', id: taken.op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+      await releasing;
+    };
+    const locks = [];
+    for (let index = 0; index < MAX_CONCURRENT_LOCKS; index++) locks.push(await take(`env-${index}`));
+    const before = ops().length;
+    await expect(channel.lock('env-extra', 10)).rejects.toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
+    expect(ops()).toHaveLength(before);
+    await release(locks.shift()!);
+    locks.push(await take('env-next'));
+    for (const taken of locks.splice(0)) await release(taken);
+    // Many take, call, release cycles.
+    for (let index = 0; index < 3 * MAX_CONCURRENT_LOCKS; index++) {
+      const taken = await take(`env-cycle-${index}`);
+      const call = taken.lock.docker(['stop', 'c1'], {});
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ t: 'result', id: lastOp(fake).id, ok: true, value: { exitCode: 0 } });
+      await call;
+      await release(taken);
+    }
+    expect(channel.busy).toBe(0);
+    // Exactly MAX_CONCURRENT_OPERATIONS plain calls go out at once; the next one waits.
+    const sentBefore = ops().length;
+    const plain = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, () => channel.docker(['ps']).catch(() => undefined));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ops().length - sentBefore).toBe(MAX_CONCURRENT_OPERATIONS);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS + 1);
+    // And MAX_CONCURRENT_LOCKS locks still go out.
+    for (let index = 0; index < MAX_CONCURRENT_LOCKS; index++) locks.push(await take(`env-again-${index}`));
+    await expect(channel.lock('env-extra', 10)).rejects.toMatchObject({ code: 'unsendable' });
+    channel.close();
+    await Promise.all(plain);
+  });
+
+  // PR #74 review round 1, A-R1-2: the Docker calls under a held lock have their own places, so the other operations of
+  // the window cannot make them `unsendable` halfway through a Stop or Delete.
+  it('A-R1-2: with every place of the operations taken, a call under the lock is sent at once and does not time out', async () => {
+    const { channel, fake, lock } = await held();
+    const ops = () => fake.messages().filter((message): message is Extract<ClientMessage, { t: 'op' }> => message.t === 'op');
+    const busy = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }).catch(() => undefined));
+    await vi.advanceTimersByTimeAsync(0);
+    const waiting = channel.docker(['ps']).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const before = ops().length;
+    const call = lock.docker(['rm', '-f', 'c1'], { timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ops()).toHaveLength(before + 1);
+    const op = lastOp(fake);
+    expect(op).toMatchObject({ op: 'docker', params: { args: ['rm', '-f', 'c1'] }, timeoutMs: 60_000 });
+    // The shared places stay full: the plain call still waits, and is `unsendable` after its slot wait.
+    await vi.advanceTimersByTimeAsync(CHANNEL_SLOT_WAIT_MS + 1);
+    expect(await waiting).toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
+    fake.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
+    await expect(call).resolves.toEqual({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+    channel.close();
+    await Promise.all(busy);
+  });
+
+  it(`A-R1-2: at most ${MAX_CONCURRENT_LOCKED_OPERATIONS} calls under locks run at once; beyond, one is not sent, without a wait`, async () => {
+    const { channel, fake, lock } = await held();
+    const ops = () => fake.messages().filter((message): message is Extract<ClientMessage, { t: 'op' }> => message.t === 'op');
+    const before = ops().length;
+    const calls = Array.from({ length: MAX_CONCURRENT_LOCKED_OPERATIONS }, (_, index) => lock.docker(['stop', `c${index}`], {}));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ops()).toHaveLength(before + MAX_CONCURRENT_LOCKED_OPERATIONS);
+    await expect(lock.docker(['stop', 'extra'], {})).rejects.toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
+    expect(ops()).toHaveLength(before + MAX_CONCURRENT_LOCKED_OPERATIONS);
+    // They take none of the shared places: plain calls still go out at once.
+    void channel.docker(['ps']).catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ops()).toHaveLength(before + MAX_CONCURRENT_LOCKED_OPERATIONS + 1);
+    // A call that ends frees its place for the next call under a lock.
+    fake.answer({ t: 'result', id: ops()[before].id, ok: true, value: { exitCode: 0 } });
+    await expect(calls[0]).resolves.toMatchObject({ exitCode: 0 });
+    const next = lock.docker(['stop', 'next'], {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastOp(fake)).toMatchObject({ op: 'docker', params: { args: ['stop', 'next'] } });
+    channel.close();
+    await Promise.allSettled([...calls, next]);
   });
 
   it('a cancel of the caller while it waits sends the cancel and rejects with an AbortError', async () => {

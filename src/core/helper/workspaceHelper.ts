@@ -520,6 +520,19 @@ export class WorkspaceHelper {
     return this.image(options, true);
   }
 
+  /**
+   * PR #74 review round 1 (A-R1-1): the helper image for the worker of the environment lock (Stop, Delete), on the engine
+   * of the operation, local or remote alike. It only builds a missing tag, like the helper runs: no check of the base
+   * image, no rebuild of an existing tag, no cleanup, so nothing long runs before the lock. A cached result whose image
+   * is gone (a prune, or another window moved the tag) is not trusted: the cache is reset and the tag ensured again.
+   * Throws like ensureImage.
+   */
+  async ensureImagePresent(options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
+    this.adoptEngine((await this.currentEngine()).key);
+    if (this.imagePromise && this.imageReadyAt !== undefined && !(await this.cachedImageCurrent())) this.resetImage();
+    return this.image({ onOutput: options.onOutput, signal: options.signal }, false);
+  }
+
   /** Whether the engine of the operation (HelperDeps.engine) is the local Docker. */
   async usesLocalEngine(): Promise<boolean> {
     return (await this.currentEngine()).key === '';

@@ -641,6 +641,12 @@ export const LOCK_HOLD_LIMIT_MS = 2 * 60 * 60_000;
  * held lock would keep its place for the whole operation, and the Docker calls of that operation would wait behind it.
  */
 export const MAX_CONCURRENT_LOCKS = 16;
+/**
+ * PR #74 review round 1 (A-R1-2): the Docker calls under held locks (HelperChannel `reserved`) of one worker at the same
+ * time. They take none of the MAX_CONCURRENT_OPERATIONS places and never wait for one, so the other operations of the
+ * window cannot starve an operation that holds a lock halfway. One call at a time per held lock, like the locks.
+ */
+export const MAX_CONCURRENT_LOCKED_OPERATIONS = MAX_CONCURRENT_LOCKS;
 
 export interface LockParams {
   environmentId: string;

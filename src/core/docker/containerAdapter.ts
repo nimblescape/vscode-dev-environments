@@ -600,6 +600,15 @@ export class ContainerAdapter {
       if (isAbortError(error)) throw error;
       if (options.signal?.aborted) throw abortError();
       this.logger.warn(`docker ${command} through the worker that holds the lock failed (${errorMessage(error)}); it is not run directly.`);
+      // PR #74 review round 1 (A-R1-2): a call that was not sent (no place of its own, or a closed channel) did not run.
+      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
+        throw new CommandError(
+          commandText(args),
+          null,
+          '',
+          `docker ${command} was not sent to the worker that holds the lock of the environment (${errorMessage(error)}); it did not run.`,
+        );
+      }
       throw new CommandError(
         commandText(args),
         null,

@@ -48,10 +48,17 @@ beforeEach(() => {
       return heldLock(environmentId);
     },
   });
-  const ensure = h.helper.ensureImageUse.bind(h.helper);
-  h.helper.ensureImageUse = async (options) => {
+  // PR #74 review round 1, A-R1-1: the image before the lock is the non-maintaining ensureImagePresent (event
+  // `ensureImage`); the maintaining ensureImageUse would add its own event, which no expectation of Stop or Delete has.
+  const ensure = h.helper.ensureImagePresent.bind(h.helper);
+  h.helper.ensureImagePresent = async (options) => {
     events.push('ensureImage');
     return ensure(options);
+  };
+  const maintain = h.helper.ensureImageUse.bind(h.helper);
+  h.helper.ensureImageUse = async (options) => {
+    events.push('ensureImageUse (maintaining)');
+    return maintain(options);
   };
   const remove = h.docker.removeContainer.bind(h.docker);
   h.docker.removeContainer = async (ref) => {
@@ -130,8 +137,9 @@ describe('Delete under the environment lock (plan step 5, PR B)', () => {
   it('user decision D1: a missing helper image is built first, then the lock is taken and the delete goes on', async () => {
     await seedEnvironment(h, { container: 'running' });
     let imagePresent = false;
-    const ensure = h.helper.ensureImageUse.bind(h.helper);
-    h.helper.ensureImageUse = async (options) => {
+    // PR #74 review round 1, A-R1-1: the missing image is built by the non-maintaining ensureImagePresent.
+    const ensure = h.helper.ensureImagePresent.bind(h.helper);
+    h.helper.ensureImagePresent = async (options) => {
       if (!imagePresent) {
         events.push('build');
         imagePresent = true;
@@ -192,6 +200,31 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
     expect((await rejection(h.service.stop(ENV_ID))).message).toContain('no space left on device');
     expect(h.docker.log).toEqual([]);
     expect(h.docker.execs).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
+  });
+
+  // PR #74 review round 1, A-R1-1: an earlier check recorded a new base digest, so the maintaining ensure would wait for
+  // a `--pull --no-cache` rebuild (here: forever). Stop does not run it: it only ensures that the tag exists.
+  it('A-R1-1: a pending rebuild of the maintaining ensure does not delay Stop: only the tag is ensured, then the lock', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.ensureImageUse = () => {
+      events.push('ensureImageUse (maintaining)');
+      return new Promise(() => {});
+    };
+    await h.service.stop(ENV_ID);
+    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop (locked)', 'release']);
+    expect(h.helper.calls).toContain('ensureImagePresent');
+    expect(h.helper.calls).not.toContain('ensureImage');
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+
+  it('A-R1-1: a failed build of the missing tag refuses Stop with the D1 message, before the lock, with no fallback', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'failed to solve: node:22');
+    const error = await rejection(h.service.stop(ENV_ID));
+    expect(error.message).toBe(PipelineTexts.environmentLockUnavailable(REPO, `${Messages.helperFailed} failed to solve: node:22`));
+    expect(events).toEqual(['ensureImage']);
+    expect(h.docker.log).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
   });
 

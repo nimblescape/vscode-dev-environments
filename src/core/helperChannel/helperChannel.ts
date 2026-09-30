@@ -25,6 +25,7 @@ import {
   LOCK_HELD_STEP,
   LOCK_HOLD_LIMIT_MS,
   MAX_CLIENT_LINE,
+  MAX_CONCURRENT_LOCKED_OPERATIONS,
   MAX_CONCURRENT_LOCKS,
   MAX_CONCURRENT_OPERATIONS,
   MAX_OPERATION_TIMEOUT_MS,
@@ -98,10 +99,18 @@ export interface OperationOptions {
    * gives what is left of its wait for the channel, so the two waits together stay within one.
    */
   slotWaitMs?: number;
+  /**
+   * PR #74 review round 1 (A-R1-2): a call under a held lock (HeldEnvironmentLock.docker). It takes a place of
+   * MAX_CONCURRENT_LOCKED_OPERATIONS, not of MAX_CONCURRENT_OPERATIONS, and never waits: beyond that bound it is
+   * `unsendable` (not sent) at once.
+   */
+  reserved?: boolean;
 }
 
 /** Options of HelperChannel.docker: those of a Docker call, and what to remove on a cancel. */
-export interface ChannelDockerOptions extends Pick<RunOptions, 'input' | 'timeoutMs' | 'signal' | 'onStdout' | 'onStderr'>, Pick<OperationOptions, 'slotWaitMs'> {
+export interface ChannelDockerOptions
+  extends Pick<RunOptions, 'input' | 'timeoutMs' | 'signal' | 'onStdout' | 'onStderr'>,
+    Pick<OperationOptions, 'slotWaitMs' | 'reserved'> {
   /**
    * Review round 1 (S1): a cleanup label value (isCleanupLabel, protocol.ts). The args must put channelStepLabel(cleanup)
    * on each container that the call starts; a cancel removes exactly the containers with that label.
@@ -130,6 +139,8 @@ interface Pending {
   op: string;
   /** Plan step 5, PR B: a lock operation holds no place of MAX_CONCURRENT_OPERATIONS (MAX_CONCURRENT_LOCKS instead). */
   lock?: boolean;
+  /** PR #74 review round 1 (A-R1-2): a call under a held lock holds a place of MAX_CONCURRENT_LOCKED_OPERATIONS. */
+  reserved?: boolean;
   /** Review round 4 (M2): the cancel was sent; waiting for the script to confirm it. */
   cancelling?: boolean;
   startedAt: number;
@@ -156,6 +167,8 @@ export class HelperChannel {
   private readonly waiting: (() => void)[] = [];
   /** Plan step 5, PR B: the lock operations that run (MAX_CONCURRENT_LOCKS; they hold no place of the others). */
   private locks = 0;
+  /** PR #74 review round 1 (A-R1-2): the calls under held locks that run (MAX_CONCURRENT_LOCKED_OPERATIONS). */
+  private lockedOperations = 0;
   private readonly closeListeners = new Set<(reason: string) => void>();
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private stderrTail = '';
@@ -374,6 +387,7 @@ export class HelperChannel {
     // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
     this.lastUsedAt = Date.now();
     if (pending.lock) this.locks--;
+    else if (pending.reserved) this.lockedOperations--;
     else this.releaseSlot();
     return pending;
   }
@@ -447,11 +461,18 @@ export class HelperChannel {
     }
     // A free place is taken at once, so the operation is written in the same turn as the call.
     const queuedAt = Date.now();
-    const release = () => (lock ? this.locks-- : this.releaseSlot());
+    const reserved = !lock && options.reserved === true;
+    const release = () => (lock ? this.locks-- : reserved ? this.lockedOperations-- : this.releaseSlot());
     if (lock) {
       // Plan step 5, PR B: a lock waits for no place; beyond MAX_CONCURRENT_LOCKS it is not sent.
       if (this.locks >= MAX_CONCURRENT_LOCKS) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} holds too many locks.`);
       this.locks++;
+    } else if (reserved) {
+      // PR #74 review round 1 (A-R1-2): a call under a held lock waits for no place either.
+      if (this.lockedOperations >= MAX_CONCURRENT_LOCKED_OPERATIONS) {
+        throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} runs too many calls under locks.`);
+      }
+      this.lockedOperations++;
     } else if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
     else {
       const waitMs = Math.min(options.slotWaitMs ?? this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY);
@@ -479,7 +500,7 @@ export class HelperChannel {
     }
     this.lastUsedAt = Date.now();
     return new Promise<unknown>((resolve, reject) => {
-      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject, lock };
+      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject, lock, reserved };
       // The `docker` operation logs its one call itself; an operation of steps gets a line at its start and its end.
       if (op !== OP_DOCKER) this.options.logger.info(`[${this.options.name}] ${op}#${id}: started.`);
       this.pending.set(id, pending);
@@ -567,7 +588,8 @@ export class HelperChannel {
     return {
       environmentId,
       lost,
-      docker: (args, options) => this.docker(args, options),
+      // PR #74 review round 1 (A-R1-2): the calls under the lock have their own places (MAX_CONCURRENT_LOCKED_OPERATIONS).
+      docker: (args, options) => this.docker(args, { ...options, reserved: true }),
       release: async () => {
         releasing = true;
         controller.abort();
@@ -602,6 +624,7 @@ export class HelperChannel {
         secret: options.secretInput,
         timeoutMs: options.timeoutMs,
         slotWaitMs: options.slotWaitMs,
+        reserved: options.reserved,
         signal,
         onOutput: (stream, text) => {
           if (stream === 'stdout') {

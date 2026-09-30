@@ -292,6 +292,7 @@ export type EnvironmentDocker = Pick<
 export type EnvironmentHelper = Pick<
   WorkspaceHelper,
   | 'ensureImageUse'
+  | 'ensureImagePresent'
   | 'clone'
   | 'readConfigFiles'
   | 'listConfigurations'
@@ -6715,8 +6716,8 @@ export class EnvironmentService {
   /**
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
    * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
-   * it is missing), then the worker with the lock (HelperChannels.lock opens it, also within the wait after a failed
-   * open). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
+   * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent), then the worker with the lock
+   * (HelperChannels.lock opens it, also within the wait after a failed open). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
    * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in
@@ -6726,11 +6727,8 @@ export class EnvironmentService {
   private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();
     try {
-      await this.deps.helper.ensureImageUse({
-        onOutput: (text) => this.logger.output(text),
-        checkBaseImage: this.deps.settings().updateImagesOnConnect,
-        signal,
-      });
+      // PR #74 review round 1 (A-R1-1): only a missing tag is built (no rebuild, check, or cleanup before Stop or Delete).
+      await this.deps.helper.ensureImagePresent({ onOutput: (text) => this.logger.output(text), signal });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);

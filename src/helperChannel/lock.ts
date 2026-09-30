@@ -46,8 +46,8 @@ export interface LockDeps {
 
 /**
  * Opens the lock file of an environment: the folder `locks` (0700, created when missing, never a symbolic link), then
- * the file with O_NOFOLLOW (0600; a symbolic link fails with ELOOP) and O_NONBLOCK (a FIFO put there would not hang the
- * open); anything but a plain file is refused. Node.js opens it with O_CLOEXEC, so the Docker calls of the worker never
+ * the file with O_NOFOLLOW (0600; a symbolic link fails with ELOOP) and O_NONBLOCK (an open never waits; on Linux an
+ * O_RDWR open of a FIFO does not wait anyway); anything but a plain file is refused (PR #74 review round 1, B-R1-6). Node.js opens it with O_CLOEXEC, so the Docker calls of the worker never
  * inherit it (only `flock`, on purpose).
  */
 export function openLockFile(stateDir: string, environmentId: string): number {

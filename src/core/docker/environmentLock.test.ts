@@ -99,6 +99,33 @@ describe('the scope of a held environment lock (plan step 5, PR B)', () => {
     expect(runner.calls).toEqual([]);
   });
 
+  // PR #74 review round 1, A-R1-2: a call that was not sent says so; only a call that was sent and then lost has an
+  // outcome that is not known. Neither runs directly or through the router.
+  it('A-R1-2: a call that was not sent (no place) fails as not sent, distinct from a lost one, and never goes direct', async () => {
+    const texts: string[] = [];
+    for (const failure of [
+      new HelperChannelError('unsendable', 'The helper channel to build-box runs too many calls under locks.'),
+      new HelperChannelError('lost', 'The helper channel to build-box was lost while docker ran.'),
+    ]) {
+      const { docker, runner, routed } = adapter();
+      const { lock, calls } = fakeLock('env-1', async () => {
+        throw failure;
+      });
+      const error = await runWithDockerTarget(REMOTE, () => runWithEnvironmentLock(lock, () => docker.run(['volume', 'rm', 'v1']))).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(CommandError);
+      texts.push((error as Error).message);
+      expect(calls).toEqual([['volume', 'rm', 'v1']]);
+      expect(runner.calls).toEqual([]);
+      expect(routed).toEqual([]);
+    }
+    expect(texts[0]).toContain('docker volume rm was not sent to the worker that holds the lock of the environment');
+    expect(texts[0]).not.toContain('is not known');
+    expect(texts[1]).toContain('the outcome of docker volume rm is not known');
+    expect(texts[1]).not.toContain('was not sent');
+  });
+
   it('after the lock was lost, no call runs at all, whatever its kind', async () => {
     const { docker, runner } = adapter();
     const { lock, calls, lose } = fakeLock();
