@@ -52,6 +52,7 @@ import {
   remoteStopAfterSeconds,
   sleepGraceAt,
   TICK_MS,
+  tickEnded,
   waitingTimeMs,
   type MonitorDecision,
   type MonitorEnvironment,
@@ -283,6 +284,8 @@ export class MonitorLoop {
       try {
         return await this.tickOn(target, now, settings);
       } finally {
+        // Plan step 4: the next tick measures its gap from here, so a hanging `docker stop` is not taken for sleep.
+        this.monitorState = tickEnded(this.monitorState, this.clock.now());
         this.tickTarget = LOCAL_DOCKER_TARGET;
         this.tickHeartbeat = undefined;
       }

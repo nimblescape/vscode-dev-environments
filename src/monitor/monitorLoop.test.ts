@@ -29,7 +29,7 @@ import {
   type MonitorLoopDeps,
   type TickResult,
 } from './monitorLoop';
-import { DOCKER_UNKNOWN_MAX_MS, SLEEP_GRACE_MS, TICK_MS } from './rules';
+import { DOCKER_UNKNOWN_MAX_MS, SLEEP_GAP_MS, SLEEP_GRACE_MS, TICK_MS } from './rules';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -679,6 +679,46 @@ describe('MonitorLoop.tick', () => {
     const results = await runUntil(h, wake + SLEEP_GRACE_MS + 3 * WAITING_MS, owner);
     expect(results.some((result) => result.end)).toBe(false);
     expect(h.docker.calls).toEqual([]);
+  });
+
+  // Plan step 4: the gap between two ticks is measured from the end of the previous tick.
+  describe('a tick that hangs in docker stop (plan step 4)', () => {
+    const HANG_MS = 5 * 60_000;
+
+    /** Ticks until A is stopped; its `docker stop` takes HANG_MS. Returns the time at the end of that tick. */
+    async function hangingStop(): Promise<number> {
+      await closedWindowScenario(h);
+      h.docker.stopHook = async () => {
+        h.clock.advance(HANG_MS);
+      };
+      for (;;) {
+        const result = await h.loop.tick();
+        if (result.stopped.length > 0) {
+          expect(result.stopped).toEqual([ID_A]);
+          return h.clock.time;
+        }
+        expect(h.clock.time).toBeLessThan(T0 + 2 * 60_000);
+        h.clock.advance(TICK_MS);
+      }
+    }
+
+    it('does not start the sleep grace when the next tick follows after a normal interval', async () => {
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(end);
+      h.docker.stopHook = undefined;
+      h.clock.advance(TICK_MS);
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBeUndefined();
+    });
+
+    it('still starts the sleep grace after a real gap between the end of the tick and the next one', async () => {
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(end);
+      h.docker.stopHook = undefined;
+      h.clock.advance(SLEEP_GAP_MS + 1);
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBe(end + SLEEP_GAP_MS + 1 + SLEEP_GRACE_MS);
+    });
   });
 
   it('removes status files of ended windows after the waiting time, but not a file that was written again', async () => {

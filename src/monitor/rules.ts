@@ -77,7 +77,10 @@ export interface MonitorEnvironment {
 
 /** State that the Session Monitor keeps from one tick to the next. Only `decide` creates new states. */
 export interface MonitorState {
-  /** Time of the previous tick. */
+  /**
+   * Time of the previous tick: `decide` sets its start, `tickEnded` its end (plan step 4: a tick that hangs, for example
+   * in a `docker stop`, is not taken for computer sleep).
+   */
   lastTickAt?: number;
   /** Until this time, active windows with a live process count as in use, whatever the age of `updatedAt`. */
   sleepGraceUntil?: number;
@@ -123,7 +126,8 @@ export interface InUseResult {
  * - it is busy.
  * A window in the state `closing` never makes an environment in use.
  *
- * The sleep grace starts when the time since the previous tick is larger than SLEEP_GAP_MS (the computer slept, or the
+ * The sleep grace starts when the time since the end of the previous tick (`tickEnded`) is larger than SLEEP_GAP_MS
+ * (the computer slept, or the
  * clock was changed), and at the first tick, because a monitor that just started cannot know whether the computer
  * just woke up. The result depends only on the input, so `containerStatesNeeded` and `decide` see the same result.
  */
@@ -396,6 +400,15 @@ function advanceClock(previous: MonitorState, now: number): MonitorState {
   }
   state.lastTickAt = now;
   return state;
+}
+
+/**
+ * Plan step 4: the state after the tick of `state` ended at `now`, so the next tick measures its gap (the sleep rule)
+ * from the end of this tick, not from its start. A state before the first `decide` stays as it is: the first tick of a
+ * monitor starts the sleep grace.
+ */
+export function tickEnded(state: MonitorState, now: number): MonitorState {
+  return state.lastTickAt === undefined ? state : { ...state, lastTickAt: now };
 }
 
 /**
