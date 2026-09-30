@@ -239,6 +239,21 @@ describe('EnvironmentRegistry reading', () => {
     expect((await registry.get(ID_B))?.keepRunningOnce).toBe(true);
   });
 
+  it('reads lifecycleIncomplete (review round 3 of PR #68, A-R3-5) with and without the field, and drops an invalid value', async () => {
+    writeRaw({
+      version: 1,
+      environments: [
+        environment(ID_A, 'o/a', { lifecycleIncomplete: 'abc123' }),
+        environment(ID_B, 'o/b'),
+        { ...environment(ID_C, 'o/c'), lifecycleIncomplete: '' },
+      ],
+    });
+    const registry = new EnvironmentRegistry(paths);
+    const list = await registry.list();
+    expect(list.map((entry) => entry.lifecycleIncomplete)).toEqual(['abc123', undefined, undefined]);
+    expect('lifecycleIncomplete' in list[2]).toBe(false);
+  });
+
   it('reads keepRunning with and without the field, drops an invalid value, and writes it under the lock', async () => {
     writeRaw({
       version: 1,

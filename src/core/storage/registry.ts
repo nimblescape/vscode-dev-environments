@@ -465,6 +465,8 @@ const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['keepRunningOnce', (value) => typeof value === 'boolean'],
   // Unit 7: the Docker host; '' is the local Docker, as a missing field.
   ['dockerHost', isNonEmptyString],
+  // Review round 3 of PR #68 (A-R3-5): a container whose lifecycle commands did not run.
+  ['lifecycleIncomplete', isNonEmptyString],
 ];
 
 /**

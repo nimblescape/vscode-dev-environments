@@ -3,8 +3,16 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { BUSY_MARK_MAX_AGE_MS, BUSY_OWNER_STATUS_MAX_AGE_MS, isBlockingBusyMark, isBusyMarkLive } from './busy';
-import type { BusyMark, WindowStatus } from './types';
+import {
+  BUSY_MARK_MAX_AGE_MS,
+  BUSY_OWNER_STATUS_MAX_AGE_MS,
+  HEARTBEAT_MAX_AGE_MS,
+  PENDING_MAX_AGE_MS,
+  isBlockingBusyMark,
+  isBusyMarkLive,
+  otherWindowUsesEnvironment,
+} from './busy';
+import type { BusyMark, PendingConnection, WindowStatus } from './types';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -97,5 +105,43 @@ describe('isBlockingBusyMark', () => {
   it('does not block for a mark that is not live', () => {
     expect(isBlockingBusyMark(mark({ pid: DEAD }), other, { now: NOW, isAlive })).toBe(false);
     expect(isBlockingBusyMark(mark(), other, { now: NOW, isAlive, windowStatuses: [] })).toBe(false);
+  });
+});
+
+describe('otherWindowUsesEnvironment (review round 3 of PR #68, A-R3-4)', () => {
+  const ENV = 'env-1';
+  const OWN = 'own-window';
+  const window = (overrides: Partial<WindowStatus> = {}): WindowStatus => status({ windowId: 'w2', environmentId: ENV, ...overrides });
+  const pending = (overrides: Partial<PendingConnection> = {}): PendingConnection => ({ environmentId: ENV, windowId: 'w2', createdAt: iso(NOW - 10_000), ...overrides });
+  const uses = (windowStatuses?: WindowStatus[], pendings?: PendingConnection[]) => otherWindowUsesEnvironment(ENV, OWN, { now: NOW, isAlive, windowStatuses, pendings });
+
+  it('finds a live, active, fresh window of another window ID that is connected to the environment', () => {
+    expect(uses([window()])).toEqual({ window: window() });
+    expect(uses([window({ updatedAt: iso(NOW - HEARTBEAT_MAX_AGE_MS) })])).toBeDefined();
+  });
+
+  it('ignores this window, another environment, a closing window, a stale or future file, and an ended process', () => {
+    expect(uses([window({ windowId: OWN })])).toBeUndefined();
+    expect(uses([window({ environmentId: 'env-2' })])).toBeUndefined();
+    expect(uses([window({ environmentId: null })])).toBeUndefined();
+    expect(uses([window({ state: 'closing' })])).toBeUndefined();
+    expect(uses([window({ updatedAt: iso(NOW - HEARTBEAT_MAX_AGE_MS - 1) })])).toBeUndefined();
+    expect(uses([window({ updatedAt: iso(NOW + HEARTBEAT_MAX_AGE_MS + 1) })])).toBeUndefined();
+    expect(uses([window({ updatedAt: 'not a time' })])).toBeUndefined();
+    expect(uses([window({ pid: DEAD })])).toBeUndefined();
+    expect(uses(undefined, undefined)).toBeUndefined();
+  });
+
+  it('finds a fresh pending connection file of another window for the environment', () => {
+    expect(uses([], [pending()])).toEqual({ pending: pending() });
+    expect(uses([], [pending({ createdAt: iso(NOW - PENDING_MAX_AGE_MS) })])).toBeDefined();
+    expect(uses([], [pending({ createdAt: iso(NOW - PENDING_MAX_AGE_MS - 1) })])).toBeUndefined();
+    expect(uses([], [pending({ windowId: OWN })])).toBeUndefined();
+    expect(uses([], [pending({ environmentId: 'env-2' })])).toBeUndefined();
+  });
+
+  it('shares the limits of the Session Monitor', () => {
+    expect(HEARTBEAT_MAX_AGE_MS).toBe(60_000);
+    expect(PENDING_MAX_AGE_MS).toBe(120_000);
   });
 });

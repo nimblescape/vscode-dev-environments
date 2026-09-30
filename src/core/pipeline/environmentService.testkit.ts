@@ -567,6 +567,12 @@ export class FakeHelper implements EnvironmentHelper {
   /** upError fails before the CLI removes the existing container (for example an invalid override configuration). */
   upFailsBeforeRemoval = false;
   /**
+   * Review round 3 of PR #68 (test gap of A-R2-3): like Compose, `up` creates the dev container again when its name is not
+   * the `container_name` of its service (the configuration hash of Compose covers the name). Off by default: the tests
+   * of the final review (FF-1, FC-1) expect the renamed previous dev container to be started as it is.
+   */
+  composeRecreatesRenamedDevContainer = false;
+  /**
    * A lifecycle command fails after `up` created or started the container, which keeps running: the description of the
    * CLI, for example `postStartCommand from devcontainer.json failed.` (lifecycle token, user decision 2026-09-27: in
    * runUserCommands).
@@ -1024,7 +1030,13 @@ export class FakeHelper implements EnvironmentHelper {
       return this.docker.containers.get(created.id) ?? created;
     };
     let containerId: string;
-    if (existing && !p.removeExistingContainer) {
+    const renamed =
+      this.composeRecreatesRenamedDevContainer && existing !== undefined && typeof dev.container_name === 'string' && existing.name !== dev.container_name;
+    if (existing && renamed && !p.removeExistingContainer) {
+      this.docker.log.push(`compose recreate ${existing.id}`);
+      this.docker.containers.delete(existing.id);
+    }
+    if (existing && !renamed && !p.removeExistingContainer) {
       existing.state = 'running';
       existing.rawState = 'running';
       containerId = existing.id;

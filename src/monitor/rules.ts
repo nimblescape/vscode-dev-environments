@@ -15,15 +15,16 @@
 //      (recording the Git summary takes time), record the Git summary, then `docker stop`.
 //      Remove the window status files of `decision.removeWindowFiles`.
 //   5. End the process when `decision.exit` is true.
+import { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../core/busy';
 import { DEFAULT_REMOTE_STOP_AFTER_SECONDS, clampLimitSeconds } from '../core/remoteMonitor/protocol';
 import type { MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 
 /** Interval between two ticks of the Session Monitor (concept 7.9). */
 export const TICK_MS = 5000;
-/** A window status file whose `updatedAt` is older than this does not make its environment in use (rule 1). */
-export const HEARTBEAT_MAX_AGE_MS = 60_000;
-/** A pending connection file older than this does not make its environment in use (rule 1). */
-export const PENDING_MAX_AGE_MS = 120_000;
+// HEARTBEAT_MAX_AGE_MS (a window status file older than this does not make its environment in use, rule 1) and
+// PENDING_MAX_AGE_MS (the same for a pending connection file) live in src/core/busy.ts since review round 3 of PR #68
+// (A-R3-4), which the environment service shares (otherWindowUsesEnvironment).
+export { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS };
 /** A gap between two ticks larger than this means that the computer slept, or that the clock was changed. */
 export const SLEEP_GAP_MS = 30_000;
 /** After such a gap, the age of `updatedAt` is ignored for this time (sleep rule). */

@@ -4,7 +4,15 @@
 
 // Liveness of busy marks (concept 7.9 rule 1: "The registry marks the environment as busy"). One rule for the windows
 // (sidebar, environment service) and the Session Monitor, so that they never disagree about a mark.
-import type { BusyMark, WindowStatus } from './types';
+import type { BusyMark, PendingConnection, WindowStatus } from './types';
+
+/**
+ * A window status file whose `updatedAt` is older than this does not make its environment in use (concept 7.9 rule 1).
+ * The Session Monitor (src/monitor/rules.ts) and otherWindowUsesEnvironment share it.
+ */
+export const HEARTBEAT_MAX_AGE_MS = 60_000;
+/** A pending connection file older than this does not make its environment in use (concept 7.9 rule 1). */
+export const PENDING_MAX_AGE_MS = 120_000;
 
 /**
  * A busy mark older than this does not protect its environment, even when a process with the owner's ID exists: the ID
@@ -69,4 +77,48 @@ export function isBlockingBusyMark(
 ): boolean {
   if (mark.pid === owner.pid) return false;
   return isBusyMarkLive(mark, input);
+}
+
+export interface OtherWindowInput {
+  /** Milliseconds since the epoch. */
+  now: number;
+  /** `process.kill(pid, 0)` does not fail with ESRCH (see `isProcessAlive`). */
+  isAlive: (pid: number) => boolean;
+  /** All window status files; `undefined` when they could not be read. */
+  windowStatuses?: readonly WindowStatus[];
+  /** All pending connection files; `undefined` when they could not be read. */
+  pendings?: readonly PendingConnection[];
+}
+
+/** The ISO time is valid and at most `maxAgeMs` away from `now` (also a time far in the future is not fresh). */
+function isFreshTime(time: string, now: number, maxAgeMs: number): boolean {
+  const at = Date.parse(time);
+  return Number.isFinite(at) && Math.abs(now - at) <= maxAgeMs;
+}
+
+/**
+ * Review round 3 of PR #68 (A-R3-4): what shows that a window other than `ownWindowId` uses the environment
+ * `environmentId`, as the Session Monitor's rule 1 counts it (computeInUse, without the sleep grace) and as
+ * SessionCoordinator.otherActiveWindows filters: a status file of another window that names the environment, in the state
+ * `active`, whose process exists, updated at most HEARTBEAT_MAX_AGE_MS ago; or a pending connection file of another window
+ * for it, at most PENDING_MAX_AGE_MS old. `undefined`: none (also for files that could not be read).
+ */
+export function otherWindowUsesEnvironment(
+  environmentId: string,
+  ownWindowId: string,
+  input: OtherWindowInput,
+): { window: WindowStatus } | { pending: PendingConnection } | undefined {
+  const window = (input.windowStatuses ?? []).find(
+    (status) =>
+      status.windowId !== ownWindowId &&
+      status.environmentId === environmentId &&
+      status.state === 'active' &&
+      isFreshTime(status.updatedAt, input.now, HEARTBEAT_MAX_AGE_MS) &&
+      input.isAlive(status.pid),
+  );
+  if (window !== undefined) return { window };
+  const pending = (input.pendings ?? []).find(
+    (entry) => entry.windowId !== ownWindowId && entry.environmentId === environmentId && isFreshTime(entry.createdAt, input.now, PENDING_MAX_AGE_MS),
+  );
+  return pending !== undefined ? { pending } : undefined;
 }

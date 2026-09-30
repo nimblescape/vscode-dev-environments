@@ -153,6 +153,14 @@ export interface Environment {
    * command show and act on the environments of the current Docker host only.
    */
   dockerHost?: string;
+  /**
+   * Review round 3 of PR #68 (A-R3-5; user decision 2026-09-29: never opened as it is after the helper was prepared): the ID
+   * of a container of the environment that `up` created or started, whose lifecycle commands could not run (the workspace
+   * helper failed), and that could be neither removed nor stopped. Step 9 does not open that container as it is while it
+   * runs: it runs `up` (without removal) and the lifecycle commands. Cleared by the next successful open (`finish`), and
+   * when that container is removed. A mark that names another container than the current one has no effect.
+   */
+  lifecycleIncomplete?: string;
 }
 
 /**

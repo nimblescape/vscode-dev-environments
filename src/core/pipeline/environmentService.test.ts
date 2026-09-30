@@ -1840,8 +1840,10 @@ describe('open: existing environment', () => {
       };
       const error = await rejection(h.service.open(TARGET, options()));
       expect(error.code).toBe('helperFailed');
+      // Review round 3 of PR #68 (A-R3-5): changed expectation (before: "… It could be neither removed nor stopped. No such
+      // image: …"): the registry marks the container, so the next open runs its lifecycle commands.
       expect(error.detail).toBe(
-        `The container was created again from the new environment image, but its lifecycle commands could not run. It could be neither removed nor stopped. No such image: sha256:${'4'.repeat(64)}`,
+        `The container was created again from the new environment image, but its lifecycle commands could not run. It could be neither removed nor stopped; the next open runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
       );
     });
 
@@ -1900,15 +1902,43 @@ describe('open: existing environment', () => {
 
     it('the sentences about the container whose lifecycle commands could not run (review round 2 of PR #68)', () => {
       const name = NAME;
-      expect(withdrawnOutcome({ outcome: 'removed', created: true, name })).toBe('It was removed; the next open creates it again.');
-      expect(withdrawnOutcome({ outcome: 'removed', created: true, name }, true)).toBe('It was removed.');
-      expect(withdrawnOutcome({ outcome: 'stopped', created: false, name })).toBe('It was stopped; the next open starts it again and runs its lifecycle commands.');
-      expect(withdrawnOutcome({ outcome: 'stoppedAfterRemovalFailed', created: true, name })).toBe(
+      // Review round 3 of PR #68 (A-R3-1): UpWithdrawn carries the container ID.
+      const id = 'c1';
+      expect(withdrawnOutcome({ outcome: 'removed', id, created: true, name })).toBe('It was removed; the next open creates it again.');
+      expect(withdrawnOutcome({ outcome: 'removed', id, created: true, name }, true)).toBe('It was removed.');
+      expect(withdrawnOutcome({ outcome: 'stopped', id, created: false, name })).toBe('It was stopped; the next open starts it again and runs its lifecycle commands.');
+      expect(withdrawnOutcome({ outcome: 'stoppedAfterRemovalFailed', id, created: true, name })).toBe(
         'It could not be removed and was stopped; the next open starts it and runs its lifecycle commands.',
       );
-      expect(withdrawnOutcome({ outcome: 'kept', created: true, name })).toBe('It could be neither removed nor stopped.');
-      expect(withdrawnOutcome({ outcome: 'kept', created: false, name })).toBe('It could not be stopped.');
-      expect(withdrawnOutcome({ outcome: 'unchanged', created: false, name })).toBe('It runs as before this open.');
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: true, name })).toBe('It could be neither removed nor stopped.');
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: false, name })).toBe('It could not be stopped.');
+      expect(withdrawnOutcome({ outcome: 'unchanged', id, created: false, name })).toBe('It runs as before this open.');
+    });
+
+    it('review round 3 of PR #68 (A-R3-1, A-R3-4, A-R3-5): the sentences in a switch, for a window that uses it, and for a marked container', () => {
+      const name = NAME;
+      const id = 'c1';
+      // A-R3-1: in a switch, no sentence about the next open (it does not start this container).
+      expect(withdrawnOutcome({ outcome: 'stopped', id, created: false, name }, true)).toBe('It was stopped.');
+      expect(withdrawnOutcome({ outcome: 'stoppedAfterRemovalFailed', id, created: true, name }, true)).toBe('It could not be removed and was stopped.');
+      expect(withdrawnOutcome({ outcome: 'unchanged', id, created: false, name }, true)).toBe('It runs as before this open.');
+      // A-R3-4.
+      expect(withdrawnOutcome({ outcome: 'inUse', id, created: false, name })).toBe('It was left running: another window is connected to it.');
+      expect(withdrawnOutcome({ outcome: 'inUse', id, created: false, name }, true)).toBe('It was left running: another window is connected to it.');
+      expect(withdrawnOutcome({ outcome: 'inUse', id, created: false, name, marked: true })).toBe('It was left running: another window is connected to it.');
+      // A-R3-4: the files of the windows could not be read (when in doubt, the container stays).
+      expect(withdrawnOutcome({ outcome: 'useUnknown', id, created: false, name })).toBe('It was left running: it could not be checked whether another window is connected to it.');
+      expect(withdrawnOutcome({ outcome: 'useUnknown', id, created: false, name, marked: true })).toBe(
+        'It was left running: it could not be checked whether another window is connected to it; the next open runs its lifecycle commands.',
+      );
+      expect(withdrawnOutcome({ outcome: 'useUnknown', id, created: false, name, marked: true }, true)).toBe(
+        'It was left running: it could not be checked whether another window is connected to it.',
+      );
+      // A-R3-5: the mark makes the next open run its lifecycle commands (not in a switch, which keeps the previous configuration).
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: true, name, marked: true })).toBe('It could be neither removed nor stopped; the next open runs its lifecycle commands.');
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: false, name, marked: true })).toBe('It could not be stopped; the next open runs its lifecycle commands.');
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: undefined, name, marked: true })).toBe('It could not be stopped; the next open runs its lifecycle commands.');
+      expect(withdrawnOutcome({ outcome: 'kept', id, created: true, name, marked: true }, true)).toBe('It could be neither removed nor stopped.');
     });
 
     it('R2B-6 Cancel during run-user-commands that fails with helperFailed ends as cancelled', async () => {
@@ -2052,6 +2082,190 @@ describe('open: existing environment', () => {
       expect(h.docker.containersOf(ENV_ID)).toEqual([]);
       await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
       expect(h.docker.containersOf(ENV_ID)[0].id).not.toBe(before);
+    });
+
+    it('B-R3-a a stopped container that `up` started and that cannot be stopped again: the detail says so', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      h.helper.userCommandsError = gone();
+      h.docker.stopContainer = async () => {
+        throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      // Review round 3 of PR #68 (A-R3-5): changed expectation (before: "… It could not be stopped. No such image: …", as
+      // reviewer B validated it on the head of round 3): the registry marks the container, so the next open runs its
+      // lifecycle commands.
+      expect(error.detail).toBe(`The container was started, but its lifecycle commands could not run. It could not be stopped; the next open runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`);
+    });
+
+    it('B-R3-b a container that `up` created is removed, not stopped first', async () => {
+      await seedEnvironment(h, { container: null });
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      const created = h.helper.userCommandRuns.at(-1)!.containerId;
+      expect(h.docker.log).toContain(`rm ${created}`);
+      expect(h.docker.log).not.toContain(`stop ${created}`);
+    });
+
+    it('A-R3-5 (review round 3 of PR #68): Step 9, the container can be neither stopped nor removed: the registry marks it, and the next open runs `up` and its lifecycle commands and clears the mark', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const container = h.docker.containersOf(ENV_ID)[0];
+      h.helper.userCommandsError = gone();
+      const stop = h.docker.stopContainer.bind(h.docker);
+      h.docker.stopContainer = async () => {
+        throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: container.id, state: 'running' })]);
+      expect((await entry())?.lifecycleIncomplete).toBe(container.id);
+      // The next open (helper back, updates off): the running container is not opened as it is.
+      h.docker.stopContainer = stop;
+      await nextOpenRunsLifecycle(`up ${IMAGE_1}`);
+      expect(h.helper.userCommandRuns.at(-1)?.containerId).toBe(container.id);
+      expect(h.docker.containersOf(ENV_ID)[0].id).toBe(container.id);
+      expect((await entry())?.lifecycleIncomplete).toBeUndefined();
+    });
+
+    it('A-R3-5 (review round 3 of PR #68): a running container of the mark is not opened as it is when the helper fails at Step 5', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      const container = h.docker.containersOf(ENV_ID)[0];
+      await h.registry.updateEnvironment(ENV_ID, (environment) => {
+        environment.lifecycleIncomplete = container.id;
+      });
+      h.helper.readConfigurationError = gone();
+      const log = h.docker.log.length;
+      // Without the mark, it opens as it is (R14-1 a plain open whose helper cannot be prepared keeps the helperFailed warning).
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('helperFailed');
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.log.slice(log).filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+      expect((await entry())?.lifecycleIncomplete).toBe(container.id);
+    });
+
+    it('A-R3-5 (review round 3 of PR #68): a mark that names another container does not keep the running container from opening as it is, and the open clears it', async () => {
+      await seedEnvironment(h, { container: 'running' });
+      await h.registry.updateEnvironment(ENV_ID, (environment) => {
+        environment.lifecycleIncomplete = 'f'.repeat(64);
+      });
+      h.settings.updateImagesOnConnect = false;
+      const result = await h.service.open(TARGET, options());
+      expect(result.containerName).toBe(NAME);
+      expect(h.helper.ups).toEqual([]);
+      expect((await entry())?.lifecycleIncomplete).toBeUndefined();
+    });
+
+    describe('A-R3-4 (review round 3 of PR #68): another window is connected to the environment', () => {
+      const WINDOW_B = 'window-b';
+      const PID_B = 4242;
+      const live = (): WindowStatus[] => [{ windowId: WINDOW_B, pid: PID_B, environmentId: ENV_ID, state: 'active', updatedAt: new Date(T0).toISOString() }];
+
+      it('a started container is left running, and nothing is stopped or removed', async () => {
+        h = recreate({ windowStatuses: async () => live() });
+        h.alivePids.add(PID_B);
+        await seedEnvironment(h, { container: 'stopped' });
+        const container = h.docker.containersOf(ENV_ID)[0];
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toBe(`The container was started, but its lifecycle commands could not run. It was left running: another window is connected to it. No such image: sha256:${'4'.repeat(64)}`);
+        expect(h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+        expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: container.id, state: 'running' })]);
+        expect(h.logger.infos.join('\n')).toContain(`The window ${WINDOW_B} is connected to it.`);
+        // It runs without the lifecycle commands of this open: the registry marks it (A-R3-5).
+        expect((await entry())?.lifecycleIncomplete).toBe(container.id);
+      });
+
+      it('a container of another window that ran before `up` is left running, and not marked', async () => {
+        h = recreate({ windowStatuses: async () => live() });
+        h.alivePids.add(PID_B);
+        // A running container of the mark (A-R3-5): Step 9 runs `up` for it, which finds it running.
+        await seedEnvironment(h, { container: 'running' });
+        const container = h.docker.containersOf(ENV_ID)[0];
+        await h.registry.updateEnvironment(ENV_ID, (environment) => {
+          environment.lifecycleIncomplete = container.id;
+        });
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(h.helper.userCommandRuns.at(-1)?.containerId).toBe(container.id);
+        expect(error.detail).toContain('It was left running: another window is connected to it.');
+        expect(h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+        expect(h.logger.infos.join('\n')).toContain(`The container ${NAME} ran before this open; its lifecycle commands could not run now. The window ${WINDOW_B} is connected to it.`);
+        // The mark of the earlier open stays.
+        expect((await entry())?.lifecycleIncomplete).toBe(container.id);
+      });
+
+      it('a window status file of another window whose process is gone, or that is stale, does not count', async () => {
+        h = recreate({
+          // window-b: a process that is gone (not PID, the process of the tests); window-c: alive, but 61 s old.
+          windowStatuses: async () => [{ ...live()[0], pid: 5151 }, { ...live()[0], windowId: 'window-c', pid: 4343, updatedAt: new Date(T0 - 61_000).toISOString() }],
+        });
+        h.alivePids.add(4343);
+        await seedEnvironment(h, { container: 'stopped' });
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toContain('It was stopped; the next open starts it again and runs its lifecycle commands.');
+      });
+
+      it('a fresh pending connection file of another window counts too', async () => {
+        await seedEnvironment(h, { container: 'stopped' });
+        h.sessionFiles.readPendings = async () => [{ environmentId: ENV_ID, windowId: WINDOW_B, createdAt: new Date(T0).toISOString() }];
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toContain('It was left running: another window is connected to it.');
+        expect(h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+      });
+
+      it('the pending connection file of this window, and a window of another environment, do not count', async () => {
+        h = recreate({ windowStatuses: async () => [{ ...live()[0], environmentId: 'other-environment' }] });
+        h.alivePids.add(PID_B);
+        await seedEnvironment(h, { container: 'stopped' });
+        h.sessionFiles.readPendings = async () => [{ environmentId: ENV_ID, windowId: WINDOW_ID, createdAt: new Date(T0).toISOString() }];
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toContain('It was stopped; the next open starts it again and runs its lifecycle commands.');
+      });
+
+      // A-R3-4 (review round 3 of PR #68, user focus "when in doubt, keep"): a file that cannot be read makes it unknown
+      // whether another window uses the container, so nothing is stopped or removed; the mark makes the next open run the
+      // lifecycle commands.
+      it('a window status file that cannot be read: the container is left running and marked (logged)', async () => {
+        h = recreate({
+          windowStatuses: async () => {
+            throw new Error('unreadable');
+          },
+        });
+        await seedEnvironment(h, { container: 'stopped' });
+        const container = h.docker.containersOf(ENV_ID)[0];
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toBe(
+          `The container was started, but its lifecycle commands could not run. It was left running: it could not be checked whether another window is connected to it; the next open runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`,
+        );
+        expect(h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+        expect(h.logger.warnings.join('\n')).toContain('The window status files could not be read: unreadable');
+        expect((await entry())?.lifecycleIncomplete).toBe(container.id);
+      });
+
+      it('pending connection files that cannot be read: a container that `up` created is not removed (logged)', async () => {
+        await seedEnvironment(h, { container: null });
+        h.sessionFiles.readPendings = async () => {
+          throw new Error('unreadable pendings');
+        };
+        h.helper.userCommandsError = gone();
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('helperFailed');
+        expect(error.detail).toContain('It was left running: it could not be checked whether another window is connected to it;');
+        expect(h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+        expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ state: 'running' })]);
+        expect(h.logger.warnings.join('\n')).toContain('The pending connection files could not be read: unreadable pendings');
+      });
     });
 
     it('a container that was stopped during the failing build does not open as it is (review round 4 of PR #64, R4-7 M2)', async () => {

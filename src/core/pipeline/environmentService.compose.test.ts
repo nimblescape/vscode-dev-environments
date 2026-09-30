@@ -1386,6 +1386,15 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.logger.infos.some((line) => line.includes('was created for a Docker Compose configuration. Its merged configuration is not checked'))).toBe(true);
   });
 
+  it('B-R3-c the detail of a failed switch whose `up` failed still says that nothing else was removed', async () => {
+    dbContainer();
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('up failed') : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toMatch(/ The Dev Container CLI may have removed the previous dev container before it failed\. Nothing else was removed, and the files in the volumes are kept\. up failed$/);
+  });
+
   it('does not start the old image of Docker Compose as a single container when up fails (review round 2, D2-4)', async () => {
     const db = dbContainer();
     h.ui.configurationChangedAnswer = 'rebuildNow';
@@ -1485,6 +1494,95 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(later.code).toBe('startFailed');
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
     expect(h.helper.userCommandRuns.length).toBe(runs);
+  });
+
+  it('A-R3-1 (review round 3 of PR #68): the new single container cannot be removed: it is stopped, the detail promises nothing about the next open, and "Rebuild later" does not start it', async () => {
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const remove = h.docker.removeContainer.bind(h.docker);
+    h.docker.removeContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      return remove(ref);
+    };
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('Its container was created, but its lifecycle commands could not run. It could not be removed and was stopped. The environment is not started');
+    expect(error.detail).not.toContain('the next open');
+    const leftover = h.docker.containersOf(ENV_ID);
+    expect(leftover).toEqual([expect.objectContaining({ state: 'stopped' })]);
+    // "Rebuild later": the environment keeps its kind (its build record: Docker Compose), as after a removal that worked.
+    h.docker.removeContainer = remove;
+    h.helper.userCommandsError = undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    const runs = h.helper.userCommandRuns.length;
+    h.helper.calls.length = 0;
+    const later = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(later.code).toBe('startFailed');
+    expect(later.detail).toBe(`The configuration no longer uses Docker Compose, which applies with a rebuild. The container ${leftover[0].name} is no container of Docker Compose; it is not started until the rebuild.`);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.helper.userCommandRuns.length).toBe(runs);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ id: leftover[0].id, state: 'stopped' })]);
+  });
+
+  it('A-R3-5 (review round 3 of PR #68): the new single container can be neither removed nor stopped: the registry marks it, "Rebuild later" does not open it as it is, and "Rebuild now" replaces it and clears the mark', async () => {
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const remove = h.docker.removeContainer.bind(h.docker);
+    const stop = h.docker.stopContainer.bind(h.docker);
+    h.docker.removeContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      return remove(ref);
+    };
+    h.docker.stopContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+      return stop(ref);
+    };
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('It could be neither removed nor stopped. The environment is not started');
+    const leftover = h.docker.containersOf(ENV_ID);
+    expect(leftover).toEqual([expect.objectContaining({ state: 'running' })]);
+    expect((await h.registry.get(ENV_ID))?.lifecycleIncomplete).toBe(leftover[0].id);
+    h.docker.removeContainer = remove;
+    h.docker.stopContainer = stop;
+    h.helper.userCommandsError = undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    const runs = h.helper.userCommandRuns.length;
+    h.helper.calls.length = 0;
+    const later = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(later.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.helper.userCommandRuns.length).toBe(runs);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.calls.filter((call) => call.startsWith('up')).at(-1)).toMatch(/--remove-existing-container$/);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).not.toContain(leftover[0].id);
+    expect((await h.registry.get(ENV_ID))?.lifecycleIncomplete).toBeUndefined();
+  });
+
+  it('A-R3-2 (review round 3 of PR #68): the dev container of Docker Compose was gone, so `up` removed nothing, and the detail does not say it did', async () => {
+    const dev = devContainer();
+    if (dev) h.docker.containers.delete(dev.id);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2}`]);
+    expect(error.detail).toContain('no longer uses Docker Compose');
+    expect(error.detail).not.toContain('The Dev Container CLI');
+    expect(error.detail).toContain(`of the service db. The files in the volumes are kept. No such image: sha256:${'4'.repeat(64)}`);
+  });
+
+  it('A-R3-2 (review round 3 of PR #68): the dev container of Docker Compose was gone and `up` failed: the detail does not say that the CLI may have removed it', async () => {
+    const dev = devContainer();
+    if (dev) h.docker.containers.delete(dev.id);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('up failed') : undefined);
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2}`]);
+    expect(error.detail).not.toContain('The Dev Container CLI');
+    expect(error.detail).toMatch(/ Nothing else was removed, and the files in the volumes are kept\. up failed$/);
   });
 
   it('keeps the containers of Docker Compose and starts nothing on "Rebuild later" (review round 1, P-1)', async () => {
@@ -3823,6 +3921,8 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
 
     it('removes the new dev container, says what happened to the previous one, keeps the previous configuration, and the next open runs up and the lifecycle commands', async () => {
+      // Review round 3 of PR #68 (A-R3-5, test gap): Compose creates a dev container again whose name changed.
+      h.helper.composeRecreatesRenamedDevContainer = true;
       await h.service.open(TARGET, options());
       const app = byService('app')!;
       const web = byService('web')!;
@@ -3848,10 +3948,15 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       h.settings.updateImagesOnConnect = false;
       const runs = h.helper.userCommandRuns.length;
       h.helper.calls.length = 0;
-      await h.service.openEnvironment(ENV_ID, options());
+      const result = await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.calls.filter((call) => call.startsWith('up'))).toHaveLength(1);
       expect(h.helper.ups.at(-1)?.override.service).toBe('app');
       expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+      // Review round 3 of PR #68 (A-R3-5, test gap): the window connects to a running container of that name, and the
+      // lifecycle commands ran in it (the fake Compose creates the renamed dev container again under its container_name).
+      const connected = h.docker.containersOf(ENV_ID).find((c) => c.name === result.containerName);
+      expect(connected).toMatchObject({ state: 'running', labels: expect.objectContaining({ 'com.docker.compose.service': 'app' }) });
+      expect(h.helper.userCommandRuns.at(-1)?.containerId).toBe(connected?.id);
     });
 
     it('when the rename of the previous dev container failed, the detail says that it was removed', async () => {
@@ -3879,6 +3984,94 @@ describe('review round 22 (D22-1): Select configuration… between two configura
         `The dev service changed from app to web. The previous dev container ${NAME} could not be renamed and was removed; its volumes are kept. No such image: sha256:${'4'.repeat(64)}`,
       );
     });
+
+    it('B-R3-d the containers cannot be listed before `up`: the previous dev container that Compose created again is stopped, and the open ends with helperFailed', async () => {
+      await h.service.open(TARGET, options());
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(byService('app')).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect(error.detail).toContain(`Docker Compose created the previous dev container again as the service app (${PROJECT}-app-1); the files outside its volumes are gone. The previous configuration stays selected.`);
+    });
+
+    it('B-R3-h the new dev container that could not be removed: the next open does what the detail says', async () => {
+      await h.service.open(TARGET, options());
+      const remove = h.docker.removeContainer.bind(h.docker);
+      h.docker.removeContainer = async (ref) => {
+        if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+        return remove(ref);
+      };
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      const web = byService('web')!;
+      expect(web).toMatchObject({ name: NAME, state: 'stopped' });
+      h.docker.removeContainer = remove;
+      h.helper.userCommandsError = undefined;
+      h.settings.updateImagesOnConnect = false;
+      const runs = h.helper.userCommandRuns.length;
+      await h.service.openEnvironment(ENV_ID, options());
+      const started = h.helper.userCommandRuns.slice(runs).some((run) => run.containerId === web.id);
+      // The detail may promise that the next open starts it and runs its lifecycle commands only when it does.
+      expect(error.detail?.includes('the next open starts it') ?? false).toBe(started);
+    });
+
+    it('B-R3-e the containers cannot be listed after the failed switch: the state of the previous dev container is not known', async () => {
+      await h.service.open(TARGET, options());
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (new Error().stack?.includes('previousDevContainerAfterFailedSwitch')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toContain(`It was removed. The state of the previous dev container ${PROJECT}-app-1 is not known. The previous configuration stays selected.`);
+    });
+
+    it('A-R3-3 (review round 3 of PR #68): the containers cannot be listed before `up`: the detail says "created or started", and nothing about the next open', async () => {
+      await h.service.open(TARGET, options());
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe(
+        `The dev service changed from app to web. The dev container of the service web was created or started, but its lifecycle commands could not run. It was stopped. Docker Compose created the previous dev container again as the service app (${PROJECT}-app-1); the files outside its volumes are gone. The previous configuration stays selected. No such image: sha256:${'4'.repeat(64)}`,
+      );
+      expect(byService('web')).toMatchObject({ name: NAME, state: 'stopped' });
+    });
+
+    it('B-R3-4 (review round 3 of PR #68): the previous dev container that Compose created again cannot be stopped: the detail says so', async () => {
+      await h.service.open(TARGET, options());
+      const list = h.docker.listEnvironmentContainers.bind(h.docker);
+      h.docker.listEnvironmentContainers = async () => {
+        if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+        return list();
+      };
+      const stop = h.docker.stopContainer.bind(h.docker);
+      h.docker.stopContainer = async (ref) => {
+        if (new Error().stack?.includes('previousDevContainerAfterFailedSwitch')) throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+        return stop(ref);
+      };
+      h.helper.userCommandsError = gone();
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toContain(
+        `Docker Compose created the previous dev container again as the service app (${PROJECT}-app-1); the files outside its volumes are gone. It could not be stopped. The previous configuration stays selected.`,
+      );
+      expect(byService('app')?.state).toBe('running');
+    });
+
+
   });
 
   describe('final review, FC-1: the new configuration does not start the previous dev service (runServices)', () => {
@@ -3940,6 +4133,23 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
       expect(error.code).toBe('helperFailed');
       expect(error.detail).toContain('It was removed. The previous dev container is kept, but it could not be stopped. The previous configuration stays selected.');
+    });
+
+    it('B-R3-4 (review round 3 of PR #68): the renamed previous dev container that is gone after the failed switch is named by its new name', async () => {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      const error = new UserFacingError('helperFailed', Messages.helperFailed, 'No such image: x');
+      // For example removed by hand while the lifecycle commands were to run.
+      Object.defineProperty(h.helper, 'userCommandsError', {
+        configurable: true,
+        get: () => {
+          h.docker.containers.delete(app.id);
+          return error;
+        },
+      });
+      const failed = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(failed.code).toBe('helperFailed');
+      expect(failed.detail).toContain(`It was removed. The previous dev container ${PROJECT}-app-1 is gone. The previous configuration stays selected.`);
     });
 
     it('connects to the dev container with the name of the environment even when the previous one runs again', async () => {
@@ -4560,5 +4770,98 @@ describe('review round 2 of PR #68: run-user-commands of Docker Compose fails wi
     );
     expect(h.docker.containersOf(ENV_ID)).toEqual([]);
     expect(h.docker.images.has(IMAGE_2)).toBe(false);
+  });
+
+  it('B-R3-f a one-off container of the project (without the ID label) that ran before `up` keeps running', async () => {
+    await seedCompose({ dev: 'stopped', db: 'running' });
+    const oneOff: ContainerInfo = {
+      id: 'one-off-1',
+      name: `${PROJECT}-db-run-1`,
+      state: 'running',
+      rawState: 'running',
+      image: DB_IMAGE,
+      labels: { 'com.docker.compose.project': PROJECT, 'com.docker.compose.service': 'db', 'com.docker.compose.oneoff': 'True' },
+    };
+    h.docker.containers.set(oneOff.id, oneOff);
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(h.docker.containers.get(oneOff.id)?.state).toBe('running');
+    expect(h.docker.log).not.toContain(`stop ${oneOff.id}`);
+  });
+
+  it('B-R3-g the containers cannot be listed before `up`: the open ends with helperFailed, and the dev container is stopped', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    const dev = devContainer()!;
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    h.docker.listEnvironmentContainers = async () => {
+      if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+      return list();
+    };
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toBe(`The container was started, but its lifecycle commands could not run. It was stopped; the next open starts it again and runs its lifecycle commands. No such image: sha256:${'4'.repeat(64)}`);
+    expect(devContainer()).toMatchObject({ id: dev.id, state: 'stopped' });
+  });
+
+  it('A-R3-1 (review round 3 of PR #68): a switch to Docker Compose whose new dev container cannot be removed at once: the cleanup of the switch removes it, and the detail names it once, as removed', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    const single = h.docker.containersOf(ENV_ID)[0];
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const remove = h.docker.removeContainer.bind(h.docker);
+    h.docker.removeContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      return remove(ref);
+    };
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toBe(
+      `The configuration now uses Docker Compose. Its dev container was created, but its lifecycle commands could not run. It was removed. The environment is not started with its previous containers, which belong to the previous configuration; rebuild it to try again. The change removed the container ${single.name}. The containers that Docker Compose had created were removed again: the container ${PROJECT}-db-1 of the service db. The files in the volumes are kept. No such image: sha256:${'4'.repeat(64)}`,
+    );
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+  });
+
+  it('A-R3-5 (review round 3 of PR #68): a switch to Docker Compose whose new dev container can be neither removed nor stopped at once: the cleanup of the switch removes it and clears the mark', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const remove = h.docker.removeContainer.bind(h.docker);
+    const stop = h.docker.stopContainer.bind(h.docker);
+    h.docker.removeContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+      return remove(ref);
+    };
+    h.docker.stopContainer = async (ref) => {
+      if (new Error().stack?.includes('withdrawAfterHelperFailed')) throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+      return stop(ref);
+    };
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toContain('Its dev container was created, but its lifecycle commands could not run. It was removed. The environment');
+    expect(error.detail).toContain(`were removed again: the container ${PROJECT}-db-1 of the service db. The files`);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    expect((await h.registry.get(ENV_ID))?.lifecycleIncomplete).toBeUndefined();
+  });
+
+  it('A-R3-3 (review round 3 of PR #68): the containers cannot be listed before `up`: the side services are left as they are, and the log says so', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    const db = dbContainer()!;
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    h.docker.listEnvironmentContainers = async () => {
+      if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+      return list();
+    };
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    expect(devContainer()?.state).toBe('stopped');
+    expect(dbContainer()).toMatchObject({ id: db.id, state: 'running' });
+    expect(h.docker.log).not.toContain(`stop ${db.id}`);
+    expect(h.logger.infos.join('\n')).toContain('was created or started, but its lifecycle commands did not run. It is stopped');
+    expect(h.logger.infos.join('\n')).toContain('The containers of the other services of acme/api are left as they are: it is not known which of them ran before up.');
   });
 });
