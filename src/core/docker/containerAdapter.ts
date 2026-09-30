@@ -29,8 +29,13 @@ import {
 } from '../ports';
 import type { ContainerState } from '../types';
 import { dockerProcessEnv, envValue } from './dockerCli';
-import { isSshClosedBeforeLogin } from './dockerHost';
+import { isSshClosedBeforeLogin, type DockerTarget } from './dockerHost';
+import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { operationDockerTarget } from './dockerTargets';
+import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
+
+// Plan step 5, PR A: the classification moved to dockerRouting.ts.
+export { isReadOnlyDockerCall };
 
 export interface ContainerInfo {
   id: string;
@@ -130,38 +135,6 @@ export const DOCKER_CLI_LOOKUP_RETRY_MS = 10_000;
  */
 export const SSH_DROP_RETRY_DELAY_MS = 1_000;
 
-/** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */
-const GLOBAL_OPTIONS_WITH_VALUE = new Set(['-H', '--host', '-c', '--context', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']);
-
-/** Docker commands that only read: `docker <command>`, or `docker <object> <command>`. */
-const READ_ONLY_COMMANDS = new Set(['info', 'version', 'ps', 'images', 'inspect']);
-const READ_ONLY_OBJECT_COMMANDS: Record<string, readonly string[]> = {
-  container: ['inspect', 'ls', 'list', 'ps'],
-  image: ['inspect', 'ls', 'list', 'history'],
-  volume: ['inspect', 'ls', 'list'],
-  network: ['inspect', 'ls', 'list'],
-  context: ['inspect', 'ls', 'list', 'show'],
-  system: ['info', 'df'],
-};
-
-/**
- * True for a Docker call that only reads (inspect, ls, ps, info, version…), which may run again without any effect.
- * Everything else (create, run, exec, start, stop, rm, build, pull, …) is never repeated.
- */
-export function isReadOnlyDockerCall(args: readonly string[]): boolean {
-  const [command, subcommand] = dockerCommandWords(args);
-  if (command === undefined) return false;
-  if (READ_ONLY_COMMANDS.has(command)) return true;
-  return READ_ONLY_OBJECT_COMMANDS[command]?.includes(subcommand ?? '') ?? false;
-}
-
-/** The first two words after the global options of the Docker CLI (`docker -H ssh://box image inspect x` → image inspect). */
-function dockerCommandWords(args: readonly string[]): string[] {
-  let i = 0;
-  while (i < args.length && args[i].startsWith('-')) i += GLOBAL_OPTIONS_WITH_VALUE.has(args[i]) ? 2 : 1;
-  return args.slice(i, i + 2);
-}
-
 /**
  * Unit 7: true when a Docker call that only reads failed because the SSH server of the remote Docker host closed the
  * connection before the login (the Docker CLI's `ssh … docker system dial-stdio` exited with 255, and ssh said nothing
@@ -180,6 +153,18 @@ export interface RegistryLogin extends Credentials {
   /** Registry host, for example `ghcr.io`. */
   registry: string;
 }
+
+/**
+ * Plan step 5, PR A: runs one plain Docker call (isRoutableDockerCall) on the engine of `target` through the worker.
+ * Undefined when it was not sent (no worker, or beyond what it carries): the call then runs directly. Rejects like
+ * HelperChannels.docker (an AbortError; HelperChannelError `lost` or `protocol`, HelperOperationError: the outcome is
+ * not known).
+ */
+export type DockerRouter = (
+  target: DockerTarget,
+  args: readonly string[],
+  options: Pick<RunOptions, 'timeoutMs' | 'signal'>,
+) => Promise<RunResult | undefined>;
 
 export interface ContainerAdapterOptions {
   /**
@@ -526,6 +511,7 @@ export class ContainerAdapter {
   private readonly onCliLost: ContainerAdapterOptions['onCliLost'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
+  private router: DockerRouter | undefined;
 
   /**
    * @param dockerPath Full path of the Docker CLI (see `findDockerCli`), or `undefined` if Docker is not installed.
@@ -566,11 +552,63 @@ export class ContainerAdapter {
   }
 
   /**
+   * Plan step 5, PR A: the worker for the plain Docker calls of an operation (HelperChannels.docker in the extension).
+   * Undefined: every call runs directly.
+   */
+  setRouter(router: DockerRouter | undefined): void {
+    this.router = router;
+  }
+
+  /**
    * Raw call. Resolves also for a non-zero exit code. Throws UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled)
-   * without a CLI, or when the CLI cannot be started anymore (removed after it was found). A call that only reads is
-   * repeated once when the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall).
+   * without a CLI, or when the CLI cannot be started anymore (removed after it was found).
+   *
+   * Plan step 5, PR A: within an operation (operationDockerTarget), a routable call (isRoutableDockerCall) goes through
+   * the router when one is set; when the router returns undefined (no worker, or the call was not sent), it runs
+   * directly. A routed call whose worker was lost, answered wrongly, or failed: a call that only reads runs once more
+   * directly (logged); any other call throws a CommandError, because its outcome is not known, and is never repeated.
    */
   async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    const target = this.router === undefined ? undefined : operationDockerTarget();
+    if (target !== undefined && isRoutableDockerCall(args, options)) {
+      const routed = await this.runRouted(target, args, options);
+      if (routed !== undefined) return routed;
+    }
+    return this.runDirect(args, options);
+  }
+
+  /** run through the router; undefined: run it directly. See run. */
+  private async runRouted(target: DockerTarget, args: readonly string[], options: RunOptions): Promise<RunResult | undefined> {
+    const router = this.router;
+    if (router === undefined) return undefined;
+    try {
+      return await router(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (options.signal?.aborted) throw abortError();
+      const unknownOutcome =
+        (error instanceof HelperChannelError && (error.code === 'lost' || error.code === 'protocol')) || error instanceof HelperOperationError;
+      if (!unknownOutcome) throw error;
+      const command = dockerCommandWords(args).join(' ');
+      if (isReadOnlyDockerCall(args)) {
+        this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); it runs once more directly.`);
+        return undefined;
+      }
+      this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); its outcome is not known, and it is not repeated.`);
+      throw new CommandError(
+        commandText(args),
+        null,
+        '',
+        `The connection to the Docker host was lost; the outcome of docker ${command} is not known.`,
+      );
+    }
+  }
+
+  /**
+   * The call without the worker (the way of every call before plan step 5). A call that only reads is repeated once when
+   * the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall).
+   */
+  async runDirect(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     const result = await this.runOnce(args, options);
     if (!sshDroppedReadCall(args, result) || options.signal?.aborted) return result;
     const command = dockerCommandWords(args).join(' ');
