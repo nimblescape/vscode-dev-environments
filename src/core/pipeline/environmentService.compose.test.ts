@@ -1775,6 +1775,26 @@ describe('review round 3 of unit 6 (P3-1, P3-3, D3-1, D3-2)', () => {
     expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
   });
 
+  it('B-R5-2 (review round 5 of PR #68): Step 9 without a busy mark does not remove the containers of other services while another window is opening the environment', async () => {
+    // PR #68 review round 5, B-R5-2: a pending connection file of window B (status files do not count while nothing runs).
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    h.helper.upError = (image) => (image === IMAGE_2 ? new Error('compose up failed') : undefined);
+    await rejection(h.service.openEnvironment(ENV_ID, options()));
+    const db = addDb();
+    h.helper.upError = () => undefined;
+    h.ui.configurationChangedAnswer = 'later';
+    h.sessionFiles.readPendings = async () => [{ environmentId: ENV_ID, windowId: 'window-b', createdAt: new Date(T0).toISOString() }];
+    const log = h.docker.log.length;
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('the containers of its other Docker Compose services must be removed, but another window is opening the environment. Nothing was stopped, removed, or renamed.');
+    expect(h.docker.log.slice(log).filter((line) => line.startsWith('stop') || line.startsWith('rm'))).toEqual([]);
+    expect(h.docker.containers.get(db.id)).toMatchObject({ state: 'running' });
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
   it('never lets an up find the container of another service next to a single container (D3-1)', async () => {
     // An up-to-date single container, and a container of a service of Docker Compose with the ID label.
     await seedEnvironment(h, { container: 'stopped' });
@@ -4064,6 +4084,48 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       expect(error.detail?.includes('the next open starts it') ?? false).toBe(started);
     });
 
+    it('B-R5-3 (review round 5 of PR #68): the next open does not rename the dev container of the other service without a busy mark while another window is opening the environment', async () => {
+      // PR #68 review round 5, B-R5-3: a pending connection file of window B (status files do not count while nothing runs).
+      await h.service.open(TARGET, options());
+      // The first removal after run-user-commands failed (the withdrawal of the new dev container web) fails.
+      let withdrawing = false;
+      let failedRemovals = 0;
+      const runUserCommands = h.helper.runUserCommands.bind(h.helper);
+      h.helper.runUserCommands = async (p) => {
+        try {
+          return await runUserCommands(p);
+        } catch (error) {
+          withdrawing = true;
+          throw error;
+        }
+      };
+      const remove = h.docker.removeContainer.bind(h.docker);
+      h.docker.removeContainer = async (ref) => {
+        if (withdrawing) {
+          withdrawing = false;
+          failedRemovals++;
+          throw new CommandError('docker rm', 1, '', 'Cannot connect to the Docker daemon');
+        }
+        return remove(ref);
+      };
+      h.helper.userCommandsError = gone();
+      await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(failedRemovals).toBe(1);
+      const web = byService('web')!;
+      h.docker.removeContainer = remove;
+      h.helper.runUserCommands = runUserCommands;
+      h.helper.userCommandsError = undefined;
+      h.settings.updateImagesOnConnect = false;
+      h.sessionFiles.readPendings = async () => [{ environmentId: ENV_ID, windowId: 'window-b', createdAt: new Date(T0).toISOString() }];
+      const log = h.docker.log.length;
+      const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+      expect(error.code).toBe('startFailed');
+      expect(error.detail).toContain(`the dev container ${NAME} of the service web must be renamed and stopped, but another window is opening the environment.`);
+      expect(h.docker.log.slice(log).filter((line) => line.startsWith('stop') || line.startsWith('rm') || line.startsWith('rename'))).toEqual([]);
+      expect(h.docker.containers.get(web.id)).toMatchObject({ name: NAME });
+      expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    });
+
     it('B-R3-e the containers cannot be listed after the failed switch: the state of the previous dev container is not known', async () => {
       await h.service.open(TARGET, options());
       const list = h.docker.listEnvironmentContainers.bind(h.docker);
@@ -5047,6 +5109,26 @@ describe('review round 4 of PR #68', () => {
     expect(result.containerName).toBe(NAME);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
     expect(devContainer()?.state).toBe('running');
+  });
+
+  it('B-R5-5 (review round 5 of PR #68): with the configuration unreadable and the dev container gone, a build record whose part lacks a field keeps the environment a Docker Compose environment', async () => {
+    // PR #68 review round 5, B-R5-5.
+    await seedCompose({ dev: null, db: 'stopped' });
+    const db = dbContainer()!;
+    await h.registry.updateEnvironment(ENV_ID, (environment) => {
+      delete (environment.buildRecord!.compose as Partial<NonNullable<BuildRecord['compose']>>).inputsHash;
+    });
+    h.settings.updateImagesOnConnect = false;
+    h.helper.readConfigurationError = new DevcontainerCommandError('devcontainer read-configuration', 1, '', 'invalid configuration');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('The Docker Compose configuration cannot be read, and the environment has no container.');
+    // Never a single container from the image of the Docker Compose dev service (D2-4): no `up` at all.
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID).filter((c) => c.name === NAME)).toEqual([]);
+    // Nothing destructive either: the container of the service db stays, and nothing was removed.
+    expect(h.docker.containers.get(db.id)).toMatchObject({ id: db.id, state: 'stopped' });
+    expect(h.docker.log.filter((line) => line.startsWith('rm'))).toEqual([]);
   });
 
   it('A-R4-4: a switch to Docker Compose whose listing before `up` failed says "created or started"', async () => {

@@ -2690,6 +2690,21 @@ describe('open: existing environment', () => {
         expect(touched()).toEqual([]);
         expect((await entry())?.busy).toEqual(markOfB());
       });
+
+      it('B-R5-7: the busy mark of the withdrawal goes also when the withdrawal throws', async () => {
+        // PR #68 review round 5, B-R5-7.
+        await seedEnvironment(h, { container: 'stopped' });
+        h.helper.userCommandsError = gone();
+        h.docker.stopContainer = async () => {
+          throw new CommandError('docker stop', 1, '', 'Cannot connect to the Docker daemon');
+        };
+        markWritesFail();
+        h.ui.warn = () => {
+          throw new Error('ui gone');
+        };
+        await rejection(h.service.open(TARGET, options()));
+        expect((await entry())?.busy).toBeUndefined();
+      });
     });
 
     describe('review round 5 of PR #68', () => {
